@@ -231,6 +231,99 @@ def _try_sd_calendar_split(
     return True
 
 
+def _try_la_html_split(
+    event_data: dict[str, Any],
+    document_id: str,
+    ruling_text: str,
+    dispatch: Any,
+) -> bool:
+    """If *ruling_text* is an LA department-response HTML page, deterministically
+    split it into per-case rulings and dispatch one synthetic split event per
+    case via *dispatch*.  Returns True if the split ran, False otherwise.
+
+    This path bypasses the LLM entirely — LA department HTML pages have a
+    predictable structure (``<b>Case Number:</b>`` blocks inside
+    ``<div id="speechSynthesis">``) that is cheap to parse with BeautifulSoup.
+    Sending the raw HTML through the LLM produced a correctness bug (#2450):
+
+    * On Word-pasted HTML variants lacking the standard
+      ``DEPARTMENT N LAW AND MOTION RULINGS`` header, the LLM failed to
+      extract ``case_number``.  The worker then synthesized
+      ``UNKNOWN-<uuid>`` as the case_number, producing ~12% UNKNOWN rate
+      across ``rebuild-ca-los_angeles`` events.
+
+    The function first checks whether the content looks like an LA HTML
+    page via ``is_la_html``.  If not, it returns False and the caller
+    continues with the normal extraction flow.
+
+    Mirrors the SD calendar pattern (``_try_sd_calendar_split``, #2447).
+    """
+    # Lazy import to avoid a circular dependency between the worker and
+    # the courts package at module load time.
+    from courts.ca.la_tentatives import _split_rulings, is_la_html
+
+    if not is_la_html(ruling_text):
+        return False
+
+    split_rulings = _split_rulings(ruling_text)
+    if not split_rulings:
+        logger.warning(
+            "LA HTML detected but splitter returned no rulings — falling through",
+            extra={"document_id": document_id},
+        )
+        return False
+
+    logger.info(
+        "LA HTML deterministic split dispatching %d ruling(s)",
+        len(split_rulings),
+        extra={
+            "document_id": document_id,
+            "ruling_count": len(split_rulings),
+            "scraper_id": event_data.get("scraper_id"),
+            "extraction_method": "la_html_deterministic",
+        },
+    )
+
+    # Import here so we don't create a new top-level dependency.
+    from .split_ids import make_split_document_id
+
+    is_multi = len(split_rulings) > 1
+    for idx, sr in enumerate(split_rulings):
+        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        hearing_date_value: str | None = None
+        if sr.hearing_date is not None:
+            hearing_date_value = (
+                sr.hearing_date.date().isoformat()
+                if isinstance(sr.hearing_date, datetime)
+                else str(sr.hearing_date)
+            )
+
+        # LASplitRuling has no judge_name field — preserve whatever the scraper
+        # provided in the original event (LA judge_name is resolved from the
+        # dept-to-judge directory snapshot).
+        split_event: dict[str, Any] = {
+            **event_data,
+            "document_id": split_doc_id,
+            "_original_document_id": document_id,
+            "_split_processed": True,
+            "_llm_extracted": True,  # Skip further LLM attempts.
+            "_split_index": idx,
+            "_split_count": len(split_rulings),
+            "ruling_text": sr.ruling_text,
+            "ruling_text_html": sr.ruling_text_html,
+            "case_number": sr.case_number or event_data.get("case_number"),
+            "case_title": sr.case_title or event_data.get("case_title"),
+            "department": sr.department or event_data.get("department"),
+            "motion_type": sr.motion_type or event_data.get("motion_type"),
+            "outcome": sr.outcome or event_data.get("outcome"),
+            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+            "parties": sr.parties if sr.parties else event_data.get("parties", []),
+        }
+        dispatch(split_event)
+
+    return True
+
+
 # Fields that LLM extraction can populate when missing from the scraper event.
 EXTRACTABLE_FIELDS = (
     "hearing_date",
@@ -2104,6 +2197,24 @@ class IngestionWorker:
         # This path is taken regardless of scraper_id so any future SD
         # calendar capture paths stay correct by default.
         if ruling_text and _try_sd_calendar_split(
+            event_data, document_id, ruling_text, self.process_event
+        ):
+            return True
+
+        # ------------------------------------------------------------------
+        # LA tentative ruling HTML deterministic split (#2450)
+        # ------------------------------------------------------------------
+        # LA department-response HTML pages have a predictable structure
+        # (<b>Case Number:</b> blocks inside <div id="speechSynthesis">) that
+        # is cheap to parse with BeautifulSoup.  Sending the raw HTML to the
+        # LLM previously failed on Word-pasted variants lacking the standard
+        # DEPARTMENT header, producing ~12% UNKNOWN-<uuid> case_numbers
+        # among events emitted by ``scripts/rebuild_db.py`` with the
+        # synthetic scraper_id ``rebuild-ca-los_angeles``.  The deterministic
+        # splitter correctly extracts case_number, hearing_date, department,
+        # and parties from the HTML.  This path is taken regardless of
+        # scraper_id so any future LA HTML capture paths stay correct.
+        if ruling_text and _try_la_html_split(
             event_data, document_id, ruling_text, self.process_event
         ):
             return True

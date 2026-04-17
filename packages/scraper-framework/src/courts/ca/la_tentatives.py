@@ -601,6 +601,25 @@ def _split_rulings(text: str) -> list[LASplitRuling]:
     return rulings
 
 
+def is_la_html(text: str | None) -> bool:
+    """Return True if *text* looks like an LA tentative ruling HTML page.
+
+    Content-based detection that does not rely on ``scraper_id``.  This lets
+    callers route synthetic events (e.g. ``rebuild-ca-los_angeles`` from
+    :mod:`scripts.rebuild_db`) through the same deterministic splitter as
+    live ``ca-la-tentatives-civil`` captures.
+
+    The check is a cheap substring test on the first 4 KB of the content —
+    the ``<div id="speechSynthesis">`` marker appears near the top of every
+    LA department response (it wraps the ruling content area).
+    """
+    if not text:
+        return False
+    # Only scan the head of the document to keep the check cheap.
+    head = text[:4096]
+    return 'id="speechSynthesis"' in head
+
+
 def _truncate_party_list(party_side: str) -> str:
     """Truncate a multi-party string to the first party + ", et al.".
 
