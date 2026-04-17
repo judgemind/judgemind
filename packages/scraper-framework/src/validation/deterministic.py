@@ -241,13 +241,30 @@ def check_ruling_text_not_empty(ruling_text: str | None) -> DeterministicRuleRes
     """Check that ruling_text is not null or empty.
 
     An empty ruling text means extraction produced no content for this
-    document, which may indicate a scraping or transcription failure.
+    document.  Rather than storing a row with NULL/empty ``ruling_text``
+    (which pollutes full-text search, judge analytics, and downstream
+    summarisation), this rule returns ``fail`` so the worker skips the
+    DB write entirely and emits a ``data_quality.ruling_empty_text_dropped``
+    telemetry event (#2646).
+
+    Before #2646 this rule returned ``flag``, which allowed NULL-text rows
+    to accumulate in ``derived.rulings`` (most visibly for Santa Clara
+    multi-case splits where the LLM extracted metadata for a case but
+    produced no ruling_text).  The flag-and-write behaviour was
+    inconsistent with the schema's intent: a ``derived.rulings`` row
+    without substantive text has no meaningful content.
+
+    A ruling that genuinely has no text (e.g. an outcome-only docket
+    entry) should not appear in ``derived.rulings`` at all.  If such
+    entries need to be preserved later, that is a separate schema
+    decision — this guard rejects them until then.
     """
     if ruling_text is None or ruling_text.strip() == "":
         return DeterministicRuleResult(
             rule="ruling_text_not_empty",
-            result="flag",
-            reason="ruling_text is null or empty — extraction produced no content",
+            result="fail",
+            reason="ruling_text is null or empty — extraction produced no content "
+            "(data_quality.ruling_empty_text_dropped)",
         )
     return DeterministicRuleResult(rule="ruling_text_not_empty", result="pass")
 
