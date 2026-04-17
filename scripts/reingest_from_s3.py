@@ -244,6 +244,13 @@ def _load_scraper_registry() -> None:
     such module the ``scraper_id`` from the config is mapped to the scraper
     class.  This eliminates the need to maintain a hardcoded import list —
     adding a new scraper module automatically registers it.
+
+    Multi-scraper modules (e.g. LA civil + appellate in ``la_tentatives``)
+    can opt-in to explicit registration by exporting a module-level
+    ``_SCRAPER_CLASS_BY_ID: dict[str, type]`` mapping each ``scraper_id``
+    to its concrete ``BaseScraper`` subclass and pairing ``default_config``
+    factories (``default_config``, ``default_config_<suffix>``, ...).
+    See ``courts.ca.la_tentatives`` for the canonical example.
     """
     if _SCRAPER_REGISTRY:
         return
@@ -271,27 +278,65 @@ def _load_scraper_registry() -> None:
             logger.debug("Could not import module, skipping", module=modname)
             continue
 
-        config_fn = getattr(mod, "default_config", None)
-        if config_fn is None or not callable(config_fn):
+        # Collect all default_config* factory functions in this module.
+        # Single-scraper modules expose just ``default_config``; multi-
+        # scraper modules expose additional ``default_config_<suffix>``.
+        config_factories: list = []
+        for _attr_name, _attr in inspect.getmembers(mod, inspect.isfunction):
+            if _attr_name == "default_config" or _attr_name.startswith(
+                "default_config_"
+            ):
+                if _attr.__module__ == mod.__name__:
+                    config_factories.append(_attr)
+
+        if not config_factories:
             continue
 
-        # Find the concrete BaseScraper subclass in this module.
-        scraper_cls: type | None = None
+        # Module-level hint: explicit scraper_id → class mapping.  Required
+        # for multi-scraper modules where class-by-alphabetical-order would
+        # be ambiguous.  Optional for single-scraper modules (we fall back
+        # to auto-detection).
+        scraper_class_by_id: dict[str, type] | None = getattr(
+            mod, "_SCRAPER_CLASS_BY_ID", None
+        )
+
+        # Auto-detect single scraper class in the module (backward compat
+        # for modules that don't export _SCRAPER_CLASS_BY_ID).
+        auto_scraper_cls: type | None = None
         for _name, obj in inspect.getmembers(mod, inspect.isclass):
             if (
                 issubclass(obj, BaseScraper)
                 and obj is not BaseScraper
                 and obj.__module__ == mod.__name__
             ):
-                scraper_cls = obj
+                auto_scraper_cls = obj
                 break
 
-        if scraper_cls is None:
-            continue
+        for config_fn in config_factories:
+            try:
+                config = config_fn()
+            except Exception:
+                logger.warning(
+                    "default_config factory failed, skipping",
+                    module=modname,
+                    factory=config_fn.__name__,
+                    exc_info=True,
+                )
+                continue
 
-        try:
-            config = config_fn()
-            _SCRAPER_REGISTRY[config.scraper_id] = scraper_cls
+            scraper_id = config.scraper_id
+            scraper_cls: type | None = None
+            if scraper_class_by_id is not None:
+                scraper_cls = scraper_class_by_id.get(scraper_id)
+            if scraper_cls is None:
+                # Fall back to the auto-detected single class.  Only safe
+                # when there is exactly one scraper in the module.
+                scraper_cls = auto_scraper_cls
+
+            if scraper_cls is None:
+                continue
+
+            _SCRAPER_REGISTRY[scraper_id] = scraper_cls
 
             # Register split function if the module exports one.
             # Convention: a module-level ``_split_rulings`` callable
@@ -299,7 +344,7 @@ def _load_scraper_registry() -> None:
             # that need splitting during full reparse.
             split_fn = getattr(mod, "_split_rulings", None)
             if split_fn is not None and callable(split_fn):
-                _SPLIT_REGISTRY[config.scraper_id] = split_fn
+                _SPLIT_REGISTRY[scraper_id] = split_fn
 
             # Register LLM-based split function if available.
             # Convention: a module-level ``_llm_extract_rulings`` callable
@@ -307,11 +352,7 @@ def _load_scraper_registry() -> None:
             # produces higher-quality ruling_text than regex splitting.
             llm_split_fn = getattr(mod, "_llm_extract_rulings", None)
             if llm_split_fn is not None and callable(llm_split_fn):
-                _LLM_SPLIT_REGISTRY[config.scraper_id] = llm_split_fn
-        except Exception:
-            logger.warning(
-                "default_config() failed, skipping", module=modname, exc_info=True
-            )
+                _LLM_SPLIT_REGISTRY[scraper_id] = llm_split_fn
 
 
 FETCH_DOCUMENTS_QUERY = """

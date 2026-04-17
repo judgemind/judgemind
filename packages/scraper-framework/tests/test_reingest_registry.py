@@ -42,11 +42,14 @@ reingest = importlib.import_module("reingest_from_s3")
 
 
 def _discover_scraper_modules() -> list[tuple[str, str]]:
-    """Return [(module_path, class_name)] for every scraper with default_config().
+    """Return [(module_path, class_name)] for every (scraper_id, class) pair.
 
     Mirrors the discovery logic in ``_load_scraper_registry()`` — walks the
     ``courts`` package tree and collects modules that expose a
     ``default_config()`` callable and a concrete ``BaseScraper`` subclass.
+
+    Multi-scraper modules (those exporting ``_SCRAPER_CLASS_BY_ID``) emit
+    one tuple per registered scraper_id (#2599).
     """
     import courts
 
@@ -64,7 +67,16 @@ def _discover_scraper_modules() -> list[tuple[str, str]]:
         if config_fn is None or not callable(config_fn):
             continue
 
-        # Find the concrete BaseScraper subclass defined in this module.
+        # Multi-scraper opt-in: module-level ``_SCRAPER_CLASS_BY_ID`` maps
+        # each scraper_id to its concrete class.  Each entry produces one
+        # (module_path, class_name) tuple.
+        scraper_class_by_id: dict[str, type] | None = getattr(mod, "_SCRAPER_CLASS_BY_ID", None)
+        if scraper_class_by_id:
+            for _sid, cls in scraper_class_by_id.items():
+                result.append((modname, cls.__name__))
+            continue
+
+        # Fallback: single-class auto-detect (backward compat).
         scraper_cls_name: str | None = None
         for name, obj in inspect.getmembers(mod, inspect.isclass):
             if (
@@ -91,13 +103,37 @@ def _load_module(module_path: str) -> ModuleType:
     return importlib.import_module(module_path)
 
 
+def _discover_config_factories(mod: ModuleType) -> list:
+    """Return all ``default_config`` / ``default_config_<suffix>`` callables.
+
+    Multi-scraper modules (#2599) expose multiple factories; single-scraper
+    modules expose just ``default_config``.
+    """
+    factories = []
+    for name, obj in inspect.getmembers(mod, inspect.isfunction):
+        if (name == "default_config" or name.startswith("default_config_")) and (
+            obj.__module__ == mod.__name__
+        ):
+            factories.append(obj)
+    return factories
+
+
 def _get_all_scraper_ids() -> dict[str, str]:
-    """Return {scraper_id: module_path} for every known scraper module."""
+    """Return {scraper_id: module_path} for every known scraper module.
+
+    Multi-scraper modules contribute one entry per ``default_config*``
+    factory (#2599).
+    """
     result: dict[str, str] = {}
+    seen_modules: set[str] = set()
     for module_path, _class_name in _SCRAPER_MODULES:
+        if module_path in seen_modules:
+            continue
+        seen_modules.add(module_path)
         mod = _load_module(module_path)
-        config = mod.default_config()
-        result[config.scraper_id] = module_path
+        for factory in _discover_config_factories(mod):
+            config = factory()
+            result[config.scraper_id] = module_path
     return result
 
 
@@ -137,22 +173,27 @@ class TestScraperRegistryNonEmpty:
 
 
 class TestRegistryKeysMatchDefaultConfig:
-    """Every registered key must match the scraper_id from default_config()."""
+    """Every registered key must match a ``default_config*`` factory's scraper_id."""
 
     def test_all_keys_match_default_config_scraper_id(self) -> None:
-        """Each key in the registry must equal the class's default_config().scraper_id."""
+        """Each key must equal some ``default_config*()`` factory's scraper_id."""
         reingest._SCRAPER_REGISTRY.clear()
         reingest._load_scraper_registry()
 
         for registry_key, scraper_cls in reingest._SCRAPER_REGISTRY.items():
-            # Find which module this class comes from
+            # Find which module this class comes from.
             module_name = scraper_cls.__module__
             mod = importlib.import_module(module_name)
-            config = mod.default_config()
-            assert registry_key == config.scraper_id, (
-                f"Registry key {registry_key!r} does not match "
-                f"default_config().scraper_id {config.scraper_id!r} "
-                f"from {module_name}"
+
+            # Collect all scraper_ids this module's factories produce —
+            # for single-scraper modules this is one id; for multi-scraper
+            # modules (#2599) it's one per factory.
+            factory_ids = {f().scraper_id for f in _discover_config_factories(mod)}
+
+            assert registry_key in factory_ids, (
+                f"Registry key {registry_key!r} does not match any "
+                f"default_config*().scraper_id in {module_name} "
+                f"(module offers {sorted(factory_ids)})"
             )
 
 
@@ -180,19 +221,60 @@ class TestRegistryCoverage:
         )
 
 
+def _instantiable_params() -> list[tuple[str, str]]:
+    """Return (module_path, class_name) pairs with duplicates collapsed.
+
+    Multi-scraper modules show up once per class in ``_SCRAPER_MODULES``
+    but we only need to test one instantiation per class.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for m, c in _SCRAPER_MODULES:
+        if (m, c) in seen:
+            continue
+        seen.add((m, c))
+        out.append((m, c))
+    return out
+
+
+_INSTANTIABLE_PARAMS = _instantiable_params()
+
+
 class TestRegistryClassesInstantiable:
     """Every scraper class in the registry must be instantiable."""
 
     @pytest.mark.parametrize(
         "module_path,class_name",
-        _SCRAPER_MODULES,
-        ids=[m for m, _c in _SCRAPER_MODULES],
+        _INSTANTIABLE_PARAMS,
+        ids=[f"{m}::{c}" for m, c in _INSTANTIABLE_PARAMS],
     )
     def test_scraper_class_instantiable(self, module_path: str, class_name: str) -> None:
-        """Each registered scraper class can be instantiated with its default config."""
+        """Each registered scraper class can be instantiated with a default config.
+
+        For multi-scraper modules (#2599), each class is instantiated with
+        whichever ``default_config*()`` factory returns the scraper_id for
+        this class (looked up via ``_SCRAPER_CLASS_BY_ID``).
+        """
         mod = _load_module(module_path)
-        config = mod.default_config()
         scraper_cls = getattr(mod, class_name)
+
+        # Resolve the matching factory for this class.
+        scraper_class_by_id: dict[str, type] | None = getattr(mod, "_SCRAPER_CLASS_BY_ID", None)
+        if scraper_class_by_id:
+            scraper_id = next(sid for sid, cls in scraper_class_by_id.items() if cls is scraper_cls)
+            # Find the factory that returns this scraper_id.
+            config = None
+            for factory in _discover_config_factories(mod):
+                candidate = factory()
+                if candidate.scraper_id == scraper_id:
+                    config = candidate
+                    break
+            assert config is not None, (
+                f"No default_config*() factory in {module_path} returns scraper_id {scraper_id!r}"
+            )
+        else:
+            config = mod.default_config()
+
         scraper = scraper_cls(config=config)
         assert scraper is not None
         assert scraper.config.scraper_id == config.scraper_id
@@ -202,19 +284,28 @@ class TestLlmSplitRegistryDiscovery:
     """Verify that _load_scraper_registry() discovers _llm_extract_rulings functions (#1969)."""
 
     def test_llm_split_registry_populated(self) -> None:
-        """Modules that export _llm_extract_rulings must be in _LLM_SPLIT_REGISTRY."""
+        """Modules that export _llm_extract_rulings must be in _LLM_SPLIT_REGISTRY.
+
+        Multi-scraper modules (#2599) register the LLM split function under
+        every scraper_id the module exposes.
+        """
         reingest._SCRAPER_REGISTRY.clear()
         reingest._LLM_SPLIT_REGISTRY.clear()
         reingest._SPLIT_REGISTRY.clear()
         reingest._load_scraper_registry()
 
-        # Discover which modules export _llm_extract_rulings
+        # Discover which scraper_ids live in modules that export
+        # _llm_extract_rulings.
         expected_llm_ids: set[str] = set()
+        seen_modules: set[str] = set()
         for module_path, _class_name in _SCRAPER_MODULES:
+            if module_path in seen_modules:
+                continue
+            seen_modules.add(module_path)
             mod = _load_module(module_path)
             if hasattr(mod, "_llm_extract_rulings") and callable(mod._llm_extract_rulings):
-                config = mod.default_config()
-                expected_llm_ids.add(config.scraper_id)
+                for factory in _discover_config_factories(mod):
+                    expected_llm_ids.add(factory().scraper_id)
 
         if not expected_llm_ids:
             pytest.skip("No scraper modules export _llm_extract_rulings")

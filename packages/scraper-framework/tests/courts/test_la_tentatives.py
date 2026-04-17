@@ -18,8 +18,12 @@ import pytest
 import respx
 
 from courts.ca.la_tentatives import (
+    APPELLATE_COURTHOUSE,
+    APPELLATE_DEPARTMENT,
+    APPELLATE_URL,
     CIVIL_URL,
     LA_SYSTEM_PROMPT,
+    LAAppellateTentativeRulingsScraper,
     LASplitRuling,
     LATentativeRulingsScraper,
     _extract_aspnet_tokens,
@@ -28,11 +32,13 @@ from courts.ca.la_tentatives import (
     _extract_parties,
     _extract_parties_from_anchor,
     _extract_ruling_fields,
+    _has_no_rulings_appellate,
     _is_dept_header_boilerplate,
     _is_name_fragment,
     _is_stale_viewstate_response,
     _la_llm_enabled,
     _llm_extract_rulings,
+    _parse_appellate_dropdown_options,
     _parse_dropdown_options,
     _parse_option,
     _replace_ruling_text_from_html,
@@ -42,6 +48,7 @@ from courts.ca.la_tentatives import (
     _split_rulings,
     _truncate_party_list,
     default_config,
+    default_config_appellate,
     is_la_html,
     sanitize_ruling_html,
 )
@@ -3311,3 +3318,337 @@ def test_split_rulings_extracts_real_case_numbers_from_full_page(
     for r in rulings:
         assert r.case_number is not None
         assert not r.case_number.startswith("UNKNOWN-")
+
+
+# ---------------------------------------------------------------------------
+# Appellate Division scraper (#2599)
+#
+# Fixtures:
+#   la_appellate_main_empty.html — real capture 2026-04-17, empty state
+#                                   (#siteMasterHolder_basicBodyHolder_NoRuling
+#                                    "No rulings have been published at this
+#                                    time.")
+#
+# The appellate dropdown uses a different ASP.NET control name
+# (List1DeptDate vs civil's List2DeptDate) and each option's value is a
+# hearing date only — no courthouse/dept, per LA Court's own HTML comment.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_appellate_main_with_dropdown(dates: list[str]) -> str:
+    """Build a minimal appellate main page with a populated dropdown.
+
+    We don't have a live-fixture of a populated appellate dropdown (the
+    division is very low volume and was empty on every Wayback snapshot
+    plus the live fetch) so this helper composes the exact structure
+    documented by LA Court's own HTML comment:
+      appellate division does not include the location and department
+      in the drop down box since there's only only location and
+      department.  The drop down box displays Hearing date only.
+    """
+    options = "\n".join(f'<option value="{d}">{d}</option>' for d in dates)
+    return f"""
+<html>
+<head></head>
+<body>
+<form method="post" action="./main.aspx?casetype=appellate" id="lascwebform">
+<input type="hidden" name="__VIEWSTATE" value="/wEFAKE" />
+<input type="hidden" name="__VIEWSTATEGENERATOR" value="APPEFAKE" />
+<input type="hidden" name="__EVENTVALIDATION" value="/wEWFAKE" />
+<select name="ctl00$ctl00$siteMasterHolder$basicBodyHolder$List1DeptDate"
+        id="siteMasterHolder_basicBodyHolder_List1DeptDate">
+{options}
+</select>
+<input type="submit" name="submit2" value="Search" />
+</form>
+</body>
+</html>
+"""
+
+
+def _synthetic_appellate_ruling_response(case_number: str = "BV033456") -> str:
+    """Build a minimal per-date ruling response following the civil speechSynthesis format."""
+    return f"""
+<html><body>
+<div id="speechSynthesis">
+<B> Case Number: </B> {case_number}&nbsp;&nbsp;&nbsp;<br>
+<B> Hearing Date: </B> April 17, 2026&nbsp;&nbsp;&nbsp;<br>
+<B> Dept: </B> Appellate<br>
+<P>JOHN SMITH, Plaintiff(s),
+vs.
+JANE DOE, Defendant(s).</P>
+<P>The appeal is DENIED.</P>
+<div>Hon. Helen I. Bendix Judge of the Superior Court</div>
+</div>
+</body></html>
+"""
+
+
+def test_has_no_rulings_appellate_detects_empty_state() -> None:
+    html = _load("la_appellate_main_empty.html")
+    assert _has_no_rulings_appellate(html) is True
+
+
+def test_has_no_rulings_appellate_negative_on_civil_page() -> None:
+    # Civil main page does not have the appellate empty-state marker.
+    html = _load("la_main_page.html")
+    assert _has_no_rulings_appellate(html) is False
+
+
+def test_has_no_rulings_appellate_negative_on_populated_fixture() -> None:
+    html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+    assert _has_no_rulings_appellate(html) is False
+
+
+def test_parse_appellate_dropdown_options_empty_state_returns_empty() -> None:
+    html = _load("la_appellate_main_empty.html")
+    options = _parse_appellate_dropdown_options(html)
+    assert options == []
+
+
+def test_parse_appellate_dropdown_options_parses_hearing_dates() -> None:
+    html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
+    options = _parse_appellate_dropdown_options(html)
+    assert len(options) == 2
+    first = options[0]
+    assert first.value == "04/17/2026"
+    assert first.hearing_date == datetime(2026, 4, 17)
+    assert first.courthouse == APPELLATE_COURTHOUSE
+    assert first.department == APPELLATE_DEPARTMENT
+    assert first.courthouse_code == "APPELLATE"
+
+
+def test_parse_appellate_dropdown_options_skips_malformed_values() -> None:
+    # Malformed values (not MM/DD/YYYY) should be skipped, not raise.
+    html = _synthetic_appellate_main_with_dropdown(["2026-04-17", "04/17/2026"])
+    options = _parse_appellate_dropdown_options(html)
+    # Only the correctly-formatted date parses.
+    assert len(options) == 1
+    assert options[0].value == "04/17/2026"
+
+
+def test_default_config_appellate() -> None:
+    config = default_config_appellate(s3_bucket="judgemind-document-archive-dev")
+    assert config.scraper_id == "ca-la-tentatives-appellate"
+    assert config.state == "CA"
+    assert config.county == "Los Angeles"
+    assert config.court == "Superior Court"
+    assert config.s3_bucket == "judgemind-document-archive-dev"
+    assert config.target_urls == [APPELLATE_URL]
+    # Twice-daily cadence mirrors civil.
+    assert len(config.schedule_windows) == 2
+
+
+@respx.mock
+def test_appellate_full_run_empty_state_yields_zero_docs() -> None:
+    """Real empty-state fixture: scraper completes successfully with 0 docs."""
+    main_html = _load("la_appellate_main_empty.html")
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+@respx.mock
+def test_appellate_full_run_populated_dropdown_captures_docs() -> None:
+    """When rulings are published, fetch_documents POSTs per hearing date and
+    stamps static Appellate Division metadata on each doc."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
+    ruling_html = _synthetic_appellate_ruling_response()
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(200, text=ruling_html))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    docs = scraper.fetch_documents()
+
+    # Two dropdown options, one case per response.
+    assert len(docs) == 2
+    for doc in docs:
+        assert doc.courthouse == APPELLATE_COURTHOUSE
+        assert doc.department == APPELLATE_DEPARTMENT
+        assert doc.source_url == APPELLATE_URL
+        assert doc.extra.get("casetype") == "appellate"
+
+
+@respx.mock
+def test_appellate_full_run_stamps_metadata_through_parse() -> None:
+    """End-to-end via scraper.run() — records_captured reflects parsed docs
+    and static appellate metadata is preserved after parse_document."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+    ruling_html = _synthetic_appellate_ruling_response()
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(200, text=ruling_html))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 1
+
+
+@respx.mock
+def test_appellate_full_run_handles_stale_viewstate() -> None:
+    """Stale-ViewState POST responses are skipped without failing the run."""
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026"])
+    # Reuse real LA stale-ViewState error fixture — same portal, same marker.
+    stale_html = _load("la_ruling_smc49.html")
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    respx.post(APPELLATE_URL).mock(return_value=httpx.Response(200, text=stale_html))
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is True
+    assert health.records_captured == 0
+
+
+def test_appellate_scraper_registered_in_runner() -> None:
+    """The appellate scraper is registered and discoverable via the runner."""
+    from framework.runner import get_scraper_ids
+
+    ids = get_scraper_ids()
+    assert "ca-la-tentatives-appellate" in ids
+    # Civil is still registered separately.
+    assert "ca-la-tentatives-civil" in ids
+
+
+def test_parse_appellate_dropdown_options_skips_empty_value_option() -> None:
+    """Options with empty ``value`` attribute (e.g. a placeholder) are skipped."""
+    html = """
+<html><body>
+<select name="ctl00$ctl00$siteMasterHolder$basicBodyHolder$List1DeptDate"
+        id="siteMasterHolder_basicBodyHolder_List1DeptDate">
+<option value="">-- select a date --</option>
+<option value="04/17/2026">04/17/2026</option>
+</select>
+</body></html>
+"""
+    options = _parse_appellate_dropdown_options(html)
+    assert len(options) == 1
+    assert options[0].value == "04/17/2026"
+
+
+def test_parse_appellate_dropdown_options_skips_invalid_calendar_date() -> None:
+    """Values matching the regex but not a real calendar date (e.g. 02/30/2026)
+    parse with ``hearing_date=None`` rather than raising."""
+    # 02/30/2026 matches the MM/DD/YYYY regex but is not a valid date —
+    # datetime.strptime raises ValueError, which the parser swallows.
+    html = _synthetic_appellate_main_with_dropdown(["02/30/2026"])
+    options = _parse_appellate_dropdown_options(html)
+    assert len(options) == 1
+    assert options[0].value == "02/30/2026"
+    assert options[0].hearing_date is None
+
+
+@respx.mock
+def test_appellate_fetch_documents_logs_and_continues_on_per_date_fetch_error() -> None:
+    """If the POST for one dropdown date raises, the scraper logs and moves on.
+
+    Covers the ``except Exception`` branch inside the per-option loop in
+    ``fetch_documents()`` (#2599).
+    """
+    main_html = _synthetic_appellate_main_with_dropdown(["04/17/2026", "04/24/2026"])
+    ruling_html = _synthetic_appellate_ruling_response()
+
+    respx.get(APPELLATE_URL).mock(return_value=httpx.Response(200, text=main_html))
+    # First POST raises a network error, second POST succeeds.
+    respx.post(APPELLATE_URL).mock(
+        side_effect=[
+            httpx.ConnectError("simulated network failure"),
+            httpx.Response(200, text=ruling_html),
+        ]
+    )
+
+    config = default_config_appellate()
+    config.request_delay_seconds = 0
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+    docs = scraper.fetch_documents()
+
+    # First date errored, second date produced one doc.
+    assert len(docs) == 1
+
+
+def _make_appellate_ruling_doc(
+    raw_content: bytes = b"<html>no speechSynthesis div here</html>",
+    **overrides: object,
+) -> CapturedDocument:
+    """Build a bare CapturedDocument for appellate parse_document tests."""
+    kwargs: dict[str, object] = {
+        "scraper_id": "ca-la-tentatives-appellate",
+        "state": "CA",
+        "county": "Los Angeles",
+        "court": "Superior Court",
+        "source_url": APPELLATE_URL,
+        "capture_timestamp": datetime(2026, 4, 17, 18, 0, 0),
+        "content_format": ContentFormat.HTML,
+        "raw_content": raw_content,
+        "content_hash": "",
+    }
+    kwargs.update(overrides)
+    return CapturedDocument(**kwargs)  # type: ignore[arg-type]
+
+
+def test_appellate_parse_document_respects_pre_split_guard() -> None:
+    """parse_document must not re-run regex on docs already LLM-pre-split.
+
+    Covers the ``pre_split``/``_llm_extracted`` early-return in
+    ``parse_document()`` (#2469, #2484, #2599).
+    """
+    config = default_config_appellate()
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+
+    # Construct a doc that has already been LLM-pre-split: fields already
+    # populated by the LLM path, and the pre_split marker set.  The method
+    # must return it unchanged (except for default courthouse/department
+    # fallbacks if either was cleared).
+    doc = _make_appellate_ruling_doc(
+        raw_content=b"<html>ignored - guard short-circuits before parse</html>",
+        case_number="BV999999",
+        ruling_text="Pre-populated by LLM",
+        extra={"pre_split": True, "_llm_extracted": True},
+    )
+    result = scraper.parse_document(doc)
+
+    # Guard kicked in: the raw HTML was NOT re-parsed (case_number would
+    # have been cleared if it had been).
+    assert result.case_number == "BV999999"
+    assert result.ruling_text == "Pre-populated by LLM"
+    # Static appellate metadata fallbacks applied.
+    assert result.courthouse == APPELLATE_COURTHOUSE
+    assert result.department == APPELLATE_DEPARTMENT
+
+
+def test_appellate_parse_document_swallows_parse_errors() -> None:
+    """Malformed HTML must not raise — parse errors are logged and skipped.
+
+    Covers the ``except Exception`` branch around ``_extract_ruling_fields``
+    in ``parse_document()`` (#2599).
+    """
+    config = default_config_appellate()
+    scraper = LAAppellateTentativeRulingsScraper(config=config)
+
+    doc = _make_appellate_ruling_doc()
+    # Force the extractor to raise so we hit the except branch.
+    with patch(
+        "courts.ca.la_tentatives._extract_ruling_fields",
+        side_effect=RuntimeError("boom"),
+    ):
+        result = scraper.parse_document(doc)
+
+    # No exception bubbled up; static appellate metadata is still stamped.
+    assert result.courthouse == APPELLATE_COURTHOUSE
+    assert result.department == APPELLATE_DEPARTMENT

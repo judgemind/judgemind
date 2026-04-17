@@ -231,8 +231,12 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     from courts.ca.fresno_tentatives import default_config as fresno_config
     from courts.ca.governor_appointments import GovernorAppointmentsScraper
     from courts.ca.governor_appointments import default_config as gov_appt_config
-    from courts.ca.la_tentatives import LATentativeRulingsScraper
+    from courts.ca.la_tentatives import (
+        LAAppellateTentativeRulingsScraper,
+        LATentativeRulingsScraper,
+    )
     from courts.ca.la_tentatives import default_config as la_config
+    from courts.ca.la_tentatives import default_config_appellate as la_appellate_config
     from courts.ca.oc_family_law_tentatives import OCFamilyLawTentativeRulingsScraper
     from courts.ca.oc_family_law_tentatives import default_config as oc_fl_config
     from courts.ca.oc_probate_tentatives import OCProbateTentativeRulingsScraper
@@ -266,6 +270,11 @@ def _build_registry() -> list[tuple[str, type, callable]]:
             ("ca-fresno-tentatives-civil", FresnoTentativeRulingsScraper, fresno_config),
             ("ca-governor-appointments", GovernorAppointmentsScraper, gov_appt_config),
             ("ca-la-tentatives-civil", LATentativeRulingsScraper, la_config),
+            (
+                "ca-la-tentatives-appellate",
+                LAAppellateTentativeRulingsScraper,
+                la_appellate_config,
+            ),
             ("ca-oc-tentatives", OCTentativeRulingsScraper, oc_config),
             ("ca-oc-tentatives-family-law", OCFamilyLawTentativeRulingsScraper, oc_fl_config),
             ("ca-oc-tentatives-probate", OCProbateTentativeRulingsScraper, oc_probate_config),

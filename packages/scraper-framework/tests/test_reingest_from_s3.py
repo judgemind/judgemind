@@ -2511,6 +2511,10 @@ class TestScraperRegistryAutoDiscovery:
 
         Auto-discovers expected scraper IDs rather than maintaining a hardcoded
         set, so adding a new scraper never requires updating this test (#680).
+
+        Multi-scraper modules (those exporting ``_SCRAPER_CLASS_BY_ID`` with
+        multiple ``default_config_<suffix>`` factories) contribute one expected
+        scraper_id per factory (#2599).
         """
         import inspect
         import pkgutil
@@ -2541,7 +2545,13 @@ class TestScraperRegistryAutoDiscovery:
             )
             if not has_scraper:
                 continue
-            expected_ids.add(config_fn().scraper_id)
+            # Collect every ``default_config*`` factory's scraper_id.  Multi-
+            # scraper modules contribute multiple entries (#2599).
+            for _name, obj in inspect.getmembers(mod, inspect.isfunction):
+                if (
+                    _name == "default_config" or _name.startswith("default_config_")
+                ) and obj.__module__ == mod.__name__:
+                    expected_ids.add(obj().scraper_id)
 
         reingest._load_scraper_registry()
         assert expected_ids == set(reingest._SCRAPER_REGISTRY.keys())
@@ -2773,15 +2783,28 @@ class TestReparsePdfDocuments:
             )
 
     def test_registry_keys_match_default_config_scraper_id(self) -> None:
-        """Each registry key should match the scraper_id from default_config()."""
+        """Each registry key should match a ``default_config*()`` factory's scraper_id.
+
+        Multi-scraper modules (#2599) expose multiple factories; walk them all
+        and verify that every registered ``scraper_id`` is produced by some
+        ``default_config*()`` factory in the class's module.
+        """
+        import importlib
+        import inspect
+
         reingest._load_scraper_registry()
         for scraper_id, cls in reingest._SCRAPER_REGISTRY.items():
-            # Find the module that defines this class and call default_config()
-            import importlib
-
             mod = importlib.import_module(cls.__module__)
-            config = mod.default_config()
-            assert config.scraper_id == scraper_id
+            factory_ids: set[str] = set()
+            for _name, obj in inspect.getmembers(mod, inspect.isfunction):
+                if (
+                    _name == "default_config" or _name.startswith("default_config_")
+                ) and obj.__module__ == mod.__name__:
+                    factory_ids.add(obj().scraper_id)
+            assert scraper_id in factory_ids, (
+                f"scraper_id {scraper_id!r} not produced by any default_config* "
+                f"factory in {mod.__name__}"
+            )
 
     def test_idempotent_load(self) -> None:
         """Calling _load_scraper_registry() twice does not duplicate entries."""
