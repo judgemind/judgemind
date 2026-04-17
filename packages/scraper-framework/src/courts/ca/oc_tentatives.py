@@ -15,10 +15,26 @@ PDF structure (Apkarian / Dept C25, 36 pages):
   Page 1 header: "TENTATIVE RULINGS / LAW & MOTION / DEPT C25 / Judge Gassia Apkarian"
   Hearing dates like "February 24, 2026"
   Case rows:  "<line#> <Case Name>  <motion>\n<case_number>  ..."
-  Case number formats:
-    Central/West:        DD-DDDDDDDD   (e.g. "25-01455183")
-    Costa Mesa/Complex:  DDDD-DDDDDDDD (e.g. "2024-01437598")
-    North:               No case numbers in PDF text (only line numbers + case names)
+
+  Case number availability varies by department, not by courthouse. The
+  courthouse-based grouping (Central/West has case numbers, North does
+  not) held for some historical PDFs but is not universal — multiple
+  Central and West departments now publish PDFs with only entry numbers
+  and case titles.
+
+  Formats observed when case numbers are present:
+    DD-DDDDDDDD   (e.g. "25-01455183")    — Central/West departments
+    DDDD-DDDDDDDD (e.g. "2024-01437598")  — Costa Mesa/Complex, some Central
+    Three-part    (e.g. "30-2024-01420730") — normalized to DDDD-DDDDDDDD
+
+  Departments observed with case numbers in PDFs:
+    C11, C20, C23, C25, C27, C28, C31, C32, C33, C34, C44, CX*, CM*
+  Departments observed without case numbers in PDFs (entry # + title only):
+    W8 / W08, N14, N16, N17, N18, C10, C24
+
+  UNKNOWN-prefixed case numbers are the expected fallback for the
+  "without" group — not a bug. See #2434 and docs/investigations/
+  unknown-case-numbers-oc-riverside-2026-03.md for context.
 
 Courthouse mapping (derived from dept code prefix):
   CX*  -> Complex Civil Department (Laguna Hills)
