@@ -26,6 +26,8 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
 - **NEVER** create additional worktrees from inside a worktree via `git worktree add`. Subagents must work in their assigned worktree only. If the worktree gets into a bad state, fix it (e.g., `git checkout -- .`, `git clean -fd`) rather than creating a new one. Child worktrees become orphaned — `cleanup_worktree.sh` cannot track them, and the dispatcher does not know about them.
 - **NEVER** close a task or remove a worktree without posting a verification evidence comment on the issue. Every task completion requires concrete evidence that the change works (deployed services) or an explicit skip reason (docs/CI/tooling). See §4.10 Step 3.
+- **NEVER** bypass a safety check (e.g. `cleanup_worktree.sh`, preflight hooks, `.githooks/pre-push`) with `--force` or a manual workaround. When a check blocks you, trust it: skip and retry later, or investigate the root cause. The check is usually right and you are usually wrong about what is happening.
+- **NEVER** run `gh auth switch` or change the active GitHub CLI account without an explicit user instruction. If `gh` fails on auth, report the problem — don't swap accounts as a workaround. A subagent doing this once caused a ghost-PR incident that derailed an agent for multiple iterations.
 
 ### ALWAYS — Before Acting
 - **ALWAYS** Read a file before Writing to it (the Write tool fails on existing files you haven't read).
@@ -129,6 +131,13 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 1. **Issue template** — the Task template uses `status/triage` (not `agent/ready`), so new issues require manual labeling.
 2. **GitHub Action** (`issue-triage.yml`) — strips `agent/ready` from issues filed by non-collaborators.
 3. **Runtime check** — dispatcher and `/task` call `scripts/check-issue-author.sh` before spawning work (fail-closed).
+
+## Collaboration & Judgment
+
+These rules govern how you work with the user in interactive sessions, not just the mechanics of a task.
+
+- **Wait for confirmation before acting on proposals.** When you present an approach, options, or questions, end the turn and wait. Don't file issues, don't start implementing, don't spawn agents until the user responds with something like "yes", "go", "file it", or "looks good". Premature action skips the collaborative refinement step and produces issues/PRs that often need to be edited or closed.
+- **Zoom out before planning: root cause vs. symptom.** Before generating a plan or filing a batch of issues, ask: do these share a root cause? Have we fixed similar things before — and if so, why did it recur? Would a structural fix prevent the entire class of problem? Group by cause, not symptom. Present the reasoning to the user, not just the conclusion. Sometimes the honest answer is "this is just iteration on a sound approach" — that's fine — but if we keep re-treading the same ground, question the approach before adding more patches.
 
 ## PR Workflow (authoritative — applies to all task work)
 
@@ -306,6 +315,7 @@ See **`docs/agent/task-dependencies.md`** and **`docs/agent/issue-authoring.md`*
 - **Sub-tasks:** reference the parent as `Parent: #N`; each sub-task should be independently pickup-able.
 - **Acceptance criteria:** concrete and machine-checkable. Each criterion has at least one `Verify:` line (SQL query, curl response, URL/screenshot, etc.). External-integration issues need a one-line HTTP feasibility note before `agent/ready` (see #1979). **Data cleanup on `derived.*` defaults to `rebuild_db.py --county <name>`** — surgical delete/patch scripts are a last resort and must be justified in the issue body.
 - **Investigation tasks:** produce documentation (issue body or `docs/investigations/`) and file follow-up issues for every actionable finding, then close.
+- **Priority:** classify by urgency + workflow impact, not user-visibility. p1 = time-sensitive or workflow accelerators (scraper failures, data quality, DX, process improvements). p2 = most user-facing bugs, backfills, refactoring, docs. p3 = large slow work (features, redesigns). p0 is human-only. See `docs/agent/issue-authoring.md` §Priority Framework for the full table.
 
 ## Ingestion Pipeline — Separation of Concerns
 

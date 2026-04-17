@@ -181,6 +181,9 @@ def find_backtick_repo_paths(line: str) -> list[str]:
     return results
 
 
+SKIP_DIR_PARTS = frozenset({".terraform", "node_modules", ".venv"})
+
+
 def gather_default_files(repo_root: Path) -> list[Path]:
     """Collect the default set of files to scan."""
     files: list[Path] = []
@@ -188,6 +191,8 @@ def gather_default_files(repo_root: Path) -> list[Path]:
     for pattern in DEFAULT_SCAN_GLOBS:
         for path in repo_root.glob(pattern):
             if not path.is_file():
+                continue
+            if SKIP_DIR_PARTS.intersection(path.parts):
                 continue
             resolved = path.resolve()
             if resolved in seen:
