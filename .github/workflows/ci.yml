@@ -556,6 +556,8 @@ jobs:
         run: scripts/tests/test_write_claude_file.sh
       - name: Test cleanup_worktree.sh
         run: scripts/tests/test_cleanup_worktree.sh
+      - name: Test sweep_stale_worktrees.sh
+        run: scripts/tests/test_sweep_stale_worktrees.sh
       - name: Test run-py.sh
         run: scripts/tests/test_run_py.sh
       - name: Test removed exports checker

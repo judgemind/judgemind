@@ -25,7 +25,30 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 If Telegram is available (the MCP Telegram plugin is active and a chat_id is known), send a session started notification using `telegram__reply`. If no chat_id is available yet, skip — the user will see notifications once they send a message.
 
-### 2. Clean up stale issue assignments
+### 2. Sweep stale worktree metadata
+
+Orphan entries in `.git/worktrees/<name>/` can accumulate silently when
+a prior session exits between removing the worktree dir and pruning the
+metadata (hard crash, manual `rm -rf`, buggy cleanup). The reactive fix
+in `cleanup_worktree.sh` (#2388) only heals orphans that are explicitly
+passed to cleanup — it never fires for paths nothing ever names.
+
+Run `scripts/sweep_stale_worktrees.sh` once at startup to proactively
+clear orphan metadata. The script only removes entries whose on-disk
+worktree dir is missing — live worktrees (including locked ones) are
+never touched.
+
+```
+scripts/sweep_stale_worktrees.sh
+```
+
+The last line of its output is always `Cleaned up N stale worktree
+entries`. Log that line so it is visible in the session transcript. If
+`N` is large (e.g. > 5), note it — a growing orphan count across
+successive startups is a useful health signal that something is
+mis-behaving in the cleanup path.
+
+### 3. Clean up stale issue assignments
 
 When a previous dispatcher or agent session ends unexpectedly (context window exhaustion, crash, terminal closed), issues assigned to the agent account may remain assigned with `agent/ready` but no agent working them. These look "in progress" but are actually abandoned, blocking future pickup.
 
@@ -45,7 +68,7 @@ When a previous dispatcher or agent session ends unexpectedly (context window ex
        --search "Closes #<N> OR Fixes #<N> OR Resolves #<N>" \
        --json number --limit 1
    ```
-   Alternatively, check the PR list from startup step 4 for branches containing the issue number.
+   Alternatively, check the PR list from startup step 5 for branches containing the issue number.
 
 3. **If an open PR exists:** The work is partially complete. Unassign the issue so the next agent can adopt the existing PR, but leave the PR open as evidence of prior work.
 
@@ -62,7 +85,7 @@ When a previous dispatcher or agent session ends unexpectedly (context window ex
 - An issue has an open PR but CI is failing and no agent is working it — still unassign so a fresh agent can pick it up and adopt the PR.
 - An issue was just assigned by another agent in the current session — unlikely at startup, but the "no open PR" heuristic handles this safely. New assignments will not have PRs yet, but the assigning agent will create one shortly. Even if the cleanup unassigns it prematurely, the agent will re-assign when it pushes its PR.
 
-### 3. Scan the work queue (startup only)
+### 4. Scan the work queue (startup only)
 
 List all open `agent/ready` issues sorted by priority:
 
@@ -79,7 +102,7 @@ If specific issues were passed as arguments, filter to only those issues.
 
 **This initial scan is for startup orientation only.** Do NOT cache this list for use in later dispatch cycles. Each dispatch cycle in the main loop (step 6) must run its own fresh query. Issues may be unblocked, relabeled, or closed between cycles — working from a stale list causes the dispatcher to miss newly-available high-priority work.
 
-### 4. Check for in-flight work
+### 5. Check for in-flight work
 
 Check for any existing open PRs or assigned issues that may need attention (stale CI, merge conflicts, etc.):
 
@@ -90,17 +113,17 @@ gh pr list --repo judgemind/judgemind --state open \
 
 Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
 
-### 5. Initialize audit counter
+### 6. Initialize audit counter
 
 Read `tmp/dispatcher_state.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
 
-### 6. Initialize context rotation counter
+### 7. Initialize context rotation counter
 
 Initialize `loop_iterations` to 0. This counter tracks how many main loop iterations have elapsed in this session. It is used to trigger a graceful exit before the context window fills up and causes compaction-related forgetfulness (see "Context-Aware Rotation" below).
 
 Also read `session_number` from `tmp/dispatcher_state.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the dispatcher has been restarted by the outer `while :; do` loop. The first invocation is session 1.
 
-### 7. Store max_slots for enforcement
+### 8. Store max_slots for enforcement
 
 Store the max slot count (from the argument, or 5 if not specified) in a variable `max_slots`. This value is used throughout the session for slot enforcement checks. **Do not change this value during the session** — it is set once at startup and used everywhere.
 
@@ -375,7 +398,7 @@ All of this state survives a rotation because it is file-backed:
 | State | Why it's OK |
 |---|---|
 | `loop_iterations` counter | Resets to 0 — that's the point of rotation |
-| In-memory `_recently_completed` list | Startup step 4 re-scans open PRs for current state |
+| In-memory `_recently_completed` list | Startup step 5 re-scans open PRs for current state |
 
 ---
 
