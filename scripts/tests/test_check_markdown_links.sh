@@ -43,6 +43,24 @@ run_checker() {
     "$CHECK_SCRIPT" --repo-root "$TMPDIR_TEST" "$TMPDIR_TEST/$file"
 }
 
+# Run the checker with --repo-root pointing at the temp dir and NO
+# explicit paths, so it uses DEFAULT_SCAN_GLOBS against the temp dir.
+# Used to verify the default scan set actually picks up a file.
+run_checker_default_scan() {
+    "$CHECK_SCRIPT" --repo-root "$TMPDIR_TEST"
+}
+
+assert_default_scan_fails() {
+    local desc="$1"
+    TESTS=$((TESTS + 1))
+    if run_checker_default_scan > /dev/null 2>&1; then
+        echo "FAIL: $desc (expected failure from default scan, got success)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "PASS: $desc"
+    fi
+}
+
 assert_fails() {
     local desc="$1"
     local file="$2"
@@ -205,6 +223,60 @@ reset_tmpdir
 create_test_file "CLAUDE.md" 'Telegram integration is opt-in. For full details, see `docs/agent/telegram-reference.md`.'
 create_test_file "docs/agent/other-file.md" '# Other'
 assert_fails "Issue #2400 repro — backtick ref to missing telegram-reference.md" "CLAUDE.md"
+reset_tmpdir
+
+# ─── Test 23: Default scan picks up packages/*/README.md (#2428) ───────
+# A broken link inside packages/scraper-framework/README.md must be
+# caught by the default scan (no explicit paths passed).
+create_test_file "packages/scraper-framework/README.md" \
+    'See [spec](../../docs/specs/missing.md) for architecture.'
+assert_default_scan_fails \
+    "Default scan catches broken link in packages/*/README.md"
+reset_tmpdir
+
+# ─── Test 24: Default scan picks up packages/*/docs/**/*.md (#2428) ────
+create_test_file "packages/api/docs/guide.md" \
+    'See [other](../missing.md) for details.'
+assert_default_scan_fails \
+    "Default scan catches broken link in packages/*/docs/**/*.md"
+reset_tmpdir
+
+# ─── Test 25: Default scan picks up infra/**/*.md (#2428) ──────────────
+create_test_file "infra/terraform/README.md" \
+    'See `docs/missing-infra-ref.md` for details.'
+assert_default_scan_fails \
+    "Default scan catches broken backtick ref in infra/**/*.md"
+reset_tmpdir
+
+# ─── Test 26: Default scan picks up .github/**/*.md (#2428) ────────────
+create_test_file ".github/ISSUE_TEMPLATE/task.md" \
+    'See [guide](../../docs/missing-template.md) for guidance.'
+assert_default_scan_fails \
+    "Default scan catches broken link in .github/**/*.md"
+reset_tmpdir
+
+# ─── Test 27: Default scan picks up top-level AGENTS.md (#2428) ────────
+create_test_file "AGENTS.md" \
+    'See [claude](CLAUDE.md) for rules.'
+# CLAUDE.md intentionally not created -> broken link
+assert_default_scan_fails \
+    "Default scan catches broken link in top-level AGENTS.md"
+reset_tmpdir
+
+# ─── Test 28: Default scan picks up top-level README.md (#2428) ────────
+create_test_file "README.md" \
+    'See [contributing](CONTRIBUTING.md) for details.'
+# CONTRIBUTING.md intentionally not created -> broken link
+assert_default_scan_fails \
+    "Default scan catches broken link in top-level README.md"
+reset_tmpdir
+
+# ─── Test 29: Default scan picks up top-level CONTRIBUTING.md (#2428) ──
+create_test_file "CONTRIBUTING.md" \
+    'See [readme](README.md) for overview.'
+# README.md intentionally not created -> broken link
+assert_default_scan_fails \
+    "Default scan catches broken link in top-level CONTRIBUTING.md"
 reset_tmpdir
 
 # ─── Summary ───────────────────────────────────────────────────────────

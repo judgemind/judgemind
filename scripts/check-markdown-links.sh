@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # check-markdown-links.sh — Validate internal markdown pointers.
 #
-# Scans CLAUDE.md, docs/**/*.md, and .claude/skills/**/*.md for broken
+# Scans the agent- and contributor-facing markdown surfaces for broken
 # pointers to other markdown files (either Markdown-style links
-# [text](path.md) or backtick references `docs/foo.md`).
+# [text](path.md) or backtick references `docs/foo.md`).  See
+# check-markdown-links.py DEFAULT_SCAN_GLOBS for the full set.
 #
 # Usage:
 #   scripts/check-markdown-links.sh          # scan the default file set
