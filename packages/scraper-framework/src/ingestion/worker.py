@@ -103,6 +103,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Extraction-methods tag recorded for every field populated by the LLM
+# enrichment stage (``_llm_enrich_fields`` → ``_apply_enrichment_result``).
+_ENRICHMENT_METHOD_TAG = "llm_enrichment"
+
 # ---------------------------------------------------------------------------
 # Markdown ↔ HTML/plain text for multimodal PDF extraction
 # ---------------------------------------------------------------------------
@@ -888,6 +892,88 @@ class IngestionWorker:
 
         return result if has_data else None
 
+    @staticmethod
+    def _apply_enrichment_result(
+        enrichment_result: Any,
+        *,
+        outcome: str | None,
+        motion_type: str | None,
+        case_title: str | None,
+        parties_data: list[dict[str, str]],
+    ) -> tuple[
+        str | None,
+        str | None,
+        str | None,
+        list[dict[str, str]],
+        dict[str, str],
+    ]:
+        """Merge an LLM enrichment result into the current field values.
+
+        Applies ``enrichment_result`` fields (``outcome``, ``motion_type``,
+        ``case_title``, ``parties``) to the current values, preserving the
+        precedence rule that existing values are never overwritten — the
+        enrichment only fills fields that are currently missing.  Also
+        converts :class:`EnrichmentParties` (plaintiffs/defendants lists)
+        to the ``list[dict]`` format used by the rest of the pipeline.
+
+        Parameters
+        ----------
+        enrichment_result :
+            An :class:`LlmEnrichmentResult` (or ``None``).  The parameter is
+            typed loosely so callers do not need to import the class at the
+            top of the module (avoids a circular-import concern mirroring
+            the lazy import in :meth:`_llm_enrich_fields`).  When ``None``,
+            all current values are returned unchanged and the methods dict
+            is empty.
+        outcome, motion_type, case_title, parties_data :
+            Current values to merge into.
+
+        Returns
+        -------
+        tuple
+            ``(outcome, motion_type, case_title, parties_data,
+            extraction_methods_entries)``.  ``extraction_methods_entries``
+            contains one entry per field the helper actually populated,
+            each mapping the field name to the enrichment method tag.
+            Fields that were left unchanged (either already set or absent
+            from the enrichment result) are NOT present.
+
+        Notes
+        -----
+        A parallel implementation exists in ``scripts/reingest_from_s3.py``
+        that operates on a dict instead of individual variables.  Any
+        schema change (new field, renamed field) must be applied in both
+        places.
+        """
+        methods: dict[str, str] = {}
+        method_tag = _ENRICHMENT_METHOD_TAG
+
+        if enrichment_result is None:
+            return outcome, motion_type, case_title, parties_data, methods
+
+        if outcome is None and enrichment_result.outcome is not None:
+            outcome = enrichment_result.outcome
+            methods["outcome"] = method_tag
+        if motion_type is None and enrichment_result.motion_type is not None:
+            motion_type = enrichment_result.motion_type
+            methods["motion_type"] = method_tag
+        if not case_title and enrichment_result.case_title is not None:
+            case_title = enrichment_result.case_title
+            methods["case_title"] = method_tag
+        if not parties_data and (
+            enrichment_result.parties.plaintiffs or enrichment_result.parties.defendants
+        ):
+            # Convert from EnrichmentParties to the parties_data
+            # list[dict] format used by the rest of the pipeline.
+            parties_data = []
+            for name in enrichment_result.parties.plaintiffs:
+                parties_data.append({"name": name, "role": "plaintiff"})
+            for name in enrichment_result.parties.defendants:
+                parties_data.append({"name": name, "role": "defendant"})
+            methods["parties"] = method_tag
+
+        return outcome, motion_type, case_title, parties_data, methods
+
     def _file_validation_issue(
         self,
         *,
@@ -1368,27 +1454,20 @@ class IngestionWorker:
         )
         if enrichment_fields_missing:
             enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
-            if enrichment_result is not None:
-                if outcome is None and enrichment_result.outcome is not None:
-                    outcome = enrichment_result.outcome
-                    extraction_methods["outcome"] = "llm_enrichment"
-                if motion_type is None and enrichment_result.motion_type is not None:
-                    motion_type = enrichment_result.motion_type
-                    extraction_methods["motion_type"] = "llm_enrichment"
-                if not case_title and enrichment_result.case_title is not None:
-                    case_title = enrichment_result.case_title
-                    extraction_methods["case_title"] = "llm_enrichment"
-                if not parties_data and (
-                    enrichment_result.parties.plaintiffs or enrichment_result.parties.defendants
-                ):
-                    # Convert from EnrichmentParties to the parties_data
-                    # list[dict] format used by the rest of the pipeline.
-                    parties_data = []
-                    for name in enrichment_result.parties.plaintiffs:
-                        parties_data.append({"name": name, "role": "plaintiff"})
-                    for name in enrichment_result.parties.defendants:
-                        parties_data.append({"name": name, "role": "defendant"})
-                    extraction_methods["parties"] = "llm_enrichment"
+            (
+                outcome,
+                motion_type,
+                case_title,
+                parties_data,
+                enrichment_methods,
+            ) = self._apply_enrichment_result(
+                enrichment_result,
+                outcome=outcome,
+                motion_type=motion_type,
+                case_title=case_title,
+                parties_data=parties_data,
+            )
+            extraction_methods.update(enrichment_methods)
 
         # ------------------------------------------------------------------
         # Remaining regex fallbacks — hearing_date, judge_name, case_number,

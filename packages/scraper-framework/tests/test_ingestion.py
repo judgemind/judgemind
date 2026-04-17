@@ -4831,6 +4831,283 @@ def test_enrichment_enabled_by_default() -> None:
 
 
 # ---------------------------------------------------------------------------
+# IngestionWorker._apply_enrichment_result — shared helper for merging an
+# LlmEnrichmentResult into the current field values (#2286).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_enrichment_result_returns_inputs_when_result_is_none() -> None:
+    """None enrichment_result returns inputs unchanged and empty methods dict."""
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            None,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            parties_data=[],
+        )
+    )
+    assert outcome is None
+    assert motion_type is None
+    assert case_title is None
+    assert parties_data == []
+    assert methods == {}
+
+
+def test_apply_enrichment_result_returns_inputs_when_result_is_none_with_values() -> None:
+    """None enrichment_result preserves any existing values."""
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            None,
+            outcome="granted",
+            motion_type="msj",
+            case_title="Existing v. Case",
+            parties_data=[{"name": "Alpha", "role": "plaintiff"}],
+        )
+    )
+    assert outcome == "granted"
+    assert motion_type == "msj"
+    assert case_title == "Existing v. Case"
+    assert parties_data == [{"name": "Alpha", "role": "plaintiff"}]
+    assert methods == {}
+
+
+def test_apply_enrichment_result_fills_all_missing_fields() -> None:
+    """All four fields are populated when currently missing and result has them."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        case_title="Alpha v. Beta",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Alpha"], defendants=["Beta"]),
+    )
+
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            result,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            parties_data=[],
+        )
+    )
+
+    assert outcome == "granted"
+    assert motion_type == "msj"
+    assert case_title == "Alpha v. Beta"
+    assert parties_data == [
+        {"name": "Alpha", "role": "plaintiff"},
+        {"name": "Beta", "role": "defendant"},
+    ]
+    assert methods == {
+        "outcome": "llm_enrichment",
+        "motion_type": "llm_enrichment",
+        "case_title": "llm_enrichment",
+        "parties": "llm_enrichment",
+    }
+
+
+def test_apply_enrichment_result_does_not_overwrite_existing_fields() -> None:
+    """Existing values are preserved — helper only fills missing fields."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        case_title="New Title",
+        motion_type="mtd",
+        outcome="denied",
+        parties=EnrichmentParties(plaintiffs=["NewP"], defendants=["NewD"]),
+    )
+
+    existing_parties = [{"name": "ExistingP", "role": "plaintiff"}]
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            result,
+            outcome="granted",
+            motion_type="msj",
+            case_title="Existing Title",
+            parties_data=existing_parties,
+        )
+    )
+
+    assert outcome == "granted"
+    assert motion_type == "msj"
+    assert case_title == "Existing Title"
+    assert parties_data == existing_parties
+    assert methods == {}
+
+
+def test_apply_enrichment_result_partial_fill() -> None:
+    """Only missing fields are filled; already-set fields are untouched."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        case_title="From LLM",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Alpha"], defendants=["Beta"]),
+    )
+
+    # outcome + parties already set; motion_type + case_title missing.
+    existing_parties = [{"name": "Existing", "role": "plaintiff"}]
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            result,
+            outcome="denied",
+            motion_type=None,
+            case_title=None,
+            parties_data=existing_parties,
+        )
+    )
+
+    assert outcome == "denied"  # preserved
+    assert motion_type == "msj"  # filled
+    assert case_title == "From LLM"  # filled
+    assert parties_data == existing_parties  # preserved
+    assert methods == {
+        "motion_type": "llm_enrichment",
+        "case_title": "llm_enrichment",
+    }
+
+
+def test_apply_enrichment_result_parties_conversion_multiple() -> None:
+    """EnrichmentParties with multiple plaintiffs/defendants converts correctly."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        parties=EnrichmentParties(
+            plaintiffs=["A1", "A2"],
+            defendants=["B1", "B2", "B3"],
+        ),
+    )
+
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            result,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            parties_data=[],
+        )
+    )
+
+    assert parties_data == [
+        {"name": "A1", "role": "plaintiff"},
+        {"name": "A2", "role": "plaintiff"},
+        {"name": "B1", "role": "defendant"},
+        {"name": "B2", "role": "defendant"},
+        {"name": "B3", "role": "defendant"},
+    ]
+    assert methods == {"parties": "llm_enrichment"}
+
+
+def test_apply_enrichment_result_no_parties_when_both_lists_empty() -> None:
+    """Parties field is NOT filled when both plaintiffs and defendants are empty."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        case_title="Alpha v. Beta",
+        parties=EnrichmentParties(plaintiffs=[], defendants=[]),
+    )
+
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            result,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            parties_data=[],
+        )
+    )
+
+    assert case_title == "Alpha v. Beta"
+    assert parties_data == []
+    assert "parties" not in methods
+    assert methods == {"case_title": "llm_enrichment"}
+
+
+def test_apply_enrichment_result_parties_plaintiffs_only() -> None:
+    """Parties populated when plaintiffs list is non-empty but defendants is empty."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        parties=EnrichmentParties(plaintiffs=["OnlyP"], defendants=[]),
+    )
+
+    _, _, _, parties_data, methods = IngestionWorker._apply_enrichment_result(
+        result,
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    assert parties_data == [{"name": "OnlyP", "role": "plaintiff"}]
+    assert methods == {"parties": "llm_enrichment"}
+
+
+def test_apply_enrichment_result_parties_defendants_only() -> None:
+    """Parties populated when defendants list is non-empty but plaintiffs is empty."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(
+        parties=EnrichmentParties(plaintiffs=[], defendants=["OnlyD"]),
+    )
+
+    _, _, _, parties_data, methods = IngestionWorker._apply_enrichment_result(
+        result,
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    assert parties_data == [{"name": "OnlyD", "role": "defendant"}]
+    assert methods == {"parties": "llm_enrichment"}
+
+
+def test_apply_enrichment_result_empty_result_yields_no_changes() -> None:
+    """An LlmEnrichmentResult with all fields None/empty produces no changes."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    result = LlmEnrichmentResult()  # all fields default: None / empty lists
+
+    outcome, motion_type, case_title, parties_data, methods = (
+        IngestionWorker._apply_enrichment_result(
+            result,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            parties_data=[],
+        )
+    )
+
+    assert outcome is None
+    assert motion_type is None
+    assert case_title is None
+    assert parties_data == []
+    assert methods == {}
+
+
+def test_apply_enrichment_result_case_title_empty_string_treated_as_missing() -> None:
+    """An empty string case_title is treated as missing and overwritten (matches original)."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    result = LlmEnrichmentResult(case_title="Filled Title")
+
+    _, _, case_title, _, methods = IngestionWorker._apply_enrichment_result(
+        result,
+        outcome=None,
+        motion_type=None,
+        case_title="",  # falsy — original code uses `not case_title`
+        parties_data=[],
+    )
+
+    assert case_title == "Filled Title"
+    assert methods == {"case_title": "llm_enrichment"}
+
+
+# ---------------------------------------------------------------------------
 # Worker-level guards for Ventura (#2370): implausible hearing date, repeated
 # title segments, trailing case number, probate decedent as judge.
 # ---------------------------------------------------------------------------
