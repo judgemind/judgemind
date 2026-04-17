@@ -12,6 +12,8 @@ parameter natively, this patch is no longer needed.
 Usage:
     python3 scripts/patch-telegram-link-preview.py [--dry-run]
 """
+
+# one-off: true
 from __future__ import annotations
 
 import argparse
