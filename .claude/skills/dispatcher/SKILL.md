@@ -982,3 +982,52 @@ Do this **immediately** after every `gh pr merge` call, before spawning new agen
 - **File issues proactively** for discovered problems — don't just observe them.
 - **Notify via Telegram** for all significant events, not just when asked. Use `telegram__reply` for every lifecycle event.
 - **Default to action.** If a decision is clear and reversible, make it. Only ask for irreversible or ambiguous decisions.
+
+
+---
+
+## Graceful Degradation on API Overload
+
+This protocol applies to **dispatcher-driven work only**. User-facing interactive sessions are free to handle 529/rate-limit errors however the moment calls for (retry, ask the user, switch to a different task). The dispatcher needs a deterministic recovery path because nobody is watching the keyboard.
+
+When a `529 overloaded_error`, Anthropic/Claude-side rate-limit error, or equivalent upstream overload surfaces during dispatcher work:
+
+### Per-task: retry once, then defer
+
+1. **Retry once with ~30s backoff.** Sleep roughly 30 seconds and reattempt the exact same operation (spawn agent, merge PR, post comment, apply terraform — whatever was overloaded). One retry is enough to ride out a transient spike; a second retry just burns API budget without improving success rate.
+2. **If the retry also fails, defer the task.** "Defer" means:
+   - Post a short comment on the affected issue: `"529 during dispatch at <ISO-8601>; deferring — retry on next dispatcher run."` Write the comment to `{worktree}/tmp/defer_comment.txt` first, then post with `gh issue comment --body-file`.
+   - Continue processing remaining slots in the main loop. **Do not stall the whole queue** over one overloaded task.
+   - If the deferred task was an agent spawn that never started, leave the issue assigned to whoever it was assigned to (the next dispatcher cycle will re-fetch and retry). If it was a PR merge, leave the PR open — the next merge pass will pick it up again.
+
+### Cross-task: wind down after 3 consecutive 529s within 10 minutes
+
+If three consecutive 529 deferrals land across different agents/operations within a 10-minute rolling window, the upstream overload is sustained, not transient — continuing to spawn agents just wastes API budget and produces more deferrals.
+
+1. **Wind down gracefully.** Finish any in-flight agents (do not kill them). Do not spawn new agents until the overload clears.
+2. **Post a Telegram summary** via `telegram__reply` if the MCP Telegram plugin is active: include how many deferrals happened, which issues were affected, and a note that the dispatcher is holding.
+3. **Resume when a probe succeeds.** After a cooldown (~5–10 minutes), run one probe operation (e.g. a trivial `gh` call — not a new agent). If it succeeds, clear the deferral counter and resume normal dispatch. If it 529s again, extend the hold and re-probe.
+
+This is the dispatcher-specific extension of the general rate-limit guidance — GitHub's API limits and Anthropic's upstream overloads are two different failure modes that both surface to the dispatcher and need two different handling strategies.
+
+### Counter state
+
+Keep the 529 deferral counter and window in `tmp/dispatcher_529_state.json`:
+
+```
+{
+  "recent_529s": [
+    {"ts": "2026-04-17T14:02:31Z", "context": "spawn /task #2650"},
+    {"ts": "2026-04-17T14:05:08Z", "context": "gh pr merge #2651"}
+  ],
+  "wind_down_triggered_at": null,
+  "last_probe_at": null
+}
+```
+
+Prune entries older than 10 minutes on every write. When `len(recent_529s) >= 3`, set `wind_down_triggered_at` and stop spawning.
+
+### See also
+
+- CLAUDE.md §GitHub API Rate Limit Awareness — the GitHub-side rate-limit rules (5,000 req/hour budget, `--interval 60` on `gh run watch`). The Claude-side 529 protocol above composes with those rules; both apply to the dispatcher simultaneously.
+- `docs/agent/unattended-patterns.md` §GitHub API Rate Limit Handling — the full operational pattern for GitHub 403/rate-limit responses.
