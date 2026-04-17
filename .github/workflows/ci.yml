@@ -75,6 +75,11 @@ jobs:
               # test_wait_for_rollout.sh fires on PRs that touch only the
               # composite action.
               - '.github/actions/ecs-deploy/**'
+              # Also trigger when the scripts-tests job itself changes, so
+              # regressions in the auto-discovery loop are caught on the
+              # PR that introduces them (#2505). Mirrors the 'hooks' filter
+              # below which does the same for preflight-hook-test.
+              - '.github/workflows/ci.yml'
             ecs-oneshot:
               - 'scripts/*.py'
               - 'scripts/ecs-run-task.sh'
