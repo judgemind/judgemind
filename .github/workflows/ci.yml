@@ -540,6 +540,8 @@ jobs:
         run: scripts/tests/test_check_schema_drift.sh
       - name: Test duplicate function checker
         run: scripts/tests/test_check_duplicate_functions.sh
+      - name: Test markdown link checker
+        run: scripts/tests/test_check_markdown_links.sh
       - name: Test migration files checker
         run: scripts/tests/test_check_migration_files.sh
       - name: Test gemini-review.sh smoke tests
@@ -833,6 +835,17 @@ jobs:
         run: scripts/check-duplicate-functions.sh
 
   # ---------------------------------------------------------------
+  # Markdown link guard: internal .md pointers in CLAUDE.md, docs/,
+  # and .claude/skills/ must point to files that exist (#2425)
+  # ---------------------------------------------------------------
+  markdown-links-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for broken markdown pointers
+        run: scripts/check-markdown-links.sh
+
+  # ---------------------------------------------------------------
   # SQL ON CONFLICT target validation: verify conflict targets match schema
   # ---------------------------------------------------------------
   sql-conflict-check:
@@ -1027,7 +1040,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
