@@ -33,6 +33,26 @@ the live worker path — known divergences have been resolved.
     cases.case_title)`` semantic at ``db.py:316`` preserves the existing
     non-null title instead of erasing it.
 
+-   The text-split branch of ``_full_reparse_document`` (the regex- or
+    LLM-split path used by counties like Fresno and Contra Costa) also
+    no longer falls back to ``doc_meta.get("case_title")`` when the
+    split produces no title (#2521).  Same fixed-point pattern, same
+    fix — let ``None`` flow through and rely on the ``db.py:316``
+    COALESCE safeguard.  Note: the scaffold path at
+    ``_reparse_document`` line ~797 *does* still initialise
+    ``case_title`` from ``doc_meta`` as the starting point, because a
+    per-scraper ``parse_document()`` overwrite immediately replaces it
+    with the parser's output; that pattern is intentional and distinct
+    from the split-branch bug.
+
+-   ``case_number`` is treated differently from ``case_title`` in the
+    split branch: it keeps its ``doc_meta`` fallback because it is an
+    identity anchor (``cases`` is keyed on ``(court_id,
+    case_number)``), not descriptive metadata.  Replacing a real number
+    with ``UNKNOWN-<uuid>`` would orphan the ruling from its existing
+    case row.  The LLM always wins when it produces a case_number, so
+    the fixed-point risk that affected ``case_title`` does not apply.
+
 For cleanup of corrupted ``derived.*`` state, prefer ``rebuild_db.py
 --county <name>`` over reingest — rebuild walks S3 directly and does not
 touch existing ``cases.*`` rows when the split set changes across runs.
@@ -1291,8 +1311,33 @@ def _full_reparse_document(
 
         extracted: dict = {
             "ruling_text": ruling_text_cleaned,
+            # ``case_number`` keeps its ``doc_meta`` fallback because it is
+            # an *identity anchor*, not descriptive metadata: the ``cases``
+            # row is keyed on ``(court_id, case_number)`` (``db.py:325``).
+            # If the split returns no case_number we want to continue
+            # writing this ruling back to the *same* case row — replacing
+            # a real number with ``UNKNOWN-<uuid>`` would orphan the
+            # ruling from the existing case.  The same doc_meta ->
+            # UNKNOWN layering repeats in the DB-write path at lines
+            # 2373-2377 as a final safety net.  (Unlike case_title, the
+            # #2502 fixed-point risk does not apply here: the LLM always
+            # wins when it produces a case_number, and a stable identity
+            # anchor is the desired behaviour.)
             "case_number": ruling.case_number or doc_meta.get("case_number"),
-            "case_title": ruling.case_title or doc_meta.get("case_title"),
+            # #2521 (sibling of #2502): Do NOT fall back to
+            # ``doc_meta.get("case_title")`` here — ``doc_meta`` carries
+            # the *existing* DB ``case_title`` (via the LEFT JOIN in
+            # ``FETCH_DOCUMENTS_QUERY``).  Falling back would create a
+            # self-sustaining fixed point for wrong titles: once a bad
+            # title is stored for a case, every reingest where the split
+            # returns no title re-writes that same wrong title back
+            # (because reingest uses ``upsert_case(force_update=True)``).
+            # Letting ``None`` flow through is SAFE: ``upsert_case``'s
+            # ``force_update=True`` branch at ``db.py:316`` uses
+            # ``COALESCE(EXCLUDED.case_title, cases.case_title)``, so an
+            # incoming ``NULL`` preserves the existing non-null title
+            # instead of erasing it.
+            "case_title": ruling.case_title,
             "case_type": doc_meta.get("case_type"),
             "judge_name": doc_judge_name,
             "outcome": normalize_outcome(ruling.outcome),
