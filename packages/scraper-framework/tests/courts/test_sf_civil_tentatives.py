@@ -771,12 +771,23 @@ class TestSFCivilScraperRun:
         for doc in docs:
             assert doc.content_format.value == "html"
 
-    def test_no_session_returns_empty(self) -> None:
-        """Without a session (and no Playwright), scraper returns empty."""
+    def test_no_session_raises(self) -> None:
+        """Session-acquisition failure must raise, not return empty (#2620).
+
+        Previously the scraper logged the failure and returned ``[]``, which
+        ``BaseScraper.run()`` treated as a successful zero-records run. That
+        reported ``status=success`` in telemetry and masked silent outages.
+        The scraper must now raise so the base runner marks the run as
+        failed. See :class:`TestRunHealthOnSessionFailure` below for the
+        end-to-end ``scraper.run().success is False`` check.
+        """
         import unittest.mock
 
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
+        # Keep a single attempt so the unit test stays fast; retry behavior
+        # is exercised in TestSessionAcquisition.
+        config.max_retries = 1
         scraper = SFCivilTentativeRulingsScraper(
             config=config,
             session_id=None,
@@ -787,8 +798,97 @@ class TestSFCivilScraperRun:
             "asyncio.run",
             return_value=None,
         ):
-            docs = scraper.fetch_documents()
-            assert docs == []
+            with pytest.raises(RuntimeError, match="session acquisition failed"):
+                scraper.fetch_documents()
+
+
+# ---------------------------------------------------------------------------
+# Run health on session failure — end-to-end regression for #2620
+# ---------------------------------------------------------------------------
+
+
+class TestRunHealthOnSessionFailure:
+    """Regression tests for #2620.
+
+    Previously, when ``_acquire_session`` returned ``None`` after all
+    retries, ``fetch_documents`` returned ``[]``. The base runner treated
+    that as a completed-without-exception run and recorded
+    ``records=0, status=success`` in ``telemetry.scraper_runs``. No alert
+    fired, so a silent CAPTCHA-gateway outage could persist indefinitely.
+
+    The fix (#2620): ``fetch_documents`` raises ``RuntimeError`` on
+    session-acquisition failure, which propagates through
+    ``BaseScraper.run()`` and causes ``success=False`` to be recorded.
+    """
+
+    def test_run_success_false_when_acquire_session_returns_none(self) -> None:
+        """scraper.run().success is False when _acquire_session returns None.
+
+        This is the explicit acceptance criterion from issue #2620:
+        "Add a regression test: when ``_acquire_session`` returns ``None``,
+        ``scraper.run().success`` is ``False``."
+        """
+        import asyncio
+
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        # Keep retries at 1 so the test stays fast — the base runner's
+        # retry_sync wraps fetch_documents with config.max_retries.
+        config.max_retries = 1
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=None,
+        )
+
+        async def _mock_acquire_session_returning_none() -> str | None:
+            return None
+
+        scraper._acquire_session = _mock_acquire_session_returning_none  # type: ignore[assignment]
+
+        # Guard against the test hanging if asyncio.run is ever reintroduced
+        # with a different mock strategy — this path should complete fast.
+        health = scraper.run()
+
+        assert health.success is False, (
+            "Session-acquisition failure must produce success=False so "
+            "telemetry records status=failed instead of silently "
+            "reporting records=0 + status=success (#2620)."
+        )
+        assert health.records_captured == 0
+        assert health.error_message is not None
+        assert "session" in health.error_message.lower()
+
+        # Reference asyncio to silence lint if the import above is unused
+        # in some future refactor — the mock replaces the asyncio.run call
+        # site entirely, so the import might otherwise look dead.
+        assert asyncio is not None
+
+    def test_run_success_false_when_fetch_documents_raises(self) -> None:
+        """Any exception from fetch_documents marks the run failed.
+
+        Belt-and-suspenders check that BaseScraper.run() correctly flips
+        success to False when the subclass raises — this is the contract
+        the #2620 fix depends on.
+        """
+        config = sf_civil_default_config()
+        config.request_delay_seconds = 0
+        config.max_retries = 1
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            session_id=None,
+        )
+
+        def _raise_runtime_error() -> list[Any]:
+            msg = "simulated session acquisition failure"
+            raise RuntimeError(msg)
+
+        scraper.fetch_documents = _raise_runtime_error  # type: ignore[assignment]
+
+        health = scraper.run()
+        assert health.success is False
+        assert health.records_captured == 0
+        assert health.error_message is not None
+        assert "simulated session acquisition failure" in health.error_message
 
 
 # ---------------------------------------------------------------------------
