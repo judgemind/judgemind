@@ -18,6 +18,15 @@
 #   --county NAME     Only process documents from this county (e.g. Ventura)
 #   --state CODE      State code for --county filtering (default: ca)
 #   --concurrency N   Number of parallel processes (default: 64)
+#   --max-worker-memory-mb N
+#                     Reserve ~N MB of RAM per worker when auto-scaling
+#                     concurrency.  Computes ``min(--concurrency,
+#                     available_memory_mb / N)`` and uses the smaller value.
+#                     Use this after bumping Fargate memory with
+#                     ``scripts/ecs-run-task.sh --memory <mb>`` so concurrency
+#                     adapts to the new allocation.  Set to 0 (default) to
+#                     disable auto-scaling and use --concurrency as-is.
+#                     See #2495.
 #   --reset           Truncate derived tables before rebuilding.  When combined
 #                     with --county, the reset is scoped to just that county's
 #                     rows (per-county reset); otherwise it truncates the
@@ -28,6 +37,17 @@
 #                     raw PDF via the ingestion worker's LLM split path, so no
 #                     override is required.  Passing this flag logs a warning
 #                     and is otherwise ignored.
+#
+# Worker-crash resilience (see #2495):
+#   * When a child process in the pool dies mid-task (segfault from
+#     pdfplumber/pdfminer C extensions, OOM, etc.), every in-flight future
+#     gets a ``BrokenProcessPool`` exception — masking *which* PDF actually
+#     killed the worker.  The orchestrator now:
+#       1. Logs the specific S3 key for every future that was in flight when
+#          the pool broke (``in-flight at pool break`` log).
+#       2. After the concurrent pass, retries each crashed key serially in
+#          a fresh ``max_workers=1`` pool so segfaults only kill the retry
+#          worker, not the whole rebuild.
 """
 
 from __future__ import annotations
@@ -381,6 +401,179 @@ def _process_one_document(
         }
 
 
+def _available_memory_mb() -> int:
+    """Return the memory available to this process in MB.
+
+    Reads the Linux cgroup memory limit (Fargate sets this) when available,
+    then falls back to ``psutil.virtual_memory()`` or the host total.  Returns
+    0 when no reliable value can be resolved — the caller treats 0 as "skip
+    autoscaling."  Never raises — failure returns 0.  See #2495.
+    """
+    # Prefer cgroup v2, then v1, then psutil.  Fargate containers expose
+    # their memory limit via the memory cgroup — the host's psutil value
+    # would overcount on a shared host.
+    for cgroup_path in (
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    ):
+        try:
+            with open(cgroup_path) as f:
+                raw = f.read().strip()
+            if raw == "max":
+                continue
+            limit_bytes = int(raw)
+            # Kernel sentinel for "no limit" — huge value ≈ 2^63.  Fall through.
+            if limit_bytes <= 0 or limit_bytes > (1 << 60):
+                continue
+            return limit_bytes // (1024 * 1024)
+        except (OSError, ValueError):
+            continue
+
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().total) // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def _autoscale_concurrency(
+    requested: int,
+    max_worker_memory_mb: int,
+    available_memory_mb: int | None = None,
+) -> int:
+    """Compute the effective worker count given a per-worker memory budget.
+
+    When ``max_worker_memory_mb`` is 0 or negative, returns ``requested``
+    unchanged (autoscaling disabled).  Otherwise returns
+    ``min(requested, available_memory_mb // max_worker_memory_mb)`` with a
+    floor of 1 so the rebuild always makes forward progress, even on tiny
+    allocations.  Exposed as a separate function so tests can stub available
+    memory without touching /sys or psutil.  See #2495.
+    """
+    if max_worker_memory_mb <= 0:
+        return requested
+    if available_memory_mb is None:
+        available_memory_mb = _available_memory_mb()
+    if available_memory_mb <= 0:
+        # Could not resolve — fall back to requested, don't silently drop to 1.
+        return requested
+    capped = available_memory_mb // max_worker_memory_mb
+    return max(1, min(requested, capped))
+
+
+def _retry_crashed_keys_serially(
+    crashed_keys: list[str],
+    cache_dir: str,
+    bucket: str,
+    database_url: str,
+    redis_url: str,
+    os_url: str,
+) -> dict[str, Any]:
+    """Retry keys that crashed a worker in the concurrent pass.
+
+    Launches a fresh ``ProcessPoolExecutor(max_workers=1)`` per key so a
+    segfault or OOM only kills the single retry worker — the orchestrator
+    survives and keeps going.  Returns an aggregate result dict with the
+    same counters shape the main loop accumulates (``processed``, ``errors``,
+    ``skipped``, ``no_hearing_date``, ``hash_mismatch_warnings``,
+    ``format_counts``) plus a list of keys that crashed on the retry too.
+    See #2495.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+
+    processed = 0
+    errors = 0
+    skipped = 0
+    no_hearing_date = 0
+    hash_mismatch_warnings = 0
+    format_counts: dict[str, int] = {}
+    still_crashed: list[str] = []
+
+    logger.info(
+        "Retrying keys that crashed a worker in the concurrent pass "
+        "(serial, max_workers=1 per key)",
+        retry_count=len(crashed_keys),
+    )
+
+    for idx, key in enumerate(crashed_keys, 1):
+        logger.info(
+            "Retry in progress",
+            retry_index=idx,
+            retry_total=len(crashed_keys),
+            s3_key=key,
+        )
+        with ProcessPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                _process_one_document,
+                key,
+                cache_dir,
+                bucket,
+                database_url,
+                redis_url,
+                os_url,
+            )
+            try:
+                result = future.result()
+            except BrokenProcessPool:
+                # The PDF crashed even a dedicated single-worker subprocess —
+                # it's almost certainly a C-extension segfault on this file.
+                logger.error(
+                    "Retry also crashed the worker — giving up on this key",
+                    s3_key=key,
+                )
+                errors += 1
+                still_crashed.append(key)
+                continue
+            except Exception as exc:
+                logger.error(
+                    "Retry raised unexpected exception",
+                    s3_key=key,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                errors += 1
+                continue
+
+        status = result.get("status", "error") if isinstance(result, dict) else result
+        content_format = (
+            result.get("content_format", "") if isinstance(result, dict) else ""
+        )
+        had_hearing_date = (
+            result.get("had_hearing_date", False) if isinstance(result, dict) else False
+        )
+        hash_mismatch = (
+            result.get("hash_mismatch", False) if isinstance(result, dict) else False
+        )
+
+        if status == "ok":
+            processed += 1
+            logger.info("Retry succeeded", s3_key=key)
+        elif status == "skip":
+            skipped += 1
+        else:
+            errors += 1
+            logger.warning("Retry produced error status", s3_key=key)
+
+        if content_format:
+            format_counts[content_format] = format_counts.get(content_format, 0) + 1
+        if status == "ok" and not had_hearing_date:
+            no_hearing_date += 1
+        if hash_mismatch:
+            hash_mismatch_warnings += 1
+
+    return {
+        "processed": processed,
+        "errors": errors,
+        "skipped": skipped,
+        "no_hearing_date": no_hearing_date,
+        "hash_mismatch_warnings": hash_mismatch_warnings,
+        "format_counts": format_counts,
+        "still_crashed": still_crashed,
+    }
+
+
 def reset_derived_tables(conn: psycopg.Connection) -> None:
     """Truncate all tables in the derived schema, preserving public/telemetry data."""
     logger.info("Resetting derived schema — truncating all derived tables...")
@@ -721,6 +914,17 @@ def main() -> None:
         help="Number of parallel processes (default: 64, or REBUILD_CONCURRENCY env)",
     )
     parser.add_argument(
+        "--max-worker-memory-mb",
+        type=int,
+        default=int(os.environ.get("REBUILD_MAX_WORKER_MEMORY_MB", "0")),
+        help=(
+            "Reserve ~N MB of RAM per worker when auto-scaling concurrency "
+            "(default: 0, disabled).  Computes min(--concurrency, "
+            "available_memory_mb / N) and uses the smaller value so "
+            "concurrency adapts to the Fargate allocation.  See #2495."
+        ),
+    )
+    parser.add_argument(
         "--reset",
         action="store_true",
         help="Truncate all derived tables and delete OpenSearch index before rebuilding",
@@ -847,8 +1051,20 @@ def main() -> None:
             logger.info("OPENSEARCH_URL not set — skipping search indexing")
 
         from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
 
-        concurrency = args.concurrency
+        concurrency_requested = args.concurrency
+        concurrency = _autoscale_concurrency(
+            concurrency_requested, args.max_worker_memory_mb
+        )
+        if concurrency != concurrency_requested:
+            logger.info(
+                "Autoscaled concurrency to fit memory budget",
+                requested=concurrency_requested,
+                effective=concurrency,
+                max_worker_memory_mb=args.max_worker_memory_mb,
+                available_memory_mb=_available_memory_mb(),
+            )
         logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
         # Step 4: Process documents concurrently using processes (not threads).
@@ -869,6 +1085,12 @@ def main() -> None:
         hash_mismatch_warnings = 0
         # Per-format counters for the summary.
         format_counts: dict[str, int] = {}
+
+        # Track keys that were in flight when a worker crashed the pool so we
+        # can (a) log exactly which raws were affected and (b) retry them
+        # serially after the concurrent pass.  See #2495.
+        crashed_keys: list[str] = []
+        pool_break_events = 0
 
         with ProcessPoolExecutor(max_workers=concurrency) as pool:
             futures = {
@@ -944,9 +1166,70 @@ def main() -> None:
                             eta_min=round(eta_min, 1),
                             errors=errors,
                         )
+                except BrokenProcessPool as exc:
+                    # A worker subprocess died mid-task (C-extension segfault,
+                    # OOM kill, etc.) and the pool propagates that to every
+                    # future that was running or pending.  We can't tell from
+                    # the exception alone which PDF triggered the crash, but
+                    # we *can* enumerate every key whose future never
+                    # completed — one of them is the culprit, all of them
+                    # deserve a retry.  See #2495.
+                    pool_break_events += 1
+                    errors += 1
+                    crashed_keys.append(key)
+                    logger.error(
+                        "in-flight at pool break",
+                        s3_key=key,
+                        error=str(exc),
+                    )
                 except Exception as exc:
                     errors += 1
                     logger.error("Failed to process", key=key, error=str(exc))
+
+        # Step 4b: Retry the keys that were in flight when the pool broke.
+        # Each retry runs in its own ``max_workers=1`` subprocess so a
+        # segfault only kills the single retry worker.  See #2495.
+        retry_summary: dict[str, Any] | None = None
+        if crashed_keys:
+            logger.warning(
+                "Pool break detected during concurrent pass — %d key(s) "
+                "affected across %d distinct crash event(s).  Retrying "
+                "serially.",
+                len(crashed_keys),
+                pool_break_events,
+                crashed_keys_count=len(crashed_keys),
+                pool_break_events=pool_break_events,
+            )
+            retry_summary = _retry_crashed_keys_serially(
+                crashed_keys,
+                cache_dir,
+                BUCKET,
+                database_url,
+                redis_url,
+                os_url,
+            )
+            # Fold retry counters back into the overall totals.  We already
+            # counted ``len(crashed_keys)`` errors during the concurrent pass
+            # (one per future that got ``BrokenProcessPool``).  Each retry
+            # resolves one of those: success → convert error into processed,
+            # skip → convert error into skipped, error → error stays.  Net
+            # effect: subtract the whole ``len(crashed_keys)`` from errors
+            # and re-add only the retry-level errors.
+            errors = max(0, errors - len(crashed_keys)) + retry_summary["errors"]
+            processed += retry_summary["processed"]
+            skipped += retry_summary["skipped"]
+            no_hearing_date += retry_summary["no_hearing_date"]
+            hash_mismatch_warnings += retry_summary["hash_mismatch_warnings"]
+            for fmt, count in retry_summary["format_counts"].items():
+                format_counts[fmt] = format_counts.get(fmt, 0) + count
+            logger.info(
+                "Retry pass complete",
+                retry_count=len(crashed_keys),
+                retry_processed=retry_summary["processed"],
+                retry_skipped=retry_summary["skipped"],
+                retry_errors=retry_summary["errors"],
+                still_crashed=retry_summary["still_crashed"],
+            )
 
         logger.info(
             "Rebuild complete",
@@ -956,6 +1239,15 @@ def main() -> None:
             total=len(keys),
             format_counts=format_counts,
             hash_mismatch_warnings=hash_mismatch_warnings,
+            pool_break_events=pool_break_events,
+            pool_break_keys_recovered=(
+                (retry_summary["processed"] + retry_summary["skipped"])
+                if retry_summary is not None
+                else 0
+            ),
+            pool_break_keys_unrecovered=(
+                len(retry_summary["still_crashed"]) if retry_summary is not None else 0
+            ),
         )
 
         if no_hearing_date > 0:

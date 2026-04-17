@@ -1404,3 +1404,518 @@ class TestRebuildSummaryHashMismatchCounter:
         ]
         assert len(rebuild_complete) == 1
         assert rebuild_complete[0].kwargs.get("hash_mismatch_warnings") == 1
+
+
+# ---------------------------------------------------------------------------
+# Worker-crash resilience — #2495
+# ---------------------------------------------------------------------------
+
+
+class TestAutoscaleConcurrency:
+    """Tests for _autoscale_concurrency()."""
+
+    def test_disabled_when_max_memory_zero(self) -> None:
+        """max_worker_memory_mb=0 returns requested concurrency unchanged."""
+        assert (
+            rebuild_db._autoscale_concurrency(
+                requested=64, max_worker_memory_mb=0, available_memory_mb=8192
+            )
+            == 64
+        )
+
+    def test_disabled_when_max_memory_negative(self) -> None:
+        """Negative values also disable autoscaling."""
+        assert (
+            rebuild_db._autoscale_concurrency(
+                requested=64, max_worker_memory_mb=-1, available_memory_mb=8192
+            )
+            == 64
+        )
+
+    def test_caps_when_memory_tight(self) -> None:
+        """With 8 GB RAM and 1 GB per worker, 64 requested → 8 effective."""
+        assert (
+            rebuild_db._autoscale_concurrency(
+                requested=64, max_worker_memory_mb=1024, available_memory_mb=8192
+            )
+            == 8
+        )
+
+    def test_returns_requested_when_memory_plentiful(self) -> None:
+        """With more than enough RAM, requested concurrency wins."""
+        assert (
+            rebuild_db._autoscale_concurrency(
+                requested=4, max_worker_memory_mb=1024, available_memory_mb=32768
+            )
+            == 4
+        )
+
+    def test_floor_of_one(self) -> None:
+        """Even with tiny RAM, at least one worker must run (no-zero floor)."""
+        assert (
+            rebuild_db._autoscale_concurrency(
+                requested=64, max_worker_memory_mb=2048, available_memory_mb=512
+            )
+            == 1
+        )
+
+    def test_falls_back_to_requested_when_memory_unknown(self) -> None:
+        """available_memory_mb=0 means we couldn't resolve — don't throttle."""
+        assert (
+            rebuild_db._autoscale_concurrency(
+                requested=32, max_worker_memory_mb=1024, available_memory_mb=0
+            )
+            == 32
+        )
+
+
+class TestAvailableMemoryMb:
+    """Tests for _available_memory_mb().
+
+    The helper reads cgroup memory limits (Fargate) before falling back to
+    ``psutil.virtual_memory()``.  We test the contract — a non-negative
+    integer — rather than mocking the filesystem, because the cgroup path
+    layout varies between cgroup v1 and v2 and across kernels.
+    """
+
+    def test_returns_non_negative_int(self) -> None:
+        value = rebuild_db._available_memory_mb()
+        assert isinstance(value, int)
+        assert value >= 0
+
+
+class TestRetryCrashedKeysSerially:
+    """Tests for _retry_crashed_keys_serially()."""
+
+    def test_empty_keys_returns_empty_summary(self) -> None:
+        """No crashed keys → no work, empty summary."""
+        summary = rebuild_db._retry_crashed_keys_serially(
+            [], "", "bucket", "postgres://x", "redis://x", ""
+        )
+        assert summary["processed"] == 0
+        assert summary["errors"] == 0
+        assert summary["skipped"] == 0
+        assert summary["still_crashed"] == []
+
+    def test_successful_retry_recovers_key(self, tmp_path: Any) -> None:
+        """When the retry worker processes the key without crashing, the
+        summary records it as processed and still_crashed stays empty.
+
+        Uses a real single-worker ``ProcessPoolExecutor`` via the function
+        under test; the child process uses the same ``_process_one_document``
+        code path and returns via a mocked ``IngestionWorker``.
+        """
+        content = b"<html>Date: 03/15/2026 ruling text</html>"
+        import hashlib
+
+        content_hash = hashlib.sha256(content).hexdigest()
+        key = f"ca/orange/superior_court/raw/{content_hash}.html"
+        cache_dir = str(tmp_path)
+        key_path = tmp_path / "ca" / "orange" / "superior_court" / "raw"
+        key_path.mkdir(parents=True)
+        (key_path / f"{content_hash}.html").write_bytes(content)
+
+        # Stub the pool so we don't fork — the retry helper uses
+        # ProcessPoolExecutor(max_workers=1) as a context manager.
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": True,
+            "hash_mismatch": False,
+        }
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        with patch("concurrent.futures.ProcessPoolExecutor", return_value=mock_pool):
+            summary = rebuild_db._retry_crashed_keys_serially(
+                [key],
+                cache_dir,
+                "test-bucket",
+                "postgres://test",
+                "redis://test",
+                "",
+            )
+
+        assert summary["processed"] == 1
+        assert summary["errors"] == 0
+        assert summary["still_crashed"] == []
+        assert summary["format_counts"] == {"html": 1}
+
+    def test_retry_that_also_crashes_appends_to_still_crashed(self, tmp_path: Any) -> None:
+        """When the single-worker retry also raises BrokenProcessPool, the
+        key lands in ``still_crashed`` and ``errors`` increments."""
+        from concurrent.futures.process import BrokenProcessPool
+
+        key = "ca/santa_clara/superior_court/raw/deadbeef.pdf"
+
+        mock_future = MagicMock()
+        mock_future.result.side_effect = BrokenProcessPool("retry segfault")
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        with patch("concurrent.futures.ProcessPoolExecutor", return_value=mock_pool):
+            summary = rebuild_db._retry_crashed_keys_serially(
+                [key],
+                "",
+                "test-bucket",
+                "postgres://test",
+                "redis://test",
+                "",
+            )
+
+        assert summary["processed"] == 0
+        assert summary["errors"] == 1
+        assert summary["still_crashed"] == [key]
+
+
+class TestMainPoolBreakHandling:
+    """Integration tests for main()'s BrokenProcessPool handling.
+
+    Before #2495, a worker crash triggered ``BrokenProcessPool`` on every
+    in-flight future, and the orchestrator's generic ``except Exception``
+    logged a single opaque "Failed to process" line per victim without
+    distinguishing "this PDF ran in the dead worker" from "some other PDF
+    ran in the dead worker."  The fix:
+
+    * The loop catches ``BrokenProcessPool`` specifically and logs
+      ``in-flight at pool break`` with the specific S3 key.
+    * After the concurrent pass, affected keys are retried serially in
+      fresh single-worker pools.
+    * The rebuild summary carries ``pool_break_events``,
+      ``pool_break_keys_recovered``, and ``pool_break_keys_unrecovered``.
+    """
+
+    def _make_cache(self, tmp_path: Any, keys: list[str]) -> str:
+        """Create a local cache with stub content for each key."""
+        cache_dir = str(tmp_path / "cache")
+        for key in keys:
+            parsed = rebuild_db.parse_s3_key(key)
+            assert parsed is not None
+            full = tmp_path / "cache" / key
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_bytes(b"<html>x</html>")
+        return cache_dir
+
+    def test_pool_break_logs_in_flight_key(self, tmp_path: Any) -> None:
+        """A ``BrokenProcessPool`` raised by ``future.result()`` must produce
+        an ``in-flight at pool break`` log carrying the specific S3 key of
+        the future, so operators can identify candidate culprit PDFs."""
+        from concurrent.futures.process import BrokenProcessPool
+
+        keys = [
+            "ca/santa_clara/superior_court/raw/aaa111.html",
+            "ca/santa_clara/superior_court/raw/bbb222.html",
+        ]
+        cache_dir = self._make_cache(tmp_path, keys)
+
+        # Future A: normal success.  Future B: raises BrokenProcessPool.
+        future_a = MagicMock()
+        future_a.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
+        future_b = MagicMock()
+        future_b.result.side_effect = BrokenProcessPool("pool died")
+
+        # Main-pass pool.  Its submit() is called for all input keys.
+        # We have to make the mapping deterministic so we know which key
+        # goes to which future.
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.side_effect = [future_a, future_b]
+
+        # Retry pool — the retry path submits its own ProcessPoolExecutor.
+        # Give it a future that re-raises so still_crashed is populated.
+        retry_future = MagicMock()
+        retry_future.result.side_effect = BrokenProcessPool("retry also died")
+        retry_pool = MagicMock()
+        retry_pool.__enter__ = MagicMock(return_value=retry_pool)
+        retry_pool.__exit__ = MagicMock(return_value=False)
+        retry_pool.submit.return_value = retry_future
+
+        # The main loop and the retry helper both instantiate
+        # ProcessPoolExecutor — patch so the main call gets the main pool
+        # and subsequent calls get the retry pool.
+        pool_sequence = [mock_pool, retry_pool]
+
+        def _pool_factory(*args: Any, **kwargs: Any) -> MagicMock:
+            return pool_sequence.pop(0) if pool_sequence else retry_pool
+
+        mock_logger = MagicMock()
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=keys,
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                side_effect=_pool_factory,
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([future_a, future_b]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+            ),
+            patch("sys.argv", ["rebuild_db.py"]),
+            patch.object(rebuild_db, "logger", mock_logger),
+        ):
+            rebuild_db.main()
+
+        # Verify the in-flight log fired with the specific key.
+        err_calls = mock_logger.error.call_args_list
+        in_flight_logs = [
+            call for call in err_calls if call.args and call.args[0] == "in-flight at pool break"
+        ]
+        assert len(in_flight_logs) == 1, f"expected 1 in-flight log, got: {err_calls}"
+        # The key in the log must be one of the inputs, not an opaque
+        # "Failed to process" message.
+        assert in_flight_logs[0].kwargs.get("s3_key") in keys
+
+        # Verify the rebuild summary reports pool-break stats.
+        info_calls = mock_logger.info.call_args_list
+        rebuild_complete = [
+            call for call in info_calls if call.args and call.args[0] == "Rebuild complete"
+        ]
+        assert len(rebuild_complete) == 1
+        kwargs = rebuild_complete[0].kwargs
+        assert kwargs.get("pool_break_events") == 1
+        # The retry also crashed, so unrecovered = 1, recovered = 0.
+        assert kwargs.get("pool_break_keys_recovered") == 0
+        assert kwargs.get("pool_break_keys_unrecovered") == 1
+
+    def test_pool_break_retry_recovers_key(self, tmp_path: Any) -> None:
+        """When a worker crashes but a serial retry succeeds, the key moves
+        from errors → processed and the summary reports recovery."""
+        from concurrent.futures.process import BrokenProcessPool
+
+        keys = ["ca/santa_clara/superior_court/raw/aaa111.html"]
+        cache_dir = self._make_cache(tmp_path, keys)
+
+        crash_future = MagicMock()
+        crash_future.result.side_effect = BrokenProcessPool("initial crash")
+
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = crash_future
+
+        recover_future = MagicMock()
+        recover_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
+        retry_pool = MagicMock()
+        retry_pool.__enter__ = MagicMock(return_value=retry_pool)
+        retry_pool.__exit__ = MagicMock(return_value=False)
+        retry_pool.submit.return_value = recover_future
+
+        pool_sequence = [mock_pool, retry_pool]
+
+        def _pool_factory(*args: Any, **kwargs: Any) -> MagicMock:
+            return pool_sequence.pop(0) if pool_sequence else retry_pool
+
+        mock_logger = MagicMock()
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=keys,
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                side_effect=_pool_factory,
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([crash_future]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+            ),
+            patch("sys.argv", ["rebuild_db.py"]),
+            patch.object(rebuild_db, "logger", mock_logger),
+        ):
+            rebuild_db.main()
+
+        info_calls = mock_logger.info.call_args_list
+        rebuild_complete = [
+            call for call in info_calls if call.args and call.args[0] == "Rebuild complete"
+        ]
+        assert len(rebuild_complete) == 1
+        kwargs = rebuild_complete[0].kwargs
+        assert kwargs.get("pool_break_events") == 1
+        assert kwargs.get("pool_break_keys_recovered") == 1
+        assert kwargs.get("pool_break_keys_unrecovered") == 0
+        # Overall: 1 processed via retry, 0 errors.
+        assert kwargs.get("processed") == 1
+        assert kwargs.get("errors") == 0
+
+
+class TestMaxWorkerMemoryCLI:
+    """CLI integration: ``--max-worker-memory-mb`` caps concurrency."""
+
+    def test_flag_caps_concurrency_before_pool_start(self, tmp_path: Any) -> None:
+        """``--max-worker-memory-mb 1024`` with 2 GB available must result
+        in ``max_workers=2`` on the pool (2048/1024), even if --concurrency
+        asks for 64."""
+        keys = ["ca/orange/superior_court/raw/abc123.html"]
+        cache_dir = str(tmp_path / "cache")
+        full = tmp_path / "cache" / keys[0]
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(b"<html>x</html>")
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        captured_max_workers: list[int] = []
+
+        def _pool_factory(*args: Any, **kwargs: Any) -> MagicMock:
+            captured_max_workers.append(kwargs.get("max_workers", -1))
+            return mock_pool
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=keys,
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch(
+                "rebuild_db._available_memory_mb",
+                return_value=2048,
+            ),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                side_effect=_pool_factory,
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([mock_future]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ),
+            patch(
+                "sys.argv",
+                [
+                    "rebuild_db.py",
+                    "--concurrency",
+                    "64",
+                    "--max-worker-memory-mb",
+                    "1024",
+                ],
+            ),
+        ):
+            rebuild_db.main()
+
+        # The main-pass pool gets max_workers=2 (2048/1024), not 64.
+        assert captured_max_workers[0] == 2
+
+    def test_flag_default_preserves_old_behavior(self, tmp_path: Any) -> None:
+        """Without ``--max-worker-memory-mb`` the old concurrency wins."""
+        keys = ["ca/orange/superior_court/raw/abc123.html"]
+        cache_dir = str(tmp_path / "cache")
+        full = tmp_path / "cache" / keys[0]
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(b"<html>x</html>")
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        captured_max_workers: list[int] = []
+
+        def _pool_factory(*args: Any, **kwargs: Any) -> MagicMock:
+            captured_max_workers.append(kwargs.get("max_workers", -1))
+            return mock_pool
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=keys,
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                side_effect=_pool_factory,
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([mock_future]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ),
+            patch(
+                "sys.argv",
+                [
+                    "rebuild_db.py",
+                    "--concurrency",
+                    "4",
+                ],
+            ),
+        ):
+            rebuild_db.main()
+
+        assert captured_max_workers[0] == 4
