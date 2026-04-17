@@ -31,6 +31,7 @@ jobs:
       dockerfile: ${{ steps.changes.outputs.dockerfile }}
       migrations: ${{ steps.changes.outputs.migrations }}
       schema: ${{ steps.changes.outputs.schema }}
+      hooks: ${{ steps.changes.outputs.hooks }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -82,6 +83,8 @@ jobs:
             schema:
               - 'packages/api/migrations/**'
               - 'packages/api/src/data-access/schema.sql'
+            hooks:
+              - '.claude/hooks/**'
       - name: Check if any coverage-producing package changed
         id: any-testable
         run: |
@@ -905,6 +908,27 @@ jobs:
         run: scripts/check-removed-exports.sh
 
   # ---------------------------------------------------------------
+  # Preflight hook test suite: runs when .claude/hooks/ changes (#2408)
+  # ---------------------------------------------------------------
+  preflight-hook-test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.hooks == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run preflight hook test suite
+        run: python3 .claude/hooks/test_preflight_hook.py
+      - name: Run agent-cwd-guard test suite
+        run: python3 .claude/hooks/test_agent_cwd_guard.py
+      - name: Run agent-worktree-guard test suite
+        run: python3 .claude/hooks/test_agent_worktree_guard.py
+      - name: Run check-inbox hook test suite
+        run: python3 .claude/hooks/test_check_inbox_hook.py
+
+  # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
   # ---------------------------------------------------------------
   ecs-oneshot-test:
@@ -983,7 +1007,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
