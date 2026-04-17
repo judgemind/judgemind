@@ -163,6 +163,23 @@ printf '%s\n' 'claude-3-5-haiku-latest' > "$TMPDIR_TEST/node_modules/some-pkg/in
 assert_passes "node_modules directory is excluded"
 reset_tmpdir
 
+# ─── Test 21: No self-match on ci.yml step name ──────────────────────────
+# The step name in .github/workflows/ci.yml that runs this guard must
+# not itself contain a deprecated model identifier — otherwise the
+# guard fails on its first CI run.  See issue #2542 for the class of
+# failure (originally observed on PR #2541 with a different guard).
+# A tempting misname for this guard would be e.g.:
+#
+#   - name: Check for deprecated models like claude-3-5-haiku-latest
+#
+# which would trip the guard on every CI run.  This assertion catches
+# the bug at test time instead.  See
+# scripts/tests/_guard_self_match_helpers.sh for the shared helper.
+# shellcheck source=./_guard_self_match_helpers.sh
+source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"
+assert_no_self_match_on_ci_step_name \
+    "scripts/check-deprecated-models.sh" "yml"
+
 # ─── Summary ──────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"
