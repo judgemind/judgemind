@@ -70,6 +70,12 @@ module "database" {
   # documented in #2549. See docs/agent/infrastructure-reference.md
   # §Dev DB Connection Budget.
   instance_class = "db.t4g.small"
+
+  # Dev applies instance-class and parameter-group changes on the next apply
+  # rather than deferring to the weekly maintenance window (Sun 05:00-06:00 UTC).
+  # Production keeps the default (false) to minimize surprise reboots during
+  # business hours. See #2573.
+  apply_immediately = true
 }
 
 module "cache" {

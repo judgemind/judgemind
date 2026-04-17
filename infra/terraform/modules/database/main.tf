@@ -42,6 +42,12 @@ variable "sslmode" {
   }
 }
 
+variable "apply_immediately" {
+  description = "Apply RDS modifications immediately instead of deferring to the next maintenance window. Defaults to false so production-grade environments keep the safer maintenance-window behavior; set to true in dev so changes land on the next apply rather than waiting for Sunday 05:00 UTC."
+  type        = bool
+  default     = false
+}
+
 # ─── Password ──────────────────────────────────────────────
 
 resource "random_password" "db" {
@@ -115,6 +121,8 @@ resource "aws_db_instance" "main" {
   final_snapshot_identifier = var.environment == "production" ? "judgemind-${var.environment}-final" : null
 
   performance_insights_enabled = true
+
+  apply_immediately = var.apply_immediately
 
   tags = {
     Name = "judgemind-${var.environment}"
