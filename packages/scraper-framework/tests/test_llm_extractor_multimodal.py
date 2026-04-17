@@ -1256,6 +1256,211 @@ class TestIsCalendarListingOnly:
         assert _is_calendar_listing_only(text) is True
 
 
+class TestIsCalendarListingOnlyWidened2489:
+    """Additional widened-filter cases for #2489.
+
+    Covers:
+    - ``O/C`` abbreviation for Off Calendar.
+    - Bare parenthetical disposition markers (``(Moot)``, ``(Continued)`` …).
+    - Bare continuance-only lines (``Cont. To 4/20``, ``CONTINUED TO 10/6/26``).
+    - Placeholder text (``Tentative pending.``, ``ADR Review Hearing``).
+    - Party-prefixed motion-type labels (``Plaintiff's Motion for …``).
+    - Demurrer with parenthetical scope.
+    """
+
+    # --- O/C abbreviation ---
+
+    def test_oc_abbreviation(self) -> None:
+        """``O/C`` is an OC shorthand for Off Calendar (#2489)."""
+        assert _is_calendar_listing_only("O/C") is True
+
+    def test_oc_abbreviation_lower(self) -> None:
+        """``o/c`` lowercase still matches (#2489)."""
+        assert _is_calendar_listing_only("o/c") is True
+
+    def test_oc_abbreviation_spaced(self) -> None:
+        """``O / C`` with spaces around the slash still matches (#2489)."""
+        assert _is_calendar_listing_only("O / C") is True
+
+    def test_oc_abbreviation_trailing_period(self) -> None:
+        """``O/C.`` with trailing period still matches (#2489)."""
+        assert _is_calendar_listing_only("O/C.") is True
+
+    def test_oc_abbreviation_inside_longer_text_not_matched_as_oc(self) -> None:
+        """``GROUP O/C PROCEEDING`` should NOT be treated as O/C alone.
+
+        The abbreviation only counts as a calendar-listing marker when it is
+        the entire stripped text (or the dominant content), not when it
+        appears embedded in a longer phrase.  This test documents the
+        boundary: a longer, non-listing phrase must not be dropped just
+        because it contains "o/c" as a substring.
+        """
+        # >100 chars so length cap would reject anyway; this is a belt-and-
+        # suspenders check that embedded O/C does not bypass the length cap.
+        text = (
+            "GROUP O/C PROCEEDING has been scheduled for hearing on the "
+            "merits — counsel shall appear remotely and be prepared to "
+            "argue per the court's calendar."
+        )
+        assert _is_calendar_listing_only(text) is False
+
+    # --- Bare parenthetical disposition ---
+
+    def test_bare_parenthetical_moot(self) -> None:
+        """``(Moot)`` alone is a calendar listing (#2489)."""
+        assert _is_calendar_listing_only("(Moot)") is True
+
+    def test_bare_parenthetical_continued(self) -> None:
+        """``(Continued)`` alone is a calendar listing (#2489)."""
+        assert _is_calendar_listing_only("(Continued)") is True
+
+    def test_bare_parenthetical_withdrawn(self) -> None:
+        """``(Withdrawn)`` alone is a calendar listing (#2489)."""
+        assert _is_calendar_listing_only("(Withdrawn)") is True
+
+    def test_bare_parenthetical_vacated(self) -> None:
+        """``(Vacated)`` alone is a calendar listing (#2489)."""
+        assert _is_calendar_listing_only("(Vacated)") is True
+
+    def test_bare_parenthetical_off_calendar(self) -> None:
+        """``(Off Calendar)`` alone is a calendar listing (#2489)."""
+        assert _is_calendar_listing_only("(Off Calendar)") is True
+
+    def test_bare_parenthetical_mixed_case(self) -> None:
+        """``(moot)`` lowercase still matches (#2489)."""
+        assert _is_calendar_listing_only("(moot)") is True
+
+    def test_bare_parenthetical_trailing_period(self) -> None:
+        """``(Continued).`` with trailing period still matches (#2489)."""
+        assert _is_calendar_listing_only("(Continued).") is True
+
+    def test_parenthetical_disposition_with_surrounding_ruling_not_dropped(
+        self,
+    ) -> None:
+        """Parenthetical inside a real ruling must not drop the ruling."""
+        text = "The court GRANTED the motion (Continued to 4/20 for argument) and ordered briefing."
+        assert _is_calendar_listing_only(text) is False
+
+    # --- Bare continuance-only lines ---
+
+    def test_bare_continuance_cont_to_short_date(self) -> None:
+        """``Cont. To 4/20`` is a bare continuance listing (#2489)."""
+        assert _is_calendar_listing_only("Cont. To 4/20") is True
+
+    def test_bare_continuance_cont_to_full_date(self) -> None:
+        """``Cont. to 4/20/2026`` is a bare continuance listing (#2489)."""
+        assert _is_calendar_listing_only("Cont. to 4/20/2026") is True
+
+    def test_bare_continuance_continued_to_upper(self) -> None:
+        """``CONTINUED TO 10/6/26`` is a bare continuance listing (#2489).
+
+        Note: ``CONTINUED`` is a disposition verb that normally keeps the
+        text classified as a real ruling, but a bare-line-only continuance
+        with no other content should still be dropped as a listing.
+        """
+        assert _is_calendar_listing_only("CONTINUED TO 10/6/26") is True
+
+    def test_bare_continuance_month_name_date(self) -> None:
+        """``Continued to April 20, 2026`` (bare) is a listing (#2489)."""
+        assert _is_calendar_listing_only("Continued to April 20, 2026") is True
+
+    def test_bare_continuance_with_at_time(self) -> None:
+        """``Cont. to 4/20 at 9:00 a.m.`` is a bare continuance listing."""
+        assert _is_calendar_listing_only("Cont. to 4/20 at 9:00 a.m.") is True
+
+    def test_continued_ruling_not_dropped(self) -> None:
+        """A real ruling that uses ``CONTINUED`` as a verb is preserved."""
+        text = "Motion CONTINUED to April 1, 2026 for further briefing."
+        # Over the bare-continuance line pattern (extra trailing content),
+        # so the disposition-verb branch preserves it.
+        assert _is_calendar_listing_only(text) is False
+
+    # --- Placeholder text ---
+
+    def test_tentative_pending(self) -> None:
+        """``Tentative pending.`` is a placeholder (#2489)."""
+        assert _is_calendar_listing_only("Tentative pending.") is True
+
+    def test_tentative_pending_no_period(self) -> None:
+        """``Tentative pending`` without a period still matches (#2489)."""
+        assert _is_calendar_listing_only("Tentative pending") is True
+
+    def test_tentative_pending_mixed_case(self) -> None:
+        """``TENTATIVE PENDING`` uppercase still matches (#2489)."""
+        assert _is_calendar_listing_only("TENTATIVE PENDING") is True
+
+    def test_adr_review_hearing(self) -> None:
+        """``ADR Review Hearing`` is a placeholder listing (#2489)."""
+        assert _is_calendar_listing_only("ADR Review Hearing") is True
+
+    def test_adr_review(self) -> None:
+        """Bare ``ADR Review`` is a placeholder listing (#2489)."""
+        assert _is_calendar_listing_only("ADR Review") is True
+
+    # --- Party-prefixed motion-type labels ---
+
+    def test_plaintiff_motion_for_approval(self) -> None:
+        """``Plaintiff's Motion for Approval`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Plaintiff's Motion for Approval") is True
+
+    def test_defendant_motion_for_bifurcation(self) -> None:
+        """``Defendant's Motion for Bifurcation`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Defendant's Motion for Bifurcation") is True
+
+    def test_plaintiffs_plural_motion(self) -> None:
+        """``Plaintiffs' Motion for Sanctions`` (plural) is a listing (#2489)."""
+        assert _is_calendar_listing_only("Plaintiffs' Motion for Sanctions") is True
+
+    def test_cross_complainant_motion(self) -> None:
+        """``Cross-Complainant's Motion to Compel`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Cross-Complainant's Motion to Compel") is True
+
+    def test_cross_defendant_motion(self) -> None:
+        """``Cross-Defendant's Motion for Summary Judgment`` is a listing."""
+        assert _is_calendar_listing_only("Cross-Defendant's Motion for Summary Judgment") is True
+
+    def test_petitioner_motion(self) -> None:
+        """``Petitioner's Motion to Amend`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Petitioner's Motion to Amend") is True
+
+    def test_respondent_motion(self) -> None:
+        """``Respondent's Motion to Quash`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Respondent's Motion to Quash") is True
+
+    def test_party_prefix_with_curly_apostrophe(self) -> None:
+        """Curly apostrophe (\u2019) variant of party prefix matches (#2489)."""
+        # U+2019 RIGHT SINGLE QUOTATION MARK — common in LLM output.
+        text = "Defendant\u2019s Motion to Dismiss"
+        assert _is_calendar_listing_only(text) is True
+
+    def test_party_prefix_demurrer(self) -> None:
+        """``Plaintiff's Demurrer to Answer`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Plaintiff's Demurrer to Answer") is True
+
+    def test_party_prefixed_real_ruling_not_dropped(self) -> None:
+        """``Plaintiff's Motion is GRANTED`` is a real ruling (disposition)."""
+        text = "Plaintiff's Motion for Summary Judgment is GRANTED."
+        assert _is_calendar_listing_only(text) is False
+
+    # --- Demurrer with parenthetical scope ---
+
+    def test_demurrer_with_parenthetical_scope(self) -> None:
+        """``Demurrer (re First Amended Complaint)`` is a listing (#2489)."""
+        assert _is_calendar_listing_only("Demurrer (re First Amended Complaint)") is True
+
+    def test_demurrer_with_parenthetical_scope_spaced(self) -> None:
+        """``Demurrer ( re First Amended Complaint)`` (space after paren) matches.
+
+        The regex originally used a misplaced word-boundary ``\\b`` between
+        the alternation ``(?:to|\\()`` and the trailing ``.*``, which
+        incorrectly required a word-boundary transition between ``(`` and
+        the next character.  That failed on formatting variants with a
+        space after the opening parenthesis.  Adversarial Gemini reviewer
+        flagged this; this test pins the fix.
+        """
+        assert _is_calendar_listing_only("Demurrer ( re First Amended Complaint)") is True
+
+
 class TestDropCalendarListingRulings:
     """Tests for _drop_calendar_listing_rulings function (#2446)."""
 
@@ -1386,6 +1591,53 @@ class TestDropCalendarListingRulings:
         result = _drop_calendar_listing_rulings(rulings)
         assert result == []
 
+    def test_drops_widened_patterns_integration(self) -> None:
+        """All widened #2489 patterns are dropped end-to-end.
+
+        One ruling per new pattern:
+        - ``O/C`` abbreviation
+        - Bare parenthetical ``(Moot)``
+        - Bare continuance ``CONTINUED TO 10/6/26``
+        - Placeholder ``Tentative pending.``
+        - Party-prefixed ``Plaintiff's Motion for Approval``
+        - Demurrer with parenthetical ``Demurrer (re First Amended Complaint)``
+
+        Plus one real ruling that must be preserved.
+        """
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="O/C",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                ruling_text="(Moot)",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00003",
+                ruling_text="CONTINUED TO 10/6/26",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00004",
+                ruling_text="Tentative pending.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00005",
+                ruling_text="Plaintiff's Motion for Approval",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00006",
+                ruling_text="Demurrer (re First Amended Complaint)",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00007",
+                ruling_text="The motion for summary judgment is GRANTED.",
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00007"
+
 
 class TestJoinPageRowsCalendarListing:
     """Integration tests: _join_page_rows drops calendar listings (#2446)."""
@@ -1508,6 +1760,46 @@ class TestJoinPageRowsCalendarListing:
         assert "GRANTED" in rulings[0].ruling_text
         assert rulings[1].ruling_text is not None
         assert "OVERRULED" in rulings[1].ruling_text
+
+    def test_widened_listing_patterns_dropped_via_join(self) -> None:
+        """All widened #2489 listing patterns are dropped via _join_page_rows."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-00001 Alpha vs. Beta",
+                "ruling_text": "O/C",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "30-2024-00002 Gamma vs. Delta",
+                "ruling_text": "(Withdrawn)",
+            },
+            {
+                "entry_number": 3,
+                "case_info": "30-2024-00003 Epsilon vs. Zeta",
+                "ruling_text": "Cont. to 4/20",
+            },
+            {
+                "entry_number": 4,
+                "case_info": "30-2024-00004 Eta vs. Theta",
+                "ruling_text": "Tentative pending.",
+            },
+            {
+                "entry_number": 5,
+                "case_info": "30-2024-00005 Iota vs. Kappa",
+                "ruling_text": "Defendant's Motion for Bifurcation",
+            },
+            {
+                "entry_number": 6,
+                "case_info": "30-2024-00006 Lambda vs. Mu",
+                "ruling_text": "The motion is DENIED on the merits.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "2024-00006"
+        assert rulings[0].ruling_text is not None
+        assert "DENIED" in rulings[0].ruling_text
 
 
 class TestJoinPageRowsContamination:
