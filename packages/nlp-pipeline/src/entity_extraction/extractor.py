@@ -119,7 +119,11 @@ class EntityExtractor:
         )
 
         raw_text = response.content[0].text.strip()
-        parsed = json.loads(raw_text)
+        # ``strict=False`` tolerates unescaped control characters inside
+        # JSON string values — LLMs occasionally emit ESC/tab/vertical-tab
+        # inside string values, which vanilla ``json.loads`` rejects per
+        # RFC 8259 §7.  See #2518 for the full rationale.
+        parsed = json.loads(raw_text, strict=False)
 
         return ExtractedEntities(
             judge_name=parsed.get("judge_name"),
