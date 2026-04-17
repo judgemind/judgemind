@@ -133,7 +133,7 @@ if echo "$COMMAND" | grep -qE '\bterraform\b' ; then
     if echo "$COMMAND" | grep -qE '\b(apply|destroy)\b' ; then
         if echo "$COMMAND" | grep -qE 'infra/terraform' ; then
             if ! echo "$COMMAND" | grep -qE 'infra/terraform/environments/' ; then
-                echo "BLOCKED: terraform apply/destroy from root infra/terraform/ is forbidden. The root state creates duplicate resources. Use an environment-specific path: infra/terraform/environments/dev/ (or staging/production). See CLAUDE.md §Infrastructure Code." >&2
+                echo "BLOCKED: terraform apply/destroy from root infra/terraform/ is forbidden. The root state creates duplicate resources. Use an environment-specific path: infra/terraform/environments/dev/ (or staging/production). See docs/agent/infrastructure-reference.md §Terraform." >&2
                 exit 2
             fi
         fi

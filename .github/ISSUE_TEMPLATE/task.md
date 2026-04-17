@@ -33,7 +33,7 @@ One clear sentence: what does "done" look like?
 <!--
 ## Feasibility check (external-integration issues only)
 
-Required if this task proposes querying a third-party website or API (court case-search endpoints, public records APIs, etc.). Complete before labeling `agent/ready` — see CLAUDE.md §Writing Acceptance Criteria.
+Required if this task proposes querying a third-party website or API (court case-search endpoints, public records APIs, etc.). Complete before labeling `agent/ready` — see `docs/agent/issue-authoring.md` §Writing Acceptance Criteria.
 
 - Endpoint: `https://...`
 - Anonymous access confirmed: yes/no (how verified)

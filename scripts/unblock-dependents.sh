@@ -7,7 +7,7 @@
 # agent/ready.
 #
 # This is the complement to block-issue.sh. It automates the manual unblocking
-# process described in CLAUDE.md §When you finish a task.
+# process described in docs/agent/task-dependencies.md §When you finish a task.
 #
 # Usage:
 #   scripts/unblock-dependents.sh <closed-issue>

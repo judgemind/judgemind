@@ -211,8 +211,8 @@ Skip this for Terraform-only or docs-only tasks.
 
 #### A.2 — Implement and review (ralph loop)
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
-- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see CLAUDE.md §Pre-PR Checks) and review your own diff before continuing.
-- **For ingestion/extraction pipeline tasks** (scraper changes, LLM prompt changes, enrichment logic): use the local dev stack to iterate. The local DB + S3 cache enables fast iteration without deploying to dev. Run `scripts/rebuild_db.sh --skip-reset` to re-process documents through the pipeline and verify data correctness against source documents. See CLAUDE.md §Local Development Stack. **Prioritize correctness over completeness** — verify that extracted fields match the source document, not just that fields are populated.
+- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see `docs/agent/code-standards.md` §Pre-PR Checks) and review your own diff before continuing.
+- **For ingestion/extraction pipeline tasks** (scraper changes, LLM prompt changes, enrichment logic): use the local dev stack to iterate. The local DB + S3 cache enables fast iteration without deploying to dev. Run `scripts/rebuild_db.sh --skip-reset` to re-process documents through the pipeline and verify data correctness against source documents. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify that extracted fields match the source document, not just that fields are populated.
 - If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
 
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
@@ -528,7 +528,7 @@ Continue to Step 5.
 
 ### Path C: Large or ambiguous task
 
-Break into sub-tasks first (see CLAUDE.md §Creating Sub-Tasks), label them `agent/ready`, then pick up the first sub-task (restart from Step 1).
+Break into sub-tasks first (see `docs/agent/issue-authoring.md` §Creating Sub-Tasks), label them `agent/ready`, then pick up the first sub-task (restart from Step 1).
 
 If you only create sub-tasks and do not pick one up in this session, stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher. Skip Step 5 — no retrospective needed for task breakdown.
 

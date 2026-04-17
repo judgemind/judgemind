@@ -557,15 +557,16 @@ Cross-region replication: The document archive is replicated to a second region.
 
 Versioning: The archive bucket has versioning enabled to protect against accidental deletion or overwrite. Object lock (WORM) is not currently enabled.
 
-### 7.5.2 PostgreSQL (Important)
+### 7.5.2 PostgreSQL (Mixed — Important)
 
-The PostgreSQL database contains all structured data (cases, judges, attorneys, docket entries, user accounts). While most of this data could be re-derived from the document archive by re-running the ingestion pipeline, that would be extremely expensive and time-consuming. Standard database backup practices apply:
+PostgreSQL contains both derived and authoritative data. The schema namespaces make the distinction explicit:
 
-Automated daily snapshots with point-in-time recovery (PITR) enabled for continuous WAL archiving.
+- **`derived.*`** (courts, judges, cases, attorneys, parties, documents, rulings, court_directory_snapshots, and `*_aliases`): rebuildable from the S3 archive by re-running ingestion (`scripts/rebuild_db.py`). These tables are cacheable, disposable state. When they drift or become corrupted, the preferred remediation is a county-scoped rebuild rather than surgical mutation. Rebuild exercises the real ingestion and enrichment pipeline, so it simultaneously validates any upstream fix and backfills existing rows — a surgical delete/patch script only touches existing rows and leaves inbound data exposed to the same root cause. Surgical one-offs are also prone to their own bugs (wrong filter, missed edge case, partial mutation) and can easily create more damage than they repair.
+- **`public.*`** (users, refresh_tokens, alert_subscriptions, alert_events): authoritative accumulated state. Not derivable from S3. Requires standard backup protection.
+- **`staging.*`** (captures, ruled_items): transient pipeline buffers between ingestion stages. Disposable but not "rebuildable" in the archive sense — drain through the pipeline rather than rebuild from source.
+- **`telemetry.*`** (scraper_runs, validation_results, data_quality_metrics): accumulated observability data. Not derivable from S3. Low-stakes — loss impairs monitoring but not product.
 
-Backup retention: 30 days of daily snapshots, 12 months of weekly snapshots.
-
-Regular backup restoration tests to verify recoverability.
+Backup practices: daily snapshots with PITR, 30 days daily / 12 months weekly retention, regular restoration tests. The backup covers all namespaces; loss of `public.*` is user-facing, loss of `derived.*` is a cost event (re-running ingestion), loss of `telemetry.*` is a monitoring gap.
 
 ### 7.5.3 OpenSearch & Qdrant (Rebuildable)
 
