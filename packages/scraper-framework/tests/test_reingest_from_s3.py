@@ -6826,6 +6826,302 @@ class TestReparseDocumentMultimodal:
 
 
 # ---------------------------------------------------------------------------
+# Text-split branch tests — sibling of TestReparseDocumentMultimodal (#2521)
+# ---------------------------------------------------------------------------
+
+
+class TestReparseDocumentTextSplit:
+    """Regression tests for the text-split branch of ``_full_reparse_document``.
+
+    Mirrors ``TestReparseDocumentMultimodal``'s ``case_title`` tests to
+    guard against the same #2502-style fixed point in the split path used
+    by Fresno, Contra Costa, and any future text-split counties (#2521).
+    """
+
+    _SCRAPER_ID = "test-split-title-2521"
+
+    def _make_doc_meta(
+        self,
+        *,
+        case_title: str | None = None,
+        case_number: str | None = "CVPS2306157",
+    ) -> dict:
+        return {
+            "document_id": str(_DOC_ID_1),
+            "state": "CA",
+            "county": "Fresno",
+            "court_name": "Fresno Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": _CAPTURED_AT_1,
+            "content_hash": "abc123",
+            "format": "pdf",
+            "case_number": case_number,
+            "case_title": case_title,
+            "case_type": None,
+            "hearing_date": _HEARING_DATE,
+            "court_id": str(_COURT_ID),
+            "scraper_id": self._SCRAPER_ID,
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+
+    def _register_split(self, rulings: list[Any]) -> MagicMock:
+        """Register a regex-split mock under ``_SCRAPER_ID`` and return it.
+
+        Callers are responsible for popping the registry entry in a
+        ``finally`` block.  Using a distinct scraper_id keeps these tests
+        isolated from real-scraper registry state.
+        """
+        mock_split = MagicMock(return_value=rulings)
+        reingest._SPLIT_REGISTRY[self._SCRAPER_ID] = mock_split
+        # Ensure no LLM split is registered so we exercise the regex path.
+        reingest._LLM_SPLIT_REGISTRY.pop(self._SCRAPER_ID, None)
+        # Ensure no scraper registry entry — avoids parse_document() call.
+        reingest._SCRAPER_REGISTRY.pop(self._SCRAPER_ID, None)
+        return mock_split
+
+    def test_case_title_null_when_split_returns_none_no_db_fallback(self) -> None:
+        """When the text split returns no case_title for a ruling, the
+        reingest dict must have case_title=None — NOT the stale DB title
+        from doc_meta (#2521, sibling of #2502).
+
+        Previously, the code used ``ruling.case_title or
+        doc_meta.get("case_title")`` which pulled the existing DB title
+        (carried via the LEFT JOIN in FETCH_DOCUMENTS_QUERY) into the
+        result when the split produced nothing.  Combined with
+        ``upsert_case(force_update=True)``, that created a self-sustaining
+        fixed point for wrong titles.  The fix removes the fallback so
+        None flows through to upsert_case, where the COALESCE semantic at
+        db.py:316 preserves the existing (non-null) title.
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        doc_meta = self._make_doc_meta(case_title="Stale DB Title")
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number="CVPS2306157",
+                ruling_text="First ruling text.",
+                case_title=None,  # split did not extract a title
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+            SplitRuling(
+                ruling_index=2,
+                case_number="CVPS2306202",
+                ruling_text="Second ruling text.",
+                case_title=None,
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+        ]
+        self._register_split(rulings)
+
+        try:
+            with (
+                patch.object(reingest, "_apply_regex_fallbacks"),
+                patch.object(reingest, "_extract_text_from_content", return_value="pdf text"),
+            ):
+                results = reingest._full_reparse_document(
+                    b"%PDF-1.4 fake pdf",
+                    self._SCRAPER_ID,
+                    doc_meta,
+                )
+        finally:
+            reingest._SPLIT_REGISTRY.pop(self._SCRAPER_ID, None)
+
+        assert len(results) == 2
+        # Both must be None — not "Stale DB Title" (no fallback to doc_meta)
+        assert results[0]["case_title"] is None
+        assert results[1]["case_title"] is None
+        # extraction_methods must NOT mark case_title as "split" when the
+        # field is None (guards against misleading provenance).
+        assert "case_title" not in results[0]["extraction_methods"]
+        assert "case_title" not in results[1]["extraction_methods"]
+
+    def test_case_title_from_split_wins_over_db_title(self) -> None:
+        """When the text split returns a case_title, it wins over any
+        existing doc_meta title (#2521, sibling of #2502).
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        doc_meta = self._make_doc_meta(case_title="Old DB Title")
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number="CVPS2306157",
+                ruling_text="First ruling text.",
+                case_title="Fresh Split Title",
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+            SplitRuling(
+                ruling_index=2,
+                case_number="CVPS2306202",
+                ruling_text="Second ruling text.",
+                case_title="Another Fresh Title",
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+        ]
+        self._register_split(rulings)
+
+        try:
+            with (
+                patch.object(reingest, "_apply_regex_fallbacks"),
+                patch.object(reingest, "_extract_text_from_content", return_value="pdf text"),
+            ):
+                results = reingest._full_reparse_document(
+                    b"%PDF-1.4 fake pdf",
+                    self._SCRAPER_ID,
+                    doc_meta,
+                )
+        finally:
+            reingest._SPLIT_REGISTRY.pop(self._SCRAPER_ID, None)
+
+        assert len(results) == 2
+        assert results[0]["case_title"] == "Fresh Split Title"
+        assert results[1]["case_title"] == "Another Fresh Title"
+
+    def test_multi_ruling_no_title_swap_when_some_rulings_miss_title(self) -> None:
+        """Multi-ruling text-split PDFs: rulings whose split extraction
+        returned no title must keep case_title=None — they must NOT pick
+        up doc_meta's title and must NOT pick up a sibling ruling's title
+        (#2521, sibling of #2502).
+
+        This mirrors the canonical #2490 Palacios-v.-Vallejo repro in the
+        multimodal branch: a multi-case PDF where one or more splits come
+        back without a title, and any fallback causes them to converge on
+        the same wrong title across reingest cycles.
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        doc_meta = self._make_doc_meta(case_title="Palacios v. Vallejo")
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number="CVPS2306001",
+                ruling_text="First ruling text.",
+                case_title="Gu v. Smith",  # split extracted this one
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+            SplitRuling(
+                ruling_index=2,
+                case_number="CVPS2306002",
+                ruling_text="Second ruling text.",
+                case_title=None,  # split did NOT extract
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+            SplitRuling(
+                ruling_index=3,
+                case_number="CVPS2306003",
+                ruling_text="Third ruling text.",
+                case_title="Clarke v. Jones",
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+            SplitRuling(
+                ruling_index=4,
+                case_number="CVPS2306004",
+                ruling_text="Fourth ruling text.",
+                case_title=None,  # split did NOT extract
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+        ]
+        self._register_split(rulings)
+
+        try:
+            with (
+                patch.object(reingest, "_apply_regex_fallbacks"),
+                patch.object(reingest, "_extract_text_from_content", return_value="pdf text"),
+            ):
+                results = reingest._full_reparse_document(
+                    b"%PDF-1.4 fake pdf",
+                    self._SCRAPER_ID,
+                    doc_meta,
+                )
+        finally:
+            reingest._SPLIT_REGISTRY.pop(self._SCRAPER_ID, None)
+
+        assert len(results) == 4
+        # Rulings with split titles keep them.
+        assert results[0]["case_title"] == "Gu v. Smith"
+        assert results[2]["case_title"] == "Clarke v. Jones"
+        # Rulings without split titles must be None — NOT doc_meta's
+        # stale "Palacios v. Vallejo", NOT a sibling ruling's title.
+        assert results[1]["case_title"] is None
+        assert results[3]["case_title"] is None
+
+    def test_case_number_preserves_doc_meta_fallback_identity_anchor(self) -> None:
+        """``case_number`` keeps its ``doc_meta`` fallback even when the
+        split returns no case_number — it is an *identity anchor* keyed
+        on ``(court_id, case_number)`` in ``cases``, not descriptive
+        metadata subject to the #2502 fixed-point risk (#2521).
+
+        If the split produces no case_number, falling back to doc_meta's
+        value keeps the ruling attached to its existing case row.
+        Replacing a real number with ``UNKNOWN-<uuid>`` would orphan it.
+        """
+        from courts.ca.fresno_tentatives import SplitRuling
+
+        doc_meta = self._make_doc_meta(
+            case_title=None,
+            case_number="CVPS-REAL-123",  # existing identity anchor
+        )
+        rulings = [
+            SplitRuling(
+                ruling_index=1,
+                case_number=None,  # split produced nothing
+                ruling_text="First ruling text.",
+                case_title=None,
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+            SplitRuling(
+                ruling_index=2,
+                case_number=None,
+                ruling_text="Second ruling text.",
+                case_title=None,
+                motion_type=None,
+                outcome=None,
+                hearing_date=None,
+            ),
+        ]
+        self._register_split(rulings)
+
+        try:
+            with (
+                patch.object(reingest, "_apply_regex_fallbacks"),
+                patch.object(reingest, "_extract_text_from_content", return_value="pdf text"),
+            ):
+                results = reingest._full_reparse_document(
+                    b"%PDF-1.4 fake pdf",
+                    self._SCRAPER_ID,
+                    doc_meta,
+                )
+        finally:
+            reingest._SPLIT_REGISTRY.pop(self._SCRAPER_ID, None)
+
+        assert len(results) == 2
+        # Both rulings must inherit the doc_meta case_number (identity
+        # anchor preserved) — NOT be None.
+        assert results[0]["case_number"] == "CVPS-REAL-123"
+        assert results[1]["case_number"] == "CVPS-REAL-123"
+
+
+# ---------------------------------------------------------------------------
 # LLM enrichment tests (#2406)
 # ---------------------------------------------------------------------------
 
