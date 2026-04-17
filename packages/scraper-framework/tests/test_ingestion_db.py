@@ -2258,6 +2258,184 @@ class TestUpsertCaseReturningTitle:
 
 
 # ---------------------------------------------------------------------------
+# upsert_case / upsert_case_returning_title — preserve-on-conflict SQL (#2468)
+# ---------------------------------------------------------------------------
+
+
+def _upsert_case_execute_sql(conn: MagicMock) -> str:
+    """Return the SQL string passed to the last cursor.execute() call.
+
+    Used to assert the ON CONFLICT clause structure in upsert_case /
+    upsert_case_returning_title.
+    """
+    cur = conn.cursor.return_value.__enter__.return_value
+    for call in reversed(cur.execute.call_args_list):
+        args = call[0]
+        if args and isinstance(args[0], str) and "INSERT INTO cases" in args[0]:
+            return args[0]
+    raise ValueError("No execute() call with INSERT INTO cases found")
+
+
+class TestUpsertCasePreservesExistingTitle:
+    """Regression tests for #2468 — ensure non-null existing case_title is
+    never silently overwritten by a later upsert.
+
+    The bug was that ``COALESCE(EXCLUDED.case_title, cases.case_title)`` used
+    the incoming value whenever it was non-null, so any upstream mis-routing
+    (e.g. fuzzy-match case-number rewrites, #2449) would propagate wrong
+    titles across the DB.  The fix swaps the COALESCE argument order to
+    ``COALESCE(cases.case_title, EXCLUDED.case_title)`` so the existing
+    value wins when present; the incoming value only fills in a currently
+    NULL column.
+    """
+
+    def test_upsert_case_sql_preserves_existing_title(self) -> None:
+        """upsert_case SQL must COALESCE(cases.case_title, EXCLUDED.case_title)."""
+        conn = _mock_conn()
+        upsert_case(conn, "24STCV12345", "court-uuid-1", case_title="New Title")
+
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)" in sql, (
+            f"Expected preserve-first COALESCE for case_title, got SQL:\n{sql}"
+        )
+        # The old buggy order must not appear.
+        assert "COALESCE(EXCLUDED.case_title" not in sql, (
+            f"Legacy overwrite COALESCE order found — this is the #2468 bug. SQL:\n{sql}"
+        )
+
+    def test_upsert_case_sql_preserves_existing_case_type(self) -> None:
+        """upsert_case SQL must COALESCE(cases.case_type, EXCLUDED.case_type)."""
+        conn = _mock_conn()
+        upsert_case(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Title",
+            case_type="civil",
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert (
+            "case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)" in sql
+            or "case_type = COALESCE(cases.case_type, EXCLUDED.case_type)" in sql
+        ), f"Expected preserve-first COALESCE for case_type, got SQL:\n{sql}"
+        assert "COALESCE(EXCLUDED.case_type" not in sql, (
+            f"Legacy overwrite COALESCE order found for case_type. SQL:\n{sql}"
+        )
+
+    def test_upsert_case_returning_title_sql_preserves_existing_title(
+        self,
+    ) -> None:
+        """upsert_case_returning_title SQL must preserve existing case_title."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", "Csicsery Family Trust")
+
+        upsert_case_returning_title(
+            conn,
+            "P25-02101",
+            "court-uuid-1",
+            case_title="Vincent Revocable Trust",
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)" in sql, (
+            f"Expected preserve-first COALESCE for case_title, got SQL:\n{sql}"
+        )
+        assert "COALESCE(EXCLUDED.case_title" not in sql, (
+            f"Legacy overwrite COALESCE order found — this is the #2468 bug. SQL:\n{sql}"
+        )
+
+    def test_upsert_case_returning_title_sql_preserves_existing_case_type(
+        self,
+    ) -> None:
+        """upsert_case_returning_title SQL must preserve existing case_type."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", "Existing Title")
+
+        upsert_case_returning_title(
+            conn,
+            "P25-02101",
+            "court-uuid-1",
+            case_title=None,
+            case_type="probate",
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert (
+            "case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)" in sql
+            or "case_type = COALESCE(cases.case_type, EXCLUDED.case_type)" in sql
+        ), f"Expected preserve-first COALESCE for case_type, got SQL:\n{sql}"
+        assert "COALESCE(EXCLUDED.case_type" not in sql, (
+            f"Legacy overwrite COALESCE order found for case_type. SQL:\n{sql}"
+        )
+
+    def test_csicsery_vs_vincent_scenario_preserves_first_title(self) -> None:
+        """Scenario from the issue: P25-02101 is Csicsery, not Vincent.
+
+        When Vincent's LLM-returned ruling (fuzzy-match-mis-routed onto
+        P25-02101) calls upsert_case_returning_title with title "Vincent
+        Revocable Trust", the DB row for P25-02101 must still return the
+        Csicsery title — i.e. the DB's existing title wins over the
+        incoming non-null value.
+
+        This test mocks the DB behavior: after swapping the COALESCE
+        argument order, a conflict returns the preserved existing title
+        from RETURNING.  Asserts that the caller receives the preserved
+        title, which is the whole point of #2468.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Simulate the DB after the fix: on conflict with an existing
+        # non-null case_title, RETURNING case_title returns the existing
+        # (preserved) value, not the incoming one.
+        cur.fetchone.return_value = (
+            "case-uuid-csicsery",
+            "Matter of the Csicsery Family Trust",
+        )
+
+        case_id, effective_title = upsert_case_returning_title(
+            conn,
+            "P25-02101",
+            "court-uuid-contra-costa",
+            case_title="Matter of: The George R. Vincent Revocable Trust",
+        )
+
+        assert case_id == "case-uuid-csicsery"
+        assert effective_title == "Matter of the Csicsery Family Trust"
+        # And the SQL still encodes the preserve-existing semantics.
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)" in sql
+
+    def test_upsert_case_fill_in_null_title_still_works(self) -> None:
+        """Cross-case title lookup (#2006) must still work.
+
+        If a case row exists with case_title = NULL and a later upsert
+        provides a non-null title, the incoming title should fill in the
+        null column.  ``COALESCE(cases.case_title, EXCLUDED.case_title)``
+        preserves this: when the existing value is NULL, the incoming
+        value wins.
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Simulate an existing row with null case_title — the DB's
+        # COALESCE(cases.case_title, EXCLUDED.case_title) will return the
+        # incoming EXCLUDED value.
+        cur.fetchone.return_value = ("case-uuid-1", "Newly Filled In Title")
+
+        case_id, effective_title = upsert_case_returning_title(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Newly Filled In Title",
+        )
+
+        assert case_id == "case-uuid-1"
+        assert effective_title == "Newly Filled In Title"
+
+
+# ---------------------------------------------------------------------------
 # resolve_judge_from_department
 # ---------------------------------------------------------------------------
 

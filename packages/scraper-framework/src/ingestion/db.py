@@ -272,8 +272,15 @@ def upsert_case(
     Uses (court_id, case_number) as the natural key per the schema UNIQUE constraint.
     case_number_normalized strips whitespace and lowercases for search.
 
-    ``case_title`` and ``case_type`` are set on INSERT and updated on conflict
-    only when a non-NULL value is provided (COALESCE preserves existing values).
+    ``case_title`` and ``case_type`` are set on INSERT and preserved on conflict:
+    once a non-NULL value exists for a case, it is NOT overwritten by a later
+    upsert (even if the incoming value is non-NULL).  An incoming non-NULL
+    value only fills in a currently-NULL column — it cannot silently replace
+    an existing title/type.  This prevents upstream mis-routing bugs (e.g.
+    fuzzy-match case-number rewrites, #2449) from propagating wrong titles
+    across the DB (#2468).  If a case identity correction is genuinely
+    needed, it must go through a deliberate, auditable update path — never
+    via a silent upsert.
 
     Returns the case UUID as a string.  To also retrieve the effective
     case_title (after COALESCE), use ``upsert_case_returning_title()``.
@@ -287,8 +294,8 @@ def upsert_case(
             INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
             VALUES (%s, %s, %s::uuid, %s, %s)
             ON CONFLICT (court_id, case_number) DO UPDATE
-                SET case_title = COALESCE(EXCLUDED.case_title, cases.case_title),
-                    case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)
+                SET case_title = COALESCE(cases.case_title, EXCLUDED.case_title),
+                    case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)
             RETURNING id
             """,
             (case_number, normalized, court_id, case_title, case_type),
@@ -322,6 +329,14 @@ def upsert_case_returning_title(
     ``case_title`` after the COALESCE.  This allows callers to discover
     an existing title that was preserved from a prior ruling — useful for
     the cross-case title lookup (#2006).
+
+    The COALESCE preserves the existing case_title/case_type on conflict:
+    once a non-NULL value exists for a case, a later upsert with a
+    different non-NULL value will NOT overwrite it (#2468).  The incoming
+    value only wins when the existing column is NULL.  This keeps the
+    cross-case title lookup (#2006) working — the first ruling to supply a
+    title wins and subsequent titleless rulings reuse it — while preventing
+    upstream mis-routing (#2449) from silently rewriting case identities.
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     case_title = normalize_case_title(_strip_nul(case_title))
@@ -332,8 +347,8 @@ def upsert_case_returning_title(
             INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
             VALUES (%s, %s, %s::uuid, %s, %s)
             ON CONFLICT (court_id, case_number) DO UPDATE
-                SET case_title = COALESCE(EXCLUDED.case_title, cases.case_title),
-                    case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)
+                SET case_title = COALESCE(cases.case_title, EXCLUDED.case_title),
+                    case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)
             RETURNING id, case_title
             """,
             (case_number, normalized, court_id, case_title, case_type),
