@@ -3080,6 +3080,35 @@ class TestReparseDocumentSanDiegoCalendarNarrowing:
         # No match — ruling_text stays as the full raw HTML fallback.
         assert result["ruling_text"].lstrip().startswith("<")
 
+    @patch.object(reingest, "_load_scraper_registry")
+    def test_odyssey_narrowing_runs_without_llm_client(
+        self,
+        mock_registry: MagicMock,
+    ) -> None:
+        """Narrowing must run even when llm_client is None (--no-llm mode).
+
+        Regression guard: previously the SD direct-narrowing lived inside
+        the ``if llm_client is not None`` branch, so ``--no-llm`` reingest
+        runs never replaced the raw HTML.  The narrowing is independent
+        of LLM availability — it's about producing clean ruling_text, not
+        preparing an LLM prompt.
+        """
+        reingest._SCRAPER_REGISTRY.pop("rebuild-ca-san_diego", None)
+
+        raw = self._SD_CALENDAR_HTML.encode("utf-8")
+        result = reingest._reparse_document(
+            raw,
+            "rebuild-ca-san_diego",
+            self._sd_doc_meta(case_number="2024-00021082"),
+            llm_client=None,  # --no-llm mode
+        )
+
+        ruling_text = result["ruling_text"]
+        assert ruling_text is not None
+        assert not ruling_text.lstrip().startswith("<")
+        assert "37-2024-00021082-CL-CL-CTL" in ruling_text
+        assert len(ruling_text) < 1000
+
 
 # ---------------------------------------------------------------------------
 class TestReparseDocumentCaseTypeFromScraperId:
