@@ -5,10 +5,17 @@ Fixtures captured from live site 2026-03-11:
   cc_dept16_031126.pdf — Dept 16, Judge Benjamin T Reyes II (civil, 506KB)
   cc_dept14_031026.pdf — Dept 14, Judge Kirk Athanasiou (civil/Richmond, 427KB)
   cc_dept30_031626.pdf — Dept 30, Judge Virginia M George (probate, 398KB)
+
+Additional fixture captured from live site 2026-04-14 (#2449):
+  cc_probate_multi_case_041426.pdf — Dept 30, Judge Virginia M George
+    (probate, 16 entries, exercises the Csicsery/Cianci/Vincent fuzzy-match
+    scenario from #2449 — three Levenshtein-close case_numbers P25-02101,
+    P25-02117, P25-02118 in the same calendar).
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -921,6 +928,331 @@ def test_cc_llm_extract_rulings_probate(mock_call_llm: MagicMock) -> None:
     assert result[0].outcome == "granted"
     assert len(result[0].parties) == 1
     assert result[0].parties[0]["role"] == "subject"
+
+
+# ---------------------------------------------------------------------------
+# Multi-case probate regression (#2449) — exercises the Csicsery/Cianci/Vincent
+# fuzzy-match scenario against a real PDF fixture.
+#
+# Three calendar rows in this PDF have Levenshtein-close case_numbers:
+#   P25-02101 — Csicsery Family Trust
+#   P25-02117 — Cianci Family 1997 Revocable Trust
+#   P25-02118 — George R. Vincent and Christie J. Vincent Revocable Trust
+# Before the #2467/#2468 fixes, these three rulings collapsed onto a single
+# P25-02101 row with the Vincent title. This test locks in that the
+# _llm_extract_rulings adapter layer preserves per-row alignment of
+# (case_number, case_title, ruling_text) verbatim from the LLM response.
+# ---------------------------------------------------------------------------
+
+
+# Mock LLM response for cc_probate_multi_case_041426.pdf. Each entry is the
+# ground truth from a calendar row in the source PDF (entries numbered
+# 1..16; the PDF has 16 rulings across 15 distinct case numbers, because
+# P24-01462 has two rulings — modeled here as line_number 8 and 9 with
+# distinct ruling_text). ruling_text is trimmed to the first line for
+# readability; this is sufficient to prove alignment because it is unique
+# per row.
+def _probate_ruling(
+    *,
+    line_number: int,
+    case_number: str,
+    case_title: str,
+    outcome: str,
+    motion_type: str,
+    ruling_text: str,
+    party_name: str,
+) -> dict[str, object]:
+    return {
+        "line_number": line_number,
+        "extracted_case_number": case_number,
+        "extracted_case_title": case_title,
+        "case_type": "probate",
+        "outcome": outcome,
+        "motion_type": motion_type,
+        "ruling_text": ruling_text,
+        "extracted_parties": [
+            {"name": party_name, "role": "subject", "confidence": "high"},
+        ],
+    }
+
+
+_MULTI_CASE_PROBATE_LLM_RESPONSE = json.dumps(
+    {
+        "extracted_judge_name": "Virginia M. George",
+        "hearing_date": "2026-04-14",
+        "department": "30",
+        "rulings": [
+            _probate_ruling(
+                line_number=1,
+                case_number="MSP12-01412",
+                case_title="Bobbye M. Hickey Family Trust",
+                outcome="granted",
+                motion_type="petition",
+                ruling_text=("Petition Approved. Proposed Order Submitted. No Appearance Required"),
+                party_name="Bobbye M. Hickey Family Trust",
+            ),
+            _probate_ruling(
+                line_number=2,
+                case_number="MSP20-00800",
+                case_title="Re The Sophia Acevedo Minor's Stlmnt Trust",
+                outcome="other",
+                motion_type="petition",
+                ruling_text=("Need: 1. Proof of mailing to Dept. of Health Care Services"),
+                party_name="Sophia Acevedo Minor's Settlement Trust",
+            ),
+            _probate_ruling(
+                line_number=3,
+                case_number="MSP21-00214",
+                case_title="Estate of Judith E. Pinson",
+                outcome="other",
+                motion_type="petition",
+                ruling_text="Petitioner, sister, still must do the following:",
+                party_name="Judith E. Pinson",
+            ),
+            _probate_ruling(
+                line_number=4,
+                case_number="P22-01450",
+                case_title="Estate of: Harold Hopkins",
+                outcome="other",
+                motion_type="petition",
+                ruling_text=("Need appearances to report status, including mediation"),
+                party_name="Harold Hopkins",
+            ),
+            _probate_ruling(
+                line_number=5,
+                case_number="P23-01809",
+                case_title="Estate of: Eugene Albright",
+                outcome="other",
+                motion_type="petition",
+                ruling_text=("Need: 1. Proof of mailing to all persons entitled to receive notice"),
+                party_name="Eugene Albright",
+            ),
+            _probate_ruling(
+                line_number=6,
+                case_number="P23-02214",
+                case_title=(
+                    "Matter of: The Crimmins Family Trust, Dated April 5, 2000, As Amended"
+                ),
+                outcome="other",
+                motion_type="petition",
+                ruling_text=("Need appearances to report status, including mediation ordered"),
+                party_name="Crimmins Family Trust",
+            ),
+            _probate_ruling(
+                line_number=7,
+                case_number="P24-00491",
+                case_title="Estate of: Floda Dunn",
+                outcome="other",
+                motion_type="petition",
+                ruling_text=("Need: 1. Appearances 2. Verified declaration by petitioner"),
+                party_name="Floda Dunn",
+            ),
+            _probate_ruling(
+                line_number=8,
+                case_number="P24-01462",
+                case_title=("Matter of: The Voss Family Trust Dated January 6, 1996, As Amended"),
+                outcome="other",
+                motion_type="motion",
+                ruling_text="Need appearances",
+                party_name="Voss Family Trust",
+            ),
+            _probate_ruling(
+                line_number=9,
+                case_number="P24-01462",
+                case_title=("Matter of: The Voss Family Trust Dated January 6, 1996, As Amended"),
+                outcome="other",
+                motion_type="petition",
+                ruling_text="Drop. Note: Request for Dismissal entered 2-13-2026.",
+                party_name="Voss Family Trust",
+            ),
+            _probate_ruling(
+                line_number=10,
+                case_number="P24-01754",
+                case_title="Estate of: Margaret Bernard",
+                outcome="other",
+                motion_type="petition",
+                ruling_text=("Petitioner still must do the following: 1. Appear at the hearing"),
+                party_name="Margaret Bernard",
+            ),
+            _probate_ruling(
+                line_number=11,
+                case_number="P25-00249",
+                case_title=("Matter of: The Alan R Pufahl Revocable Trust Dated June 1, 2006"),
+                outcome="other",
+                motion_type="petition",
+                ruling_text="Need appearances to report status",
+                party_name="Alan R Pufahl Revocable Trust",
+            ),
+            _probate_ruling(
+                line_number=12,
+                case_number="P25-01473",
+                case_title=(
+                    "Matter of: Sue Lin Bypass Trust Dated March 10, 2007 "
+                    "and The Chin-Chu Lin Survivor's Trust "
+                    "Dated March 10, 2007"
+                ),
+                outcome="other",
+                motion_type="motion",
+                ruling_text=(
+                    "Drop. Note: Request to Withdraw Motion for Joinder and Order filed 12-3-2025."
+                ),
+                party_name="Sue Lin Bypass Trust",
+            ),
+            _probate_ruling(
+                line_number=13,
+                case_number="P25-02101",
+                case_title=("Matter of: The Csicsery Family Trust Dated April 24, 1992"),
+                outcome="other",
+                motion_type="petition",
+                ruling_text=(
+                    "Need: 1. Appearances 2. Proof of service in the manner provided in CCP"
+                ),
+                party_name="Csicsery Family Trust",
+            ),
+            _probate_ruling(
+                line_number=14,
+                case_number="P25-02117",
+                case_title=(
+                    "Matter of: Cianci Family 1997 Revocable Trust Agreement "
+                    "As Amended and Restated"
+                ),
+                outcome="other",
+                motion_type="petition",
+                ruling_text=(
+                    "Need: 1. Appearances 2. Proof of service in the manner provided in CCP"
+                ),
+                party_name="Cianci Family 1997 Revocable Trust",
+            ),
+            _probate_ruling(
+                line_number=15,
+                case_number="P25-02118",
+                case_title=(
+                    "Matter of: The George R. Vincent and "
+                    "Christie J. Vincent Revocable Trust, "
+                    "Under Declaration Dated March 2, 1997, "
+                    "As Amended and Restated on November 4, 2011"
+                ),
+                outcome="granted",
+                motion_type="petition",
+                ruling_text=("Petition Approved. Proposed Order Submitted. No Appearance Required"),
+                party_name=("George R. Vincent and Christie J. Vincent Revocable Trust"),
+            ),
+            _probate_ruling(
+                line_number=16,
+                case_number="P25-01628",
+                case_title="Estate of: Razia Alam",
+                outcome="other",
+                motion_type="petition",
+                ruling_text="Need appearances to report status",
+                party_name="Razia Alam",
+            ),
+        ],
+    }
+)
+
+
+@patch("ingestion.llm_providers.call_llm")
+def test_cc_llm_extract_rulings_multi_case_probate_alignment(
+    mock_call_llm: MagicMock,
+) -> None:
+    """Regression #2449: multi-case probate PDF — per-row field alignment.
+
+    Exercises the scenario from the original bug: three Levenshtein-close
+    case_numbers (P25-02101 Csicsery, P25-02117 Cianci, P25-02118 Vincent)
+    appear in the same calendar, along with 13 other rows. Each row's
+    (case_number, case_title, ruling_text) tuple must be preserved verbatim
+    from the LLM response — no collapse, no cross-row contamination.
+
+    This test uses the real PDF fixture `cc_probate_multi_case_041426.pdf`
+    (Dept 30, Judge Virginia M George, 2026-04-14) as the pdf_text input
+    to `_llm_extract_rulings`, with a mocked LLM that returns the ground
+    truth transcription of all 16 rows. Asserts per-row alignment for every
+    entry plus the specific three-way fuzzy-match scenario that caused the
+    original #2449 bug.
+    """
+    mock_response = MagicMock()
+    mock_response.text = _MULTI_CASE_PROBATE_LLM_RESPONSE
+    mock_response.input_tokens = 4000
+    mock_response.output_tokens = 2500
+    mock_call_llm.return_value = mock_response
+
+    pdf_bytes = _load_bytes("cc_probate_multi_case_041426.pdf")
+    pdf_text = _extract_pdf_text(pdf_bytes)
+    assert pdf_text, "PDF text extraction must not be empty"
+
+    result = _llm_extract_rulings(pdf_text)
+    assert result is not None, "LLM extraction must succeed"
+    assert len(result) == 16, f"expected 16 rulings from 16-entry calendar, got {len(result)}"
+
+    # Index by ruling_index (1-based, matches line_number in the LLM JSON).
+    # Each case_number appears exactly once in this PDF except P24-01462
+    # which has two rulings (entries 8A/8B in the PDF) — both titled
+    # Voss Family Trust. The bug's core regression is that per-row fields
+    # must stay aligned; cross-row checks happen via Hickey, Csicsery,
+    # Cianci, and Vincent below.
+    by_index = {r.ruling_index: r for r in result}
+
+    # Row 1 — Hickey (this is the one whose ruling text got misrouted in #2449).
+    hickey = by_index[1]
+    assert hickey.case_number == "MSP12-01412"
+    assert hickey.case_title == "Bobbye M. Hickey Family Trust"
+    assert "Petition Approved" in hickey.ruling_text
+
+    # Row 13 — Csicsery (P25-02101). Before #2467, this row's title got
+    # overwritten to "Vincent Trust" due to fuzzy collapse + title-clobber.
+    csicsery = by_index[13]
+    assert csicsery.case_number == "P25-02101"
+    assert "Csicsery" in csicsery.case_title, (
+        f"P25-02101 must be Csicsery, got: {csicsery.case_title!r}"
+    )
+    assert "Vincent" not in csicsery.case_title, (
+        f"P25-02101 must NOT be titled Vincent (#2449 regression): {csicsery.case_title!r}"
+    )
+    assert "Appearances" in csicsery.ruling_text
+    assert "Petition Approved" not in csicsery.ruling_text
+
+    # Row 14 — Cianci (P25-02117). Before #2467, this row collapsed onto
+    # P25-02101 via Levenshtein-distance-2 fuzzy match.
+    cianci = by_index[14]
+    assert cianci.case_number == "P25-02117"
+    assert "Cianci" in cianci.case_title
+    assert "Csicsery" not in cianci.case_title
+    assert "Vincent" not in cianci.case_title
+
+    # Row 15 — Vincent (P25-02118). This is the row that donated its
+    # "Petition Approved" text to P25-02101 in the original bug. Its
+    # ruling_text must stay on P25-02118, not leak to P25-02101.
+    vincent = by_index[15]
+    assert vincent.case_number == "P25-02118"
+    assert "Vincent" in vincent.case_title
+    assert "Csicsery" not in vincent.case_title
+    assert "Petition Approved" in vincent.ruling_text
+
+    # All three Levenshtein-close case_numbers must stay distinct.
+    csicsery_cianci_vincent = {
+        csicsery.case_number,
+        cianci.case_number,
+        vincent.case_number,
+    }
+    assert csicsery_cianci_vincent == {
+        "P25-02101",
+        "P25-02117",
+        "P25-02118",
+    }, (
+        f"#2449 regression: the three Levenshtein-close probate numbers "
+        f"must remain distinct — got {csicsery_cianci_vincent!r}"
+    )
+
+    # Global invariant: every row has a non-empty case_number, case_title,
+    # and ruling_text, and ruling_index is 1..16 exactly once.
+    seen_indices: set[int] = set()
+    for r in result:
+        assert r.case_number, f"ruling {r.ruling_index} has empty case_number"
+        assert r.case_title, f"ruling {r.ruling_index} has empty case_title"
+        assert r.ruling_text, f"ruling {r.ruling_index} has empty ruling_text"
+        assert r.ruling_index not in seen_indices, f"duplicate ruling_index {r.ruling_index}"
+        seen_indices.add(r.ruling_index)
+    assert seen_indices == set(range(1, 17))
 
 
 @patch("ingestion.llm_providers.call_llm")
