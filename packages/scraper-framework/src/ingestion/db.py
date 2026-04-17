@@ -484,23 +484,56 @@ def insert_document(
     The scraper's document_id UUID is used as documents.id so that OpenSearch
     document IDs and rulings.document_id references all converge on the same key.
 
-    When ``force_update`` is True, the ON CONFLICT clause overwrites
-    ``hearing_date`` with the new value unconditionally (instead of using
-    ``COALESCE``).  This is the "force update" path used by
-    ``reingest_from_s3.py`` to correct bad historical data — live ingestion
-    uses the default ``force_update=False`` to preserve good existing dates
-    when a new extraction happens to miss them (#2405).
+    **Column classification for ON CONFLICT semantics (#2475):**
+
+    ===============  ==================  ==========================================
+    Column           Class               Default (live) semantics
+    ===============  ==================  ==========================================
+    ``case_id``      identity anchor     preserve first — once set, a later live
+                                         re-ingest will NOT silently relink the
+                                         document to a different case.  Overwrite
+                                         is only available under ``force_update``.
+    ``hearing_date`` correctable fact    incoming wins when non-NULL — a later,
+                                         higher-quality extraction legitimately
+                                         updates the hearing date.
+    ``last_seen_at`` timestamp           always NOW() on every conflict.
+    ===============  ==================  ==========================================
+
+    **Default (``force_update=False``) — live ingestion path:**
+    ``case_id`` uses ``COALESCE(documents.case_id, EXCLUDED.case_id)``: once
+    the document is linked to a case, that link is preserved.  An upstream
+    fuzzy-match bug that re-routes the document to the wrong case cannot
+    silently rewrite the identity — same guard shape as #2468.  ``hearing_date``
+    uses ``COALESCE(EXCLUDED.hearing_date, documents.hearing_date)``: an
+    incoming non-NULL date replaces the stored date, but an incoming NULL
+    preserves a previously-extracted date (#2405 fill-in semantics).
+
+    **``force_update=True`` — reingest / correction path (#2405):**
+    Both ``case_id`` and ``hearing_date`` are overwritten with ``EXCLUDED.*``
+    unconditionally, so ``reingest_from_s3.py`` can deliberately re-route a
+    document to a corrected case or replace a stuck hearing date after an
+    extraction-logic fix.
     """
     # Map ContentFormat string to PostgreSQL document_format enum value
     format_map = {"html": "html", "pdf": "pdf", "docx": "docx", "text": "txt"}
     pg_format = format_map.get(content_format.lower(), "html")
 
+    # Build ON CONFLICT set clauses.  ``case_id`` is an identity anchor: in the
+    # default (live-ingestion) path we preserve the first non-NULL case link to
+    # guard against upstream mis-routing (#2475, sibling of #2468).  Under
+    # ``force_update=True`` the reingest path can deliberately re-route the
+    # document to a corrected case.  ``hearing_date`` is a correctable fact:
+    # incoming wins when non-NULL in the default path (#2405 semantics); under
+    # ``force_update`` the reingest path overwrites even with NULL to clear a
+    # previously-bad date.
     if force_update:
         hearing_date_clause = "hearing_date = EXCLUDED.hearing_date"
+        case_id_clause = "case_id = EXCLUDED.case_id"
     else:
         hearing_date_clause = (
             "hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date)"
         )
+        case_id_clause = "case_id = COALESCE(documents.case_id, EXCLUDED.case_id)"
 
     sql = f"""
         INSERT INTO documents (
@@ -519,7 +552,7 @@ def insert_document(
         )
         ON CONFLICT (id) DO UPDATE SET
             {hearing_date_clause},
-            case_id = EXCLUDED.case_id,
+            {case_id_clause},
             last_seen_at = NOW()
         RETURNING (xmax = 0) AS is_new
     """
@@ -1442,18 +1475,62 @@ def insert_ruling(
     AI-generated plain-English summaries produced at ingestion time
     (gated behind ``ENABLE_RULING_SUMMARIZATION``).
 
+    **Column classification for ON CONFLICT semantics (#2475):**
+
+    ========================  ==================  ==================================
+    Column                    Class               Default (live) semantics
+    ========================  ==================  ==================================
+    ``case_id``               identity anchor     preserve first — a later live
+                                                  re-ingest will NOT silently
+                                                  relink the ruling to a different
+                                                  case.  Overwrite available only
+                                                  under ``force_update``.
+    ``judge_id``              identity anchor     preserve first — nullable, so an
+                                                  incoming non-NULL still fills in
+                                                  a currently-NULL judge, but an
+                                                  established judge is never
+                                                  silently replaced.  Overwrite
+                                                  available only under
+                                                  ``force_update``.
+    ``hearing_date``          correctable fact    incoming wins when non-NULL.
+    ``outcome``               correctable fact    incoming wins when non-NULL.
+    ``motion_type``           correctable fact    incoming wins when non-NULL.
+    ``department``            correctable fact    incoming wins when non-NULL.
+    ``ruling_text``           correctable fact    incoming wins when non-NULL;
+                                                  never erased (always COALESCE
+                                                  regardless of ``force_update``).
+    ``ruling_text_html``      correctable fact    same as ``ruling_text``.
+    ``summary``               correctable fact    same as ``ruling_text``.
+    ``summary_model``         correctable fact    same as ``ruling_text``.
+    ``summary_generated_at``  correctable fact    same as ``ruling_text``.
+    ``ruling_text_hash``      correctable fact    derived from ``ruling_text``.
+    ========================  ==================  ==================================
+
     **force_update (keyword-only, default False):**
-    Controls COALESCE vs direct-overwrite semantics on conflict.  When False
-    (live-ingestion default), the ON CONFLICT clause uses
-    ``COALESCE(EXCLUDED.col, rulings.col)`` so a re-ingest that happens to
-    miss a field does not erase the previously-good value.  When True
-    (reingest path), the ON CONFLICT clause overwrites ``case_id``,
-    ``judge_id``, ``hearing_date``, ``outcome``, ``motion_type``, and
-    ``department`` with ``EXCLUDED.*`` unconditionally — including NULL —
-    so reingest can correct bad historical data (#2405).  Text fields
-    (``ruling_text``, ``ruling_text_html``, ``summary``) always use
-    COALESCE regardless of force_update: we never erase a good ruling text
-    just because a re-extraction happened to miss it.
+    Controls COALESCE vs direct-overwrite semantics on conflict.
+
+    *Default (``force_update=False``) — live ingestion path:* identity
+    anchors (``case_id``, ``judge_id``) use preserve-first COALESCE
+    ``COALESCE(rulings.col, EXCLUDED.col)`` so an upstream mis-routing bug
+    (e.g. fuzzy-match case-number rewrite, #2449) cannot silently relink
+    the ruling to the wrong case or judge — same guard shape as #2468 on
+    ``cases.case_title``.  Correctable facts
+    (``hearing_date``, ``outcome``, ``motion_type``, ``department``, and
+    the text/summary fields) use incoming-wins COALESCE
+    ``COALESCE(EXCLUDED.col, rulings.col)`` so a later, higher-quality
+    extraction legitimately updates them, while an incoming NULL does not
+    erase a good existing value.
+
+    *``force_update=True`` — reingest path (#2405):* identity anchors and
+    the non-text correctable facts (``case_id``, ``judge_id``,
+    ``hearing_date``, ``outcome``, ``motion_type``, ``department``) are
+    overwritten with ``EXCLUDED.*`` unconditionally — including NULL — so
+    ``scripts/reingest_from_s3.py`` can correct bad historical data after
+    an extraction-logic fix.  Text fields (``ruling_text``,
+    ``ruling_text_html``, ``summary``, ``summary_model``,
+    ``summary_generated_at``, ``ruling_text_hash``) always use COALESCE
+    regardless of ``force_update``: we never erase a good ruling text just
+    because a re-extraction happened to miss it.
     """
     ruling_text = _strip_nul(ruling_text)
     ruling_text_html = _strip_nul(ruling_text_html)
@@ -1464,14 +1541,29 @@ def insert_ruling(
 
     text_hash = normalize_ruling_text_hash(ruling_text)
 
-    # Build ON CONFLICT set clauses based on force_update mode.  In the default
-    # (live-ingestion) mode, structured fields use COALESCE so a miss during
-    # re-extraction does not erase the previously-good value.  In force_update
-    # mode (reingest), case_id / judge_id / hearing_date / outcome /
-    # motion_type / department are overwritten with EXCLUDED.* unconditionally
-    # so reingest can correct bad historical data (#2405).  Text and summary
-    # fields always use COALESCE — we never erase good ruling text just
-    # because a re-extraction happened to miss it.
+    # Build ON CONFLICT set clauses based on force_update mode (#2475).
+    #
+    # Identity anchors (case_id, judge_id): in the default (live-ingestion)
+    # mode, these use PRESERVE-FIRST COALESCE — ``COALESCE(rulings.col,
+    # EXCLUDED.col)`` — so an upstream mis-routing bug (#2449) cannot silently
+    # relink the ruling to the wrong case or judge.  An incoming non-NULL only
+    # wins when the existing column is NULL (e.g. first-time judge fill-in).
+    # In force_update mode (reingest, #2405), these are overwritten with
+    # ``EXCLUDED.*`` unconditionally so ``reingest_from_s3.py`` can
+    # deliberately re-route after an extraction-logic fix.
+    #
+    # Correctable facts (hearing_date, outcome, motion_type, department): in
+    # the default mode, these use INCOMING-WINS COALESCE — ``COALESCE(
+    # EXCLUDED.col, rulings.col)`` — so a later, higher-quality extraction
+    # legitimately replaces them while an incoming NULL preserves a good
+    # existing value.  In force_update mode they are overwritten with
+    # ``EXCLUDED.*`` unconditionally (including NULL) so reingest can clear
+    # bad historical data.
+    #
+    # Text and summary fields (ruling_text, ruling_text_html, summary,
+    # summary_model, summary_generated_at, ruling_text_hash) always use
+    # incoming-wins COALESCE regardless of force_update — we never erase good
+    # ruling text just because a re-extraction happened to miss it.
     if force_update:
         conflict_case_id = "case_id = EXCLUDED.case_id"
         conflict_judge_id = "judge_id = EXCLUDED.judge_id"
@@ -1480,8 +1572,10 @@ def insert_ruling(
         conflict_motion_type = "motion_type = EXCLUDED.motion_type"
         conflict_department = "department = EXCLUDED.department"
     else:
-        conflict_case_id = "case_id = COALESCE(EXCLUDED.case_id, rulings.case_id)"
-        conflict_judge_id = "judge_id = COALESCE(EXCLUDED.judge_id, rulings.judge_id)"
+        # Identity anchors: preserve first.
+        conflict_case_id = "case_id = COALESCE(rulings.case_id, EXCLUDED.case_id)"
+        conflict_judge_id = "judge_id = COALESCE(rulings.judge_id, EXCLUDED.judge_id)"
+        # Correctable facts: incoming wins when non-NULL.
         conflict_hearing_date = (
             "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date)"
         )
@@ -1577,7 +1671,23 @@ def insert_ruling(
         # Mirror the force_update semantics on the fallback UPDATE so reingest
         # can correct bad judge_id / hearing_date / outcome / motion_type /
         # department on rulings that matched by content hash rather than by
-        # document_id.  Text/summary fields always keep COALESCE.
+        # document_id.  Text/summary fields always keep incoming-wins COALESCE.
+        #
+        # Identity-anchor semantics (#2475):
+        # - ``case_id`` is fixed by the WHERE clause (``WHERE case_id = %s::uuid
+        #   AND ruling_text_hash = %s``), so it cannot be silently re-routed
+        #   here — the match already requires it to stay the same.
+        # - ``judge_id`` is an assignment.  Default (live) mode uses
+        #   preserve-first ``COALESCE(judge_id, %s::uuid)``: an established
+        #   judge is never silently replaced by an incoming non-NULL value,
+        #   while a currently-NULL judge can still be filled in.  Under
+        #   ``force_update`` we overwrite unconditionally so reingest can
+        #   correct a bad judge link.
+        #
+        # Correctable facts (hearing_date, outcome, motion_type, department)
+        # keep incoming-wins COALESCE in the default path (a later extraction
+        # can legitimately improve them) and unconditional overwrite under
+        # force_update.
         if force_update:
             judge_id_clause = "judge_id = %s::uuid"
             hearing_date_clause = "hearing_date = %s::date"
@@ -1585,7 +1695,9 @@ def insert_ruling(
             motion_type_clause = "motion_type = %s"
             department_clause = "department = %s"
         else:
-            judge_id_clause = "judge_id = COALESCE(%s::uuid, judge_id)"
+            # Identity anchor: preserve first.
+            judge_id_clause = "judge_id = COALESCE(judge_id, %s::uuid)"
+            # Correctable facts: incoming wins when non-NULL.
             hearing_date_clause = "hearing_date = COALESCE(%s::date, hearing_date)"
             outcome_clause = "outcome = COALESCE(%s::ruling_outcome, outcome)"
             motion_type_clause = "motion_type = COALESCE(%s, motion_type)"
@@ -1680,11 +1792,23 @@ def insert_document_and_ruling(
     (#2215).
 
     ``force_update`` (default False) is threaded through to both
-    ``insert_document`` and ``insert_ruling``.  When True, ON CONFLICT
-    clauses overwrite ``case_id``, ``judge_id``, ``hearing_date``,
-    ``outcome``, ``motion_type``, and ``department`` with ``EXCLUDED.*``
-    unconditionally (including NULL) so reingest can correct bad historical
-    data (#2405).  Text and summary fields always keep COALESCE.
+    ``insert_document`` and ``insert_ruling``.  See those functions'
+    docstrings for the full column-by-column preserve-first vs incoming-wins
+    classification (#2475).  Briefly:
+
+    - **Default (``force_update=False``) — live ingestion:** identity
+      anchors (``documents.case_id``, ``rulings.case_id``, ``rulings.judge_id``)
+      use preserve-first COALESCE so a silent upstream re-route cannot rewrite
+      the identity (#2468 / #2475).  Correctable facts (``hearing_date``,
+      ``outcome``, ``motion_type``, ``department``, and the text/summary
+      fields) use incoming-wins COALESCE so later, higher-quality extractions
+      legitimately replace them.
+    - **``force_update=True`` — reingest path (#2405):** identity anchors
+      and the non-text correctable facts are overwritten with ``EXCLUDED.*``
+      unconditionally (including NULL) so reingest can correct bad historical
+      data.  Text/summary fields always use incoming-wins COALESCE regardless
+      of ``force_update`` — we never erase a good ruling text just because a
+      re-extraction happened to miss it.
 
     Returns ``True`` if the document row was newly inserted, ``False`` if it
     already existed (same semantics as ``insert_document``).

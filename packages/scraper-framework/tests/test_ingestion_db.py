@@ -2868,3 +2868,399 @@ class TestDeleteStaleSplitChildren:
         assert "validation_results" in sql_calls[1]
         assert "rulings" in sql_calls[2]
         assert "DELETE FROM documents" in sql_calls[3]
+
+
+# ---------------------------------------------------------------------------
+# insert_ruling / insert_document identity-anchor preservation (#2475)
+# ---------------------------------------------------------------------------
+
+
+def _insert_ruling_conflict_sql(conn: MagicMock) -> str:
+    """Extract the ``INSERT INTO rulings`` SQL from a mocked ``insert_ruling`` call.
+
+    Returns the raw SQL string so tests can assert on the ON CONFLICT clause.
+    """
+    cur = conn.cursor.return_value.__enter__.return_value
+    for call in reversed(cur.execute.call_args_list):
+        args = call[0]
+        if args and isinstance(args[0], str) and "INSERT INTO rulings" in args[0]:
+            return args[0]
+    raise ValueError("No execute() call with INSERT INTO rulings found")
+
+
+def _insert_document_sql(conn: MagicMock) -> str:
+    """Extract the ``INSERT INTO documents`` SQL from a mocked ``insert_document`` call."""
+    cur = conn.cursor.return_value.__enter__.return_value
+    for call in reversed(cur.execute.call_args_list):
+        args = call[0]
+        if args and isinstance(args[0], str) and "INSERT INTO documents" in args[0]:
+            return args[0]
+    raise ValueError("No execute() call with INSERT INTO documents found")
+
+
+class TestInsertRulingPreservesIdentityAnchors:
+    """Regression tests for #2475 — identity-anchor preservation in ``insert_ruling``.
+
+    ``case_id`` and ``judge_id`` are **identity anchors**: once a ruling has been
+    linked to a case and a judge, a later live-ingestion re-ingest must NOT
+    silently relink it to a different case or judge.  The pre-#2475 SQL used
+    ``COALESCE(EXCLUDED.case_id, rulings.case_id)`` which meant an incoming
+    non-NULL value always won — exactly the shape of the #2468 bug.  The fix
+    swaps the argument order for these two columns only, so the existing value
+    wins in the default (live-ingestion) path.
+
+    ``force_update=True`` still overwrites with ``EXCLUDED.*`` unconditionally
+    so ``reingest_from_s3.py`` can correct bad historical identity anchors
+    (e.g. after fixing an upstream fuzzy-match bug).
+    """
+
+    def test_insert_ruling_default_preserves_case_id(self) -> None:
+        """Default mode: ON CONFLICT uses COALESCE(rulings.case_id, EXCLUDED.case_id)."""
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-1",
+        )
+
+        sql = _insert_ruling_conflict_sql(conn)
+        assert "case_id = COALESCE(rulings.case_id, EXCLUDED.case_id)" in sql, (
+            f"Expected preserve-first COALESCE for case_id, got SQL:\n{sql}"
+        )
+        # The old buggy order must not appear.
+        assert "COALESCE(EXCLUDED.case_id" not in sql, (
+            f"Legacy overwrite COALESCE order found for case_id — this is the "
+            f"#2475/#2468 identity-anchor bug. SQL:\n{sql}"
+        )
+
+    def test_insert_ruling_default_preserves_judge_id(self) -> None:
+        """Default mode: ON CONFLICT uses COALESCE(rulings.judge_id, EXCLUDED.judge_id)."""
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-1",
+        )
+
+        sql = _insert_ruling_conflict_sql(conn)
+        assert "judge_id = COALESCE(rulings.judge_id, EXCLUDED.judge_id)" in sql, (
+            f"Expected preserve-first COALESCE for judge_id, got SQL:\n{sql}"
+        )
+        assert "COALESCE(EXCLUDED.judge_id" not in sql, (
+            f"Legacy overwrite COALESCE order found for judge_id. SQL:\n{sql}"
+        )
+
+    def test_insert_ruling_correctable_fields_still_use_incoming_wins(self) -> None:
+        """Correctable facts (outcome, motion_type, department, hearing_date,
+        ruling_text, ruling_text_html, summary) keep the incoming-wins
+        COALESCE(EXCLUDED.*, rulings.*) order in default mode — a later,
+        higher-quality extraction legitimately should replace them.
+        """
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-1",
+            outcome="granted",
+            motion_type="Demurrer",
+            ruling_text_html="<p>Motion GRANTED</p>",
+            summary="Motion granted.",
+        )
+
+        sql = _insert_ruling_conflict_sql(conn)
+        # Each correctable field must keep EXCLUDED-first COALESCE semantics.
+        expected_correctable_fragments = [
+            "hearing_date = COALESCE(EXCLUDED.hearing_date, rulings.hearing_date)",
+            "outcome = COALESCE(EXCLUDED.outcome, rulings.outcome)",
+            "motion_type = COALESCE(EXCLUDED.motion_type, rulings.motion_type)",
+            "department = COALESCE(EXCLUDED.department, rulings.department)",
+            "ruling_text = COALESCE(EXCLUDED.ruling_text, rulings.ruling_text)",
+            "summary = COALESCE(EXCLUDED.summary, rulings.summary)",
+        ]
+        for fragment in expected_correctable_fragments:
+            assert fragment in sql, (
+                f"Expected incoming-wins COALESCE for correctable field — "
+                f"missing fragment {fragment!r} in SQL:\n{sql}"
+            )
+
+
+class TestInsertRulingForceUpdateIdentityAnchors:
+    """Regression tests for #2475 — ``force_update=True`` in ``insert_ruling`` still
+    overwrites identity anchors ``case_id`` and ``judge_id`` with ``EXCLUDED.*``.
+
+    This preserves the reingest path (#2405 / #2431) where
+    ``scripts/reingest_from_s3.py`` deliberately re-routes rulings to the
+    correct case or judge after an extraction-logic fix.
+    """
+
+    def test_force_update_overwrites_case_id_unconditionally(self) -> None:
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-2-corrected",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-1",
+            force_update=True,
+        )
+
+        sql = _insert_ruling_conflict_sql(conn)
+        assert "case_id = EXCLUDED.case_id" in sql, (
+            f"Expected unconditional overwrite for case_id in force_update mode, got SQL:\n{sql}"
+        )
+        # No preserve-first COALESCE in force_update mode.
+        assert "COALESCE(rulings.case_id" not in sql
+
+    def test_force_update_overwrites_judge_id_unconditionally(self) -> None:
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-2-corrected",
+            force_update=True,
+        )
+
+        sql = _insert_ruling_conflict_sql(conn)
+        assert "judge_id = EXCLUDED.judge_id" in sql, (
+            f"Expected unconditional overwrite for judge_id in force_update mode, got SQL:\n{sql}"
+        )
+        assert "COALESCE(rulings.judge_id" not in sql
+
+
+class TestInsertRulingContentHashFallbackPreservesJudgeId:
+    """Regression tests for #2475 — the content-hash fallback UPDATE path
+    must also preserve an established ``judge_id`` in default mode.
+
+    ``case_id`` is fixed by the WHERE clause (``WHERE case_id = %s::uuid AND
+    ruling_text_hash = %s``) so it cannot be silently re-routed there.  But
+    ``judge_id`` is an assignment and was previously written as
+    ``judge_id = COALESCE(%s::uuid, judge_id)`` — incoming wins.  Flipped to
+    preserve-first: ``judge_id = COALESCE(judge_id, %s::uuid)``.
+    """
+
+    def test_fallback_update_default_preserves_judge_id(self) -> None:
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="new-doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-different",
+        )
+
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]]
+        assert len(update_calls) == 1
+        sql = update_calls[0][0][0]
+        assert "judge_id = COALESCE(judge_id, %s::uuid)" in sql, (
+            f"Expected preserve-first COALESCE for judge_id in fallback UPDATE, got SQL:\n{sql}"
+        )
+        # The old buggy order (incoming wins) must not appear.
+        assert "judge_id = COALESCE(%s::uuid, judge_id)" not in sql, (
+            f"Legacy incoming-wins COALESCE order found for judge_id in the "
+            f"content-hash fallback UPDATE. SQL:\n{sql}"
+        )
+
+    def test_fallback_update_force_update_overwrites_judge_id(self) -> None:
+        """``force_update=True`` in the fallback UPDATE path still overwrites
+        judge_id unconditionally — this is the reingest / correction path.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+
+        insert_ruling(
+            conn,
+            document_id="new-doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+            judge_id="judge-corrected",
+            force_update=True,
+        )
+
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE rulings SET" in c[0][0]]
+        assert len(update_calls) == 1
+        sql = update_calls[0][0][0]
+        assert "judge_id = %s::uuid" in sql
+        # In force_update mode the default preserve-first clause must not appear.
+        assert "judge_id = COALESCE(judge_id, %s::uuid)" not in sql
+
+
+class TestInsertRulingReRouteScenario:
+    """Scenario test mirroring the #2468 Csicsery-vs-Vincent scenario, at the
+    ruling level.
+
+    Setup: a document already ingested against ``case_id = case-csicsery``.
+    The document is re-ingested (same document_id) and an upstream mis-routing
+    bug re-routes the ruling to ``case_id = case-vincent`` and ``judge_id =
+    judge-wrong``.  In default (live-ingestion) mode, the ON CONFLICT clause
+    must preserve the originally-linked case and judge — the fix is the SQL
+    literal, not a runtime check, so the test asserts on the generated SQL.
+    """
+
+    def test_live_ingestion_reroute_is_silently_ignored(self) -> None:
+        conn = _mock_conn()
+        insert_ruling(
+            conn,
+            document_id="doc-csicsery-ruling",
+            case_id="case-vincent-wrong",  # silent re-route attempt
+            court_id="court-contra-costa",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="The motion is GRANTED.",
+            department="Probate",
+            judge_id="judge-wrong",
+        )
+
+        sql = _insert_ruling_conflict_sql(conn)
+        # Preserve-first COALESCE must guard both identity anchors.
+        assert "case_id = COALESCE(rulings.case_id, EXCLUDED.case_id)" in sql
+        assert "judge_id = COALESCE(rulings.judge_id, EXCLUDED.judge_id)" in sql
+
+
+class TestInsertDocumentPreservesCaseId:
+    """Regression tests for #2475 — ``insert_document`` must not silently re-route
+    a document to a different case on ON CONFLICT.
+
+    The pre-#2475 SQL had a raw ``case_id = EXCLUDED.case_id`` — strictly worse
+    than COALESCE because it would even overwrite a good existing case_id with
+    NULL (though ``case_id`` is NOT NULL so NULL is impossible in practice, the
+    overwrite-on-non-null was still a silent re-route).  Default mode now uses
+    preserve-first ``COALESCE(documents.case_id, EXCLUDED.case_id)``.
+    """
+
+    def test_insert_document_default_preserves_case_id(self) -> None:
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="abc123",
+            s3_key="rulings/doc-1.html",
+            s3_bucket="judgemind-docs",
+            source_url="https://example.com/ruling.html",
+            scraper_id="scraper-oc",
+            captured_at=datetime(2026, 3, 5, 10, 0, 0),
+            hearing_date=date(2026, 3, 10),
+        )
+
+        sql = _insert_document_sql(conn)
+        assert "case_id = COALESCE(documents.case_id, EXCLUDED.case_id)" in sql, (
+            f"Expected preserve-first COALESCE for case_id in insert_document, got SQL:\n{sql}"
+        )
+        # The old unconditional-overwrite form must not appear.
+        # Grep specifically for the ON CONFLICT SET clause pattern,
+        # not the INSERT column list (which does contain "case_id" alone).
+        assert "case_id = EXCLUDED.case_id" not in sql, (
+            f"Legacy unconditional overwrite for case_id found in "
+            f"insert_document — this is the #2475 identity-anchor bug. "
+            f"SQL:\n{sql}"
+        )
+        # Guard against a regression to the original buggy COALESCE order.
+        assert "COALESCE(EXCLUDED.case_id" not in sql
+
+    def test_insert_document_force_update_overwrites_case_id(self) -> None:
+        """``force_update=True`` threads through to the ON CONFLICT clause and
+        restores unconditional overwrite — the reingest correction path."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-2-corrected",
+            court_id="court-1",
+            content_format="html",
+            content_hash="abc123",
+            s3_key="rulings/doc-1.html",
+            s3_bucket="judgemind-docs",
+            source_url="https://example.com/ruling.html",
+            scraper_id="scraper-oc",
+            captured_at=datetime(2026, 3, 5, 10, 0, 0),
+            hearing_date=date(2026, 3, 10),
+            force_update=True,
+        )
+
+        sql = _insert_document_sql(conn)
+        assert "case_id = EXCLUDED.case_id" in sql, (
+            f"Expected unconditional overwrite for case_id in force_update mode, got SQL:\n{sql}"
+        )
+        assert "COALESCE(documents.case_id" not in sql
+
+    def test_insert_document_hearing_date_still_correctable_default(self) -> None:
+        """``hearing_date`` remains a correctable fact — default mode uses
+        incoming-wins COALESCE(EXCLUDED.hearing_date, documents.hearing_date).
+        """
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (True,)
+
+        insert_document(
+            conn,
+            document_id="doc-1",
+            case_id="case-1",
+            court_id="court-1",
+            content_format="html",
+            content_hash="abc123",
+            s3_key=None,
+            s3_bucket=None,
+            source_url="https://example.com",
+            scraper_id="scraper-1",
+            captured_at=datetime(2026, 3, 5),
+            hearing_date=date(2026, 3, 10),
+        )
+
+        sql = _insert_document_sql(conn)
+        assert "hearing_date = COALESCE(EXCLUDED.hearing_date, documents.hearing_date)" in sql
