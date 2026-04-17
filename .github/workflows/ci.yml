@@ -85,6 +85,10 @@ jobs:
               - 'packages/api/src/data-access/schema.sql'
             hooks:
               - '.claude/hooks/**'
+              # Also trigger when the preflight-hook-test job itself changes,
+              # so regressions in the auto-discovery loop are caught on the
+              # PR that introduces them (#2410).
+              - '.github/workflows/ci.yml'
       - name: Check if any coverage-producing package changed
         id: any-testable
         run: |
