@@ -154,7 +154,10 @@ runs:
         #
         # See issue #2519 for the full motivation. The logic lives in a separate
         # script so it can be shellchecked and unit-tested with a mock AWS CLI.
-        "${GITHUB_ACTION_PATH}/wait-for-rollout.sh"
+        # Single source of truth at scripts/wait-for-rollout.sh (see #2523) —
+        # also invoked directly by scripts/ecs-redeploy.sh for operator-run
+        # manual redeploys.
+        "${GITHUB_WORKSPACE}/scripts/wait-for-rollout.sh"
 
     - name: Update EventBridge Scheduler target
       if: inputs.deploy-mode == 'scheduler'
