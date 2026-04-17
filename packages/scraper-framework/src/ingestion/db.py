@@ -1458,9 +1458,21 @@ def insert_ruling(
        exists (from a prior scrape that produced different raw bytes but
        semantically identical text), the unique index
        ``uq_rulings_case_text_hash`` raises a UniqueViolation.  We catch it
-       inside a savepoint and fall back to an UPDATE of the existing row.
-       The hash is a SHA-256 of the lowercased, whitespace-collapsed ruling
-       text (see ``normalize_ruling_text_hash``).
+       inside a savepoint and **supersede the losing document** (#2458): the
+       ruling row already present for the winner keeps its text/fields, and
+       the losing document is marked ``status = 'superseded'`` so it is
+       excluded from future queries.  Any stale ruling row keyed on the
+       losing document_id is deleted first.  The hash is a SHA-256 of the
+       lowercased, whitespace-collapsed ruling text (see
+       ``normalize_ruling_text_hash``).
+
+       Historical note (pre-#2458): the fallback path used to run
+       ``UPDATE rulings ... WHERE case_id = ? AND ruling_text_hash = ?``,
+       which matched the *winner*'s row (already present) rather than the
+       loser's (never inserted).  That path silently mutated the winner
+       with the loser's fields and left the loser's document with stale
+       ``ruling_text`` from before reingest.  Superseding the loser is
+       both simpler and avoids writing the loser's fields onto the winner.
 
     Requires a UNIQUE constraint on ``rulings.document_id`` (migration 3) and
     a partial UNIQUE index on ``(case_id, ruling_text_hash)`` where
@@ -1663,95 +1675,47 @@ def insert_ruling(
             raise
 
         # Content-hash collision — a ruling with the same normalized text
-        # already exists for this case under a different document_id.
-        # Update the existing row instead.
+        # already exists for this case under a different document_id.  The
+        # current document is a duplicate at the content level; supersede it
+        # (#2458).
 
-    # Fallback: update the existing ruling that has the same content hash.
-    if text_hash is not None:
-        # Mirror the force_update semantics on the fallback UPDATE so reingest
-        # can correct bad judge_id / hearing_date / outcome / motion_type /
-        # department on rulings that matched by content hash rather than by
-        # document_id.  Text/summary fields always keep incoming-wins COALESCE.
-        #
-        # Identity-anchor semantics (#2475):
-        # - ``case_id`` is fixed by the WHERE clause (``WHERE case_id = %s::uuid
-        #   AND ruling_text_hash = %s``), so it cannot be silently re-routed
-        #   here — the match already requires it to stay the same.
-        # - ``judge_id`` is an assignment.  Default (live) mode uses
-        #   preserve-first ``COALESCE(judge_id, %s::uuid)``: an established
-        #   judge is never silently replaced by an incoming non-NULL value,
-        #   while a currently-NULL judge can still be filled in.  Under
-        #   ``force_update`` we overwrite unconditionally so reingest can
-        #   correct a bad judge link.
-        #
-        # Correctable facts (hearing_date, outcome, motion_type, department)
-        # keep incoming-wins COALESCE in the default path (a later extraction
-        # can legitimately improve them) and unconditional overwrite under
-        # force_update.
-        if force_update:
-            judge_id_clause = "judge_id = %s::uuid"
-            hearing_date_clause = "hearing_date = %s::date"
-            outcome_clause = "outcome = %s::ruling_outcome"
-            motion_type_clause = "motion_type = %s"
-            department_clause = "department = %s"
-        else:
-            # Identity anchor: preserve first.
-            judge_id_clause = "judge_id = COALESCE(judge_id, %s::uuid)"
-            # Correctable facts: incoming wins when non-NULL.
-            hearing_date_clause = "hearing_date = COALESCE(%s::date, hearing_date)"
-            outcome_clause = "outcome = COALESCE(%s::ruling_outcome, outcome)"
-            motion_type_clause = "motion_type = COALESCE(%s, motion_type)"
-            department_clause = "department = COALESCE(%s, department)"
-
-        update_sql = f"""
-            UPDATE rulings SET
-                {judge_id_clause},
-                {hearing_date_clause},
-                {outcome_clause},
-                {motion_type_clause},
-                ruling_text = COALESCE(%s, ruling_text),
-                ruling_text_html = COALESCE(%s, ruling_text_html),
-                {department_clause},
-                summary = COALESCE(%s, summary),
-                summary_model = COALESCE(%s, summary_model),
-                summary_generated_at = COALESCE(%s, summary_generated_at),
-                updated_at = NOW()
-            WHERE case_id = %s::uuid AND ruling_text_hash = %s
-        """
-
-        with conn.cursor() as cur:
-            cur.execute(
-                update_sql,
-                (
-                    judge_id,
-                    hearing_date,
-                    outcome,
-                    motion_type,
-                    ruling_text,
-                    ruling_text_html,
-                    department,
-                    summary,
-                    summary_model,
-                    summary_generated_at,
-                    case_id,
-                    text_hash,
-                ),
-            )
-            if cur.rowcount == 0:
-                logger.warning(
-                    "insert_ruling: fallback UPDATE matched 0 rows — "
-                    "conflicting row may have been deleted concurrently "
-                    "(document_id=%s, case_id=%s, text_hash=%s)",
-                    document_id,
-                    case_id,
-                    text_hash,
-                )
-        logger.info(
-            "insert_ruling: content-hash dedup — updated existing ruling "
-            "instead of inserting duplicate (document_id=%s, case_id=%s)",
-            document_id,
-            case_id,
+    # Fallback: supersede the losing document.
+    #
+    # A content-hash collision means another document (the winner) already
+    # owns a ruling row keyed on (case_id, ruling_text_hash).  Rather than
+    # mutating the winner's row with this document's fields — the old
+    # behavior that caused the bug in #2458 where the *loser's* row was
+    # left with stale ruling_text — we mark this document as superseded
+    # so it drops out of ``active`` queries.  The winner's ruling row is
+    # left untouched: it already has the correct text (same text by
+    # definition, since the hashes match) and was populated by whichever
+    # document was processed first.
+    #
+    # Any stale ruling row still keyed on ``document_id`` (e.g. from an
+    # earlier run that inserted before the other document existed) is
+    # deleted first so the superseded document leaves no orphaned ruling
+    # behind.
+    #
+    # Matches the existing ``_supersede_document`` pattern in
+    # ``scripts/reingest_from_s3.py`` used for split-child dedup.
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM rulings WHERE document_id = %s::uuid",
+            (document_id,),
         )
+        deleted = cur.rowcount
+        cur.execute(
+            "UPDATE documents SET status = 'superseded' WHERE id = %s::uuid",
+            (document_id,),
+        )
+    logger.info(
+        "insert_ruling: content-hash dedup — superseded losing document "
+        "%s (case_id=%s, ruling_text_hash=%s, deleted %d stale ruling row(s))",
+        document_id,
+        case_id,
+        text_hash,
+        deleted,
+    )
 
 
 def insert_document_and_ruling(

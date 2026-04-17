@@ -5504,7 +5504,7 @@ def _make_content_hash_fallback_conn() -> tuple[MagicMock, MagicMock]:
     """Return a (conn, cursor) mock that raises UniqueViolation on the INSERT.
 
     The raised UniqueViolation mimics the ``uq_rulings_case_text_hash``
-    constraint violation that triggers the fallback UPDATE path.
+    constraint violation that triggers the supersede-the-loser path (#2458).
     """
     conn = MagicMock(spec=psycopg.Connection)
     cur = MagicMock()
@@ -5516,7 +5516,7 @@ def _make_content_hash_fallback_conn() -> tuple[MagicMock, MagicMock]:
 
     def execute_side_effect(sql: str, *args: object, **kwargs: object) -> None:
         call_index[0] += 1
-        # SAVEPOINT -> INSERT -> ROLLBACK -> UPDATE
+        # SAVEPOINT -> INSERT -> ROLLBACK -> DELETE FROM rulings -> UPDATE documents
         if call_index[0] == 2 and "INSERT INTO rulings" in sql:
             exc = psycopg.errors.UniqueViolation("duplicate key")
             raise exc
@@ -5527,27 +5527,33 @@ def _make_content_hash_fallback_conn() -> tuple[MagicMock, MagicMock]:
     return conn, cur
 
 
-def _fallback_update_sql(cur: MagicMock) -> str:
+def _supersede_stmts(cur: MagicMock) -> list[tuple[str, tuple[object, ...]]]:
+    """Return (sql, params) tuples for the supersede-path calls.
+
+    The supersede path runs exactly two statements after ROLLBACK TO
+    SAVEPOINT: a ``DELETE FROM rulings WHERE document_id = %s::uuid`` and
+    an ``UPDATE documents SET status = 'superseded' WHERE id = %s::uuid``.
+    """
+    stmts: list[tuple[str, tuple[object, ...]]] = []
     for call in cur.execute.call_args_list:
         sql = call.args[0] if call.args else ""
-        if "UPDATE rulings SET" in sql:
-            return sql
-    raise AssertionError("No UPDATE rulings SET call was made on this cursor")
+        params = call.args[1] if len(call.args) > 1 else ()
+        if "DELETE FROM rulings WHERE document_id" in sql:
+            stmts.append((sql, params))
+        elif "UPDATE documents SET status = 'superseded'" in sql:
+            stmts.append((sql, params))
+    return stmts
 
 
-def test_insert_ruling_content_hash_fallback_default_uses_coalesce() -> None:
-    """Default fallback UPDATE path uses COALESCE for structured fields.
-
-    Per #2475, ``judge_id`` is an identity anchor: preserve-first in the default
-    path so a re-matching LLM extraction cannot silently overwrite an existing
-    non-NULL judge. Other fields (hearing_date, outcome, motion_type,
-    department) are correctable facts — incoming-wins when non-NULL.
-    """
+def test_insert_ruling_content_hash_collision_supersedes_loser_default() -> None:
+    """On ``uq_rulings_case_text_hash`` violation, the losing document is
+    superseded — no content-hash UPDATE runs on the winner (#2458)."""
     conn, cur = _make_content_hash_fallback_conn()
 
+    losing_doc_id = "11111111-1111-1111-1111-111111111111"
     insert_ruling(
         conn,
-        document_id="11111111-1111-1111-1111-111111111111",
+        document_id=losing_doc_id,
         case_id="22222222-2222-2222-2222-222222222222",
         court_id="33333333-3333-3333-3333-333333333333",
         hearing_date=date(2026, 4, 1),
@@ -5558,23 +5564,30 @@ def test_insert_ruling_content_hash_fallback_default_uses_coalesce() -> None:
         motion_type="Motion to Compel",
     )
 
-    update_sql = _fallback_update_sql(cur)
-    # Identity anchor: preserve-first COALESCE.
-    assert "judge_id = COALESCE(judge_id, %s::uuid)" in update_sql
-    # Correctable facts: incoming-wins COALESCE.
-    assert "hearing_date = COALESCE(%s::date, hearing_date)" in update_sql
-    assert "outcome = COALESCE(%s::ruling_outcome, outcome)" in update_sql
-    assert "motion_type = COALESCE(%s, motion_type)" in update_sql
-    assert "department = COALESCE(%s, department)" in update_sql
+    supersede_stmts = _supersede_stmts(cur)
+    # Exactly one DELETE + one UPDATE, both scoped to the losing document_id.
+    assert len(supersede_stmts) == 2
+    delete_sql, delete_params = supersede_stmts[0]
+    update_sql, update_params = supersede_stmts[1]
+    assert "DELETE FROM rulings WHERE document_id" in delete_sql
+    assert delete_params == (losing_doc_id,)
+    assert "UPDATE documents SET status = 'superseded'" in update_sql
+    assert update_params == (losing_doc_id,)
+    # The old buggy fallback UPDATE that targeted (case_id, ruling_text_hash)
+    # must not run — it silently mutated the winner's row (#2458).
+    all_sql = [call.args[0] if call.args else "" for call in cur.execute.call_args_list]
+    assert not any("UPDATE rulings SET" in s and "ruling_text_hash" in s for s in all_sql)
 
 
-def test_insert_ruling_content_hash_fallback_force_update_overrides() -> None:
-    """force_update=True fallback UPDATE uses direct %s assignment (no COALESCE)."""
+def test_insert_ruling_content_hash_collision_supersedes_loser_force_update() -> None:
+    """``force_update=True`` (reingest path) also supersedes the loser —
+    the supersede decision does not depend on ``force_update`` (#2458)."""
     conn, cur = _make_content_hash_fallback_conn()
 
+    losing_doc_id = "11111111-1111-1111-1111-111111111111"
     insert_ruling(
         conn,
-        document_id="11111111-1111-1111-1111-111111111111",
+        document_id=losing_doc_id,
         case_id="22222222-2222-2222-2222-222222222222",
         court_id="33333333-3333-3333-3333-333333333333",
         hearing_date=None,
@@ -5586,20 +5599,13 @@ def test_insert_ruling_content_hash_fallback_force_update_overrides() -> None:
         force_update=True,
     )
 
-    update_sql = _fallback_update_sql(cur)
-    # Structured fields: direct %s assignment (no COALESCE wrapper).
-    assert "judge_id = %s::uuid" in update_sql
-    assert "COALESCE(%s::uuid, judge_id)" not in update_sql
-    assert "hearing_date = %s::date" in update_sql
-    assert "COALESCE(%s::date, hearing_date)" not in update_sql
-    assert "outcome = %s::ruling_outcome" in update_sql
-    assert "COALESCE(%s::ruling_outcome, outcome)" not in update_sql
-    # motion_type/department are bare %s (the raw %s without cast) —
-    # use surrounding context to avoid matching the COALESCE variant.
-    assert "motion_type = %s,\n" in update_sql
-    assert "department = %s,\n" in update_sql
-    assert "COALESCE(%s, motion_type)" not in update_sql
-    assert "COALESCE(%s, department)" not in update_sql
-    # Text/summary fields always keep COALESCE.
-    assert "ruling_text = COALESCE(%s, ruling_text)" in update_sql
-    assert "summary = COALESCE(%s, summary)" in update_sql
+    supersede_stmts = _supersede_stmts(cur)
+    assert len(supersede_stmts) == 2
+    _, delete_params = supersede_stmts[0]
+    _, update_params = supersede_stmts[1]
+    assert delete_params == (losing_doc_id,)
+    assert update_params == (losing_doc_id,)
+    # No UPDATE rulings SET of any form should run — the supersede path
+    # must not touch the winner's ruling row.
+    all_sql = [call.args[0] if call.args else "" for call in cur.execute.call_args_list]
+    assert not any("UPDATE rulings SET" in s for s in all_sql)
