@@ -205,6 +205,50 @@ class TestCaseNameFieldRe:
         assert m is not None
         assert "Smith v. Jones" in m.group("title")
 
+    # Regression tests for #2578 — FILED metadata boundary.  Some LA dept pages
+    # (Dept 25 Mkrtchyan pattern) render CASE NAME on the same visual line as
+    # a COMP/PET/FAC FILED metadata field — the old regex only stopped at
+    # "CASE NUMBER" so it leaked the filing date into the title.
+
+    def test_case_name_stops_at_comp_filed(self) -> None:
+        text = "CASE NAME: Landaverde v. Meller    COMP. FILED: 07-03-25"
+        m = CASE_NAME_FIELD_RE.search(text)
+        assert m is not None
+        title = m.group("title").strip()
+        assert title == "Landaverde v. Meller"
+        assert "FILED" not in title.upper()
+        assert "07-03-25" not in title
+
+    def test_case_name_stops_at_pet_filed(self) -> None:
+        text = "CASE NAME: Smith v. Jones    PET. FILED: 11-26-25"
+        m = CASE_NAME_FIELD_RE.search(text)
+        assert m is not None
+        title = m.group("title").strip()
+        assert title == "Smith v. Jones"
+        assert "FILED" not in title.upper()
+
+    def test_case_name_stops_at_fac_filed(self) -> None:
+        text = "CASE NAME: Acme Corp v. Beta Industries   FAC FILED: 02-15-25"
+        m = CASE_NAME_FIELD_RE.search(text)
+        assert m is not None
+        title = m.group("title").strip()
+        assert title == "Acme Corp v. Beta Industries"
+        assert "FILED" not in title.upper()
+
+    def test_case_name_stops_at_complaint_filed_longform(self) -> None:
+        text = "CASE NAME: Doe v. Roe    COMPLAINT FILED: 01-01-25"
+        m = CASE_NAME_FIELD_RE.search(text)
+        assert m is not None
+        title = m.group("title").strip()
+        assert title == "Doe v. Roe"
+
+    def test_case_name_stops_at_petition_filed_longform(self) -> None:
+        text = "CASE NAME: In re Smith    PETITION FILED: 03-12-25"
+        m = CASE_NAME_FIELD_RE.search(text)
+        assert m is not None
+        title = m.group("title").strip()
+        assert title == "In re Smith"
+
 
 # ---------------------------------------------------------------------------
 # Constants tests

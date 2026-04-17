@@ -116,9 +116,21 @@ VS_RE = re.compile(r"\bv(?:s)?\.", re.IGNORECASE)
 # Case name / title field pattern
 # ---------------------------------------------------------------------------
 
-# Inline "Case Name: [text]" or "Case Title: [text]" field
+# Inline "Case Name: [text]" or "Case Title: [text]" field.
+#
+# Some LA dept pages (Dept 25 Mkrtchyan pattern) render CASE NAME on the same
+# visual line as a FILED metadata field — e.g.:
+#   "CASE NAME:  Landaverde v. Meller      COMP. FILED:  07-03-25"
+# Without the FILED boundary below, the lazy ".+?" keeps matching through
+# the COMP/PET/FAC FILED metadata looking for the CASE NUMBER boundary on a
+# later line, which leaks the filing date into the extracted title (#2578).
 CASE_NAME_FIELD_RE = re.compile(
-    r"CASE\s+(?:NAME|TITLE)\s*:\s*(?P<title>.+?)(?:\s+CASE\s+NUMBER|\s*$)",
+    r"CASE\s+(?:NAME|TITLE)\s*:\s*(?P<title>.+?)"
+    r"(?:"
+    r"\s+(?:COMP|COMPLAINT|PET|PETITION|FAC)\.?\s*FILED"
+    r"|\s+CASE\s+NUMBER"
+    r"|\s*$"
+    r")",
     re.IGNORECASE | re.MULTILINE,
 )
 
