@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
-"""Re-ingest existing documents from S3 through the (now-idempotent) pipeline.
+"""Re-ingest existing documents from S3 through the pipeline.
 
 **This script operates on existing database records only.** It queries the
 ``documents`` table for matching rows, then re-processes each one through the
@@ -9,6 +9,23 @@ yet (e.g. a newly added county with S3 data but no prior ingestion), this
 script will process 0 documents.  For initial population from S3, use
 ``rebuild_db.py --county <name>`` instead — it discovers documents directly
 from S3 keys and does not require pre-existing database records.
+
+**Known non-idempotency (#2490):** This script is NOT a drop-in idempotent
+counterpart of the live worker path.  Two divergences exist:
+
+1. ``FETCH_DOCUMENTS_QUERY`` does not select ``judge_name`` or ``department``
+   from the database, so the LLM-cache metadata footprint differs from the
+   worker path and forces a separate cache lane for the same raw PDF
+   (#2501).
+2. The multimodal branch falls back to ``doc_meta.get("case_title")`` when
+   the LLM returns no title — this lets stale DB state propagate forward
+   instead of resetting to NULL, and combined with ``force_update=True``
+   on ``upsert_case`` creates a self-sustaining fixed point for wrong
+   titles (#2502).
+
+For cleanup of corrupted ``derived.*`` state, prefer ``rebuild_db.py
+--county <name>`` over reingest — rebuild walks S3 directly and does not
+participate in either of the divergences above.
 
 For each document in the database, fetches the raw content from S3, re-runs
 the scraper's parse_document() to extract fields with the current (improved)
