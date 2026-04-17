@@ -13,7 +13,7 @@ Response: {"result": [<count>, "<html_table>"]}
 The HTML table contains structured <tr> rows with headers:
   Case Number, Case Title, Court Date, Calendar Matter, Rulings
 
-7 RulingIDs map to 5 departments:
+8 RulingIDs map to 6 departments:
   10 → Dept 301 (Law & Motion/Discovery, odd case numbers)
    2 → Dept 302 (Law & Motion/Discovery, even case numbers)
    6 → Dept 304 (Asbestos Discovery)
@@ -21,6 +21,7 @@ The HTML table contains structured <tr> rows with headers:
    8 → Dept 304 (Asbestos Motion Calendar)
    9 → Dept 210 (Real Property Housing Court Motions)
    3 → Dept 501 (Real Property Housing Court Motions)
+   7 → Dept 204 (Probate)
 
 The site is behind Cloudflare Turnstile CAPTCHA. The scraper uses
 Playwright with stealth to navigate the CAPTCHA page, which auto-solves
@@ -94,6 +95,7 @@ RULING_ID_MAP: dict[int, dict[str, str]] = {
     8: {"department": "304", "type": "Asbestos Motion Calendar"},
     9: {"department": "210", "type": "Real Property Housing Court Motions"},
     3: {"department": "501", "type": "Real Property Housing Court Motions"},
+    7: {"department": "204", "type": "Probate"},
 }
 
 # Ordered list of RulingIDs to fetch.
