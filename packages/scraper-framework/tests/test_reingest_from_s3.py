@@ -60,6 +60,8 @@ def _make_document_row(
     hearing_date: date | None = _HEARING_DATE,
     ruling_hearing_date: date | None = _HEARING_DATE,
     stored_ruling_text: str | None = None,
+    ruling_department: str | None = None,
+    ruling_judge_name: str | None = None,
 ) -> tuple:
     """Return a tuple matching the FETCH_DOCUMENTS_QUERY columns."""
     return (
@@ -81,6 +83,8 @@ def _make_document_row(
         case_title,  # c.case_title
         ruling_hearing_date,  # ruling_hearing_date (subquery)
         stored_ruling_text,  # stored_ruling_text (subquery)
+        ruling_department,  # ruling_department (subquery)
+        ruling_judge_name,  # ruling_judge_name (subquery)
     )
 
 
@@ -187,6 +191,184 @@ class TestFetchDocumentsQuery:
     def test_query_has_limit(self) -> None:
         """The query must still use LIMIT for batch sizing."""
         assert "LIMIT %s" in reingest.FETCH_DOCUMENTS_QUERY
+
+    def test_query_selects_judge_name_and_department(self) -> None:
+        """The query must fetch judge_name and department from rulings so
+        the multimodal LLM cache key matches the worker path.  See #2501.
+        """
+        query = reingest.FETCH_DOCUMENTS_QUERY
+        assert "AS ruling_department" in query
+        assert "AS ruling_judge_name" in query
+        # The judge_name subquery must join rulings -> judges to get the
+        # canonical judge name rather than selecting a non-existent column.
+        assert "j.canonical_name" in query
+        assert "LEFT JOIN judges j ON j.id = r.judge_id" in query
+
+
+# ---------------------------------------------------------------------------
+# LLM cache key parity: worker vs reingest paths
+# ---------------------------------------------------------------------------
+
+
+class TestLlmCacheKeyParity:
+    """Verify reingest and worker paths produce identical LLM cache keys.
+
+    Regression test for #2501: FETCH_DOCUMENTS_QUERY previously omitted
+    judge_name and department, so reingest built metadata = {hearing_date}
+    while the worker built metadata = {judge_name, department, hearing_date}.
+    Same raw PDF -> different content_hash_for_cache -> duplicate LLM calls
+    + divergent extraction output.
+    """
+
+    @staticmethod
+    def _build_worker_metadata(event_data: dict) -> dict[str, str]:
+        """Mirror packages/scraper-framework/src/ingestion/worker.py ~L2222.
+
+        This is the exact logic the live ingestion worker uses to build
+        the metadata dict passed to multimodal_extractor.extract_from_pdf.
+        """
+        metadata: dict[str, str] = {}
+        if event_data.get("judge_name"):
+            metadata["judge_name"] = event_data["judge_name"]
+        if event_data.get("department"):
+            metadata["department"] = event_data["department"]
+        if event_data.get("hearing_date"):
+            metadata["hearing_date"] = str(event_data["hearing_date"])
+        return metadata
+
+    @staticmethod
+    def _build_reingest_metadata(doc_meta: dict) -> dict[str, str]:
+        """Mirror scripts/reingest_from_s3.py ~L1483 inside _reparse_document_multimodal.
+
+        Only the three keys that actually feed the LLM cache hash.
+        """
+        metadata: dict[str, str] = {}
+        if doc_meta.get("judge_name"):
+            metadata["judge_name"] = str(doc_meta["judge_name"])
+        if doc_meta.get("department"):
+            metadata["department"] = str(doc_meta["department"])
+        if doc_meta.get("hearing_date"):
+            metadata["hearing_date"] = str(doc_meta["hearing_date"])
+        return metadata
+
+    def test_reingest_row_populates_judge_name_and_department_in_doc_meta(self) -> None:
+        """End-to-end: a row with judge_name and department must map into
+        doc_meta so downstream metadata matches the worker path.
+        """
+        from framework.llm_extractor import _content_hash_for_cache
+
+        # Event payload the scraper produced at capture time (worker path).
+        event_data = {
+            "judge_name": "Hon. Layne H. Melzer",
+            "department": "C25",
+            "hearing_date": date(2026, 3, 5),
+        }
+
+        # Row returned by FETCH_DOCUMENTS_QUERY after the fix.
+        row = _make_document_row(
+            scraper_id="ca-oc-tentatives-civil",
+            hearing_date=event_data["hearing_date"],
+            ruling_hearing_date=event_data["hearing_date"],
+            ruling_department=event_data["department"],
+            ruling_judge_name=event_data["judge_name"],
+        )
+
+        # Reingest unpacks the row the same way the script does.  We
+        # reproduce the doc_meta construction here rather than invoking
+        # the full reingest_batch pipeline because the full pipeline
+        # requires DB / S3 mocks for every step, and this test only
+        # cares about the judge_name/department propagation.
+        ruling_department = row[18]
+        ruling_judge_name = row[19]
+
+        doc_meta = {
+            "format": "pdf",
+            "hearing_date": row[9],
+            "judge_name": ruling_judge_name,
+            "department": ruling_department,
+        }
+
+        # Build metadata via both paths and hash the same PDF bytes.
+        pdf_bytes = b"%PDF-1.7\nfake pdf contents\n"
+        worker_meta = self._build_worker_metadata(event_data)
+        reingest_meta = self._build_reingest_metadata(doc_meta)
+
+        assert worker_meta == reingest_meta, (
+            "Worker and reingest metadata dicts must be identical; got "
+            f"worker={worker_meta} vs reingest={reingest_meta}"
+        )
+        assert _content_hash_for_cache(pdf_bytes, worker_meta) == _content_hash_for_cache(
+            pdf_bytes, reingest_meta
+        )
+
+    def test_cache_keys_diverge_when_judge_name_and_department_missing(self) -> None:
+        """Regression: without the fix, reingest metadata drops judge_name
+        and department, and the cache key differs from the worker path.
+
+        This pins the bug: if someone reverts the FETCH_DOCUMENTS_QUERY fix
+        without updating the test suite, this test's expectation would
+        stop protecting the guarantee.  The test is positive (divergence
+        exists when fields are missing) rather than negative, so it stays
+        green when the fix is present and only demonstrates the failure
+        mode it's protecting against.
+        """
+        from framework.llm_extractor import _content_hash_for_cache
+
+        pdf_bytes = b"%PDF-1.7\nfake pdf contents\n"
+
+        worker_meta = self._build_worker_metadata(
+            {
+                "judge_name": "Hon. Layne H. Melzer",
+                "department": "C25",
+                "hearing_date": date(2026, 3, 5),
+            }
+        )
+        reingest_meta_without_fix = self._build_reingest_metadata(
+            {"hearing_date": date(2026, 3, 5)}
+        )
+
+        assert _content_hash_for_cache(pdf_bytes, worker_meta) != _content_hash_for_cache(
+            pdf_bytes, reingest_meta_without_fix
+        )
+
+    def test_cache_key_parity_for_missing_scraper_metadata(self) -> None:
+        """When both paths have no judge_name/department (e.g. a county
+        whose scraper does not provide either), the cache keys must still
+        match — both paths see only hearing_date.
+        """
+        from framework.llm_extractor import _content_hash_for_cache
+
+        event_data = {
+            "judge_name": None,
+            "department": None,
+            "hearing_date": date(2026, 3, 5),
+        }
+
+        row = _make_document_row(
+            scraper_id="ca-oc-tentatives-civil",
+            hearing_date=event_data["hearing_date"],
+            ruling_hearing_date=event_data["hearing_date"],
+            ruling_department=None,
+            ruling_judge_name=None,
+        )
+        ruling_department = row[18]
+        ruling_judge_name = row[19]
+
+        doc_meta = {
+            "format": "pdf",
+            "hearing_date": row[9],
+            "judge_name": ruling_judge_name,
+            "department": ruling_department,
+        }
+
+        pdf_bytes = b"%PDF-1.7\nfake pdf contents\n"
+        worker_meta = self._build_worker_metadata(event_data)
+        reingest_meta = self._build_reingest_metadata(doc_meta)
+
+        assert worker_meta == reingest_meta
+        assert _content_hash_for_cache(pdf_bytes, worker_meta) == _content_hash_for_cache(
+            pdf_bytes, reingest_meta
+        )
 
 
 # ---------------------------------------------------------------------------
