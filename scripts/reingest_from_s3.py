@@ -11,21 +11,25 @@ script will process 0 documents.  For initial population from S3, use
 from S3 keys and does not require pre-existing database records.
 
 **Known non-idempotency (#2490):** This script is NOT a drop-in idempotent
-counterpart of the live worker path.  Two divergences exist:
+counterpart of the live worker path.  One divergence remains:
 
-1. ``FETCH_DOCUMENTS_QUERY`` does not select ``judge_name`` or ``department``
-   from the database, so the LLM-cache metadata footprint differs from the
-   worker path and forces a separate cache lane for the same raw PDF
-   (#2501).
-2. The multimodal branch falls back to ``doc_meta.get("case_title")`` when
+1. The multimodal branch falls back to ``doc_meta.get("case_title")`` when
    the LLM returns no title — this lets stale DB state propagate forward
    instead of resetting to NULL, and combined with ``force_update=True``
    on ``upsert_case`` creates a self-sustaining fixed point for wrong
    titles (#2502).
 
+**Resolved divergences:**
+
+-   ``FETCH_DOCUMENTS_QUERY`` now selects ``judge_name`` (via
+    ``rulings.judge_id`` -> ``judges.canonical_name``) and ``department``
+    (from ``rulings.department``) and propagates them into ``doc_meta`` so
+    the LLM-cache metadata footprint matches the worker path for the same
+    raw PDF (#2501).
+
 For cleanup of corrupted ``derived.*`` state, prefer ``rebuild_db.py
 --county <name>`` over reingest — rebuild walks S3 directly and does not
-participate in either of the divergences above.
+participate in the remaining divergence above.
 
 For each document in the database, fetches the raw content from S3, re-runs
 the scraper's parse_document() to extract fields with the current (improved)
@@ -293,7 +297,12 @@ FETCH_DOCUMENTS_QUERY = """
         (SELECT r.hearing_date FROM rulings r
          WHERE r.document_id = d.id LIMIT 1) AS ruling_hearing_date,
         (SELECT r.ruling_text FROM rulings r
-         WHERE r.document_id = d.id LIMIT 1) AS stored_ruling_text
+         WHERE r.document_id = d.id LIMIT 1) AS stored_ruling_text,
+        (SELECT r.department FROM rulings r
+         WHERE r.document_id = d.id LIMIT 1) AS ruling_department,
+        (SELECT j.canonical_name FROM rulings r
+         LEFT JOIN judges j ON j.id = r.judge_id
+         WHERE r.document_id = d.id LIMIT 1) AS ruling_judge_name
     FROM documents d
     JOIN courts ct ON ct.id = d.court_id
     LEFT JOIN cases c ON c.id = d.case_id
@@ -1900,6 +1909,8 @@ def reingest_batch(
             case_title,
             ruling_hearing_date,
             stored_ruling_text,
+            ruling_department,
+            ruling_judge_name,
         ) = row
         processed += 1
         doc_id_str = str(doc_id)
@@ -1991,6 +2002,13 @@ def reingest_batch(
             "s3_key": s3_key,
             "s3_bucket": s3_bucket,
             "stored_ruling_text": stored_ruling_text,
+            # judge_name and department are pulled from the rulings row so
+            # the multimodal LLM cache key matches the worker path.  Without
+            # these, reingest builds a different content_hash_for_cache than
+            # the live ingestion worker for the same PDF, causing duplicate
+            # LLM spend and divergent extraction output.  See #2501.
+            "judge_name": ruling_judge_name,
+            "department": ruling_department,
         }
 
         parseable.append((idx, doc_meta, raw_content))
