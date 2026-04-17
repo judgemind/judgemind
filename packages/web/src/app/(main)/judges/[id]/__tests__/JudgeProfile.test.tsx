@@ -39,6 +39,9 @@ vi.mock('lucide-react', () => ({
   X: ({ className }: { className?: string }) => (
     <span data-testid="x-icon" className={className} aria-hidden="true" />
   ),
+  ChevronRight: ({ className }: { className?: string }) => (
+    <span data-testid="chevron-right-icon" className={className} aria-hidden="true" />
+  ),
 }));
 
 // IntersectionObserver mock
@@ -1135,6 +1138,115 @@ describe('JudgeProfile', () => {
       expect(screen.getByTestId('motion-type-filter-pill')).toBeInTheDocument();
     });
     expect(screen.getByTestId('motion-type-filter-pill')).toHaveTextContent('MSJ');
+  });
+
+  // -------------------------------------------------------------------------
+  // Affordance tests (#2150) — visual indicators that rows are clickable
+  // -------------------------------------------------------------------------
+
+  it('renders a caption under the motion type breakdown table explaining the click-to-filter interaction', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-aff-1'),
+      buildRulingsMock('judge-aff-1'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-aff-1" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // A hint caption should tell the user that rows are clickable
+    const hint = screen.getByTestId('motion-type-click-hint');
+    expect(hint).toBeInTheDocument();
+    expect(hint.textContent?.toLowerCase()).toMatch(/click.*filter/);
+  });
+
+  it('styles motion type name cells with a link-style class (text-primary) to indicate interactivity', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-aff-2'),
+      buildRulingsMock('judge-aff-2'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-aff-2" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // The motion type name cell should have text-primary styling on the label
+    const msjLabel = screen.getByTestId('motion-type-label-msj');
+    expect(msjLabel).toBeInTheDocument();
+    expect(msjLabel.className).toContain('text-primary');
+  });
+
+  it('renders a chevron affordance indicator on each motion type row', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-aff-3'),
+      buildRulingsMock('judge-aff-3'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-aff-3" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Each motion type row should contain a ChevronRight icon as an affordance
+    const chevrons = screen.getAllByTestId('chevron-right-icon');
+    // Two motion types (msj, demurrer) in the default mock
+    expect(chevrons.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('includes visually hidden context describing the filter action on each motion type row', async () => {
+    const mocks = [
+      buildAnalyticsMock('judge-aff-4'),
+      buildRulingsMock('judge-aff-4'),
+    ];
+
+    render(
+      <MockedProvider mocks={mocks}>
+        <JudgeProfile judgeId="judge-aff-4" />
+      </MockedProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Motion Type Breakdown')).toBeInTheDocument();
+    });
+
+    // Each row should include a visually hidden (sr-only) span describing the
+    // click action, so screen readers announce the action after the row's
+    // cells (rather than an aria-label on the row, which would override the
+    // accessible names of descendant cells and hide the statistics).
+    const msjCells = screen.getAllByText('MSJ');
+    const msjRow = msjCells[0].closest('tr');
+    expect(msjRow).not.toBeNull();
+
+    // No aria-label on the row itself (would suppress child TableCell text).
+    expect(msjRow?.getAttribute('aria-label')).toBeNull();
+
+    // sr-only span inside the row describes the filter action.
+    const srOnlySpans = msjRow?.querySelectorAll('span.sr-only') ?? [];
+    const srOnlyText = Array.from(srOnlySpans)
+      .map((s) => s.textContent ?? '')
+      .join(' ');
+    expect(srOnlyText).toMatch(/click to filter rulings by this motion type/i);
+
+    // The row also exposes a non-announcing data attribute (used for tests
+    // and e2e targeting) describing the same action.
+    expect(msjRow?.getAttribute('data-motion-action')).toMatch(/filter.*MSJ/i);
   });
 
   // -------------------------------------------------------------------------
