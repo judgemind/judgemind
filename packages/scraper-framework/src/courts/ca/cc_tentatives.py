@@ -62,7 +62,7 @@ from bs4 import BeautifulSoup
 
 from framework import CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
 from framework.extraction_config import get_county_extraction_config
-from framework.llm_utils import strip_llm_json_fences
+from framework.llm_utils import parse_llm_json
 
 from .pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
 
@@ -232,8 +232,7 @@ def _llm_extract_rulings(pdf_text: str) -> list[CCSplitRuling] | None:
         return None
 
     try:
-        raw = strip_llm_json_fences(response.text)
-        data = json.loads(raw)
+        data = parse_llm_json(response.text)
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning("cc.llm_parse_failed", error=str(exc))
         return None

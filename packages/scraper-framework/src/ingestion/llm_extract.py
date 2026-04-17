@@ -32,7 +32,7 @@ from framework.llm_schema import (
     ConfidenceLevel,
     FieldConfidence,
 )
-from framework.llm_utils import strip_llm_json_fences
+from framework.llm_utils import parse_llm_json
 
 from .llm_providers import call_llm, call_llm_with_images
 
@@ -1083,8 +1083,7 @@ def _parse_response(
 ) -> LLMExtractionResult | None:
     """Parse the JSON response from the model into an ``LLMExtractionResult``."""
     try:
-        cleaned = strip_llm_json_fences(raw_text)
-        parsed = json.loads(cleaned)
+        parsed = parse_llm_json(raw_text)
     except json.JSONDecodeError as exc:
         logger.warning("llm_extract.json_parse_error", error=str(exc), raw=raw_text[:200])
         return None
