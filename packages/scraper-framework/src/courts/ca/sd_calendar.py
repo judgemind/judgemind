@@ -657,3 +657,98 @@ def default_config(s3_bucket: str = "") -> ScraperConfig:
         max_retries=3,
         s3_bucket=s3_bucket,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-ruling split (#2447)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SDSplitRuling:
+    """A single ruling extracted from a multi-case SD calendar HTML page.
+
+    Mirrors the shape of ``LASplitRuling`` from :mod:`courts.ca.la_tentatives`
+    so both scrapers can share downstream split-dispatch logic.
+    """
+
+    ruling_index: int
+    case_number: str | None
+    ruling_text: str
+    case_title: str | None = None
+    motion_type: str | None = None
+    outcome: str | None = None
+    hearing_date: datetime | None = None
+    department: str | None = None
+    judge_name: str | None = None
+    parties: list[dict[str, str]] = field(default_factory=list)
+
+
+def is_sd_calendar_html(text: str | None) -> bool:
+    """Return True if the text looks like a San Diego calendar HTML page.
+
+    Content-based detection that does not rely on ``scraper_id``.  This lets
+    callers route synthetic events (e.g. ``rebuild-ca-san_diego`` from
+    :mod:`scripts.rebuild_db`) through the same deterministic splitter as
+    live ``ca-sd-calendar`` captures.
+
+    The check is a cheap substring test on the first 4 KB of the content
+    — the header ``<h1>CIVIL CALENDAR For ...</h1>`` appears early in every
+    SD calendar page.
+    """
+    if not text:
+        return False
+    # Only scan the head of the document to keep the check cheap.
+    head = text[:4096]
+    return "CIVIL CALENDAR For" in head
+
+
+def _split_rulings(text: str) -> list[SDSplitRuling]:
+    """Split a SD calendar HTML page into per-case rulings.
+
+    Registered in :data:`scripts.reingest_from_s3._SPLIT_REGISTRY` under
+    ``ca-sd-calendar`` via the module-level name convention (#2447).  Also
+    invoked by the ingestion worker when the content is detected as a SD
+    calendar HTML page, regardless of ``scraper_id`` — this routes synthetic
+    rebuild events (``rebuild-ca-san_diego``) through the same deterministic
+    splitter, avoiding the LLM path that previously stored raw HTML as
+    ruling_text.
+
+    Returns an empty list when the content is not a SD calendar HTML page
+    (so callers can fall through to their default extraction path).
+
+    Each returned ruling has a *focused* ``ruling_text`` built from that
+    case's calendar row only — NEVER the full HTML.  This is what prevents
+    50000-char raw-HTML dumps and cross-case contamination.
+    """
+    if not is_sd_calendar_html(text):
+        return []
+
+    hearings = parse_calendar_page(text)
+    rulings: list[SDSplitRuling] = []
+    for idx, hearing in enumerate(h for h in hearings if _is_motion_event(h.event_type)):
+        # Build the per-case focused ruling_text.  ``extract_case_section``
+        # already returns a compact plain-text excerpt (no raw HTML).
+        section = extract_case_section(text, hearing.case_number)
+        if not section:
+            # Defensive: skip hearings we cannot narrow.  The calendar
+            # parse found the row, so this should only happen when
+            # ``extract_case_section``'s matching logic rejects the row.
+            continue
+
+        rulings.append(
+            SDSplitRuling(
+                ruling_index=idx + 1,
+                case_number=hearing.case_number,
+                ruling_text=section,
+                case_title=hearing.case_title,
+                motion_type=hearing.event_type,
+                outcome=None,  # Calendar entries have no ruling disposition yet.
+                hearing_date=hearing.hearing_date,
+                department=hearing.department,
+                judge_name=hearing.judge_name,
+                parties=list(hearing.parties),
+            )
+        )
+
+    return rulings

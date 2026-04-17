@@ -2221,3 +2221,230 @@ class TestMultimodalSplitEnrichment:
         assert mock_upsert_case.called
         upsert_kwargs = mock_upsert_case.call_args.kwargs
         assert upsert_kwargs.get("case_title") == "Smith v. Jones"
+
+
+# ---------------------------------------------------------------------------
+# SD calendar deterministic split routing (#2447)
+# ---------------------------------------------------------------------------
+
+
+class TestSDCalendarDeterministicSplit:
+    """The worker routes SD calendar HTML through the deterministic splitter
+    BEFORE invoking the LLM, regardless of ``scraper_id``.
+
+    This closes Bug A and Bug B in #2447:
+
+    * Bug A (swapped identifiers) — the LLM saw 60-100KB of HTML with
+      30+ cases but a prompt assuming a single case.  It extracted one
+      case's ruling_text while the outer event kept another case's
+      identifiers, producing cross-case contamination.
+    * Bug B (50000-char dumps) — when LLM extraction produced an empty
+      ruling, ``convert_extracted_rulings`` substituted the full HTML
+      as ruling_text, hitting the 50000-char truncation cap.
+
+    The fix — routing through ``_try_sd_calendar_split`` at the top of
+    ``_llm_split_document`` — bypasses the LLM entirely for calendar
+    HTML content.  These tests verify the routing, not the splitter
+    itself (covered in tests/courts/test_sd_calendar.py).
+    """
+
+    _CALENDAR_HTML = (
+        "<!DOCTYPE html>\n"
+        "<html><body>\n"
+        "<h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>\n"
+        "<h3>CENTRAL DIVISION, CENTRAL COURTHOUSE</h3>\n"
+        "<div class='department'><h2>Department: C-60</h2>"
+        "<table class='tables'><thead><tr>"
+        "<th>Time</th><th>Case#</th><th>Entitlement</th><th>Event</th>"
+        "<th>Hearing Officer</th><th>Party</th><th>Attorney</th></tr></thead>"
+        "<tbody><tr>"
+        "<td>9:00 AM</td><td>24CU016153C</td>"
+        "<td>Smith vs Jones</td><td>Motion Hearing</td>"
+        "<td>Judge MATTHEW C. BRANER</td>"
+        "<td><p>(PL) John Smith</p><p>(DF) Jane Jones</p></td>"
+        "<td><p>Attorney A</p><p>Attorney B</p></td>"
+        "</tr>"
+        "<tr>"
+        "<td>10:00 AM</td><td>25CU003887C</td>"
+        "<td>Doe vs Roe</td><td>Demurrer/Motion to Strike</td>"
+        "<td>Judge MATTHEW C. BRANER</td>"
+        "<td><p>(PL) John Doe</p><p>(DF) Jane Roe</p></td>"
+        "<td><p>Attorney C</p><p>Attorney D</p></td>"
+        "</tr></tbody></table></div>\n"
+        "</body></html>\n"
+    )
+
+    def test_rebuild_scraper_id_triggers_deterministic_split(self) -> None:
+        """Synthetic rebuild events route through ``_try_sd_calendar_split``.
+
+        This is the specific failure mode from #2447: ``rebuild_db.py``
+        emits events with ``scraper_id='rebuild-ca-san_diego'`` that
+        previously fell through to the county LLM default.
+        """
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-san_diego",
+                state="CA",
+                county="San Diego",
+                content_format="html",
+                ruling_text=self._CALENDAR_HTML,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                self._CALENDAR_HTML,
+                "CA",
+                "San Diego",
+            )
+
+        assert result is True, (
+            "_llm_split_document must return True when the deterministic "
+            "splitter dispatches synthetic split events."
+        )
+        # Two motion-type hearings in the fixture → two dispatched events.
+        assert mock_process.call_count == 2
+
+    def test_ca_sd_calendar_scraper_id_triggers_deterministic_split(self) -> None:
+        """Live ``ca-sd-calendar`` captures also route through the splitter."""
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="ca-sd-calendar",
+                state="CA",
+                county="San Diego",
+                content_format="html",
+                ruling_text=self._CALENDAR_HTML,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                self._CALENDAR_HTML,
+                "CA",
+                "San Diego",
+            )
+
+        assert result is True
+        assert mock_process.call_count == 2
+
+    def test_split_dispatched_events_carry_focused_ruling_text(self) -> None:
+        """Each dispatched synthetic event has ruling_text that is:
+
+        * A focused plain-text excerpt (no ``<`` / ``>`` HTML tags).
+        * Well below the 50000-char truncation cap.
+        * Contains ONLY its own case number (no cross-contamination).
+        """
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-san_diego",
+                state="CA",
+                county="San Diego",
+                content_format="html",
+                ruling_text=self._CALENDAR_HTML,
+            )
+            worker._llm_split_document(
+                event,
+                event["document_id"],
+                self._CALENDAR_HTML,
+                "CA",
+                "San Diego",
+            )
+
+        dispatched_events = [call.args[0] for call in mock_process.call_args_list]
+        assert len(dispatched_events) == 2
+
+        case_numbers = {e["case_number"] for e in dispatched_events}
+        assert case_numbers == {"24CU016153C", "25CU003887C"}
+
+        for ev in dispatched_events:
+            rt = ev["ruling_text"]
+            assert rt is not None
+            assert "<" not in rt
+            assert ">" not in rt
+            assert "<!doctype" not in rt.lower()
+            assert len(rt) < 50_000
+
+            # No foreign case numbers in this ruling's text.
+            own_case = ev["case_number"]
+            other_cases = case_numbers - {own_case}
+            for other in other_cases:
+                assert other not in rt, f"ruling_text for {own_case} leaked {other}"
+
+    def test_split_dispatched_events_are_marked_llm_extracted(self) -> None:
+        """Synthetic split events must carry the ``_llm_extracted`` marker
+        so downstream per-field LLM calls are skipped."""
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-san_diego",
+                state="CA",
+                county="San Diego",
+                content_format="html",
+                ruling_text=self._CALENDAR_HTML,
+            )
+            worker._llm_split_document(
+                event,
+                event["document_id"],
+                self._CALENDAR_HTML,
+                "CA",
+                "San Diego",
+            )
+
+        for call in mock_process.call_args_list:
+            dispatched = call.args[0]
+            assert dispatched.get("_split_processed") is True
+            assert dispatched.get("_llm_extracted") is True
+            assert dispatched.get("_original_document_id") == event["document_id"]
+
+    def test_non_calendar_content_does_not_trigger_split(self) -> None:
+        """Non-calendar content falls through to the normal LLM extraction
+        flow (the splitter returns False and the caller continues)."""
+        worker, _ = _make_worker()
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = [
+            ExtractedRuling(
+                extracted_case_number="24STCV01234",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="Motion granted.",
+                outcome=ExtractionOutcome.GRANTED,
+                motion_type="Motion for Summary Judgment",
+                extracted_parties=[],
+            ),
+        ]
+
+        plain_text = "Case No. 24STCV01234\nSmith v. Jones\nMotion granted."
+
+        with (
+            patch("ingestion.worker.LlmExtractor") as mock_cls,
+            patch(
+                "framework.extraction_config.get_county_extraction_config",
+                return_value=None,
+            ),
+            patch.object(worker, "process_event") as mock_process,
+        ):
+            mock_cls.return_value = mock_extractor
+            event = _make_event(
+                scraper_id="ca-la-tentatives",
+                state="CA",
+                county="Los Angeles",
+                content_format="text",
+                ruling_text=plain_text,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                plain_text,
+                "CA",
+                "Los Angeles",
+            )
+
+        assert result is True
+        # Normal LLM path — extractor called, one ruling dispatched.
+        mock_extractor.extract.assert_called_once()
+        assert mock_process.call_count == 1

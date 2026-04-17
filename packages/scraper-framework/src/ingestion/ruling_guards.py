@@ -26,6 +26,60 @@ if TYPE_CHECKING:
     from framework.llm_schema import ExtractedRuling
 
 
+# ---------------------------------------------------------------------------
+# Raw-HTML safety net (#2447)
+# ---------------------------------------------------------------------------
+#
+# When LLM extraction returns zero or one ruling with empty/null
+# ``ruling_text`` for a document whose text is actually raw HTML (e.g. an
+# entire SD calendar page of ~60KB with 30+ cases), the single-ruling
+# fallback path previously stored the full HTML as ``ruling_text``.  That
+# produced 50000-char raw-HTML dumps and polluted every downstream query.
+# The guard below refuses to substitute raw HTML as ``ruling_text`` — the
+# caller gets ``None`` instead, which the enrichment pipeline and search
+# indexer already handle safely.
+
+_RAW_HTML_PREFIXES: tuple[str, ...] = (
+    "<!doctype",
+    "<!DOCTYPE",
+    "<html",
+    "<HTML",
+    "<?xml",
+)
+
+
+def _looks_like_raw_html(text: str) -> bool:
+    """Return True if *text* is (almost certainly) raw HTML rather than ruling text.
+
+    Trigger conditions (cheap prefix/substring checks):
+
+    - The text, after stripping leading whitespace, starts with a common
+      HTML/XML document prefix (``<!DOCTYPE``, ``<html>``, ``<?xml``).
+    - The first 2 KB contains a ``<body>`` or ``<BODY>`` opening tag —
+      a strong signal that this is a full HTML document rather than the
+      plain-text or lightly-formatted ruling_text we expect.
+
+    The check is intentionally conservative.  It does not flag strings
+    that merely contain ``<`` or HTML entities — those appear in real
+    ruling text (e.g. party names like ``<Name> (PL)``, inline
+    annotations).  Only top-of-document structural markers flip the
+    guard on.
+    """
+    if not text:
+        return False
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    for prefix in _RAW_HTML_PREFIXES:
+        if stripped.startswith(prefix):
+            return True
+    # Some rebuild payloads begin with a BOM or stray whitespace we
+    # already stripped, but still contain a <body> opening in the first
+    # couple of KB.  Treat that as raw HTML too.
+    head = stripped[:2048]
+    return "<body" in head or "<BODY" in head
+
+
 @dataclass(frozen=True, slots=True)
 class OrphanCheckResult:
     """Result of the post-extraction orphan integrity check (#1337).
@@ -138,16 +192,21 @@ def convert_extracted_rulings(
         if normalize_motion and motion_type_str:
             motion_type_str = normalize_motion_type(motion_type_str)
 
-        # --- Ruling text guard (#2057, #2078) ---
+        # --- Ruling text guard (#2057, #2078, #2447) ---
         # For multi-ruling documents: an empty/missing ruling_text becomes
         # None.  We NEVER substitute the full document text because that
         # would copy every case's text into every ruling (cross-contamination).
         # For single-ruling documents: fall back to the caller-provided
         # ``fallback_text`` (which may be the full text, an empty string,
-        # or None depending on the caller).
+        # or None depending on the caller) — EXCEPT when the fallback is
+        # raw HTML.  Raw HTML in ``ruling_text`` produced 50000-char
+        # calendar-page dumps for San Diego (#2447); the guard returns
+        # ``None`` instead so downstream consumers treat it as missing.
         if ruling.ruling_text:
             ruling_text_value: str | None = ruling.ruling_text
         elif is_multi:
+            ruling_text_value = None
+        elif fallback_text and _looks_like_raw_html(fallback_text):
             ruling_text_value = None
         else:
             ruling_text_value = fallback_text

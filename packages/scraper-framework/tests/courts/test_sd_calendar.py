@@ -24,13 +24,16 @@ import respx
 from courts.ca.sd_calendar import (
     CALENDAR_BASE_URL,
     SDCalendarScraper,
+    SDSplitRuling,
     _case_numbers_match,
     _clean_case_title,
     _is_motion_event,
     _parse_calendar_date,
     _parse_judge_name,
+    _split_rulings,
     default_config,
     extract_case_section,
+    is_sd_calendar_html,
     parse_calendar_page,
 )
 from framework.models import ContentFormat, ScraperConfig
@@ -1127,3 +1130,270 @@ class TestDefaultConfig:
     def test_poll_interval(self) -> None:
         config = default_config()
         assert config.poll_interval_seconds == 86400  # daily
+
+
+# ---------------------------------------------------------------------------
+# is_sd_calendar_html — content detection (#2447)
+# ---------------------------------------------------------------------------
+
+
+class TestIsSDCalendarHtml:
+    """Tests for the content-based SD calendar HTML detector."""
+
+    def test_detects_central_fixture(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        assert is_sd_calendar_html(html) is True
+
+    def test_detects_north_fixture(self) -> None:
+        html = _load_html("sd_calendar_north.html")
+        assert is_sd_calendar_html(html) is True
+
+    def test_detects_empty_calendar_page(self) -> None:
+        """Even an empty calendar page contains the CIVIL CALENDAR header."""
+        html = _load_html("sd_calendar_empty.html")
+        assert is_sd_calendar_html(html) is True
+
+    def test_returns_false_for_non_calendar_html(self) -> None:
+        assert is_sd_calendar_html("<html><body>ruling text</body></html>") is False
+
+    def test_returns_false_for_plain_ruling_text(self) -> None:
+        assert is_sd_calendar_html("TENTATIVE RULING: motion granted.") is False
+
+    def test_returns_false_for_empty_string(self) -> None:
+        assert is_sd_calendar_html("") is False
+
+    def test_returns_false_for_none(self) -> None:
+        assert is_sd_calendar_html(None) is False
+
+    def test_matches_header_in_first_4kb(self) -> None:
+        """The detector only scans the first 4 KB — padding past 4 KB fails."""
+        padding = "x" * 5000
+        html = padding + "<h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>"
+        assert is_sd_calendar_html(html) is False
+
+    def test_case_sensitive_header(self) -> None:
+        """The header marker is a literal substring (preserves case)."""
+        # Real pages always use the exact capitalisation.
+        html = "<h1>civil calendar for Friday</h1>"
+        assert is_sd_calendar_html(html) is False
+
+
+# ---------------------------------------------------------------------------
+# _split_rulings — deterministic per-case splitter (#2447)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRulings:
+    """Tests for the deterministic SD calendar splitter used by the worker
+    and the reingest registry.
+
+    The splitter MUST:
+      * Return an empty list when the content is not a SD calendar page,
+        so non-SD callers fall through to their default path.
+      * Produce one ``SDSplitRuling`` per motion-type hearing.
+      * Build a focused ``ruling_text`` per case (no raw HTML, no
+        cross-contamination between cases, well below the 50000-char
+        truncation cap).
+      * Filter out non-motion events (CMCs, Ex Parte, Restraining Order,
+        Name Change).
+    """
+
+    def test_returns_empty_for_non_calendar_html(self) -> None:
+        """Non-calendar content returns an empty list (callers fall through)."""
+        assert _split_rulings("<html><body>just some HTML</body></html>") == []
+
+    def test_returns_empty_for_plain_ruling_text(self) -> None:
+        assert _split_rulings("TENTATIVE RULING: motion granted.") == []
+
+    def test_returns_empty_for_empty_string(self) -> None:
+        assert _split_rulings("") == []
+
+    def test_returns_empty_for_empty_calendar(self) -> None:
+        """An SD calendar page with no hearings yields no rulings."""
+        html = _load_html("sd_calendar_empty.html")
+        assert _split_rulings(html) == []
+
+    def test_splits_central_fixture_into_seven_rulings(self) -> None:
+        """Central fixture has 7 motion-type hearings → 7 rulings.
+
+        Non-motion events (CMC, Restraining Order, Ex Parte) are filtered
+        out by the splitter even though they appear in the calendar HTML.
+        """
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        assert len(rulings) == 7
+
+    def test_all_results_are_sdsplitruling(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        assert all(isinstance(r, SDSplitRuling) for r in rulings)
+
+    def test_split_returns_all_motion_case_numbers(self) -> None:
+        """Every motion-type case from the fixture is represented exactly once."""
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        case_numbers = [r.case_number for r in rulings]
+        expected = {
+            "24CU016153C",  # Motion Hearing (C-60)
+            "25CU003887C",  # Demurrer (C-60)
+            "23CU005421C",  # Summary Judgment (C-60)
+            "25CU008912C",  # Discovery Hearing (C-65)
+            "24CU019876C",  # Motion to Quash (C-65)
+            "24CU012345C",  # Motion for Sanctions (C-67)
+            "23CU007654C",  # Class Action (C-67)
+        }
+        assert set(case_numbers) == expected
+
+    def test_split_filters_non_motion_events(self) -> None:
+        """Non-motion events must NOT appear in the split output."""
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        case_numbers = {r.case_number for r in rulings}
+        # These are the three non-motion events in the fixture:
+        assert "26CL011234C" not in case_numbers  # Case Management Conference
+        assert "25HR050123C" not in case_numbers  # Restraining Order
+        assert "26CL015678C" not in case_numbers  # Ex Parte Hearing
+
+    def test_ruling_text_is_focused_not_raw_html(self) -> None:
+        """Each ruling's ruling_text is a plain-text excerpt (NO raw HTML).
+
+        The critical bug in #2447 was that the LLM path substituted the
+        entire 60-100KB HTML page as ruling_text.  The splitter MUST NOT
+        emit HTML tags in ruling_text.
+        """
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        for r in rulings:
+            assert "<" not in r.ruling_text
+            assert ">" not in r.ruling_text
+            assert "<!doctype" not in r.ruling_text.lower()
+            assert "<html" not in r.ruling_text.lower()
+            assert "<body" not in r.ruling_text.lower()
+
+    def test_ruling_text_lengths_are_well_below_50000(self) -> None:
+        """Each focused excerpt is ~1KB — nowhere near the 50000-char cap.
+
+        This is the direct regression test for Bug B in #2447 (stored
+        ruling_text values of exactly 50000 chars).
+        """
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        for r in rulings:
+            assert len(r.ruling_text) < 50000, (
+                f"ruling_text for {r.case_number} is {len(r.ruling_text)} chars "
+                "— must be well under the 50000 truncation cap"
+            )
+            # Sanity: real focused excerpts are typically 200-2000 chars.
+            assert len(r.ruling_text) < 10_000
+
+    def test_ruling_text_contains_only_own_case_number(self) -> None:
+        """No ruling's text may contain the case number of another ruling.
+
+        This is the direct regression test for Bug A in #2447 (DB
+        identifiers for case X while ruling_text body refers to case Y).
+        """
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        all_case_numbers = {r.case_number for r in rulings if r.case_number}
+        for r in rulings:
+            own = r.case_number
+            for other in all_case_numbers:
+                if other == own:
+                    continue
+                assert other not in r.ruling_text, (
+                    f"ruling_text for {own} leaked foreign case number {other}"
+                )
+
+    def test_split_preserves_case_title(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        by_case = {r.case_number: r for r in rulings}
+        assert by_case["24CU016153C"].case_title == ("Aasi et al vs American Honda Motor Co Inc")
+        assert by_case["25CU003887C"].case_title == "Garcia vs City of San Diego"
+
+    def test_split_preserves_department(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        by_case = {r.case_number: r for r in rulings}
+        assert by_case["24CU016153C"].department == "C-60"
+        assert by_case["25CU008912C"].department == "C-65"
+        assert by_case["24CU012345C"].department == "C-67"
+
+    def test_split_preserves_motion_type(self) -> None:
+        """motion_type carries the calendar's Event column verbatim."""
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        by_case = {r.case_number: r for r in rulings}
+        assert by_case["24CU016153C"].motion_type == "Motion Hearing"
+        assert by_case["25CU003887C"].motion_type == "Demurrer/Motion to Strike"
+        assert by_case["23CU005421C"].motion_type == ("Summary Judgment/Summary Adjudication")
+        assert by_case["25CU008912C"].motion_type == "Discovery Hearing"
+        assert by_case["24CU019876C"].motion_type == "Motion to Quash"
+        assert by_case["24CU012345C"].motion_type == "Motion for Sanctions"
+
+    def test_split_preserves_hearing_date(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        # Central fixture header is "Friday, 03/13/2026".
+        assert all(r.hearing_date == datetime(2026, 3, 13) for r in rulings)
+
+    def test_split_preserves_judge_name_when_real(self) -> None:
+        """Real judge names propagate; generic 'Judge C-67 Central' becomes None."""
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        by_case = {r.case_number: r for r in rulings}
+        # C-60 and C-65 have real judges.
+        assert by_case["24CU016153C"].judge_name == "Matthew C. Braner"
+        assert by_case["25CU008912C"].judge_name == "Karen S. Hewitt"
+        # C-67 uses "Judge C-67 Central" — filtered to None.
+        assert by_case["24CU012345C"].judge_name is None
+
+    def test_split_preserves_parties(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        by_case = {r.case_number: r for r in rulings}
+        aasi = by_case["24CU016153C"]
+        assert aasi.parties
+        names = {p["name"] for p in aasi.parties}
+        assert "Sumayya Aasi" in names
+        assert "American Honda Motor Co Inc" in names
+
+    def test_ruling_indices_are_1_based_and_sequential(self) -> None:
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        indices = [r.ruling_index for r in rulings]
+        assert indices == [1, 2, 3, 4, 5, 6, 7]
+
+    def test_outcome_is_none(self) -> None:
+        """Calendar rows carry no ruling disposition yet."""
+        html = _load_html("sd_calendar_central.html")
+        rulings = _split_rulings(html)
+        assert all(r.outcome is None for r in rulings)
+
+
+# ---------------------------------------------------------------------------
+# Extraction config — rebuild-ca-san_diego override (#2447)
+# ---------------------------------------------------------------------------
+
+
+class TestRebuildSanDiegoExtractionOverride:
+    """Ensure the synthetic rebuild scraper_id gets ExtractionMethod.NONE.
+
+    ``scripts/rebuild_db.py`` synthesises events with ``scraper_id`` set to
+    ``rebuild-ca-san_diego``.  Without the override, the (CA, San Diego)
+    county default (LLM) would fire on a 60-100KB calendar HTML page and
+    produce the 50000-char raw-HTML dumps reported in #2447.
+    """
+
+    def test_rebuild_ca_san_diego_uses_none(self) -> None:
+        from framework.extraction_config import ExtractionMethod, get_county_extraction_config
+
+        config = get_county_extraction_config("CA", "San Diego", scraper_id="rebuild-ca-san_diego")
+        assert config is not None
+        assert config.method == ExtractionMethod.NONE
+
+    def test_rebuild_override_registered_in_scraper_configs(self) -> None:
+        from framework.extraction_config import _SCRAPER_CONFIGS, ExtractionMethod
+
+        assert "rebuild-ca-san_diego" in _SCRAPER_CONFIGS
+        assert _SCRAPER_CONFIGS["rebuild-ca-san_diego"].method == ExtractionMethod.NONE
