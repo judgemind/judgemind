@@ -438,6 +438,101 @@ class TestParsePageRows:
         rows = _parse_page_rows(raw, page_index=0)
         assert rows == []
 
+    # --- case_number sanitization (#2577) ---
+
+    def test_case_number_equal_to_case_title_is_discarded(self) -> None:
+        """The LLM sometimes copies the caption into case_number on OC
+        calendar PDFs that have no explicit case numbers (Dept N17/C10).
+
+        When that happens, case_info would become
+        ``"Ayala v. Castillo\\nAyala v. Castillo"`` and
+        ``_split_fused_case_info`` would phantom-split it into two
+        identical rulings.  ``_parse_page_rows`` must detect the
+        duplication and discard the bogus case_number.
+        """
+        raw = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "entry_number": "4",
+                        "case_number": "Ayala v. Castillo",
+                        "case_title": "Ayala v. Castillo",
+                        "ruling_text": "Demurrer OVERRULED.",
+                    }
+                ]
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert len(rows) == 1
+        # case_info should contain ONE copy of "Ayala v. Castillo",
+        # not two — and must not contain the "v." boundary that would
+        # trip _split_fused_case_info.
+        assert rows[0]["case_info"].count("Ayala v. Castillo") == 1
+
+    def test_case_number_with_vs_clause_and_no_digits_discarded(self) -> None:
+        """case_number values that look like captions (contain "v." or
+        "vs." and have no digits at all) are not real case numbers —
+        discard them to keep case_info clean."""
+        raw = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "entry_number": "1",
+                        "case_number": "Smith vs. Jones",
+                        "case_title": "Smith vs. Jones, et al.",
+                        "ruling_text": "Denied.",
+                    }
+                ]
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        # Only case_title should remain in case_info.
+        assert "Smith vs. Jones, et al." in rows[0]["case_info"]
+        # The bogus case_number must not produce a second "v." clause.
+        assert rows[0]["case_info"].count("vs.") == 1
+
+    def test_valid_case_number_with_vs_in_title_preserved(self) -> None:
+        """A real case number alongside a "v."-bearing title is kept:
+        sanitizer must not over-reach and strip legitimate case numbers.
+        """
+        raw = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "entry_number": "1",
+                        "case_number": "C22-01971",
+                        "case_title": "Marquez vs. Kohl's",
+                        "ruling_text": "Denied.",
+                    }
+                ]
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        assert "C22-01971" in rows[0]["case_info"]
+        assert "Marquez vs. Kohl's" in rows[0]["case_info"]
+
+    def test_bogus_case_number_different_from_title_kept_if_has_digits(
+        self,
+    ) -> None:
+        """If case_number has digits, it's *probably* a real number even
+        if it doesn't match our strict regex — keep it rather than
+        discard (avoid false positives that strip legitimate numbers)."""
+        raw = json.dumps(
+            {
+                "rulings": [
+                    {
+                        "entry_number": "1",
+                        "case_number": "12345-weird-format",
+                        "case_title": "Smith v. Jones",
+                        "ruling_text": "Granted.",
+                    }
+                ]
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        # The "weird-format" case_number is retained as-is.
+        assert "12345-weird-format" in rows[0]["case_info"]
+
 
 class TestExtractCaseTitleTruncation:
     """Tests for case_title truncation in _extract_case_title_from_info."""
@@ -3221,6 +3316,35 @@ class TestSplitFusedCaseInfo:
         assert "Xy v." in joined
         assert "Yz" in joined
 
+    # --- #2577: duplicate-caption fusion (defense-in-depth) ---
+
+    def test_duplicated_caption_returns_single_subcase(self) -> None:
+        """Two byte-identical captions joined by a newline must NOT be
+        split into two rulings (#2577).
+
+        Upstream bug: on OC N17/C10 PDFs with no case numbers, the LLM
+        sometimes returns ``case_number="Ayala v. Castillo"`` alongside
+        ``case_title="Ayala v. Castillo"``.  ``_parse_page_rows``
+        concatenates them into ``case_info = "Ayala v. Castillo\\nAyala
+        v. Castillo"``.  With two "v." clauses, the repeating-plaintiff
+        tier would match and produce ``["Ayala v. Castillo", "Ayala v.
+        Castillo"]`` — two identical rulings, the second silently
+        losing its ruling_text in ``_join_page_rows``.  The splitter
+        must detect byte-equal halves and collapse them.
+        """
+        fused = "Ayala v. Castillo\nAyala v. Castillo"
+        result = _split_fused_case_info(fused)
+        assert result == ["Ayala v. Castillo"]
+
+    def test_duplicated_caption_whitespace_variant_collapses(self) -> None:
+        """Whitespace-only differences between the two halves still
+        collapse — same bug, triggered by trailing spaces or newlines."""
+        fused = "Ayala v. Castillo  \n  Ayala v. Castillo"
+        result = _split_fused_case_info(fused)
+        # Normalizing whitespace makes the two halves equal — collapse.
+        assert len(result) == 1
+        assert "Ayala v. Castillo" in result[0]
+
 
 # ---------------------------------------------------------------------------
 # _join_page_rows fused-row split integration tests (#2500)
@@ -3410,3 +3534,124 @@ class TestJoinPageRowsFusedRowSplit:
         # text (originally at index 0).
         assert rulings[3].cross_reference_source == 1
         assert rulings[3].ruling_text == long_ruling
+
+
+# ---------------------------------------------------------------------------
+# #2577: OC N17/C10 calendar PDFs — case_number sanitization regression
+# ---------------------------------------------------------------------------
+
+
+class TestOcNoCaseNumberCalendarPdfRegression:
+    """End-to-end regression for the bug described in #2577.
+
+    On OC Dept N17 (01f97e9d...pdf) and OC Dept C10 (15e603da...pdf)
+    calendar PDFs, the multimodal LLM observed in diagnostic runs
+    returned rows shaped like::
+
+        {"entry_number": "4",
+         "case_number": "Ayala v. Castillo",
+         "case_title": "Ayala v. Castillo",
+         "ruling_text": "Demurrer OVERRULED."}
+
+    because the PDFs contain no alphanumeric case numbers at all — just
+    a ``#`` column and a CASE NAME column.  Without the #2577 fix the
+    downstream pipeline would:
+
+    1. ``_parse_page_rows`` concatenates both fields into
+       ``case_info = "Ayala v. Castillo\\nAyala v. Castillo"``.
+    2. ``_split_fused_case_info`` sees two "v." clauses and the
+       repeating-plaintiff tier matches, producing two byte-identical
+       sub-cases.
+    3. ``_join_page_rows`` builds two ExtractedRuling objects — the
+       first with the real ruling text, the second with
+       ``ruling_text=None``.
+
+    With the fix, both the parse-time sanitizer and the
+    ``_split_fused_case_info`` duplicate-detector independently prevent
+    the phantom duplication.  This test verifies the full pipeline by
+    feeding a raw JSON shape that matches the observed LLM output and
+    asserting a single ruling is produced with its ruling_text intact.
+    """
+
+    def test_ayala_duplicate_caption_produces_single_ruling(self) -> None:
+        """Raw LLM JSON → _parse_page_rows → _join_page_rows yields 1
+        ruling, not 2."""
+        raw = json.dumps(
+            {
+                "page_header": {
+                    "department": None,
+                    "judge_name": None,
+                    "hearing_date": None,
+                },
+                "rulings": [
+                    {
+                        "entry_number": "4",
+                        "case_number": "Ayala v. Castillo",
+                        "case_title": "Ayala v. Castillo",
+                        "ruling_text": (
+                            "Defendant Carlos Contreras' Demurrer to all six "
+                            "causes of action contained in the FAC is "
+                            "OVERRULED."
+                        ),
+                    }
+                ],
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1, (
+            f"Expected 1 ruling, got {len(rulings)}: {[r.extracted_case_title for r in rulings]}"
+        )
+        # The single surviving ruling keeps the ruling_text — it is NOT
+        # lost to a phantom second sub-case.
+        assert rulings[0].ruling_text is not None
+        assert "OVERRULED" in rulings[0].ruling_text
+        # The case_title is correctly extracted from case_info.
+        assert rulings[0].extracted_case_title == "Ayala v. Castillo"
+
+    def test_page_with_mixed_duplicate_and_normal_rulings(self) -> None:
+        """A page where one row has the duplicate-caption bug and other
+        rows are normal yields exactly one ruling per input row (not
+        one-plus-phantom for the bad row)."""
+        raw = json.dumps(
+            {
+                "page_header": {
+                    "department": "C10",
+                    "judge_name": "R. Shawn Nelson",
+                    "hearing_date": "2026-03-12",
+                },
+                "rulings": [
+                    {
+                        "entry_number": "3",
+                        "case_number": "Smith v. Jones",
+                        "case_title": "Smith v. Jones",
+                        "ruling_text": "Motion GRANTED.",
+                    },
+                    {
+                        "entry_number": "4",
+                        "case_number": "Ayala v. Castillo",
+                        "case_title": "Ayala v. Castillo",
+                        "ruling_text": "Demurrer OVERRULED.",
+                    },
+                    {
+                        "entry_number": "5",
+                        "case_number": "C22-01971",
+                        "case_title": "Doe v. Roe",
+                        "ruling_text": "Denied.",
+                    },
+                ],
+            }
+        )
+        rows = _parse_page_rows(raw, page_index=0)
+        rulings = _join_page_rows(rows)
+        # Exactly 3 rulings — no phantom duplicates.
+        assert len(rulings) == 3
+        titles = [r.extracted_case_title for r in rulings]
+        assert "Smith v. Jones" in titles
+        assert "Ayala v. Castillo" in titles
+        assert "Doe v. Roe" in titles
+        # All three have ruling_text — the duplicate-caption bug would
+        # have left the phantom duplicate with ruling_text=None.
+        for r in rulings:
+            assert r.ruling_text is not None
+            assert r.ruling_text.strip() != ""
