@@ -46,7 +46,19 @@
 #   --logs <task-arn>   Retrieve logs and status for a previously launched task.
 #                       Accepts a full task ARN.
 #   --dry-run           Show what would be done without running
-#   --timeout <secs>    Max seconds to wait for task completion (default: 1800)
+#   --timeout <secs>    Max seconds to wait for task completion (default: 1800).
+#                       This is a client-side wait: if the task does not stop
+#                       within this window the script exits but the task keeps
+#                       running on ECS (possibly for hours).  Use --max-runtime
+#                       to enforce a server-side lifetime cap inside the task.
+#   --max-runtime <secs> Wrap the container command with `timeout` so the task
+#                       self-terminates after this many seconds even if the
+#                       Python script hangs or retry-loops.  Default: unset
+#                       (opt-in).  A value of 0 also disables the cap.  This
+#                       is a belt-and-suspenders complement to in-script
+#                       retry caps — use it for long-running jobs where a
+#                       runaway retry loop could exhaust shared resources
+#                       (e.g. dev DB connection slots).  See #2572.
 #   --help              Show this help message
 #
 # Examples:
@@ -66,6 +78,7 @@ DRY_RUN=false
 DETACH=false
 LOGS_TASK_ARN=""
 TIMEOUT=1800
+MAX_RUNTIME=""
 CPU_OVERRIDE=""
 MEMORY_OVERRIDE=""
 SCRIPT_PATH=""
@@ -125,8 +138,12 @@ while [[ $# -gt 0 ]]; do
             TIMEOUT="$2"
             shift 2
             ;;
+        --max-runtime)
+            MAX_RUNTIME="$2"
+            shift 2
+            ;;
         --help|-h)
-            head -n 54 "$0" | tail -n +2 | sed 's/^# \?//'
+            head -n 66 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
             ;;
         --)
@@ -299,6 +316,17 @@ if ! validate_fargate_resources "$CPU" "$MEMORY"; then
     echo "  2048 CPU: 4096-16384 MB (1 GB increments)" >&2
     echo "  4096 CPU: 8192-30720 MB (1 GB increments)" >&2
     exit 1
+fi
+
+# ─── Validate --max-runtime ───────────────────────────────────────────────
+# --max-runtime must be a non-negative integer (seconds).  An empty value
+# means "no cap" (the default).  A value of 0 also disables the cap, so
+# operators can override env defaults without juggling unset-vs-zero.
+if [[ -n "$MAX_RUNTIME" ]]; then
+    if ! [[ "$MAX_RUNTIME" =~ ^[0-9]+$ ]]; then
+        echo "Error: --max-runtime must be a non-negative integer (seconds), got: '${MAX_RUNTIME}'" >&2
+        exit 1
+    fi
 fi
 
 # ─── Cleanup trap ────────────────────────────────────────────────────────────
@@ -488,6 +516,27 @@ for arg in "${SCRIPT_ARGS[@]+"${SCRIPT_ARGS[@]}"}"; do
     ARGS_STR="${ARGS_STR} '${escaped}'"
 done
 
+# Build the interpreter invocation, optionally wrapped with `timeout` so
+# the container self-terminates after --max-runtime seconds even if the
+# script retry-loops or hangs (#2572).  The coreutils `timeout` command is
+# present at /usr/bin/timeout in the python:3.12-slim base image used by
+# the ingestion worker task definition.
+#
+# Flags:
+#   --preserve-status   exit with the script's exit status when it finishes
+#                       before the deadline (instead of timeout's own 124);
+#                       this keeps the normal exit-code path unchanged
+#   --signal=TERM       send SIGTERM first so Python can run atexit handlers
+#                       and psycopg can close its connections cleanly
+#   --kill-after=30     escalate to SIGKILL 30s later if the script ignores
+#                       SIGTERM; bounds total wall-clock overhead
+# When `timeout` kills the script it exits 124 + 128 = 137, which propagates
+# through bash -c and surfaces in the task's containers[].exitCode.
+INVOCATION="${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 ]]; then
+    INVOCATION="timeout --preserve-status --signal=TERM --kill-after=30 ${MAX_RUNTIME} ${INVOCATION}"
+fi
+
 # The ECS run-task command override limit is 8192 bytes total for the
 # containerOverrides JSON. The base64-encoded script plus the wrapper
 # command must fit within this limit. We use ~6000 bytes as the threshold
@@ -521,19 +570,22 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
 
     # Use Python's urllib to download — always available in the container
     # image (python:3.12-slim). Avoids "curl: command not found" noise.
-    COMMAND_STR="python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\" && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+    COMMAND_STR="python3 -c \"import urllib.request; urllib.request.urlretrieve('${PRESIGNED_URL}', '/tmp/_oneshot_script')\" && ${INVOCATION}"
 else
     # Strip newlines from base64 output: Linux base64 wraps at 76 chars by
     # default, and the newlines break the ECS command override when bash -c
     # interprets them as separate commands.  macOS base64 does not wrap, but
     # tr -d '\n' is harmless there.
     ENCODED=$(base64 < "$SCRIPT_PATH" | tr -d '\n')
-    COMMAND_STR="echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INTERPRETER} /tmp/_oneshot_script${ARGS_STR}"
+    COMMAND_STR="echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INVOCATION}"
 fi
 
 echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2
 echo "Interpreter: ${INTERPRETER}" >&2
 echo "Resources: ${CPU} CPU / ${MEMORY} MB memory" >&2
+if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 ]]; then
+    echo "Max runtime: ${MAX_RUNTIME}s (timeout --signal=TERM --kill-after=30)" >&2
+fi
 if [[ -n "$OVERRIDE_ROLE_ARN" ]]; then
     echo "Task role: ${ROLE_OVERRIDE} (override)" >&2
 fi

@@ -473,6 +473,123 @@ def _autoscale_concurrency(
     return max(1, min(requested, capped))
 
 
+def _should_abort_retry_pass(
+    crashed_count: int,
+    total_count: int,
+    max_count: int,
+    max_ratio: float,
+) -> tuple[bool, str]:
+    """Return (should_abort, reason) for the serial retry pass.
+
+    The serial retry pass in ``_retry_crashed_keys_serially`` is designed to
+    recover from single-worker segfaults on individual bad PDFs: one crashed
+    key at a time, in its own subprocess, under the theory that the C
+    extension died on THIS specific input.  That's a valid recovery strategy
+    when the crash rate is low.
+
+    But when the pool breaks for a systemic reason (DB connection slots
+    exhausted, OOM across many workers, network partition), *every*
+    in-flight future gets ``BrokenProcessPool``, so effectively every key
+    lands in ``crashed_keys``.  Serially retrying thousands of keys — at
+    roughly one every several minutes, since each retry opens fresh DB
+    connections and reloads all worker state — turns a 10-minute rebuild
+    into a 12+ hour zombie task, during which the exhausted resources never
+    recover (#2572, #2549).
+
+    This function gates entry into the serial retry pass:
+
+    - ``max_count``: absolute ceiling on keys eligible for serial retry.
+      Above this count we assume a systemic cause (not per-doc bad PDFs)
+      and abort with a terminal error rather than churning for hours.
+      Set to 0 to disable.
+    - ``max_ratio``: fraction of total keys that crashed.  A high ratio
+      similarly signals systemic failure (e.g. 15% pool-break rate means
+      every worker is failing, not specific PDFs).  Set to 0 to disable.
+
+    Strict ``>`` comparison on both thresholds so operators who set the
+    flag to e.g. ``--max-retry-count 200`` get exactly what they asked for
+    — up to and including 200 retries, abort only above that.
+
+    Returns a tuple of (should_abort, reason).  ``reason`` is a human-
+    readable string suitable for logging; empty when should_abort is False.
+    """
+    if total_count <= 0:
+        return False, ""
+
+    # Check count threshold first: it's the more actionable signal for
+    # operators (bounds retry wall-clock time directly), and the message
+    # puts the specific tripped threshold first.
+    if max_count > 0 and crashed_count > max_count:
+        return True, (
+            f"crashed_count={crashed_count} exceeds --max-retry-count={max_count} "
+            f"(out of total_count={total_count})"
+        )
+
+    if max_ratio > 0:
+        ratio = crashed_count / total_count
+        if ratio > max_ratio:
+            return True, (
+                f"crashed_count/total_count={crashed_count}/{total_count}="
+                f"{ratio:.1%} exceeds --max-retry-ratio={max_ratio:.1%}"
+            )
+
+    return False, ""
+
+
+def _default_max_retry_count(env: dict[str, str] | None = None) -> int:
+    """Resolve the default for ``--max-retry-count`` from the environment.
+
+    Extracted as a pure function so argparse's default-at-import-time
+    pattern doesn't hide the env-var lookup from tests.  Accepts an
+    optional env dict for testability (defaults to ``os.environ``).
+
+    The default (200) is deliberately conservative: most healthy rebuilds
+    see fewer than a dozen crashed keys from per-doc bad PDFs, so 200
+    comfortably absorbs a bad batch while still tripping on a systemic
+    pool-break storm.  See #2572.
+    """
+    source = env if env is not None else os.environ
+    return int(source.get("REBUILD_MAX_RETRY_COUNT", "200"))
+
+
+def _default_max_retry_ratio(env: dict[str, str] | None = None) -> float:
+    """Resolve the default for ``--max-retry-ratio`` from the environment.
+
+    Extracted as a pure function for the same reason as
+    ``_default_max_retry_count``.  The default (0.10 = 10%) catches the
+    small-rebuild case where all-keys-crashed is under the absolute count
+    cap but is still clearly systemic.  See #2572.
+    """
+    source = env if env is not None else os.environ
+    return float(source.get("REBUILD_MAX_RETRY_RATIO", "0.10"))
+
+
+def _build_abort_log_sample(
+    crashed_keys: list[str], sample_size: int = 20
+) -> tuple[list[str], bool]:
+    """Return (sample, truncated) for the retry-abort log record.
+
+    When the retry pass aborts on a systemic failure (#2572), we want
+    operators to have a few real S3 keys in CloudWatch so they can jump
+    straight to the raw document that failed.  But we also don't want to
+    dump thousands of keys into a single log record — it's unreadable, it
+    may hit CloudWatch's per-event size limits, and the first few are
+    enough to kick off diagnosis.
+
+    This helper exists as a pure function (not an inline slice in main())
+    so the sample-truncation behavior can be unit-tested without standing
+    up the whole rebuild pipeline.  Returns a tuple of:
+
+    - ``sample``: up to ``sample_size`` keys (the first N); empty list if
+      ``crashed_keys`` is empty.
+    - ``truncated``: True when ``crashed_keys`` had more than ``sample_size``
+      entries, so the log record can flag that more keys exist.
+    """
+    sample = crashed_keys[:sample_size]
+    truncated = len(crashed_keys) > len(sample)
+    return sample, truncated
+
+
 def _retry_crashed_keys_serially(
     crashed_keys: list[str],
     cache_dir: str,
@@ -970,6 +1087,32 @@ def main() -> None:
             "ignored."
         ),
     )
+    parser.add_argument(
+        "--max-retry-count",
+        type=int,
+        default=_default_max_retry_count(),
+        help=(
+            "Abort the serial retry pass when more than N keys crashed the "
+            "concurrent pool (default: 200).  A high absolute count almost "
+            "always means a systemic failure (DB connection exhaustion, OOM "
+            "across many workers) rather than per-document bad PDFs, in "
+            "which case serially retrying each key for minutes will "
+            "compound the problem for hours without recovery.  Set to 0 to "
+            "disable the absolute cap.  See #2572."
+        ),
+    )
+    parser.add_argument(
+        "--max-retry-ratio",
+        type=float,
+        default=_default_max_retry_ratio(),
+        help=(
+            "Abort the serial retry pass when the ratio of crashed keys to "
+            "total keys exceeds this fraction (default: 0.10 = 10%%).  Paired "
+            "with --max-retry-count as a second-axis check: a small rebuild "
+            "of 50 keys where all 50 crashed is systemic, but under the "
+            "absolute count cap.  Set to 0 to disable the ratio cap.  See #2572."
+        ),
+    )
     args = parser.parse_args()
 
     if args.force_split_child_loss:
@@ -1016,6 +1159,11 @@ def main() -> None:
         # Write rebuild-in-progress marker so the data quality check
         # downgrades P1 alerts during the rebuild window (#2222).
         _write_rebuild_marker(conn, in_progress=True)
+
+    # Initialize the retry-abort reason outside the try block so it's
+    # always in scope for the post-finally exit check below, even if the
+    # rebuild raises before reaching the retry gate.  See #2572.
+    retry_aborted_reason: str | None = None
 
     # Wrap the rebuild in try/finally so the completion marker is always
     # written when --reset was used, even if the rebuild fails partway (#2222).
@@ -1207,32 +1355,73 @@ def main() -> None:
         # Step 4b: Retry the keys that were in flight when the pool broke.
         # Each retry runs in its own ``max_workers=1`` subprocess so a
         # segfault only kills the single retry worker.  See #2495.
+        #
+        # Gate entry to the retry pass: if too many keys crashed the pool
+        # (by absolute count or by ratio of total keys), that's almost
+        # certainly a systemic failure (DB exhaustion, OOM across workers)
+        # rather than per-doc bad PDFs, and the serial retry pass will
+        # churn for hours without recovery.  See #2572.
         retry_summary: dict[str, Any] | None = None
         if crashed_keys:
-            logger.warning(
-                "Pool break detected during concurrent pass — %d key(s) "
-                "affected across %d distinct crash event(s).  Retrying "
-                "serially.",
-                len(crashed_keys),
-                pool_break_events,
-                crashed_keys_count=len(crashed_keys),
-                pool_break_events=pool_break_events,
+            should_abort, abort_reason = _should_abort_retry_pass(
+                crashed_count=len(crashed_keys),
+                total_count=len(keys),
+                max_count=args.max_retry_count,
+                max_ratio=args.max_retry_ratio,
             )
-            retry_summary = _retry_crashed_keys_serially(
-                crashed_keys,
-                cache_dir,
-                BUCKET,
-                database_url,
-                redis_url,
-                os_url,
-            )
-            # Fold retry counters back into the overall totals.  We already
-            # counted ``len(crashed_keys)`` errors during the concurrent pass
-            # (one per future that got ``BrokenProcessPool``).  Each retry
-            # resolves one of those: success → convert error into processed,
-            # skip → convert error into skipped, error → error stays.  Net
-            # effect: subtract the whole ``len(crashed_keys)`` from errors
-            # and re-add only the retry-level errors.
+            if should_abort:
+                retry_aborted_reason = abort_reason
+                # Log a sample of crashed keys so operators have a starting
+                # point for manual investigation.  Cap at 20 so logs don't
+                # explode when thousands crashed.  See #2572.
+                sample_keys, sample_truncated = _build_abort_log_sample(crashed_keys)
+                logger.error(
+                    "Aborting serial retry pass — systemic failure signal. "
+                    "%d key(s) crashed the concurrent pool, which exceeds "
+                    "the configured retry cap (%s).  Serial retry would "
+                    "churn for hours without recovery; likely root cause "
+                    "is DB connection exhaustion, OOM across workers, or "
+                    "network partition.  Diagnose before re-running.  See "
+                    "#2572.",
+                    len(crashed_keys),
+                    abort_reason,
+                    crashed_keys_count=len(crashed_keys),
+                    pool_break_events=pool_break_events,
+                    abort_reason=abort_reason,
+                    sample_crashed_keys=sample_keys,
+                    sample_crashed_keys_truncated=sample_truncated,
+                )
+            else:
+                logger.warning(
+                    "Pool break detected during concurrent pass — %d key(s) "
+                    "affected across %d distinct crash event(s).  Retrying "
+                    "serially.",
+                    len(crashed_keys),
+                    pool_break_events,
+                    crashed_keys_count=len(crashed_keys),
+                    pool_break_events=pool_break_events,
+                )
+                retry_summary = _retry_crashed_keys_serially(
+                    crashed_keys,
+                    cache_dir,
+                    BUCKET,
+                    database_url,
+                    redis_url,
+                    os_url,
+                )
+        # Fold retry counters back into the overall totals only when the
+        # retry pass actually ran.  If we aborted before entering it
+        # (``retry_summary is None``), ``errors`` already includes every
+        # crashed key from the concurrent pass — no adjustment needed.
+        # See #2572 for the abort path.
+        if retry_summary is not None:
+            # We already counted ``len(crashed_keys)`` errors during the
+            # concurrent pass (one per future that got
+            # ``BrokenProcessPool``).  Each retry resolves one of those:
+            # success → convert error into processed, skip → convert error
+            # into skipped, error → error stays.  Net effect: subtract the
+            # whole ``len(crashed_keys)`` from errors and re-add only the
+            # retry-level errors.
             errors = max(0, errors - len(crashed_keys)) + retry_summary["errors"]
             processed += retry_summary["processed"]
             skipped += retry_summary["skipped"]
@@ -1295,6 +1484,18 @@ def main() -> None:
             _write_rebuild_marker(conn, in_progress=False)
 
     conn.close()
+
+    # Propagate retry-cap abort as a non-zero exit so the ECS orchestrator
+    # surfaces the failure.  We do this AFTER closing the DB connection and
+    # clearing the rebuild marker so the dev environment returns to a clean
+    # state before the task exits.  See #2572.
+    if retry_aborted_reason is not None:
+        logger.error(
+            "Exiting non-zero because serial retry pass was aborted — "
+            "systemic failure requires manual diagnosis before re-running.",
+            retry_aborted_reason=retry_aborted_reason,
+        )
+        sys.exit(2)
 
 
 if __name__ == "__main__":
