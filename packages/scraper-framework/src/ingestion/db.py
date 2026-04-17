@@ -15,6 +15,7 @@ Write order per event:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -1722,25 +1723,127 @@ def insert_ruling(
     # deleted first so the superseded document leaves no orphaned ruling
     # behind.
     #
+    # We also link the loser to the winner via
+    # ``documents.previous_version_id`` and set ``change_type =
+    # 'duplicate_content'`` so downstream consumers (spotcheck, reporting)
+    # can trace a loser-doc to its canonical rulings (#2569).  Without
+    # this link, loser docs look like "zero derived rulings" to naive
+    # queries keyed on ``documents.s3_key`` — the rulings really exist
+    # but live on the winner's doc_id.
+    #
+    # A structured WARN is emitted (promoted from info in #2569) and a
+    # ``content_hash_dedup_supersede`` row is written to
+    # ``telemetry.data_quality_metrics`` so the historically silent dedup
+    # path now has observability and a classable log level.
+    #
     # Matches the existing ``_supersede_document`` pattern in
     # ``scripts/reingest_from_s3.py`` used for split-child dedup.
+    winner_document_id: str | None = None
+    county_for_metric: str | None = None
+    s3_key_for_log: str | None = None
     with conn.cursor() as cur:
+        # Look up the winner's document_id by the (case_id, text_hash)
+        # pair that caused the UniqueViolation.  ``text_hash`` is non-NULL
+        # here because a NULL hash cannot trigger the partial unique
+        # index ``uq_rulings_case_text_hash``.  The winner is whichever
+        # document inserted its ruling row first.
+        cur.execute(
+            "SELECT document_id::text FROM rulings "
+            "WHERE case_id = %s::uuid AND ruling_text_hash = %s "
+            "LIMIT 1",
+            (case_id, text_hash),
+        )
+        winner_row = cur.fetchone()
+        if winner_row is not None:
+            winner_document_id = winner_row[0]
+
+        # Fetch county and s3_key for the loser so we can emit a
+        # per-county telemetry metric and a structured WARN log.  Best-
+        # effort — failure to fetch doesn't prevent the supersede.
+        try:
+            cur.execute(
+                "SELECT c.county, d.s3_key FROM documents d "
+                "JOIN courts c ON d.court_id = c.id "
+                "WHERE d.id = %s::uuid",
+                (document_id,),
+            )
+            ctx_row = cur.fetchone()
+            if ctx_row is not None:
+                county_for_metric = ctx_row[0]
+                s3_key_for_log = ctx_row[1]
+        except Exception:  # noqa: BLE001 — telemetry lookup is best-effort
+            pass
+
         cur.execute(
             "DELETE FROM rulings WHERE document_id = %s::uuid",
             (document_id,),
         )
         deleted = cur.rowcount
-        cur.execute(
-            "UPDATE documents SET status = 'superseded' WHERE id = %s::uuid",
-            (document_id,),
-        )
-    logger.info(
-        "insert_ruling: content-hash dedup — superseded losing document "
-        "%s (case_id=%s, ruling_text_hash=%s, deleted %d stale ruling row(s))",
-        document_id,
-        case_id,
-        text_hash,
-        deleted,
+
+        if winner_document_id is not None:
+            cur.execute(
+                "UPDATE documents "
+                "SET status = 'superseded', "
+                "    previous_version_id = %s::uuid, "
+                "    change_type = 'duplicate_content' "
+                "WHERE id = %s::uuid",
+                (winner_document_id, document_id),
+            )
+        else:
+            # Defensive fallback: if we couldn't resolve the winner
+            # (unexpected — the constraint only fires when a winner row
+            # exists), still mark the loser superseded with the classifier
+            # so reporting knows why.
+            cur.execute(
+                "UPDATE documents "
+                "SET status = 'superseded', "
+                "    change_type = 'duplicate_content' "
+                "WHERE id = %s::uuid",
+                (document_id,),
+            )
+
+        # Emit a per-county telemetry metric.  If county lookup failed
+        # (e.g. the document row doesn't exist yet in this transaction's
+        # visible snapshot), skip — we don't want a telemetry write to
+        # break the primary supersede path.
+        if county_for_metric is not None:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO data_quality_metrics
+                        (recorded_at, county, metric_name, metric_value, metadata)
+                    VALUES (now(), %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        county_for_metric,
+                        "content_hash_dedup_supersede",
+                        1,
+                        json.dumps(
+                            {
+                                "loser_document_id": document_id,
+                                "winner_document_id": winner_document_id,
+                                "case_id": case_id,
+                                "ruling_text_hash": text_hash,
+                                "s3_key": s3_key_for_log,
+                            }
+                        ),
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                pass
+
+    logger.warning(
+        "insert_ruling: content-hash dedup — superseded losing document",
+        extra={
+            "loser_document_id": document_id,
+            "winner_document_id": winner_document_id,
+            "case_id": case_id,
+            "ruling_text_hash": text_hash,
+            "s3_key": s3_key_for_log,
+            "county": county_for_metric,
+            "deleted_stale_rulings": deleted,
+            "event": "content_hash_dedup_supersede",
+        },
     )
 
 

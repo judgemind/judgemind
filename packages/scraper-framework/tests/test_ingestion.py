@@ -5576,6 +5576,79 @@ def test_llm_split_logs_orphan_warning_when_no_rulings_extracted(
     assert getattr(record, "reason", None)  # non-empty
 
 
+def test_llm_split_writes_zero_ruling_extraction_metric_on_orphan(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Orphan branch also writes a ``zero_ruling_extraction`` telemetry row (#2569).
+
+    When ``_llm_split_document`` takes the orphan branch, it must (a)
+    emit the WARN log (covered by #1337 test above) AND (b) write a
+    per-county telemetry row so the rate is dashboard-queryable rather
+    than log-grep-only.
+    """
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = []  # orphan.
+
+    event = _make_event(
+        document_id="orphan-doc-id-0000-0000-000000000001",
+        scraper_id="ca-oc-tentatives-probate",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/probate-orphan.pdf",
+        ruling_text="Some text that the LLM cannot classify as a ruling",
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        caplog.at_level("WARNING", logger="ingestion.worker"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is False
+    # The orphan branch must have attempted a data_quality_metrics
+    # INSERT inside a savepoint-protected block.
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert any("INSERT INTO data_quality_metrics" in s for s in executed_sql), (
+        "Orphan branch must write a data_quality_metrics row so the zero-"
+        "extraction rate is dashboard-visible (#2569)."
+    )
+    # Find the INSERT call and verify its params.
+    metric_calls = [
+        call
+        for call in mock_cur.execute.call_args_list
+        if "INSERT INTO data_quality_metrics" in call[0][0]
+    ]
+    assert len(metric_calls) == 1
+    params = metric_calls[0][0][1]
+    # (county, metric_name, metric_value, metadata_json)
+    assert params[0] == "Orange"
+    assert params[1] == "zero_ruling_extraction"
+    assert params[2] == 1
+    import json as _json
+
+    meta = _json.loads(params[3])
+    assert meta["document_id"] == "orphan-doc-id-0000-0000-000000000001"
+    assert meta["s3_key"] == "ca/orange/superior_court/raw/probate-orphan.pdf"
+    assert meta["state"] == "CA"
+    # Savepoint is used so a transient telemetry failure doesn't abort
+    # the caller's transaction.
+    assert any("SAVEPOINT zero_ruling_metric" in s for s in executed_sql)
+
+
 def test_llm_split_does_not_log_orphan_warning_when_rulings_extracted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -5971,8 +6044,11 @@ def test_insert_ruling_content_hash_collision_supersedes_loser_default() -> None
     update_sql, update_params = supersede_stmts[1]
     assert "DELETE FROM rulings WHERE document_id" in delete_sql
     assert delete_params == (losing_doc_id,)
-    assert "UPDATE documents SET status = 'superseded'" in update_sql
-    assert update_params == (losing_doc_id,)
+    assert "UPDATE documents" in update_sql and "superseded" in update_sql
+    # After #2569, the UPDATE also carries the winner_id in earlier
+    # positions when a winner row was resolved.  The loser id is always
+    # the LAST positional param.
+    assert update_params[-1] == losing_doc_id
     # The old buggy fallback UPDATE that targeted (case_id, ruling_text_hash)
     # must not run — it silently mutated the winner's row (#2458).
     all_sql = [call.args[0] if call.args else "" for call in cur.execute.call_args_list]
@@ -6004,7 +6080,9 @@ def test_insert_ruling_content_hash_collision_supersedes_loser_force_update() ->
     _, delete_params = supersede_stmts[0]
     _, update_params = supersede_stmts[1]
     assert delete_params == (losing_doc_id,)
-    assert update_params == (losing_doc_id,)
+    # After #2569, the UPDATE params may include winner_id in earlier
+    # positions; the loser id is always the LAST positional param.
+    assert update_params[-1] == losing_doc_id
     # No UPDATE rulings SET of any form should run — the supersede path
     # must not touch the winner's ruling row.
     all_sql = [call.args[0] if call.args else "" for call in cur.execute.call_args_list]

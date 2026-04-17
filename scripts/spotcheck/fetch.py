@@ -19,6 +19,7 @@ one item at a time.
 Expansion strategies are registered in STRATEGIES. To add a new entity
 type, implement an ExpansionStrategy subclass and register it.
 """
+
 from __future__ import annotations
 
 import abc
@@ -70,7 +71,9 @@ def register_strategy(entity_type: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _run_db_query(sql: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
+def _run_db_query(
+    sql: str, params: tuple[Any, ...] | None = None
+) -> list[dict[str, Any]]:
     """Run a SQL query and return parsed results as a list of dicts.
 
     Uses psycopg directly if DATABASE_URL is set (ECS environment).
@@ -266,14 +269,18 @@ class RulingsStrategy(ExpansionStrategy):
         for rec in records:
             full_text = rec.get("ruling_text", "")
             if full_text:
-                (item_dir / "ruling_text.txt").write_text(str(full_text), encoding="utf-8")
+                (item_dir / "ruling_text.txt").write_text(
+                    str(full_text), encoding="utf-8"
+                )
                 result["artifacts"].append("ruling_text.txt")
                 rec["ruling_text_length"] = len(str(full_text))
                 rec["ruling_text_preview"] = str(full_text)[:300]
                 del rec["ruling_text"]
             html_text = rec.get("ruling_text_html")
             if html_text:
-                (item_dir / "ruling_text.html").write_text(str(html_text), encoding="utf-8")
+                (item_dir / "ruling_text.html").write_text(
+                    str(html_text), encoding="utf-8"
+                )
                 result["artifacts"].append("ruling_text.html")
                 del rec["ruling_text_html"]
             elif "ruling_text_html" in rec:
@@ -341,9 +348,31 @@ class OriginalsStrategy(ExpansionStrategy):
             result["artifacts"].append(f"original.{ext}")
 
         # 2. Fetch all derived rulings from DB
-        # Escape single quotes in the S3 key for SQL safety
+        #
+        # A naive ``WHERE d.s3_key = <key>`` misses rulings when the
+        # queried S3 key is a content-hash-dedup *loser* (#2569): the
+        # loser's document row is marked superseded with its rulings
+        # deleted, while the actual rulings for those cases live on the
+        # *winner*'s document (a different s3_key).  We follow the
+        # ``documents.previous_version_id`` link so either the winner or
+        # the loser S3 key surfaces the canonical rulings.
+        #
+        # The subquery collects (a) any document that currently has this
+        # s3_key and (b) any document that points to one of those docs
+        # via ``previous_version_id`` (the winner when this key is a
+        # loser), then the outer query fetches rulings linked to ANY of
+        # those doc ids.
+        #
+        # Escape single quotes in the S3 key for SQL safety.
         safe_key = entity_id.replace("'", "''")
         query = (
+            "WITH target_docs AS ("
+            "  SELECT id FROM documents WHERE s3_key = '" + safe_key + "' "
+            "  UNION "
+            "  SELECT previous_version_id AS id FROM documents "
+            "  WHERE s3_key = '" + safe_key + "' "
+            "    AND previous_version_id IS NOT NULL "
+            ") "
             "SELECT r.id::text AS ruling_id, r.outcome::text, "
             "r.motion_type, r.hearing_date::text, r.department, "
             "cs.case_number, cs.case_title, "
@@ -351,10 +380,9 @@ class OriginalsStrategy(ExpansionStrategy):
             "length(r.ruling_text) AS ruling_text_length, "
             "left(r.ruling_text, 300) AS ruling_text_preview "
             "FROM rulings r "
-            "JOIN documents d ON r.document_id = d.id "
+            "JOIN target_docs td ON r.document_id = td.id "
             "JOIN cases cs ON r.case_id = cs.id "
-            "LEFT JOIN judges j ON r.judge_id = j.id "
-            f"WHERE d.s3_key = '{safe_key}'"
+            "LEFT JOIN judges j ON r.judge_id = j.id"
         )
         derived = _run_db_query(query)
         derived_path = item_dir / "derived_rulings.json"
@@ -374,9 +402,7 @@ class OriginalsStrategy(ExpansionStrategy):
                     ruling_id = ruling.get("ruling_id", "")
                     if ruling_id:
                         screenshot_path = screenshots_dir / f"{ruling_id}.png"
-                        if _take_screenshot(
-                            f"/rulings/{ruling_id}", screenshot_path
-                        ):
+                        if _take_screenshot(f"/rulings/{ruling_id}", screenshot_path):
                             result["artifacts"].append(
                                 f"ruling_screenshots/{ruling_id}.png"
                             )
@@ -413,9 +439,7 @@ def fetch_manifest(
 
     # Copy manifest into output
     manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     summary: dict[str, Any] = {
         "entity": entity_type,
@@ -477,7 +501,10 @@ def main() -> None:
             sys.exit(1)
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     else:
-        print("ERROR: Provide either a manifest file path or --manifest-json", file=sys.stderr)
+        print(
+            "ERROR: Provide either a manifest file path or --manifest-json",
+            file=sys.stderr,
+        )
         sys.exit(1)
     output_dir = Path(args.output)
 

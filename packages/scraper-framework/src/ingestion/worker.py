@@ -2474,6 +2474,9 @@ class IngestionWorker:
             # (those that produce zero ruling records) via a structured, easily
             # searchable warning so operators can detect when probate PDFs or
             # other problematic content fail extraction.
+            #
+            # A per-county telemetry row is also written so the zero-extraction
+            # rate is dashboard-queryable rather than grep-only (#2569).
             orphan_result = check_no_orphan_rulings(0)
             if orphan_result.is_orphan:
                 logger.warning(
@@ -2488,8 +2491,49 @@ class IngestionWorker:
                         "llm_latency_ms": llm_latency_ms,
                         "extraction_method": extraction_method,
                         "reason": orphan_result.reason,
+                        "event": "zero_ruling_extraction",
                     },
                 )
+                # Best-effort telemetry write (savepoint-protected so a
+                # transient failure does not abort the caller's
+                # transaction).
+                try:
+                    conn = self._get_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("SAVEPOINT zero_ruling_metric")
+                        try:
+                            cur.execute(
+                                """
+                                INSERT INTO data_quality_metrics
+                                    (recorded_at, county, metric_name,
+                                     metric_value, metadata)
+                                VALUES (now(), %s, %s, %s, %s::jsonb)
+                                """,
+                                (
+                                    county,
+                                    "zero_ruling_extraction",
+                                    1,
+                                    json.dumps(
+                                        {
+                                            "document_id": document_id,
+                                            "s3_key": event_data.get("s3_key"),
+                                            "state": state,
+                                            "scraper_id": event_data.get("scraper_id"),
+                                            "extraction_method": extraction_method,
+                                            "reason": orphan_result.reason,
+                                        }
+                                    ),
+                                ),
+                            )
+                            cur.execute("RELEASE SAVEPOINT zero_ruling_metric")
+                        except Exception:  # noqa: BLE001 — best-effort
+                            cur.execute("ROLLBACK TO SAVEPOINT zero_ruling_metric")
+                            raise
+                except Exception:  # noqa: BLE001 — telemetry is best-effort
+                    logger.debug(
+                        "zero_ruling_extraction telemetry write failed",
+                        exc_info=True,
+                    )
             return False
 
         logger.info(
