@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, gql } from '@apollo/client';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { BarChart3, Scale, X } from 'lucide-react';
+import { BarChart3, ChevronRight, Scale, X } from 'lucide-react';
 import { ErrorBanner } from '@/components/ErrorBanner';
 import {
   formatDate,
@@ -361,6 +361,12 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                 <Scale className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
                 Motion Type Breakdown
               </CardTitle>
+              <p
+                className="text-xs text-muted-foreground"
+                data-testid="motion-type-click-hint"
+              >
+                Click a row to filter the rulings below by that motion type.
+              </p>
             </CardHeader>
             <CardContent className="pt-0">
               <Table>
@@ -372,21 +378,30 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                     <TableHead className="text-right">Denied</TableHead>
                     <TableHead className="text-right">Partial</TableHead>
                     <TableHead className="text-right">Grant Rate</TableHead>
+                    <TableHead className="w-8">
+                      <span className="sr-only">Filter</span>
+                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {analytics.rulingsByMotionType.map((row) => {
                     const isActive = motionTypeFilter === row.motionType;
                     const isLowSample = row.total < LOW_SAMPLE_THRESHOLD;
+                    const motionLabel = formatMotionType(row.motionType);
                     return (
                       <TableRow
                         key={row.motionType}
-                        className={`cursor-pointer transition-colors ${isActive ? 'bg-accent' : 'hover:bg-accent/50'}`}
+                        className={`group cursor-pointer transition-colors ${isActive ? 'bg-accent' : 'hover:bg-accent/50'}`}
                         onClick={() => handleMotionTypeClick(row.motionType)}
                         role="button"
                         tabIndex={0}
                         aria-pressed={isActive}
                         data-low-sample={isLowSample || undefined}
+                        data-motion-action={
+                          isActive
+                            ? `Currently filtering by ${motionLabel} — click to clear`
+                            : `Filter rulings by ${motionLabel}`
+                        }
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault();
@@ -395,7 +410,17 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                         }}
                       >
                         <TableCell className="font-medium">
-                          {formatMotionType(row.motionType)}
+                          <span
+                            className="text-primary underline-offset-2 group-hover:underline"
+                            data-testid={`motion-type-label-${row.motionType}`}
+                          >
+                            {motionLabel}
+                          </span>
+                          <span className="sr-only">
+                            {isActive
+                              ? '. Currently filtering by this motion type. Click to clear.'
+                              : '. Click to filter rulings by this motion type.'}
+                          </span>
                         </TableCell>
                         <TableCell className="text-right tabular-nums">{row.total}</TableCell>
                         <TableCell className="text-right tabular-nums">{row.granted}</TableCell>
@@ -411,6 +436,16 @@ export function JudgeProfile({ judgeId }: { judgeId: string }) {
                               (limited data)
                             </span>
                           )}
+                        </TableCell>
+                        <TableCell className="w-8 text-right">
+                          <ChevronRight
+                            className={`h-4 w-4 transition-opacity ${
+                              isActive
+                                ? 'text-foreground opacity-100'
+                                : 'text-muted-foreground opacity-60 group-hover:opacity-100'
+                            }`}
+                            aria-hidden="true"
+                          />
                         </TableCell>
                       </TableRow>
                     );
