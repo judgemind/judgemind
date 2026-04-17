@@ -540,48 +540,45 @@ jobs:
         run: pytest scripts/tests/ -v --tb=short
       - name: Check AWS CLI boolean flag usage
         run: scripts/check-aws-bool-flags.sh
-      - name: Test AWS CLI boolean flag checker
-        run: scripts/tests/test_check_aws_bool_flags.sh
-      - name: Test deprecated model checker
-        run: scripts/tests/test_check_deprecated_models.sh
-      - name: Test hardcoded model checker
-        run: scripts/tests/test_check_hardcoded_models.sh
-      - name: Test schema drift checker
-        run: scripts/tests/test_check_schema_drift.sh
-      - name: Test duplicate function checker
-        run: scripts/tests/test_check_duplicate_functions.sh
-      - name: Test test-except-pass checker
-        run: scripts/tests/test_check_test_except_pass.sh
-      - name: Test markdown link checker
-        run: scripts/tests/test_check_markdown_links.sh
-      - name: Test migration files checker
-        run: scripts/tests/test_check_migration_files.sh
-      - name: Test gemini-review.sh smoke tests
-        run: scripts/tests/test_gemini_review.sh
-      - name: Test adopt-pr.sh
-        run: scripts/tests/test_adopt_pr.sh
-      - name: Test oneshot repo-path checker
-        run: scripts/tests/test_check_oneshot_repo_paths.sh
-      - name: Test run-scraper.sh
-        run: scripts/tests/test_run_scraper.sh
-      - name: Test ecs-task-logs.sh
-        run: scripts/tests/test_ecs_task_logs.sh
-      - name: Test write-claude-file.sh
-        run: scripts/tests/test_write_claude_file.sh
-      - name: Test cleanup_worktree.sh
-        run: scripts/tests/test_cleanup_worktree.sh
-      - name: Test sweep_stale_worktrees.sh
-        run: scripts/tests/test_sweep_stale_worktrees.sh
-      - name: Test run-py.sh
-        run: scripts/tests/test_run_py.sh
-      - name: Test removed exports checker
-        run: scripts/tests/test_check_removed_exports.sh
-      - name: Test GraphQL query checker
-        run: scripts/tests/test_check_graphql_queries.sh
-      - name: Test install-package-venv.sh
-        run: scripts/tests/test_install_package_venv.sh
-      - name: Test wait-for-rollout.sh
-        run: scripts/tests/test_wait_for_rollout.sh
+      # Auto-discover and run every executable shell test under
+      # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
+      # that adding a new shell test is just `touch + chmod +x` — no
+      # matching ci.yml edit required. Previously, three tests
+      # (test_check_oneshot_imports.sh, test_ecs_logs.sh, test_preflight.sh)
+      # were silently never running in CI because they'd never been added
+      # to the list.
+      - name: Run all scripts/tests shell tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          tests=(scripts/tests/*.sh)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "No shell test files found under scripts/tests/ — nothing to run."
+            exit 0
+          fi
+          failed=0
+          ran=0
+          skipped=0
+          for t in "${tests[@]}"; do
+            if [ ! -x "$t" ]; then
+              echo "::warning::Skipping $t — not executable (chmod +x required)"
+              skipped=$((skipped + 1))
+              continue
+            fi
+            echo "::group::$t"
+            if ! "$t"; then
+              echo "::error::$t failed"
+              failed=$((failed + 1))
+            fi
+            ran=$((ran + 1))
+            echo "::endgroup::"
+          done
+          echo "Ran $ran shell test(s). Skipped: $skipped. Failed: $failed."
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed shell test(s) failed."
+            exit 1
+          fi
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
