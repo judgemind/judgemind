@@ -11,6 +11,16 @@
 #      redeploy path, see #2523). Same task-def ARN as before, but a new
 #      deployment ID.
 #
+# IMPORTANT — paths-filter contract (see #2592):
+#   Any deploy workflow that adopts this script (directly or via the
+#   ecs-deploy composite action) MUST add `scripts/wait-for-rollout.sh`
+#   to its `on.push.paths:` filter. Otherwise a PR that changes only this
+#   shared script will merge without triggering any deploy workflow — so
+#   the fix is not exercised against a real rollout on its own PR, and
+#   regressions surface on the next unrelated deploy. Current callers:
+#     - .github/workflows/deploy-scraper.yml
+#     - .github/workflows/deploy-api.yml
+#
 # Identifying the deployment:
 #   - CI path knows the new task-def ARN up front.
 #   - Operator redeploy path does not change the task-def ARN; only a new
