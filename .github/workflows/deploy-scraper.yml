@@ -238,7 +238,14 @@ jobs:
 
           echo "Running tasks: $RUNNING_COUNT / Desired: $DESIRED_COUNT"
 
-          if [ "$RUNNING_COUNT" -ge "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
+          # Treat running==desired as success. This includes the scale-to-zero
+          # case (desired=0, running=0): the dev ingestion worker is kept at
+          # desiredCount=0 and runs on-demand, so "no tasks running" is the
+          # expected steady state. Mirrors the #2585 fix in
+          # scripts/wait-for-rollout.sh (see #2605).
+          if [ "$DESIRED_COUNT" -eq 0 ] && [ "$RUNNING_COUNT" -eq 0 ]; then
+            echo "Service is scaled to zero (desired=0, running=0) — treating as healthy."
+          elif [ "$RUNNING_COUNT" -ge "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
             echo "Service has expected number of running tasks."
           else
             echo "ERROR: Service running count ($RUNNING_COUNT) does not match desired ($DESIRED_COUNT)."
@@ -248,6 +255,21 @@ jobs:
       - name: Health check — verify no crash-loop
         id: crash-check
         run: |
+          # When the service is scaled to zero (desired=0), there are no tasks
+          # to inspect — no running tasks is the expected state, not a
+          # crash-loop. Skip the task inspection entirely. Mirrors the #2585
+          # fix in scripts/wait-for-rollout.sh (see #2605).
+          DESIRED_COUNT=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$INGESTION_SERVICE" \
+            --query 'services[0].desiredCount' \
+            --output text)
+
+          if [ "$DESIRED_COUNT" -eq 0 ]; then
+            echo "Service is scaled to zero (desired=0) — skipping crash-loop check (no tasks to inspect)."
+            exit 0
+          fi
+
           # Check that the most recent task has been running for at least 30 seconds
           # (a crash-looping container restarts quickly)
           TASKS=$(aws ecs list-tasks \
