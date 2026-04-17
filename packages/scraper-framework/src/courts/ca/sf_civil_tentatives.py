@@ -23,17 +23,37 @@ The HTML table contains structured <tr> rows with headers:
    3 → Dept 501 (Real Property Housing Court Motions)
    7 → Dept 204 (Probate)
 
-The site is behind Cloudflare Turnstile CAPTCHA. The scraper uses
-Playwright with stealth to navigate the CAPTCHA page, which auto-solves
-for legitimate browsers. After the CAPTCHA resolves, the page contains
-a session ID (seshID) that is extracted and used for REST API calls
-via httpx (no browser needed per ruling).
+The site is behind Cloudflare Turnstile CAPTCHA (sitekey
+``0x4AAAAAAAhseTmUbrk0U5ab``, compat=recaptcha). Session acquisition
+uses one of three paths depending on available configuration, in
+priority order:
+
+1. **CAPSolver (deterministic, when ``CAPSOLVER_API_KEY`` is set).**
+   Uses Playwright to navigate to the gateway, calls the CAPSolver
+   two-step API to obtain a Turnstile response token, injects it into
+   the hidden ``g-recaptcha-response`` input, and invokes the site's
+   ``recaptchaCallBack`` to submit the form. See #2623 / PR #2634.
+2. **Patchright + residential proxy (stealth fallback, when
+   ``SF_PROXY_URL`` or ``SD_PROXY_URL`` is set and CAPSolver is
+   unset).** Uses ``patchright.async_api.async_playwright`` with
+   ``channel="chrome"``, zero custom launch args, and a
+   higher-reputation egress IP from the residential proxy pool.
+   Patchright's stealth-optimized build handles fingerprint masking
+   internally; any override (user-agent, viewport, timezone, locale)
+   is intentionally omitted per the library's guidance to keep
+   detection entropy low. See #2622.
+3. **Plain playwright + playwright-stealth (last resort, when neither
+   the CAPSolver key nor a proxy URL is configured).** Kept for local
+   development and tests that don't route through external services.
+
+After any path produces the seshID, REST API calls proceed via httpx
+(no browser needed per ruling).
 
 No LLM extraction needed — all fields are deterministically parseable
 from the structured HTML response.
 
-Investigation: #2129
-Fix: #2348
+Investigation: #2129, #2619
+Fix: #2348 (initial), #2622 (Patchright + proxy), #2623 (CAPSolver)
 """
 
 from __future__ import annotations
@@ -86,8 +106,20 @@ TURNSTILE_SITEKEY = "0x4AAAAAAAhseTmUbrk0U5ab"
 # to hit CAPSolver).
 CAPSOLVER_API_KEY_ENV_VAR = "CAPSOLVER_API_KEY"
 
+# Environment variable name for the SF-specific residential proxy URL.
+# Primary proxy env var for this scraper — when set (and CAPSolver is
+# unset), the Patchright stealth path routes through this proxy. See #2622.
+SF_PROXY_URL_ENV_VAR = "SF_PROXY_URL"
+
+# Environment variable name for the fallback residential proxy URL.
+# Shared with the San Diego scraper — reused when ``SF_PROXY_URL`` is
+# unset but ``SD_PROXY_URL`` points at the same residential pool.
+SD_PROXY_URL_ENV_VAR = "SD_PROXY_URL"
+
 # Turnstile challenge timeout (seconds) — how long to wait for auto-solve.
-TURNSTILE_TIMEOUT = 45.0
+# Bumped from 45 -> 60 in #2622 to give Patchright+proxy more headroom on
+# the interactive challenge variant served to fresh IPs.
+TURNSTILE_TIMEOUT = 60.0
 
 # Turnstile poll interval (seconds) — how often to check for page navigation.
 TURNSTILE_POLL_INTERVAL = 2.0
@@ -518,17 +550,28 @@ def extract_session_id(html: str) -> str | None:
 class SFCivilTentativeRulingsScraper(BaseScraper):
     """San Francisco civil tentative rulings — REST API with Turnstile CAPTCHA.
 
-    Uses Playwright to solve the Cloudflare Turnstile CAPTCHA and obtain a
-    session ID. Then fetches rulings from the REST API endpoint for all 7
-    RulingIDs (5 departments). Each ruling is emitted as a separate
-    CapturedDocument.
+    Session acquisition has three possible paths (listed in priority order):
 
-    Session acquisition flow:
-      1. Navigate to captcha.dll gateway with Playwright + stealth
-      2. Turnstile auto-solves for legitimate browsers
-      3. Page redirects to tr.dll with session ID in page JavaScript
-      4. Extract seshID from ``var seshID="..."`` in the page source
-      5. Use seshID with REST API for fast httpx-based data fetching
+    1. **CAPSolver path (deterministic).** When ``CAPSOLVER_API_KEY`` is
+       set, uses plain Playwright with explicit launch args + stealth
+       evasions + the CAPSolver two-step API to solve Turnstile. This is
+       the most reliable path; CAPSolver's backend handles the
+       fingerprint/proof-of-work challenges directly. See #2623 / PR #2634.
+    2. **Patchright + residential proxy path (stealth).** When CAPSolver
+       is unset but ``SF_PROXY_URL`` (or ``SD_PROXY_URL``) is set, uses
+       ``patchright.async_api.async_playwright`` with ``channel="chrome"``,
+       zero custom launch args, and no context overrides, routed through
+       the residential proxy. Patchright's stealth-optimized build keeps
+       fingerprint entropy minimal; the higher-reputation egress IPs
+       from the residential pool improve Turnstile's auto-solve odds vs.
+       consumer datacenter IPs. See #2622.
+    3. **Plain playwright + stealth fallback (legacy).** When neither
+       CAPSolver nor a proxy URL is configured, falls back to the
+       historical path for local development and unit tests that don't
+       hit external services.
+
+    All three paths end by calling ``_wait_for_session`` to extract the
+    seshID from the post-CAPTCHA page content.
 
     An optional ``dept_judge_map`` (department -> judge name) can be passed
     to populate judge names from the SF court roster. When provided, the
@@ -537,6 +580,11 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
 
     An optional ``session_id`` can be injected directly (for testing) to
     skip Playwright-based session acquisition.
+
+    An optional ``proxy_url`` can be passed to force the Patchright+proxy
+    path regardless of env vars (primarily for tests). When omitted, the
+    scraper reads from ``SF_PROXY_URL`` first, then ``SD_PROXY_URL`` as a
+    fallback.
     """
 
     def __init__(
@@ -547,12 +595,25 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         dept_judge_map: dict[str, str] | None = None,
         session_id: str | None = None,
         headless: bool = True,
+        proxy_url: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(config=config, archiver=archiver, event_bus=event_bus)
         self._dept_judge_map: dict[str, str] = dept_judge_map or {}
         self._session_id: str | None = session_id
         self._headless: bool = headless
+        # Resolve proxy URL: explicit arg > SF_PROXY_URL env > SD_PROXY_URL env.
+        # The SD proxy env var is reused because both scrapers share the
+        # residential proxy secret in dev (same ``proxy_secret_arn`` in
+        # infra/terraform/modules/compute); allowing either env var means we
+        # don't need to re-populate the secret to get this scraper on the
+        # proxy path.
+        resolved_proxy = (
+            proxy_url
+            or os.environ.get(SF_PROXY_URL_ENV_VAR)
+            or os.environ.get(SD_PROXY_URL_ENV_VAR)
+        )
+        self._proxy_url: str | None = resolved_proxy or None
 
     def fetch_documents(self) -> list[CapturedDocument]:
         """Fetch civil tentative rulings from the REST API.
@@ -693,14 +754,47 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
     async def _acquire_session(self) -> str | None:
         """Acquire a session ID by solving the Cloudflare Turnstile CAPTCHA.
 
-        Uses Playwright to navigate to the CAPTCHA gateway, waits for the
-        Turnstile widget to auto-solve, and extracts the seshID from the
-        resulting page's JavaScript.
+        Selects the async_playwright factory based on configuration:
+
+        * When ``CAPSOLVER_API_KEY`` is set, use plain ``playwright`` (the
+          custom launch args + stealth evasions are compatible with
+          CAPSolver's page-injection flow).
+        * When ``CAPSOLVER_API_KEY`` is unset, prefer ``patchright`` — its
+          stealth-optimized build pairs with the residential proxy for a
+          no-cost-per-solve path. If patchright is not importable (e.g.
+          dev environment that hasn't run ``patchright install chromium``
+          yet), fall back to plain playwright so tests and local dev keep
+          working.
+
+        The selected factory is then passed into ``_try_acquire_session``,
+        preserving the existing injection point so test suites that mock
+        ``async_playwright`` continue to work unchanged.
 
         Returns:
             The session ID string, or None if acquisition failed.
         """
-        from playwright.async_api import async_playwright
+        use_solver = bool(os.environ.get(CAPSOLVER_API_KEY_ENV_VAR, ""))
+
+        if use_solver:
+            from playwright.async_api import async_playwright
+
+            factory_name = "playwright"
+        else:
+            try:
+                from patchright.async_api import async_playwright
+
+                factory_name = "patchright"
+            except ImportError:
+                from playwright.async_api import async_playwright
+
+                factory_name = "playwright"
+
+        self._log.info(
+            "Acquiring SF civil session",
+            factory=factory_name,
+            proxy=bool(self._proxy_url),
+            use_solver=use_solver,
+        )
 
         for attempt in range(1, SESSION_MAX_RETRIES + 1):
             self._log.info(
@@ -732,22 +826,29 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
     async def _try_acquire_session(self, async_playwright: Any) -> str | None:
         """Single attempt to acquire a session via Playwright.
 
-        The flow has two branches:
+        Three possible branches (in priority order):
 
-        1. **CAPSolver-assisted (preferred, deterministic)**: when the
+        1. **CAPSolver-assisted (deterministic)**: when the
            ``CAPSOLVER_API_KEY`` env var is set, call the CAPSolver API to
            obtain a Turnstile response token, inject it into the hidden
            ``g-recaptcha-response`` input, and invoke the site's
            ``recaptchaCallBack`` JavaScript callback, which submits the
            form and redirects to ``tr.dll?RulingID=N`` where seshID lives.
+           Uses custom launch args + stealth evasions (compatible with
+           CAPSolver; the solver doesn't care about fingerprint quality).
 
-        2. **Stealth fallback (legacy)**: when the env var is absent,
-           apply stealth evasions and poll for the CAPTCHA to
-           auto-resolve. This worked historically but became unreliable
-           in interactive mode (see #2619).
+        2. **Patchright + proxy (stealth)**: when CAPSolver is unset,
+           ``async_playwright`` is the patchright factory (selected by
+           ``_acquire_session``). Launch with ``channel="chrome"``, zero
+           custom args, no context overrides, no manual stealth — per
+           Patchright's guidance, any override increases detection
+           entropy. Route through the residential proxy if configured.
 
-        Both branches end by calling ``_wait_for_session`` to extract the
-        seshID from the post-CAPTCHA page.
+        3. **Plain playwright + stealth (last resort)**: when CAPSolver is
+           unset AND patchright is not importable, same as branch 2 but
+           with the legacy playwright+stealth setup.
+
+        All three end by calling ``_wait_for_session`` to extract seshID.
 
         Args:
             async_playwright: The async_playwright context manager factory.
@@ -755,42 +856,70 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         Returns:
             The session ID string, or None if this attempt failed.
         """
+        api_key = os.environ.get(CAPSOLVER_API_KEY_ENV_VAR, "")
+        use_solver = bool(api_key)
+
+        # Factory module name is used to detect the patchright path: when
+        # patchright is the active factory, skip custom launch args and
+        # stealth overrides per Patchright's guidance.
+        factory_module = getattr(async_playwright, "__module__", "") or ""
+        is_patchright = "patchright" in factory_module and not use_solver
+
+        launch_kwargs: dict[str, Any] = {"headless": self._headless}
+        if is_patchright:
+            # Patchright's recommended minimal-args launch: channel="chrome"
+            # uses the stable Chrome build (not chromium), and no custom
+            # args means the fingerprint stays as close as possible to a
+            # real Chrome session.
+            launch_kwargs["channel"] = "chrome"
+        else:
+            launch_kwargs["args"] = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-extensions",
+                "--disable-sync",
+                "--no-first-run",
+                "--window-size=1920,1080",
+            ]
+
+        if self._proxy_url:
+            launch_kwargs["proxy"] = {"server": self._proxy_url}
+
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=self._headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-infobars",
-                    "--disable-background-networking",
-                    "--disable-default-apps",
-                    "--disable-extensions",
-                    "--disable-sync",
-                    "--no-first-run",
-                    "--window-size=1920,1080",
-                ],
-            )
+            browser = await pw.chromium.launch(**launch_kwargs)
 
             try:
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1920, "height": 1080},
-                    java_script_enabled=True,
-                    locale="en-US",
-                    timezone_id="America/Los_Angeles",
-                )
+                if is_patchright:
+                    # Zero context overrides — patchright defaults are
+                    # already tuned for stealth. Overriding user_agent,
+                    # viewport, timezone_id, locale, etc. raises
+                    # detection entropy.
+                    context = await browser.new_context()
+                else:
+                    context = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        ),
+                        viewport={"width": 1920, "height": 1080},
+                        java_script_enabled=True,
+                        locale="en-US",
+                        timezone_id="America/Los_Angeles",
+                    )
 
                 page = await context.new_page()
 
-                # Apply stealth evasions. These still help even with
-                # CAPSolver because the post-CAPTCHA tr.dll page also
-                # performs bot checks.
-                await _apply_stealth(page)
+                if not is_patchright:
+                    # Apply stealth evasions on the playwright path.
+                    # Patchright handles stealth internally — applying
+                    # playwright-stealth on top would re-introduce the
+                    # bot-detectable artifacts it's designed to mask.
+                    await _apply_stealth(page)
 
                 # Use the first RulingID as the CAPTCHA referrer — all
                 # RulingIDs share the same session.
@@ -806,8 +935,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                 )
 
                 # Branch on CAPSolver availability.
-                api_key = os.environ.get(CAPSOLVER_API_KEY_ENV_VAR, "")
-                if api_key:
+                if use_solver:
                     submitted = await self._submit_captcha_with_solver(
                         page=page,
                         captcha_url=captcha_url,
@@ -821,8 +949,8 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
                         )
 
                 # Wait for the page to navigate to tr.dll and extract seshID.
-                # Works for both branches: CAPSolver-triggered redirect or
-                # stealth auto-solve.
+                # Works for all branches: CAPSolver-triggered redirect,
+                # patchright auto-solve, or legacy stealth auto-solve.
                 session_id = await self._wait_for_session(page)
                 return session_id
 
@@ -910,6 +1038,15 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         elapsed = 0.0
         while elapsed < TURNSTILE_TIMEOUT:
             current_url = page.url
+
+            # Per-poll debug log so operators can see in CloudWatch
+            # whether the page is still sitting on the CAPTCHA gateway or
+            # has progressed toward the tr.dll redirect.
+            self._log.debug(
+                "Polling for session",
+                url=current_url,
+                elapsed=elapsed,
+            )
 
             # Check if we've navigated away from the CAPTCHA page
             if "captcha" not in current_url.lower():

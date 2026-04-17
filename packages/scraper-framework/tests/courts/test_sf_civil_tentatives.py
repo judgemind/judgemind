@@ -25,7 +25,10 @@ from courts.ca.sf_civil_tentatives import (
     CIVIL_REST_BASE,
     RULING_ID_MAP,
     RULING_IDS,
+    SD_PROXY_URL_ENV_VAR,
+    SF_PROXY_URL_ENV_VAR,
     TURNSTILE_SITEKEY,
+    TURNSTILE_TIMEOUT,
     SFCivilTentativeRulingsScraper,
     _clean_party_name,
     extract_outcome,
@@ -1240,6 +1243,381 @@ class TestCAPSolverIntegration:
             )
 
         assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Patchright + residential proxy path (#2622)
+# ---------------------------------------------------------------------------
+
+
+class TestProxyInitialization:
+    """Tests for ``proxy_url`` / env-var resolution in ``__init__``."""
+
+    def test_proxy_url_from_sf_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When SF_PROXY_URL is set, _proxy_url picks it up."""
+        monkeypatch.setenv(SF_PROXY_URL_ENV_VAR, "http://sf-proxy.example:33335")
+        monkeypatch.delenv(SD_PROXY_URL_ENV_VAR, raising=False)
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        assert scraper._proxy_url == "http://sf-proxy.example:33335"
+
+    def test_proxy_url_from_sd_env_var_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When SF_PROXY_URL is unset but SD_PROXY_URL is set, fall back to SD."""
+        monkeypatch.delenv(SF_PROXY_URL_ENV_VAR, raising=False)
+        monkeypatch.setenv(SD_PROXY_URL_ENV_VAR, "http://sd-proxy.example:33335")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        assert scraper._proxy_url == "http://sd-proxy.example:33335"
+
+    def test_proxy_url_prefers_sf_over_sd(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When both SF_PROXY_URL and SD_PROXY_URL are set, SF wins."""
+        monkeypatch.setenv(SF_PROXY_URL_ENV_VAR, "http://sf-proxy.example:33335")
+        monkeypatch.setenv(SD_PROXY_URL_ENV_VAR, "http://sd-proxy.example:33335")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        assert scraper._proxy_url == "http://sf-proxy.example:33335"
+
+    def test_proxy_url_explicit_arg_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit proxy_url constructor arg takes precedence over env vars."""
+        monkeypatch.setenv(SF_PROXY_URL_ENV_VAR, "http://sf-env.example:33335")
+        monkeypatch.setenv(SD_PROXY_URL_ENV_VAR, "http://sd-env.example:33335")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            proxy_url="http://explicit.example:33335",
+        )
+        assert scraper._proxy_url == "http://explicit.example:33335"
+
+    def test_proxy_url_defaults_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no env vars and no explicit arg, _proxy_url is None."""
+        monkeypatch.delenv(SF_PROXY_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv(SD_PROXY_URL_ENV_VAR, raising=False)
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        assert scraper._proxy_url is None
+
+    def test_empty_env_var_treated_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Empty string env vars should NOT be passed as a proxy URL."""
+        monkeypatch.setenv(SF_PROXY_URL_ENV_VAR, "")
+        monkeypatch.setenv(SD_PROXY_URL_ENV_VAR, "")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        assert scraper._proxy_url is None
+
+
+class TestTurnstileTimeout:
+    """TURNSTILE_TIMEOUT guardrail (#2622 bump 45 -> 60)."""
+
+    def test_turnstile_timeout_bumped_to_60(self) -> None:
+        """TURNSTILE_TIMEOUT must be at least 60s to accommodate Patchright+proxy."""
+        assert TURNSTILE_TIMEOUT >= 60.0
+
+
+class TestPatchrightFactorySelection:
+    """Tests for _acquire_session factory selection (patchright vs playwright)."""
+
+    def test_playwright_used_when_capsolver_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When CAPSOLVER_API_KEY is set, use plain playwright (not patchright)."""
+        import asyncio
+        import sys
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake")
+
+        # Stub both modules to record which one gets imported.
+        fake_playwright = unittest.mock.MagicMock()
+        fake_playwright.async_api = unittest.mock.MagicMock()
+        fake_playwright.async_api.async_playwright = unittest.mock.MagicMock(
+            name="playwright.async_playwright"
+        )
+        fake_patchright = unittest.mock.MagicMock()
+        fake_patchright.async_api = unittest.mock.MagicMock()
+        fake_patchright.async_api.async_playwright = unittest.mock.MagicMock(
+            name="patchright.async_playwright"
+        )
+
+        monkeypatch.setitem(sys.modules, "playwright", fake_playwright)
+        monkeypatch.setitem(sys.modules, "playwright.async_api", fake_playwright.async_api)
+        monkeypatch.setitem(sys.modules, "patchright", fake_patchright)
+        monkeypatch.setitem(sys.modules, "patchright.async_api", fake_patchright.async_api)
+
+        captured: dict[str, Any] = {}
+
+        async def _mock_try_acquire(pw: Any) -> str | None:
+            captured["factory"] = pw
+            return "DEADBEEF1234567890ABCDEF1234567890ABCDEF"
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
+
+        asyncio.run(scraper._acquire_session())
+
+        assert captured["factory"] is fake_playwright.async_api.async_playwright
+
+    def test_patchright_used_when_capsolver_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When CAPSOLVER_API_KEY is unset, prefer patchright factory."""
+        import asyncio
+        import sys
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        fake_playwright = unittest.mock.MagicMock()
+        fake_playwright.async_api = unittest.mock.MagicMock()
+        fake_playwright.async_api.async_playwright = unittest.mock.MagicMock(
+            name="playwright.async_playwright"
+        )
+        fake_patchright = unittest.mock.MagicMock()
+        fake_patchright.async_api = unittest.mock.MagicMock()
+        fake_patchright.async_api.async_playwright = unittest.mock.MagicMock(
+            name="patchright.async_playwright"
+        )
+
+        monkeypatch.setitem(sys.modules, "playwright", fake_playwright)
+        monkeypatch.setitem(sys.modules, "playwright.async_api", fake_playwright.async_api)
+        monkeypatch.setitem(sys.modules, "patchright", fake_patchright)
+        monkeypatch.setitem(sys.modules, "patchright.async_api", fake_patchright.async_api)
+
+        captured: dict[str, Any] = {}
+
+        async def _mock_try_acquire(pw: Any) -> str | None:
+            captured["factory"] = pw
+            return "DEADBEEF1234567890ABCDEF1234567890ABCDEF"
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
+
+        asyncio.run(scraper._acquire_session())
+
+        assert captured["factory"] is fake_patchright.async_api.async_playwright
+
+    def test_falls_back_to_playwright_when_patchright_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If patchright import fails, fall back to playwright gracefully."""
+        import asyncio
+        import sys
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        fake_playwright = unittest.mock.MagicMock()
+        fake_playwright.async_api = unittest.mock.MagicMock()
+        fake_playwright.async_api.async_playwright = unittest.mock.MagicMock(
+            name="playwright.async_playwright"
+        )
+
+        # Force patchright import to fail.
+        monkeypatch.setitem(sys.modules, "playwright", fake_playwright)
+        monkeypatch.setitem(sys.modules, "playwright.async_api", fake_playwright.async_api)
+        monkeypatch.setitem(sys.modules, "patchright", None)
+        monkeypatch.setitem(sys.modules, "patchright.async_api", None)
+
+        captured: dict[str, Any] = {}
+
+        async def _mock_try_acquire(pw: Any) -> str | None:
+            captured["factory"] = pw
+            return "DEADBEEF1234567890ABCDEF1234567890ABCDEF"
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        scraper._try_acquire_session = _mock_try_acquire  # type: ignore[assignment]
+
+        asyncio.run(scraper._acquire_session())
+
+        assert captured["factory"] is fake_playwright.async_api.async_playwright
+
+
+class TestProxyPassedToLaunch:
+    """Tests for ``_try_acquire_session`` passing proxy to browser launch."""
+
+    def _build_mock_playwright(self, factory_module: str = "unittest.mock") -> tuple[Any, Any, Any]:
+        """Build an async_playwright mock; set __module__ to simulate patchright."""
+        import unittest.mock
+
+        mock_page = unittest.mock.AsyncMock()
+        mock_page.url = "https://webapps.sftc.org/tr/tr.dll/?RulingID=2"
+        mock_page.content.return_value = (
+            '<script>var seshID="CAFEBABE0123456789ABCDEFCAFEBABE01234567";</script>'
+        )
+
+        mock_context = unittest.mock.AsyncMock()
+        mock_context.new_page.return_value = mock_page
+
+        mock_browser = unittest.mock.AsyncMock()
+        mock_browser.new_context.return_value = mock_context
+
+        mock_pw = unittest.mock.AsyncMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+
+        mock_pw_cm = unittest.mock.AsyncMock()
+        mock_pw_cm.__aenter__.return_value = mock_pw
+
+        mock_pw_factory = unittest.mock.MagicMock(return_value=mock_pw_cm)
+        # Override __module__ so the scraper's is_patchright detection works.
+        mock_pw_factory.__module__ = factory_module
+
+        return mock_pw_factory, mock_pw, mock_browser
+
+    def test_proxy_passed_to_launch_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When _proxy_url is set, launch receives proxy={"server": url}."""
+        import asyncio
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(SF_PROXY_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv(SD_PROXY_URL_ENV_VAR, raising=False)
+
+        mock_pw_factory, mock_pw, _ = self._build_mock_playwright()
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            proxy_url="http://proxy.example:33335",
+        )
+
+        asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        launch_call = mock_pw.chromium.launch.call_args
+        assert launch_call.kwargs.get("proxy") == {"server": "http://proxy.example:33335"}
+
+    def test_proxy_not_passed_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When _proxy_url is None, launch kwargs do not include 'proxy'."""
+        import asyncio
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+        monkeypatch.delenv(SF_PROXY_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv(SD_PROXY_URL_ENV_VAR, raising=False)
+
+        mock_pw_factory, mock_pw, _ = self._build_mock_playwright()
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+        assert scraper._proxy_url is None
+
+        asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        launch_call = mock_pw.chromium.launch.call_args
+        assert "proxy" not in launch_call.kwargs
+
+    def test_patchright_path_uses_minimal_launch_args(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On the patchright path, launch uses channel=chrome and no custom args."""
+        import asyncio
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        mock_pw_factory, mock_pw, _ = self._build_mock_playwright(
+            factory_module="patchright.async_api"
+        )
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(
+            config=config,
+            proxy_url="http://proxy.example:33335",
+        )
+
+        asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        launch_call = mock_pw.chromium.launch.call_args
+        assert launch_call.kwargs.get("channel") == "chrome"
+        # Zero custom args on patchright path
+        assert "args" not in launch_call.kwargs
+        # Proxy still flows through
+        assert launch_call.kwargs.get("proxy") == {"server": "http://proxy.example:33335"}
+
+    def test_patchright_path_uses_bare_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On patchright path, new_context is called with no overrides."""
+        import asyncio
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        mock_pw_factory, mock_pw, mock_browser = self._build_mock_playwright(
+            factory_module="patchright.async_api"
+        )
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        context_call = mock_browser.new_context.call_args
+        # Bare context: no user_agent, viewport, timezone, locale overrides
+        assert context_call.kwargs == {}
+
+    def test_patchright_path_skips_apply_stealth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On patchright path, _apply_stealth is NOT invoked on the page."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        mock_pw_factory, _, _ = self._build_mock_playwright(factory_module="patchright.async_api")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        with unittest.mock.patch("courts.ca.sf_civil_tentatives._apply_stealth") as mock_apply:
+            asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        mock_apply.assert_not_called()
+
+    def test_playwright_path_still_applies_stealth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On legacy playwright path, _apply_stealth IS invoked."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        # factory_module="unittest.mock" => is_patchright=False (legacy path)
+        mock_pw_factory, _, _ = self._build_mock_playwright()
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        with unittest.mock.patch("courts.ca.sf_civil_tentatives._apply_stealth") as mock_apply:
+            asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        mock_apply.assert_awaited_once()
+
+    def test_capsolver_path_still_uses_full_launch_args(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On CAPSolver path (patchright factory or not), full args are used."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake-key")
+
+        # Even if factory claims to be patchright, CAPSolver path wins.
+        mock_pw_factory, mock_pw, _ = self._build_mock_playwright(
+            factory_module="patchright.async_api"
+        )
+
+        async def _fake_solver(**_kwargs: Any) -> str | None:
+            return "TOKEN"
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        with unittest.mock.patch(
+            "courts.ca.sf_civil_tentatives.solve_turnstile",
+            side_effect=_fake_solver,
+        ):
+            asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        launch_call = mock_pw.chromium.launch.call_args
+        # CAPSolver path uses legacy args
+        assert "args" in launch_call.kwargs
+        assert "channel" not in launch_call.kwargs
 
 
 # ---------------------------------------------------------------------------
