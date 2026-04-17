@@ -353,11 +353,11 @@ class TestNormalizeCaseTitle:
 class TestRulingIdMap:
     """Tests for the RulingID-to-department mapping."""
 
-    def test_seven_ruling_ids(self) -> None:
-        assert len(RULING_ID_MAP) == 7
+    def test_eight_ruling_ids(self) -> None:
+        assert len(RULING_ID_MAP) == 8
 
     def test_all_ids_present(self) -> None:
-        expected_ids = {10, 2, 6, 5, 8, 9, 3}
+        expected_ids = {10, 2, 6, 5, 8, 9, 3, 7}
         assert set(RULING_ID_MAP.keys()) == expected_ids
 
     def test_dept_301(self) -> None:
@@ -376,6 +376,11 @@ class TestRulingIdMap:
 
     def test_dept_501(self) -> None:
         assert RULING_ID_MAP[3]["department"] == "501"
+
+    def test_dept_204_probate(self) -> None:
+        """RulingID 7 maps to Dept 204 (Probate)."""
+        assert RULING_ID_MAP[7]["department"] == "204"
+        assert RULING_ID_MAP[7]["type"] == "Probate"
 
     def test_ruling_ids_sorted(self) -> None:
         """RULING_IDS list should be sorted."""
@@ -479,8 +484,8 @@ class TestSFCivilScraperRun:
 
         health = scraper.run()
         assert health.success is True
-        # 7 RulingIDs * 12 rulings each = 84
-        assert health.records_captured == 7 * 12
+        # 8 RulingIDs * 12 rulings each = 96
+        assert health.records_captured == 8 * 12
 
     @respx.mock
     def test_fetch_documents_populates_fields(self) -> None:
@@ -522,8 +527,8 @@ class TestSFCivilScraperRun:
 
         docs = scraper.fetch_documents()
         departments = {d.department for d in docs}
-        # All 5 departments should be represented (each RulingID returns data)
-        assert departments == {"210", "301", "302", "304", "501"}
+        # All 6 departments should be represented (each RulingID returns data)
+        assert departments == {"204", "210", "301", "302", "304", "501"}
 
     @respx.mock
     def test_fetch_documents_sets_judge_name_from_dept_map(self) -> None:
@@ -537,6 +542,7 @@ class TestSFCivilScraperRun:
             "304": "Anne-Christine Massullo",
             "210": "Samuel K. Feng",
             "501": "Richard B. Ulmer",
+            "204": "Probate Judge Name",
         }
         config = sf_civil_default_config()
         config.request_delay_seconds = 0
