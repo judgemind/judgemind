@@ -16,6 +16,10 @@ data "aws_secretsmanager_secret" "courtlistener_api_token" {
   name = "judgemind/courtlistener/api-token"
 }
 
+data "aws_secretsmanager_secret" "capsolver_api_key" {
+  name = "judgemind/capsolver/api-key"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "production"
@@ -66,6 +70,7 @@ module "compute" {
   document_archive_bucket            = module.document_archive.bucket_id
   proxy_secret_arn                   = data.aws_secretsmanager_secret.residential_proxy.arn
   courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
+  capsolver_api_key_secret_arn       = data.aws_secretsmanager_secret.capsolver_api_key.arn
 
   # Production: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
   task_cpu            = 1024

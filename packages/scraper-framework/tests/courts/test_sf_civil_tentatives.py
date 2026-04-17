@@ -21,9 +21,11 @@ import pytest
 import respx
 
 from courts.ca.sf_civil_tentatives import (
+    CAPSOLVER_API_KEY_ENV_VAR,
     CIVIL_REST_BASE,
     RULING_ID_MAP,
     RULING_IDS,
+    TURNSTILE_SITEKEY,
     SFCivilTentativeRulingsScraper,
     _clean_party_name,
     extract_outcome,
@@ -1002,6 +1004,242 @@ class TestApplyStealth:
         mock_page.evaluate = unittest.mock.AsyncMock()
         asyncio.run(_apply_stealth(mock_page))
         # Should complete without raising
+
+
+# ---------------------------------------------------------------------------
+# CAPSolver integration — _try_acquire_session branches on API key
+# ---------------------------------------------------------------------------
+
+
+class TestCAPSolverIntegration:
+    """Tests for the CAPSolver-assisted Turnstile session acquisition path.
+
+    ``_try_acquire_session`` branches based on the ``CAPSOLVER_API_KEY``
+    environment variable. When the key is present, the scraper invokes
+    ``framework.turnstile_solver.solve_turnstile`` to obtain a response
+    token and injects it into the gateway page. When the key is absent,
+    the scraper falls back to the legacy stealth-polling path.
+    """
+
+    def _build_mock_playwright(self) -> tuple[Any, Any, Any]:
+        """Build an async_playwright factory with mock page/context/browser.
+
+        Returns:
+            A tuple of (mock_pw_factory, mock_page, mock_browser). The
+            factory can be passed to ``_try_acquire_session`` and the
+            page/browser are exposed so tests can configure URL/content
+            and assert on calls.
+        """
+        import unittest.mock
+
+        mock_page = unittest.mock.AsyncMock()
+        mock_page.url = "https://webapps.sftc.org/tr/tr.dll/?RulingID=2"
+        mock_page.content.return_value = (
+            '<script>var rulingID=2;var seshID="CAFEBABE0123456789ABCDEFCAFEBABE01234567";</script>'
+        )
+
+        mock_context = unittest.mock.AsyncMock()
+        mock_context.new_page.return_value = mock_page
+
+        mock_browser = unittest.mock.AsyncMock()
+        mock_browser.new_context.return_value = mock_context
+
+        mock_pw = unittest.mock.AsyncMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+
+        mock_pw_cm = unittest.mock.AsyncMock()
+        mock_pw_cm.__aenter__.return_value = mock_pw
+        mock_pw_factory = unittest.mock.MagicMock(return_value=mock_pw_cm)
+
+        return mock_pw_factory, mock_page, mock_browser
+
+    def test_solver_invoked_when_api_key_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When CAPSOLVER_API_KEY is set, solve_turnstile is called and token injected."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake-key-xyz")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_pw_factory, mock_page, mock_browser = self._build_mock_playwright()
+
+        # Patch solve_turnstile in the scraper module's namespace.
+        async def _fake_solver(**kwargs: Any) -> str | None:
+            assert kwargs["sitekey"] == TURNSTILE_SITEKEY
+            assert kwargs["api_key"] == "fake-key-xyz"
+            assert "webapps.sftc.org" in kwargs["page_url"]
+            return "SOLVED_TOKEN_ABC123"
+
+        with unittest.mock.patch(
+            "courts.ca.sf_civil_tentatives.solve_turnstile",
+            side_effect=_fake_solver,
+        ) as mock_solver:
+            result = asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        assert result == "CAFEBABE0123456789ABCDEFCAFEBABE01234567"
+        mock_solver.assert_called_once()
+        # The token must have been evaluated into the page via evaluate()
+        mock_page.evaluate.assert_awaited()
+        # evaluate is called with (script, token) — verify token is passed
+        call_args = mock_page.evaluate.call_args
+        assert call_args.args[1] == "SOLVED_TOKEN_ABC123"
+        mock_browser.close.assert_awaited_once()
+
+    def test_solver_skipped_when_api_key_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When CAPSOLVER_API_KEY is unset, solve_turnstile is NOT called."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.delenv(CAPSOLVER_API_KEY_ENV_VAR, raising=False)
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_pw_factory, mock_page, mock_browser = self._build_mock_playwright()
+
+        with unittest.mock.patch("courts.ca.sf_civil_tentatives.solve_turnstile") as mock_solver:
+            result = asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        # Stealth fallback still extracts seshID from the mocked page
+        assert result == "CAFEBABE0123456789ABCDEFCAFEBABE01234567"
+        mock_solver.assert_not_called()
+        # evaluate is called by _apply_stealth, but not with our injection
+        # script — assert the token injection path was not triggered.
+        # We check that no call was made with the token string as 2nd arg.
+        for call in mock_page.evaluate.await_args_list:
+            if len(call.args) >= 2:
+                assert call.args[1] != "SOLVED_TOKEN_ABC123"
+        mock_browser.close.assert_awaited_once()
+
+    def test_solver_failure_falls_back_to_stealth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When solve_turnstile returns None, continue to stealth polling."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake-key")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_pw_factory, _mock_page, mock_browser = self._build_mock_playwright()
+
+        async def _failing_solver(**_kwargs: Any) -> str | None:
+            return None
+
+        with unittest.mock.patch(
+            "courts.ca.sf_civil_tentatives.solve_turnstile",
+            side_effect=_failing_solver,
+        ) as mock_solver:
+            result = asyncio.run(scraper._try_acquire_session(mock_pw_factory))
+
+        # Solver was called, returned None, but the mocked page still has
+        # a seshID so _wait_for_session still succeeds.
+        mock_solver.assert_called_once()
+        assert result == "CAFEBABE0123456789ABCDEFCAFEBABE01234567"
+        mock_browser.close.assert_awaited_once()
+
+    def test_submit_captcha_with_solver_injects_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_submit_captcha_with_solver injects token and invokes callback."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake-key")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_page = unittest.mock.AsyncMock()
+
+        async def _fake_solver(**_kwargs: Any) -> str | None:
+            return "TOKEN_XYZ"
+
+        with unittest.mock.patch(
+            "courts.ca.sf_civil_tentatives.solve_turnstile",
+            side_effect=_fake_solver,
+        ):
+            ok = asyncio.run(
+                scraper._submit_captcha_with_solver(
+                    page=mock_page,
+                    captcha_url="https://webapps.sftc.org/captcha/captcha.dll?foo=bar",
+                    api_key="fake-key",
+                )
+            )
+
+        assert ok is True
+        mock_page.evaluate.assert_awaited_once()
+        # Inspect the call — 1st arg should be the JS snippet, 2nd is the token.
+        call_args = mock_page.evaluate.call_args
+        assert "recaptchaCallBack" in call_args.args[0]
+        assert "g-recaptcha-response" in call_args.args[0]
+        assert call_args.args[1] == "TOKEN_XYZ"
+
+    def test_submit_captcha_with_solver_returns_false_on_no_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Returns False when CAPSolver returns no token; skips injection."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake-key")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_page = unittest.mock.AsyncMock()
+
+        async def _no_token(**_kwargs: Any) -> str | None:
+            return None
+
+        with unittest.mock.patch(
+            "courts.ca.sf_civil_tentatives.solve_turnstile",
+            side_effect=_no_token,
+        ):
+            ok = asyncio.run(
+                scraper._submit_captcha_with_solver(
+                    page=mock_page,
+                    captcha_url="https://webapps.sftc.org/captcha/captcha.dll",
+                    api_key="fake-key",
+                )
+            )
+
+        assert ok is False
+        mock_page.evaluate.assert_not_awaited()
+
+    def test_submit_captcha_with_solver_returns_false_on_evaluate_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Returns False when page.evaluate raises (e.g., page navigated)."""
+        import asyncio
+        import unittest.mock
+
+        monkeypatch.setenv(CAPSOLVER_API_KEY_ENV_VAR, "fake-key")
+
+        config = sf_civil_default_config()
+        scraper = SFCivilTentativeRulingsScraper(config=config)
+
+        mock_page = unittest.mock.AsyncMock()
+        mock_page.evaluate.side_effect = RuntimeError("page closed")
+
+        async def _fake_solver(**_kwargs: Any) -> str | None:
+            return "TOKEN_ABC"
+
+        with unittest.mock.patch(
+            "courts.ca.sf_civil_tentatives.solve_turnstile",
+            side_effect=_fake_solver,
+        ):
+            ok = asyncio.run(
+                scraper._submit_captcha_with_solver(
+                    page=mock_page,
+                    captcha_url="https://webapps.sftc.org/captcha/captcha.dll",
+                    api_key="fake-key",
+                )
+            )
+
+        assert ok is False
 
 
 # ---------------------------------------------------------------------------

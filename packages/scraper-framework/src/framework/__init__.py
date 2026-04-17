@@ -58,6 +58,7 @@ from .runner import get_scraper_ids, run_scrapers
 from .s3_cache import CachedS3Client, make_s3_client
 from .search import IndexingConsumer, create_index
 from .storage import S3Archiver, build_s3_key
+from .turnstile_solver import solve_turnstile
 
 __all__ = [
     "BaseScraper",
@@ -115,4 +116,5 @@ __all__ = [
     "retry_async",
     "retry_sync",
     "sha256_hex",
+    "solve_turnstile",
 ]
