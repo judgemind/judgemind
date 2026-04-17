@@ -360,7 +360,17 @@ def _process_one_document(
         if os_url:
             from opensearchpy import OpenSearch
 
-            os_kwargs: dict = {"hosts": [os_url]}
+            # 30s timeout + 3 retries: opensearchpy defaults to 10s and no
+            # retries, which produces sporadic ``ConnectionTimeout`` entries
+            # during rebuild under load (#2481).  ``IndexingConsumer`` also
+            # swallows terminal timeouts as a warning so a missed index
+            # never fails document processing.
+            os_kwargs: dict = {
+                "hosts": [os_url],
+                "timeout": 30,
+                "max_retries": 3,
+                "retry_on_timeout": True,
+            }
             os_user = os.environ.get("OPENSEARCH_USERNAME", "")
             os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
             if os_user and os_pass:
@@ -797,7 +807,14 @@ def reset_opensearch_index(os_url: str) -> None:
     """Delete the OpenSearch tentative_rulings index so it's rebuilt from scratch."""
     from opensearchpy import OpenSearch
 
-    os_kwargs: dict = {"hosts": [os_url]}
+    # 30s timeout + 3 retries — same rationale as the per-worker client
+    # constructed in ``_process_one_document``.  See #2481.
+    os_kwargs: dict = {
+        "hosts": [os_url],
+        "timeout": 30,
+        "max_retries": 3,
+        "retry_on_timeout": True,
+    }
     os_user = os.environ.get("OPENSEARCH_USERNAME", "")
     os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
     if os_user and os_pass:

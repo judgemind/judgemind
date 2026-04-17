@@ -34,6 +34,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from opensearchpy import helpers
+from opensearchpy.exceptions import ConnectionError as OSConnectionError
+from opensearchpy.exceptions import ConnectionTimeout
 
 from .mapping import TENTATIVE_RULINGS_ALIAS, create_index
 
@@ -85,7 +87,19 @@ class IndexingConsumer:
             judge_name, hearing_date, content_hash, content_format
 
         Returns True if the document was indexed (new or updated),
-        False if skipped (same content_hash already indexed).
+        False if skipped (same content_hash already indexed) or if the
+        OpenSearch write failed with a transient connection/timeout error.
+
+        Transient connection errors (``ConnectionTimeout`` /
+        ``ConnectionError`` from ``opensearchpy``) are logged as warnings
+        and swallowed — indexing is best-effort because the OpenSearch
+        index is fully derivable from ``derived.*`` (see
+        ``docs/specs/architecture-spec-v1.md``).  Propagating a transient
+        search-indexing failure up the call chain would fail the
+        document's Postgres write, which is the source-of-truth write
+        and must not be gated on a flaky search backend.  See #2481.
+        Non-transient errors (invalid index, 4xx data errors, auth
+        failures) still propagate so real bugs are surfaced loudly.
         """
         os_doc = self._build_os_doc(event)
         if os_doc is None:
@@ -93,11 +107,23 @@ class IndexingConsumer:
 
         document_id = event["document_id"]
 
-        self._os.index(
-            index=self._index,
-            id=document_id,
-            body=os_doc,
-        )
+        try:
+            self._os.index(
+                index=self._index,
+                id=document_id,
+                body=os_doc,
+            )
+        except (ConnectionTimeout, OSConnectionError) as exc:
+            logger.warning(
+                "OpenSearch indexing skipped due to transient connection error "
+                "(document_id=%s, case=%s, court=%s) — document's Postgres "
+                "write is unaffected; search index will self-heal on re-index. %s",
+                document_id,
+                os_doc.get("case_number"),
+                os_doc.get("court"),
+                exc,
+            )
+            return False
 
         logger.info(
             "Indexed document %s (case=%s, court=%s)",
@@ -139,12 +165,27 @@ class IndexingConsumer:
         if not actions:
             return 0
 
-        success, errors = helpers.bulk(
-            self._os,
-            actions,
-            stats_only=True,
-            raise_on_error=False,
-        )
+        try:
+            success, errors = helpers.bulk(
+                self._os,
+                actions,
+                stats_only=True,
+                raise_on_error=False,
+            )
+        except (ConnectionTimeout, OSConnectionError) as exc:
+            # Same best-effort rationale as ``index_document``: the bulk
+            # request hit a transient connection/timeout error before any
+            # acks came back, so we treat the whole batch as unindexed
+            # and move on.  OpenSearch is rebuildable from ``derived.*``
+            # via re-index.  See #2481.
+            logger.warning(
+                "OpenSearch bulk indexing skipped due to transient connection "
+                "error — %d action(s) unindexed; search index will self-heal "
+                "on re-index. %s",
+                len(actions),
+                exc,
+            )
+            return 0
 
         if errors:
             logger.error("Bulk indexing had %d failures out of %d actions", errors, len(actions))
