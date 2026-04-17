@@ -156,10 +156,11 @@ After claiming the issue, create todos using `TaskCreate` to track your major wo
 
 **For investigation tasks (Path B):**
 1. "Investigate and document findings"
-2. "File follow-up issues"
-3. "Post summary and close issue"
-4. "Unblock dependent issues"
-5. "Retrospective" — identify workflow efficiencies and preventative measures
+2. "Update contradicted source-file docstrings"
+3. "File follow-up issues"
+4. "Post summary and close issue"
+5. "Unblock dependent issues"
+6. "Retrospective" — identify workflow efficiencies and preventative measures
 
 Mark each todo `in_progress` when you start it and `completed` when done. If a task has fewer than 3 steps total (e.g. a trivial fix), skip todo creation.
 
@@ -503,6 +504,20 @@ Do not just list recommendations — **create GitHub issues** for each concrete 
 - Add `agent/ready` if the issue is fully specified and ready for work. If it requires a human decision first, note that in the body and omit `agent/ready`.
 
 If the investigation reveals no actionable follow-ups (everything is working as expected), state that explicitly in the findings.
+
+#### B.1.5 — Update contradicted source-file docstrings (MANDATORY)
+
+An investigation frequently invalidates claims made in source-file docstrings, inline comments, or nearby `README.md` files. Those are the source-of-truth location for "how this module works" — standalone investigation docs are not discoverable when reading the code, so they go stale the moment the investigation lands. Update the docstrings as part of the investigation's resolution, not as a separate follow-up that may never be picked up.
+
+**Required actions:**
+
+1. **Grep the codebase for any claims contradicted by the investigation's findings.** Search source-file docstrings, inline comments, and nearby `README.md` files (including `tests/fixtures/README.md`) for statements the investigation has shown to be wrong. For a scraper investigation, grep the scraper module's docstring and comments; for an ingestion investigation, grep the relevant `enrichment/` or `transcription/` modules. Example patterns to grep: specific regex claims, format descriptions, "case number format", "always", "never", field-availability claims, etc.
+2. **List each stale location you find** in the investigation's findings document, with file path + line numbers + the incorrect text + the corrected text.
+3. **Either update them in the same PR as the investigation, or file a follow-up issue** (via B.1) that lists the specific locations and the corrected text verbatim. Do not file a vague "update docstrings" issue — the follow-up must be concrete enough that an agent can pick it up and mechanically apply the edits.
+
+**Do not treat "update the docstring" as non-actionable.** The existing B.1 rule ("file follow-up issues for every actionable finding") is not enough by itself, because docstring updates are easy to rationalize as already-covered-by-the-investigation-doc. They are not — the investigation doc lives in `docs/investigations/`, the source docstring lives next to the code, and readers of the code see only the latter.
+
+**Concrete example — #2434:** The investigation in `docs/investigations/unknown-case-numbers-oc-riverside-2026-03.md` documented that OC PDF case-number availability varies per-department (not per-courthouse as `packages/scraper-framework/src/courts/ca/oc_tentatives.py` lines 18-21 claimed). The stale docstring sat in the repo for weeks producing misleading context for anyone reading the scraper. If B.1.5 had existed at the time, the investigation would have either corrected the docstring in the same PR or filed a concrete follow-up naming `oc_tentatives.py:18-21` with the corrected text — either path would have closed the loop. Instead, the docstring drift only surfaced weeks later via #2434.
 
 #### B.2 — Post summary and close the issue
 
