@@ -265,7 +265,9 @@ class TestParseUnifiedDiff:
         assert 13 in r.ci_yml_changed_lines
 
     def test_pure_deletion_is_detected(self) -> None:
-        """Deletion-only hunks should still flag the surrounding new-side range."""
+        """Deletion-only hunks flag exactly `new_start` — a synthetic marker
+        so body-level pure deletes are detected without claiming unchanged
+        context lines are "modified"."""
         diff = textwrap.dedent(
             """\
             diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
@@ -279,9 +281,30 @@ class TestParseUnifiedDiff:
             """
         )
         r = parse_unified_diff(diff, ".github/workflows/ci.yml")
-        # Context lines at new-side 20 and 21 should be flagged
+        # new_start (line 20) is flagged as a synthetic marker. Context
+        # lines (21) are NOT flagged — they're unchanged on the new side.
         assert 20 in r.ci_yml_changed_lines
-        assert 21 in r.ci_yml_changed_lines
+        assert 21 not in r.ci_yml_changed_lines
+
+    def test_context_lines_never_marked_as_changed(self) -> None:
+        """A pure-addition hunk with context should only flag `+` lines."""
+        diff = textwrap.dedent(
+            """\
+            diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+            --- a/.github/workflows/ci.yml
+            +++ b/.github/workflows/ci.yml
+            @@ -100,3 +100,5 @@
+             ctx-a
+             ctx-b
+            +new-1
+            +new-2
+             ctx-c
+            """
+        )
+        r = parse_unified_diff(diff, ".github/workflows/ci.yml")
+        # Only the two `+` lines (new-side 102 and 103) are marked.
+        # Context lines 100, 101, 104 are NOT marked.
+        assert r.ci_yml_changed_lines == {102, 103}
 
     def test_non_ci_yml_changes_dont_record_ci_lines(self) -> None:
         diff = textwrap.dedent(

@@ -193,7 +193,7 @@ def parse_ci_yaml(ci_yml_path: Path) -> CIYaml:
     # ------- Step 3: for each job, find end line and `if:` gate -------
     jobs: list[Job] = []
     for idx, (name, start_i) in enumerate(job_headers):
-        # End is the line before the next job header (or EOF/end-of-jobs).
+        # Tentative end: line before the next job header (or EOF/end-of-jobs).
         if idx + 1 < len(job_headers):
             end_i = job_headers[idx + 1][1] - 1
         else:
@@ -203,6 +203,23 @@ def parse_ci_yaml(ci_yml_path: Path) -> CIYaml:
                 if ln and not ln.startswith(" ") and not ln.startswith("#"):
                     end_i = j - 1
                     break
+
+        # Walk backward to strip trailing blank lines AND top-level comments
+        # (lines that start with `  #` at indent 2 — those are leading
+        # doc comments for the NEXT job, not part of the current job body).
+        while end_i > start_i:
+            ln = lines[end_i]
+            stripped = ln.strip()
+            if not stripped:
+                end_i -= 1
+                continue
+            # Only strip comments at indent 2 — those are between-job banners.
+            # Comments at deeper indent (e.g. inline `# comment` on a step)
+            # are genuine body content and stay.
+            if re.match(r"^ {0,3}#", ln) and ln.startswith("  #"):
+                end_i -= 1
+                continue
+            break
 
         # Find `if:` gate inside this job body at indent 4 (direct child).
         # Collect ALL outputs.X names in the expression so multi-filter
@@ -345,10 +362,15 @@ HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 def parse_unified_diff(diff_text: str, ci_yml_rel_path: str) -> DiffResult:
     """Parse a unified diff and extract changed files + ci.yml modified lines.
 
-    We consider a line modified on the NEW side if it is a `+` line. We
-    also mark nearby new-side lines when a hunk contains `-` (deletion)
-    lines, so that pure-deletion edits inside a job body are still
-    detected as a modification to that job.
+    We consider a new-side line truly "modified" only when there is a `+`
+    line in the diff at that position. Context lines (` `) and deletion
+    lines (`-`) never mark a new-side line as changed — deletions do not
+    exist on the new side, and context lines are unchanged by definition.
+
+    Edge case: a *pure-deletion* hunk (no `+` lines at all) still means
+    content was removed; we represent that by marking `new_start` as
+    changed so a job body that was purely deleted from is still detected
+    as modified.
     """
     changed_files: list[str] = []
     ci_lines: set[int] = set()
@@ -387,22 +409,25 @@ def parse_unified_diff(diff_text: str, ci_yml_rel_path: str) -> DiffResult:
         m_hunk = HUNK_HEADER_RE.match(line)
         if m_hunk and current_file == ci_yml_rel_path:
             new_start = int(m_hunk.group(1))
-            hunk_has_deletion = False
+            has_plus = False
+            has_minus = False
             j = i + 1
-            hunk_new_line_numbers: list[int] = []
             running_new_line = new_start
             while j < len(lines):
                 hl = lines[j]
                 if hl.startswith("@@ ") or hl.startswith("diff --git "):
                     break
                 if hl.startswith("+"):
+                    # True addition to new side — mark as changed.
                     ci_lines.add(running_new_line)
-                    hunk_new_line_numbers.append(running_new_line)
+                    has_plus = True
                     running_new_line += 1
                 elif hl.startswith("-"):
-                    hunk_has_deletion = True
+                    # Deletion — old-side only; no new-side line to mark.
+                    has_minus = True
                 elif hl.startswith(" "):
-                    hunk_new_line_numbers.append(running_new_line)
+                    # Context — unchanged. Advance new-side counter but do
+                    # NOT mark as changed.
                     running_new_line += 1
                 elif hl.startswith("\\"):
                     # `\ No newline at end of file`
@@ -411,12 +436,10 @@ def parse_unified_diff(diff_text: str, ci_yml_rel_path: str) -> DiffResult:
                     break
                 j += 1
 
-            if hunk_has_deletion and hunk_new_line_numbers:
-                # Mark the new-side range of the hunk as changed so that
-                # pure deletions inside a job body are still detected.
-                for ln in hunk_new_line_numbers:
-                    ci_lines.add(ln)
-                # Also mark new_start for pure-deletion hunks with no +/context.
+            # Pure-deletion hunk (only `-` lines, no `+`) — mark new_start
+            # as a synthetic change marker so body-level pure deletes are
+            # still detected as modifications to the surrounding job.
+            if has_minus and not has_plus:
                 ci_lines.add(new_start)
 
             i = j
