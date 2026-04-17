@@ -48,6 +48,69 @@ The fix was simple — `tentative\s+rulings?\b` — but the missed variant cause
 - **The worker has fallback chains for critical fields.** If the scraper event doesn't include hearing_date, case_number, or case_title, the worker tries `extract_hearing_date()`, `extract_case_number()`, and `extract_case_title()` from ruling text before giving up. This is a safety net, not a substitute for proper scraper extraction.
 - **Party extraction is the hardest field.** Only LA implements it (structured HTML with role labels). PDF-based courts don't have reliable party structure. This remains an open problem.
 
+## Defensive rollback pattern
+
+When an exception handler inside a DB-writing function needs to recover the connection so subsequent writes can proceed, it calls `conn.rollback()`. The connection may itself be broken (closed, timed out, etc.), in which case `rollback()` also raises. To avoid cascading a second exception inside an already-failing handler, wrap the rollback in a nested `try/except` that swallows the error:
+
+```python
+try:
+    insert_validation_result(conn, ...)
+except Exception as exc:
+    # Primary handler: log, flag, and continue.
+    logger.warning("validation insert failed: %s", exc)
+
+    # Defensive rollback: a closed connection can make rollback() itself raise.
+    # We don't want to cascade a second exception inside an already-failing
+    # handler, so swallow it. The next DB write will reopen the connection
+    # via the worker's connection helper, so the subsequent path can proceed.
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+```
+
+This pattern appears in `packages/scraper-framework/src/ingestion/worker.py` around every defensive insert (e.g. `insert_validation_result`, split-event writes) — see `#2385` for the original incident and `#2350` / `#2371` for follow-up applications of the same pattern.
+
+### Why this matters for tests: the diff-coverage pitfall
+
+Tests that use a plain `MagicMock()` for `conn` exercise only the "happy" branch of the nested `try/except` — `mock.rollback()` returns silently, so the inner `except Exception: pass` body is never executed. `diff-cover` counts those two lines (`except Exception:` and `pass`) as uncovered, which drops new-line diff coverage to ~50% and fails CI's 90% diff-coverage gate.
+
+We hit this concretely in `#2385` / PR `#2389`: three new rollback handlers added three unexercised defensive branches (lines 1463-1464, 1496-1497, 1599-1600 in `worker.py`). The fix was not to remove the handlers or loosen the coverage gate — it was to add a dedicated test per handler that makes `rollback()` itself raise.
+
+### Canonical test template
+
+For every defensive rollback handler you add, add a paired test that exercises the inner branch:
+
+```python
+def test_defensive_rollback_does_not_crash(mock_conn, worker):
+    """rollback() itself raising inside the defensive handler must not propagate."""
+    # Make the primary DB write fail so we enter the handler at all.
+    mock_conn.insert_validation_result.side_effect = Exception("insert failed")
+    # Then make the defensive rollback fail too.
+    mock_conn.rollback.side_effect = RuntimeError("connection closed")
+
+    # The function under test must swallow both exceptions and not propagate.
+    worker.process_event(event)
+
+    # Optional: assert the rollback was attempted even though it failed.
+    mock_conn.rollback.assert_called()
+```
+
+Two cautions when writing these tests:
+
+- If the same mock connection is reused across a later path that calls `conn.rollback()` and *does* expect it to succeed, use a list for `side_effect` so only the first call raises: `mock_conn.rollback.side_effect = [RuntimeError("closed"), None]`.
+- Don't assert on log output or re-raise — the whole point is that the defensive branch is silent. Assert on the post-handler behavior (e.g. function returns, OpenSearch not indexed, subsequent write still happens).
+
+### Reference tests
+
+Three existing tests cover this pattern and can be used as templates when adding a new rollback handler:
+
+- `packages/scraper-framework/tests/test_deterministic_validation_integration.py`:
+  - `test_det_validation_fail_rollback_error_does_not_crash`
+  - `test_det_validation_flag_rollback_error_does_not_crash`
+- `packages/scraper-framework/tests/test_ingestion_validation.py`:
+  - `test_validation_fail_rollback_error_still_returns`
+
 ## `None` vs Empty Collection — The Falsy Sentinel Antipattern
 
 When a function uses `None` as a sentinel to mean "operation failed" and an empty collection (`[]`, `{}`) to mean "operation succeeded but found nothing," testing the result with `if not result:` is a bug. Both `None` and `[]` are falsy in Python, so the check conflates failure with empty success.
