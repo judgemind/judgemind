@@ -48,6 +48,10 @@ EXCLUDE_DIRS=(
     "__pycache__"
     ".claude"
     ".vite"
+    # Local developer scratch dir for agent workflows (not tracked; see
+    # CLAUDE.md §ALWAYS — Before Acting).  CI checkout has no tmp/, so
+    # excluding it only affects local runs and keeps behavior consistent.
+    "tmp"
 )
 
 # ─── Files that legitimately mention the pattern as context ──────────────
