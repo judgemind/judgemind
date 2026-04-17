@@ -25,9 +25,11 @@ from framework.llm_extractor import (
     LlmExtractor,
     _create_google_client,
     _deduplicate_ruling_texts,
+    _drop_calendar_listing_rulings,
     _extract_case_number_from_info,
     _extract_case_title_from_info,
     _is_calendar_header,
+    _is_calendar_listing_only,
     _is_new_case,
     _join_page_rows,
     _parse_page_rows,
@@ -1061,6 +1063,451 @@ class TestDeduplicateRulingTexts:
         assert result[1].outcome == ExtractionOutcome.DENIED
         assert result[1].case_type == "civil"
         assert result[1].confidence == confidence
+
+
+# ---------------------------------------------------------------------------
+# Calendar-listing-only detection (#2446)
+# ---------------------------------------------------------------------------
+
+
+class TestIsCalendarListingOnly:
+    """Tests for _is_calendar_listing_only function (#2446)."""
+
+    # --- Positive cases: these should be classified as calendar listings ---
+
+    def test_off_calendar_marker(self) -> None:
+        """Bare OFF-CALENDAR marker is a calendar listing."""
+        assert _is_calendar_listing_only("OFF-CALENDAR") is True
+
+    def test_off_calendar_no_hyphen(self) -> None:
+        """OFF CALENDAR without hyphen still matches."""
+        assert _is_calendar_listing_only("OFF CALENDAR") is True
+
+    def test_off_calendar_mixed_case(self) -> None:
+        """Off-Calendar in mixed case still matches."""
+        assert _is_calendar_listing_only("Off-Calendar") is True
+
+    def test_off_calendar_trailing_period(self) -> None:
+        """OFF-CALENDAR. with trailing period still matches."""
+        assert _is_calendar_listing_only("OFF-CALENDAR.") is True
+
+    def test_off_calendar_em_dash(self) -> None:
+        """OFF\u2014CALENDAR (em dash) still matches."""
+        assert _is_calendar_listing_only("OFF\u2014CALENDAR") is True
+
+    def test_no_tentative_posted_marker(self) -> None:
+        """'NO TENTATIVE POSTED' is a calendar-listing marker (#2446)."""
+        assert _is_calendar_listing_only("NO TENTATIVE POSTED") is True
+
+    def test_no_tentative_alone(self) -> None:
+        """Bare 'NO TENTATIVE' is a calendar-listing marker."""
+        assert _is_calendar_listing_only("NO TENTATIVE") is True
+
+    def test_no_tentative_mixed_case(self) -> None:
+        """'No Tentative Posted' in mixed case still matches."""
+        assert _is_calendar_listing_only("No Tentative Posted") is True
+
+    def test_no_tentative_trailing_period(self) -> None:
+        """'No tentative posted.' with trailing period still matches."""
+        assert _is_calendar_listing_only("No tentative posted.") is True
+
+    def test_motion_to_strike_only(self) -> None:
+        """Just a motion-type label is a calendar listing."""
+        assert _is_calendar_listing_only("Motion to Strike") is True
+
+    def test_demurrer_only(self) -> None:
+        """Just 'Demurrer' is a calendar listing."""
+        assert _is_calendar_listing_only("Demurrer") is True
+
+    def test_demurrer_to_fac(self) -> None:
+        """'Demurrer to First Amended Complaint' is a calendar listing."""
+        assert _is_calendar_listing_only("Demurrer to First Amended Complaint") is True
+
+    def test_demurrers_plural(self) -> None:
+        """Plural 'Demurrers' is still a calendar listing (#2446)."""
+        assert _is_calendar_listing_only("Demurrers") is True
+
+    def test_hearings_plural(self) -> None:
+        """Plural 'Hearings on Motion' is a calendar listing (#2446)."""
+        assert _is_calendar_listing_only("Hearings on Motions") is True
+
+    def test_applications_plural(self) -> None:
+        """Plural 'Applications for Fees' is a calendar listing (#2446)."""
+        assert _is_calendar_listing_only("Applications for Attorney Fees") is True
+
+    def test_motion_type_with_trailing_period(self) -> None:
+        """A motion-type label with a trailing period is a calendar listing (#2446)."""
+        assert _is_calendar_listing_only("Motion to Strike.") is True
+
+    def test_motion_type_with_internal_periods(self) -> None:
+        """Motion labels with internal periods (e.g. N.O.V.) are calendar listings."""
+        assert _is_calendar_listing_only("Motion for Judgment N.O.V.") is True
+
+    def test_demurrer_with_trailing_period(self) -> None:
+        """Demurrer with trailing period is a calendar listing (#2446)."""
+        assert _is_calendar_listing_only("Demurrer to Complaint.") is True
+
+    def test_multiline_motions(self) -> None:
+        """Multiple motion labels on separate lines are a calendar listing."""
+        assert _is_calendar_listing_only("Demurrer\nMotion to Strike") is True
+
+    def test_motion_for_attorneys_fees(self) -> None:
+        """'Motion for Attorneys' Fees' is a calendar listing."""
+        assert _is_calendar_listing_only("Motion for Attorneys' Fees") is True
+
+    def test_motion_for_summary_judgment(self) -> None:
+        """'Motion for Summary Judgment' alone (no disposition) is a listing."""
+        assert _is_calendar_listing_only("Motion for Summary Judgment") is True
+
+    def test_case_management_conference(self) -> None:
+        """Case Management Conference alone is a calendar listing."""
+        assert _is_calendar_listing_only("Case Management Conference") is True
+
+    def test_ex_parte_application(self) -> None:
+        """Ex Parte Application to ... alone is a calendar listing."""
+        assert _is_calendar_listing_only("Ex Parte Application to Continue") is True
+
+    def test_osc(self) -> None:
+        """OSC re contempt alone is a calendar listing."""
+        assert _is_calendar_listing_only("OSC re Sanctions") is True
+
+    # --- Negative cases: these are real rulings, must NOT be dropped ---
+
+    def test_real_short_grant(self) -> None:
+        """Motion to strike is GRANTED — real ruling with disposition."""
+        assert _is_calendar_listing_only("The motion is GRANTED.") is False
+
+    def test_real_short_denied(self) -> None:
+        """'Denied.' alone counts as a ruling (has disposition verb)."""
+        assert _is_calendar_listing_only("Denied.") is False
+
+    def test_real_short_sustained(self) -> None:
+        """Demurrer SUSTAINED — real ruling."""
+        assert _is_calendar_listing_only("Demurrer is SUSTAINED without leave.") is False
+
+    def test_real_short_overruled(self) -> None:
+        """Demurrer OVERRULED — real ruling."""
+        assert _is_calendar_listing_only("Demurrer OVERRULED.") is False
+
+    def test_real_continued(self) -> None:
+        """Motion CONTINUED to a later date — real ruling."""
+        assert _is_calendar_listing_only("Motion CONTINUED to April 1, 2026.") is False
+
+    def test_none_text(self) -> None:
+        """None text is not a calendar listing (preserve for other filters)."""
+        assert _is_calendar_listing_only(None) is False
+
+    def test_empty_text(self) -> None:
+        """Empty string is not a calendar listing."""
+        assert _is_calendar_listing_only("") is False
+
+    def test_whitespace_only(self) -> None:
+        """Whitespace-only text is not a calendar listing."""
+        assert _is_calendar_listing_only("   \n\t  ") is False
+
+    def test_long_substantive_text(self) -> None:
+        """Text longer than the calendar-listing threshold is never dropped."""
+        # 200+ chars of real ruling reasoning, no short-listing match.
+        text = (
+            "The court has reviewed the moving and opposition papers and finds "
+            "that Defendant has met the initial burden on summary judgment. "
+            "Plaintiff has failed to produce admissible evidence to raise a "
+            "triable issue of material fact. The motion is GRANTED."
+        )
+        assert _is_calendar_listing_only(text) is False
+
+    def test_long_text_no_disposition(self) -> None:
+        """Long text without a disposition verb is still not a listing if > threshold.
+
+        The threshold check prevents us from dropping a substantive ruling
+        that happens to lack an explicit disposition keyword.  This is
+        critical for correctness — better to keep ambiguous rows than drop
+        them.
+        """
+        # 150 chars — over the 100-char threshold.
+        text = (
+            "The court has reviewed all papers submitted by the parties "
+            "including the recent supplemental brief filed after oral "
+            "argument on the matter presented."
+        )
+        assert _is_calendar_listing_only(text) is False
+
+    def test_mixed_valid_and_motion_line_with_disposition(self) -> None:
+        """If any disposition verb is present, text is a real ruling."""
+        text = "Motion to Strike is DENIED for the reasons stated."
+        assert _is_calendar_listing_only(text) is False
+
+    def test_ruling_text_mentions_motion_but_has_no_disposition(self) -> None:
+        """Pure motion label with no disposition IS a listing (short)."""
+        assert _is_calendar_listing_only("Motion to Compel Further") is True
+
+    def test_motion_label_with_appointment(self) -> None:
+        """Petition to Approve is a calendar listing."""
+        assert _is_calendar_listing_only("Petition to Approve Compromise") is True
+
+    def test_motion_granted_word_embedded_in_name(self) -> None:
+        """
+        A party name or word like 'Grantor' does not count as a disposition
+        because the regex matches whole words only.  Here the text has the
+        literal substring "grant" inside "Grantham" but no full-word match.
+        """
+        # Pure short motion label with party-name-like text — still a listing.
+        text = "Motion to Strike Grantham's Answer"
+        assert _is_calendar_listing_only(text) is True
+
+
+class TestDropCalendarListingRulings:
+    """Tests for _drop_calendar_listing_rulings function (#2446)."""
+
+    def test_drops_off_calendar_entry(self) -> None:
+        """OFF-CALENDAR rows are filtered out."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                extracted_case_title="Anderson vs. Schreiffer",
+                ruling_text="OFF-CALENDAR",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                extracted_case_title="Smith vs. Jones",
+                ruling_text="Demurrer is SUSTAINED. Leave to amend granted.",
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00002"
+
+    def test_drops_no_tentative_posted_entry(self) -> None:
+        """'NO TENTATIVE POSTED' rows are filtered out (#2446)."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                extracted_case_title="Acme v. Widgets",
+                ruling_text="NO TENTATIVE POSTED",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                extracted_case_title="Smith vs. Jones",
+                ruling_text="Demurrer is SUSTAINED. Leave to amend granted.",
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00002"
+
+    def test_drops_motion_type_only_entry(self) -> None:
+        """Rows whose ruling_text is only a motion label are filtered out."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="Motion for Attorneys' Fees",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                ruling_text="Motion is GRANTED on the merits. " * 5,
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00002"
+
+    def test_preserves_cross_reference_entries(self) -> None:
+        """Entries with cross_reference_source set are exempt from the filter."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="Demurrer",  # would normally be classified as listing
+                cross_reference_source=2,
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00001"
+
+    def test_preserves_none_text_entries(self) -> None:
+        """Entries whose ruling_text is None are preserved (handled elsewhere)."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                extracted_case_title="Alpha v. Beta",
+                ruling_text=None,
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00001"
+
+    def test_preserves_empty_text_entries(self) -> None:
+        """Entries whose ruling_text is empty string are preserved."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="",
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+
+    def test_preserves_real_rulings(self) -> None:
+        """Substantive rulings with dispositions are never dropped."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="Demurrer is SUSTAINED without leave to amend.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                ruling_text="The motion for summary judgment is DENIED.",
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 2
+
+    def test_empty_list(self) -> None:
+        """Empty input returns empty output."""
+        assert _drop_calendar_listing_rulings([]) == []
+
+    def test_all_calendar_listings_dropped(self) -> None:
+        """All-calendar-listing input returns empty list."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="OFF-CALENDAR",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                ruling_text="Demurrer\nMotion to Strike",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00003",
+                ruling_text="Motion to Compel Further Discovery",
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert result == []
+
+
+class TestJoinPageRowsCalendarListing:
+    """Integration tests: _join_page_rows drops calendar listings (#2446)."""
+
+    def test_w8_calendar_pdf_produces_zero_rulings(self) -> None:
+        """A W8-style calendar with only motion-type cells produces 0 rulings.
+
+        Simulates the Dept W8 March 13, 2026 calendar where every row is a
+        case+motion listing with no actual ruling body.  The expected
+        behavior is that _join_page_rows returns an empty list.
+        """
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-00001 Anderson vs. P.K. Schreiffer LLP",
+                "ruling_text": "Motion for Attorneys' Fees",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "30-2024-00002 Ko vs. Bank of America Corporation",
+                "ruling_text": "Demurrer\nMotion to Strike",
+            },
+            {
+                "entry_number": 3,
+                "case_info": "30-2024-00003 Smith vs. Jones",
+                "ruling_text": "Motion to Compel Further Discovery",
+            },
+            {
+                "entry_number": 4,
+                "case_info": "30-2024-00004 Alpha vs. Beta",
+                "ruling_text": "OFF-CALENDAR",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert rulings == []
+
+    def test_mixed_calendar_and_real_rulings(self) -> None:
+        """A mixed page: real rulings kept, calendar listings dropped."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-00001 Alpha vs. Beta",
+                "ruling_text": "Motion for Attorneys' Fees",  # listing
+            },
+            {
+                "entry_number": 2,
+                "case_info": "30-2024-00002 Gamma vs. Delta",
+                "ruling_text": "The motion to strike is GRANTED in part.",
+            },
+            {
+                "entry_number": 3,
+                "case_info": "30-2024-00003 Epsilon vs. Zeta",
+                "ruling_text": "OFF-CALENDAR",  # listing
+            },
+            {
+                "entry_number": 4,
+                "case_info": "30-2024-00004 Eta vs. Theta",
+                "ruling_text": "Demurrer is OVERRULED as to the first cause.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        # Note: the extractor strips the OC "30-" prefix from case numbers.
+        assert rulings[0].extracted_case_number == "2024-00002"
+        assert rulings[0].ruling_text is not None
+        assert "GRANTED" in rulings[0].ruling_text
+        assert rulings[1].extracted_case_number == "2024-00004"
+        assert rulings[1].ruling_text is not None
+        assert "OVERRULED" in rulings[1].ruling_text
+
+    def test_palacios_style_row_dropped(self) -> None:
+        """Evidence row 1 (Anderson 26-char listing) is dropped."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-00001 Anderson vs. P.K. Schreiffer LLP",
+                # 26 chars, motion-type-only — matches the DB evidence.
+                "ruling_text": "Motion for Attorneys' Fees",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert rulings == []
+
+    def test_ko_bank_of_america_row_dropped(self) -> None:
+        """Evidence row 2 (Ko vs. Bank of America 25-char listing) is dropped."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-00002 Ko vs. Bank of America Corporation",
+                "ruling_text": "Demurrer\nMotion to Strike",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert rulings == []
+
+    def test_all_real_rulings_preserved(self) -> None:
+        """A page of real rulings is unaffected by the filter."""
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "30-2024-00001 Alpha vs. Beta",
+                "ruling_text": (
+                    "The motion for summary judgment is GRANTED. "
+                    "Defendant has met its initial burden and Plaintiff has "
+                    "failed to raise a triable issue of material fact."
+                ),
+            },
+            {
+                "entry_number": 2,
+                "case_info": "30-2024-00002 Gamma vs. Delta",
+                "ruling_text": (
+                    "Demurrer is OVERRULED as to the first cause of action "
+                    "and SUSTAINED without leave to amend as to the second."
+                ),
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].ruling_text is not None
+        assert "GRANTED" in rulings[0].ruling_text
+        assert rulings[1].ruling_text is not None
+        assert "OVERRULED" in rulings[1].ruling_text
 
 
 class TestJoinPageRowsContamination:
