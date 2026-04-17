@@ -202,9 +202,13 @@ Glob pattern: scripts/*.py
 
 If the count exceeds **35**, flag a finding. The current baseline is ~29 permanent utility scripts — 35 gives headroom for a few new utilities while catching accumulation of unarchived one-off scripts.
 
-2. **Missing `# one-off: true` headers.** Scan all `scripts/*.py` files for scripts that look like one-off data operations (names containing `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, `remediat`) but lack a `# one-off: true` header in the first 10 lines. These should either be marked as one-off or confirmed as permanent utilities.
+2. **Missing `# one-off: true` or `# permanent: true` headers.** Scan all `scripts/*.py` files for scripts that look like one-off data operations (names containing `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, `remediat`) but lack EITHER a `# one-off: true` header OR a `# permanent: true` header in the first 10 lines. A script should carry exactly one of these markers:
+   - `# one-off: true` — finite-lifetime script (tied to a specific bug fix or migration). Candidate for archival once its work is done.
+   - `# permanent: true` — re-runnable utility (parameterizable, idempotent, intended to be invoked repeatedly). Exempt from one-off nagging and staleness checks.
 
-3. **Stale one-off scripts.** For scripts that DO have `# one-off: true`, check their git log to see when they were last modified. If a one-off script has not been modified in more than 30 days, flag it as a candidate for archiving to `scripts/archive/`.
+   Scripts previously confirmed as permanent in issue comments should carry the canonical `# permanent: true` marker so the check is machine-readable and does not re-flag them each audit cycle (see #2530). The audit treats either marker as sufficient — only unmarked scripts matching the name pattern are flagged.
+
+3. **Stale one-off scripts.** For scripts that DO have `# one-off: true`, check their git log to see when they were last modified. If a one-off script has not been modified in more than 30 days, flag it as a candidate for archiving to `scripts/archive/`. Scripts with `# permanent: true` are exempt from this staleness check.
 
 #### Filing issues
 
@@ -213,7 +217,7 @@ For script count threshold violations, file a `priority/p2` `type/chore` issue w
 - List of scripts that appear to be one-off (by name pattern or `# one-off: true` header).
 - Suggested action: archive completed one-off scripts to `scripts/archive/`.
 
-For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed for the `# one-off: true` header.
+For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed. Each listed script should get either `# one-off: true` (if finite-lifetime) or `# permanent: true` (if re-runnable utility).
 
 ---
 

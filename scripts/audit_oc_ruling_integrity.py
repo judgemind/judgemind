@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
+# permanent: true
 """Audit OC ruling data integrity — detect misrouted and boilerplate rulings.
 
 Queries the database for Orange County rulings and checks for two classes of
