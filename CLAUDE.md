@@ -55,8 +55,14 @@ preflight_rate_budget       # Warn if GitHub API rate budget < 100 remaining
 
 Judgemind is a free, open-source legal research platform replacing Trellis.law. Read the specs in `docs/specs/` for full context. The key things to know:
 
-- **Tentative rulings are ephemeral.** If a scraper is down, data is permanently lost. Scraper reliability is the highest priority in the system.
-- **Two data pipelines.** Model A captures California tentative rulings (ephemeral, high urgency). Model B extracts judge analytics from dockets/documents (all other states, persistent data, NLP-dependent).
+- **Capture to S3 is the most critical step.** Tentative rulings disappear from court websites within days. If the scraper is down when a ruling is posted, the raw is lost forever — scraper reliability is the top priority. Once captured to S3, the raw is durable.
+- **Data is tiered; the schema encodes the tiers.** S3 is the source of truth. PostgreSQL is split by schema namespace:
+  - `derived.*` (documents, rulings, cases, judges, attorneys, parties, court_directory_snapshots, aliases) — fully rebuildable from S3 via `rebuild_db.py`. **For cleanup or corrupted state, prefer rebuild over surgical deletion/patch scripts.** Surgical one-offs are prone to their own bugs (wrong filter, missed edge case, partial mutation) and frequently create more problems than they solve. They also only touch existing rows — they don't validate the ingestion or enrichment pipeline, so inbound data can keep arriving with the same root-cause bug. Rebuild exercises the real pipeline end-to-end: the same fix validates existing and future rows in one step.
+  - `public.*` (users, refresh_tokens, alert_subscriptions, alert_events) — authoritative accumulated state. Never drop without explicit justification; not rebuildable.
+  - `staging.*` (captures, ruled_items) — transient pipeline state. Drain, don't rebuild.
+  - `telemetry.*` (scraper_runs, validation_results, data_quality_metrics) — accumulated observability. Low-stakes but not rebuildable from S3.
+  - OpenSearch is fully derivable from `derived.*`.
+- **Two data pipelines.** Model A captures California tentative rulings (ephemeral at capture, high urgency). Model B extracts judge analytics from dockets/documents (all other states, persistent, NLP-dependent).
 - **Self-funded and free.** Every architecture decision must consider cost. Prefer fixed-cost over usage-based. Never assume unlimited budget.
 - **API-first.** The web app is a client of the API. Every UI feature has an API endpoint.
 
@@ -72,6 +78,12 @@ Consult these docs before making changes in their domain:
 | `docs/web-patterns.md` | **All frontend work** — page layout patterns, component usage, consistency rules |
 | `docs/BRAND.md` | Colors, typography, design principles for all visual work |
 | `docs/web-lessons.md` | Frontend incident lessons, server component error handling |
+| `docs/agent/code-standards.md` | Python/TypeScript/Terraform standards, pre-PR check commands, coverage gates |
+| `docs/agent/issue-authoring.md` | Writing acceptance criteria, sub-tasks, investigation follow-ups |
+| `docs/agent/task-dependencies.md` | Blocking/unblocking issues, `Blocked by` mechanics |
+| `docs/agent/infrastructure-reference.md` | ECS script execution, Terraform apply, secrets, Vercel, Reingest vs Rebuild |
+| `docs/agent/local-dev.md` | Docker Compose, local DB rebuild, S3 cache, local env vars |
+| `docs/agent/unattended-patterns.md` | Permission-prompt workarounds for git, curl, secrets, `.claude/` writes |
 
 ## Starting a New Session
 
@@ -261,123 +273,19 @@ GitHub allows 5,000 API requests per hour. With multiple concurrent agents, this
 
 For detailed infrastructure reference (Vercel, Terraform state, ECS, secrets), see `docs/agent/infrastructure-reference.md`.
 
-## Code Standards
+## Code Standards & Pre-PR Checks
 
-### Python (scrapers, NLP pipeline)
+See **`docs/agent/code-standards.md`** for the full reference (Python/TypeScript/Terraform style, one-off script conventions, pre-PR commands, coverage gates). Highlights every agent must internalize:
 
-- Python 3.12+, using `.venv` in each package directory
-- Run tests: `.venv/bin/pytest tests/ -v`
-- Install deps: `.venv/bin/pip install -e ".[dev]"`
-- Type hints on all function signatures
-- pytest for testing; ruff for linting and formatting
-- Dependencies managed via pyproject.toml
-- Async where appropriate (httpx for HTTP, playwright for browser automation)
-
-### Python scripts (`scripts/*.py`)
-
-Scripts in `scripts/` that import non-stdlib modules must declare their venv with a `# venv:` header comment in the first 10 lines:
-
-```python
-#!/usr/bin/env python3
-"""Script docstring."""
-# venv: scraper-framework
-from __future__ import annotations
-```
-
-Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header and activates the correct venv automatically.
-
-- **One-off scripts** (backfills, cleanups, fixups) must include a `# one-off: true` header comment in the first 10 lines. This marks them for automatic detection by the `/audit` skill so they can be archived when no longer needed. Example:
-
-```python
-#!/usr/bin/env python3
-"""Backfill missing party names for Santa Barbara rulings."""
-# venv: scraper-framework
-# one-off: true
-from __future__ import annotations
-```
-
-- Eval scripts (`scripts/eval/`) are excluded from this convention.
-- **ECS oneshot constraint:** Scripts run via `ecs-run-task.sh` are uploaded as single files — they **cannot import other `.py` files from `scripts/`**. Only stdlib and installed packages are available. If you need shared code, either inline it, use a lazy import inside a function (for optional features), or move the shared code into an installed package. CI enforces this via `scripts/check-oneshot-imports.sh`. Scripts that are never run as ECS oneshots can be added to the `LOCAL_ONLY` list in that script.
-
-### TypeScript (API, frontend)
-
-- Strict mode always
-- Node.js 20+ for API; activate with `source ~/.nvm/nvm.sh && nvm install 20 --no-progress`
-- Next.js 14+ for frontend
-- ESLint + Prettier
-- In `packages/web/src/app/`, use `@/` path aliases instead of deep relative imports (`../../` or deeper). The `local/prefer-path-alias` ESLint rule enforces this. Deep relative imports break when route groups are reorganised.
-- **Follow `docs/web-patterns.md`** for all page layout, component usage, and consistency decisions. This is mandatory for frontend work.
-- **Apollo cache keyFields:** Any new GraphQL type without an `id` field needs a `keyFields` entry in `packages/web/src/lib/apollo-client.ts` `typePolicies`. Without this, Apollo may collapse distinct items into a single cache entry. Options: `keyFields: ['fieldName']` for types with a natural unique key, or `keyFields: false` for embedded/non-normalized types (edges, etc.). Run `scripts/check-apollo-keyfields.sh` locally to verify before pushing. See #1779.
-- Jest or Vitest for testing
-
-### General
-
-- All code must have tests. Scrapers must have regression tests against archived pages in `tests/fixtures/`.
-- Never hardcode secrets, API keys, credentials, or URLs to live court sites in source code. Use environment variables.
-- Never commit large binary files. Use `.gitignore`.
-- Write clear docstrings/comments for non-obvious logic.
-- **When removing or renaming module-level exports** (functions, classes, constants), grep for all import sites across the entire codebase (`src/` and `tests/`) before committing. Update or remove every import — not just the test file matching the modified module. Broken imports in unrelated test files will not surface until CI runs the full suite, and may not surface at all if the tests are skipped or filtered.
-
-### Performance awareness
-
-Every diff review must check for these common bottlenecks:
-
-- **Sequential I/O over collections.** Use concurrency (`ThreadPoolExecutor`, `asyncio.gather`, `pipeline()`) or batching instead of per-item network calls.
-- **O(n^2) pagination.** Use keyset (cursor-based) pagination, never `LIMIT/OFFSET` for large datasets.
-- **Unbatched DB writes.** Use `executemany`, `COPY`, or psycopg3 `pipeline()` mode.
-- **Missing connection reuse.** Reuse HTTP clients, DB connections, and S3 clients across calls.
-
-If unsure whether a perf pattern matters at current scale, add a `# TODO(perf):` comment.
-
-## Pre-PR Checks (MANDATORY — No Exceptions)
-
-**Every agent MUST run ALL applicable checks locally BEFORE pushing.** The `.githooks/pre-push` hook also runs them automatically.
-
-**Python packages** (from the package directory):
-
-```
-.venv/bin/ruff check src/ tests/           # Lint (rules: E, F, I, N, UP, ANN, DTZ)
-.venv/bin/ruff format --check src/ tests/   # Format check
-.venv/bin/pytest tests/ -v --tb=short       # Tests with coverage
-```
-
-If lint fails: `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
-
-Common ruff pitfalls: **I001** (unsorted imports, `--fix` resolves), **F401** (unused imports, remove them), **UP017** (use `datetime.now(datetime.UTC)`). Format and lint are **separate commands** — run BOTH.
-
-**Coverage gates (enforced in CI):**
-- **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).
-- **Coverage floor ratchet:** overall package coverage must not decrease below the baseline in `coverage-baselines.json`. The floor only goes up — when coverage increases, update the baselines with `scripts/update-coverage-baselines.py`.
-
-**TypeScript packages:**
-
-```
-npm run lint                                # ESLint
-npm run typecheck                           # tsc --noEmit
-npm test                                    # Vitest
-```
-
-For `packages/web/`, also run `npm run build`. The same diff coverage and floor ratchet gates apply to TypeScript packages (CI reads `lcov.info`).
-
-**Terraform** (from `infra/terraform/`):
-
-```
-terraform fmt -check -recursive
-terraform init -backend=false
-terraform validate
-```
+- **Python:** 3.12+, `.venv` per package, ruff + pytest. Scripts in `scripts/` need a `# venv:` header; one-off scripts also need `# one-off: true`. ECS oneshot scripts cannot import from other `scripts/*.py` files.
+- **TypeScript:** strict mode, Node 20+. In `packages/web/`, use `@/` path aliases; any new GraphQL type without `id` needs a `keyFields` entry in `apollo-client.ts`.
+- **General:** all code has tests. Never hardcode secrets. When removing/renaming exports, grep every import site across `src/` and `tests/` before committing.
+- **Perf:** watch for sequential I/O, `LIMIT/OFFSET` pagination, unbatched DB writes, missing connection reuse.
+- **Pre-PR (MANDATORY, `.githooks/pre-push` enforces):** from each touched package, run `ruff check`, `ruff format --check`, and `pytest` (Python) or `lint`/`typecheck`/`test` + `build` for `packages/web/` (TS). Diff coverage ≥ 90% on changed lines; package floor ratchet in `coverage-baselines.json`. Subagents run the same checks; never push on red.
 
 ### Subagent Responsibilities
 
-#### Worktree Isolation
-
-**Spawn `/task` agents with `isolation: "worktree"` on the Agent tool.** Claude Code creates a unique worktree at `.claude/worktrees/agent-<id>/` automatically — no locking, no number contention, no races. The `/task` agent detects it is already in a worktree and skips manual worktree setup.
-
-For non-`/task` subagents needing branch isolation (rare), create a worktree manually. **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.**
-
-#### Pre-PR Checks
-
-Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.
+**Spawn `/task` agents with `isolation: "worktree"` on the Agent tool.** Claude Code creates a unique worktree at `.claude/worktrees/agent-<id>/` automatically — no locking, no number contention, no races. The `/task` agent detects it is already in a worktree and skips manual worktree setup. For non-`/task` subagents needing branch isolation (rare), create a worktree manually. **Never run `git checkout` or `git switch` in the parent's working directory from a subagent.**
 
 ## Git Workflow
 
@@ -385,80 +293,15 @@ Subagents MUST install dependencies, run ALL lint/format/test commands for every
 - Always work on the worktree branch. Open a PR, wait for CI. You may merge your own PRs after ralph and CI are green.
 - **A PR is not done until it has no conflicts and CI is green.**
 
-## Task Dependencies
+## Task Dependencies, Sub-Tasks, Investigations
 
-- Blocked issues carry `status/blocked` and do **not** have `agent/ready`. Agents skip them.
-- Dependencies are listed as `Blocked by #N` under a `## Dependencies` heading.
+See **`docs/agent/task-dependencies.md`** and **`docs/agent/issue-authoring.md`** for the full mechanics. Core rules every agent must follow:
 
-### Marking an issue as blocked
-
-**Both pieces are required** — the `status/blocked` label AND a `Blocked by #N` line in the issue body. The `unblock-issues` CI workflow searches for `Blocked by #N` in the body to find issues to unblock when a PR merges. If the label is present but the body text is missing, the workflow never fires and the issue stays stuck forever.
-
-**Always use the helper script** to block an issue:
-
-```
-scripts/block-issue.sh <issue> <blocker>
-```
-
-This atomically: (1) adds `Blocked by #<blocker>` to the issue body's `## Dependencies` section (creating it if absent), (2) adds the `status/blocked` label, and (3) removes the `agent/ready` label.
-
-**Do NOT** block issues by only adding the `status/blocked` label, only posting a comment, or using `Parent: #N` without a `Blocked by` line. These patterns break auto-unblocking:
-
-| Pattern | Auto-unblock? | Correct? |
-|---|---|---|
-| `status/blocked` label + `Blocked by #N` in body | Yes | Yes |
-| `status/blocked` label + comment "Blocked by #N" (no body text) | **No** | **No** |
-| `Parent: #N` without `Blocked by #N` | **No** | **No** — `Parent:` is hierarchy, not dependency |
-| `status/blocked` label only (no body reference at all) | **No** | **No** |
-
-**Note:** `Parent: #N` expresses hierarchy (this is a sub-task of #N), not dependency. A sub-task can be worked on independently even while the parent is open. Only use `Blocked by #N` when the issue genuinely cannot proceed until #N is resolved.
-
-### When you finish a task
-
-**Implementation tasks (PRs):** dependent issues are unblocked automatically by the `unblock-issues` CI workflow when the PR merges. The PR body must include `Closes #N`.
-
-**Non-PR completions:** unblock dependent issues by running `scripts/unblock-dependents.sh <your-issue>`. The script searches for open issues with `Blocked by #<your-issue>`, checks if all blockers are closed, and if so removes `status/blocked`, adds `agent/ready`, and cleans the `Blocked by` lines from the body. Use `--dry-run` to preview changes first.
-
-## Creating Sub-Tasks
-
-If a task naturally breaks into 2+ independent pieces of work, create child issues:
-
-- Reference the parent: "Parent: #42" in the issue body.
-- Sub-tasks should be self-contained — another agent should be able to pick one up independently.
-- Label child issues appropriately and add `agent/ready` if fully specified.
-
-## Writing Acceptance Criteria
-
-When filing issues, acceptance criteria must be concrete and machine-checkable wherever possible. Vague criteria like "page looks correct" allow agents to hand-wave past verification. Instead, include specific verification commands and expected results.
-
-**Guidelines:**
-- **Data changes**: include the SQL query and expected result.
-- **Frontend changes**: include the URL and what should be visible (element, text, layout).
-- **API changes**: include the endpoint, request, and expected response shape.
-- **Behavior changes**: include the specific trigger and expected outcome.
-- **External-integration changes** (issues proposing to query a third-party website or API — court case-search endpoints, public records APIs, etc.): include a one-line HTTP feasibility note confirming the endpoint is actually usable before labeling the issue `agent/ready`. Example: `Feasibility: curl https://example.court.gov/api/search?case=123 returns JSON, no reCAPTCHA/WAF, anonymous access works`. At minimum, verify: (1) the endpoint responds to an anonymous request, (2) there is no reCAPTCHA / Cloudflare challenge / login wall on the query path, (3) the expected data is actually returned for a realistic sample. Issues without a feasibility note risk premising acceptance criteria on integrations that cannot work — see #1979 for a case where ~a day of agent time was spent on an infeasible premise.
-
-**Example — vague (bad):**
-```
-- [ ] Zavala v Becker shows only its ruling text
-```
-
-**Example — machine-checkable (good):**
-```
-- [ ] Zavala v Becker shows only its ruling text
-  Verify: `SELECT length(ruling_text) FROM rulings WHERE case_id = 'f51849ca-...'` returns values < 5000
-  Verify: Screenshot of /cases/f51849ca-... shows single-case content
-```
-
-Each criterion should have at least one `Verify:` line that an agent can execute to confirm the criterion is met. This applies to issues filed by both humans and agents. If a verification command is not possible (e.g., requires subjective judgment), note that explicitly so reviewers know it requires manual verification.
-
-## Investigation Tasks
-
-Investigation tasks produce documentation, not code:
-
-- Write findings in the issue body or `docs/investigations/`.
-- **Always file follow-up issues** for every actionable finding. Label them `agent/ready` if fully specified. Reference the investigation issue as the parent.
-- After documenting findings and filing follow-ups, close the investigation issue unless human judgment is genuinely needed.
+- **Blocking:** use `scripts/block-issue.sh <issue> <blocker>`. Both the `status/blocked` label AND a `Blocked by #N` line in the issue body are required — the `unblock-issues` CI workflow searches the body for `Blocked by #N`. Label-only blocks never auto-unblock. `Parent: #N` is hierarchy, not a dependency.
+- **Unblocking:** PR merges auto-unblock via `Closes #N`. For non-PR completions, run `scripts/unblock-dependents.sh <your-issue>`.
+- **Sub-tasks:** reference the parent as `Parent: #N`; each sub-task should be independently pickup-able.
+- **Acceptance criteria:** concrete and machine-checkable. Each criterion has at least one `Verify:` line (SQL query, curl response, URL/screenshot, etc.). External-integration issues need a one-line HTTP feasibility note before `agent/ready` (see #1979). **Data cleanup on `derived.*` defaults to `rebuild_db.py --county <name>`** — surgical delete/patch scripts are a last resort and must be justified in the issue body.
+- **Investigation tasks:** produce documentation (issue body or `docs/investigations/`) and file follow-up issues for every actionable finding, then close.
 
 ## Ingestion Pipeline — Separation of Concerns
 
@@ -487,95 +330,39 @@ Key paths: framework in `packages/scraper-framework/src/framework/`, California 
 - **Scrapers extract metadata from website structure only** — judge name from link text, department from URL parameters, etc. They do NOT parse PDF content or extract fields from unstructured text. Field extraction from document content happens downstream in enrichment.
 - **Data correctness is the #1 priority. Completeness is secondary.** A missing field is acceptable; a wrong field is a bug. When evaluating data quality, always verify correctness first (is the extracted value accurate compared to the source document?), then completeness (is the field populated?). Completeness metrics are useful as a signal toward correctness problems — a sudden drop in judge match rate suggests a bug — but high completeness with low correctness is worse than low completeness with high correctness. Required fields: **judge name, motion type, case title, hearing date, outcome, parties**. Write regression tests against real fixtures for every field.
 
-## Infrastructure Code
+## Infrastructure & Data Scripts
+
+### Terraform
 
 - Terraform for all AWS resources. Every resource must be in a module.
 - **Do NOT add `tags` blocks to individual resources** — the AWS provider's `default_tags` handles this.
 - Never commit AWS credentials or state files.
-- **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges to main, the dispatcher automatically runs `terraform apply` for the dev environment. Production applies remain human-only. See `.claude/skills/dispatcher/SKILL.md` for the full apply procedure.
-
-For Terraform apply/deploy details, see `docs/agent/infrastructure-reference.md`.
+- **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges to main, the dispatcher automatically runs `terraform apply` for the dev environment. Production applies remain human-only. See `.claude/skills/dispatcher/SKILL.md` and `docs/agent/infrastructure-reference.md` for the full procedure.
 
 ### Running Data Scripts on Dev
 
-The dev database is in a private VPC — it is **not reachable from localhost**. Never use `scripts/with-secret.sh` with `DATABASE_URL` to run data scripts locally; the connection will fail.
+The dev database is in a private VPC — **not reachable from localhost**. Never use `scripts/with-secret.sh` with `DATABASE_URL` to run data scripts locally; the connection will fail. Use:
 
-| Tool | Use for | Reliability |
-|---|---|---|
-| `scripts/ecs-run-task.sh` | **All data scripts** (backfills, migrations, audits, one-off fixups) | Reliable — launches a standalone Fargate task with full VPC access and CloudWatch log streaming |
-| `scripts/dev-db-query.sh` | **Quick SQL queries** (SELECT, EXPLAIN) | Good for short queries — uses ECS Exec internally |
-| `scripts/ecs-run.sh` | **Interactive debugging only** (e.g., `ecs-run.sh bash`) | Unreliable — SSM sessions drop after seconds, losing all output. Never use for scripts that take more than a few seconds |
+- `scripts/ecs-run-task.sh` for **all data scripts** (backfills, migrations, audits, one-offs) — standalone Fargate task with CloudWatch log streaming, most reliable.
+- `scripts/dev-db-query.sh` for **quick SQL queries** (SELECT, EXPLAIN) — uses ECS Exec internally.
+- `scripts/ecs-run.sh` for **interactive debugging only** (e.g. `bash`) — SSM sessions drop; never use for scripts.
 
-**Standard patterns:**
-
-```
-# Run a data script on dev (preferred)
-scripts/ecs-run-task.sh scripts/backfill_example.py -- --dry-run
-
-# Quick SQL query
-scripts/dev-db-query.sh "SELECT COUNT(*) FROM rulings"
-
-# Long-running script: launch and check later
-scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
-scripts/ecs-run-task.sh --logs <task-arn>
-```
+See `docs/agent/infrastructure-reference.md` §ECS Script Execution for full patterns, flag reference, and CPU/memory overrides.
 
 **Reingest vs Rebuild — choosing the right script:**
 
 | Scenario | Script | Why |
 |---|---|---|
+| Cleanup orphaned/corrupted `derived.*` state (failed run, bad IDs, partial mutation) | `rebuild_db.py --county <name>` | `derived.*` is fully rebuildable from S3. Rebuild is idempotent, validates the real ingestion/enrichment path (fixing inbound data, not just existing rows), and handles edge cases surgical scripts miss. Surgical one-offs often introduce bugs of their own — only write one if rebuild cost is prohibitive at the affected scale. |
 | Re-process existing records after extraction logic changes | `reingest_from_s3.py --county <name>` | Queries the `documents` table — only works when records already exist |
 | Initial population of a county that has S3 data but no DB records | `rebuild_db.py --county <name>` | Discovers documents directly from S3 keys — does not require pre-existing DB records |
 | Full database rebuild from scratch | `rebuild_db.py` (no `--skip-reset`) | Truncates derived tables and re-processes everything from S3 |
 
-`reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. Use `rebuild_db.py --county <name>` for initial population.
+`reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently.
 
-For full details and options, see `docs/agent/infrastructure-reference.md` §ECS Script Execution.
+### Local Development
 
-### Local Development Stack
-
-A full local dev stack runs via Docker Compose: Postgres, Redis, OpenSearch, MinIO.
-
-```
-docker compose up -d postgres redis    # minimum for local work
-docker compose up -d                   # full stack
-```
-
-**Local database:** `postgres://judgemind:localdev@localhost:5432/judgemind`
-
-**Schema management:**
-- `scripts/apply_migrations.sh` — applies all migrations (up sections only) to local DB
-- `scripts/regenerate_schema.sh` — regenerates `schema.sql` from migrations (run after adding a migration)
-- `scripts/check_schema_drift.sh` — verifies `schema.sql` matches applied migrations
-- `schema.sql` is auto-generated — **do not edit directly**. Add a migration, then run `regenerate_schema.sh`.
-
-**S3 local cache:** Set `S3_CACHE_DIR=/tmp/judgemind-archive` to cache S3 objects on local disk. All S3 reads/writes go through the cache transparently.
-- `scripts/s3_cache.py sync` — bulk download all S3 objects to local cache
-- `S3_LOCAL_ONLY=1` — fully offline mode, no S3 contact at all
-- Content-addressed keys mean cached files never go stale
-
-**Full local DB rebuild from S3:**
-```
-scripts/rebuild_db.sh              # drop DB, fetch rosters, rebuild with LLM
-scripts/rebuild_db.sh --no-llm     # regex-only (no API key needed)
-scripts/rebuild_db.sh --skip-reset # incremental, keep existing data
-```
-
-This rebuilds the entire database from archived S3 content: seeds courts from S3 key prefixes, fetches court directory rosters for judge resolution, then processes every document through the ingestion pipeline (LLM extraction + enrichment). The database is a derived index — the S3 archive is the source of truth.
-
-**Roster fetching:** `scripts/fetch_rosters.py` fetches dept-to-judge directory snapshots from all 9 CA county court websites. Runs automatically as part of `rebuild_db.sh` and daily scraper runs.
-
-**Environment variables for local dev:**
-| Variable | Purpose | Default |
-|---|---|---|
-| `DATABASE_URL` | Postgres connection | (required) |
-| `REDIS_URL` | Redis connection | `redis://localhost:6379` |
-| `S3_CACHE_DIR` | Local S3 cache directory | (disabled) |
-| `S3_LOCAL_ONLY` | Skip S3, cache-only | `0` |
-| `JUDGEMIND_ARCHIVE_BUCKET` | S3 bucket name | `judgemind-document-archive-dev` |
-| `GOOGLE_API_KEY` | Gemini LLM extraction | (optional, via `scripts/with-secret.sh`) |
-| `REBUILD_CONCURRENCY` | Parallel threads for rebuild | `8` |
-| `OPENSEARCH_URL` | OpenSearch endpoint | (optional, mocked if absent) |
+Docker Compose stack (Postgres, Redis, OpenSearch, MinIO), schema management, S3 cache, and `rebuild_db.sh` for full local rebuilds from S3 — see **`docs/agent/local-dev.md`** for commands, env vars, and rebuild options.
 
 ## Unattended Operation Patterns
 

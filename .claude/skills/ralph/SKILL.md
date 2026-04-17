@@ -14,7 +14,7 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 
 **When NOT to use:** Terraform, DB migrations, CI/CD, docs, investigation tasks. For those, implement directly per CLAUDE.md.
 
-**Local dev iteration for ingestion/extraction tasks:** When the task involves the ingestion pipeline, scraper logic, LLM extraction, or enrichment, use the local dev stack for faster iteration. The local DB + S3 cache (`S3_CACHE_DIR=/tmp/judgemind-archive`) enables running the full pipeline locally. After implementing changes, run `scripts/rebuild_db.sh --skip-reset` to re-process documents and verify data correctness against source documents. The LLM result cache makes subsequent rebuilds near-instant. See CLAUDE.md §Local Development Stack. **Prioritize correctness over completeness** — verify extracted values match source documents.
+**Local dev iteration for ingestion/extraction tasks:** When the task involves the ingestion pipeline, scraper logic, LLM extraction, or enrichment, use the local dev stack for faster iteration. The local DB + S3 cache (`S3_CACHE_DIR=/tmp/judgemind-archive`) enables running the full pipeline locally. After implementing changes, run `scripts/rebuild_db.sh --skip-reset` to re-process documents and verify data correctness against source documents. The LLM result cache makes subsequent rebuilds near-instant. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify extracted values match source documents.
 
 Do not ask for confirmation. Work autonomously through every step.
 

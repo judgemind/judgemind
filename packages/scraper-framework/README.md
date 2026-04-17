@@ -1,6 +1,6 @@
 # scraper-framework
 
-Court data scraping framework and ingestion pipeline for Judgemind. This is the most operationally critical package in the system -- if scrapers are down, ephemeral data like tentative rulings is permanently lost.
+Court data scraping framework and ingestion pipeline for Judgemind. This is the most operationally critical package in the system — tentative rulings are ephemeral at the source (courts remove them within days), so a scraper outage during the capture window is unrecoverable data loss. Once captured to S3, the raw is durable and all downstream `derived.*` state is rebuildable.
 
 ## Key Entry Points
 
