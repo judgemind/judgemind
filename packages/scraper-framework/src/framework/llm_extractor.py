@@ -600,12 +600,87 @@ _OFF_CALENDAR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ``O/C`` shorthand for Off Calendar — used in OC department calendars as a
+# bare listing marker (#2489).  Matches the entire stripped text so that
+# embedded substrings like "GROUP O/C PROCEEDING …" are NOT misclassified.
+# The optional leading/trailing whitespace and trailing punctuation allow
+# ``O/C``, ``O / C``, ``o/c``, and ``O/C.`` to match.
+_OC_ABBREV_RE = re.compile(
+    r"\A\s*O\s*/\s*C\s*[.!]?\s*\Z",
+    re.IGNORECASE,
+)
+
 # "NO TENTATIVE" markers — OC calendar listings for cases where the court
 # did not post a tentative ruling.  Like OFF-CALENDAR, these are not real
 # rulings and should be dropped.  Covers "NO TENTATIVE", "NO TENTATIVE
 # POSTED", and trivial whitespace variations.
 _NO_TENTATIVE_RE = re.compile(
     r"\bNO\s+TENTATIVE\b",
+    re.IGNORECASE,
+)
+
+# Bare parenthetical disposition markers (#2489) — e.g. ``(Moot)``,
+# ``(Continued)``, ``(Withdrawn)``, ``(Vacated)``, ``(Off Calendar)``.
+# Matches ONLY when the entire stripped text is such a parenthetical (with
+# optional trailing period), so that parentheticals embedded in a real
+# ruling ("The motion is GRANTED (Continued to 4/20)") are not misclassified.
+_BARE_DISPOSITION_RE = re.compile(
+    r"\A\s*\(\s*("
+    r"Moot|"
+    r"Continued|"
+    r"Withdrawn|"
+    r"Vacated|"
+    r"Settled|"
+    r"Dropped|"
+    r"Dismissed|"
+    r"Off[\s\-]*Calendar|"
+    r"Taken[\s\-]+Off[\s\-]*Calendar"
+    r")\s*\)\s*[.!]?\s*\Z",
+    re.IGNORECASE,
+)
+
+# Bare continuance-only lines (#2489) — e.g. ``Cont. To 4/20``,
+# ``CONTINUED TO 10/6/26``, ``Continued to April 20, 2026``.  These are
+# calendar-listing cells that communicate only "this matter is continued"
+# with no actual ruling body.  Must be evaluated BEFORE the disposition-verb
+# short-circuit, since ``CONTINUED`` matches ``_RULING_VERB_RE`` and would
+# otherwise cause bare continuances to be classified as real rulings.
+#
+# The regex anchors to the full stripped text to avoid matching
+# "Motion CONTINUED to April 1 for briefing." (a real ruling that happens
+# to contain a continuance clause).  The date portion accepts either a
+# numeric date (``4/20``, ``4/20/26``, ``10/6/2026``) or a month-name date
+# (``April 20``, ``April 20, 2026``), with optional trailing time/detail
+# segment (``at 9:00 a.m.``).
+_BARE_CONTINUANCE_RE = re.compile(
+    r"\A\s*"
+    r"(?:Cont\.?|Continued|CONT)\s+"
+    r"(?:to|TO)\s+"
+    r"(?:"
+    # Numeric date: M/D, M/D/YY, M/D/YYYY
+    r"\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    r"|"
+    # Month-name date: "April 20" or "April 20, 2026"
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
+    r"Nov(?:ember)?|Dec(?:ember)?)"
+    r"\.?\s+\d{1,2}(?:,?\s*\d{2,4})?"
+    r")"
+    # Optional trailing detail (time, courtroom, dept, etc.) — short only.
+    r"(?:\s+(?:at|@|in|for|dept\.?|department|courtroom|ctrm\.?)\b.*)?"
+    r"\s*[.!]?\s*\Z",
+    re.IGNORECASE,
+)
+
+# Placeholder text (#2489) — ``Tentative pending``, ``ADR Review``,
+# ``ADR Review Hearing``.  These OC calendar cells signal that no tentative
+# was posted without using the literal "OFF-CALENDAR" / "NO TENTATIVE"
+# phrasing.  Like the other listing markers they are not real rulings.
+_PLACEHOLDER_RE = re.compile(
+    r"\A\s*("
+    r"Tentative\s+pending|"
+    r"ADR\s+Review(?:\s+Hearing)?"
+    r")\s*[.!]?\s*\Z",
     re.IGNORECASE,
 )
 
@@ -635,6 +710,26 @@ _RULING_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Optional party-prefix for motion-type labels (#2489) — OC calendar cells
+# sometimes attribute the motion to a party ("Plaintiff's Motion for …",
+# "Defendant's Motion to …", "Cross-Complainant's Motion to …").  Accepts
+# both straight and curly apostrophes (``'`` and ``\u2019``) and singular/
+# plural party forms.  Used as a non-capturing optional prefix inside
+# ``_MOTION_TYPE_LINE_RE``.
+_PARTY_PREFIX = (
+    r"(?:"
+    r"Plaintiffs?|"
+    r"Defendants?|"
+    r"Cross[\s\-]Complainants?|"
+    r"Cross[\s\-]Defendants?|"
+    r"Petitioners?|"
+    r"Respondents?|"
+    r"Applicants?|"
+    r"Movants?|"
+    r"Claimants?"
+    r")['\u2019]s?\s+"
+)
+
 # Lines that look like motion-type labels — used in OC calendar cells to
 # show which motions are scheduled, without providing a tentative body.
 # Plural forms (Motions, Demurrers, Hearings, Applications, Petitions) are
@@ -643,10 +738,13 @@ _RULING_VERB_RE = re.compile(
 # (e.g. trailing punctuation, acronyms like "N.O.V.") — safe because
 # ``_is_calendar_listing_only`` short-circuits on any disposition verb
 # before reaching this regex, so real rulings are never misclassified.
+# Optional ``_PARTY_PREFIX`` allows party-attributed labels like
+# ``Plaintiff's Motion for Approval`` (#2489).
 _MOTION_TYPE_LINE_RE = re.compile(
-    r"^\s*("
+    r"^\s*(?:" + _PARTY_PREFIX + r")?"
+    r"("
     r"Motions?\s+(?:to|for|in)\b.*|"
-    r"Demurrers?(?:\s+to\b.*)?|"
+    r"Demurrers?(?:\s+(?:to\b|\().*)?|"
     r"Petitions?\s+(?:to|for)\b.*|"
     r"Hearings?(?:\s+on\b.*)?|"
     r"Ex\s+Parte\b.*|"
@@ -672,17 +770,44 @@ def _is_calendar_listing_only(text: str | None) -> bool:
 
     A "calendar listing" is a per-case cell from an Orange County department
     calendar PDF that contains only the motion-type heading or an
-    "OFF-CALENDAR" marker — no actual tentative ruling body.  Examples::
+    "OFF-CALENDAR" / "NO TENTATIVE" / "O/C" / bare-continuance /
+    parenthetical-disposition marker — no actual tentative ruling body.
+    Examples::
 
         "OFF-CALENDAR"
+        "O/C"
+        "(Moot)"
+        "Cont. To 4/20"
+        "CONTINUED TO 10/6/26"
+        "Tentative pending."
+        "ADR Review Hearing"
         "Motion to Strike"
+        "Plaintiff's Motion for Approval"
         "Demurrer\nMotion to Strike"
         "Motion for Attorneys' Fees"
 
     These are distinguishable from real short rulings because real rulings
-    contain a disposition verb (GRANTED/DENIED/SUSTAINED/etc.).  The filter
-    is deliberately conservative — if any disposition verb is present, the
-    text is treated as a real ruling and not dropped.
+    contain a disposition verb (GRANTED/DENIED/SUSTAINED/etc.) used as a
+    substantive verb rather than as a bare listing marker.  The filter is
+    deliberately conservative — if any disposition verb is present in a
+    *non-bare* context, the text is treated as a real ruling and not
+    dropped.
+
+    The evaluation order is:
+
+    1. Reject text longer than ``_CALENDAR_LISTING_MAX_LENGTH``.
+    2. Accept bare continuance lines (``Cont. to 4/20``, ``CONTINUED TO
+       10/6/26``) — these contain the ``CONTINUED`` disposition verb but
+       are listings, so they must be checked *before* the disposition-verb
+       short-circuit.
+    3. Accept bare parenthetical dispositions (``(Moot)``, ``(Withdrawn)``)
+       for the same reason as (2) — some parenthetical markers contain
+       disposition verbs.
+    4. Short-circuit to False on any *substantive* disposition verb in
+       the remaining text.
+    5. Accept O/C, OFF-CALENDAR, NO TENTATIVE, and placeholder markers.
+    6. Accept text where every line is a motion-type label (possibly with
+       optional party prefix).
 
     Returns ``False`` for ``None`` or empty text so callers preserve those
     entries (they may be metadata-only rows handled by other filters).
@@ -695,13 +820,26 @@ def _is_calendar_listing_only(text: str | None) -> bool:
     # Too long to be a calendar listing.
     if len(stripped) > _CALENDAR_LISTING_MAX_LENGTH:
         return False
+    # Bare continuance and bare parenthetical dispositions must be checked
+    # BEFORE the disposition-verb short-circuit: their markers ("CONTINUED
+    # TO", "(Withdrawn)", "(Vacated)") contain disposition verbs but the
+    # full stripped text is still a listing rather than a real ruling.
+    if _BARE_CONTINUANCE_RE.match(stripped):
+        return True
+    if _BARE_DISPOSITION_RE.match(stripped):
+        return True
     # Any disposition verb means this is a real ruling — never drop.
     if _RULING_VERB_RE.search(stripped):
         return False
-    # OFF-CALENDAR or "NO TENTATIVE" markers are calendar listings, not
-    # real rulings (OC department calendars use these for cases where no
-    # tentative was posted).
-    if _OFF_CALENDAR_RE.search(stripped) or _NO_TENTATIVE_RE.search(stripped):
+    # OFF-CALENDAR, O/C, "NO TENTATIVE", and placeholder markers are
+    # calendar listings, not real rulings (OC department calendars use
+    # these for cases where no tentative was posted).
+    if (
+        _OFF_CALENDAR_RE.search(stripped)
+        or _OC_ABBREV_RE.match(stripped)
+        or _NO_TENTATIVE_RE.search(stripped)
+        or _PLACEHOLDER_RE.match(stripped)
+    ):
         return True
     # Otherwise, the text must consist entirely of motion-type-style lines.
     lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
