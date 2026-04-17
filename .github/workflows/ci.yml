@@ -32,6 +32,7 @@ jobs:
       migrations: ${{ steps.changes.outputs.migrations }}
       schema: ${{ steps.changes.outputs.schema }}
       hooks: ${{ steps.changes.outputs.hooks }}
+      githooks: ${{ steps.changes.outputs.githooks }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -88,6 +89,10 @@ jobs:
               # Also trigger when the preflight-hook-test job itself changes,
               # so regressions in the auto-discovery loop are caught on the
               # PR that introduces them (#2410).
+              - '.github/workflows/ci.yml'
+            githooks:
+              - '.githooks/**'
+              - 'scripts/tests/test_pre_push_hook.sh'
               - '.github/workflows/ci.yml'
       - name: Check if any coverage-producing package changed
         id: any-testable
@@ -963,6 +968,18 @@ jobs:
           echo "All ${#tests[@]} hook test suite(s) passed."
 
   # ---------------------------------------------------------------
+  # Git pre-push hook test: regression guard for stdin field parsing (#2487)
+  # ---------------------------------------------------------------
+  githooks-pre-push-test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.githooks == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run pre-push hook regression test
+        run: scripts/tests/test_pre_push_hook.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
   # ---------------------------------------------------------------
   ecs-oneshot-test:
@@ -1041,7 +1058,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test]
     if: always()
     runs-on: ubuntu-latest
     steps:
