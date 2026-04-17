@@ -2435,6 +2435,234 @@ class TestUpsertCasePreservesExistingTitle:
         assert effective_title == "Newly Filled In Title"
 
 
+class TestUpsertCaseForceUpdate:
+    """Regression tests for #2431 — ``force_update=True`` must allow
+    reingest to correct previously-stuck ``case_type`` / ``case_title``
+    values after an extraction logic fix.
+
+    The #2468 fix swapped the COALESCE argument order so the existing
+    value wins on conflict, preventing silent identity rewrites from
+    upstream mis-routing bugs (#2449).  That made reingest unable to
+    fix legitimately stuck values (e.g. an SF document misclassified as
+    ``case_type='criminal'`` that should be ``'family'`` after the #2368
+    regex fix).  ``force_update=True`` restores the overwrite behavior
+    for reingest while preserving the safe preserve-existing default for
+    live ingestion, and NULL incoming values still never erase a good
+    existing column (COALESCE falls through to ``cases.*``).
+    """
+
+    def test_upsert_case_force_update_flips_case_title_coalesce(self) -> None:
+        """``upsert_case(force_update=True)`` must use
+        ``COALESCE(EXCLUDED.case_title, cases.case_title)`` so the
+        incoming value wins when non-NULL."""
+        conn = _mock_conn()
+        upsert_case(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Corrected Title",
+            force_update=True,
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)" in sql, (
+            f"Expected incoming-wins COALESCE for case_title in force_update mode, got SQL:\n{sql}"
+        )
+        # Preserve-existing order must NOT appear in force_update mode.
+        assert "COALESCE(cases.case_title" not in sql, (
+            f"Preserve-existing COALESCE order found in force_update mode. SQL:\n{sql}"
+        )
+
+    def test_upsert_case_force_update_flips_case_type_coalesce(self) -> None:
+        """``upsert_case(force_update=True)`` must use
+        ``COALESCE(EXCLUDED.case_type, cases.case_type)`` so the
+        incoming value wins when non-NULL."""
+        conn = _mock_conn()
+        upsert_case(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Title",
+            case_type="family",
+            force_update=True,
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert (
+            "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+            or "case_type = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+        ), f"Expected incoming-wins COALESCE for case_type in force_update mode, got SQL:\n{sql}"
+        assert "COALESCE(cases.case_type" not in sql, (
+            "Preserve-existing COALESCE order found for case_type in force_update mode. "
+            f"SQL:\n{sql}"
+        )
+
+    def test_upsert_case_default_keeps_preserve_existing_coalesce(self) -> None:
+        """Without ``force_update``, ``upsert_case`` MUST keep the
+        preserve-existing COALESCE order (#2468).  Explicit assertion that
+        the default and force_update modes yield different SQL."""
+        conn = _mock_conn()
+        upsert_case(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Incoming Title",
+            case_type="civil",
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)" in sql
+        assert (
+            "case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)" in sql
+            or "case_type = COALESCE(cases.case_type, EXCLUDED.case_type)" in sql
+        )
+        # The force_update variant must NOT appear in the default-mode SQL.
+        assert "COALESCE(EXCLUDED.case_title" not in sql
+        assert "COALESCE(EXCLUDED.case_type" not in sql
+
+    def test_upsert_case_returning_title_force_update_flips_case_title(
+        self,
+    ) -> None:
+        """``upsert_case_returning_title(force_update=True)`` must use
+        ``COALESCE(EXCLUDED.case_title, cases.case_title)``."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", "Corrected Title")
+
+        case_id, effective_title = upsert_case_returning_title(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Corrected Title",
+            force_update=True,
+        )
+
+        assert case_id == "case-uuid-1"
+        assert effective_title == "Corrected Title"
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)" in sql
+        assert "COALESCE(cases.case_title" not in sql
+
+    def test_upsert_case_returning_title_force_update_flips_case_type(self) -> None:
+        """``upsert_case_returning_title(force_update=True)`` must use
+        ``COALESCE(EXCLUDED.case_type, cases.case_type)``."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", "Title")
+
+        upsert_case_returning_title(
+            conn,
+            "FDI-12-345678",
+            "court-uuid-sf",
+            case_title=None,
+            case_type="family",
+            force_update=True,
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert (
+            "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+            or "case_type = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+        )
+        assert "COALESCE(cases.case_type" not in sql
+
+    def test_upsert_case_returning_title_default_keeps_preserve_existing(
+        self,
+    ) -> None:
+        """Without ``force_update``, ``upsert_case_returning_title`` MUST
+        keep the preserve-existing COALESCE order (#2468)."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("case-uuid-1", "Existing Title")
+
+        upsert_case_returning_title(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title="Incoming Title",
+            case_type="civil",
+        )
+
+        sql = _upsert_case_execute_sql(conn)
+        assert "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)" in sql
+        assert "COALESCE(EXCLUDED.case_title" not in sql
+
+    def test_sf_family_reingest_scenario_corrects_case_type(self) -> None:
+        """End-to-end-ish scenario from #2431: an SF family-court case
+        row has ``case_type='criminal'`` from a pre-fix extraction pass.
+        After the #2368 regex fix, reingest passes ``case_type='family'``
+        with ``force_update=True``.  The SQL must encode the incoming-wins
+        COALESCE so Postgres will write the corrected value.  The mocked
+        RETURNING returns the corrected effective type so callers see
+        the new value on subsequent reads."""
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        # Simulate Postgres behavior after the force_update fix: on conflict
+        # with an existing non-null case_type, COALESCE(EXCLUDED.case_type,
+        # cases.case_type) picks the incoming 'family' value and RETURNING
+        # returns the corrected type via case_title (we only fetch id here,
+        # but the SQL is the source of truth).
+        cur.fetchone.return_value = ("case-uuid-sf-1",)
+
+        case_id = upsert_case(
+            conn,
+            "FDI-12-345678",
+            "court-uuid-sf",
+            case_title="IN RE MARRIAGE OF SMITH",
+            case_type="family",
+            force_update=True,
+        )
+
+        assert case_id == "case-uuid-sf-1"
+        sql = _upsert_case_execute_sql(conn)
+        # Both columns must use the incoming-wins order.
+        assert "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)" in sql
+        assert (
+            "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+            or "case_type = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+        )
+        # And the incoming values were actually passed as parameters.
+        args = _get_execute_args(conn)
+        assert "family" in args
+        # case_title is normalized (title-cased); verify the normalized
+        # form is what lands in the parameter list.
+        assert any(
+            isinstance(a, str) and a.lower().startswith("in re marriage of smith") for a in args
+        )
+
+    def test_upsert_case_force_update_null_incoming_never_erases_existing(
+        self,
+    ) -> None:
+        """Even with ``force_update=True``, a NULL incoming value must
+        not erase a good existing column.  The SQL
+        ``COALESCE(EXCLUDED.case_title, cases.case_title)`` naturally
+        preserves this: when EXCLUDED is NULL, COALESCE falls through to
+        ``cases.case_title``.  This test asserts that the SQL is
+        structured that way (not e.g. the raw ``EXCLUDED.case_title``
+        which would erase).
+        """
+        conn = _mock_conn()
+        upsert_case(
+            conn,
+            "24STCV12345",
+            "court-uuid-1",
+            case_title=None,
+            case_type=None,
+            force_update=True,
+        )
+        sql = _upsert_case_execute_sql(conn)
+        # Both columns must still wrap EXCLUDED in COALESCE against cases.*
+        # so NULL EXCLUDED falls back to the preserved existing value.
+        assert "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)" in sql
+        assert (
+            "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+            or "case_type = COALESCE(EXCLUDED.case_type, cases.case_type)" in sql
+        )
+        # Guard against a regression that would write EXCLUDED.* raw.
+        assert "case_title = EXCLUDED.case_title" not in sql
+        assert "case_type = EXCLUDED.case_type" not in sql
+
+
 # ---------------------------------------------------------------------------
 # resolve_judge_from_department
 # ---------------------------------------------------------------------------

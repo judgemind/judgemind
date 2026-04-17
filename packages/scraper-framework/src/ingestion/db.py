@@ -266,21 +266,39 @@ def upsert_case(
     court_id: str,
     case_title: str | None = None,
     case_type: str | None = None,
+    *,
+    force_update: bool = False,
 ) -> str:
     """Upsert a case row and return its UUID.
 
     Uses (court_id, case_number) as the natural key per the schema UNIQUE constraint.
     case_number_normalized strips whitespace and lowercases for search.
 
-    ``case_title`` and ``case_type`` are set on INSERT and preserved on conflict:
-    once a non-NULL value exists for a case, it is NOT overwritten by a later
+    ``case_title`` and ``case_type`` are set on INSERT.  The behavior on
+    conflict is controlled by ``force_update``:
+
+    **Default (``force_update=False``) — live ingestion path (#2468):**
+    ``case_title`` and ``case_type`` are preserved on conflict.  Once a
+    non-NULL value exists for a case, it is NOT overwritten by a later
     upsert (even if the incoming value is non-NULL).  An incoming non-NULL
     value only fills in a currently-NULL column — it cannot silently replace
     an existing title/type.  This prevents upstream mis-routing bugs (e.g.
     fuzzy-match case-number rewrites, #2449) from propagating wrong titles
-    across the DB (#2468).  If a case identity correction is genuinely
-    needed, it must go through a deliberate, auditable update path — never
-    via a silent upsert.
+    across the DB.  Live ingestion (``ingestion.worker.IngestionWorker``)
+    relies on this default.
+
+    **``force_update=True`` — reingest / correction path (#2431):**
+    The ON CONFLICT clause swaps the COALESCE argument order so the
+    *incoming* value wins when non-NULL:
+    ``COALESCE(EXCLUDED.case_title, cases.case_title)`` (and same for
+    ``case_type``).  This allows ``scripts/reingest_from_s3.py`` to
+    overwrite stuck/bad historical values (e.g. a misclassified
+    ``case_type='criminal'`` that should be ``'family'`` after the #2368
+    regex fix) while still refusing to erase a good existing value with an
+    incoming NULL — COALESCE falls through to the preserved ``cases.*``
+    column when the incoming EXCLUDED value is NULL.  Mirrors the
+    ``force_update`` semantic already used by ``insert_document`` /
+    ``insert_ruling`` (#2405).
 
     Returns the case UUID as a string.  To also retrieve the effective
     case_title (after COALESCE), use ``upsert_case_returning_title()``.
@@ -288,16 +306,30 @@ def upsert_case(
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     case_title = normalize_case_title(_strip_nul(case_title))
     case_type = _strip_nul(case_type)
+    # Build ON CONFLICT set clauses based on force_update mode.  The default
+    # (preserve-existing) mode guards live ingestion against silent identity
+    # rewrites (#2468).  The force_update mode lets reingest correct
+    # previously-stuck values (#2431) while still never erasing a good
+    # existing value with a NULL incoming — EXCLUDED=NULL → COALESCE falls
+    # through to cases.case_title / cases.case_type.
+    if force_update:
+        case_title_clause = "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)"
+        case_type_clause = "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)"
+    else:
+        case_title_clause = "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)"
+        case_type_clause = "case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)"
+
+    sql = f"""
+        INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
+        VALUES (%s, %s, %s::uuid, %s, %s)
+        ON CONFLICT (court_id, case_number) DO UPDATE
+            SET {case_title_clause},
+                {case_type_clause}
+        RETURNING id
+        """
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
-            VALUES (%s, %s, %s::uuid, %s, %s)
-            ON CONFLICT (court_id, case_number) DO UPDATE
-                SET case_title = COALESCE(cases.case_title, EXCLUDED.case_title),
-                    case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)
-            RETURNING id
-            """,
+            sql,
             (case_number, normalized, court_id, case_title, case_type),
         )
         row = cur.fetchone()
@@ -322,6 +354,8 @@ def upsert_case_returning_title(
     court_id: str,
     case_title: str | None = None,
     case_type: str | None = None,
+    *,
+    force_update: bool = False,
 ) -> tuple[str, str | None]:
     """Upsert a case row and return ``(case_id, effective_case_title)``.
 
@@ -330,27 +364,47 @@ def upsert_case_returning_title(
     an existing title that was preserved from a prior ruling — useful for
     the cross-case title lookup (#2006).
 
-    The COALESCE preserves the existing case_title/case_type on conflict:
+    **Default (``force_update=False``) — live ingestion path (#2468):**
+    Preserves the existing ``case_title`` / ``case_type`` on conflict:
     once a non-NULL value exists for a case, a later upsert with a
-    different non-NULL value will NOT overwrite it (#2468).  The incoming
-    value only wins when the existing column is NULL.  This keeps the
-    cross-case title lookup (#2006) working — the first ruling to supply a
-    title wins and subsequent titleless rulings reuse it — while preventing
+    different non-NULL value will NOT overwrite it.  The incoming value
+    only wins when the existing column is NULL.  This keeps the cross-case
+    title lookup (#2006) working — the first ruling to supply a title
+    wins and subsequent titleless rulings reuse it — while preventing
     upstream mis-routing (#2449) from silently rewriting case identities.
+
+    **``force_update=True`` — reingest / correction path (#2431):**
+    Swaps the COALESCE argument order so the incoming value wins when
+    non-NULL (``COALESCE(EXCLUDED.case_title, cases.case_title)``), letting
+    ``scripts/reingest_from_s3.py`` correct previously-stuck ``case_type``
+    / ``case_title`` values after an extraction logic fix.  A NULL incoming
+    EXCLUDED value still falls through to the preserved ``cases.*`` column
+    — we never erase a good existing value with an incoming NULL.  Mirrors
+    the ``force_update`` semantic already used by ``insert_document`` /
+    ``insert_ruling`` (#2405).
     """
     normalized = case_number.strip().lower().replace(" ", "").replace("-", "")
     case_title = normalize_case_title(_strip_nul(case_title))
     case_type = _strip_nul(case_type)
+    # See ``upsert_case`` for the full force_update rationale (#2431 / #2468).
+    if force_update:
+        case_title_clause = "case_title = COALESCE(EXCLUDED.case_title, cases.case_title)"
+        case_type_clause = "case_type  = COALESCE(EXCLUDED.case_type, cases.case_type)"
+    else:
+        case_title_clause = "case_title = COALESCE(cases.case_title, EXCLUDED.case_title)"
+        case_type_clause = "case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)"
+
+    sql = f"""
+        INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
+        VALUES (%s, %s, %s::uuid, %s, %s)
+        ON CONFLICT (court_id, case_number) DO UPDATE
+            SET {case_title_clause},
+                {case_type_clause}
+        RETURNING id, case_title
+        """
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO cases (case_number, case_number_normalized, court_id, case_title, case_type)
-            VALUES (%s, %s, %s::uuid, %s, %s)
-            ON CONFLICT (court_id, case_number) DO UPDATE
-                SET case_title = COALESCE(cases.case_title, EXCLUDED.case_title),
-                    case_type  = COALESCE(cases.case_type, EXCLUDED.case_type)
-            RETURNING id, case_title
-            """,
+            sql,
             (case_number, normalized, court_id, case_title, case_type),
         )
         row = cur.fetchone()

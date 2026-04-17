@@ -9198,6 +9198,52 @@ class TestReingestAppliesGuardsAndForceUpdate:
     @patch("reingest_from_s3.upsert_case")
     @patch("reingest_from_s3._reparse_document")
     @patch("reingest_from_s3._fetch_s3_content")
+    def test_calls_upsert_case_with_force_update_true(
+        self,
+        mock_fetch_s3: MagicMock,
+        mock_reparse: MagicMock,
+        mock_upsert_case: MagicMock,
+        _mock_insert: MagicMock,
+        mock_resolve_judge: MagicMock,
+        _mock_upsert_cj: MagicMock,
+        _mock_batch_parties: MagicMock,
+    ) -> None:
+        """Regression test for #2431: reingest must pass ``force_update=True``
+        to ``upsert_case`` so stuck ``case_type`` / ``case_title`` values can
+        be corrected after an extraction logic fix.  Without it, the default
+        preserve-existing COALESCE (#2468) leaves bad historical rows
+        untouched — which is exactly the bug #2431 reports."""
+        row = _make_document_row()
+        conn = _mock_conn_with_rows([row])
+        mock_fetch_s3.return_value = b"<html>content</html>"
+        mock_reparse.return_value = self._make_extracted()
+        mock_upsert_case.return_value = "new-case-id"
+        mock_resolve_judge.return_value = "judge-id"
+
+        reingest.reingest_batch(
+            conn,
+            MagicMock(),
+            batch_size=10,
+            cursor=_DEFAULT_CURSOR,
+            filters="",
+            filter_params=[],
+        )
+
+        assert mock_upsert_case.called, "upsert_case must be called"
+        for call in mock_upsert_case.call_args_list:
+            assert call.kwargs.get("force_update") is True, (
+                "reingest must pass force_update=True to upsert_case "
+                f"so it can correct stuck case_type/case_title (#2431); "
+                f"got {call.kwargs.get('force_update')!r}"
+            )
+
+    @patch("reingest_from_s3.batch_upsert_parties")
+    @patch("reingest_from_s3.upsert_case_judge")
+    @patch("reingest_from_s3.resolve_judge")
+    @patch("reingest_from_s3.insert_document_and_ruling")
+    @patch("reingest_from_s3.upsert_case")
+    @patch("reingest_from_s3._reparse_document")
+    @patch("reingest_from_s3._fetch_s3_content")
     def test_guards_are_applied_before_db_write(
         self,
         mock_fetch_s3: MagicMock,
