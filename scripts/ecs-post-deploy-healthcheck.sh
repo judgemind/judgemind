@@ -177,7 +177,7 @@ EVENTS=$("$AWS_CLI" logs get-log-events \
     --log-group-name "$LOG_GROUP" \
     --log-stream-name "$LATEST_STREAM" \
     --limit 20 \
-    --start-from-head false \
+    --no-start-from-head \
     --output json 2>/dev/null || echo '{"events":[]}')
 
 EVENT_COUNT=$(echo "$EVENTS" | jq '.events | length')
