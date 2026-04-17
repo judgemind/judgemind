@@ -202,13 +202,23 @@ Glob pattern: scripts/*.py
 
 If the count exceeds **35**, flag a finding. The current baseline is ~29 permanent utility scripts — 35 gives headroom for a few new utilities while catching accumulation of unarchived one-off scripts.
 
-2. **Missing `# one-off: true` or `# permanent: true` headers.** Scan all `scripts/*.py` files for scripts that look like one-off data operations (names containing `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, `remediat`) but lack EITHER a `# one-off: true` header OR a `# permanent: true` header in the first 10 lines. A script should carry exactly one of these markers:
+2. **Missing `# one-off: true` or `# permanent: true` headers.** Use the machine-verifiable check — do not eyeball line numbers:
+
+```
+scripts/check-script-headers.sh   # exit 0 = all good, exit 1 = missing markers
+```
+
+The script scans top-level `scripts/*.py` whose filename contains `backfill`, `cleanup`, `fix`, `dedup`, `merge`, `migrate`, or `remediat` and requires EITHER `# one-off: true` OR `# permanent: true` anywhere in the first 50 lines (the script's header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring). The 50-line window replaces the old "first 10 lines" rule-of-thumb that routinely flagged correctly-marked scripts whose docstrings pushed the marker to line 15, 20, or 32 (see #2533 for the historical context).
+
+A script should carry exactly one marker:
    - `# one-off: true` — finite-lifetime script (tied to a specific bug fix or migration). Candidate for archival once its work is done.
    - `# permanent: true` — re-runnable utility (parameterizable, idempotent, intended to be invoked repeatedly). Exempt from one-off nagging and staleness checks.
 
-   Scripts previously confirmed as permanent in issue comments should carry the canonical `# permanent: true` marker so the check is machine-readable and does not re-flag them each audit cycle (see #2530). The audit treats either marker as sufficient — only unmarked scripts matching the name pattern are flagged.
+Scripts previously confirmed as permanent in issue comments should carry the canonical `# permanent: true` marker so the check is machine-readable and does not re-flag them each audit cycle (see #2530). The audit treats either marker as sufficient — only unmarked scripts matching the name pattern are flagged.
 
-3. **Stale one-off scripts.** For scripts that DO have `# one-off: true`, check their git log to see when they were last modified. If a one-off script has not been modified in more than 30 days, flag it as a candidate for archiving to `scripts/archive/`. Scripts with `# permanent: true` are exempt from this staleness check.
+The same check runs in CI as the `script-headers-check` job and in `.githooks/pre-push`, so the repo baseline should always be green; audit findings here should be rare and typically represent newly-added unmarked scripts.
+
+3. **Stale one-off scripts.** For scripts that DO have `# one-off: true`, check their git log to see when they were last modified. If a one-off script has not been modified in more than 30 days, flag it as a candidate for archiving to `scripts/archive/`. Scripts with `# permanent: true` are exempt from this staleness check. When reading the marker, use the same 50-line window as check 2 — a simple `grep -n "^# one-off: true" scripts/*.py` suffices.
 
 #### Filing issues
 
@@ -217,7 +227,7 @@ For script count threshold violations, file a `priority/p2` `type/chore` issue w
 - List of scripts that appear to be one-off (by name pattern or `# one-off: true` header).
 - Suggested action: archive completed one-off scripts to `scripts/archive/`.
 
-For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed. Each listed script should get either `# one-off: true` (if finite-lifetime) or `# permanent: true` (if re-runnable utility).
+For missing headers, file a single `priority/p3` `type/dx` issue listing the scripts that should be reviewed. Include the verbatim output of `scripts/check-script-headers.sh` in the body so the fix is mechanical. Each listed script should get either `# one-off: true` (if finite-lifetime) or `# permanent: true` (if re-runnable utility).
 
 ---
 

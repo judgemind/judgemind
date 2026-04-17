@@ -453,6 +453,32 @@ if [ -n "$changed_markdown" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Script header marker check — run whenever scripts/*.py changes
+# -------------------------------------------------------------------
+# Mirrors the CI `script-headers-check` job so one-off/permanent marker
+# violations are caught locally before the CI round trip. See #2533 —
+# top-level scripts whose filename matches the one-off pattern
+# (backfill, cleanup, fix, dedup, merge, migrate, remediat) must carry
+# `# one-off: true` or `# permanent: true` in the first 50 lines.
+changed_scripts_py=$(echo "$changed_files" | grep -E '^scripts/[^/]+\.py$' || true)
+if [ -n "$changed_scripts_py" ]; then
+    echo "pre-push: checking one-off/permanent markers on scripts/*.py..." >&2
+    if [ -x scripts/check-script-headers.sh ]; then
+        if ! scripts/check-script-headers.sh 2>&1; then
+            echo "" >&2
+            echo "  FAILED: scripts/check-script-headers.sh" >&2
+            echo "  A top-level one-off-pattern script is missing its marker." >&2
+            echo "  Add '# one-off: true' or '# permanent: true' within the" >&2
+            echo "  first 50 lines of the file. See docs/agent/code-standards.md" >&2
+            echo "  §Python scripts and issue #2533." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-script-headers.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # PR existence check (advisory — runs before push completes)
 # -------------------------------------------------------------------
 # Git has no native post-push hook. We check here as the closest
