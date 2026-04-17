@@ -108,6 +108,16 @@ terraform init -backend=false
 terraform validate
 ```
 
+### Docs / Markdown
+
+When any `.md` file changes (CLAUDE.md, docs, skill SKILL.md, package READMEs, etc.), run:
+
+```
+scripts/check-markdown-links.sh
+```
+
+This validates internal markdown pointers — both Markdown-style links and backtick references to repo-relative paths — resolve to files that exist. The same check runs in CI as the `markdown-links-check` job; the pre-push hook runs it on any `.md` in the push so failures are caught before the 2-3 minute CI round trip. If a backtick token that looks like a repo path is illustrative (not a real file), remove the backticks or rephrase so the checker does not flag it.
+
 ### Subagent responsibilities
 
 Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.

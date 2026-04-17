@@ -394,6 +394,28 @@ if [ -n "$changed_workflows" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Markdown link check — run whenever any .md file is in the push
+# -------------------------------------------------------------------
+# Mirrors the CI `markdown-links-check` job so broken internal pointers
+# are caught locally before the 2-3 minute CI round trip (#2464).
+changed_markdown=$(echo "$changed_files" | grep -E '\.md$' || true)
+if [ -n "$changed_markdown" ]; then
+    echo "pre-push: checking markdown links..." >&2
+    if [ -x scripts/check-markdown-links.sh ]; then
+        if ! scripts/check-markdown-links.sh 2>&1; then
+            echo "" >&2
+            echo "  FAILED: scripts/check-markdown-links.sh" >&2
+            echo "  Broken internal markdown pointer detected." >&2
+            echo "  Fix the pointer, create the target, or drop the backticks" >&2
+            echo "  if the token is illustrative prose rather than a real path." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-markdown-links.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # PR existence check (advisory — runs before push completes)
 # -------------------------------------------------------------------
 # Git has no native post-push hook. We check here as the closest
