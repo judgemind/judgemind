@@ -17,9 +17,20 @@ set -uo pipefail
 # Determine the range of commits being pushed
 # -------------------------------------------------------------------
 # Git passes the remote name and URL as positional args.
-# Stdin contains lines of the form:
+# Stdin contains one line per ref being pushed, with four space-separated
+# fields in this exact order:
 #   <local ref> <local sha> <remote ref> <remote sha>
-# We diff between remote sha and local sha to find changed files.
+# See `man githooks` (pre-push section) for the authoritative spec.
+#
+# The variable names below MUST match this order. Getting the 3rd and 4th
+# fields swapped (e.g. reading them as `remote_sha _rest`) is silent: the
+# new-branch zero-SHA check never fires because field 3 is always a ref
+# name (never a SHA), and `git diff <remote-ref> <local-sha>` against the
+# local tracking copy of the remote ref returns empty for a first push of
+# a brand-new branch — causing all downstream per-package checks to be
+# skipped. See #2487 for the regression and test that caught it.
+#
+# We diff between remote_sha and local_sha to find changed files.
 
 remote="$1"
 # url="$2"  # unused
@@ -28,7 +39,7 @@ failures=0
 push_ref=""
 push_is_new_branch=false
 
-while read -r local_ref local_sha remote_sha _rest; do
+while read -r local_ref local_sha remote_ref remote_sha; do
     # Track the ref and whether it's new for the PR check at the end
     push_ref="$local_ref"
 
