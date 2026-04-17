@@ -2884,15 +2884,24 @@ def _process_prefix_document(
     database_url: str,
     redis_url: str,
     os_url: str,
-) -> str:
+) -> dict[str, Any]:
     """Process a single S3 object through the ingestion pipeline.
 
     Creates its own DB connection, Redis client, and IngestionWorker.
     Designed for ProcessPoolExecutor — each call is fully independent.
+
+    Returns a dict with:
+      - ``status``: ``"ok"``, ``"skip"``, or ``"error"``
+      - ``hash_mismatch``: whether the S3 key hash did not match the object
+        bytes' SHA-256.  Non-fatal — reingest proceeds using the key hash as
+        the canonical ``content_hash`` so the worker's LLM split path can
+        re-derive any split-children from the raw content.  Mirrors the
+        behavior already in ``rebuild_db._process_one_document`` (see #2494,
+        #2628).
     """
     parsed = _parse_s3_key(key)
     if not parsed:
-        return "skip"
+        return {"status": "skip", "hash_mismatch": False}
 
     from framework.s3_cache import make_s3_client as _make_s3
 
@@ -2902,20 +2911,28 @@ def _process_prefix_document(
         content = response["Body"].read()
     except Exception:
         logger.warning("Failed to fetch S3 object, skipping", s3_key=key, exc_info=True)
-        return "error"
+        return {"status": "error", "hash_mismatch": False}
 
     if not content:
-        return "skip"
+        return {"status": "skip", "hash_mismatch": False}
 
+    # Byte-integrity check.  A mismatch used to short-circuit with
+    # ``status="error"``, but that caused the ~4% flat-hash orphan rate on
+    # Santa Clara (#2628): raws captured under a wrong content-hash filename
+    # were permanently unreingestable.  Now we log a warning and let the
+    # worker process the raw; the LLM split path derives split-children from
+    # the content and stores them with hashes derived from the canonical key
+    # hash.  Matches ``rebuild_db._process_one_document`` (#2494).
     actual_hash = hashlib.sha256(content).hexdigest()
-    if actual_hash != parsed["content_hash"]:
-        logger.error(
-            "S3 content hash mismatch, skipping document",
+    hash_mismatch = actual_hash != parsed["content_hash"]
+    if hash_mismatch:
+        logger.warning(
+            "S3 content hash mismatch — proceeding with reingest using key "
+            "hash as canonical content_hash (see #2494, #2628)",
             s3_key=key,
             key_hash=parsed["content_hash"],
-            content_hash=actual_hash,
+            actual_content_hash=actual_hash,
         )
-        return "error"
 
     event = _build_prefix_event(key, content, parsed, bucket)
 
@@ -2961,10 +2978,10 @@ def _process_prefix_document(
 
     try:
         worker.process_event(event)
-        return "ok"
+        return {"status": "ok", "hash_mismatch": hash_mismatch}
     except Exception:
         logger.warning("Failed to process document", s3_key=key, exc_info=True)
-        return "error"
+        return {"status": "error", "hash_mismatch": hash_mismatch}
 
 
 def run_reingest_from_prefix(
@@ -3065,6 +3082,7 @@ def run_reingest_from_prefix(
     processed = 0
     errors = 0
     skipped = 0
+    hash_mismatch_warnings = 0
 
     logger.info(
         "Processing documents from S3",
@@ -3088,9 +3106,19 @@ def run_reingest_from_prefix(
             key = futures[future]
             try:
                 result = future.result()
-                if result == "ok":
+                # ``_process_prefix_document`` returns a dict with ``status``
+                # and ``hash_mismatch`` keys.  Older versions returned a bare
+                # string — tolerate that shape for one release to avoid
+                # breaking any callers that pickled intermediate results.
+                if isinstance(result, dict):
+                    status = result.get("status", "error")
+                    if result.get("hash_mismatch"):
+                        hash_mismatch_warnings += 1
+                else:
+                    status = result
+                if status == "ok":
                     processed += 1
-                elif result == "skip":
+                elif status == "skip":
                     skipped += 1
                 else:
                     errors += 1
@@ -3125,6 +3153,7 @@ def run_reingest_from_prefix(
         "processed": processed,
         "errors": errors,
         "skipped": skipped,
+        "hash_mismatch_warnings": hash_mismatch_warnings,
         "wall_time_seconds": wall_time,
     }
 
@@ -3132,6 +3161,17 @@ def run_reingest_from_prefix(
         "Prefix reingest complete",
         **stats,
     )
+
+    if hash_mismatch_warnings > 0:
+        logger.warning(
+            "%d raw S3 objects had content-hash mismatches — reingest "
+            "proceeded using the S3 key hash as canonical content_hash "
+            "(see #2494, #2628).  Investigate the scraper S3 upload path "
+            "if this count is non-trivial.",
+            hash_mismatch_warnings,
+            hash_mismatch_warnings=hash_mismatch_warnings,
+            processed=processed,
+        )
 
     return stats
 
