@@ -96,12 +96,21 @@ fi
 #    These look like attempts to bypass safety checks by prepending empty quotes
 #    to a flag argument (e.g. rm '' -rf /important).
 #
-#    Legitimate uses of '' or "" are NOT blocked:
+#    Legitimate uses of '' or "" are NOT blocked — the regex only matches when
+#    empty quotes are followed by whitespace then a dash (flag). Specifically
+#    allowed patterns include:
 #      - jq expressions: --jq '.state + " - " + .title'
-#      - SQL comparisons: WHERE title != ''
+#      - SQL equality checks: WHERE col = '' (issue #2049)
+#      - SQL inequality checks: WHERE title != ''
+#      - SQL CASE expressions: CASE WHEN col = '' THEN 1 END
+#      - SQL escaped quotes: WHERE col = ''''   (four quotes = one escaped quote)
 #      - Empty string arguments: --default ""
+#      - Empty string at end of command: echo ''
 #
-#    Only blocks when empty quotes are followed by whitespace then a dash (flag).
+#    Do NOT widen the pattern without adding regression tests in
+#    .claude/hooks/test_preflight_hook.py — widening risks false positives on
+#    scripts/dev-db-query.sh SQL arguments, which legitimately contain '' for
+#    empty-string comparisons in PostgreSQL.
 if echo "$COMMAND" | grep -qE "''[[:space:]]+-" ; then
     echo "BLOCKED: Command contains empty quotes before a flag ('' -...), which looks like a bypass attempt. If this is a legitimate use, write the command to a script file. See CLAUDE.md §Unattended Operation Patterns." >&2
     exit 2

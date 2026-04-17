@@ -152,6 +152,55 @@ run_test(
     0,
 )
 
+# Issue #2049: SQL empty-string patterns passed to dev-db-query.sh must be allowed.
+# These are regression tests for the specific patterns called out in the issue's
+# acceptance criteria.  Empty-string comparisons (`= ''`) and escaped-quote
+# patterns (`''''`) are legitimate PostgreSQL syntax.  The check-6 regex only
+# triggers on `'' -` (empty quotes followed by whitespace then a dash), so these
+# SQL patterns are outside its scope — but explicit tests guard against
+# regressions if the regex is ever widened.
+run_test(
+    "SQL = '' inside dev-db-query.sh allowed (#2049)",
+    f"scripts/dev-db-query.sh {DQ}SELECT CASE WHEN col = {SQ}{SQ} THEN 1 END FROM t{DQ}",
+    0,
+)
+run_test(
+    "SQL = '' with COUNT inside dev-db-query.sh allowed (#2049)",
+    f"scripts/dev-db-query.sh {DQ}SELECT COUNT(*) FROM rulings WHERE ruling_text = {SQ}{SQ}{DQ}",
+    0,
+)
+run_test(
+    "SQL escaped quote '''' inside dev-db-query.sh allowed (#2049)",
+    f"scripts/dev-db-query.sh {DQ}SELECT CASE WHEN col = {SQ}{SQ}{SQ}{SQ} THEN 1 END FROM t{DQ}",
+    0,
+)
+run_test(
+    "SQL CASE WHEN col = '' THEN 1 via dev-db-query.sh allowed (#2049)",
+    (
+        f"scripts/dev-db-query.sh "
+        f"{DQ}SELECT id, CASE WHEN ruling_text = {SQ}{SQ} THEN 1 ELSE 0 END FROM rulings{DQ}"
+    ),
+    0,
+)
+run_test(
+    "SQL LENGTH(col) comparison allowed (unrelated but common pattern)",
+    f"scripts/dev-db-query.sh {DQ}SELECT COUNT(*) FROM t WHERE LENGTH(col) = 0{DQ}",
+    0,
+)
+
+# Regression guard: truly obfuscated patterns outside a SQL context must still
+# be blocked, per AC3 of issue #2049.
+run_test(
+    "obfuscated '' --force outside SQL still blocked (#2049)",
+    f"somecmd {SQ}{SQ} --force",
+    2,
+)
+run_test(
+    "obfuscated '' -rf outside SQL still blocked (#2049)",
+    f"rm {SQ}{SQ} -rf /tmp/important",
+    2,
+)
+
 # Normal usage should pass
 run_test("normal command no quotes", "git status", 0)
 run_test("normal command with path", "git -C /path/to/repo status", 0)
