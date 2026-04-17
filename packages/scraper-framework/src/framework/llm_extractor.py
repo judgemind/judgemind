@@ -446,8 +446,18 @@ _XREF_ORDER_ABOVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Minimum ruling_text length to consider "substantial" (non-stub).
-_XREF_MIN_TEXT_LENGTH = 100
+# Minimum ruling_text length on the *referenced* entry for it to be considered
+# substantive enough to copy.  Short referenced text (< 100 chars) usually means
+# the reference target is itself a stub and copying would propagate the stub.
+_XREF_REF_MIN_TEXT_LENGTH = 100
+
+# Maximum ruling_text length on the *stub* entry for us to still consider it a
+# stub.  Santa Clara stubs commonly run 300-500 chars because the LLM prefixes
+# the caption header (e.g. ``**Order on Defendants' Demurrer...**``) before the
+# cross-reference phrase.  Texts beyond 2000 chars almost certainly contain a
+# real ruling and should not be overwritten even if they happen to mention
+# another line number.  See #2416.
+_XREF_STUB_MAX_TEXT_LENGTH = 2000
 
 
 def _resolve_cross_references(
@@ -463,12 +473,24 @@ def _resolve_cross_references(
     their ``ruling_text``, resulting in null outcome after enrichment.
 
     This function:
-    1. Detects cross-reference patterns in ``ruling_text``.
+
+    1. Detects cross-reference patterns in ``ruling_text`` regardless of the
+       stub text's length (up to ``_XREF_STUB_MAX_TEXT_LENGTH``).  Santa Clara
+       stubs frequently include a caption-header prefix that pushes the stub
+       text past a few hundred chars — an aggressive length gate was filtering
+       those out previously (#2416).
     2. Extracts the referenced line number (or uses the previous entry for
        ``[Order above]``).
-    3. Copies ``ruling_text`` from the referenced entry if it is substantial
-       (> 100 chars).
+    3. Copies ``ruling_text`` from the referenced entry when (a) the referenced
+       entry has substantial text (>= ``_XREF_REF_MIN_TEXT_LENGTH`` chars), and
+       (b) the referenced text is longer than the current stub text so we never
+       replace a longer, presumably-more-complete ruling with a shorter one.
     4. Sets ``cross_reference_source`` to the referenced entry_number.
+
+    Because ``_join_page_rows`` is invoked on the rows from *all* pages joined
+    together (see :func:`extract_from_pdf`), cross-references that span pages
+    (e.g. stub on page 2, target on page 1) resolve naturally — the joined
+    ``entry_number_to_index`` contains every line number from every page.
 
     Parameters
     ----------
@@ -485,8 +507,10 @@ def _resolve_cross_references(
         if not text:
             continue
 
-        # Already substantial text — not a cross-reference stub.
-        if len(text) > _XREF_MIN_TEXT_LENGTH:
+        # Cap the stub length.  Texts much longer than this almost certainly
+        # contain a real ruling — even if they happen to mention another line
+        # number in passing.  Do not overwrite them.
+        if len(text) > _XREF_STUB_MAX_TEXT_LENGTH:
             continue
 
         # Try explicit line number patterns.
@@ -499,10 +523,14 @@ def _resolve_cross_references(
                 if ref_idx is not None and ref_idx != i:
                     ref_ruling = rulings[ref_idx]
                     ref_text = ref_ruling.ruling_text
-                    if ref_text and len(ref_text) > _XREF_MIN_TEXT_LENGTH:
+                    if (
+                        ref_text
+                        and len(ref_text) >= _XREF_REF_MIN_TEXT_LENGTH
+                        and len(ref_text) > len(text)
+                    ):
                         rulings[i] = ruling.model_copy(
                             update={
-                                "ruling_text": ref_ruling.ruling_text,
+                                "ruling_text": ref_text,
                                 "cross_reference_source": ref_line,
                             }
                         )
@@ -510,7 +538,8 @@ def _resolve_cross_references(
                             "llm_extractor.xref_resolved",
                             case_number=ruling.extracted_case_number,
                             ref_line=ref_line,
-                            text_length=len(ref_ruling.ruling_text),
+                            stub_length=len(text),
+                            ref_length=len(ref_text),
                         )
                 continue
 
@@ -523,10 +552,15 @@ def _resolve_cross_references(
             if prev_idx is not None:
                 ref_ruling = rulings[prev_idx]
                 ref_entry = index_to_entry.get(prev_idx)
-                if ref_ruling.ruling_text and len(ref_ruling.ruling_text) > _XREF_MIN_TEXT_LENGTH:
+                ref_text = ref_ruling.ruling_text
+                if (
+                    ref_text
+                    and len(ref_text) >= _XREF_REF_MIN_TEXT_LENGTH
+                    and len(ref_text) > len(text)
+                ):
                     rulings[i] = ruling.model_copy(
                         update={
-                            "ruling_text": ref_ruling.ruling_text,
+                            "ruling_text": ref_text,
                             "cross_reference_source": ref_entry,
                         }
                     )
@@ -534,7 +568,8 @@ def _resolve_cross_references(
                         "llm_extractor.xref_resolved_order_above",
                         case_number=ruling.extracted_case_number,
                         prev_entry=ref_entry,
-                        text_length=len(ref_ruling.ruling_text),
+                        stub_length=len(text),
+                        ref_length=len(ref_text),
                     )
 
     return rulings

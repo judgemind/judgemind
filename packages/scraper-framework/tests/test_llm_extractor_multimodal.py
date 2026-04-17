@@ -1895,19 +1895,72 @@ class TestResolveCrossReferences:
         assert result[0].ruling_text == "[Order above]"
         assert result[0].cross_reference_source is None
 
-    def test_no_resolution_for_substantial_text(self) -> None:
-        """Entries with substantial ruling_text (> 100 chars) are not resolved."""
-        long_text_1 = "The first motion is GRANTED. " * 10
-        long_text_2 = "See Line 1. But also this is a real ruling. " * 5
+    def test_no_resolution_for_very_long_stub_text(self) -> None:
+        """Entries with very long ruling_text (> 2000 chars) are not resolved (#2416)."""
+        # A ruling with real content that happens to mention another line in
+        # passing — we must not overwrite it with the referenced text.  The
+        # stub cap protects against this.
+        long_stub = "The motion is DENIED. " * 120 + " See Line 1 for related matter."
+        assert len(long_stub) > 2000
+        ref_text = "The motion is GRANTED. " * 10
         rulings = [
-            self._make_ruling("2024-00001", long_text_1),
-            self._make_ruling("2024-00002", long_text_2),
+            self._make_ruling("2024-00001", ref_text),
+            self._make_ruling("2024-00002", long_stub),
         ]
         entry_map = {1: 0, 2: 1}
         result = _resolve_cross_references(rulings, entry_map)
-        # Second entry is substantial, so should NOT be resolved.
-        assert result[1].ruling_text == long_text_2
+        # Second entry is longer than the cap, so should NOT be resolved.
+        assert result[1].ruling_text == long_stub
         assert result[1].cross_reference_source is None
+
+    def test_no_resolution_when_stub_longer_than_ref(self) -> None:
+        """Stub text that is already longer than the referenced entry is not overwritten (#2416)."""
+        stub_text = (
+            "The motion is DENIED with prejudice. "
+            "The Court finds the moving party has failed to establish good cause. "
+            "See Line 1 for additional context."
+        )
+        # Referenced text is SHORTER than the stub — we should not overwrite
+        # the longer stub with a shorter reference.
+        short_ref = "GRANTED in part, DENIED in part."
+        assert len(short_ref) < len(stub_text)
+        rulings = [
+            self._make_ruling("2024-00001", short_ref),
+            self._make_ruling("2024-00002", stub_text),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == stub_text
+        assert result[1].cross_reference_source is None
+
+    def test_long_stub_with_header_prefix_resolves(self) -> None:
+        """Santa Clara stubs with caption-header prefix + 'See Line N' resolve (#2416).
+
+        Santa Clara PDFs often include a bold caption header before the
+        cross-reference phrase, e.g. "**Order on Defendants' Demurrer to the
+        Fifth Cause of Action and Motion to Strike**\\n\\nSee Line 1 below for
+        complete tentative ruling..." which typically runs 300-500 chars.
+        The old threshold of 100 chars caused these to be silently skipped.
+        """
+        long_stub = (
+            "**Order on Defendants' Demurrer to the Fifth Cause of Action "
+            "and Motion to Strike**\n\n"
+            "See Line 1 below for complete tentative ruling. After the "
+            "hearing, the Court will prepare and file one formal Order "
+            "addressing both Defendants' Demurrer and Motion to Strike."
+        )
+        # Sanity: the stub is longer than the old 100-char threshold but
+        # shorter than the new 2000-char cap.
+        assert 100 < len(long_stub) < 2000
+        long_ref = "The demurrer is OVERRULED. " * 30
+        rulings = [
+            self._make_ruling("2024-00001", long_ref),
+            self._make_ruling("2024-00002", long_stub),
+        ]
+        entry_map = {1: 0, 2: 1}
+        result = _resolve_cross_references(rulings, entry_map)
+        assert result[1].ruling_text == long_ref
+        assert result[1].cross_reference_source == 1
 
     def test_no_resolution_when_ref_not_found(self) -> None:
         """Cross-reference to non-existent line number leaves text unchanged."""
@@ -2080,3 +2133,72 @@ class TestCrossReferenceIntegration:
         assert rulings[0].cross_reference_source is None
         assert rulings[1].ruling_text == "The demurrer is OVERRULED."
         assert rulings[1].cross_reference_source is None
+
+    def test_cross_page_xref_resolves_after_join(self) -> None:
+        """Cross-references spanning page boundaries resolve via _join_page_rows (#2416).
+
+        The multimodal extractor processes each page independently but
+        concatenates the rows from all pages into a single list before
+        calling ``_join_page_rows``.  This test simulates that flow: line 1's
+        full text is on page 1, while the line 4 stub lives on page 2.
+        After ``_join_page_rows``, the stub should be resolved against
+        line 1's text — the joined ``entry_number_to_index`` is built from
+        every page's rows.
+        """
+        long_text = ("The motion is GRANTED in full. " * 8).strip()
+
+        # Simulate per-page extraction: page 1 contains lines 1-3, page 2
+        # contains lines 4-5.  The extractor .extend()s page_rows into a
+        # single all_rows list (see LlmExtractor.extract_from_pdf), which is
+        # exactly what we pre-build below.
+        page1_rows = [
+            {
+                "entry_number": 1,
+                "case_info": "20CV374597 Regional Medical v. County of SC",
+                "ruling_text": long_text,
+            },
+            {
+                "entry_number": 2,
+                "case_info": "20CV374598 Other Medical v. County",
+                "ruling_text": "See Line 1 for tentative ruling.",
+            },
+            {
+                "entry_number": 3,
+                "case_info": "21CV378378 Wong-Mikhail v. Sutter Bay",
+                "ruling_text": "DENIED without prejudice. Parties may refile.",
+            },
+        ]
+        page2_rows = [
+            {
+                "entry_number": 4,
+                "case_info": "22CV400123 Third Party v. County",
+                "ruling_text": "See Line 1 for tentative ruling.",
+            },
+            {
+                "entry_number": 5,
+                "case_info": "22CV400124 Fourth Party v. County",
+                "ruling_text": "[Order above]",
+            },
+        ]
+        all_rows = page1_rows + page2_rows
+
+        rulings = _join_page_rows(all_rows)
+
+        assert len(rulings) == 5
+        # Line 1 keeps its own text.
+        assert rulings[0].ruling_text == long_text
+        assert rulings[0].cross_reference_source is None
+        # Line 2 stub resolves to line 1 text (same page).
+        assert rulings[1].ruling_text == long_text
+        assert rulings[1].cross_reference_source == 1
+        # Line 3 has its own text — untouched.
+        assert rulings[2].ruling_text == "DENIED without prejudice. Parties may refile."
+        assert rulings[2].cross_reference_source is None
+        # Line 4 stub resolves to line 1 text — cross-page resolution.
+        assert rulings[3].ruling_text == long_text
+        assert rulings[3].cross_reference_source == 1
+        # Line 5 [Order above] resolves to the preceding entry (line 4,
+        # which itself was resolved to line 1's text).
+        assert rulings[4].ruling_text == long_text
+        # [Order above] uses the previous entry's entry_number.
+        assert rulings[4].cross_reference_source == 4
