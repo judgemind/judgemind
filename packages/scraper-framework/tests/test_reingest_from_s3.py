@@ -9313,6 +9313,109 @@ class TestApplyPostExtractionGuards:
         assert extracted["extraction_methods"] == {"hearing_date": "llm"}
 
 
+class TestFinalizeHearingDate:
+    """Unit tests for finalize_hearing_date helper (#2456).
+
+    The helper owns the entire "pick the final hearing_date" decision
+    end-to-end: it runs the #2370 plausibility guard on each candidate in
+    the fallback chain (extracted, then doc_meta) and returns the first
+    plausible value, or None if no candidate is plausible. This replaces
+    the ``extracted["hearing_date"] or doc_meta["hearing_date"]`` + post
+    check pattern that #2432 showed was easy to bypass.
+    """
+
+    _CAPTURE = datetime(2026, 4, 1, 12, 0)
+
+    def test_both_implausible_returns_none(self) -> None:
+        """When both candidates are implausible, returns None."""
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=date(2099, 1, 1),  # far future
+            doc_meta_hearing=date(2020, 1, 1),  # far past
+            capture_timestamp=self._CAPTURE,
+        )
+        assert result is None
+
+    def test_extracted_implausible_doc_meta_plausible_returns_doc_meta(
+        self,
+    ) -> None:
+        """When extracted is implausible but doc_meta is plausible, returns doc_meta."""
+        plausible = date(2026, 4, 5)
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=date(2099, 1, 1),
+            doc_meta_hearing=plausible,
+            capture_timestamp=self._CAPTURE,
+        )
+        assert result == plausible
+
+    def test_both_none_returns_none(self) -> None:
+        """When both candidates are None, returns None."""
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=None,
+            doc_meta_hearing=None,
+            capture_timestamp=self._CAPTURE,
+        )
+        assert result is None
+
+    def test_extracted_plausible_returns_extracted(self) -> None:
+        """When extracted is plausible, returns extracted (no fallback consulted)."""
+        plausible = date(2026, 4, 5)
+        # Provide a plausible doc_meta too — we should still see extracted win.
+        other_plausible = date(2026, 4, 10)
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=plausible,
+            doc_meta_hearing=other_plausible,
+            capture_timestamp=self._CAPTURE,
+        )
+        assert result == plausible
+
+    def test_capture_timestamp_none_is_permissive(self) -> None:
+        """With capture_timestamp=None, plausibility cannot be checked; the
+        first non-None candidate wins."""
+        # extracted non-None, doc_meta non-None: extracted wins.
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=date(2099, 1, 1),
+            doc_meta_hearing=date(2026, 4, 5),
+            capture_timestamp=None,
+        )
+        assert result == date(2099, 1, 1)
+
+        # extracted None, doc_meta non-None: doc_meta wins.
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=None,
+            doc_meta_hearing=date(2099, 1, 1),
+            capture_timestamp=None,
+        )
+        assert result == date(2099, 1, 1)
+
+        # Both None: None.
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=None,
+            doc_meta_hearing=None,
+            capture_timestamp=None,
+        )
+        assert result is None
+
+    def test_extracted_none_doc_meta_plausible_returns_doc_meta(self) -> None:
+        """When extracted is None, doc_meta is consulted."""
+        plausible = date(2026, 4, 5)
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=None,
+            doc_meta_hearing=plausible,
+            capture_timestamp=self._CAPTURE,
+        )
+        assert result == plausible
+
+    def test_extracted_plausible_doc_meta_none(self) -> None:
+        """When doc_meta is None, extracted plausible value wins."""
+        plausible = date(2026, 4, 5)
+        result = reingest.finalize_hearing_date(
+            extracted_hearing=plausible,
+            doc_meta_hearing=None,
+            capture_timestamp=self._CAPTURE,
+        )
+        assert result == plausible
+
+
 class TestReingestAppliesGuardsAndForceUpdate:
     """End-to-end: reingest DB-write loop applies guards + force_update (#2405)."""
 
