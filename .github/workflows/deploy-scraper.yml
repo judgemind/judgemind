@@ -7,6 +7,10 @@ on:
       - "packages/scraper-framework/**"
       - ".github/workflows/deploy-scraper.yml"
       - ".github/actions/ecs-deploy/**"
+      # scripts/wait-for-rollout.sh is invoked by the ecs-deploy composite
+      # action. Changes to the shared script must trigger this deploy so the
+      # fix is exercised against a real rollout on its own PR (see #2592).
+      - "scripts/wait-for-rollout.sh"
   workflow_dispatch:
     inputs:
       image_tag:
