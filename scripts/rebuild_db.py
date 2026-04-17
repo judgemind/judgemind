@@ -23,10 +23,11 @@
 #                     rows (per-county reset); otherwise it truncates the
 #                     derived schema globally.
 #   --force-split-child-loss
-#                     Override the split-child preflight guard (see #2494,
-#                     #2496) and proceed with --reset --county even when the
-#                     rebuild cannot restore all deleted rows.  Expect data
-#                     loss on multi-case-PDF counties.
+#                     Deprecated no-op kept for CLI/tooling compatibility.  As
+#                     of #2494, the rebuild re-derives split-children from the
+#                     raw PDF via the ingestion worker's LLM split path, so no
+#                     override is required.  Passing this flag logs a warning
+#                     and is otherwise ignored.
 """
 
 from __future__ import annotations
@@ -273,10 +274,19 @@ def _process_one_document(
       - ``status``: ``"ok"``, ``"skip"``, or ``"error"``
       - ``content_format``: the document format (``"html"``, ``"pdf"``, etc.)
       - ``had_hearing_date``: whether ``hearing_date`` was present in the event
+      - ``hash_mismatch``: whether the S3 key hash did not match the object
+        bytes' SHA-256.  Non-fatal — rebuild proceeds using the key hash as
+        the canonical ``content_hash`` so the worker's LLM split path can
+        re-derive any split-children from the raw PDF (see #2494).
     """
     parsed = parse_s3_key(key)
     if not parsed:
-        return {"status": "skip", "content_format": "", "had_hearing_date": False}
+        return {
+            "status": "skip",
+            "content_format": "",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
 
     content_format = EXT_TO_FORMAT.get(parsed["ext"], "bin")
 
@@ -294,21 +304,25 @@ def _process_one_document(
             "status": "skip",
             "content_format": content_format,
             "had_hearing_date": False,
+            "hash_mismatch": False,
         }
 
+    # Byte-integrity check.  A mismatch used to short-circuit with
+    # ``status="error"``, but that caused multi-case-PDF counties (Santa
+    # Clara, Orange, Riverside, Fresno) to lose all their split-children on
+    # rebuild — #2494.  Now we log a warning and let the worker process the
+    # raw PDF; the LLM split path derives N split-children from the content
+    # and stores them with hashes derived from the canonical key hash.
     actual_hash = hashlib.sha256(content).hexdigest()
-    if actual_hash != parsed["content_hash"]:
-        logger.error(
-            "S3 content hash mismatch, skipping document",
+    hash_mismatch = actual_hash != parsed["content_hash"]
+    if hash_mismatch:
+        logger.warning(
+            "S3 content hash mismatch — proceeding with rebuild using key "
+            "hash as canonical content_hash (see #2494)",
             s3_key=key,
             key_hash=parsed["content_hash"],
-            content_hash=actual_hash,
+            actual_content_hash=actual_hash,
         )
-        return {
-            "status": "error",
-            "content_format": content_format,
-            "had_hearing_date": False,
-        }
 
     event = build_event(key, content, parsed, bucket)
     had_hearing_date = bool(event.get("hearing_date"))
@@ -350,6 +364,7 @@ def _process_one_document(
             "status": "ok",
             "content_format": content_format,
             "had_hearing_date": had_hearing_date,
+            "hash_mismatch": hash_mismatch,
         }
     except Exception:
         logger.error(
@@ -362,6 +377,7 @@ def _process_one_document(
             "status": "error",
             "content_format": content_format,
             "had_hearing_date": had_hearing_date,
+            "hash_mismatch": hash_mismatch,
         }
 
 
@@ -463,18 +479,14 @@ def reset_derived_tables_for_county(
       rulings are indexed.
 
     .. note::
-        **Split-child hazard.** Counties whose scrapers split multi-case PDFs
-        into multiple ``derived.documents`` rows per raw S3 object (currently
-        Santa Clara, and any other county whose raws are multi-case PDFs —
-        Orange, Riverside, Fresno) fan out N:1 at ingest time.  On rebuild,
-        each raw PDF re-derives **only one** row, not N, because of the
-        ``content_hash`` / ``key_hash`` mismatch in the rebuild pipeline
-        (see #2494).  Running ``--reset --county`` on such a county will
-        therefore delete all the split-children and the rebuild cannot
-        restore them — the county ends up with only the raw-aligned subset.
-        Callers must clear ``preflight_split_child_guard`` (or pass
-        ``--force-split-child-loss`` on the CLI) before invoking this
-        function on a multi-case-PDF county.
+        **Split-children are re-derived on rebuild (as of #2494).** Counties
+        whose scrapers split multi-case PDFs into multiple ``derived.documents``
+        rows per raw S3 object (Santa Clara, Orange, Riverside, Fresno) fan
+        out N:1 at ingest time.  Rebuild re-runs the ingestion worker's LLM
+        split path for each raw PDF, so the deleted rows are reconstructed
+        from the raw content.  No preflight guard is required, and
+        ``--force-split-child-loss`` is a deprecated no-op kept only for CLI
+        compatibility.
 
     Raises:
         ValueError: if no courts match ``(state, county)``.  Silently
@@ -586,149 +598,6 @@ def reset_derived_tables_for_county(
         deleted=deleted,
     )
     return deleted
-
-
-# Fanout ratio at or above which the split-child guard fires.  Chosen to
-# leave headroom for normal drift (staging rows, accidental dupes, edits
-# that add a handful of rows per raw) while still catching the N:1 pattern
-# (Santa Clara pre-reset was ~20x).
-_SPLIT_CHILD_FANOUT_RATIO = 1.5
-
-
-class SplitChildDataLossError(RuntimeError):
-    """Raised when ``--reset --county`` would delete more rows than rebuild
-    can restore from S3 — the split-child data-loss hazard from #2494.
-
-    See ``preflight_split_child_guard`` for details and the override
-    mechanism (``--force-split-child-loss``).
-    """
-
-
-def preflight_split_child_guard(
-    conn: psycopg.Connection,
-    state: str,
-    county: str,
-    s3_key_count: int,
-    force: bool,
-) -> None:
-    """Refuse per-county reset when rebuild cannot restore what reset deletes.
-
-    Background (#2494, #2496): when the ingestion pipeline splits a single
-    multi-case raw PDF into N ``derived.documents`` rows (one per extracted
-    case), the rows share the raw's S3 key but carry different content
-    hashes.  The rebuild path hashes the raw bytes and tries to match against
-    the S3 key filename — that only reproduces **one** row per raw PDF, not
-    N.  So a ``--reset --county`` on a multi-case-PDF county (e.g. Santa
-    Clara, Orange, Riverside, Fresno) will delete all N split-children and
-    rebuild will only recreate the 1 raw-aligned row.  Result: silent data
-    loss equal to ``(N-1) * raw_count`` per county on every run.
-
-    The guard compares the DB's ``derived.documents`` count for the county
-    against the raw-object count in S3.  If the DB has meaningfully more
-    rows than S3 (ratio >= ``_SPLIT_CHILD_FANOUT_RATIO``), the fanout
-    pattern is present and the reset is refused unless ``force`` is True.
-
-    Edge cases:
-    * Both counts zero → no data to lose, allow.
-    * DB count lower than S3 count → no fanout, allow (this is the initial-
-      population path before the worker has caught up).
-    * S3 count zero but DB has rows → worst case, reset would nuke everything
-      with no rebuild capacity to restore; refuse unless forced.
-
-    Args:
-        conn: Open DB connection (used to resolve court ids and count rows).
-        state: Two-letter state code (case-insensitive).
-        county: County name (case-insensitive, unnormalised).
-        s3_key_count: Number of content-addressed raw objects under
-            ``{state}/{county}/`` in S3 (or the local cache) — caller is
-            responsible for counting these.
-        force: Caller opted into the data loss (``--force-split-child-loss``).
-
-    Raises:
-        ValueError: no courts match ``(state, county)`` (typo guard — mirrors
-            ``reset_derived_tables_for_county``).
-        SplitChildDataLossError: fanout detected and ``force`` is False.
-    """
-    court_ids = _resolve_county_court_ids(conn, state, county)
-    if not court_ids:
-        raise ValueError(
-            f"No courts found in derived.courts for state={state!r}, county={county!r}. "
-            "Refusing to run split-child preflight against a nonexistent county."
-        )
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) FROM derived.documents WHERE court_id = ANY(%s::uuid[])",
-            (court_ids,),
-        )
-        db_doc_count = int(cur.fetchone()[0])
-
-    # Ratio is undefined if s3_key_count == 0 but db_doc_count > 0.  That's
-    # the worst case (reset would nuke everything, rebuild restores nothing)
-    # so treat it as an unconditional fanout violation.
-    if s3_key_count == 0 and db_doc_count == 0:
-        ratio: float = 0.0
-    elif s3_key_count == 0:
-        ratio = float("inf")
-    else:
-        ratio = db_doc_count / s3_key_count
-
-    logger.info(
-        "Split-child preflight",
-        state=state,
-        county=county,
-        s3_key_count=s3_key_count,
-        db_doc_count=db_doc_count,
-        fanout_ratio=round(ratio, 2) if ratio != float("inf") else "inf",
-        threshold=_SPLIT_CHILD_FANOUT_RATIO,
-        force_split_child_loss=force,
-    )
-
-    fanout_detected = ratio >= _SPLIT_CHILD_FANOUT_RATIO
-
-    if not fanout_detected:
-        logger.info(
-            "Split-child preflight passed — DB row count within fanout tolerance",
-            state=state,
-            county=county,
-            db_doc_count=db_doc_count,
-            s3_key_count=s3_key_count,
-        )
-        return
-
-    # Fanout detected.  Either refuse, or warn and proceed under --force.
-    msg = (
-        f"Split-child data-loss hazard detected for {state}/{county}: "
-        f"derived.documents has {db_doc_count} rows but S3 has only "
-        f"{s3_key_count} raw objects (fanout ratio "
-        f"{'inf' if ratio == float('inf') else f'{ratio:.2f}x'} "
-        f">= {_SPLIT_CHILD_FANOUT_RATIO}x threshold). "
-        "Running --reset --county will delete the split-children and the "
-        "rebuild cannot restore them (see #2494). Pass "
-        "--force-split-child-loss to proceed anyway."
-    )
-
-    if not force:
-        logger.error(
-            "Split-child preflight FAILED — refusing to reset",
-            state=state,
-            county=county,
-            db_doc_count=db_doc_count,
-            s3_key_count=s3_key_count,
-            fanout_ratio=round(ratio, 2) if ratio != float("inf") else "inf",
-        )
-        raise SplitChildDataLossError(msg)
-
-    logger.warning(
-        "Split-child preflight overridden by --force-split-child-loss — "
-        "proceeding with reset. Expected data loss: approximately "
-        "%d rows that rebuild cannot restore.",
-        max(0, db_doc_count - s3_key_count),
-        state=state,
-        county=county,
-        db_doc_count=db_doc_count,
-        s3_key_count=s3_key_count,
-    )
 
 
 def reset_opensearch_index(os_url: str) -> None:
@@ -872,12 +741,21 @@ def main() -> None:
         "--force-split-child-loss",
         action="store_true",
         help=(
-            "Override the split-child preflight guard on --reset --county. "
-            "Proceed with reset even when the rebuild cannot restore all "
-            "deleted rows (see #2494, #2496).  Expect data loss."
+            "Deprecated no-op kept for CLI/tooling compatibility.  As of "
+            "#2494, rebuild re-derives split-children from the raw PDF via "
+            "the worker's LLM split path, so no override is required.  "
+            "Passing this flag logs a deprecation warning and is otherwise "
+            "ignored."
         ),
     )
     args = parser.parse_args()
+
+    if args.force_split_child_loss:
+        logger.warning(
+            "--force-split-child-loss is deprecated and has no effect: "
+            "split-children are re-derived from the raw PDF on rebuild "
+            "(see #2494).  You can stop passing this flag."
+        )
 
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
@@ -892,41 +770,13 @@ def main() -> None:
 
     os_url = os.environ.get("OPENSEARCH_URL", "")
 
-    # Step 0 (optional): Reset derived data for a clean rebuild
+    # Step 0 (optional): Reset derived data for a clean rebuild.  As of
+    # #2494 the split-child preflight guard is gone: rebuild re-derives
+    # split-children from the raw PDF via the ingestion worker's LLM split
+    # path, so ``--reset --county`` on multi-case-PDF counties (Santa Clara,
+    # Orange, Riverside, Fresno) is safe.
     if args.reset:
         if args.county:
-            # Per-county reset: only delete rows belonging to this county.
-            # Before deleting, run the split-child preflight so we don't
-            # destroy rows that rebuild cannot restore (see #2494, #2496).
-            # We need an S3 key count for the preflight — this is the same
-            # list that step 1 builds later, but we need it up front here.
-            preflight_prefix = f"{sluggify(args.state)}/{sluggify(args.county)}/"
-            if cache_dir:
-                preflight_s3_key_count = len(
-                    list_local_keys(Path(cache_dir), prefix=preflight_prefix)
-                )
-            else:
-                preflight_s3_key_count = len(
-                    list_s3_keys(s3, BUCKET, prefix=preflight_prefix)
-                )
-
-            try:
-                preflight_split_child_guard(
-                    conn,
-                    state=args.state,
-                    county=args.county,
-                    s3_key_count=preflight_s3_key_count,
-                    force=args.force_split_child_loss,
-                )
-            except SplitChildDataLossError as exc:
-                logger.error(
-                    "Aborting per-county reset — pass --force-split-child-loss "
-                    "to override: %s",
-                    exc,
-                )
-                conn.close()
-                sys.exit(2)
-
             # Skip the OpenSearch index reset — the global index self-heals
             # as new rulings are indexed during the rebuild.  See #2465.
             reset_derived_tables_for_county(conn, args.state, args.county)
@@ -1013,6 +863,10 @@ def main() -> None:
         # fails, the ruling row is skipped.  This counter helps diagnose
         # missing-ruling issues for PDF counties.
         no_hearing_date = 0
+        # Track raw S3 objects whose bytes did not hash to the hash in their
+        # S3 key (see #2494).  Non-fatal — rebuild proceeds — but a spike
+        # indicates an S3 integrity or upload-path issue worth investigating.
+        hash_mismatch_warnings = 0
         # Per-format counters for the summary.
         format_counts: dict[str, int] = {}
 
@@ -1048,6 +902,11 @@ def main() -> None:
                         if isinstance(result, dict)
                         else False
                     )
+                    hash_mismatch = (
+                        result.get("hash_mismatch", False)
+                        if isinstance(result, dict)
+                        else False
+                    )
 
                     if status == "ok":
                         processed += 1
@@ -1062,6 +921,8 @@ def main() -> None:
                         )
                     if status == "ok" and not had_hearing_date:
                         no_hearing_date += 1
+                    if hash_mismatch:
+                        hash_mismatch_warnings += 1
 
                     total_done = processed + errors + skipped
                     if processed > 0 and processed % 50 == 0:
@@ -1094,6 +955,7 @@ def main() -> None:
             skipped=skipped,
             total=len(keys),
             format_counts=format_counts,
+            hash_mismatch_warnings=hash_mismatch_warnings,
         )
 
         if no_hearing_date > 0:
@@ -1102,6 +964,17 @@ def main() -> None:
                 "been skipped if worker-side extraction (LLM/regex) also failed",
                 no_hearing_date,
                 no_hearing_date=no_hearing_date,
+                processed=processed,
+            )
+
+        if hash_mismatch_warnings > 0:
+            logger.warning(
+                "%d raw S3 objects had content-hash mismatches — rebuild "
+                "proceeded using the S3 key hash as canonical content_hash "
+                "(see #2494).  Investigate the S3 upload path if this count "
+                "is non-trivial.",
+                hash_mismatch_warnings,
+                hash_mismatch_warnings=hash_mismatch_warnings,
                 processed=processed,
             )
     finally:
