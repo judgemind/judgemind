@@ -1856,8 +1856,13 @@ class TestMaxWorkerMemoryCLI:
         # The main-pass pool gets max_workers=2 (2048/1024), not 64.
         assert captured_max_workers[0] == 2
 
-    def test_flag_default_preserves_old_behavior(self, tmp_path: Any) -> None:
-        """Without ``--max-worker-memory-mb`` the old concurrency wins."""
+    def test_flag_default_autoscales_with_memory_budget(self, tmp_path: Any) -> None:
+        """Without an explicit ``--max-worker-memory-mb``, the default (1024)
+        applies.  With 16 GB available that yields 16 capacity, so
+        ``--concurrency 4`` still wins via ``min(4, 16)`` and the pool gets
+        ``max_workers=4`` — verifying the default does not over-throttle
+        when memory is plentiful.  See #2576.
+        """
         keys = ["ca/orange/superior_court/raw/abc123.html"]
         cache_dir = str(tmp_path / "cache")
         full = tmp_path / "cache" / keys[0]
@@ -1892,6 +1897,10 @@ class TestMaxWorkerMemoryCLI:
             patch("rebuild_db.seed_courts", return_value={}),
             patch("rebuild_db._fetch_rosters"),
             patch(
+                "rebuild_db._available_memory_mb",
+                return_value=16384,
+            ),
+            patch(
                 "concurrent.futures.ProcessPoolExecutor",
                 side_effect=_pool_factory,
             ),
@@ -1913,6 +1922,79 @@ class TestMaxWorkerMemoryCLI:
                     "rebuild_db.py",
                     "--concurrency",
                     "4",
+                ],
+            ),
+        ):
+            rebuild_db.main()
+
+        assert captured_max_workers[0] == 4
+
+    def test_flag_default_throttles_on_low_memory(self, tmp_path: Any) -> None:
+        """With the default ``--max-worker-memory-mb=1024`` and only 4 GB
+        available (ECS ecs-run-task.sh default), ``--concurrency 64`` must
+        autoscale down to 4 (4096/1024) — preventing the OOM footgun from
+        #2576.  This is the regression test for the issue's acceptance
+        criterion.
+        """
+        keys = ["ca/orange/superior_court/raw/abc123.html"]
+        cache_dir = str(tmp_path / "cache")
+        full = tmp_path / "cache" / keys[0]
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(b"<html>x</html>")
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        captured_max_workers: list[int] = []
+
+        def _pool_factory(*args: Any, **kwargs: Any) -> MagicMock:
+            captured_max_workers.append(kwargs.get("max_workers", -1))
+            return mock_pool
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=keys,
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch(
+                "rebuild_db._available_memory_mb",
+                return_value=4096,
+            ),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                side_effect=_pool_factory,
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([mock_future]),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ),
+            patch(
+                "sys.argv",
+                [
+                    "rebuild_db.py",
+                    "--concurrency",
+                    "64",
                 ],
             ),
         ):

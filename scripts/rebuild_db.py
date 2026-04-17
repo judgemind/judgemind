@@ -23,11 +23,13 @@
 #                     Reserve ~N MB of RAM per worker when auto-scaling
 #                     concurrency.  Computes ``min(--concurrency,
 #                     available_memory_mb / N)`` and uses the smaller value.
-#                     Use this after bumping Fargate memory with
-#                     ``scripts/ecs-run-task.sh --memory <mb>`` so concurrency
-#                     adapts to the new allocation.  Set to 0 (default) to
-#                     disable auto-scaling and use --concurrency as-is.
-#                     See #2495.
+#                     Default: 1024 — sized so the ECS 4 GB Fargate default
+#                     (from ``scripts/ecs-run-task.sh``) autoscales to ~4
+#                     workers instead of blindly spawning 64 and OOM-ing
+#                     (exit 137).  Bump ``--memory`` on ecs-run-task.sh to
+#                     unlock more concurrency; this flag auto-adapts.  Set
+#                     to 0 to disable auto-scaling and use --concurrency
+#                     as-is.  See #2495, #2576.
 #   --reset           Truncate derived tables before rebuilding.  When combined
 #                     with --county, the reset is scoped to just that county's
 #                     rows (per-county reset); otherwise it truncates the
@@ -1051,12 +1053,15 @@ def main() -> None:
     parser.add_argument(
         "--max-worker-memory-mb",
         type=int,
-        default=int(os.environ.get("REBUILD_MAX_WORKER_MEMORY_MB", "0")),
+        default=int(os.environ.get("REBUILD_MAX_WORKER_MEMORY_MB", "1024")),
         help=(
             "Reserve ~N MB of RAM per worker when auto-scaling concurrency "
-            "(default: 0, disabled).  Computes min(--concurrency, "
-            "available_memory_mb / N) and uses the smaller value so "
-            "concurrency adapts to the Fargate allocation.  See #2495."
+            "(default: 1024, sized for ECS 4 GB Fargate default so effective "
+            "concurrency drops to ~4 instead of OOM-ing at 64).  Computes "
+            "min(--concurrency, available_memory_mb / N) and uses the "
+            "smaller value so concurrency adapts to the Fargate allocation. "
+            "Set to 0 to disable auto-scaling and use --concurrency as-is. "
+            "See #2495, #2576."
         ),
     )
     parser.add_argument(
