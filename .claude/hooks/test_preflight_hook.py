@@ -101,9 +101,73 @@ run_test(
 )
 run_test("no quotes with && allowed", "ls && pwd", 0)
 
+# Issue #2589 regression tests: semicolons / && inside quoted arguments must
+# NOT trigger the check. The check exists to prevent shell-level compound
+# commands that mix quoted strings with &&/;, not to block a `;` that is part
+# of a single argument value.
+run_test(
+    "semicolon inside double-quoted --title arg allowed (#2589 AC1)",
+    f"gh pr create --title {DQ}feat(infra): extend apply_immediately to ElastiCache; document OpenSearch (#2581){DQ} --body-file tmp/pr_body.txt",
+    0,
+)
+run_test(
+    "semicolon inside single-quoted arg allowed (#2589)",
+    f"gh pr create --title {SQ}feat: foo; bar{SQ} --body-file tmp/b.txt",
+    0,
+)
+run_test(
+    "&& inside double-quoted arg allowed (#2589)",
+    f"echo {DQ}x && y{DQ}",
+    0,
+)
+run_test(
+    "&& inside single-quoted arg allowed (#2589)",
+    f"echo {SQ}x && y{SQ}",
+    0,
+)
+run_test(
+    "quoted args on both sides of real && still blocked (#2589 AC2)",
+    f"echo {DQ}quoted{DQ} && echo {DQ}more{DQ}",
+    2,
+)
+run_test(
+    "semicolon after quoted arg is still a real compound-command (#2589 AC2)",
+    f"echo {DQ}hi{DQ}; echo bye",
+    2,
+)
+run_test(
+    "unquoted cmd1 ; cmd2 still treated as compound (not blocked by check 4, quotes absent)",
+    "echo hi ; echo bye",
+    0,
+)
+run_test(
+    "real semicolon-separated with quotes on one side still blocked (#2589 AC2)",
+    f"echo hi; echo {SQ}bye{SQ}",
+    2,
+)
+
 # --- Check 5: cd in compound commands ---
 print("\nCheck 5: cd in compound commands")
 run_test("cd && cmd blocked", "cd /tmp && ls", 2)
+
+# Issue #2589 regression tests for check 5: a literal `cd` inside a quoted
+# argument is not an actual `cd` shell command, and &&/; inside a quoted
+# argument are not compound-command operators.
+run_test(
+    "cd inside double-quoted arg with && elsewhere in quoted arg allowed (#2589 AC3)",
+    f"gh issue create --title {DQ}docs: explain how to cd into foo && bar{DQ}",
+    0,
+)
+run_test(
+    "cd inside single-quoted arg allowed (#2589 AC3)",
+    f"some_cmd --name {SQ}cd into foo{SQ}",
+    0,
+)
+run_test(
+    "cd inside quoted arg with unquoted && still blocked by cd check (#2589)",
+    f"cd /tmp && some_cmd --name {SQ}foo{SQ}",
+    2,
+)
 
 # --- Check 6: empty quotes before flags (bypass attempts) ---
 print("\nCheck 6: Empty quotes before flags")

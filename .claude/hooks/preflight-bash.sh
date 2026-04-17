@@ -28,6 +28,19 @@ RUN_IN_BG=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin);
 # Allow tests to override the working directory for check 9 and 10.
 EFFECTIVE_CWD="${PREFLIGHT_CWD:-$PWD}"
 
+# Produce a copy of $COMMAND with single- and double-quoted substrings removed.
+# This is used by checks 4 and 5 so that `&&` / `;` / `cd` that appear inside
+# quoted arguments (e.g. `--title "feat: foo; bar"`) are NOT misread as shell-
+# level compound-command operators. This is an approximation — it does not
+# handle escaped quotes, nested quotes, $'...' strings, or here-strings — but
+# it covers the common case of plain quoted arguments without regressing the
+# true positives (`cmd1; cmd2`, `cmd1 "foo" && cmd2`, `cd /x && ls`).
+#
+# The sed strips:
+#   's/'"'"'[^'"'"']*'"'"'//g'  — single-quoted runs (no single-quote escaping)
+#   's/"[^"]*"//g'              — double-quoted runs (no double-quote escaping)
+STRIPPED_COMMAND=$(printf '%s' "$COMMAND" | sed -E "s/'[^']*'//g; s/\"[^\"]*\"//g")
+
 # --- Forbidden pattern checks ---
 # Note: uses grep -E (POSIX extended regex) for macOS compatibility. Do NOT use grep -P.
 
@@ -74,7 +87,10 @@ if echo "$COMMAND" | grep -qE 'python3?[[:space:]]+-c[[:space:]]' ; then
 fi
 
 # 4. Quoted strings combined with && or ;
-if echo "$COMMAND" | grep -qE '&&|;' ; then
+#    Uses $STRIPPED_COMMAND so that `;` / `&&` inside quoted arguments (e.g.
+#    `--title "feat: foo; bar"`) do not trigger the check. Only unquoted `&&`
+#    and `;` count as real compound-command operators. See issue #2589.
+if echo "$STRIPPED_COMMAND" | grep -qE '&&|;' ; then
     if echo "$COMMAND" | grep -qE "[\"']" ; then
         echo "BLOCKED: Command contains quoted strings combined with && or ;. Split into separate tool calls. See CLAUDE.md §Unattended Operation Patterns." >&2
         exit 2
@@ -82,8 +98,11 @@ if echo "$COMMAND" | grep -qE '&&|;' ; then
 fi
 
 # 5. cd in compound commands (use git -C, npm --prefix, or separate tool calls)
-if echo "$COMMAND" | grep -qE '&&|;' ; then
-    if echo "$COMMAND" | grep -qE '\bcd\b' ; then
+#    Uses $STRIPPED_COMMAND so that `cd` inside a quoted string (e.g.
+#    `--name "cd into foo"`) and `;` / `&&` inside quoted arguments do not
+#    trigger the check. See issue #2589.
+if echo "$STRIPPED_COMMAND" | grep -qE '&&|;' ; then
+    if echo "$STRIPPED_COMMAND" | grep -qE '\bcd\b' ; then
         echo "BLOCKED: Do not use cd in compound commands. Use 'git -C /path', 'npm --prefix /path', or separate tool calls instead. See CLAUDE.md §Unattended Operation Patterns." >&2
         exit 2
     fi
