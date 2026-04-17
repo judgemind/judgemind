@@ -900,6 +900,20 @@ jobs:
         run: scripts/check-test-except-pass.sh
 
   # ---------------------------------------------------------------
+  # Script header guard: top-level scripts/*.py whose name matches a
+  # one-off pattern (backfill, cleanup, fix, dedup, merge, migrate,
+  # remediat) must carry `# one-off: true` OR `# permanent: true` in
+  # the first 50 lines. Replaces the "first 10 lines" rule-of-thumb
+  # with a machine-verifiable check (#2533).
+  # ---------------------------------------------------------------
+  script-headers-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check one-off/permanent markers on scripts/*.py
+        run: scripts/check-script-headers.sh
+
+  # ---------------------------------------------------------------
   # Markdown link guard: internal .md pointers in CLAUDE.md, docs/,
   # .claude/skills/, packages/*/README.md, packages/*/docs/,
   # infra/, and .github/ must point to files that exist (#2425, #2428)
