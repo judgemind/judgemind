@@ -138,6 +138,16 @@ scripts/check-markdown-links.sh
 
 This validates internal markdown pointers — both Markdown-style links and backtick references to repo-relative paths — resolve to files that exist. The same check runs in CI as the `markdown-links-check` job; the pre-push hook runs it on any `.md` in the push so failures are caught before the 2-3 minute CI round trip. If a backtick token that looks like a repo path is illustrative (not a real file), remove the backticks or rephrase so the checker does not flag it.
 
+### CI workflow edits
+
+When `.github/workflows/ci.yml` changes, run:
+
+```
+scripts/check-ci-job-skipped.sh
+```
+
+This detects the #2410 / #2505 footgun: a PR modifies a job body whose `if: needs.detect-changes.outputs.X == 'true'` gate's paths-filter does not match anything in the diff, so the job will be SKIPPED on that PR's own CI run and the modification is never actually exercised. The same check runs in CI as the `ci-job-skipped-check` job; the pre-push hook runs it whenever `ci.yml` is in the push. If it fails, either add `.github/workflows/ci.yml` to the offending filter (so the job always runs when ci.yml itself changes) or modify a file that already matches the filter.
+
 ### Subagent responsibilities
 
 Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.

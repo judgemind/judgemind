@@ -959,6 +959,21 @@ jobs:
         run: scripts/check-removed-exports.sh
 
   # ---------------------------------------------------------------
+  # CI job-skipped guard: detect jobs whose body is modified on a PR
+  # but would be SKIPPED on that PR's CI run because their paths-filter
+  # if-gate doesn't match anything in the diff (#2410, #2505, #2527).
+  # ---------------------------------------------------------------
+  ci-job-skipped-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect modified CI jobs that would be skipped on their own PR
+        run: python3 scripts/check-ci-job-skipped.py --base "origin/${{ github.event.pull_request.base.ref }}"
+
+  # ---------------------------------------------------------------
   # Preflight hook test suite: runs when .claude/hooks/ changes (#2408)
   # ---------------------------------------------------------------
   preflight-hook-test:
@@ -1088,7 +1103,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
