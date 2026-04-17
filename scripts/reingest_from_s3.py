@@ -797,6 +797,35 @@ def _reparse_document(
             extraction_methods[field] = "scraper"
 
     # ------------------------------------------------------------------
+    # San Diego direct narrowing (#2311, #2381)
+    # ------------------------------------------------------------------
+    # San Diego calendar pages contain 30+ cases per HTML file.  When a
+    # document has no registered scraper class (e.g. scraper_id
+    # "rebuild-ca-san_diego" from rebuild_db.py), ``parse_document`` is
+    # never called and ``extracted["ruling_text"]`` remains the full raw
+    # HTML page (~50KB).  We narrow directly here so the stored
+    # ruling_text becomes the plain-text excerpt for the specific case,
+    # independent of whether LLM extraction runs below.
+    sd_case_num = extracted.get("case_number")
+    if (
+        sd_case_num
+        and extracted.get("ruling_text") == text  # Not already narrowed
+        and doc_meta.get("county", "").lower() == "san diego"
+        and doc_format == "html"
+    ):
+        try:
+            from courts.ca.sd_calendar import extract_case_section
+
+            section = extract_case_section(
+                raw_content.decode("utf-8", errors="replace"),
+                sd_case_num,
+            )
+            if section:
+                extracted["ruling_text"] = section
+        except Exception:
+            pass  # Fall through to full-text extraction
+
+    # ------------------------------------------------------------------
     # LLM extraction — secondary method for missing fields
     # ------------------------------------------------------------------
     llm_skipped = False
@@ -828,39 +857,11 @@ def _reparse_document(
             llm_skipped = True
             llm_outcome = "skipped"
         elif (missing_fields or force_llm) and text.strip():
-            # Use narrowed ruling_text from parse_document when available
-            # (#2311 — SD calendar pages contain 30+ cases; sending the
-            # full page to the LLM causes output truncation).
+            # Use narrowed ruling_text when available (#2311 — SD calendar
+            # pages contain 30+ cases; sending the full page to the LLM
+            # causes output truncation).  Narrowing already happened
+            # above for SD HTML pages regardless of LLM availability.
             llm_text = extracted.get("ruling_text") or text
-
-            # Direct narrowing for SD calendar pages that weren't handled
-            # by parse_document (e.g. rebuild-ca-san_diego scraper IDs
-            # that have no registered scraper class).
-            case_num = extracted.get("case_number")
-            if (
-                case_num
-                and llm_text == text  # Not already narrowed by parse_document
-                and doc_meta.get("county", "").lower() == "san diego"
-                and doc_format == "html"
-            ):
-                try:
-                    from courts.ca.sd_calendar import extract_case_section
-
-                    section = extract_case_section(
-                        raw_content.decode("utf-8", errors="replace"),
-                        case_num,
-                    )
-                    if section:
-                        llm_text = section
-                        # Also replace the stored ruling_text so the DB
-                        # receives the narrowed plain-text excerpt instead
-                        # of the full raw HTML page (#2381).  Without this,
-                        # ``rebuild-ca-san_diego`` documents — which have no
-                        # scraper class to call ``parse_document`` — end up
-                        # with 50KB of raw HTML as ``ruling_text``.
-                        extracted["ruling_text"] = section
-                except Exception:
-                    pass  # Fall through to full-text extraction
             # Look up county-specific max_output_tokens (#2355).
             # Large-document counties (e.g. Santa Clara, 130K+ chars)
             # need more than the default 4096 output tokens to avoid
