@@ -337,40 +337,63 @@ def test_det_validation_flag_multiple_adversarial_patterns_issue_2398_example(
 
 
 # ---------------------------------------------------------------------------
-# Tests: deterministic validation — flag (empty ruling text)
+# Tests: deterministic validation — fail (empty ruling text, #2646)
 # ---------------------------------------------------------------------------
 
 
+@patch("ingestion.worker.insert_document_and_ruling")
 @patch("ingestion.worker.insert_validation_result")
 @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
 @patch(_EXTRACT_LLM_MOCK, return_value=None)
 @patch(_SPLIT_MOCK, return_value=False)
 @patch("ingestion.worker.psycopg")
-def test_det_validation_flag_empty_ruling_text_still_writes(
+def test_det_validation_fail_empty_ruling_text_rejected(
     mock_psycopg: MagicMock,
     mock_split: MagicMock,
     mock_extract_llm: MagicMock,
     mock_resolve_judge: MagicMock,
     mock_insert_validation: MagicMock,
+    mock_insert_doc_ruling: MagicMock,
 ) -> None:
-    """Empty ruling text triggers a flag but still writes to DB."""
+    """Empty ruling text triggers a fail and skips the DB write (#2646).
+
+    Before #2646 this test asserted "flag but still writes" — the rule
+    was ``flag`` and the worker wrote the NULL-text row anyway, polluting
+    ``derived.rulings`` (19 NULL rows accumulated for Santa Clara).  The
+    rule is now ``fail`` and the worker skips the insert.
+    """
     worker, os_mock = _make_worker()
 
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
+    # upsert_court + upsert_case run before deterministic validation fires.
+    # insert_document (and therefore its (True,) fetch) never runs because
+    # the fail path returns before insert_document_and_ruling.
     mock_cur.fetchone.side_effect = [
-        ("court-uuid-1",),  # upsert_court (flag logging)
         ("court-uuid-1",),  # upsert_court (main flow)
         ("case-uuid-1",),  # upsert_case
-        (True,),  # insert_document: is_new = True
     ]
     mock_cur.rowcount = 1
 
     event = _make_event(ruling_text="")
     worker.process_event(event)
 
-    # Document was still committed to DB (flag doesn't block)
-    assert mock_conn.commit.call_count >= 1
+    # insert_document_and_ruling must NOT have been called — empty text
+    # now fails validation and the worker returns before the DB write.
+    mock_insert_doc_ruling.assert_not_called()
+
+    # A deterministic fail result with the empty-text telemetry marker
+    # was logged instead.
+    fail_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and c.kwargs["result"].result == "fail"
+        and "ruling_text is null or empty" in (c.kwargs["result"].reason or "")
+    ]
+    assert len(fail_calls) == 1
+    assert "data_quality.ruling_empty_text_dropped" in (fail_calls[0].kwargs["result"].reason or "")
 
 
 # ---------------------------------------------------------------------------
@@ -1301,3 +1324,139 @@ def test_det_validation_case_number_marker_db_error_does_not_crash(
             )
             # Should not raise despite DB error during flag logging.
             worker.process_event(event)
+
+
+# ---------------------------------------------------------------------------
+# Tests: empty-text rejection on split events (#2646)
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.worker.insert_document_and_ruling")
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DELETE_STALE_MOCK, return_value=0)
+@patch("ingestion.worker.psycopg")
+def test_det_validation_multi_case_empty_text_split_rejected(
+    mock_psycopg: MagicMock,
+    mock_delete_stale: MagicMock,
+    mock_insert_validation: MagicMock,
+    mock_insert_doc_ruling: MagicMock,
+) -> None:
+    """#2646 regression — multi-case split where one case has text and one
+    does not.  The case with text is written; the empty-text case is
+    rejected with a ``data_quality.ruling_empty_text_dropped`` telemetry
+    marker on the validation-result reason field.
+
+    Reproduces the Santa Clara failure mode: the multi-case-PDF LLM
+    extraction produces N rulings, but extraction yields no text for one
+    of them.  Before this fix the empty-text row silently reached
+    ``derived.rulings`` with NULL ``ruling_text``; after the fix the
+    worker's deterministic-validation path rejects it.  The test uses
+    the default LA event (no county-specific extractor config) so the
+    parent's ``_llm_split_document`` call honours the injected
+    ``_framework_extractor`` mock — the bug is county-agnostic so this
+    is a valid surrogate for the SC production path.
+    """
+    from ingestion.ruling_guards import ConvertedRuling
+
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # Only the first (non-empty) split needs DB fetches — the second is
+    # rejected before insert_document_and_ruling runs.  upsert_court +
+    # upsert_case are called before deterministic validation for split 0.
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court (split 0)
+        ("case-uuid-1",),  # upsert_case (split 0)
+        (True,),  # insert_document (split 0)
+        ("court-uuid-1",),  # upsert_court (split 1 — runs before det-validate)
+        ("case-uuid-2",),  # upsert_case (split 1 — runs before det-validate)
+    ]
+    mock_cur.rowcount = 1
+    # insert_document_and_ruling patched — simulate "new row" for split 0.
+    mock_insert_doc_ruling.return_value = True
+
+    # Split 0 has real text.  Split 1 has empty text — simulates the LLM
+    # extracting metadata but failing to transcribe the body for the
+    # second case in the PDF.
+    converted = [
+        ConvertedRuling(
+            document_id="split-uuid-0",
+            original_document_id="parent-uuid-1",
+            split_index=0,
+            split_count=2,
+            is_multi=True,
+            ruling_text="The motion for summary judgment is GRANTED.",
+            case_number="23CV1111",
+            case_title="Alpha v. Beta",
+            judge_name="Smith, John A.",
+            department="6",
+            motion_type="motion_for_summary_judgment",
+            outcome="granted",
+            hearing_date="2026-03-05",
+        ),
+        ConvertedRuling(
+            document_id="split-uuid-1",
+            original_document_id="parent-uuid-1",
+            split_index=1,
+            split_count=2,
+            is_multi=True,
+            ruling_text=None,  # empty — the extraction failure under test
+            case_number="23CV2222",
+            case_title="Gamma v. Delta",
+            judge_name="Smith, John A.",
+            department="6",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-05",
+        ),
+    ]
+
+    with patch(_CONVERT_MOCK, return_value=converted):
+        with patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1"):
+            # Use the default LA event so _llm_split_document takes the
+            # _get_framework_extractor() path (LA has no custom provider
+            # config), which honours the extractor_mock assigned below.
+            # County-specific configs (SC/Ventura/Fresno) route through
+            # _get_county_extractor() which is harder to mock and would
+            # return None without an API key — causing the parent to fall
+            # through to single-document processing and write the parent
+            # event's document_id instead of the split IDs.
+            extractor_mock = MagicMock()
+            extractor_mock.extract.return_value = MagicMock(rulings=[MagicMock()] * 2)
+            worker._framework_extractor = extractor_mock
+
+            event = _make_event(
+                ruling_text="Full parent-PDF text here " * 20,
+            )
+            worker.process_event(event)
+
+    # Exactly one document+ruling should have been written (the non-empty
+    # split).  The empty-text split is rejected before insert runs.
+    assert mock_insert_doc_ruling.call_count == 1, (
+        f"Expected exactly one DB write, got {mock_insert_doc_ruling.call_count}. "
+        f"The empty-text split should have been rejected by deterministic validation."
+    )
+    written_kwargs = mock_insert_doc_ruling.call_args_list[0].kwargs
+    assert written_kwargs["document_id"] == "split-uuid-0"
+    assert written_kwargs["ruling_text"] == "The motion for summary judgment is GRANTED."
+
+    # The empty-text split must produce a deterministic-validation fail
+    # record citing ruling_text_not_empty and the telemetry marker.
+    fail_calls = [
+        c
+        for c in mock_insert_validation.call_args_list
+        if c.kwargs.get("result")
+        and c.kwargs["result"].model == "deterministic"
+        and c.kwargs["result"].result == "fail"
+        and "ruling_text is null or empty" in (c.kwargs["result"].reason or "")
+    ]
+    assert len(fail_calls) == 1, (
+        f"Expected one empty-text fail record, got: "
+        f"{[c.kwargs.get('result') for c in mock_insert_validation.call_args_list]}"
+    )
+    fail_result = fail_calls[0].kwargs["result"]
+    assert "data_quality.ruling_empty_text_dropped" in (fail_result.reason or "")
+    # The fail record must be attached to the empty split's document_id,
+    # not the parent's — this is the row that would have gone to DB.
+    assert fail_calls[0].kwargs["document_id"] == "split-uuid-1"

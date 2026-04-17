@@ -1853,11 +1853,23 @@ class IngestionWorker:
                 output_tokens=0,
                 latency_ms=0,
             )
+            failed_rule_names = [r.rule for r in det_result.failed_rules]
+            # Surface a dedicated telemetry marker when the drop was driven
+            # by the empty-text rule (#2646).  This lets log-based
+            # dashboards/alerts count drops without string-matching the
+            # aggregated reason field.
+            telemetry_event = (
+                "data_quality.ruling_empty_text_dropped"
+                if "ruling_text_not_empty" in failed_rule_names
+                else None
+            )
             logger.warning(
                 "Deterministic validation FAIL — skipping DB write",
                 extra={
                     "document_id": document_id,
                     "det_reasons": det_result.reasons,
+                    "det_failed_rules": failed_rule_names,
+                    "telemetry_event": telemetry_event,
                     "county": county,
                     "case_number": case_number,
                 },

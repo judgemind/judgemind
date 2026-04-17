@@ -244,24 +244,33 @@ class TestNoMultipleAdversarialPatterns:
 
 
 class TestRulingTextNotEmpty:
-    """Tests for the ruling_text_not_empty rule."""
+    """Tests for the ruling_text_not_empty rule.
+
+    As of #2646 this rule returns ``fail`` (not ``flag``) for null/empty
+    ruling_text so the worker skips the DB write.  Previously-flagged
+    rows accumulated in ``derived.rulings`` as NULL-text ghosts, most
+    visibly for Santa Clara multi-case splits.
+    """
 
     def test_pass_has_content(self) -> None:
         result = check_ruling_text_not_empty("The motion is granted.")
         assert result.result == "pass"
 
-    def test_flag_none(self) -> None:
+    def test_fail_none(self) -> None:
         result = check_ruling_text_not_empty(None)
-        assert result.result == "flag"
+        assert result.result == "fail"
         assert "null or empty" in (result.reason or "")
+        # Includes the telemetry marker so log-based dashboards can count
+        # drops without string-matching the whole reason (#2646).
+        assert "data_quality.ruling_empty_text_dropped" in (result.reason or "")
 
-    def test_flag_empty_string(self) -> None:
+    def test_fail_empty_string(self) -> None:
         result = check_ruling_text_not_empty("")
-        assert result.result == "flag"
+        assert result.result == "fail"
 
-    def test_flag_whitespace_only(self) -> None:
+    def test_fail_whitespace_only(self) -> None:
         result = check_ruling_text_not_empty("   \n\t  ")
-        assert result.result == "flag"
+        assert result.result == "fail"
 
 
 # ---------------------------------------------------------------------------
@@ -933,12 +942,16 @@ class TestRunDeterministicRules:
         assert unknown_null[0].result == "pass"
 
     def test_flag_only(self) -> None:
-        """When only flag rules fire, overall is flag."""
-        # Note: UNKNOWN case_number WITH a real title keeps this test in the
-        # flag-only regime.  UNKNOWN + NULL title now triggers the new #2571
-        # fail rule, so we pass a title here to stay in flag-only territory.
+        """When only flag rules fire, overall is flag.
+
+        Note: since #2646 ``ruling_text=None`` now fails (not flags), so
+        this test uses a non-empty ruling_text and relies on
+        ``case_number_not_unknown`` as the sole flag trigger.  UNKNOWN
+        case_number WITH a real title keeps this in flag-only territory
+        (UNKNOWN + NULL title triggers the #2571 fail rule).
+        """
         result = run_deterministic_rules(
-            ruling_text=None,  # triggers ruling_text_not_empty flag
+            ruling_text="The motion is granted.",  # non-empty — no fail
             case_number="UNKNOWN-abc",  # triggers case_number_not_unknown flag
             case_title="Smith v. Jones",
             hearing_date=None,
@@ -946,6 +959,7 @@ class TestRunDeterministicRules:
         )
         assert result.overall == "flag"
         assert len(result.flagged_rules) >= 1
+        assert result.failed_rules == []
 
     def test_spotcheck_la_html_ruling(self) -> None:
         """LA ruling 65932ec6 — raw HTML should be caught by no_html_in_ruling_text."""
