@@ -128,7 +128,7 @@ Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 de
 
 ### One-off script convention
 
-Scripts in `scripts/` that are one-off (backfills, cleanups, fixups — intended to run once or a few times and then be archived) must include a `# one-off: true` header comment in the first 10 lines. This makes them programmatically identifiable by the `/audit` skill, which monitors `scripts/*.py` count and flags when it exceeds 35. One-off scripts that have been run and verified should be moved to `scripts/archive/` to keep the directory manageable.
+Scripts in `scripts/` that are one-off (backfills, cleanups, fixups — intended to run once or a few times and then be archived) must include a `# one-off: true` header comment in the first 50 lines. This makes them programmatically identifiable by the `/audit` skill, which monitors `scripts/*.py` count and flags when it exceeds 42 (the threshold tracks the permanent utility baseline plus a few slots for transient one-offs; see `.claude/skills/audit/SKILL.md` §1.9 and #2537). One-off scripts that have been run and verified should be moved to `scripts/archive/` to keep the directory manageable.
 
 ```python
 #!/usr/bin/env python3

@@ -200,7 +200,7 @@ Monitor the `scripts/` directory for one-off script accumulation. After #2095 ar
 Glob pattern: scripts/*.py
 ```
 
-If the count exceeds **35**, flag a finding. The current baseline is ~29 permanent utility scripts — 35 gives headroom for a few new utilities while catching accumulation of unarchived one-off scripts.
+If the count exceeds **42**, flag a finding. The permanent utility baseline has grown from ~29 (when the threshold was initially set at 35) to ~37 as new permanent checkers and tooling were added (e.g., `check-ci-job-skipped.py` from #2527, `check-script-headers.py` from #2533, plus the `phase_timer.py`, `ralph_review_log.py`, `log_ralph_review.py`, and `log_ralph_summary.py` utilities that support the task workflow). 42 gives ~5 slots of headroom above the current permanent baseline to absorb legitimately-blocked one-off scripts (e.g., `cleanup_sc_aborted_reingest_2416.py` and `cleanup_sc_failed_reingest.py`, waiting on #2454 / #2419; `patch-telegram-link-preview.py`, waiting on the upstream plugin to land `disable_web_page_preview`) without triggering a false-positive audit finding. When `#2454` and similar blockers clear, the count will drift back toward 37 and headroom is restored. Revisit this number whenever permanent utilities cross 38 — the threshold should track the real permanent baseline plus a few slots for transient one-offs. See #2537 for the rationale.
 
 2. **Missing `# one-off: true` or `# permanent: true` headers.** Use the machine-verifiable check — do not eyeball line numbers:
 
@@ -223,7 +223,7 @@ The same check runs in CI as the `script-headers-check` job and in `.githooks/pr
 #### Filing issues
 
 For script count threshold violations, file a `priority/p2` `type/chore` issue with:
-- Current count and the threshold (35).
+- Current count and the threshold (42).
 - List of scripts that appear to be one-off (by name pattern or `# one-off: true` header).
 - Suggested action: archive completed one-off scripts to `scripts/archive/`.
 
