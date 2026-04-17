@@ -11,6 +11,12 @@ on:
       # action. Changes to the shared script must trigger this deploy so the
       # fix is exercised against a real rollout on its own PR (see #2592).
       - "scripts/wait-for-rollout.sh"
+      # scripts/ecs-post-deploy-healthcheck.sh is invoked by the
+      # post-deploy-health-check job below. Same paths-filter contract as
+      # wait-for-rollout.sh — changes to the shared health-check script
+      # must trigger this deploy so regressions surface on the PR that
+      # introduces them, not on the next unrelated deploy (see #2608/#2592).
+      - "scripts/ecs-post-deploy-healthcheck.sh"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -219,147 +225,32 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Checkout (for post-deploy-healthcheck script)
+        uses: actions/checkout@v6
+
       - name: Wait for new tasks to start
         run: |
           echo "Waiting 60 seconds for new ingestion worker task to fully start..."
           sleep 60
 
-      - name: Health check — verify service is running
-        id: service-check
-        run: |
-          SERVICE_DESC=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$INGESTION_SERVICE" \
-            --query 'services[0]' \
-            --output json)
-
-          RUNNING_COUNT=$(echo "$SERVICE_DESC" | jq -r '.runningCount')
-          DESIRED_COUNT=$(echo "$SERVICE_DESC" | jq -r '.desiredCount')
-
-          echo "Running tasks: $RUNNING_COUNT / Desired: $DESIRED_COUNT"
-
-          # Treat running==desired as success. This includes the scale-to-zero
-          # case (desired=0, running=0): the dev ingestion worker is kept at
-          # desiredCount=0 and runs on-demand, so "no tasks running" is the
-          # expected steady state. Mirrors the #2585 fix in
-          # scripts/wait-for-rollout.sh (see #2605).
-          if [ "$DESIRED_COUNT" -eq 0 ] && [ "$RUNNING_COUNT" -eq 0 ]; then
-            echo "Service is scaled to zero (desired=0, running=0) — treating as healthy."
-          elif [ "$RUNNING_COUNT" -ge "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
-            echo "Service has expected number of running tasks."
-          else
-            echo "ERROR: Service running count ($RUNNING_COUNT) does not match desired ($DESIRED_COUNT)."
-            exit 1
-          fi
-
-      - name: Health check — verify no crash-loop
-        id: crash-check
-        run: |
-          # When the service is scaled to zero (desired=0), there are no tasks
-          # to inspect — no running tasks is the expected state, not a
-          # crash-loop. Skip the task inspection entirely. Mirrors the #2585
-          # fix in scripts/wait-for-rollout.sh (see #2605).
-          DESIRED_COUNT=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$INGESTION_SERVICE" \
-            --query 'services[0].desiredCount' \
-            --output text)
-
-          if [ "$DESIRED_COUNT" -eq 0 ]; then
-            echo "Service is scaled to zero (desired=0) — skipping crash-loop check (no tasks to inspect)."
-            exit 0
-          fi
-
-          # Check that the most recent task has been running for at least 30 seconds
-          # (a crash-looping container restarts quickly)
-          TASKS=$(aws ecs list-tasks \
-            --cluster "$ECS_CLUSTER" \
-            --service-name "$INGESTION_SERVICE" \
-            --desired-status RUNNING \
-            --query 'taskArns' \
-            --output json)
-
-          TASK_COUNT=$(echo "$TASKS" | jq 'length')
-
-          if [ "$TASK_COUNT" -eq 0 ]; then
-            echo "ERROR: No running tasks found for service."
-            exit 1
-          fi
-
-          FIRST_TASK=$(echo "$TASKS" | jq -r '.[0]')
-          TASK_DESC=$(aws ecs describe-tasks \
-            --cluster "$ECS_CLUSTER" \
-            --tasks "$FIRST_TASK" \
-            --query 'tasks[0]' \
-            --output json)
-
-          LAST_STATUS=$(echo "$TASK_DESC" | jq -r '.lastStatus')
-          HEALTH_STATUS=$(echo "$TASK_DESC" | jq -r '.healthStatus // "UNKNOWN"')
-
-          echo "Task status: $LAST_STATUS, health: $HEALTH_STATUS"
-
-          # Check container exit codes — if any container has stopped with non-zero, it's crash-looping
-          STOPPED_CONTAINERS=$(echo "$TASK_DESC" | jq '[.containers[] | select(.lastStatus == "STOPPED" and .exitCode != 0)] | length')
-
-          if [ "$STOPPED_CONTAINERS" -gt 0 ]; then
-            echo "ERROR: Found $STOPPED_CONTAINERS stopped containers with non-zero exit codes — possible crash-loop."
-            echo "$TASK_DESC" | jq '.containers[] | {name, lastStatus, exitCode, reason}'
-            exit 1
-          fi
-
-          echo "No crash-loop detected. Service appears healthy."
-
-      - name: Health check — verify recent log output (no errors)
-        id: log-check
-        run: |
-          # Fetch the last 20 log events from the ingestion worker
-          LOG_GROUP="/ecs/judgemind-ingestion-worker-dev"
-
-          # Get the most recent log stream
-          LATEST_STREAM=$(aws logs describe-log-streams \
-            --log-group-name "$LOG_GROUP" \
-            --order-by LastEventTime \
-            --descending \
-            --limit 1 \
-            --query 'logStreams[0].logStreamName' \
-            --output text 2>/dev/null || echo "")
-
-          if [ -z "$LATEST_STREAM" ] || [ "$LATEST_STREAM" = "None" ]; then
-            echo "WARNING: No log streams found. Service may still be starting."
-            exit 0
-          fi
-
-          echo "Checking latest log stream: $LATEST_STREAM"
-
-          # Get recent log events
-          EVENTS=$(aws logs get-log-events \
-            --log-group-name "$LOG_GROUP" \
-            --log-stream-name "$LATEST_STREAM" \
-            --limit 20 \
-            --start-from-head false \
-            --output json 2>/dev/null || echo '{"events":[]}')
-
-          EVENT_COUNT=$(echo "$EVENTS" | jq '.events | length')
-          echo "Found $EVENT_COUNT recent log events."
-
-          # Check for critical errors (not warnings or info-level mentions of "error")
-          CRITICAL_ERRORS=$(echo "$EVENTS" | jq -r '.events[].message' | grep -ic "CRITICAL\|Traceback\|InfrastructureError\|crash" || true)
-
-          if [ "$CRITICAL_ERRORS" -gt 0 ]; then
-            echo "WARNING: Found $CRITICAL_ERRORS critical error indicators in recent logs."
-            echo "Recent log events:"
-            echo "$EVENTS" | jq -r '.events[].message' | tail -10
-            # Warning only — don't fail the whole deploy for log noise
-          else
-            echo "No critical errors found in recent logs."
-          fi
+      # Post-deploy health check — delegates to the extracted, unit-tested
+      # script at scripts/ecs-post-deploy-healthcheck.sh. The extraction
+      # keeps the scale-to-zero rule (running==desired==0 treated as
+      # healthy) codified in one place so drift like #2605 cannot recur.
+      - name: Post-deploy ingestion worker health check
+        id: healthcheck
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          INGESTION_SERVICE: ${{ env.INGESTION_SERVICE }}
+          LOG_GROUP: /ecs/judgemind-ingestion-worker-dev
+        run: bash scripts/ecs-post-deploy-healthcheck.sh
 
       - name: Set health check status
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEALTH_STATUS: ${{ (steps.service-check.outcome == 'success' && steps.crash-check.outcome == 'success') && 'success' || 'failure' }}
-          HEALTH_DESC: ${{ (steps.service-check.outcome == 'success' && steps.crash-check.outcome == 'success') && 'Ingestion worker health check passed' || 'Ingestion worker health check failed' }}
+          HEALTH_STATUS: ${{ steps.healthcheck.outcome == 'success' && 'success' || 'failure' }}
+          HEALTH_DESC: ${{ steps.healthcheck.outcome == 'success' && 'Ingestion worker health check passed' || 'Ingestion worker health check failed' }}
         run: |
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
