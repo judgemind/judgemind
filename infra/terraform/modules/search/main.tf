@@ -48,6 +48,21 @@ resource "aws_security_group" "opensearch" {
 # ─── OpenSearch Domain ───────────────────────────────────────────────────────
 # Single-node t3.small.search for dev; override instance_type and
 # instance_count for production workloads.
+#
+# Note on apply_immediately semantics (see #2573, #2581):
+# Unlike `aws_db_instance` (RDS) and `aws_elasticache_cluster`, the AWS
+# provider's `aws_opensearch_domain` resource does NOT expose an
+# `apply_immediately` argument — and it does not need one. OpenSearch
+# applies user-initiated configuration changes (instance_type, instance_count,
+# ebs_options, engine_version, advanced_security_options) via a blue/green
+# deployment that starts as soon as the API call lands, not on a weekly
+# maintenance window. The `software_update_options` and Auto-Tune
+# `maintenance_schedule` blocks only govern AWS-initiated updates (minor
+# software patches and Auto-Tune's own tuning actions); they do not defer
+# terraform-managed changes. This means a dispatcher-driven `terraform apply`
+# already lands OpenSearch changes immediately without any additional
+# variable override, so the dev/production env blocks intentionally omit any
+# apply_immediately-equivalent setting here.
 
 resource "aws_opensearch_domain" "main" {
   domain_name    = "judgemind-${var.environment}"

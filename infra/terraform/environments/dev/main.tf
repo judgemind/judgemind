@@ -86,6 +86,12 @@ module "cache" {
   private_subnet_ids = module.networking.private_subnet_ids
   node_type          = "cache.t4g.micro"
   num_cache_nodes    = 1
+
+  # Dev applies node_type / engine_version / parameter-group changes on the
+  # next apply rather than deferring to the weekly ElastiCache maintenance
+  # window. Production keeps the default (false) so surprise reboots don't
+  # land during business hours. See #2573 (RDS) and #2581 (this extension).
+  apply_immediately = true
 }
 
 module "compute" {

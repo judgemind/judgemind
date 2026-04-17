@@ -35,3 +35,9 @@ variable "engine_version" {
   type        = string
   default     = "7.1"
 }
+
+variable "apply_immediately" {
+  description = "Apply ElastiCache modifications (node_type, engine_version, parameter_group_name) immediately instead of deferring to the next weekly maintenance window. Defaults to false so production-grade environments keep the safer maintenance-window behavior; set to true in dev so dispatcher-driven applies land changes on the next apply rather than waiting. See #2573 for the equivalent RDS pattern and #2581 for this extension."
+  type        = bool
+  default     = false
+}
