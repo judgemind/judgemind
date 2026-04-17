@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """check-markdown-links.py — Validate internal markdown pointers.
 
-Scans CLAUDE.md, docs/**/*.md, and .claude/skills/**/*.md for pointers to
-other markdown files and reports any that point to files that do not exist.
+Scans the agent-facing and contributor-facing Markdown surfaces for
+pointers to other markdown files and reports any that point to files
+that do not exist.  The default scan set covers:
+
+* top-level docs (CLAUDE.md, README.md, AGENTS.md, CONTRIBUTING.md)
+* docs/**/*.md
+* .claude/skills/**/*.md
+* packages/*/README.md and packages/*/docs/**/*.md
+* infra/**/*.md
+* .github/**/*.md
 
 Two link styles are checked:
 
@@ -70,8 +78,15 @@ TOP_LEVEL_MD_FILES = frozenset(
 # Glob patterns for the default scan set.
 DEFAULT_SCAN_GLOBS = (
     "CLAUDE.md",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "README.md",
     "docs/**/*.md",
     ".claude/skills/**/*.md",
+    "packages/*/README.md",
+    "packages/*/docs/**/*.md",
+    "infra/**/*.md",
+    ".github/**/*.md",
 )
 
 # ─── Regexes ────────────────────────────────────────────────────────────

@@ -836,7 +836,8 @@ jobs:
 
   # ---------------------------------------------------------------
   # Markdown link guard: internal .md pointers in CLAUDE.md, docs/,
-  # and .claude/skills/ must point to files that exist (#2425)
+  # .claude/skills/, packages/*/README.md, packages/*/docs/,
+  # infra/, and .github/ must point to files that exist (#2425, #2428)
   # ---------------------------------------------------------------
   markdown-links-check:
     runs-on: ubuntu-latest
