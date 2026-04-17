@@ -44,7 +44,7 @@ from .llm_schema import (
     ExtractionResult,
     FieldConfidence,
 )
-from .llm_utils import strip_llm_json_fences
+from .llm_utils import parse_llm_json, strip_llm_json_fences
 
 logger = structlog.get_logger(__name__)
 
@@ -1873,8 +1873,7 @@ class LlmExtractor:
         case numbers, and applies authoritative metadata overrides.
         """
         try:
-            cleaned = strip_llm_json_fences(raw_text)
-            parsed = json.loads(cleaned)
+            parsed = parse_llm_json(raw_text)
         except json.JSONDecodeError as exc:
             logger.warning(
                 "llm_extractor.json_parse_error",
@@ -2179,8 +2178,10 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
     """
     cleaned = strip_llm_json_fences(raw_text)
 
+    # ``strict=False`` tolerates unescaped control characters inside JSON
+    # string values (see #2518 and :func:`parse_llm_json`).
     try:
-        parsed = json.loads(cleaned)
+        parsed = json.loads(cleaned, strict=False)
     except json.JSONDecodeError:
         # Try to find a JSON object or array in the response.
         obj_start = cleaned.find("{")
@@ -2189,7 +2190,7 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
             obj_end = cleaned.rfind("}") + 1
             if obj_end > obj_start:
                 try:
-                    parsed = json.loads(cleaned[obj_start:obj_end])
+                    parsed = json.loads(cleaned[obj_start:obj_end], strict=False)
                 except json.JSONDecodeError:
                     parsed = None
             else:
@@ -2198,7 +2199,7 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
             arr_end = cleaned.rfind("]") + 1
             if arr_end > arr_start:
                 try:
-                    parsed = json.loads(cleaned[arr_start:arr_end])
+                    parsed = json.loads(cleaned[arr_start:arr_end], strict=False)
                 except json.JSONDecodeError:
                     parsed = None
             else:

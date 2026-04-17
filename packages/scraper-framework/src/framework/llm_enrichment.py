@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from ingestion.llm_providers import LLMResponse, call_llm
 
-from .llm_utils import strip_llm_json_fences
+from .llm_utils import parse_llm_json
 
 logger = structlog.get_logger(__name__)
 
@@ -407,8 +407,7 @@ def _parse_response(text: str) -> LlmEnrichmentResult | None:
     the expected schema.
     """
     try:
-        cleaned = strip_llm_json_fences(text)
-        data = json.loads(cleaned)
+        data = parse_llm_json(text)
     except json.JSONDecodeError:
         logger.debug("llm_enrichment.json_decode_error", text_preview=text[:200])
         return None

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from judgemind_config import DEFAULT_HAIKU_MODEL
 
-from framework.llm_utils import strip_llm_json_fences
+from framework.llm_utils import parse_llm_json
 from ingestion.llm_providers import LLMResponse, call_llm
 
 if TYPE_CHECKING:
@@ -297,8 +297,7 @@ def _parse_validation_response(
     On parse failure, returns an ``error`` result so ingestion is not blocked.
     """
     try:
-        text = strip_llm_json_fences(response.text)
-        data: dict[str, Any] = json.loads(text)
+        data: dict[str, Any] = parse_llm_json(response.text)
         result_value = data.get("result", "pass")
         reason = data.get("reason")
 
