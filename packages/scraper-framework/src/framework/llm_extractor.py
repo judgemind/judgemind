@@ -220,7 +220,11 @@ PDF_PER_PAGE_PROMPT = (
     "printed, including any letter prefix (e.g. 'C22-01971', "
     "'2024-01393434', 'CVRI2401570', '22SMCV01940', 'N25-2112'). "
     "The letter prefix (C, N, etc.) is part of the case number, not "
-    "part of the case title. Empty string if not visible.\n"
+    "part of the case title. Empty string if not visible. **Do NOT "
+    "put the case title, party names, or the word 'v.'/'vs.' in "
+    "case_number — if the PDF row shows no explicit alphanumeric "
+    "case number (many OC calendar PDFs have only a # column and a "
+    "CASE NAME column), return case_number as empty string.**\n"
     "- **case_title** (string): ONLY the party names from the case "
     "caption (e.g. 'Constantina Marquez vs. Kohl\\'s Department "
     "Stores, Inc.'). This is JUST the names — plaintiff vs. "
@@ -2269,6 +2273,25 @@ def _parse_page_rows(raw_text: str, page_index: int) -> list[dict]:
         if "case_number" in item or "case_title" in item:
             case_number = str(item.get("case_number") or "").strip()
             case_title = str(item.get("case_title") or "").strip()
+            # Sanitize bogus case_number values (#2577).
+            # The multimodal LLM sometimes copies the case title into the
+            # case_number field when the PDF has no actual case numbers —
+            # e.g. returning ``case_number="Ayala v. Castillo"`` on an OC
+            # N17/C10 calendar PDF where no case numbers are printed.  If
+            # that fused value is passed through unchanged, downstream
+            # ``_split_fused_case_info`` sees a duplicated
+            # ``"Ayala v. Castillo\nAyala v. Castillo"`` case_info, detects
+            # two "v." clauses, splits on the repeating-plaintiff tier, and
+            # produces TWO identical rulings (one with the real text, one
+            # with ``ruling_text=None``).  Reject values that don't look
+            # like a case number: if case_number matches the "v." caption
+            # pattern OR is byte-identical to case_title, discard it.
+            if case_number:
+                looks_like_case_number = bool(_CASE_NUMBER_RE.search(case_number))
+                looks_like_caption = bool(_VS_RE.search(case_number))
+                duplicates_title = case_title and case_number == case_title
+                if not looks_like_case_number and (looks_like_caption or duplicates_title):
+                    case_number = ""
             # Post-process: strip trailing artifacts from case_title.
             # The LLM sometimes appends county prefix letters, motion
             # descriptions, or cause of action text to the case title.
@@ -2605,6 +2628,17 @@ def _split_fused_case_info(case_info: str | None) -> list[str]:
     # fall back to no split to avoid losing content.
     if not sub1 or not sub2_raw:
         return [case_info]
+
+    # If sub1 and sub2 are byte-identical (or differ only in whitespace),
+    # the "fusion" is actually a duplicated line — the LLM returned the
+    # same caption twice in case_info.  Splitting would produce two
+    # identical rulings where the second silently loses its ruling_text
+    # in ``_join_page_rows``.  Return the single de-duplicated sub-case
+    # instead of a phantom split (#2577).
+    norm1 = re.sub(r"\s+", " ", sub1)
+    norm2 = re.sub(r"\s+", " ", sub2_raw)
+    if norm1 == norm2:
+        return [sub1]
 
     # Recurse on the tail to handle triple+ fusion.
     tail_parts = _split_fused_case_info(sub2_raw)
