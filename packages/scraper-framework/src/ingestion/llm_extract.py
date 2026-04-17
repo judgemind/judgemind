@@ -786,6 +786,7 @@ def extract_fields_llm(
     max_total_chars: int | None = None,
     token_tracker: TokenTracker | None = None,
     max_tokens: int = 4096,
+    bust_cache: bool = False,
 ) -> LLMExtractionResult | None:
     """Extract structured fields from a court ruling via a configurable LLM.
 
@@ -831,6 +832,11 @@ def extract_fields_llm(
             to 4096.  Counties with large documents (e.g. Santa Clara,
             130K+ chars) need a higher value (e.g. 32768) to avoid
             truncated JSON responses.
+        bust_cache: When ``True``, skip the LLM cache read.  Cache writes
+            still happen so subsequent calls without the flag benefit
+            from the fresh result.  Used by the ``--bust-llm-cache``
+            reingest flag (#2424) to force fresh LLM output after a
+            prompt change, without invalidating the cache permanently.
 
     Returns:
         An ``LLMExtractionResult`` with extracted fields, or ``None`` if
@@ -839,10 +845,12 @@ def extract_fields_llm(
     if not document_text or not document_text.strip():
         return None
 
-    # LLM result cache — check before doing any work.
+    # LLM result cache — check before doing any work.  When bust_cache
+    # is set, the cache read is skipped (but writes still happen so
+    # subsequent runs benefit from the fresh extraction).
     cache = _get_llm_cache(provider, model)
     cache_key = _compute_cache_key(document_text, metadata)
-    if cache is not None:
+    if cache is not None and not bust_cache:
         cached = cache.get(_SYSTEM_PROMPT, cache_key)
         if cached is not None:
             logger.debug("llm_extract.cache_hit", cache_key=cache_key[:12])

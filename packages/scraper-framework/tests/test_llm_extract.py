@@ -2489,3 +2489,78 @@ class TestSerializeDeserializeRoundTrip:
         # Verify it round-trips through JSON
         loaded = json.loads(body)
         assert loaded[0]["rulings"][0]["confidence"]["outcome"] == "low"
+
+
+# ---------------------------------------------------------------------------
+# #2424: --bust-llm-cache flag plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFieldsLlmBustCache:
+    """Verify bust_cache=True skips cache read but preserves cache write."""
+
+    @patch("ingestion.llm_extract._get_llm_cache")
+    @patch("ingestion.llm_extract.call_llm")
+    def test_bust_cache_skips_cache_get_calls_llm(
+        self,
+        mock_call_llm: MagicMock,
+        mock_get_cache: MagicMock,
+    ) -> None:
+        """With bust_cache=True, cache.get is NOT called and the LLM IS."""
+        cache = MagicMock()
+        cache.get.return_value = {
+            "rulings": [],
+            "case_count": 0,
+        }
+        mock_get_cache.return_value = cache
+        mock_call_llm.return_value = LLMResponse(
+            text='{"rulings": [{"case_number": "23CV001"}]}',
+            input_tokens=10,
+            output_tokens=5,
+        )
+
+        client = MagicMock()
+        result = extract_fields_llm(
+            document_text="Case No. 23CV001. Motion granted.",
+            content_format="html",
+            client=client,
+            provider="google",
+            model="gemini-2.5-flash-lite",
+            bust_cache=True,
+        )
+
+        cache.get.assert_not_called()
+        mock_call_llm.assert_called()  # LLM was actually called.
+        assert result is not None
+
+    @patch("ingestion.llm_extract._get_llm_cache")
+    @patch("ingestion.llm_extract.call_llm")
+    def test_cache_hit_honored_without_bust_cache(
+        self,
+        mock_call_llm: MagicMock,
+        mock_get_cache: MagicMock,
+    ) -> None:
+        """With bust_cache=False (default), cache.get short-circuits; the
+        LLM is NOT invoked."""
+        cache = MagicMock()
+        cache.get.return_value = [
+            {
+                "rulings": [{"case_number": "CACHED-123"}],
+                "case_count": 1,
+            }
+        ]
+        mock_get_cache.return_value = cache
+
+        client = MagicMock()
+        result = extract_fields_llm(
+            document_text="irrelevant",
+            content_format="html",
+            client=client,
+            provider="google",
+            model="gemini-2.5-flash-lite",
+            bust_cache=False,
+        )
+
+        cache.get.assert_called_once()
+        mock_call_llm.assert_not_called()
+        assert result is not None
