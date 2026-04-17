@@ -6200,6 +6200,597 @@ class TestReparseDocumentMultimodal:
         assert results[0]["parties"][1] == {"name": "Jones", "role": "defendant"}
 
 
+# ---------------------------------------------------------------------------
+# LLM enrichment tests (#2406)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyLlmEnrichment:
+    """Tests for ``_apply_llm_enrichment()`` — the post-multimodal enrichment step."""
+
+    def _make_enrichment_result(
+        self,
+        *,
+        case_title: str | None = None,
+        motion_type: str | None = None,
+        outcome: str | None = None,
+        plaintiffs: list[str] | None = None,
+        defendants: list[str] | None = None,
+    ) -> Any:
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+        return LlmEnrichmentResult(
+            case_title=case_title,
+            motion_type=motion_type,
+            outcome=outcome,
+            parties=EnrichmentParties(
+                plaintiffs=plaintiffs or [],
+                defendants=defendants or [],
+            ),
+        )
+
+    def _make_extracted(
+        self,
+        *,
+        ruling_text: str | None = "The motion is GRANTED.",
+        outcome: str | None = None,
+        motion_type: str | None = None,
+        case_title: str | None = None,
+        parties: list | None = None,
+    ) -> dict:
+        return {
+            "ruling_text": ruling_text,
+            "case_number": "30-2024-01234567",
+            "case_title": case_title,
+            "case_type": None,
+            "judge_name": "Judge Smith",
+            "outcome": outcome,
+            "motion_type": motion_type,
+            "department": "C1",
+            "parties": parties if parties is not None else [],
+            "hearing_date": date(2026, 3, 5),
+            "extraction_methods": {"_all": "multimodal"},
+            "llm_skipped": False,
+            "llm_outcome": "multimodal_success",
+            "ruling_index": 0,
+            "split_document_id": "test-doc-id",
+            "is_split": False,
+        }
+
+    def test_populates_missing_enrichment_fields(self) -> None:
+        """Enrichment fills outcome, motion_type, case_title, parties when absent."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        enrichment = self._make_enrichment_result(
+            case_title="Smith v. Jones",
+            motion_type="msj",
+            outcome="granted",
+            plaintiffs=["Smith"],
+            defendants=["Jones"],
+        )
+
+        with patch.object(reingest, "enrich_ruling", return_value=enrichment) as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model="gemini-2.0-flash-lite",
+                document_id="doc-1",
+            )
+
+        mock_enrich.assert_called_once()
+        call_kwargs = mock_enrich.call_args.kwargs
+        assert call_kwargs["provider"] == "google"
+        assert call_kwargs["model"] == "gemini-2.0-flash-lite"
+        assert call_kwargs["client"] is mock_client
+        assert extracted["outcome"] == "granted"
+        assert extracted["motion_type"] == "msj"
+        assert extracted["case_title"] == "Smith v. Jones"
+        assert extracted["parties"] == [
+            {"name": "Smith", "role": "plaintiff"},
+            {"name": "Jones", "role": "defendant"},
+        ]
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment"
+        assert methods["motion_type"] == "llm_enrichment"
+        assert methods["case_title"] == "llm_enrichment"
+        assert methods["parties"] == "llm_enrichment"
+
+    def test_does_not_overwrite_existing_fields(self) -> None:
+        """Pre-populated fields must not be replaced by enrichment."""
+        extracted = self._make_extracted(
+            outcome="denied",
+            motion_type="demurrer",
+            case_title="Existing v. Title",
+            parties=[{"name": "Prev", "role": "plaintiff"}],
+        )
+        mock_client = MagicMock()
+        enrichment = self._make_enrichment_result(
+            case_title="SHOULD NOT WIN",
+            motion_type="msj",
+            outcome="granted",
+            plaintiffs=["New"],
+            defendants=["Party"],
+        )
+
+        with patch.object(reingest, "enrich_ruling", return_value=enrichment):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        assert extracted["outcome"] == "denied"
+        assert extracted["motion_type"] == "demurrer"
+        assert extracted["case_title"] == "Existing v. Title"
+        assert extracted["parties"] == [{"name": "Prev", "role": "plaintiff"}]
+        methods = extracted["extraction_methods"]
+        assert "outcome" not in methods
+        assert "motion_type" not in methods
+        assert "case_title" not in methods
+        assert "parties" not in methods
+
+    def test_skipped_when_all_fields_present(self) -> None:
+        """enrich_ruling is not called if no enrichment is needed."""
+        extracted = self._make_extracted(
+            outcome="granted",
+            motion_type="msj",
+            case_title="Smith v. Jones",
+            parties=[{"name": "Smith", "role": "plaintiff"}],
+        )
+        mock_client = MagicMock()
+
+        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        mock_enrich.assert_not_called()
+
+    def test_skipped_when_ruling_text_empty(self) -> None:
+        """Cross-contamination guard result (None text) must not trigger enrichment."""
+        extracted = self._make_extracted(ruling_text=None)
+        mock_client = MagicMock()
+
+        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        mock_enrich.assert_not_called()
+
+    def test_skipped_when_ruling_text_whitespace(self) -> None:
+        """Whitespace-only text must not trigger enrichment."""
+        extracted = self._make_extracted(ruling_text="   \n\t  ")
+        mock_client = MagicMock()
+
+        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        mock_enrich.assert_not_called()
+
+    def test_skipped_when_no_llm_client(self) -> None:
+        """Regex-only mode (no client) must not attempt enrichment."""
+        extracted = self._make_extracted()
+
+        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=None,
+                llm_provider=None,
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        mock_enrich.assert_not_called()
+        assert extracted["outcome"] is None
+        assert extracted["motion_type"] is None
+
+    def test_llm_returns_none_does_not_raise(self) -> None:
+        """LLM API failure (enrich_ruling returns None) is handled gracefully."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+
+        with patch.object(reingest, "enrich_ruling", return_value=None):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        assert extracted["outcome"] is None
+        assert extracted["motion_type"] is None
+
+    def test_llm_exception_does_not_raise(self) -> None:
+        """Unexpected exceptions from enrich_ruling are caught and logged."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+
+        with patch.object(reingest, "enrich_ruling", side_effect=RuntimeError("boom")):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        assert extracted["outcome"] is None
+        assert extracted["motion_type"] is None
+        # The extraction_methods dict should be unmodified by the failed call.
+        assert extracted["extraction_methods"] == {"_all": "multimodal"}
+
+    def test_defaults_provider_to_google(self) -> None:
+        """A None provider is normalized to 'google'."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        enrichment = self._make_enrichment_result(outcome="granted")
+
+        with patch.object(reingest, "enrich_ruling", return_value=enrichment) as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider=None,
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        assert mock_enrich.call_args.kwargs["provider"] == "google"
+
+    def test_partial_enrichment_merges_only_missing(self) -> None:
+        """When enrichment returns only some fields, only those get set."""
+        extracted = self._make_extracted(motion_type="demurrer")
+        mock_client = MagicMock()
+        enrichment = self._make_enrichment_result(
+            outcome="granted",
+            motion_type="msj",  # Ignored — motion_type already set.
+            case_title="Smith v. Jones",
+            # No parties extracted.
+        )
+
+        with patch.object(reingest, "enrich_ruling", return_value=enrichment):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-1",
+            )
+
+        assert extracted["outcome"] == "granted"
+        assert extracted["motion_type"] == "demurrer"  # Not overwritten.
+        assert extracted["case_title"] == "Smith v. Jones"
+        assert extracted["parties"] == []
+        methods = extracted["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment"
+        assert methods["case_title"] == "llm_enrichment"
+        assert "motion_type" not in methods
+        assert "parties" not in methods
+
+
+class TestReparseMultimodalCallsEnrichment:
+    """Integration: ``_reparse_document_multimodal`` wires enrichment in (#2406)."""
+
+    def _make_doc_meta(self, doc_id: str = "test-doc-id") -> dict:
+        return {
+            "document_id": doc_id,
+            "state": "CA",
+            "county": "Orange",
+            "court_name": "Orange County Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": datetime(2026, 3, 1, 10, 0, 0),
+            "content_hash": "abc123hash",
+            "format": "pdf",
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": date(2026, 3, 5),
+            "court_id": "court-id-1",
+            "scraper_id": "ca-oc-tentatives-civil",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+
+    def test_enrichment_called_for_each_ruling_with_text(self) -> None:
+        """After multimodal transcription, enrich_ruling is called for each ruling."""
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        # Simulate an extractor without its own pre-initialized internal
+        # client -- forces the enrichment fallback to the shared text-path
+        # llm_client.  See #2406 adversarial review.
+        mock_extractor._client = None
+        mock_extractor._provider = None
+        mock_extractor._model = None
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                extracted_case_title="Smith v. Jones",
+                ruling_text="The motion for summary judgment is GRANTED.",
+            ),
+        ]
+        mock_llm_client = MagicMock()
+        enrichment_result = LlmEnrichmentResult(
+            case_title="Smith v. Jones",
+            motion_type="msj",
+            outcome="granted",
+            parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+        )
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling", return_value=enrichment_result) as mock_enrich,
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=mock_llm_client,
+                llm_provider="google",
+                llm_model="gemini-2.0-flash-lite",
+            )
+
+        # enrich_ruling must have been called with the multimodal ruling_text.
+        mock_enrich.assert_called_once()
+        call_kwargs = mock_enrich.call_args.kwargs
+        call_args = mock_enrich.call_args.args
+        called_text = call_args[0] if call_args else call_kwargs.get("ruling_text")
+        assert called_text == "The motion for summary judgment is GRANTED."
+        # With no extractor-internal client, the shared llm_client is used.
+        assert call_kwargs["client"] is mock_llm_client
+
+        # The returned ruling has enrichment fields populated.
+        assert len(results) == 1
+        assert results[0]["outcome"] == "granted"
+        assert results[0]["motion_type"] == "msj"
+        assert results[0]["case_title"] == "Smith v. Jones"
+        assert results[0]["parties"] == [
+            {"name": "Smith", "role": "plaintiff"},
+            {"name": "Jones", "role": "defendant"},
+        ]
+        methods = results[0]["extraction_methods"]
+        assert methods["outcome"] == "llm_enrichment"
+        assert methods["motion_type"] == "llm_enrichment"
+
+    def test_enrichment_called_per_ruling_on_multi_ruling_pdf(self) -> None:
+        """Each split ruling in a multi-case PDF goes through enrichment."""
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                ruling_text="Motion GRANTED.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000002",
+                ruling_text="Motion DENIED.",
+            ),
+        ]
+        mock_llm_client = MagicMock()
+
+        def fake_enrich(ruling_text: str, **_: object) -> LlmEnrichmentResult:
+            if "GRANTED" in ruling_text:
+                return LlmEnrichmentResult(
+                    outcome="granted",
+                    motion_type="msj",
+                    parties=EnrichmentParties(),
+                )
+            return LlmEnrichmentResult(
+                outcome="denied",
+                motion_type="mtd",
+                parties=EnrichmentParties(),
+            )
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling", side_effect=fake_enrich) as mock_enrich,
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=mock_llm_client,
+                llm_provider="google",
+            )
+
+        assert mock_enrich.call_count == 2
+        assert len(results) == 2
+        assert results[0]["outcome"] == "granted"
+        assert results[0]["motion_type"] == "msj"
+        assert results[1]["outcome"] == "denied"
+        assert results[1]["motion_type"] == "mtd"
+
+    def test_enrichment_skipped_without_llm_client(self) -> None:
+        """Regex-only mode (no llm_client, no extractor client) skips enrichment."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        # Simulate --no-llm mode: no extractor-internal client either.
+        mock_extractor._client = None
+        mock_extractor._provider = None
+        mock_extractor._model = None
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                ruling_text="Motion GRANTED.",
+            ),
+        ]
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling") as mock_enrich,
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=None,
+            )
+
+        mock_enrich.assert_not_called()
+        assert len(results) == 1
+        # outcome stays None — regex-only mode.
+        assert results[0]["outcome"] is None
+
+    def test_enrichment_skipped_on_empty_ruling_text(self) -> None:
+        """Rulings whose text was nulled by cross-contamination guard skip enrichment."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        # Multi-ruling document where the 2nd ruling has empty text.
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                ruling_text="Motion GRANTED.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000002",
+                ruling_text=None,
+            ),
+        ]
+        mock_llm_client = MagicMock()
+
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+        enrichment_result = LlmEnrichmentResult(
+            outcome="granted",
+            motion_type="msj",
+            parties=EnrichmentParties(),
+        )
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling", return_value=enrichment_result) as mock_enrich,
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=mock_llm_client,
+                llm_provider="google",
+            )
+
+        # enrich_ruling called only once — for the ruling with text.
+        assert mock_enrich.call_count == 1
+        assert len(results) == 2
+        assert results[0]["outcome"] == "granted"
+        assert results[1]["outcome"] is None  # Text nulled by guard, enrichment skipped.
+
+    def test_enrichment_failure_does_not_break_pipeline(self) -> None:
+        """If enrich_ruling returns None, the ruling is still produced successfully."""
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                ruling_text="Motion GRANTED.",
+            ),
+        ]
+        mock_llm_client = MagicMock()
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling", return_value=None),
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=mock_llm_client,
+                llm_provider="google",
+            )
+
+        assert len(results) == 1
+        # The pipeline still produces a ruling, just with no enrichment fields.
+        assert results[0]["ruling_text"] == "Motion GRANTED."
+        assert results[0]["outcome"] is None
+
+    def test_enrichment_reuses_multimodal_extractor_client(self) -> None:
+        """When the multimodal extractor has its own client, enrichment reuses it.
+
+        Regression for #2406 adversarial review: the issue requires that
+        enrichment share the same LLM client/provider/model as the
+        multimodal transcription for connection reuse and LLM family
+        consistency.
+        """
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        extractor_client = MagicMock(name="extractor_internal_client")
+        mock_extractor = MagicMock()
+        mock_extractor._client = extractor_client
+        mock_extractor._provider = "google"
+        mock_extractor._model = "gemini-2.5-flash-lite"
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00000001",
+                ruling_text="Motion GRANTED.",
+            ),
+        ]
+        different_llm_client = MagicMock(name="shared_text_path_client")
+
+        enrichment_result = LlmEnrichmentResult(
+            outcome="granted",
+            motion_type="msj",
+            parties=EnrichmentParties(),
+        )
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling", return_value=enrichment_result) as mock_enrich,
+        ):
+            reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=different_llm_client,
+                llm_provider="anthropic",
+                llm_model="claude-haiku",
+            )
+
+        mock_enrich.assert_called_once()
+        call_kwargs = mock_enrich.call_args.kwargs
+        # The extractor's internal client / provider / model win over
+        # the text-path args -- this keeps transcription and enrichment
+        # on the same LLM family (#2406).
+        assert call_kwargs["client"] is extractor_client
+        assert call_kwargs["provider"] == "google"
+        assert call_kwargs["model"] == "gemini-2.5-flash-lite"
+
+
 class TestReingestBatchMultimodal:
     """Tests for reingest_batch with multimodal extraction enabled."""
 

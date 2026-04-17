@@ -2084,3 +2084,140 @@ class TestS3PdfDownloadInProcessEvent:
 
         # S3 should NOT be called for HTML content
         worker._s3_client.get_object.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Regression: multimodal split events still trigger LLM enrichment (#2406)
+# ---------------------------------------------------------------------------
+
+
+class TestMultimodalSplitEnrichment:
+    """Regression tests for #2406.
+
+    When the live worker processes a multimodal-derived split event
+    (``_llm_extracted=True``) with empty ``outcome``/``motion_type``, it MUST
+    call ``_llm_enrich_fields`` and apply the returned enrichment values.
+
+    The per-field LLM call (``extract_fields_llm``) is intentionally skipped
+    when ``_llm_extracted`` is set, because the transcription pipeline
+    already produced the base fields.  But that skip must NOT extend to
+    enrichment, which is responsible for outcome/motion_type/case_title/
+    parties per ``architecture-spec-v1.md`` §5.2.1.
+    """
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_split_event_triggers_enrichment(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """A split event with _llm_extracted=True and null outcome gets enriched."""
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        # Simulate a split event from the multimodal transcription path:
+        # ruling_text is present, but enrichment fields are empty.
+        split_event = _make_event(
+            ruling_text="The motion for summary judgment is GRANTED.",
+            case_number="30-2024-01234567",
+            _split_processed=True,
+            _llm_extracted=True,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+        )
+
+        enrichment_result = LlmEnrichmentResult(
+            case_title="Smith v. Jones",
+            motion_type="msj",
+            outcome="granted",
+            parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+        )
+
+        with patch.object(
+            worker,
+            "_llm_enrich_fields",
+            return_value=enrichment_result,
+        ) as mock_enrich:
+            worker.process_event(split_event)
+
+        # Enrichment must have been called despite _llm_extracted=True.
+        mock_enrich.assert_called_once()
+        # The ruling_text argument (first positional or keyword) must match.
+        args, kwargs = mock_enrich.call_args
+        called_text = args[0] if args else kwargs.get("ruling_text")
+        assert called_text == "The motion for summary judgment is GRANTED."
+
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_extracted_split_event_applies_enrichment_to_ruling_record(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+    ) -> None:
+        """The enrichment result is applied to the persisted ruling record."""
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+        worker, _ = _make_worker()
+        mock_conn, mock_cur = _make_mock_conn()
+        mock_psycopg.connect.return_value = mock_conn
+        mock_cur.fetchone.side_effect = [
+            ("court-uuid-1",),
+            ("case-uuid-1",),
+            (True,),
+        ]
+
+        split_event = _make_event(
+            ruling_text="The motion is GRANTED.",
+            case_number="30-2024-01234567",
+            _split_processed=True,
+            _llm_extracted=True,
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+        )
+
+        enrichment_result = LlmEnrichmentResult(
+            case_title="Smith v. Jones",
+            motion_type="msj",
+            outcome="granted",
+            parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+        )
+
+        with (
+            patch.object(
+                worker,
+                "_llm_enrich_fields",
+                return_value=enrichment_result,
+            ),
+            patch("ingestion.worker.insert_document_and_ruling") as mock_insert,
+            patch(
+                "ingestion.worker.upsert_case_returning_title",
+                return_value=("case-uuid-1", "Smith v. Jones"),
+            ) as mock_upsert_case,
+        ):
+            worker.process_event(split_event)
+
+        # insert_document_and_ruling receives the enriched outcome/motion_type.
+        assert mock_insert.called
+        insert_kwargs = mock_insert.call_args.kwargs
+        assert insert_kwargs.get("outcome") == "granted"
+        assert insert_kwargs.get("motion_type") == "msj"
+
+        # upsert_case_returning_title receives the enriched case_title.
+        assert mock_upsert_case.called
+        upsert_kwargs = mock_upsert_case.call_args.kwargs
+        assert upsert_kwargs.get("case_title") == "Smith v. Jones"
