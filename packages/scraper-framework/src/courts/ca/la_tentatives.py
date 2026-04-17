@@ -154,6 +154,20 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 # Judge name: "<div>William A. Crowfoot Judge of the Superior Court</div>"
 _JUDGE_DIV_RE = re.compile(r"(.+?)\s+Judge of the Superior Court", re.DOTALL)
 
+# Judge name: "JUDGE/DEPT:  Mkrtchyan/25" form-layout header (Dept 25 pattern, #2578).
+# Some LA dept pages print the presiding judge as a surname followed by a
+# slash and the department identifier in a header row.  The surname may be
+# a single word (Mkrtchyan) or a compound (Van Der Berg, O'Connor, etc.).
+# We stop at the first "/" that precedes a short dept token (letters + digits,
+# typically <=8 chars), so "O'Connor/25" and "Van Der Berg/F46" both match
+# cleanly without swallowing unrelated trailing text.
+_JUDGE_DEPT_RE = re.compile(
+    r"JUDGE\s*/\s*DEPT\s*:\s*"
+    r"(?P<name>[A-Za-z][A-Za-z\-\'\. ]*?)"
+    r"\s*/\s*[A-Za-z0-9]{1,8}\b",
+    re.IGNORECASE,
+)
+
 # Case title extraction from party caption block.
 # The party section text typically looks like:
 #   "SUMAYYA AASI, et al.,\n  Plaintiff(s),\n  vs.\n  AMERICAN HONDA...,\n  Defendant(s)."
@@ -752,6 +766,11 @@ def _sanitize_title(
         return None
 
     title = raw_title
+
+    # Strip U+00BF inverted question mark — the LA clerk's Word-to-HTML export
+    # injects literal "¿" in place of soft hyphens or non-breaking spaces,
+    # leaking into titles as e.g. "Company, Inc.¿" (#2578).
+    title = title.replace("\u00bf", "")
 
     # Normalize "vs.", "vs", "V." etc. to " v. " so splitting works consistently.
     title = re.sub(r"\s+[Vv][Ss]?\.?\s+", " v. ", title)
@@ -1620,16 +1639,24 @@ def _extract_ruling_fields(soup: BeautifulSoup, doc: CapturedDocument) -> None:
     # Party extraction
     doc.parties = _extract_parties(content)
 
-    # Judge name from the signature div
-    for div in content.find_all("div"):
-        div_text = div.get_text(separator=" ", strip=True)
-        m = _JUDGE_DIV_RE.match(div_text)
-        if m:
-            # Normalize whitespace in name
-            doc.judge_name = " ".join(m.group(1).split())
-            break
+    # Judge name — strategy 1: "JUDGE/DEPT: <Surname>/<dept>" form-layout
+    # header (Dept 25 Mkrtchyan pattern, #2578).  This is a compact form-style
+    # header that the signature-line regex below never matches.
+    judge_dept_match = _JUDGE_DEPT_RE.search(full_text)
+    if judge_dept_match:
+        doc.judge_name = " ".join(judge_dept_match.group("name").split())
 
-    # Fallback: use the broader regex patterns from extract.py
+    # Judge name — strategy 2: "<X> Judge of the Superior Court" signature div.
+    if not doc.judge_name:
+        for div in content.find_all("div"):
+            div_text = div.get_text(separator=" ", strip=True)
+            m = _JUDGE_DIV_RE.match(div_text)
+            if m:
+                # Normalize whitespace in name
+                doc.judge_name = " ".join(m.group(1).split())
+                break
+
+    # Judge name — strategy 3 (fallback): broader regex patterns from extract.py.
     if not doc.judge_name and doc.ruling_text:
         from ingestion.extract import extract_judge_name
 

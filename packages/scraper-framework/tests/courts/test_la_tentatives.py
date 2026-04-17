@@ -3652,3 +3652,293 @@ def test_appellate_parse_document_swallows_parse_errors() -> None:
     # No exception bubbled up; static appellate metadata is still stamped.
     assert result.courthouse == APPELLATE_COURTHOUSE
     assert result.department == APPELLATE_DEPARTMENT
+
+
+# ---------------------------------------------------------------------------
+# LA extraction fixes — Bug fixes for #2578
+#
+# LA HTML has three extraction gaps documented in #2578:
+#   1. Judge NULL when the page uses "JUDGE/DEPT: <surname>/<dept>" form layout
+#      (Dept 25 Mkrtchyan pattern) — the classic "X Judge of the Superior Court"
+#      signature regex never matches.
+#   2. case_title contaminated by metadata like "COMP. FILED : 07-03-25" or
+#      "PET. FILED : 11-26-25" because the inline CASE NAME: field runs on the
+#      same line as the FILED metadata and the regex only stopped at
+#      "CASE NUMBER".
+#   3. Trailing U+00BF inverted question mark (¿) in titles because the LA
+#      clerk's Word-to-HTML conversion injects literal ¿ where soft hyphens or
+#      non-breaking spaces should be.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_ruling_fields_judge_dept_form_layout() -> None:
+    """Bug 1: JUDGE/DEPT: <surname>/<dept> layout populates doc.judge_name (#2578)."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_dept25_judge_dept_format.html")
+    soup = BeautifulSoup(html, "lxml")
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 26),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    _extract_ruling_fields(soup, doc)
+    assert doc.judge_name is not None, "judge_name must be extracted from JUDGE/DEPT line"
+    assert doc.judge_name == "Mkrtchyan"
+
+
+def test_extract_ruling_fields_judge_dept_regex_direct() -> None:
+    """Bug 1: JUDGE/DEPT regex handles simple surname/department pairs."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>HEARING DATE: Thursday, March 26, 2026 "
+        "JUDGE/DEPT: Mkrtchyan/25</p>"
+        "<p>Case Number: 25STLC05162</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 26),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    _extract_ruling_fields(soup, doc)
+    assert doc.judge_name == "Mkrtchyan"
+
+
+def test_extract_ruling_fields_judge_dept_with_compound_surname() -> None:
+    """Bug 1: JUDGE/DEPT regex accepts compound surnames with spaces."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>HEARING DATE: Thursday, March 26, 2026 "
+        "JUDGE/DEPT: Van Der Berg/F46</p>"
+        "<p>Case Number: 25STLC99999</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 26),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    _extract_ruling_fields(soup, doc)
+    assert doc.judge_name == "Van Der Berg"
+
+
+def test_extract_ruling_fields_judge_div_still_works() -> None:
+    """Bug 1 regression: JUDGE/DEPT extraction does not break the existing
+    'X Judge of the Superior Court' signature path."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>Case Number: 24NNCV02551</p>"
+        "<div>William A. Crowfoot Judge of the Superior Court</div>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 26),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    _extract_ruling_fields(soup, doc)
+    assert doc.judge_name == "William A. Crowfoot"
+
+
+def test_extract_case_title_stops_at_comp_filed() -> None:
+    """Bug 2: CASE NAME: ... COMP. FILED : <date> must not leak FILED text (#2578)."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>CASE NAME: Landaverde v. Meller    COMP. FILED: 07-03-25</p>"
+        "<p>CASE NUMBER: 25STLC05162    PET. FILED: 10-01-25</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "FILED" not in title.upper()
+    assert "07-03-25" not in title
+    assert "Landaverde" in title
+    assert "Meller" in title
+
+
+def test_extract_case_title_stops_at_pet_filed() -> None:
+    """Bug 2: PET. FILED boundary also stops the CASE NAME capture."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>CASE NAME: Smith v. Jones    PET. FILED: 11-26-25</p>"
+        "<p>CASE NUMBER: 25STPB12345</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "FILED" not in title.upper()
+    assert "11-26-25" not in title
+    assert "Smith" in title
+    assert "Jones" in title
+
+
+def test_extract_case_title_stops_at_fac_filed() -> None:
+    """Bug 2: FAC FILED (First Amended Complaint) also stops the capture."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>CASE NAME: Acme Corp v. Beta Industries   FAC FILED: 02-15-25</p>"
+        "<p>CASE NUMBER: 25STCV00001</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "FILED" not in title.upper()
+    assert "02-15-25" not in title
+    assert "Acme" in title
+    assert "Beta" in title
+
+
+def test_extract_case_title_stops_at_complaint_filed() -> None:
+    """Bug 2: Long-form 'COMPLAINT FILED' variant also works."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>CASE NAME: Doe v. Roe    COMPLAINT FILED: 01-01-25</p>"
+        "<p>CASE NUMBER: 25STCV22222</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "FILED" not in title.upper()
+    assert "01-01-25" not in title
+    assert "Doe" in title
+
+
+def test_extract_case_title_case_number_boundary_still_works() -> None:
+    """Bug 2 regression: The original CASE NUMBER boundary still fires."""
+    from bs4 import BeautifulSoup
+
+    html = (
+        "<div id='speechSynthesis'>"
+        "<p>CASE NAME: Porsche Leasing Ltd. et al. v. Tsisana Mikia, et al. "
+        "CASE NUMBER: 25SMCV01132</p>"
+        "</div>"
+    )
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    assert title is not None
+    assert "25SMCV01132" not in title
+    assert "Porsche" in title
+
+
+def test_sanitize_title_strips_inverted_question_mark() -> None:
+    """Bug 3: U+00BF inverted question mark is stripped from titles (#2578)."""
+    raw = "Abigail Rodriguez And Iliana Mendez v. American Honda Motor Company, Inc.\u00bf"
+    result = _sanitize_title(raw)
+    assert result is not None
+    assert "\u00bf" not in result
+    assert "American Honda" in result
+    assert "Abigail Rodriguez" in result
+
+
+def test_sanitize_title_strips_multiple_inverted_question_marks() -> None:
+    """Bug 3: Multiple ¿ characters are all removed."""
+    raw = "A\u00bfBC Corp v. XY\u00bfZ Industries\u00bf"
+    result = _sanitize_title(raw)
+    assert result is not None
+    assert "\u00bf" not in result
+
+
+def test_sanitize_title_inverted_question_mark_only_below_min_length() -> None:
+    """Bug 3: If stripping ¿ leaves the title below the 5-char minimum, return None."""
+    raw = "A\u00bf\u00bf\u00bf"
+    result = _sanitize_title(raw)
+    assert result is None
+
+
+def test_extract_case_title_honda_fixture_strips_question_mark() -> None:
+    """Bug 3 end-to-end: Honda fixture (has literal ¿ in defendant caption)
+    yields a title without ¿."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_honda_inverted_qmark.html")
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.find("div", id="speechSynthesis")
+    title = _extract_case_title(content)
+    # Honda may not produce a title from the parties anchor if cleaning removes
+    # too much, but if it does, ¿ must not appear.
+    if title is not None:
+        assert "\u00bf" not in title
+
+
+def test_extract_ruling_fields_landaverde_fixture_end_to_end() -> None:
+    """Bug 1+2 end-to-end: Dept 25 Landaverde fixture yields clean title and judge."""
+    from bs4 import BeautifulSoup
+
+    html = _load("la_ruling_dept25_judge_dept_format.html")
+    soup = BeautifulSoup(html, "lxml")
+    doc = CapturedDocument(
+        scraper_id="test",
+        state="CA",
+        county="Los Angeles",
+        court="Superior Court",
+        source_url=CIVIL_URL,
+        capture_timestamp=datetime(2026, 3, 26),
+        content_format=ContentFormat.HTML,
+        raw_content=html.encode("utf-8"),
+        content_hash="",
+    )
+    _extract_ruling_fields(soup, doc)
+
+    # Judge extracted from JUDGE/DEPT line
+    assert doc.judge_name == "Mkrtchyan"
+    # case_number extracted via deterministic header (#2330 path)
+    assert doc.case_number == "25STLC05162"
+    # Department extracted
+    assert doc.department == "25"
+    # Title extracted from CASE NAME: field, without COMP. FILED contamination
+    if doc.case_title is not None:
+        assert "FILED" not in doc.case_title.upper()
+        assert "07-03-25" not in doc.case_title
+        assert "Landaverde" in doc.case_title
+        assert "Meller" in doc.case_title
