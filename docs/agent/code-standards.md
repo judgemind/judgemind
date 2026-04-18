@@ -161,6 +161,18 @@ scripts/check-ci-job-skipped.sh
 
 This detects the #2410 / #2505 footgun: a PR modifies a job body whose `if: needs.detect-changes.outputs.X == 'true'` gate's paths-filter does not match anything in the diff, so the job will be SKIPPED on that PR's own CI run and the modification is never actually exercised. The same check runs in CI as the `ci-job-skipped-check` job; the pre-push hook runs it whenever `ci.yml` is in the push. If it fails, either add `.github/workflows/ci.yml` to the offending filter (so the job always runs when ci.yml itself changes) or modify a file that already matches the filter.
 
+### Database migrations — schema drift
+
+When any file under `packages/api/migrations/` changes, regenerate `packages/api/src/data-access/schema.sql`:
+
+```
+scripts/regenerate_schema.sh
+```
+
+Then commit the updated `schema.sql` alongside the migration. `schema.sql` is auto-generated — do not edit it directly. If you prefer to verify before regenerating, run `scripts/check_schema_drift.sh` which compares `schema.sql` against a fresh migration-applied schema and exits non-zero on drift.
+
+The same check runs in CI as the `schema-drift-check` job. The pre-push hook runs it whenever a `packages/api/migrations/*.sql` file is in the push (requires Docker + a running daemon; emits a WARNING and skips if Docker is unavailable), so migration-vs-schema drift is caught locally before the ~10 minute CI round trip. See #2702.
+
 ### Subagent responsibilities
 
 Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.

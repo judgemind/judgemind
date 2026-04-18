@@ -453,6 +453,45 @@ if [ -n "$changed_markdown" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Schema drift check — run whenever packages/api/migrations/*.sql changes
+# -------------------------------------------------------------------
+# Mirrors the CI `schema-drift-check` job so `schema.sql` falling out of
+# sync with the migrations (e.g. agent added a migration but forgot to
+# run `scripts/regenerate_schema.sh`) is caught locally before the ~10
+# minute CI round trip (#2702). The check requires Docker with a running
+# postgres container — if Docker is unavailable we emit a WARNING and
+# skip, matching the pattern used for ruff/actionlint/terraform above.
+changed_migrations=$(echo "$changed_files" | grep -E '^packages/api/migrations/.+\.sql$' || true)
+if [ -n "$changed_migrations" ]; then
+    echo "pre-push: checking schema drift (packages/api/src/data-access/schema.sql vs migrations)..." >&2
+    if ! command -v docker &>/dev/null; then
+        echo "  WARNING: docker not found — skipping schema drift check" >&2
+        echo "  Install Docker Desktop to enable local schema drift checks." >&2
+    elif ! docker info &>/dev/null; then
+        echo "  WARNING: docker daemon not running — skipping schema drift check" >&2
+        echo "  Start Docker Desktop to enable local schema drift checks." >&2
+    elif [ ! -x scripts/check_schema_drift.sh ]; then
+        echo "  WARNING: scripts/check_schema_drift.sh not found or not executable — skipping" >&2
+    else
+        # Use --ci mode so the check spins up its own ephemeral postgres
+        # container rather than relying on the docker-compose stack being
+        # up. ~15s when postgres image is already cached; ~30-60s cold.
+        if ! scripts/check_schema_drift.sh --ci 2>&1; then
+            echo "" >&2
+            echo "  FAILED: scripts/check_schema_drift.sh" >&2
+            echo "  packages/api/src/data-access/schema.sql is out of sync with the" >&2
+            echo "  migrations in packages/api/migrations/." >&2
+            echo "" >&2
+            echo "  To fix: run scripts/regenerate_schema.sh" >&2
+            echo "" >&2
+            echo "  This same check runs in CI as schema-drift-check (~10 minutes" >&2
+            echo "  round trip). Catching it locally saves a full CI cycle." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Script header marker check — run whenever scripts/*.py changes
 # -------------------------------------------------------------------
 # Mirrors the CI `script-headers-check` job so one-off/permanent marker

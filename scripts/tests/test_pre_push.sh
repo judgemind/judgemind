@@ -366,6 +366,108 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 9: Migration change fires schema drift check
+# ───────────────────────────────────────────────────────────────────────
+# A push that touches packages/api/migrations/*.sql must run the
+# schema-drift check. Without Docker we should see the WARNING branch
+# (exit 0); with Docker unavailable in this scratch repo we exercise
+# the "docker not found" path, matching the pattern used for ruff /
+# actionlint / terraform missing-tool tests. See #2702.
+echo "[scenario 9] migration change + missing docker — WARNING only, hook fires"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-migration
+mkdir -p "$WORK/packages/api/migrations"
+cat > "$WORK/packages/api/migrations/0001_test.sql" <<'SQL'
+-- Up migration
+CREATE TABLE IF NOT EXISTS test_table (id SERIAL PRIMARY KEY);
+
+-- Down migration
+DROP TABLE IF EXISTS test_table;
+SQL
+git -C "$WORK" add packages/api/migrations/0001_test.sql
+git -C "$WORK" commit --quiet -m "migration: add test table"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook_without docker \
+    "refs/heads/feature-migration $feat_sha refs/heads/feature-migration $ZERO_SHA"
+
+if ! echo "$hook_out" | grep -q "checking schema drift"; then
+    report_fail "hook did NOT run schema drift check on migration push (#2702)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "WARNING: docker not found"; then
+    report_fail "expected 'WARNING: docker not found' when docker is missing" "$hook_out"
+elif [ "$hook_rc" -ne 0 ]; then
+    report_fail "missing docker should not fail push, got rc=$hook_rc" "$hook_out"
+else
+    report_pass "migration push fires schema drift check; missing docker -> WARNING only"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 10: Schema drift failure names regenerate_schema.sh verbatim
+# ───────────────────────────────────────────────────────────────────────
+# Acceptance criterion from #2702: "Failure message names the exact fix
+# (scripts/regenerate_schema.sh) verbatim." We stub check_schema_drift.sh
+# to fail and assert the hook's failure message surfaces the fix string.
+echo "[scenario 10] schema drift failure surfaces 'scripts/regenerate_schema.sh' fix text"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-drift
+mkdir -p "$WORK/packages/api/migrations" "$WORK/scripts"
+cat > "$WORK/packages/api/migrations/0001_drift.sql" <<'SQL'
+-- Up migration
+CREATE TABLE IF NOT EXISTS drift_table (id SERIAL PRIMARY KEY);
+
+-- Down migration
+DROP TABLE IF EXISTS drift_table;
+SQL
+# Stub check_schema_drift.sh: pretend docker is present and fail immediately.
+cat > "$WORK/scripts/check_schema_drift.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "=== FAIL: schema.sql has drifted from migrations ==="
+exit 1
+STUB
+chmod +x "$WORK/scripts/check_schema_drift.sh"
+# Also stub a `docker` binary on PATH that reports `docker info` success,
+# so the hook takes the "run check" branch rather than the WARNING branch.
+STUB_BIN="$TMPDIR/stub-bin"
+rm -rf "$STUB_BIN"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/docker" <<'DOCKER'
+#!/usr/bin/env bash
+# Minimal docker stub — `docker info` succeeds, anything else succeeds too.
+exit 0
+DOCKER
+chmod +x "$STUB_BIN/docker"
+# Symlink the rest of PATH so git/grep/etc still work.
+IFS=:
+for dir in $PATH; do
+    [ -d "$dir" ] || continue
+    for src in "$dir"/*; do
+        [ -e "$src" ] || continue
+        name="$(basename "$src")"
+        [ "$name" = "docker" ] && continue
+        [ -e "$STUB_BIN/$name" ] && continue
+        ln -s "$src" "$STUB_BIN/$name" 2>/dev/null || true
+    done
+done
+unset IFS
+git -C "$WORK" add packages/api/migrations/0001_drift.sql scripts/check_schema_drift.sh
+git -C "$WORK" commit --quiet -m "migration: add drift table"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+hook_out="$(cd "$WORK" && echo "refs/heads/feature-drift $feat_sha refs/heads/feature-drift $ZERO_SHA" \
+    | PATH="$STUB_BIN" "$HOOK" origin "$REMOTE" 2>&1)" \
+    && hook_rc=0 || hook_rc=$?
+
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to reject drift, exit was 0" "$hook_out"
+elif ! echo "$hook_out" | grep -q "scripts/regenerate_schema.sh"; then
+    report_fail "expected failure message to name 'scripts/regenerate_schema.sh' verbatim (#2702 AC1)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: scripts/check_schema_drift.sh"; then
+    report_fail "expected 'FAILED: scripts/check_schema_drift.sh' in output" "$hook_out"
+else
+    report_pass "hook rejects drift and names regenerate_schema.sh in the fix message"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
