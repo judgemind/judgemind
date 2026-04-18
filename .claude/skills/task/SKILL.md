@@ -12,6 +12,10 @@ Pick up one issue from the Judgemind backlog and complete it autonomously. Do no
 
 **IMPORTANT — Post-compaction recovery.** If your context was just autocompacted (your summary references "previous conversation"), you are NOT done with the task. Autocompaction preserves *what was done* but not the procedural imperative *what still needs to happen next* (see #2545). Before emitting any final report or `end_turn`, run the status-file-driven recovery check described in §A.0 (implementation tasks) or §B.0 (investigation tasks). The status file at `{repo_root}/tmp/agent-status/<agent-id>.txt` is your authoritative "where am I" anchor — re-read this SKILL.md from the section named by your current `phase` and continue. Only `phase=done`, `phase=verified`, or `phase=blocked` means stop.
 
+**IMPORTANT — MCP-first for GitHub reads.** Prefer `mcp__github__*` tools for reads (issue/PR lookup, status, files, comments, search). Keep `gh` for writes (comment, edit, create, merge, close) — the MCP server currently has no auth token so all writes fail. Keep `gh` permanently for `gh run watch`, `gh run list --workflow`, `gh pr edit --body-file`, and anything else without an MCP equivalent. Decision table: `docs/agent/github-api-access.md`. Full inventory: `docs/agent/gh-to-mcp-migration.md`.
+
+Loading a deferred MCP tool requires a one-time `ToolSearch` call to pull its schema — e.g. `ToolSearch query="select:mcp__github__get_issue,mcp__github__list_issues,mcp__github__get_pull_request,mcp__github__get_pull_request_status"`. Once loaded, the tool is callable for the rest of the session.
+
 ---
 
 ## Step 0 — Verify worktree exists
@@ -84,23 +88,29 @@ This writes `{worktree}/tmp/timing.json` with the full phase breakdown and appen
 Interpret `$ARGUMENTS` as follows:
 
 ### Empty or "next"
-List all open, unassigned `agent/ready` issues and pick the highest-priority one:
+List all open, unassigned `agent/ready` issues and pick the highest-priority one using MCP:
+
 ```
-gh issue list --repo judgemind/judgemind \
-    --label agent/ready --state open \
-    --json number,title,assignees,labels \
-    --limit 20
+mcp__github__list_issues
+  owner=judgemind repo=judgemind
+  labels=["agent/ready"] state="open" per_page=20
 ```
+
 Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. Within the same priority, prefer lower issue numbers (older issues first). Skip issues already assigned to another agent unless their worktree no longer exists in `git -C $REPO_ROOT worktree list`.
 
+MCP does not support filtering by assignee directly — filter the returned list client-side on each issue's `assignees` array.
+
 ### `#N` (e.g. `/task #42`)
-Work on that specific issue regardless of its current labels or assignment. Fetch it:
+Work on that specific issue regardless of its current labels or assignment. Fetch it via MCP:
+
 ```
-gh issue view 42 --repo judgemind/judgemind --json number,title,body,labels,assignees,comments
+mcp__github__get_issue owner=judgemind repo=judgemind issue_number=42
 ```
 
+This returns the full issue object (number, title, body, labels, assignees, state). `get_issue` does **not** embed comments — see Step 4 below for the comments fetch.
+
 ### Natural language (e.g. `/task scrapers`, `/task next perf bug`, `/task SF tentatives`)
-List `agent/ready` issues, then pick the one that best matches the description. Prefer exact label or area matches; fall back to title/body keyword matches. If multiple candidates are equally good, pick the highest-priority unassigned one. Briefly note which issue you chose and why before proceeding.
+List `agent/ready` issues with `mcp__github__list_issues` (same call as above), then pick the one that best matches the description. Prefer exact label or area matches; fall back to title/body keyword matches. If multiple candidates are equally good, pick the highest-priority unassigned one. Briefly note which issue you chose and why before proceeding.
 
 ---
 
@@ -113,7 +123,7 @@ scripts/check-issue-author.sh <issue-number>
 ```
 
 - **Exit 0 (trusted):** proceed to Step 2.
-- **Exit 1 (untrusted):** **do not work on this issue.** Remove the `agent/ready` label and add `status/triage`:
+- **Exit 1 (untrusted):** **do not work on this issue.** Remove the `agent/ready` label and add `status/triage`. Until MCP writes are authenticated, use `gh`:
   ```
   gh issue edit <N> --repo judgemind/judgemind --remove-label agent/ready --add-label status/triage
   ```
@@ -127,16 +137,18 @@ scripts/check-issue-author.sh <issue-number>
 
 ## Step 2 — Claim the issue and rename the conversation
 
-Assign it to yourself:
+Assign it to yourself (write — MCP auth currently blocked, stays on `gh`):
 ```
 gh issue edit <N> --repo judgemind/judgemind --add-assignee @me
 ```
 
-Write the claim comment to a temp file, then post it:
+Write the claim comment to a temp file, then post it (write — stays on `gh`):
 ```
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/claim_comment.txt
 ```
 Comment content: `Picking this up in {agent-id}.`
+
+Once MCP writes are unblocked (follow-up issue referenced from `docs/agent/gh-to-mcp-migration.md`), this becomes `mcp__github__update_issue` + `mcp__github__add_issue_comment` with no tmp-file preamble.
 
 **Rename this conversation** so it is identifiable in the sidebar:
 - Format: `#<N> — <short title>` (drop any `[AREA]` prefix tag from the issue title)
@@ -176,7 +188,7 @@ Mark each todo `in_progress` when you start it and `completed` when done. If a t
 
 Read the issue body thoroughly, including linked issues. Check `docs/specs/` for relevant guidance. Look at existing code for patterns — be consistent with what's already there.
 
-**Fetch issue comments for full context.** Issue comments often contain scope clarifications, additional acceptance criteria, and implementation notes from prior attempts. Fetch them:
+**Fetch issue comments for full context.** Issue comments often contain scope clarifications, additional acceptance criteria, and implementation notes from prior attempts. `mcp__github__get_issue` does not embed comments, so fetch them explicitly via `gh` (MCP has `add_issue_comment` for posting but no first-class "list comments on an issue" tool):
 
 ```
 gh issue view <N> --repo judgemind/judgemind --json number,title,body,labels,assignees,comments
@@ -250,7 +262,7 @@ Skip this for Terraform-only or docs-only tasks.
 **POST-RALPH SELF-RECOVERY GUARD:** Before proceeding to A.2b, verify that the task is genuinely incomplete by running these checks:
 1. Run `git -C {worktree} status` to confirm there are uncommitted changes (there should be — ralph implements but does not commit).
 2. Run `git -C {worktree} log --oneline -1` to see the latest commit — it should NOT contain the current issue number (the implementation hasn't been committed yet).
-3. Check whether a PR already exists for this branch: `gh pr list --repo judgemind/judgemind --head <branch-name> --json number --limit 1`. It should return an empty list (no PR yet).
+3. Check whether a PR already exists for this branch: `mcp__github__list_pull_requests owner=judgemind repo=judgemind head="judgemind:<branch-name>" per_page=1`. It should return an empty list (no PR yet).
 4. Run the authoritative recovery check: `{worktree}/scripts/check-task-recovery.sh {worktree}`. It must return exit 1 (`RESUME`). If it returns 0 (`DONE`), that means the status file shows a terminal phase you did not intend — update the status file to reflect the actual phase and re-run the check.
 
 If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.2b. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721, #2545).
@@ -287,7 +299,7 @@ Before committing or creating a PR, post a process summary comment on the GitHub
 <Any intentional exclusions or scope boundaries — what was NOT done and why>
 ```
 
-Post it:
+Post it (write — stays on `gh` until MCP writes land):
 ```
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/process_summary.txt
 ```
@@ -354,7 +366,7 @@ The **Post-deploy verification** section must include at least one concrete veri
 - [ ] N/A — no deployed component (docs/CI/tooling only)
 ```
 
-Create the PR:
+Create the PR (write — stays on `gh` until MCP writes land):
 ```
 gh pr create --repo judgemind/judgemind \
     --title "..." \
@@ -363,10 +375,13 @@ gh pr create --repo judgemind/judgemind \
 ```
 
 #### A.4 — Verify no merge conflicts
+Read merge status via MCP:
+
 ```
-gh pr view <PR-N> --repo judgemind/judgemind --json mergeable,mergeStateStatus
+mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<PR-N>
 ```
-If `mergeable` is `CONFLICTING`, rebase and resolve:
+
+Check the `mergeable` and `mergeable_state` fields in the response. If `mergeable` is `false` or `mergeable_state` is `dirty`/`unstable`, rebase and resolve:
 ```
 git -C {worktree} fetch origin main
 git -C {worktree} rebase origin/main
@@ -379,13 +394,24 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 
 **Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 1200000`** as CI runs typically take 10-25 minutes.
 
+`gh run watch` has no MCP equivalent — stays on `gh`:
+
 ```
 gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
 ```
+
+For quick status polls without watching, `mcp__github__get_pull_request_status` returns the combined check rollup in one MCP call.
+
 If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} ci-fix`. Diagnose, fix locally, push, return to A.4. On the next CI watch, increment the attempt number in the phase name (e.g. `ci-watch (2)`). Repeat until all checks pass.
 
 #### A.6 — Update the PR test plan
-Fetch the current PR body, check off the **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked in A.8 after merge and deploy. Write the updated body to `{worktree}/tmp/pr_body.txt`, then:
+Fetch the current PR body via MCP:
+
+```
+mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<PR-N>
+```
+
+Check off the **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked in A.8 after merge and deploy. Write the updated body to `{worktree}/tmp/pr_body.txt`, then (write — `gh pr edit` has no MCP equivalent, stays on `gh`):
 ```
 gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.txt
 ```
@@ -394,7 +420,7 @@ gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.
 Write status: `phase: merging`, `summary: Squash merging PR #<N>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} merging`
 
-The PR has passed the ralph loop review (A.2) and CI is green. Merge it:
+The PR has passed the ralph loop review (A.2) and CI is green. Merge it (stays on `gh` — MCP's `merge_pull_request` has no `--delete-branch` flag):
 ```
 gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 ```
@@ -418,7 +444,7 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
    - `packages/scraper-framework/` or scraper code → `deploy-scraper.yml`
    - `packages/web/` or frontend → `deploy-production.yml`
    - `infra/terraform/` → `terraform.yml`
-2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 1200000`** as deploys can take several minutes.
+2. **Run deploy watches in the foreground** — do not use `run_in_background`. **Use `timeout: 1200000`** as deploys can take several minutes. (`gh run list --workflow` and `gh run watch` have no MCP equivalent — stay on `gh`.)
    ```
    gh run list --repo judgemind/judgemind --workflow "<deploy-workflow>.yml" --branch main --limit 1 --json databaseId -q '.[0].databaseId'
    gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
@@ -463,7 +489,7 @@ If functional verification **fails**: diagnose the issue. If it's a simple fix, 
 
 After verification succeeds (or after determining the change has no deployed component), you MUST post a verification evidence comment on the issue. This is a hard gate — the task cannot proceed to A.9 without this comment.
 
-Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it:
+Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it (write — stays on `gh` until MCP writes land):
 ```
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/verification_evidence.txt
 ```
@@ -507,7 +533,7 @@ Post-deploy verification: N/A (no deployed component)
 **GATE CHECK:** Do not proceed to A.9 until the verification evidence comment has been posted. A task closed without a verification evidence comment is a workflow failure.
 
 After posting, update the PR test plan to check off the post-deploy verification items:
-1. Fetch the current PR body.
+1. Fetch the current PR body via `mcp__github__get_pull_request`.
 2. Check off the **Post-deploy verification** checkboxes.
 3. Write updated body to `{worktree}/tmp/pr_body.txt` and update with `gh pr edit --body-file`.
 
@@ -545,7 +571,7 @@ Write findings to `docs/investigations/<slug>-<YYYY-MM>.md` and/or into the issu
 
 Do not just list recommendations — **create GitHub issues** for each concrete next step so the work is tracked and can be picked up by agents. For each follow-up:
 
-- Write the issue body to `{worktree}/tmp/followup_N.txt`, then create it with `gh issue create --body-file`.
+- Write the issue body to `{worktree}/tmp/followup_N.txt`, then create it with `gh issue create --body-file` (write — stays on `gh` until MCP writes land).
 - Reference the investigation as the parent: include `Parent: #<investigation-issue>` in the body.
 - Label with appropriate area and type labels.
 - Add `agent/ready` if the issue is fully specified and ready for work. If it requires a human decision first, note that in the body and omit `agent/ready`.
@@ -572,7 +598,7 @@ Post a summary comment on the investigation issue listing the findings and linki
 
 **Close the investigation issue after posting findings.** Investigation issues are fully resolved once findings are documented and follow-up issues are filed. Leaving them open causes duplicate agent work — another agent will pick up the still-open issue and re-investigate.
 
-Write the close comment to `{worktree}/tmp/close_comment.txt`, then post and close:
+Write the close comment to `{worktree}/tmp/close_comment.txt`, then post and close (writes — stay on `gh`; `gh issue close --reason completed` has no MCP equivalent):
 ```
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/close_comment.txt
 gh issue close <N> --repo judgemind/judgemind --reason completed
@@ -623,7 +649,7 @@ Review the bug or problem you just fixed and ask:
 
 For each actionable finding from 5a and 5b:
 
-- Write the issue body to `{worktree}/tmp/retro_N.txt`, then create it with `gh issue create --body-file`.
+- Write the issue body to `{worktree}/tmp/retro_N.txt`, then create it with `gh issue create --body-file` (write — stays on `gh` until MCP writes land).
 - Label with `type/dx` (workflow improvements) or the appropriate area label (preventative measures).
 - Set priority based on impact: `priority/p1` for things that would prevent production bugs or save significant agent time across many tasks; `priority/p2` for nice-to-have workflow improvements or one-off friction. **Never set `priority/p0`** — that priority is reserved for humans.
 - Add `agent/ready` so the issue can be picked up autonomously.
@@ -660,4 +686,5 @@ Worktree cleanup is handled automatically by Claude Code when the agent exits.
 - **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
 - **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, and any data-processing script.
 - **After any context reset, run §A.0 / §B.0 recovery** — `{worktree}/scripts/check-task-recovery.sh {worktree}` is the authoritative "am I done?" check.
+- **Prefer MCP for reads** (`mcp__github__get_issue`, `get_pull_request`, `list_issues`, `list_pull_requests`, `get_pull_request_status`). Keep `gh` for writes and for workflow-run operations. See `docs/agent/github-api-access.md`.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.

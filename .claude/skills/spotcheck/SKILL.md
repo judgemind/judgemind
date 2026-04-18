@@ -26,6 +26,8 @@ Bidirectional spot-check across all active counties:
 
 **Do not ask for confirmation. Work autonomously through every step.**
 
+> **MCP vs `gh`:** use `mcp__github__list_issues` for the open-issues lookup in Step 4.1 (no `--json` enumeration, no `-q` jq — returns full typed objects). Keep `gh issue create --body-file` for new-issue writes — the MCP write path (`mcp__github__create_issue`) exists but is currently auth-blocked on this machine. See `docs/agent/github-api-access.md` for the decision rule.
+
 ---
 
 ## Step 0 — Run the one-shot spotcheck script
@@ -145,10 +147,15 @@ Check for garbled titles, missing fields, layout issues. Record in `{worktree}/t
 
 ### 4.1 — Fetch open issues
 
+Use MCP — returns full typed objects (number, title, body, labels, assignees) in one call:
+
 ```
-gh issue list --repo judgemind/judgemind --state open \
-    --label "type/bug" \
-    --json number,title,body,labels --limit 200
+mcp__github__list_issues
+  owner: "judgemind"
+  repo: "judgemind"
+  state: "open"
+  labels: ["type/bug"]
+  per_page: 200
 ```
 
 ### 4.2 — Classify findings
