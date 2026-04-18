@@ -189,6 +189,37 @@ module "ses" {
   sending_domain = "judgemind.org"
 }
 
+# Dispatcher v2 Spike 0.1 — throwaway Fargate task for testing `claude -p`.
+# See issue #2683 and docs/investigations/dispatcher-v2-spike-0.1.md. Delete
+# this module, the dispatcher_spike schema, and Dockerfile.dispatcher-spike
+# once the spike's findings are recorded and the follow-up cleanup issue lands.
+module "dispatcher_spike" {
+  source = "../../modules/dispatcher-spike"
+
+  environment                  = "dev"
+  anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
+  db_connection_secret_arn     = module.database.db_connection_secret_arn
+  # github_token_secret_arn intentionally unset — the spike's mcp_probe
+  # scenario runs without a GitHub token to observe the explicit failure
+  # mode of the github MCP server, which itself answers Open Question 2
+  # in docs/specs/dispatcher-v2-spec.md §17.
+}
+
+output "dispatcher_spike_ecr_url" {
+  description = "Spike 0.1 ECR repository URL (throwaway)."
+  value       = module.dispatcher_spike.ecr_repository_url
+}
+
+output "dispatcher_spike_task_family" {
+  description = "Spike 0.1 ECS task definition family (throwaway)."
+  value       = module.dispatcher_spike.task_definition_family
+}
+
+output "dispatcher_spike_log_group" {
+  description = "Spike 0.1 CloudWatch log group (throwaway)."
+  value       = module.dispatcher_spike.log_group_name
+}
+
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url

@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 17 migrations.
+-- Generated from 18 migrations.
 
 
 
@@ -19,6 +19,9 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 CREATE SCHEMA derived;
+
+
+CREATE SCHEMA dispatcher_spike;
 
 
 CREATE SCHEMA staging;
@@ -308,6 +311,30 @@ COMMENT ON COLUMN derived.rulings.summary IS 'Cached AI summary. Served from cac
 COMMENT ON COLUMN derived.rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
 
 
+CREATE TABLE dispatcher_spike.runs (
+    run_id bigint NOT NULL,
+    scenario text NOT NULL,
+    task_arn text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    ended_at timestamp with time zone,
+    exit_code integer,
+    stdout_tail text,
+    stderr_tail text,
+    notes text
+);
+
+
+CREATE SEQUENCE dispatcher_spike.runs_run_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher_spike.runs_run_id_seq OWNED BY dispatcher_spike.runs.run_id;
+
+
 CREATE TABLE public.alert_events (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     subscription_id uuid NOT NULL,
@@ -467,6 +494,9 @@ COMMENT ON COLUMN telemetry.validation_results.latency_ms IS 'Wall-clock time fo
 ALTER TABLE ONLY derived.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('derived.court_directory_snapshots_id_seq'::regclass);
 
 
+ALTER TABLE ONLY dispatcher_spike.runs ALTER COLUMN run_id SET DEFAULT nextval('dispatcher_spike.runs_run_id_seq'::regclass);
+
+
 ALTER TABLE ONLY telemetry.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('telemetry.data_quality_metrics_id_seq'::regclass);
 
 
@@ -548,6 +578,10 @@ ALTER TABLE ONLY derived.case_parties
 
 ALTER TABLE ONLY derived.rulings
     ADD CONSTRAINT uq_rulings_document_id UNIQUE (document_id);
+
+
+ALTER TABLE ONLY dispatcher_spike.runs
+    ADD CONSTRAINT runs_pkey PRIMARY KEY (run_id);
 
 
 ALTER TABLE ONLY public.alert_events
