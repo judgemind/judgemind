@@ -19,6 +19,7 @@ import pytest
 import respx
 
 from courts.ca.fresno_tentatives import (
+    _HREF_FILTER_RE,
     _ISSUED_BY_RE,
     _NO_RULINGS_RE,
     BASE_URL,
@@ -1390,3 +1391,113 @@ def test_base_process_document_salted_id_for_pre_split() -> None:
     parent_id = str(_uuid.uuid5(_uuid.NAMESPACE_URL, sha256_hex(b"shared-bytes-for-all-children")))
     for idx, observed in zip((3, 20, 47), ids_observed, strict=True):
         assert observed == make_split_document_id(parent_id, idx)
+
+
+# ---------------------------------------------------------------------------
+# #2644: Non-ruling admin PDF filtering via URL filename pattern
+# ---------------------------------------------------------------------------
+
+
+def test_fresno_href_filter_accepts_ruling_urls() -> None:
+    """_HREF_FILTER_RE matches legitimate tentative-ruling PDF filenames."""
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/03-10-26-dept-403.pdf") is not None
+    )
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/03-04-26-dept-403_0.pdf")
+        is not None
+    )
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/02-26-26-dept-501.pdf") is not None
+    )
+    # 2-digit department codes should also match (defensive)
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/03-10-26-dept-12.pdf") is not None
+    )
+
+
+def test_fresno_href_filter_rejects_admin_notice_urls() -> None:
+    """_HREF_FILTER_RE rejects non-ruling PDFs (e-Court transition notices, etc.)."""
+    # The real #2644 scenario: an e-Court transition notice PDF posted to
+    # the same index page as the tentative-ruling PDFs.  Its URL does not
+    # contain the "MM-DD-YY-dept-NNN" pattern.
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/eCourt-transition-notice.pdf")
+        is None
+    )
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/holiday-closure-2026.pdf") is None
+    )
+    assert _HREF_FILTER_RE.search("/system/files/tentative-rulings/we-have-moved.pdf") is None
+    # Totally unrelated paths must also be rejected.
+    assert _HREF_FILTER_RE.search("/some/other/path/admin.pdf") is None
+    # Missing department number.
+    assert _HREF_FILTER_RE.search("/system/files/tentative-rulings/03-10-26-dept-.pdf") is None
+    # Wrong extension.
+    assert (
+        _HREF_FILTER_RE.search("/system/files/tentative-rulings/03-10-26-dept-403.pdf.bak") is None
+    )
+
+
+@respx.mock
+def test_fresno_fetch_documents_skips_admin_notice_pdfs() -> None:
+    """Mixed index page with admin-notice PDFs: only ruling PDFs are captured (#2644).
+
+    The fixture ``fresno_index_with_admin_notice.html`` contains 3 ruling PDFs
+    (matching ``MM-DD-YY-dept-NNN.pdf``) and 2 admin-notice PDFs that do NOT
+    match.  After filtering, only 3 documents should be fetched — the admin
+    notices must be skipped at capture time, not emitted with all-NULL metadata.
+    """
+    from unittest.mock import patch
+
+    html = _load_html("fresno_index_with_admin_notice.html")
+    pdf_bytes = _load_bytes("fresno_403_20260310_d019042f.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+
+    # Track which URLs are actually fetched so we can assert the admin
+    # notices are never requested (capture-time filter, not download-then-drop).
+    fetched_urls: list[str] = []
+
+    def pdf_side_effect(request: httpx.Request) -> httpx.Response:
+        fetched_urls.append(str(request.url))
+        return httpx.Response(200, content=pdf_bytes)
+
+    respx.get(url__regex=r"\.pdf").mock(side_effect=pdf_side_effect)
+
+    config = fresno_default_config()
+    config.request_delay_seconds = 0
+    scraper = FresnoTentativeRulingsScraper(config=config)
+
+    # Patch _extract_pdf_text to avoid invoking pdfplumber on real bytes for
+    # every link — the test is about URL filtering, not PDF splitting.
+    with patch(
+        "courts.ca.fresno_tentatives._extract_pdf_text",
+        return_value="No Tentative Rulings for this date.",
+    ):
+        docs = scraper.fetch_documents()
+
+    # Admin notice URLs must never be fetched.
+    admin_fetches = [u for u in fetched_urls if "transition" in u or "holiday" in u]
+    assert admin_fetches == [], (
+        f"Admin notice PDFs should be filtered at capture time, but were fetched: {admin_fetches}"
+    )
+
+    # All 3 legitimate ruling PDFs should be fetched.
+    ruling_fetches = [u for u in fetched_urls if "dept-" in u]
+    assert len(ruling_fetches) == 3
+
+    # No docs should have NULL department — the filter guarantees every
+    # captured doc has a filename with a matching dept pattern.
+    for doc in docs:
+        assert doc.department is not None, (
+            f"Expected non-null department; got doc with department=None "
+            f"and filename={doc.extra.get('filename')!r}"
+        )
+
+
+def test_fresno_scraper_wires_href_filter() -> None:
+    """FresnoTentativeRulingsScraper sets href_filter_re on its PdfLinkConfig."""
+    config = fresno_default_config()
+    scraper = FresnoTentativeRulingsScraper(config=config)
+    assert scraper._pdf_config.href_filter_re is _HREF_FILTER_RE

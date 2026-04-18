@@ -73,6 +73,15 @@ class PdfLinkConfig:
     # text is a date and department is extracted from the URL filename).
     filter_by_link_text: bool = True
 
+    # Optional regex applied to the PDF URL (or its filename).  When set,
+    # links whose URL does not match are skipped before fetching.  Used by
+    # courts like Fresno where link text is uninformative but the URL
+    # filename encodes a predictable pattern (e.g. "MM-DD-YY-dept-NNN.pdf").
+    # This filters out non-ruling PDFs (e-Court transition notices, holiday
+    # closure banners, "we moved" announcements) linked from the same index
+    # page as tentative rulings (#2644).
+    href_filter_re: re.Pattern | None = None
+
     # Case number regex applied to extracted PDF text
     case_number_re: re.Pattern = field(default_factory=lambda: re.compile(r"\b\d{2}-\d{8}\b"))
 
@@ -143,6 +152,23 @@ class PdfLinkScraper(BaseScraper):
                         link_text=link_text,
                         url=href,
                         pattern=pc.link_text_re.pattern,
+                    )
+                    continue
+
+                # Filter: skip links whose URL does not match the expected
+                # filename pattern (#2644).  Used by courts where link text
+                # is uninformative (e.g. Fresno "March 10, 2026") but the URL
+                # filename follows a strict format (e.g. "dept-NNN.pdf").
+                # Non-matching URLs are e-Court transition notices, holiday
+                # closure announcements, and other admin PDFs posted to the
+                # same index page — they must be skipped to avoid emitting
+                # all-NULL-metadata noise rows.
+                if pc.href_filter_re is not None and not pc.href_filter_re.search(href):
+                    self._log.warning(
+                        "Skipping PDF link — URL does not match expected pattern",
+                        link_text=link_text,
+                        url=href,
+                        pattern=pc.href_filter_re.pattern,
                     )
                     continue
 

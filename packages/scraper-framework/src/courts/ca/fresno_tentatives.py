@@ -23,6 +23,11 @@ Link text format: date only — e.g. "March 10, 2026"
 
 PDF URL pattern: /system/files/tentative-rulings/{MM}-{DD}-{YY}-dept-{NNN}[_N].pdf
   The optional "_N" suffix (e.g. "_0") appears on revised uploads.
+  Links whose URL filename does not match this pattern are skipped at
+  capture time via ``_HREF_FILTER_RE`` — the court occasionally posts
+  non-ruling PDFs (e-Court transition notices, holiday closure
+  announcements) to the same index page, and those must not be captured
+  as rulings (#2644).
 
 PDF structure (multi-ruling, similar to Riverside):
   Page 1: boilerplate header with "Tentative Rulings for March 10, 2026\nDepartment 403"
@@ -89,6 +94,18 @@ _FILENAME_DEPT_RE = re.compile(
 # Hearing date from filename: "03-10-26-dept-403.pdf" → MM-DD-YY
 _FILENAME_DATE_RE = re.compile(
     r"^(\d{2})-(\d{2})-(\d{2})-dept-",
+)
+
+# URL filter: a legitimate Fresno tentative-ruling PDF has a filename in the
+# format "MM-DD-YY-dept-NNN[_N].pdf".  Non-ruling PDFs (e-Court transition
+# notices, holiday closure announcements, "we moved" banners) the court
+# occasionally posts to the same index page have filenames that do not
+# match this pattern (e.g. "eCourt-transition-notice.pdf").  Skipping
+# non-matching URLs at capture time prevents all-NULL-metadata noise rows
+# in derived.rulings (#2644).
+_HREF_FILTER_RE = re.compile(
+    r"/\d{2}-\d{2}-\d{2}-dept-\d{2,3}(?:_\d+)?\.pdf$",
+    re.IGNORECASE,
 )
 
 # Hearing date from PDF text: "Tentative Rulings for March 10, 2026"
@@ -493,6 +510,7 @@ class FresnoTentativeRulingsScraper(PdfLinkScraper):
             courthouse_from_dept=_fresno_courthouse,
             verify_ssl=True,
             filter_by_link_text=False,  # link text is a date, not dept/judge
+            href_filter_re=_HREF_FILTER_RE,  # #2644: skip non-ruling admin PDFs
             case_number_re=_CASE_NUMBER_RE,
         )
         super().__init__(config, pdf_config=pdf_config, **kwargs)
