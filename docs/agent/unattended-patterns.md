@@ -24,6 +24,59 @@
 
   The script uses Python's `shutil.copy2()` internally, which bypasses the platform restriction. **Do not use `cp` directly** — it may also be blocked. This pattern applies to skill definitions (`SKILL.md`), hook scripts, and any other file under `.claude/`.
 
+## MCP Servers (github, telegram)
+
+MCP ("Model Context Protocol") servers expose structured tools — e.g. `mcp__github__get_issue`, `mcp__github__create_pull_request` — that return parsed JSON instead of the ad-hoc text output from `gh`. When available, MCP is the **preferred** tool for structured reads and writes against GitHub. It is **not a global replacement** for `gh`: commands like `gh run watch`, `gh pr merge`, `gh issue create --body-file` remain the canonical path. Use the right tool for the job — MCP for structured queries, `gh` for workflow-execution plumbing and anything without an MCP equivalent.
+
+### Reachability from `/task` subagents
+
+MCP servers are configured in `~/.claude.json` at user scope (not inside the repo). The `github` server lives under `projects.<project-path>.mcpServers.github` with the `local` scope — `npx -y @modelcontextprotocol/server-github`. This config is per-user and per-project and is **not** checked into the repo; new maintainers need to add it themselves (see Setup below).
+
+**Required for subagent reachability:** after the config is in place, the Claude Code CLI must be restarted. A running CLI does not re-read `~/.claude.json` on its own, so newly-added MCP servers only propagate to subagents (`/task`, `/ralph`, `/spotcheck`, etc.) after the next CLI launch. This is the root cause of #2658 — the server was configured but the CLI had not been relaunched, so `/task` subagents saw zero `mcp__github__*` tools in their deferred-tool registry.
+
+**Verification from a subagent:**
+
+```
+ToolSearch query="select:mcp__github__get_issue" max_results=1
+```
+
+This should return the tool's JSON schema. Once loaded, call it:
+
+```
+mcp__github__get_issue owner=judgemind repo=judgemind issue_number=<N>
+```
+
+If `ToolSearch` returns no `mcp__github__*` tools, the server is not reachable from the subagent. Debug order:
+1. `claude mcp list` — does it show `github: ✓ Connected`?
+2. `claude mcp get github` — is the scope what you expect (`local` for this project, `user` for all projects)?
+3. If both look right but subagents still can't see tools, **restart the Claude CLI** — the running process likely predates the config change.
+
+### Setup on a new machine
+
+To add the `github` MCP server for this project at `local` scope (user-level, project-scoped):
+
+```
+claude mcp add github -s local -- npx -y @modelcontextprotocol/server-github
+```
+
+For `user` scope (reachable in every project), use `-s user`. For `project` scope (committed to `.mcp.json` in the repo so other maintainers inherit it), use `-s project` — but note we currently keep it at `local` scope because `.mcp.json` is not tracked in this repo.
+
+After adding, **relaunch the Claude CLI** so subagents can see the new tools.
+
+### When to prefer MCP over `gh`
+
+- **Structured reads** (`get_issue`, `get_pull_request`, `search_issues`, `list_commits`, `get_pull_request_files`, `get_pull_request_comments`) — MCP returns typed JSON, no `--json field1,field2` enumeration, no `-q` jq juggling.
+- **Structured writes** (`add_issue_comment`, `update_issue`, `create_pull_request`) — fewer quoting pitfalls than `gh` when the body contains special characters.
+
+### When to stay on `gh`
+
+- `gh run watch <id>` — MCP has no equivalent long-poll watcher.
+- `gh pr merge --squash --delete-branch` — MCP has `merge_pull_request` but the existing `gh pr merge` path is well-tested; no reason to churn.
+- Anything that reads from a body file: `gh issue create --body-file` and `gh pr create --body-file` remain the safest way to pass multi-line content without quoting issues.
+- `gh auth status`, `gh api rate_limit`, `gh secret`, workflow/label/project management — no MCP equivalents at the moment.
+
+Do **not** mandate MCP-over-`gh` globally — a wholesale migration is out of scope here (see #2678 for that separate decision). The guidance is: when an MCP tool exists and the task is a structured read or write, use MCP; otherwise stay on `gh`.
+
 ## `gh` jq Quoting (`-q` / `--jq`)
 
 The `gh` CLI accepts a `-q` / `--jq` flag to filter JSON output with a jq expression. When the jq expression contains mixed quote characters — e.g., `'"\(` or `)"'` — the consecutive `'"` or `"'` pattern at a word boundary triggers the platform's safety check for potential obfuscation. This causes a permission prompt that breaks unattended operation.
