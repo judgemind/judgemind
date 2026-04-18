@@ -10,6 +10,12 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 **Dispatcher mode is opt-in.** Interactive sessions are general-purpose by default. The user invokes `/dispatcher` when they want autonomous queue management.
 
 > **MCP-first for GitHub reads.** Prefer `mcp__github__*` tools (`list_issues`, `list_pull_requests`, `get_pull_request`, `get_pull_request_files`, `get_pull_request_status`) over `gh ... --json` for reads — no `-q` jq, no shell quoting, full typed objects. The first use in a session loads the schema via `ToolSearch query="select:mcp__github__list_issues,mcp__github__list_pull_requests,..."`. See `docs/agent/github-api-access.md` for the decision rule. Writes (`gh issue edit`, `gh issue comment`, `gh pr merge`, `gh issue create`, `gh issue close`) stay on `gh` for now — the MCP write path is blocked pending a token (see `docs/agent/gh-to-mcp-migration.md` §Write-path status).
+>
+> **MCP gotchas (read these before your first call):**
+>
+> - **Params are snake_case.** `pull_number`, `per_page`, `issue_number` — not `pullNumber`/`perPage`. camelCase gets rejected with a cryptic `Required` error on the snake_case name.
+> - **`list_issues` on a busy queue can exceed the context budget.** The per-issue payload includes full body + labels, so 50 open `agent/ready` issues can be >300 KB / >5000 lines, which errors out with "exceeds maximum allowed tokens." Use `per_page: 20` (or smaller) and paginate if needed, or fall back to `gh issue list --json number,title,labels,assignees,createdAt --label agent/ready` which returns a much tighter shape.
+> - **`get_pull_request_status` only returns legacy commit statuses** (e.g. Vercel's deploy status), **not GitHub Actions check runs.** For CI check-run status, use `mcp__github__get_pull_request` (returns `mergeable`, `mergeable_state`) and/or fall back to `gh pr view <N> --repo judgemind/judgemind --json statusCheckRollup,mergeable,mergeStateStatus`. Do not rely on `get_pull_request_status` alone to gate a merge.
 
 
 > **MCP-first for AWS reads.** Prefer `mcp__awslabs_ecs-mcp-server__ecs_resource_management` for ECS reads (`DescribeServices`, `DescribeTasks`, `ListTasks`) and `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` for ad-hoc CloudWatch Logs queries when checking deploy/scraper/ingestion health between sweeps. Load via `ToolSearch query="select:mcp__awslabs_ecs-mcp-server__ecs_resource_management,mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query"`. See `docs/agent/aws-api-access.md`. The `scripts/ecs-*.sh` wrappers stay for launch-and-stream-logs workflows; the `aws` CLI stays for writes (until Phase B), S3, secrets, and interactive Exec.
@@ -121,7 +127,7 @@ mcp__github__list_pull_requests
   per_page: 50
 ```
 
-For detailed CI status on a specific PR, use `mcp__github__get_pull_request_status`. Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
+For detailed CI status on a specific PR, use `mcp__github__get_pull_request` (for `mergeable` / `mergeable_state`) — **not** `get_pull_request_status`, which only returns legacy commit statuses (Vercel etc.) and misses GitHub Actions check runs. For the full check-run rollup, fall back to `gh pr view <N> --repo judgemind/judgemind --json statusCheckRollup,mergeable,mergeStateStatus`. Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
 
 ### 6. Initialize audit counter
 
