@@ -479,7 +479,7 @@ Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/di
 
 2. **MCP tool propagation to subprocesses.** During #2656, the `/task` Agent-tool subagent had no access to the `github` MCP server that was active in the parent session (sandbox denied `claude mcp list`; no `github_*` tools exposed). If the same limitation applies to `claude -p` subprocesses started from the daemon, tools like `github_*` in the diagnoser skill require an explicit MCP config path. **Action:** run `claude -p` from inside a container with an explicit MCP config file and verify the `github` tools are callable.
 
-3. **Worktree inside Fargate ephemeral storage** — 50GB is enough for ~5 concurrent worktrees of ~5GB each (the repo is ~1.5GB, but ralph's tmp dir grows). Is growth bounded? **Action:** measure current worktree sizes at peak.
+3. **Worktree inside Fargate ephemeral storage** — **Resolved (Spike 0.6, #2688).** Measured: 5 concurrent worktrees at typical Python workload is ~3.4 GB; realistic mixed peak (one terraform-touching agent in the mix) is ~10 GB; adversarial worst case (all 5 touching web + terraform + both Python venvs) is ~19.6 GB. 50 GB ephemeral storage gives 5× headroom on the realistic peak; 20 GB default would fit typical load but leaves no margin. `.git/objects/` is shared across worktrees (fixed 75 MB, not multiplied). Ralph tmp dir growth is bounded at sub-MB. **Decision:** keep 50 GB as spec'd (§14); no EFS; no shared venvs. See `docs/investigations/dispatcher-v2-spike-0.6.md`.
 
 4. **Cost comparison** — laptop dispatcher costs Anthropic tokens + user's time. Daemon costs tokens + ECS (~$30/mo task + CW logs) + dev DB load. Is the delta justified by self-healing? **Action:** project a month's run before building.
 
