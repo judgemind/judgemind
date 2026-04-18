@@ -591,6 +591,179 @@ def _deduplicate_ruling_texts(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: concatenated case-title truncation (#2562)
+# ---------------------------------------------------------------------------
+#
+# Santa Clara (and occasionally other multi-case-PDF counties) sometimes
+# produces an ``extracted_case_title`` that concatenates adjacent calendar
+# lines — e.g.
+#
+#   "Liangbei Wang v. NetEase, Inc., et al. Manuel Panilag v. Armando "
+#   "Contreras et al. Jin Yin, et al vs Xiaoxiao Lu, et al."
+#
+# This produces one ``ExtractedRuling`` whose ``extracted_case_title``
+# contains 2+ adversarial separators (``v.`` / ``vs.`` / bare ``vs``).  The
+# deterministic rule ``check_no_multiple_adversarial_patterns`` (#2398)
+# already flags this, but flagged rulings are still written to the DB.  To
+# prevent contaminated titles from reaching ``derived.cases``, this
+# post-processor rewrites the title in-place to keep only the first
+# ``A v. B`` caption.  It runs alongside ``_deduplicate_ruling_texts`` in
+# every code path that emits rulings: the main extractor path and both
+# cache-hit filter helpers.
+#
+# Design notes:
+#
+# * We only truncate when there are 2+ adversarial separators.  A single
+#   ``v.`` or ``vs.`` is a clean caption and is passed through.
+# * We cut at the boundary BEFORE the second separator, not at the first
+#   separator — keeping the "A v. B" caption intact (including any trailing
+#   ``, et al.`` on the defendant side).  We then trim stray boundary
+#   punctuation so the result reads as a complete caption.
+# * The truncation is deterministic (pure regex + string ops) — no LLM
+#   round-trip, safe to apply on every extraction path including cache hits.
+
+# Case-insensitive separator pattern used by the truncator.  Matches the
+# same three forms as ``_MULTI_VS_PATTERN`` in ``validation/deterministic.py``
+# so the deterministic flag rule and this truncator agree on what counts as
+# an adversarial separator:
+#   - ``v.`` + whitespace          (e.g. "Smith v. Jones")
+#   - ``vs.`` + whitespace         (e.g. "TAYLOR VS. AMAZON")
+#   - whitespace + ``vs`` + whitespace  (bare ``vs``, e.g. "Yin vs Lu")
+_TITLE_SEPARATOR_RE = re.compile(
+    r"(?:\bv\.\s|\bvs\.\s|\s+vs\s+)",
+    re.IGNORECASE,
+)
+
+
+def _truncate_concatenated_title(title: str | None) -> str | None:
+    """Return *title* truncated to its first ``A v. B`` caption (#2562).
+
+    If *title* contains fewer than 2 adversarial separators, it is returned
+    unchanged.  Otherwise, the string is split at the boundary BEFORE the
+    second caption's plaintiff, and everything from that boundary onward
+    is dropped.
+
+    The heuristic:
+
+    1. Find all separator match spans using ``_TITLE_SEPARATOR_RE``.  If
+       there are 0 or 1 matches, return *title* unchanged — the caller
+       already has a clean (or obviously-missing) caption.
+    2. The first match anchors the first caption.  Between the end of the
+       first separator and the start of the second separator sits the
+       first caption's defendant + the second caption's plaintiff (fused
+       by the LLM).  Walk this middle region to find the natural
+       boundary, in priority order:
+       - a trailing ``et al.`` / ``et al`` / ``et. al.`` token — cut
+         immediately after it
+       - a sentence-terminating ``.``, ``!``, or ``?`` followed by
+         whitespace — cut after the terminator
+       - otherwise, walk LEFT from the second separator over whitespace
+         and one non-whitespace token (the second caption's plaintiff
+         name, e.g. "Doe" in ``"Jones Doe v. Roe"``), and cut at the
+         resulting position.  This keeps the first caption's defendant
+         intact.
+    3. Strip trailing whitespace and any stray boundary punctuation
+       (``,``/``;``/``:``) so the result reads as a single caption.
+
+    ``None`` and empty/whitespace-only strings are returned unchanged.
+    """
+    if title is None:
+        return None
+    if not title.strip():
+        return title
+
+    matches = list(_TITLE_SEPARATOR_RE.finditer(title))
+    if len(matches) < 2:
+        return title
+
+    first_end = matches[0].end()
+    second_start = matches[1].start()
+    # The fused region between the end of the first separator and the
+    # start of the second separator.  This region contains the first
+    # caption's defendant name followed by the second caption's plaintiff
+    # name, with no delimiter.
+    middle = title[first_end:second_start]
+
+    # Priority 1: ``et al`` anchor inside the fused region.  Cut after
+    # the last ``et al`` occurrence — this keeps the full first-caption
+    # defendant (including ``, et al.``) and strips the fused plaintiff
+    # that follows.
+    boundary_re = re.compile(r"\bet\.?\s*al\.?", re.IGNORECASE)
+    anchor_match: re.Match[str] | None = None
+    for anchor in boundary_re.finditer(middle):
+        anchor_match = anchor  # keep the last occurrence within `middle`
+    if anchor_match is not None:
+        cut = first_end + anchor_match.end()
+        result = title[:cut]
+    else:
+        # Priority 2: sentence terminator followed by whitespace inside
+        # the fused region.  Cut after the terminator.
+        terminator_re = re.compile(r"[.!?]\s+")
+        terminator_match: re.Match[str] | None = None
+        for t in terminator_re.finditer(middle):
+            terminator_match = t
+        if terminator_match is not None:
+            cut = first_end + terminator_match.start() + 1
+            result = title[:cut]
+        else:
+            # Priority 3: strip the trailing token in `middle`.  That
+            # token is the second caption's plaintiff name that was
+            # fused onto the end of the first caption's defendant.
+            stripped_middle = middle.rstrip()
+            # Find the last whitespace boundary in the stripped middle.
+            # Everything AFTER that boundary is the second caption's
+            # plaintiff name — strip it off.
+            ws_iter = list(re.finditer(r"\s+", stripped_middle))
+            if ws_iter:
+                last_ws = ws_iter[-1]
+                # Cut at the start of the final whitespace run.
+                cut = first_end + last_ws.start()
+                result = title[:cut]
+            else:
+                # The fused region is a single token (e.g. "B Doe"
+                # would split; "BDoe" would not).  Fall back to keeping
+                # only the first-separator + no defendant — this is the
+                # degenerate case and is rare in real data.
+                result = title[:first_end].rstrip()
+
+    # Final cleanup: strip trailing whitespace and stray connector
+    # punctuation that can be left behind at the boundary.
+    result = result.rstrip()
+    result = re.sub(r"[,;:]+$", "", result).rstrip()
+    return result
+
+
+def _truncate_concatenated_case_titles(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Truncate ``extracted_case_title`` to first caption when concatenated (#2562).
+
+    Runs ``_truncate_concatenated_title`` on each ruling's title and rewrites
+    the ruling via ``model_copy`` when the title changes.  Preserves every
+    other field.  Logs one ``llm_extractor.truncate_concatenated_title``
+    record per rewritten title so production can observe the guard's
+    activity.
+
+    This post-processor is idempotent — re-applying it to an already-clean
+    output is a no-op.
+    """
+    for i, ruling in enumerate(rulings):
+        original = ruling.extracted_case_title
+        truncated = _truncate_concatenated_title(original)
+        if truncated != original:
+            rulings[i] = ruling.model_copy(update={"extracted_case_title": truncated})
+            logger.warning(
+                "llm_extractor.truncate_concatenated_title",
+                case_number=ruling.extracted_case_number,
+                original_length=len(original) if original else 0,
+                truncated_length=len(truncated) if truncated else 0,
+                original_title=original,
+                truncated_title=truncated,
+            )
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: calendar-listing-only detection (#2446)
 # ---------------------------------------------------------------------------
 
@@ -1101,6 +1274,7 @@ def _apply_pdf_cache_hit_filters(
     original_count = len(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
+    rulings = _truncate_concatenated_case_titles(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _filter_citation_artifacts(rulings)
     if len(rulings) != original_count:
@@ -1133,6 +1307,7 @@ def _apply_text_cache_hit_filters(
     """
     original_count = len(rulings)
     rulings = _filter_citation_artifacts(rulings)
+    rulings = _truncate_concatenated_case_titles(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     if len(rulings) != original_count:
         logger.info(
@@ -3001,6 +3176,15 @@ def _join_page_rows(
     # marker, and AFTER cross-reference resolution so shared text isn't
     # misclassified as unsubstantive.
     rulings = _drop_short_unsubstantive_rulings(rulings)
+
+    # Post-processing: truncate concatenated case titles (#2562).
+    # Santa Clara multi-case PDFs sometimes produce an ``extracted_case_title``
+    # that fuses adjacent calendar lines ("Smith v. Jones Doe v. Roe").  Run
+    # this BEFORE ``_deduplicate_ruling_texts`` because the truncated title
+    # is a more accurate signal for downstream dedup heuristics and for the
+    # deterministic flag rule ``check_no_multiple_adversarial_patterns`` in
+    # the worker's validation step.
+    rulings = _truncate_concatenated_case_titles(rulings)
 
     # Post-processing: deduplicate identical ruling texts (#2096).
     # The LLM sometimes produces the same ruling text for multiple cases
