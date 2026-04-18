@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 18 migrations.
+-- Generated from 19 migrations.
 
 
 
@@ -311,6 +311,16 @@ COMMENT ON COLUMN derived.rulings.summary IS 'Cached AI summary. Served from cac
 COMMENT ON COLUMN derived.rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
 
 
+CREATE TABLE dispatcher_spike.failures (
+    failure_id uuid NOT NULL,
+    category text NOT NULL,
+    agent_id text NOT NULL,
+    details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    hook_fire_ts timestamp with time zone NOT NULL,
+    inserted_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
 CREATE TABLE dispatcher_spike.runs (
     run_id bigint NOT NULL,
     scenario text NOT NULL,
@@ -580,6 +590,10 @@ ALTER TABLE ONLY derived.rulings
     ADD CONSTRAINT uq_rulings_document_id UNIQUE (document_id);
 
 
+ALTER TABLE ONLY dispatcher_spike.failures
+    ADD CONSTRAINT failures_pkey PRIMARY KEY (failure_id);
+
+
 ALTER TABLE ONLY dispatcher_spike.runs
     ADD CONSTRAINT runs_pkey PRIMARY KEY (run_id);
 
@@ -739,6 +753,12 @@ CREATE INDEX idx_rulings_posted_at ON derived.rulings USING btree (posted_at DES
 
 
 CREATE UNIQUE INDEX uq_rulings_case_text_hash ON derived.rulings USING btree (case_id, ruling_text_hash) WHERE (ruling_text_hash IS NOT NULL);
+
+
+CREATE INDEX idx_dispatcher_spike_failures_agent_id ON dispatcher_spike.failures USING btree (agent_id);
+
+
+CREATE INDEX idx_dispatcher_spike_failures_category ON dispatcher_spike.failures USING btree (category);
 
 
 CREATE INDEX idx_alert_events_sub_id ON public.alert_events USING btree (subscription_id);

@@ -28,15 +28,18 @@
 #   SPIKE_TIMEOUT    — client-side wait for task completion, seconds (default: 1200)
 #   SPIKE_NOTES      — free-form note written into dispatcher_spike.runs.notes
 #   SPIKE_SKIP_DB    — if set to 1, don't attempt to insert a row
+#   SPIKE_AGENT_ID   — (spike 0.2) if set, passed to the container as
+#                      $SPIKE_AGENT_ID so dispatcher_spike.failures rows
+#                      inserted by the PreToolUse hook carry this identifier.
 
 set -euo pipefail
 
 SCENARIO="${1:-success}"
 case "${SCENARIO}" in
-    success|turn_limit|auth_fail|mcp_probe) ;;
+    success|turn_limit|auth_fail|mcp_probe|hook_latency|hook_failmode) ;;
     *)
         echo "Error: unknown scenario '${SCENARIO}'." >&2
-        echo "Valid scenarios: success, turn_limit, auth_fail, mcp_probe" >&2
+        echo "Valid scenarios: success, turn_limit, auth_fail, mcp_probe, hook_latency, hook_failmode" >&2
         exit 2
         ;;
 esac
@@ -153,8 +156,39 @@ log "security_groups=${SECURITY_GROUPS}"
 # ─── Launch the task ────────────────────────────────────────────────────────
 log "launching ${TASK_FAMILY} with command=[${SCENARIO}]..."
 
+# Build container overrides. For spike-0.2 hook scenarios we pass
+# SPIKE_AGENT_ID into the container so dispatcher_spike.failures.agent_id
+# matches a caller-chosen value (e.g. harness-<uuid>) rather than the
+# task UUID — this lets the harness filter its rows deterministically.
 OVERRIDES_JSON="${TMPDIR_SPIKE}/overrides.json"
-printf '{"containerOverrides": [{"name": "dispatcher-spike", "command": ["%s"]}]}' "${SCENARIO}" \
+
+cat > "${TMPDIR_SPIKE}/build_overrides.py" <<'PYEOF'
+"""Build containerOverrides JSON for `aws ecs run-task`.
+
+Reads SCENARIO and optional SPIKE_AGENT_ID from the environment; emits:
+
+    {"containerOverrides": [{
+        "name": "dispatcher-spike",
+        "command": ["<scenario>"],
+        "environment": [{"name": "SPIKE_AGENT_ID", "value": "<id>"}]   # if set
+    }]}
+"""
+import json, os, sys
+
+override = {
+    "name": "dispatcher-spike",
+    "command": [os.environ["SCENARIO"]],
+}
+agent_id = os.environ.get("SPIKE_AGENT_ID", "").strip()
+if agent_id:
+    override["environment"] = [{"name": "SPIKE_AGENT_ID", "value": agent_id}]
+
+json.dump({"containerOverrides": [override]}, sys.stdout)
+PYEOF
+
+SCENARIO="${SCENARIO}" \
+    SPIKE_AGENT_ID="${SPIKE_AGENT_ID:-}" \
+    python3 "${TMPDIR_SPIKE}/build_overrides.py" \
     > "${OVERRIDES_JSON}"
 
 RUN_OUTPUT_FILE="${TMPDIR_SPIKE}/run-output.json"
