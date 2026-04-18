@@ -86,6 +86,8 @@ Consult these docs before making changes in their domain:
 | `docs/agent/infrastructure-reference.md` | ECS script execution, Terraform apply, secrets, Vercel, Reingest vs Rebuild |
 | `docs/agent/local-dev.md` | Docker Compose, local DB rebuild, S3 cache, local env vars |
 | `docs/agent/unattended-patterns.md` | Permission-prompt workarounds for git, curl, secrets, `.claude/` writes |
+| `docs/agent/github-api-access.md` | When to use the GitHub MCP server vs the `gh` CLI — MCP-first for reads, `gh` for writes and gaps |
+| `docs/agent/gh-to-mcp-migration.md` | Full tool-by-tool `gh` → `mcp__github__*` mapping, including the known gaps |
 
 ## Starting a New Session
 
@@ -267,6 +269,8 @@ For agents spawned with `isolation: "worktree"`, Claude Code handles cleanup aut
 - **Use dedicated tools for file operations** — never use Bash for `cat`, `ls`, `grep`, `find`. Use Read, Glob, and Grep instead.
 - **Always Read before Write** — the Write tool requires this for existing files.
 - **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
+- **MCP-first for GitHub reads.** Prefer `mcp__github__*` tools (`get_issue`, `list_issues`, `get_pull_request`, `list_pull_requests`, `get_pull_request_files`, `get_pull_request_status`, `search_issues`, `search_code`) over `gh ... --json` for reads. MCP returns full typed objects in one call — no `--json` enumeration, no `-q` jq, no shell quoting. Tools are deferred; load via `ToolSearch query="select:mcp__github__get_issue,..."` before first use in a session. See `docs/agent/github-api-access.md` for the decision table and `docs/agent/gh-to-mcp-migration.md` for the full mapping.
+- **`gh` CLI is still the write path** (and the fill-in for MCP gaps). Writes — `gh issue create`, `gh issue comment`, `gh issue edit`, `gh issue close --reason`, `gh pr create`, `gh pr merge --squash --delete-branch`, `gh pr edit`, `gh pr review` — stay on `gh` until the MCP server has a `GITHUB_PERSONAL_ACCESS_TOKEN` (see `docs/agent/gh-to-mcp-migration.md` §Write-path status). Reads without an MCP equivalent also stay on `gh`: `gh run watch`, `gh run list --workflow`, `gh run view`, `gh pr diff`, `gh api rate_limit`, `gh auth status`. Do not invent MCP calls that do not exist.
 - **Parallelize independent Bash calls** — when multiple Bash commands have no dependencies between them (e.g., fetching multiple issue details, running lint + format check), make all calls in a single message rather than sequentially. This significantly reduces wall-clock time for multi-step workflows.
 - `sudo` and `rm` always prompt; split commands to avoid triggering prompts.
 

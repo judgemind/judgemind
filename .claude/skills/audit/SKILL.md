@@ -10,7 +10,9 @@ Perform a comprehensive codebase health audit, filing GitHub issues for every ac
 
 **Trigger:** The dispatcher spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/dispatcher_state.json`). It can also be invoked manually.
 
-**Prerequisites:** Must be in a worktree. No special dependencies required — the audit uses Read, Grep, Glob, and `gh` CLI only.
+**Prerequisites:** Must be in a worktree. No special dependencies required — the audit uses Read, Grep, Glob, `mcp__github__*` tools (preferred for reads), and `gh` CLI (for writes and ops without MCP equivalents).
+
+> **MCP-first for GitHub reads.** Prefer `mcp__github__*` tools (`list_pull_requests`, `list_issues`, `get_pull_request_files`, `search_issues`) over `gh ... --json` for reads. The one call this skill keeps on `gh` is `gh pr diff <N>` — MCP has no unified-diff endpoint (see `docs/agent/gh-to-mcp-migration.md` — the Gap row). Writes (`gh issue create --body-file`) stay on `gh` for now; MCP write path is auth-blocked.
 
 Do not ask for confirmation. Work autonomously through every step.
 
@@ -24,18 +26,28 @@ Create a working directory for audit state:
 {worktree}/tmp/audit/
 ```
 
-Fetch the list of recently merged PRs (the last 20):
+Fetch the list of recently merged PRs (the last 20) via MCP:
 
 ```
-gh pr list --repo judgemind/judgemind --state merged --limit 20 \
-    --json number,title,headRefName,mergedAt,files,body
+mcp__github__list_pull_requests
+  owner: "judgemind"
+  repo: "judgemind"
+  state: "closed"
+  sort: "updated"
+  direction: "desc"
+  per_page: 20
 ```
+
+Client-side filter to `merged_at != null` (the MCP response includes `merged_at`; a closed PR with `merged_at: null` was closed without merging). For each PR you want file-level detail on, call `mcp__github__get_pull_request_files` — the `list_pull_requests` response does not include the changed-file list.
 
 Also fetch the current list of open issues to avoid filing duplicates:
 
 ```
-gh issue list --repo judgemind/judgemind --state open \
-    --json number,title,body,labels --limit 200
+mcp__github__list_issues
+  owner: "judgemind"
+  repo: "judgemind"
+  state: "open"
+  per_page: 200
 ```
 
 Store both results in `{worktree}/tmp/audit/recent_prs.json` and `{worktree}/tmp/audit/open_issues.json` for reference throughout the audit.
@@ -60,7 +72,7 @@ Work through each category in order. For each finding, record it in `{worktree}/
 
 Review the last 20 merged PRs for real bugs that slipped through review:
 
-1. For each PR, read the diff using `gh pr diff <N> --repo judgemind/judgemind`.
+1. For each PR, read the diff using `gh pr diff <N> --repo judgemind/judgemind` (MCP has no unified-diff endpoint — this is the one `gh` read this skill retains). For just the file list without the patch text, prefer `mcp__github__get_pull_request_files`.
 2. Look for:
    - **Logic errors** — off-by-one, wrong comparison operators, inverted conditions, missing null checks.
    - **Race conditions** — shared mutable state without synchronization, TOCTOU patterns.
@@ -254,8 +266,11 @@ For missing headers, file a single `priority/p3` `type/dx` issue listing the scr
 Re-run the same query from Step 0 to get a fresh list of open issues:
 
 ```
-gh issue list --repo judgemind/judgemind --state open \
-    --json number,title,body,labels --limit 200
+mcp__github__list_issues
+  owner: "judgemind"
+  repo: "judgemind"
+  state: "open"
+  per_page: 200
 ```
 
 Overwrite `{worktree}/tmp/audit/open_issues.json` with the fresh data.
@@ -265,8 +280,13 @@ Overwrite `{worktree}/tmp/audit/open_issues.json` with the fresh data.
 Before marking any finding as "skipped — duplicate of #N" based on a matching issue #N, verify that #N is still open:
 
 ```
-gh issue view <N> --repo judgemind/judgemind --json state -q '.state'
+mcp__github__get_issue
+  owner: "judgemind"
+  repo: "judgemind"
+  issue_number: <N>
 ```
+
+Inspect the returned object's `state` field — accept only `"open"`.
 
 If the issue has been closed since the list was fetched, treat the finding as new instead. Do not reference closed issues as duplicates — the fix may have already shipped, or the issue may have been closed as stale.
 

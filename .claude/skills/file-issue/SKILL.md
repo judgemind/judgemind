@@ -9,6 +9,8 @@ A guardrail/checklist for filing an issue in `judgemind/judgemind`. This skill d
 
 **Why this exists:** agents routinely file issues with inline bodies, vague acceptance criteria, missing `Verify:` lines, or the wrong priority. The pattern is in the docs, but it's easy to forget under time pressure. This skill is the pre-filing checklist.
 
+> **MCP vs `gh`:** issue creation is a write operation. `mcp__github__create_issue` exists and would let the body be passed as a native string (no tmp file), but the MCP server currently has no auth token and all writes fail with `Requires authentication` (verified from a `/task` subagent). Until that is fixed, this skill keeps `gh issue create --body-file`. See `docs/agent/github-api-access.md` for the decision rule and `docs/agent/gh-to-mcp-migration.md` for the full inventory.
+
 ---
 
 ## Checklist — run through every item before calling `gh issue create`
@@ -116,6 +118,8 @@ Capture the returned URL and reference it in any comment, PR, or Telegram reply 
 
 ## See also
 
+- `docs/agent/github-api-access.md` — MCP vs `gh` decision rule and the write-path note.
+- `docs/agent/gh-to-mcp-migration.md` — full tool-by-tool inventory.
 - `docs/agent/issue-authoring.md` — full authoring reference, priority framework, sub-task mechanics, investigation-task conventions.
 - `docs/agent/task-dependencies.md` — blocking/unblocking mechanics, `Blocked by #N` semantics.
 - `scripts/block-issue.sh` — the helper that satisfies the Blocked-by contract.

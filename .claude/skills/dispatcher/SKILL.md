@@ -9,6 +9,8 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 **Dispatcher mode is opt-in.** Interactive sessions are general-purpose by default. The user invokes `/dispatcher` when they want autonomous queue management.
 
+> **MCP-first for GitHub reads.** Prefer `mcp__github__*` tools (`list_issues`, `list_pull_requests`, `get_pull_request`, `get_pull_request_files`, `get_pull_request_status`) over `gh ... --json` for reads — no `-q` jq, no shell quoting, full typed objects. The first use in a session loads the schema via `ToolSearch query="select:mcp__github__list_issues,mcp__github__list_pull_requests,..."`. See `docs/agent/github-api-access.md` for the decision rule. Writes (`gh issue edit`, `gh issue comment`, `gh pr merge`, `gh issue create`, `gh issue close`) stay on `gh` for now — the MCP write path is blocked pending a token (see `docs/agent/gh-to-mcp-migration.md` §Write-path status).
+
 ---
 
 ## Arguments
@@ -54,19 +56,20 @@ When a previous dispatcher or agent session ends unexpectedly (context window ex
 
 **Run this cleanup once at startup, before scanning the work queue.**
 
-1. List all open issues assigned to the agent account that have the `agent/ready` label:
+1. List all open issues assigned to the agent account that have the `agent/ready` label. Use MCP (no `@me` filter — filter client-side on the `assignees` field, matching the agent account login e.g. `drewthaler`):
    ```
-   gh issue list --repo judgemind/judgemind \
-       --label agent/ready --state open --assignee @me \
-       --json number,title \
-       --limit 50
+   mcp__github__list_issues
+     owner: "judgemind"
+     repo: "judgemind"
+     labels: ["agent/ready"]
+     state: "open"
+     per_page: 50
    ```
 
-2. For each assigned issue, check whether an open PR exists that references it:
+2. For each assigned issue, check whether an open PR exists that references it. Use MCP `search_issues` with a `repo:judgemind/judgemind is:pr is:open` qualifier, or reuse the PR list fetched in startup step 5 and match on branch names / body:
    ```
-   gh pr list --repo judgemind/judgemind --state open \
-       --search "Closes #<N> OR Fixes #<N> OR Resolves #<N>" \
-       --json number --limit 1
+   mcp__github__search_issues
+     q: "repo:judgemind/judgemind is:pr is:open in:body #<N>"
    ```
    Alternatively, check the PR list from startup step 5 for branches containing the issue number.
 
@@ -87,13 +90,15 @@ When a previous dispatcher or agent session ends unexpectedly (context window ex
 
 ### 4. Scan the work queue (startup only)
 
-List all open `agent/ready` issues sorted by priority:
+List all open `agent/ready` issues sorted by priority (use MCP — `list_issues` returns full typed objects including labels and assignees):
 
 ```
-gh issue list --repo judgemind/judgemind \
-    --label agent/ready --state open \
-    --json number,title,assignees,labels \
-    --limit 50
+mcp__github__list_issues
+  owner: "judgemind"
+  repo: "judgemind"
+  labels: ["agent/ready"]
+  state: "open"
+  per_page: 50
 ```
 
 Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. Within the same priority, prefer lower issue numbers (older first).
@@ -104,14 +109,17 @@ If specific issues were passed as arguments, filter to only those issues.
 
 ### 5. Check for in-flight work
 
-Check for any existing open PRs or assigned issues that may need attention (stale CI, merge conflicts, etc.):
+Check for any existing open PRs or assigned issues that may need attention (stale CI, merge conflicts, etc.). Use MCP — returns full PR objects with head ref, mergeable state, and CI status all in one call:
 
 ```
-gh pr list --repo judgemind/judgemind --state open \
-    --json number,title,headRefName,statusCheckRollup,mergeable
+mcp__github__list_pull_requests
+  owner: "judgemind"
+  repo: "judgemind"
+  state: "open"
+  per_page: 50
 ```
 
-Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
+For detailed CI status on a specific PR, use `mcp__github__get_pull_request_status`. Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
 
 ### 6. Initialize audit counter
 
@@ -138,7 +146,7 @@ The dispatcher runs a continuous loop:
 3. **Handle in-flight PRs** — merge any that are ready, fix any that are failing
 4. **Sync after merges** — pull latest main after each merge (see "Post-merge sync" in Rules)
 5. **Check audit trigger** — if `prs_since_last_audit >= 20`, spawn `/audit` (see "Periodic Audit" below)
-6. **Fill agent slots** — **run a fresh `gh issue list --label agent/ready` query**, then launch `/task` agents for the highest-priority issues (see "Spawning agents" for the **mandatory fresh query and slot count check**)
+6. **Fill agent slots** — **run a fresh `mcp__github__list_issues labels=["agent/ready"] state="open"` query**, then launch `/task` agents for the highest-priority issues (see "Spawning agents" for the **mandatory fresh query and slot count check**)
 7. **Process completions** — handle agent completion/failure notifications
 8. **Triage** — close done issues, file new issues for discovered problems
 9. **Check context rotation** — increment `loop_iterations` and check if it is time to wind down (see "Context-Aware Rotation" below)
@@ -165,13 +173,15 @@ The dispatcher runs a continuous loop:
 
 **NEVER work from a cached or in-memory issue list.** The work queue changes constantly — issues get unblocked by the `unblock-issues` CI workflow, new issues are filed, priorities change, and other agents claim work. A cached list from startup or a previous cycle will miss newly-available high-priority issues.
 
-Run a fresh query every dispatch cycle:
+Run a fresh query every dispatch cycle (use MCP — fastest and cleanest for repeated reads):
 
 ```
-gh issue list --repo judgemind/judgemind \
-    --label agent/ready --state open \
-    --json number,title,assignees,labels \
-    --limit 50
+mcp__github__list_issues
+  owner: "judgemind"
+  repo: "judgemind"
+  labels: ["agent/ready"]
+  state: "open"
+  per_page: 50
 ```
 
 Use the results of THIS query — not the startup scan, not a previous cycle's results — to pick the next issue to dispatch. Apply the same priority ordering: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`, lower issue numbers first within the same priority.
@@ -446,7 +456,7 @@ The checkpoint is a Markdown file (human-readable, easy for the LLM to parse) wi
 
 ## Next Actions
 - Process next task-notification -> cleanup worktree, re-anchor cwd, send Telegram, free slot
-- When slot opens -> fresh `gh issue list --label agent/ready` query, dispatch highest priority
+- When slot opens -> fresh `mcp__github__list_issues labels=["agent/ready"]` query, dispatch highest priority
 - If prs_since_last_audit >= 20 -> spawn /audit
 - Check for Telegram messages
 (adjust based on current state -- e.g., if winding down, note "waiting for agents to finish before exiting")
@@ -672,13 +682,16 @@ This same logic also handles `terraform_apply` instructions from the subagent in
 
 #### Detecting infra PRs
 
-After merging a PR, check whether any changed files match `infra/terraform/**`. Use the PR's file list:
+After merging a PR, check whether any changed files match `infra/terraform/**`. Use MCP to fetch the PR's file list:
 
 ```
-gh pr view <N> --repo judgemind/judgemind --json files --jq '.files[].path'
+mcp__github__get_pull_request_files
+  owner: "judgemind"
+  repo: "judgemind"
+  pull_number: <N>
 ```
 
-If any path starts with `infra/terraform/`, proceed with the apply.
+The response is an array of file objects; inspect each `filename` field. If any path starts with `infra/terraform/`, proceed with the apply.
 
 #### Determining which environments to apply
 
@@ -918,7 +931,7 @@ Shutdown triggers:
 
 ### Queue low or empty → spawn /spotcheck instead of idling
 
-When `gh issue list --label agent/ready` returns fewer issues than available `/task` slots and there are no in-flight agents with follow-ups pending, the correct idle behavior (especially overnight) is to spawn `/spotcheck` as a subagent (`isolation: worktree`) rather than winding down. /spotcheck samples across counties, compares DB records to source PDFs, and files per-pattern data-quality issues — which refills the queue with concrete work the dispatcher picks up in the next cycle. Treat this as standing instruction; do not ask permission when operating autonomously. Only move to full shutdown when /spotcheck itself produces no new work AND the queue is genuinely empty.
+When `mcp__github__list_issues labels=["agent/ready"]` returns fewer issues than available `/task` slots and there are no in-flight agents with follow-ups pending, the correct idle behavior (especially overnight) is to spawn `/spotcheck` as a subagent (`isolation: worktree`) rather than winding down. /spotcheck samples across counties, compares DB records to source PDFs, and files per-pattern data-quality issues — which refills the queue with concrete work the dispatcher picks up in the next cycle. Treat this as standing instruction; do not ask permission when operating autonomously. Only move to full shutdown when /spotcheck itself produces no new work AND the queue is genuinely empty.
 
 ### Full shutdown procedure (user-initiated or queue empty)
 
