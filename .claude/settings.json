@@ -42,6 +42,8 @@
       "Bash(gh run*)",
       "Bash(gh workflow*)",
       "Bash(gh search*)",
+      "Bash(claude mcp list)",
+      "Bash(claude mcp get *)",
       "Bash(.venv/bin/*)",
       "Bash(**/.venv/bin/*)",
       "Bash(scripts/*)",
