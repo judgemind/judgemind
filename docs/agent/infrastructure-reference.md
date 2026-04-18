@@ -168,8 +168,8 @@ remaining connection slots are reserved for roles with privileges of the "rds_re
 
 Best practices:
 
-1. Never launch a rebuild while another rebuild or large backfill is already running against dev.  Check with `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING` before starting anything that opens many connections.
-2. If you see `rds_reserved` errors, first check for runaway oneshot tasks (`aws ecs list-tasks`, then `aws ecs describe-tasks`) and stop any that are stuck retrying — each zombie task holds N connections until it exits.
+1. Never launch a rebuild while another rebuild or large backfill is already running against dev. Check first — preferred path: `mcp__awslabs_ecs-mcp-server__ecs_resource_management` with `api_operation: "ListTasks"`, `api_params: {"cluster": "judgemind-dev", "desiredStatus": "RUNNING"}`. CLI fallback: `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING`. (See `docs/agent/aws-api-access.md`.)
+2. If you see `rds_reserved` errors, first check for runaway oneshot tasks (preferred: MCP `ListTasks` + `DescribeTasks` as above; CLI: `aws ecs list-tasks` then `aws ecs describe-tasks`) and stop any that are stuck retrying — each zombie task holds N connections until it exits.
 3. When iterating locally, prefer `scripts/rebuild_db.sh` against the Docker Compose Postgres rather than dev.
 4. If you *must* run rebuild with aggressive concurrency on dev, drop `--concurrency` to match the headroom (e.g. `--concurrency 32` leaves ~100 connections free for other callers).
 
@@ -204,9 +204,9 @@ Best practices:
 
 **Manual stop runbook.**  If you spot a zombie oneshot already running (ECS task that has been `RUNNING` far longer than expected, or dev DB showing `rds_reserved` errors):
 
-1. `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING --region us-west-2` — find the task ARN.
-2. `aws ecs describe-tasks --cluster judgemind-dev --tasks <arn> --region us-west-2` — confirm it's the oneshot and check `startedAt` vs now.
-3. `aws ecs stop-task --cluster judgemind-dev --task <arn> --reason "zombie retry-loop (#2572)" --region us-west-2` — sends SIGTERM then SIGKILL.
+1. **Find the task ARN.** Preferred: `mcp__awslabs_ecs-mcp-server__ecs_resource_management` with `api_operation: "ListTasks"`, `api_params: {"cluster": "judgemind-dev", "desiredStatus": "RUNNING"}`. CLI fallback: `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING --region us-west-2`.
+2. **Confirm it's the oneshot and check `startedAt` vs now.** Preferred: `ecs_resource_management` with `api_operation: "DescribeTasks"`, `api_params: {"cluster": "judgemind-dev", "tasks": ["<arn>"]}`. CLI fallback: `aws ecs describe-tasks --cluster judgemind-dev --tasks <arn> --region us-west-2`.
+3. **Stop the task** — sends SIGTERM then SIGKILL. The MCP `StopTask` is gated behind Phase B (`ALLOW_WRITE`), so this step stays on the CLI: `aws ecs stop-task --cluster judgemind-dev --task <arn> --reason "zombie retry-loop (#2572)" --region us-west-2`.
 4. Wait for the task to fully STOP (connection slots release as psycopg closes).  Verify with `scripts/dev-db-query.sh "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE '%rebuild%'"`.
 5. Diagnose the root cause before re-running — if connection exhaustion, confirm no other rebuild is running; if OOM, bump `--memory`; if the retry cap was tripped, consult the crashed-key sample in the CloudWatch logs.
 

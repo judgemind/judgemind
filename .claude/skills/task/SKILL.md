@@ -437,6 +437,8 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 - Changes to `packages/api/`, `packages/scraper-framework/`, `packages/web/`, `infra/terraform/`, or scripts run via ECS → **has deployed component** → continue to Step 1.
 - Changes to docs, CI config, `.claude/`, tooling scripts, or library code with no deployed service → **no deployed component** → skip to the evidence comment (Step 3) and post a skip-reason comment.
 
+**Quick health check via MCP (optional):** before watching the deploy workflow, you can call `mcp__awslabs_ecs-mcp-server__ecs_resource_management` with `api_operation: "DescribeServices"` against the affected dev service (e.g. `judgemind-ingestion-worker-dev`, `judgemind-api-dev`) to capture the current task-definition revision and `runningCount`. After the deploy lands, a second `DescribeServices` call confirms the revision bumped and the new tasks are healthy without leaving the agent context.
+
 **Step 1 — Watch the deploy workflow:**
 
 1. Identify the relevant deploy workflow based on which packages were modified:
@@ -463,8 +465,8 @@ A successful deploy only means the new image is running — not that the service
 |---|---|---|
 | **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors | DB query output showing the column/table exists + a successful request/response |
 | **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors | The curl response (status code + relevant body snippet) |
-| **Ingestion pipeline** | Confirm the worker processes at least one message successfully (check ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50`) | Log lines showing successful message processing |
-| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors | Log lines showing successful document capture |
+| **Ingestion pipeline** | Confirm the worker processes at least one message successfully. Prefer `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` against `/ecs/judgemind-ingestion-worker-dev` for an ad-hoc Insights query; fall back to `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for the recent-N-lines convenience or `--follow` for live tail. | Log lines showing successful message processing |
+| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors. Same MCP-first pattern as ingestion (Insights query against `/ecs/judgemind-scraper-dev`). | Log lines showing successful document capture |
 | **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot via `scripts/run-py.sh scripts/screenshot.py` or the page content showing the feature works |
 | **DX/tooling** | Run the tool in a representative scenario and confirm expected output | Command output showing the tool works correctly |
 | **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. | DB query results showing the data changed (e.g., "2444/2444 rulings now have ruling_text_html") |
