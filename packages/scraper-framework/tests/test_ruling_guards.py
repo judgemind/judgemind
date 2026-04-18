@@ -11,6 +11,8 @@ See #2084 for background.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from framework.llm_schema import (
@@ -20,8 +22,11 @@ from framework.llm_schema import (
     ExtractionOutcome,
 )
 from ingestion.ruling_guards import (
+    NON_RULING_PDF_DROPPED_EVENT,
+    NON_RULING_PDF_DROPPED_METRIC,
     _looks_like_raw_html,
     convert_extracted_rulings,
+    is_all_null_metadata,
 )
 from ingestion.split_ids import make_split_document_id
 
@@ -623,3 +628,267 @@ class TestRawHtmlGuardInConvertExtractedRulings:
             fallback_text=huge_html,
         )
         assert results[0].ruling_text is None
+
+
+# ---------------------------------------------------------------------------
+# All-NULL metadata guard (#2676)
+# ---------------------------------------------------------------------------
+
+
+class TestIsAllNullMetadata:
+    """Unit tests for ``is_all_null_metadata`` — the pipeline-side
+    defense-in-depth guard.
+
+    The helper classifies a ruling as "all-NULL metadata" when every one of
+    the six metadata fields (case_number, case_title, judge_name,
+    department, motion_type, outcome) is None / empty / whitespace-only.
+    A synthetic placeholder case_number such as ``UNKNOWN-<hash>`` is
+    treated as equivalent to NULL: when the scraper did not recover a real
+    case number, the row still looks like non-ruling noise.
+
+    The event/metric constants are used by the worker to emit structured
+    telemetry when the guard drops a row.
+
+    See #2676 and #2486 for the corpus-poisoning background.
+    """
+
+    def test_event_constant_is_fully_qualified(self) -> None:
+        """The event name matches the documented telemetry namespace."""
+        assert NON_RULING_PDF_DROPPED_EVENT == "data_quality.non_ruling_pdf_dropped"
+
+    def test_metric_constant_matches_data_quality_metric_name(self) -> None:
+        """The metric_name is short-form (no dotted namespace) so it fits
+        existing ``telemetry.data_quality_metrics`` naming."""
+        assert NON_RULING_PDF_DROPPED_METRIC == "non_ruling_pdf_dropped"
+
+    # ------ positive: all six fields fully NULL -> True ------
+
+    def test_all_none_is_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title=None,
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is True
+
+    def test_all_empty_strings_is_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number="",
+            case_title="",
+            judge_name="",
+            department="",
+            motion_type="",
+            outcome="",
+        )
+        assert is_all_null_metadata(ruling) is True
+
+    def test_all_whitespace_only_is_all_null(self) -> None:
+        """Whitespace-only strings are treated as NULL."""
+        ruling = SimpleNamespace(
+            case_number="   ",
+            case_title="\n",
+            judge_name="\t",
+            department="  \n  ",
+            motion_type=" ",
+            outcome="\r\n",
+        )
+        assert is_all_null_metadata(ruling) is True
+
+    # ------ negative: any one populated field -> False ------
+
+    def test_case_number_populated_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number="24STCV01234",
+            case_title=None,
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_case_title_populated_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title="Smith v. Jones",
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_judge_name_populated_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title=None,
+            judge_name="Hon. Jane Doe",
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_department_populated_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title=None,
+            judge_name=None,
+            department="Dept 11",
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_motion_type_populated_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title=None,
+            judge_name=None,
+            department=None,
+            motion_type="msj",
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_outcome_populated_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title=None,
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome="granted",
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    # ------ UNKNOWN-<hash> case_number sentinel ------
+
+    def test_unknown_case_number_alone_is_all_null(self) -> None:
+        """A synthetic ``UNKNOWN-<hash>`` case_number is treated as NULL.
+
+        Enrichment sometimes assigns a placeholder case number when the
+        PDF has nothing real to extract.  The placeholder must not by
+        itself keep a metadata-free row alive.
+        """
+        ruling = SimpleNamespace(
+            case_number="UNKNOWN-abc123",
+            case_title=None,
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is True
+
+    def test_unknown_case_number_with_real_case_title_is_not_all_null(self) -> None:
+        """A placeholder case_number combined with any real metadata is NOT
+        all-null — the row has at least one genuine signal."""
+        ruling = SimpleNamespace(
+            case_number="UNKNOWN-abc123",
+            case_title="Smith v. Jones",
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_unknown_case_number_with_judge_name_is_not_all_null(self) -> None:
+        ruling = SimpleNamespace(
+            case_number="UNKNOWN-abc123",
+            case_title=None,
+            judge_name="Hon. Jane Doe",
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    def test_real_case_number_with_unknown_prefix_in_title_is_not_all_null(self) -> None:
+        """The ``UNKNOWN-`` prefix only triggers on the case_number field."""
+        ruling = SimpleNamespace(
+            case_number="24STCV01234",
+            case_title="UNKNOWN-something",  # not a sentinel here
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert is_all_null_metadata(ruling) is False
+
+    # ------ dict input shape ------
+
+    def test_accepts_dict_input(self) -> None:
+        """Helper works on a dict shape (not just objects with attributes).
+
+        Callers in worker.py and reingest paths sometimes have dicts
+        before they are converted into dataclasses."""
+        ruling = {
+            "case_number": None,
+            "case_title": None,
+            "judge_name": None,
+            "department": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        assert is_all_null_metadata(ruling) is True
+
+    def test_accepts_dict_input_with_one_field_populated(self) -> None:
+        ruling = {
+            "case_number": None,
+            "case_title": "Smith v. Jones",
+            "judge_name": None,
+            "department": None,
+            "motion_type": None,
+            "outcome": None,
+        }
+        assert is_all_null_metadata(ruling) is False
+
+    # ------ works on ConvertedRuling (real pipeline shape) ------
+
+    def test_works_on_converted_ruling_no_metadata(self) -> None:
+        """A ConvertedRuling with all NULL metadata fields is all-null."""
+        ruling = convert_extracted_rulings(
+            [ExtractedRuling(ruling_text="some text")],  # no metadata
+            _DOC_ID,
+        )[0]
+        assert is_all_null_metadata(ruling) is True
+
+    def test_works_on_converted_ruling_with_metadata(self) -> None:
+        """A ConvertedRuling with real metadata is NOT all-null."""
+        ruling = convert_extracted_rulings([_RULING_WITH_TEXT], _DOC_ID)[0]
+        assert is_all_null_metadata(ruling) is False
+
+    # ------ missing attributes are treated as NULL ------
+
+    def test_missing_attributes_treated_as_null(self) -> None:
+        """If the object is missing some metadata attributes entirely,
+        treat them as NULL — don't raise."""
+        ruling = SimpleNamespace(case_number=None, case_title=None)
+        # judge_name / department / motion_type / outcome not set
+        assert is_all_null_metadata(ruling) is True
+
+    def test_missing_attributes_with_one_present_and_populated(self) -> None:
+        ruling = SimpleNamespace(case_title="Smith v. Jones")
+        assert is_all_null_metadata(ruling) is False
+
+    def test_non_string_non_none_field_counts_as_populated(self) -> None:
+        """If a metadata field is a non-string, non-None value (e.g. a
+        numeric or enum type that slipped through), treat it as populated.
+
+        The guard is conservative: it never falsely drops rows whose
+        metadata shape we do not recognise.
+        """
+        ruling = SimpleNamespace(
+            case_number=None,
+            case_title=None,
+            judge_name=None,
+            department=None,
+            motion_type=None,
+            outcome=42,  # unexpected non-string value
+        )
+        assert is_all_null_metadata(ruling) is False

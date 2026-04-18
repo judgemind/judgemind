@@ -17,13 +17,129 @@ See #2084 for the refactoring that introduced this module.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .extract import normalize_motion_type
 from .split_ids import make_split_document_id
 
 if TYPE_CHECKING:
     from framework.llm_schema import ExtractedRuling
+
+
+# ---------------------------------------------------------------------------
+# All-NULL metadata guard (#2676)
+# ---------------------------------------------------------------------------
+#
+# Capture-side filters (#2486) skip non-ruling PDFs (admin notices, cover
+# sheets, "no tentative rulings today" pages) before they ever reach the
+# ingestion worker.  This pipeline-side guard is the defense-in-depth
+# fallback: if a non-ruling PDF slips past the scraper — a new county
+# adds an admin-notice URL, an upstream filter regresses, a one-off
+# capture backfill runs without filters — the guard here prevents a
+# metadata-free row from polluting ``derived.rulings``.
+#
+# The helper is consulted at the worker's pre-DB-write boundary.  When it
+# returns True, the worker skips the upsert and emits a
+# ``data_quality.non_ruling_pdf_dropped`` telemetry event (both as a
+# structured log field and as a row in ``telemetry.data_quality_metrics``).
+
+#: Structured log ``telemetry_event`` value emitted by the worker when the
+#: pipeline-side guard drops a ruling row.  Fully-qualified namespace so
+#: downstream dashboards can filter without ambiguity.
+NON_RULING_PDF_DROPPED_EVENT = "data_quality.non_ruling_pdf_dropped"
+
+#: Short-form ``metric_name`` written to ``telemetry.data_quality_metrics``.
+#: Matches the naming convention of peer metrics (e.g. ``ruling_empty_text``,
+#: ``zero_ruling_extraction``).
+NON_RULING_PDF_DROPPED_METRIC = "non_ruling_pdf_dropped"
+
+#: The six metadata fields the guard inspects.  All six must be NULL/empty
+#: for a ruling to be classified as all-null.
+_METADATA_FIELDS: tuple[str, ...] = (
+    "case_number",
+    "case_title",
+    "judge_name",
+    "department",
+    "motion_type",
+    "outcome",
+)
+
+#: Prefix for synthetic placeholder case numbers assigned during enrichment
+#: when no real case number can be recovered.  A ruling with an
+#: ``UNKNOWN-...`` case_number and no other metadata is still non-ruling
+#: noise — the placeholder alone must not keep the row alive.
+_UNKNOWN_CASE_NUMBER_PREFIX = "UNKNOWN-"
+
+
+def _get_field(ruling: Any, name: str) -> Any:
+    """Return ``ruling[name]`` for dicts, or ``getattr(ruling, name, None)``
+    for objects.  Missing keys/attributes are treated as ``None``."""
+    if isinstance(ruling, dict):
+        return ruling.get(name)
+    return getattr(ruling, name, None)
+
+
+def _is_nullish(value: Any) -> bool:
+    """True when *value* represents NULL/empty for guard purposes.
+
+    ``None``, empty strings, and whitespace-only strings are all treated
+    as NULL.  Non-string truthy values (numbers, enums) are treated as
+    populated.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
+
+
+def is_all_null_metadata(ruling: Any) -> bool:
+    """Return True when a ruling has NO meaningful metadata.
+
+    A ruling is "all-null metadata" when every one of the six core
+    metadata fields (case_number, case_title, judge_name, department,
+    motion_type, outcome) is ``None``, an empty string, or a
+    whitespace-only string.
+
+    A synthetic placeholder ``case_number`` that starts with
+    ``UNKNOWN-`` is treated as equivalent to NULL for this check: the
+    enrichment layer sometimes assigns such a placeholder when nothing
+    real can be extracted, and a row with only that placeholder is
+    still non-ruling noise.  A real case number (no ``UNKNOWN-``
+    prefix) counts as populated even if the rest is NULL.
+
+    The helper works on any object or dict that exposes the metadata
+    field names — ``ConvertedRuling``, the worker's per-ruling dicts,
+    ``SimpleNamespace`` used in tests, etc.  Missing fields are treated
+    as NULL rather than raising.
+
+    Parameters
+    ----------
+    ruling:
+        An object (attribute access) or dict (key access) exposing the
+        six metadata field names.
+
+    Returns
+    -------
+    bool
+        ``True`` if the ruling has no meaningful metadata (pipeline
+        should drop it); ``False`` if at least one real field is
+        populated.
+    """
+    for name in _METADATA_FIELDS:
+        value = _get_field(ruling, name)
+        if _is_nullish(value):
+            continue
+        # case_number has a sentinel placeholder form we treat as NULL.
+        if (
+            name == "case_number"
+            and isinstance(value, str)
+            and value.startswith(_UNKNOWN_CASE_NUMBER_PREFIX)
+        ):
+            continue
+        # Any other populated field -> not all-null.
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
