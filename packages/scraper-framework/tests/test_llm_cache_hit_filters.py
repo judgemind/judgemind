@@ -101,6 +101,31 @@ class TestApplyPdfCacheHitFilters:
         case_numbers = [r.extracted_case_number for r in filtered]
         assert case_numbers == ["30-2024-01"]
 
+    def test_drops_short_unsubstantive_ruling_on_cache_hit(self) -> None:
+        """A stale short-unsubstantive row (#2645) is dropped on cache-hit.
+
+        Simulates a cache entry written before the short-unsubstantive
+        filter existed: the 46-char case-caption noise from the issue body
+        must be dropped on cache read rather than requiring a reingest.
+        """
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-01",
+                extracted_case_title="Real Ruling",
+                ruling_text="The demurrer is SUSTAINED without leave to amend.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-02",
+                extracted_case_title="Empty-cell Noise (#2645)",
+                ruling_text="MALKI, Wajih v. KARANOUH, Abdulmajid",
+                motion_type=None,
+                outcome=None,
+            ),
+        ]
+        filtered = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+        case_numbers = [r.extracted_case_number for r in filtered]
+        assert case_numbers == ["30-2024-01"]
+
     def test_preserves_valid_rulings(self) -> None:
         """Non-listing rulings are preserved through cache-hit filters."""
         rulings = [
