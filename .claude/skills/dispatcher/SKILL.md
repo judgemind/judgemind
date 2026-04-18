@@ -11,6 +11,8 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 > **MCP-first for GitHub reads.** Prefer `mcp__github__*` tools (`list_issues`, `list_pull_requests`, `get_pull_request`, `get_pull_request_files`, `get_pull_request_status`) over `gh ... --json` for reads — no `-q` jq, no shell quoting, full typed objects. The first use in a session loads the schema via `ToolSearch query="select:mcp__github__list_issues,mcp__github__list_pull_requests,..."`. See `docs/agent/github-api-access.md` for the decision rule. Writes (`gh issue edit`, `gh issue comment`, `gh pr merge`, `gh issue create`, `gh issue close`) stay on `gh` for now — the MCP write path is blocked pending a token (see `docs/agent/gh-to-mcp-migration.md` §Write-path status).
 
+
+> **MCP-first for AWS reads.** Prefer `mcp__awslabs_ecs-mcp-server__ecs_resource_management` for ECS reads (`DescribeServices`, `DescribeTasks`, `ListTasks`) and `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` for ad-hoc CloudWatch Logs queries when checking deploy/scraper/ingestion health between sweeps. Load via `ToolSearch query="select:mcp__awslabs_ecs-mcp-server__ecs_resource_management,mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query"`. See `docs/agent/aws-api-access.md`. The `scripts/ecs-*.sh` wrappers stay for launch-and-stream-logs workflows; the `aws` CLI stays for writes (until Phase B), S3, secrets, and interactive Exec.
 ---
 
 ## Arguments

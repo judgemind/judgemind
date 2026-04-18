@@ -28,6 +28,8 @@ Bidirectional spot-check across all active counties:
 
 > **MCP vs `gh`:** use `mcp__github__list_issues` for the open-issues lookup in Step 4.1 (no `--json` enumeration, no `-q` jq — returns full typed objects). Keep `gh issue create --body-file` for new-issue writes — the MCP write path (`mcp__github__create_issue`) exists but is currently auth-blocked on this machine. See `docs/agent/github-api-access.md` for the decision rule.
 
+
+> **MCP vs `aws` CLI:** the spotcheck stays on `scripts/ecs-run-task.sh` for the oneshot Fargate launch (handles network config, log streaming, exit-code propagation — not MCP-replaceable) and on `aws s3 cp` for downloading the spotcheck JSON and PDF artifacts (no MCP S3 coverage in Phase A). For ad-hoc post-run health checks against the dev cluster (`DescribeServices` on the ingestion worker, Logs Insights queries against `/ecs/judgemind-ingestion-worker-dev`), prefer the `mcp__awslabs_ecs-mcp-server__*` and `mcp__awslabs_cloudwatch-mcp-server__*` tools — see `docs/agent/aws-api-access.md`.
 ---
 
 ## Step 0 — Run the one-shot spotcheck script
