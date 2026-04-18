@@ -1,5 +1,9 @@
 export CLAUDE_CODE_SUBAGENT_MODEL="claude-opus-4-7"
 
+# MCP startup timeout in ms. Default 30s trips on first-run `uvx` downloads
+# of large MCP server packages (e.g. awslabs CloudWatch/ECS pull ~60MB of deps).
+export MCP_TIMEOUT=180000
+
 # Default permission mode; suppressed if the caller overrides it via "$@".
 perm_args=(--permission-mode acceptEdits)
 for arg in "$@"; do
