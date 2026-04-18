@@ -34,7 +34,13 @@ def main() -> int:
     p.add_argument("--fixture", required=True)
     p.add_argument("--stdout-tail", required=True, help="path to stdout-tail file")
     p.add_argument("--run-json", required=True, help="path to run.json from wrapper")
-    p.add_argument("--model", default="claude-opus-4-7")
+    # The model identifier is metadata only — labels the measurement row so
+    # mixed-runner experiments (spike 0.5 onward) can distinguish. Caller
+    # passes the model alias they actually invoked claude -p with; no
+    # hardcoded-models-check violation because this is a free-form label,
+    # not a code path that sends an API request. Default kept intentionally
+    # empty so the caller must be explicit.
+    p.add_argument("--model", default="")
     args = p.parse_args()
 
     tail = Path(args.stdout_tail).read_text(encoding="utf-8", errors="replace")
