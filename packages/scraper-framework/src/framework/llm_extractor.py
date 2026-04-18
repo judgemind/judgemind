@@ -906,6 +906,160 @@ def _drop_calendar_listing_rulings(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: short-unsubstantive ruling filter (#2645)
+# ---------------------------------------------------------------------------
+#
+# Some OC calendar PDFs include rows on the tentative-rulings table whose
+# body cell is empty — the court lists the case on the calendar but did not
+# post a tentative ruling for that row.  The multimodal LLM still emits one
+# object per calendar row, filling ``ruling_text`` with whatever happened to
+# be in that cell: the case caption, the motion-name header, a stray
+# punctuation mark, a fragment of nearby text.  These slip through the
+# pattern-based ``_drop_calendar_listing_rulings`` filter because the noise
+# text doesn't match any of its known markers (OFF-CALENDAR, NO TENTATIVE,
+# motion-type labels, etc.).
+#
+# The symptom is diagnosable by three shared characteristics of every
+# observed case:
+#
+#   * ``len(ruling_text) < 100`` — real tentative rulings run multi-paragraph
+#   * ``motion_type is None``    — LLM found no recognizable motion
+#   * ``outcome is None``        — LLM found no disposition verb
+#
+# Any one of these three signals alone is weak (real short "GRANTED."
+# rulings lack only length; a long citation artifact lacks only outcome),
+# but ALL THREE together virtually guarantees the row is calendar-listing
+# noise that the pattern filter missed.  "Missing > wrong" — when in doubt,
+# skip the row rather than emit something bogus.
+
+# Upper bound on ruling_text length for "short-unsubstantive" classification.
+# Real tentative rulings almost always exceed this length when complete; if
+# a row has <100 chars AND is missing both motion_type and outcome, the LLM
+# had no substantive content to summarize.
+_SHORT_UNSUBSTANTIVE_MAX_LENGTH = 100
+
+
+def _is_short_unsubstantive_ruling(
+    ruling: ExtractedRuling,
+    *,
+    length_threshold: int = _SHORT_UNSUBSTANTIVE_MAX_LENGTH,
+) -> bool:
+    """Return True if ``ruling`` is short and has no motion/outcome signal.
+
+    A "short-unsubstantive" ruling is one whose body text is below the
+    minimum-content threshold AND whose LLM extraction produced neither a
+    ``motion_type`` nor an ``outcome``.  These three signals together
+    indicate the row is almost certainly an empty-cell calendar listing
+    that the pattern-based filter missed — the LLM saw a calendar row with
+    no ruling body and filled ``ruling_text`` with whatever happened to be
+    in that cell (case caption fragment, motion-name header, stray text).
+
+    Additional qualifying condition: the ruling must have a case identifier
+    (``extracted_case_number`` or ``extracted_case_title``).  Rows without
+    either field are cross-page continuations that ``_join_page_rows``
+    could not merge into a previous case (no previous page context); those
+    promote to standalone ruling rows and must not be dropped even when
+    they happen to be short, because their content is real body text
+    belonging to a real case whose header was on a prior page.
+
+    The filter also short-circuits to False if the text contains a
+    disposition verb (GRANTED, DENIED, SUSTAINED, etc.).  Real one-liner
+    rulings like ``"Motion GRANTED."`` occasionally make it through with
+    null ``motion_type``/``outcome`` (LLM extraction failures are not free
+    of bugs), and those are real rulings we should not drop.
+
+    Parameters
+    ----------
+    ruling : ExtractedRuling
+        The ruling to evaluate.
+    length_threshold : int, optional
+        Maximum ``ruling_text`` length for short classification.  Defaults to
+        100 — chosen to match the matching OC spotcheck criterion in #2645.
+
+    Returns
+    -------
+    bool
+        True if ``ruling`` should be dropped as short-unsubstantive.
+    """
+    text = ruling.ruling_text
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped) >= length_threshold:
+        return False
+    # A disposition verb means this is a real ruling, even if motion_type
+    # and outcome happen to be None (LLM extraction isn't bug-free either).
+    if _RULING_VERB_RE.search(stripped):
+        return False
+    # Cross-page continuations lack both case_number and case_title — those
+    # rows carry real body text whose header lives on a prior page.  Never
+    # drop them even when short and signal-free; that's the splitter's job
+    # to recover the full context on a later pass, not this filter's.
+    if not ruling.extracted_case_number and not ruling.extracted_case_title:
+        return False
+    # The three-signal test: missing motion_type AND outcome AND short.
+    return ruling.motion_type is None and ruling.outcome is None
+
+
+def _drop_short_unsubstantive_rulings(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Filter out rulings below the minimum-content threshold (#2645).
+
+    Orange County calendar PDFs sometimes list cases with empty
+    tentative-ruling cells (the court listed the case but did not post a
+    tentative for that row).  The multimodal LLM still emits one row per
+    listed case, filling ``ruling_text`` with whatever happened to be in
+    that cell — e.g. a fragment of the case caption or motion label.
+    These rows slip through ``_drop_calendar_listing_rulings`` because the
+    noise text doesn't match any of its known placeholder patterns.
+
+    This filter drops rulings that are **simultaneously**:
+
+    1. Short — ``len(ruling_text) < 100``
+    2. Missing ``motion_type`` (LLM found no motion label)
+    3. Missing ``outcome`` (LLM found no disposition)
+    4. Do not contain any disposition verb in ``ruling_text``
+
+    All four conditions must hold.  A disposition verb (``GRANTED``,
+    ``SUSTAINED``, etc.) is a strong enough signal that this is a real
+    short ruling — short-but-real rulings like ``"Motion GRANTED."`` are
+    preserved even if the LLM happened to leave ``motion_type``/``outcome``
+    null.
+
+    Rules:
+
+    - Entries with ``cross_reference_source`` set are exempt (same pattern
+      as ``_drop_calendar_listing_rulings``) — the shared text is the
+      referent's responsibility.
+    - Entries with ``ruling_text`` of ``None`` or empty are preserved —
+      they carry metadata only; dropping them is the job of other filters.
+
+    "Missing > wrong" (CLAUDE.md §Scraper Development Rules): when in doubt
+    between emitting a bogus short ruling and dropping the row, drop it.
+    """
+    kept: list[ExtractedRuling] = []
+    for ruling in rulings:
+        if ruling.cross_reference_source is not None:
+            kept.append(ruling)
+            continue
+        if not ruling.ruling_text:
+            kept.append(ruling)
+            continue
+        if _is_short_unsubstantive_ruling(ruling):
+            logger.warning(
+                "llm_extractor.short_unsubstantive_dropped",
+                case_number=ruling.extracted_case_number,
+                case_title=ruling.extracted_case_title,
+                text_preview=ruling.ruling_text[:100],
+                text_length=len(ruling.ruling_text),
+            )
+            continue
+        kept.append(ruling)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: cache-hit filter re-application (#2513)
 # ---------------------------------------------------------------------------
 #
@@ -946,6 +1100,7 @@ def _apply_pdf_cache_hit_filters(
     """
     original_count = len(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
+    rulings = _drop_short_unsubstantive_rulings(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _filter_citation_artifacts(rulings)
     if len(rulings) != original_count:
@@ -2836,6 +2991,16 @@ def _join_page_rows(
     # this AFTER cross-reference resolution so legitimate shared text is
     # not accidentally classified as calendar-only.
     rulings = _drop_calendar_listing_rulings(rulings)
+
+    # Post-processing: drop short-unsubstantive rulings that slipped
+    # through the pattern-based calendar-listing filter (#2645).  Catches
+    # empty-cell OC calendar rows where the LLM filled ruling_text with
+    # noise (case caption fragment, motion label without disposition)
+    # instead of a real tentative ruling body.  Must run AFTER the
+    # pattern-based filter so pattern-matched rows log under their specific
+    # marker, and AFTER cross-reference resolution so shared text isn't
+    # misclassified as unsubstantive.
+    rulings = _drop_short_unsubstantive_rulings(rulings)
 
     # Post-processing: deduplicate identical ruling texts (#2096).
     # The LLM sometimes produces the same ruling text for multiple cases

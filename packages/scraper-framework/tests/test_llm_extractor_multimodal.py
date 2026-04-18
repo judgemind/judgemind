@@ -26,18 +26,20 @@ from framework.llm_extractor import (
     _create_google_client,
     _deduplicate_ruling_texts,
     _drop_calendar_listing_rulings,
+    _drop_short_unsubstantive_rulings,
     _extract_case_number_from_info,
     _extract_case_title_from_info,
     _is_calendar_header,
     _is_calendar_listing_only,
     _is_new_case,
+    _is_short_unsubstantive_ruling,
     _join_page_rows,
     _parse_page_rows,
     _render_pdf_pages,
     _resolve_cross_references,
     _split_fused_case_info,
 )
-from framework.llm_schema import ExtractedRuling
+from framework.llm_schema import ExtractedRuling, ExtractionOutcome
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -910,7 +912,13 @@ class TestJoinPageRows:
     def test_case_info_merging_for_continuation(self) -> None:
         """Continuation case_info is appended to previous case."""
         rows = [
-            {"entry_number": 1, "case_info": "2024-00001 Alpha v. Beta", "ruling_text": "Part 1"},
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                # Include a disposition verb so the short-unsubstantive
+                # filter (#2645) doesn't drop the merged row.
+                "ruling_text": "GRANTED. Part 1",
+            },
             {"entry_number": None, "case_info": "Additional info", "ruling_text": "Part 2"},
         ]
         rulings = _join_page_rows(rows)
@@ -1733,6 +1741,383 @@ class TestDropCalendarListingRulings:
         result = _drop_calendar_listing_rulings(rulings)
         assert len(result) == 1
         assert result[0].extracted_case_number == "30-2024-00007"
+
+
+class TestIsShortUnsubstantiveRuling:
+    """Tests for ``_is_short_unsubstantive_ruling`` (#2645).
+
+    Validates the three-signal test: ``ruling_text`` shorter than
+    threshold AND ``motion_type`` is None AND ``outcome`` is None.  A
+    disposition verb in the text short-circuits to False — real short
+    rulings are never dropped.
+    """
+
+    # --- Positive cases: should be classified as short-unsubstantive ---
+
+    def test_empty_cell_case_caption_noise(self) -> None:
+        """Calendar row with empty cell, LLM filled text with case caption (#2645)."""
+        # 46-char text matching the Malki symptom from the issue body —
+        # short, no motion, no outcome, no disposition verb.
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            extracted_case_title="Malki vs Karanouh",
+            ruling_text="MALKI, Wajih v. KARANOUH, Abdulmajid",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is True
+
+    def test_short_noise_no_motion_no_outcome(self) -> None:
+        """Generic short text with no motion/outcome is dropped."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="Case caption only text here.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is True
+
+    def test_short_with_title_only_no_signals_dropped(self) -> None:
+        """Case with only a title (no case_number) but null motion/outcome is dropped."""
+        ruling = ExtractedRuling(
+            extracted_case_number=None,
+            extracted_case_title="Smith vs Jones",
+            ruling_text="Short caption fragment text",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is True
+
+    def test_exactly_at_threshold_boundary(self) -> None:
+        """Text at exactly threshold length is NOT dropped (strict <)."""
+        # Exactly 100 chars.
+        text = "A" * 100
+        ruling = ExtractedRuling(
+            ruling_text=text,
+            motion_type=None,
+            outcome=None,
+        )
+        # _SHORT_UNSUBSTANTIVE_MAX_LENGTH = 100, condition is len < 100.
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_short_single_word(self) -> None:
+        """A single bare word with a case identifier is dropped."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Stray Row",
+            ruling_text="Malki",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is True
+
+    def test_cross_page_continuation_preserved(self) -> None:
+        """Cross-page continuation (no case_number/title) is NOT dropped.
+
+        Continuations get promoted to standalone rulings by ``_join_page_rows``
+        when there's no previous case on the same page to merge into.
+        They must not be dropped — their content is real ruling body text
+        whose header lives on a prior page.
+        """
+        ruling = ExtractedRuling(
+            extracted_case_number=None,
+            extracted_case_title=None,
+            ruling_text="...remaining text from previous case.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    # --- Negative cases: real short rulings must be preserved ---
+
+    def test_real_short_granted_preserved(self) -> None:
+        """'Motion GRANTED.' is real — preserved even with null motion/outcome."""
+        ruling = ExtractedRuling(
+            ruling_text="Motion GRANTED.",
+            motion_type=None,
+            outcome=None,
+        )
+        # Disposition verb short-circuits to False.
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_real_short_denied_preserved(self) -> None:
+        """'Denied.' alone preserved — disposition verb present."""
+        ruling = ExtractedRuling(
+            ruling_text="Denied.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_short_with_motion_type_preserved(self) -> None:
+        """Short text WITH motion_type extracted is preserved."""
+        ruling = ExtractedRuling(
+            ruling_text="Short text here",
+            motion_type="demurrer",
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_short_with_outcome_preserved(self) -> None:
+        """Short text WITH outcome extracted is preserved."""
+        ruling = ExtractedRuling(
+            ruling_text="Short text here",
+            motion_type=None,
+            outcome=ExtractionOutcome.GRANTED,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_long_text_never_dropped(self) -> None:
+        """Text >= threshold is never dropped, even with null motion/outcome.
+
+        Above the threshold, even "no signals" text may be a real ruling
+        that the LLM failed to classify.  Err on the side of keeping it
+        (missing > wrong applies both ways — don't drop legit rulings).
+        """
+        # 200 chars of body text, no disposition verb, no motion, no outcome.
+        text = "The parties appeared for oral argument on the motion. " * 4
+        assert len(text) >= 100
+        ruling = ExtractedRuling(
+            ruling_text=text,
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_none_text_preserved(self) -> None:
+        """None text returns False (metadata-only rows handled elsewhere)."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_empty_text_preserved(self) -> None:
+        """Empty-string text returns False."""
+        ruling = ExtractedRuling(
+            ruling_text="",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_whitespace_only_preserved(self) -> None:
+        """Whitespace-only text returns False (treated as empty)."""
+        ruling = ExtractedRuling(
+            ruling_text="   \n\t  ",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_short_with_sustained_verb_preserved(self) -> None:
+        """Short text with SUSTAINED is preserved."""
+        ruling = ExtractedRuling(
+            ruling_text="Demurrer SUSTAINED.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_short_with_overruled_verb_preserved(self) -> None:
+        """Short text with OVERRULED is preserved."""
+        ruling = ExtractedRuling(
+            ruling_text="Objection OVERRULED.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_short_with_continued_verb_preserved(self) -> None:
+        """Short text with CONTINUED is preserved (real continuance)."""
+        ruling = ExtractedRuling(
+            ruling_text="Motion CONTINUED to April 20.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _is_short_unsubstantive_ruling(ruling) is False
+
+    def test_custom_length_threshold(self) -> None:
+        """Threshold parameter overrides the default."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Some Case",
+            ruling_text="A" * 50,
+            motion_type=None,
+            outcome=None,
+        )
+        # With threshold 40, this 50-char text is above threshold.
+        assert _is_short_unsubstantive_ruling(ruling, length_threshold=40) is False
+        # With threshold 80, this 50-char text is below threshold.
+        assert _is_short_unsubstantive_ruling(ruling, length_threshold=80) is True
+
+
+class TestDropShortUnsubstantiveRulings:
+    """Tests for ``_drop_short_unsubstantive_rulings`` (#2645)."""
+
+    def test_drops_46_char_empty_cell_noise(self) -> None:
+        """Direct regression for the Malki symptom in issue #2645.
+
+        46 chars, motion_type=None, outcome=None — exactly the pattern the
+        issue describes.
+        """
+        noise = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            extracted_case_title="Malki vs Karanouh",
+            ruling_text="MALKI, Wajih v. KARANOUH, Abdulmajid",
+            motion_type=None,
+            outcome=None,
+        )
+        real = ExtractedRuling(
+            extracted_case_number="30-2024-00002",
+            extracted_case_title="Smith vs Jones",
+            ruling_text="Demurrer is SUSTAINED without leave to amend.",
+            motion_type="demurrer",
+            outcome=ExtractionOutcome.GRANTED,
+        )
+        result = _drop_short_unsubstantive_rulings([noise, real])
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "30-2024-00002"
+
+    def test_preserves_real_short_rulings_with_disposition(self) -> None:
+        """Short ruling with a disposition verb is preserved even if motion/outcome null."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="Motion GRANTED.",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _drop_short_unsubstantive_rulings([ruling]) == [ruling]
+
+    def test_preserves_rulings_with_motion_type(self) -> None:
+        """Short rulings with a motion_type are preserved."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="Short text here.",
+            motion_type="demurrer",
+            outcome=None,
+        )
+        assert _drop_short_unsubstantive_rulings([ruling]) == [ruling]
+
+    def test_preserves_rulings_with_outcome(self) -> None:
+        """Short rulings with an outcome are preserved."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="Short text here.",
+            motion_type=None,
+            outcome=ExtractionOutcome.DENIED,
+        )
+        assert _drop_short_unsubstantive_rulings([ruling]) == [ruling]
+
+    def test_preserves_cross_reference_entries(self) -> None:
+        """Cross-reference entries are exempt from the short-unsubstantive filter."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="Short noise text",
+            motion_type=None,
+            outcome=None,
+            cross_reference_source=2,
+        )
+        result = _drop_short_unsubstantive_rulings([ruling])
+        assert len(result) == 1
+
+    def test_preserves_none_text(self) -> None:
+        """None ruling_text entries are preserved (metadata-only rows)."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text=None,
+            motion_type=None,
+            outcome=None,
+        )
+        assert _drop_short_unsubstantive_rulings([ruling]) == [ruling]
+
+    def test_preserves_empty_text(self) -> None:
+        """Empty-string ruling_text entries are preserved."""
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="",
+            motion_type=None,
+            outcome=None,
+        )
+        assert _drop_short_unsubstantive_rulings([ruling]) == [ruling]
+
+    def test_preserves_long_rulings_without_signals(self) -> None:
+        """Long ruling text is preserved even with null motion/outcome."""
+        long_text = "The parties appeared for oral argument. " * 5
+        ruling = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text=long_text,
+            motion_type=None,
+            outcome=None,
+        )
+        assert len(long_text) >= 100
+        assert _drop_short_unsubstantive_rulings([ruling]) == [ruling]
+
+    def test_empty_list(self) -> None:
+        """Empty input returns empty list."""
+        assert _drop_short_unsubstantive_rulings([]) == []
+
+    def test_multiple_noise_rulings_all_dropped(self) -> None:
+        """Multiple empty-cell noise rows all get dropped."""
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="Smith vs Jones",
+                motion_type=None,
+                outcome=None,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                ruling_text="Motion for something",
+                motion_type=None,
+                outcome=None,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00003",
+                ruling_text="Short blurb",
+                motion_type=None,
+                outcome=None,
+            ),
+        ]
+        assert _drop_short_unsubstantive_rulings(rulings) == []
+
+    def test_interaction_with_calendar_listing_filter(self) -> None:
+        """The two filters are complementary — both needed.
+
+        The calendar-listing filter handles pattern-matched placeholders
+        (OFF-CALENDAR, motion labels).  The short-unsubstantive filter
+        catches unknown-pattern noise (case-caption fragments).
+        """
+        # OFF-CALENDAR matches _is_calendar_listing_only — would be dropped
+        # by the calendar-listing filter too, but the short-unsubstantive
+        # filter is tolerant of either pattern firing first.
+        listing = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            ruling_text="OFF-CALENDAR",
+            motion_type=None,
+            outcome=None,
+        )
+        # Unknown-pattern noise — only the short-unsubstantive filter catches it.
+        unknown = ExtractedRuling(
+            extracted_case_number="30-2024-00002",
+            ruling_text="MALKI, Wajih v. KARANOUH, Abdulmajid",
+            motion_type=None,
+            outcome=None,
+        )
+        real = ExtractedRuling(
+            extracted_case_number="30-2024-00003",
+            ruling_text="Demurrer is SUSTAINED without leave to amend.",
+            motion_type="demurrer",
+            outcome=ExtractionOutcome.GRANTED,
+        )
+        # Apply both filters in the same order as _join_page_rows.
+        step1 = _drop_calendar_listing_rulings([listing, unknown, real])
+        # step1: listing gone, unknown + real remain
+        assert len(step1) == 2
+        step2 = _drop_short_unsubstantive_rulings(step1)
+        # step2: unknown gone, only real remains
+        assert len(step2) == 1
+        assert step2[0].extracted_case_number == "30-2024-00003"
 
 
 class TestJoinPageRowsCalendarListing:
@@ -3426,11 +3811,14 @@ class TestJoinPageRowsFusedRowSplit:
         splitter fix, the same 5 rows expand to 6 rulings with distinct
         case titles.
         """
+        # Include disposition verbs (GRANTED, DENIED) in each stub so the
+        # short-unsubstantive filter (#2645) does not drop them — these
+        # placeholders are shorter than the real-ruling threshold.
         rows = [
             {
                 "entry_number": 1,
                 "case_info": "30-2024-01111111 Grossman v. Smith",
-                "ruling_text": "Ruling 1.",
+                "ruling_text": "GRANTED. Ruling 1.",
             },
             {
                 "entry_number": 2,
@@ -3438,22 +3826,22 @@ class TestJoinPageRowsFusedRowSplit:
                     "Gu v. Family Orthodontics & Oral Surgery 2 "
                     "Clarke, Inc. v. Ellis & Son Trucking, Inc."
                 ),
-                "ruling_text": "Ruling 2 (on Gu).",
+                "ruling_text": "GRANTED. Ruling 2 (on Gu).",
             },
             {
                 "entry_number": 3,
                 "case_info": "30-2024-02222222 Sandoval v. Lopez",
-                "ruling_text": "Ruling 3.",
+                "ruling_text": "DENIED. Ruling 3.",
             },
             {
                 "entry_number": 4,
                 "case_info": "30-2024-03333333 Moore v. Williams",
-                "ruling_text": "Ruling 4.",
+                "ruling_text": "GRANTED. Ruling 4.",
             },
             {
                 "entry_number": 5,
                 "case_info": "30-2024-04444444 Palacios v. Vallejo",
-                "ruling_text": "Ruling 5.",
+                "ruling_text": "DENIED. Ruling 5.",
             },
         ]
         rulings = _join_page_rows(rows)
@@ -3483,7 +3871,9 @@ class TestJoinPageRowsFusedRowSplit:
                     "Gu v. Family Orthodontics & Oral Surgery 2 "
                     "Clarke, Inc. v. Ellis & Son Trucking, Inc."
                 ),
-                "ruling_text": "R1.",
+                # Include a disposition verb so the short-unsubstantive
+                # filter (#2645) preserves this stub.
+                "ruling_text": "GRANTED. R1.",
             },
         ]
         rulings = _join_page_rows(rows)
@@ -3518,7 +3908,9 @@ class TestJoinPageRowsFusedRowSplit:
                     "Gu v. Family Orthodontics & Oral Surgery 2 "
                     "Clarke, Inc. v. Ellis & Son Trucking, Inc."
                 ),
-                "ruling_text": "Ruling 2.",
+                # Include a disposition verb so the short-unsubstantive
+                # filter (#2645) preserves the fused row's sub-cases.
+                "ruling_text": "GRANTED. Ruling 2.",
             },
             {
                 "entry_number": 3,
