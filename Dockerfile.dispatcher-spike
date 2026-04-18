@@ -27,14 +27,23 @@ FROM node:20-slim AS spike
 # arm64 hosts produce an amd64 image Fargate can execute.
 
 # System deps: ca-certificates for HTTPS (Anthropic + GitHub APIs),
-# git for any MCP server that needs it, and Python 3 for the entrypoint's
-# JSON glue.
+# git for any MCP server that needs it, Python 3 for the entrypoint's
+# JSON glue, pip + psycopg[binary] for the spike 0.2 PreToolUse hook
+# that writes directly to Postgres via `emit_failure.py`.
+#
+# We install psycopg v3 (the `psycopg` import name) to match the rest of
+# the repo (`packages/scraper-framework` depends on `psycopg[binary]>=3.1`).
+# The --break-system-packages flag is required on Debian bookworm's PEP
+# 668-marked python3; the spike image is throwaway and not a shared
+# system Python, so the safety rail doesn't apply here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
         python3 \
+        python3-pip \
         curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages 'psycopg[binary]>=3.1'
 
 # Pin the Claude Code CLI version so the spike is reproducible. If the
 # latest CLI version breaks on Fargate we want that to be a visible pin
@@ -58,6 +67,21 @@ RUN useradd --uid 1100 --create-home --shell /bin/bash spike \
 COPY scripts/dispatcher-spike/mcp-config.json \
      /etc/dispatcher-spike/mcp-config.json
 RUN chmod 0644 /etc/dispatcher-spike/mcp-config.json
+
+# Spike 0.2: ship the PreToolUse hook settings, the hook shim, and the
+# emit_failure.py implementation. The hook fires on Read tool calls from
+# inside `claude -p` and writes a row to `dispatcher_spike.failures`.
+COPY scripts/dispatcher-spike/settings.json \
+     /etc/dispatcher-spike/settings.json
+RUN chmod 0644 /etc/dispatcher-spike/settings.json
+
+COPY scripts/dispatcher-spike/hook-emit-failure.sh \
+     /usr/local/bin/dispatcher-spike-hook.sh
+RUN chmod 0755 /usr/local/bin/dispatcher-spike-hook.sh
+
+COPY scripts/dispatcher/emit_failure.py \
+     /usr/local/bin/emit_failure.py
+RUN chmod 0755 /usr/local/bin/emit_failure.py
 
 # Copy the in-container entrypoint that runs claude -p with the scenario.
 COPY scripts/dispatcher-spike/container-entry.sh \
