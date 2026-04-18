@@ -180,7 +180,7 @@ git -C {worktree} rebase origin/main
 git push -u origin <branch>
 ```
 
-Before creating a PR, check for duplicates using `preflight_no_duplicate_pr` from `scripts/preflight.sh`. If a duplicate is found (return code 0), adopt the existing PR instead of creating a new one. If no duplicate (return code 1) or on error (return code 2), proceed normally:
+Before creating a PR, check for duplicates with `scripts/check-duplicate-pr.sh <N>` (a thin wrapper around `preflight_no_duplicate_pr` that avoids the `source && fn` preflight-hook friction). If a duplicate is found (return code 0), adopt the existing PR instead of creating a new one. If no duplicate (return code 1) or on error (return code 2), proceed normally:
 
 ```
 gh pr create --repo judgemind/judgemind ...
