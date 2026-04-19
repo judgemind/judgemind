@@ -48,3 +48,60 @@ export function extractPriority(
   }
   return null;
 }
+
+/**
+ * Map of `priority/pN` labels to their numeric sort rank. Lower is
+ * more urgent. Mirrors ``_PRIORITY_LABEL_RANKS`` in
+ * ``scripts/dispatcher/daemon.py`` so the admin-page queue display
+ * matches the daemon's pick order (issue #2843 / parallel to #2835).
+ */
+const PRIORITY_LABEL_RANKS: Readonly<Record<string, number>> = {
+  'priority/p0': 0,
+  'priority/p1': 1,
+  'priority/p2': 2,
+  'priority/p3': 3,
+};
+
+/**
+ * Rank assigned to issues that carry no recognised `priority/pN`
+ * label. Sinks below p3 so priority-labelled work always wins a
+ * head-to-head against unlabelled work, but unlabelled issues remain
+ * eligible once the labelled ones are exhausted.
+ */
+export const PRIORITY_RANK_NO_LABEL = 4;
+
+/**
+ * Return the lowest (most-urgent) priority rank implied by `labels`.
+ *
+ * - `priority/p0` → 0
+ * - `priority/p1` → 1
+ * - `priority/p2` → 2
+ * - `priority/p3` → 3
+ * - No priority label (or empty / malformed input) →
+ *   {@link PRIORITY_RANK_NO_LABEL} (4)
+ *
+ * Used as the primary sort key for the admin page's queue display so
+ * the operator sees issues in the same order the daemon picks them
+ * (parallel to `_priority_rank` in `scripts/dispatcher/daemon.py`
+ * from issue #2835).
+ *
+ * When an issue carries more than one priority label (shouldn't
+ * happen, but defensive), the lowest rank wins — picking the most
+ * urgent interpretation matches operator intent.
+ *
+ * Tolerates non-array input (returns the no-label floor) and ignores
+ * non-string entries, so a malformed ``issues_json`` row cannot crash
+ * the sort.
+ */
+export function priorityRank(labels: unknown): number {
+  if (!Array.isArray(labels)) return PRIORITY_RANK_NO_LABEL;
+  let best = PRIORITY_RANK_NO_LABEL;
+  for (const entry of labels) {
+    if (typeof entry !== 'string') continue;
+    const rank = PRIORITY_LABEL_RANKS[entry];
+    if (rank !== undefined && rank < best) {
+      best = rank;
+    }
+  }
+  return best;
+}

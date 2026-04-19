@@ -21,11 +21,14 @@ import {
   normalizeSnapshotJson,
   queueItemFromSnapshot,
   recentCompletionsToGraphQL,
+  sortAndSliceQueueReady,
   type SnapshotIssueRecord,
 } from '../src/graphql/dispatcher/resolvers';
 import {
   extractPriority,
   parseBlockedBy,
+  priorityRank,
+  PRIORITY_RANK_NO_LABEL,
 } from '../src/graphql/dispatcher/parse-labels';
 
 describe('normalizeSnapshotJson', () => {
@@ -259,5 +262,206 @@ describe('parse-labels helpers (pure, no fetch)', () => {
 
   it('parseBlockedBy ignores "Parent:" lines (distinct mechanic)', () => {
     expect(parseBlockedBy('Parent: #1\n')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// priorityRank + sortAndSliceQueueReady (issue #2843 — parallel to #2835)
+// ---------------------------------------------------------------------------
+
+describe('priorityRank', () => {
+  it('maps priority labels to their rank (p0..p3 → 0..3)', () => {
+    expect(priorityRank(['priority/p0'])).toBe(0);
+    expect(priorityRank(['priority/p1'])).toBe(1);
+    expect(priorityRank(['priority/p2'])).toBe(2);
+    expect(priorityRank(['priority/p3'])).toBe(3);
+  });
+
+  it('returns the no-label floor (4) when no priority label is present', () => {
+    expect(priorityRank(['area/api', 'type/bug'])).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank([])).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(PRIORITY_RANK_NO_LABEL).toBe(4);
+  });
+
+  it('returns the no-label floor for null / undefined / non-array input', () => {
+    expect(priorityRank(null)).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank(undefined)).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank('priority/p0')).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank({ 'priority/p0': 1 })).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank(42)).toBe(PRIORITY_RANK_NO_LABEL);
+  });
+
+  it('ignores non-string entries in the label array', () => {
+    // Every entry is non-string → floor
+    expect(priorityRank([{ name: 'priority/p0' }, 42, null])).toBe(
+      PRIORITY_RANK_NO_LABEL,
+    );
+    // Mixed — valid string wins despite noise
+    expect(priorityRank([null, 'priority/p1', { obj: true }])).toBe(1);
+  });
+
+  it('picks the lowest rank when multiple priority labels are present', () => {
+    expect(priorityRank(['priority/p2', 'priority/p0'])).toBe(0);
+    expect(priorityRank(['priority/p3', 'priority/p1'])).toBe(1);
+    expect(priorityRank(['priority/p2', 'priority/p3'])).toBe(2);
+  });
+
+  it('rejects malformed priority labels (priority/p9, priority/high, etc.)', () => {
+    expect(priorityRank(['priority/p9'])).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank(['priority/high'])).toBe(PRIORITY_RANK_NO_LABEL);
+    expect(priorityRank(['priority/p0 '])).toBe(PRIORITY_RANK_NO_LABEL);
+  });
+
+  it('documents the end-to-end rank ordering (p0 < p1 < p2 < p3 < floor)', () => {
+    const ranks = [
+      priorityRank(['priority/p0']),
+      priorityRank(['priority/p1']),
+      priorityRank(['priority/p2']),
+      priorityRank(['priority/p3']),
+      priorityRank([]),
+    ];
+    expect(ranks).toEqual([0, 1, 2, 3, PRIORITY_RANK_NO_LABEL]);
+    expect(ranks).toEqual([...ranks].sort((a, b) => a - b));
+  });
+});
+
+describe('sortAndSliceQueueReady', () => {
+  /** Small helper — build a SnapshotIssueRecord with sensible defaults. */
+  function issue(
+    number: number,
+    labels: string[],
+    createdAt: string,
+  ): SnapshotIssueRecord {
+    return { number, title: `Issue ${number}`, labels, createdAt };
+  }
+
+  it('surfaces the p0 at row 1 even when it is the 23rd newest (#2712 scenario)', () => {
+    // Mirrors the real-world case from the issue body: 22 p1/p2 issues
+    // filed AFTER the single p0, stored in gh CREATED_AT DESC order.
+    // With the buggy slice-only behaviour the p0 is invisible; the
+    // fixed resolver must surface it at row 1.
+    const newerP1P2: SnapshotIssueRecord[] = [];
+    for (let i = 0; i < 22; i += 1) {
+      // createdAt strictly newer than the p0 below. Alternate p1/p2.
+      const day = String(20 - (i % 20)).padStart(2, '0');
+      const createdAt = `2026-05-${day}T12:00:00Z`;
+      const prio = i % 2 === 0 ? 'priority/p1' : 'priority/p2';
+      newerP1P2.push(issue(3000 + i, [prio, 'agent/ready'], createdAt));
+    }
+    const p0 = issue(
+      2712,
+      ['priority/p0', 'agent/ready'],
+      '2026-03-01T00:00:00Z',
+    );
+    // Storage order is CREATED_AT DESC — the 22 newer ones first, then the p0.
+    const storedOrder = [...newerP1P2, p0];
+    // Sanity — p0 is at the 23rd position by default.
+    expect(storedOrder[22].number).toBe(2712);
+    // The buggy path would drop the p0 from slice(0, 10) entirely.
+    expect(storedOrder.slice(0, 10).some((i) => i.number === 2712)).toBe(false);
+
+    const result = sortAndSliceQueueReady(storedOrder, 10);
+
+    expect(result).toHaveLength(10);
+    expect(result[0].number).toBe(2712);
+    expect(priorityRank(result[0].labels)).toBe(0);
+    // Every other row in top 10 is p1 (p1 beats p2 in the sort).
+    for (let i = 1; i < result.length; i += 1) {
+      expect(result[i].labels).toContain('priority/p1');
+    }
+  });
+
+  it('sorts unlabelled issues last among open issues', () => {
+    const unlabelled = issue(900, ['area/api'], '2026-01-01T00:00:00Z');
+    const p3 = issue(901, ['priority/p3'], '2026-04-19T00:00:00Z');
+    const p0 = issue(902, ['priority/p0'], '2026-04-19T00:00:00Z');
+    const input = [unlabelled, p0, p3];
+
+    const result = sortAndSliceQueueReady(input, 10);
+
+    expect(result.map((r) => r.number)).toEqual([902, 901, 900]);
+    // Specifically: the oldest-by-createdAt `unlabelled` still sorts last
+    // because its rank (4) beats every priority-labelled issue.
+    expect(result[result.length - 1].number).toBe(900);
+  });
+
+  it('breaks ties within a priority bucket by createdAt ASC (older first)', () => {
+    // Three p1 issues, stored in createdAt DESC order (newest first).
+    const newer = issue(100, ['priority/p1'], '2026-04-19T12:00:00Z');
+    const middle = issue(101, ['priority/p1'], '2026-04-18T12:00:00Z');
+    const older = issue(102, ['priority/p1'], '2026-04-17T12:00:00Z');
+
+    const result = sortAndSliceQueueReady([newer, middle, older], 10);
+
+    expect(result.map((r) => r.number)).toEqual([102, 101, 100]);
+  });
+
+  it('respects both keys: priority first, then createdAt ASC', () => {
+    // Mixed priorities + mixed createdAts. Expected order:
+    //   p0 (any createdAt wins), then p1 by createdAt ASC, then p2.
+    const p0New = issue(1, ['priority/p0'], '2026-04-19T00:00:00Z');
+    const p1Old = issue(2, ['priority/p1'], '2026-01-01T00:00:00Z');
+    const p1New = issue(3, ['priority/p1'], '2026-04-19T00:00:00Z');
+    const p2 = issue(4, ['priority/p2'], '2025-12-01T00:00:00Z');
+
+    const result = sortAndSliceQueueReady([p2, p1New, p0New, p1Old], 10);
+
+    expect(result.map((r) => r.number)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('slices to `limit` after sorting, not before', () => {
+    // Deliberately order the input so a naive `input.slice(0, limit)`
+    // would drop the p0, exactly as the old queryQueueReady bug did.
+    const input: SnapshotIssueRecord[] = [];
+    for (let i = 0; i < 15; i += 1) {
+      input.push(
+        issue(2000 + i, ['priority/p2'], `2026-04-${String(19 - i).padStart(2, '0')}T00:00:00Z`),
+      );
+    }
+    const p0 = issue(1, ['priority/p0'], '2025-01-01T00:00:00Z');
+    input.push(p0); // p0 at position 15 (past the slice boundary)
+
+    const result = sortAndSliceQueueReady(input, 10);
+
+    expect(result).toHaveLength(10);
+    expect(result[0].number).toBe(1);
+  });
+
+  it('returns an empty array for an empty input', () => {
+    expect(sortAndSliceQueueReady([], 10)).toEqual([]);
+  });
+
+  it('does not mutate the input array', () => {
+    const input: SnapshotIssueRecord[] = [
+      issue(1, ['priority/p2'], '2026-04-19T00:00:00Z'),
+      issue(2, ['priority/p0'], '2026-04-18T00:00:00Z'),
+    ];
+    const inputCopy = input.slice();
+
+    sortAndSliceQueueReady(input, 10);
+
+    expect(input).toEqual(inputCopy);
+    expect(input[0].number).toBe(1);
+  });
+
+  it('handles missing / empty createdAt by sorting them last within their bucket', () => {
+    const withTs = issue(1, ['priority/p1'], '2026-04-19T00:00:00Z');
+    const withoutTs = issue(2, ['priority/p1'], '');
+
+    const result = sortAndSliceQueueReady([withoutTs, withTs], 10);
+
+    expect(result.map((r) => r.number)).toEqual([1, 2]);
+  });
+
+  it('handles a limit larger than the input length without padding', () => {
+    const input: SnapshotIssueRecord[] = [
+      issue(1, ['priority/p0'], '2026-04-19T00:00:00Z'),
+      issue(2, ['priority/p1'], '2026-04-19T00:00:00Z'),
+    ];
+
+    const result = sortAndSliceQueueReady(input, 10);
+
+    expect(result).toHaveLength(2);
+    expect(result.map((r) => r.number)).toEqual([1, 2]);
   });
 });
