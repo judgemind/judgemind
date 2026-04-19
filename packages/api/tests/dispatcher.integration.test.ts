@@ -307,6 +307,34 @@ describe('dispatcherState — admin', () => {
     expect(ours!.status).toBe('running');
   });
 
+  it('queueDepth reflects the latest row in dispatcher.queue_snapshots (#2768)', async () => {
+    // Seed two snapshots: an older one with depth 3, a newer one with
+    // depth 7. The resolver should return 7 (latest by observed_at DESC).
+    // We seed via the run we'll insert so cleanup cascades correctly.
+    const runId = await insertRun();
+    await pool.query(
+      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, run_id)
+       VALUES (now() - interval '2 minutes', 3, ARRAY[11,22,33]::int[], $1)`,
+      [runId],
+    );
+    await pool.query(
+      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, run_id)
+       VALUES (now() - interval '10 seconds', 7, ARRAY[40,41,42,43,44,45,46]::int[], $1)`,
+      [runId],
+    );
+
+    const body = await gql(
+      `{ dispatcherState { queueDepth } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    expect(state.queueDepth).toBe(7);
+    // Snapshots are ON DELETE CASCADE on dispatcher.runs, so removing
+    // the inserted run in cleanup tears down the snapshot rows too.
+  });
+
   it('surfaces recent failures within sinceHours window', async () => {
     const agentId = await insertAgent({ issueNumber: 999002, status: 'failed' });
     await insertFailure({

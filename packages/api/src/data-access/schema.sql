@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 22 migrations.
+-- Generated from 24 migrations.
 
 
 
@@ -484,6 +484,24 @@ CREATE SEQUENCE dispatcher.phase_transitions_transition_id_seq
 ALTER SEQUENCE dispatcher.phase_transitions_transition_id_seq OWNED BY dispatcher.phase_transitions.transition_id;
 
 
+CREATE TABLE dispatcher.queue_snapshots (
+    snapshot_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    queue_depth integer NOT NULL,
+    issue_numbers integer[] NOT NULL,
+    run_id uuid
+);
+
+
+COMMENT ON TABLE dispatcher.queue_snapshots IS 'Append-only history of observed agent/ready queue depths. Written by the daemon on each 30s scheduler tick (Phase 2+).';
+
+
+COMMENT ON COLUMN dispatcher.queue_snapshots.issue_numbers IS 'Array of the observed issue numbers, ordered by priority as seen by the daemon at scan time.';
+
+
+COMMENT ON COLUMN dispatcher.queue_snapshots.run_id IS 'Owning daemon run. Snapshots cascade-delete with the run row so forensic queries after a crash stay clean.';
+
+
 CREATE TABLE dispatcher.retry_markers (
     marker_id bigint NOT NULL,
     agent_id uuid NOT NULL,
@@ -821,6 +839,10 @@ ALTER TABLE ONLY dispatcher.phase_transitions
     ADD CONSTRAINT phase_transitions_pkey PRIMARY KEY (transition_id);
 
 
+ALTER TABLE ONLY dispatcher.queue_snapshots
+    ADD CONSTRAINT queue_snapshots_pkey PRIMARY KEY (snapshot_id);
+
+
 ALTER TABLE ONLY dispatcher.retry_markers
     ADD CONSTRAINT retry_markers_pkey PRIMARY KEY (marker_id);
 
@@ -1019,6 +1041,9 @@ CREATE UNIQUE INDEX idx_dispatcher_phase_outputs_agent_phase ON dispatcher.phase
 CREATE INDEX idx_dispatcher_phase_transitions_agent_ts ON dispatcher.phase_transitions USING btree (agent_id, ts DESC);
 
 
+CREATE INDEX idx_dispatcher_queue_snapshots_observed_at ON dispatcher.queue_snapshots USING btree (observed_at DESC);
+
+
 CREATE INDEX idx_dispatcher_retry_markers_pending ON dispatcher.retry_markers USING btree (retry_after_ts) WHERE (resolved_at IS NULL);
 
 
@@ -1180,6 +1205,10 @@ ALTER TABLE ONLY dispatcher.phase_outputs
 
 ALTER TABLE ONLY dispatcher.phase_transitions
     ADD CONSTRAINT phase_transitions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.queue_snapshots
+    ADD CONSTRAINT queue_snapshots_run_id_fkey FOREIGN KEY (run_id) REFERENCES dispatcher.runs(run_id) ON DELETE CASCADE;
 
 
 ALTER TABLE ONLY dispatcher.retry_markers
