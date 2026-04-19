@@ -376,9 +376,15 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('judges returns JudgeConnection', async () => {
-      const body = await gql(`{
-        judges { edges { node { id canonicalName } cursor } pageInfo { hasNextPage } }
-      }`);
+      // Scope by courtId so this test is stable against local dev DBs populated
+      // with thousands of judges — without a narrowing filter, the default page
+      // (first: 20) won't contain the seeded judge (#2745).
+      const body = await gql(
+        `query($id: ID!) {
+          judges(courtId: $id) { edges { node { id canonicalName } cursor } pageInfo { hasNextPage } }
+        }`,
+        { id: courtId },
+      );
       expect(body.errors).toBeUndefined();
       const edges = ((body.data?.judges as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
       expect(edges.some((e) => e.node.id === judgeId)).toBe(true);
@@ -436,9 +442,15 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('rulings returns RulingConnection', async () => {
-      const body = await gql(`{
-        rulings { edges { node { id outcome } cursor } pageInfo { hasNextPage } }
-      }`);
+      // Scope by courtId so this test is stable against local dev DBs populated
+      // with thousands of rulings — without a narrowing filter, the default page
+      // (first: 20) won't contain the seeded ruling (#2745).
+      const body = await gql(
+        `query($id: ID!) {
+          rulings(courtId: $id) { edges { node { id outcome } cursor } pageInfo { hasNextPage } }
+        }`,
+        { id: courtId },
+      );
       expect(body.errors).toBeUndefined();
       const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
       expect(edges.some((e) => e.node.id === rulingId)).toBe(true);
@@ -475,14 +487,25 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('filters by county', async () => {
-      const body = await gql(`{ rulings(county: "${GQL_COUNTY}") { edges { node { id } } } }`);
+      // Also scope by courtId to keep the default page narrow on dev DBs with
+      // many "Los Angeles" rulings (#2745). The county filter is still exercised.
+      const body = await gql(
+        `query($id: ID!) { rulings(courtId: $id, county: "${GQL_COUNTY}") { edges { node { id } } } }`,
+        { id: courtId },
+      );
       expect(body.errors).toBeUndefined();
       const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
       expect(edges.some((e) => e.node.id === rulingId)).toBe(true);
     });
 
     it('filters by outcome', async () => {
-      const granted = await gql(`{ rulings(outcome: "granted") { edges { node { id outcome } } } }`);
+      // Also scope by courtId so the default page contains the seeded row on
+      // dev DBs with many granted rulings (#2745). The outcome filter is still
+      // verified both by presence and by asserting all returned edges match.
+      const granted = await gql(
+        `query($id: ID!) { rulings(courtId: $id, outcome: "granted") { edges { node { id outcome } } } }`,
+        { id: courtId },
+      );
       expect(granted.errors).toBeUndefined();
       const gEdges = ((granted.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; outcome: string } }>);
       expect(gEdges.some((e) => e.node.id === rulingId)).toBe(true);
@@ -490,9 +513,15 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('filters by dateFrom / dateTo', async () => {
-      const body = await gql(`{
-        rulings(dateFrom: "2026-03-02", dateTo: "2026-03-02") { edges { node { id hearingDate } } }
-      }`);
+      // Also scope by courtId so the default page contains the seeded row on
+      // dev DBs with many rulings on 2026-03-02 (#2745). The date filter is
+      // still verified by the per-edge hearingDate assertion.
+      const body = await gql(
+        `query($id: ID!) {
+          rulings(courtId: $id, dateFrom: "2026-03-02", dateTo: "2026-03-02") { edges { node { id hearingDate } } }
+        }`,
+        { id: courtId },
+      );
       expect(body.errors).toBeUndefined();
       const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; hearingDate: string } }>);
       expect(edges.length).toBeGreaterThan(0);
@@ -532,14 +561,23 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('filters by motionType', async () => {
-      const msj = await gql(`{ rulings(motionType: "msj") { edges { node { id motionType } } } }`);
+      // Also scope by courtId so the default page contains the seeded row on
+      // dev DBs with many msj/mtd rulings (#2745). The motionType filter is
+      // still verified by the per-edge motionType assertion.
+      const msj = await gql(
+        `query($id: ID!) { rulings(courtId: $id, motionType: "msj") { edges { node { id motionType } } } }`,
+        { id: courtId },
+      );
       expect(msj.errors).toBeUndefined();
       const msjEdges = ((msj.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; motionType: string } }>);
       expect(msjEdges.some((e) => e.node.id === rulingId)).toBe(true);
       msjEdges.filter((e) => e.node.id === rulingId).forEach((e) => expect(e.node.motionType).toBe('msj'));
 
       // motionType=mtd should not return the msj ruling
-      const mtd = await gql(`{ rulings(motionType: "mtd") { edges { node { id motionType } } } }`);
+      const mtd = await gql(
+        `query($id: ID!) { rulings(courtId: $id, motionType: "mtd") { edges { node { id motionType } } } }`,
+        { id: courtId },
+      );
       expect(mtd.errors).toBeUndefined();
       const mtdEdges = ((mtd.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; motionType: string } }>);
       expect(mtdEdges.some((e) => e.node.id === rulingId)).toBe(false);
@@ -547,14 +585,23 @@ describe('GraphQL schema — integration', () => {
     });
 
     it('filters by caseType', async () => {
-      const civil = await gql(`{ rulings(caseType: "civil") { edges { node { id } } } }`);
+      // Also scope by courtId so the default page contains the seeded row on
+      // dev DBs with many civil rulings (#2745). The caseType filter is still
+      // exercised — the civil case should appear, the family filter should not.
+      const civil = await gql(
+        `query($id: ID!) { rulings(courtId: $id, caseType: "civil") { edges { node { id } } } }`,
+        { id: courtId },
+      );
       expect(civil.errors).toBeUndefined();
       const civilEdges = ((civil.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
       // Our seeded case is 'civil', so the ruling should appear
       expect(civilEdges.some((e) => e.node.id === rulingId)).toBe(true);
 
       // caseType=family should not return rulings from our civil case
-      const family = await gql(`{ rulings(caseType: "family") { edges { node { id } } } }`);
+      const family = await gql(
+        `query($id: ID!) { rulings(courtId: $id, caseType: "family") { edges { node { id } } } }`,
+        { id: courtId },
+      );
       expect(family.errors).toBeUndefined();
       const familyEdges = ((family.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>);
       expect(familyEdges.some((e) => e.node.id === rulingId)).toBe(false);
