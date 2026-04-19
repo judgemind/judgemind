@@ -19,7 +19,7 @@ import {
 import { DispatcherHeader } from './DispatcherHeader';
 import { DispatcherControls } from './DispatcherControls';
 import { ActiveAgentsTable } from './ActiveAgentsTable';
-import { QueuePanel } from './QueuePanel';
+import { QueueBlockedPanel, QueueReadyPanel } from './QueuePanel';
 import { RecentCompletionsPanel } from './RecentCompletionsPanel';
 import { RecentFailuresPanel } from './RecentFailuresPanel';
 import { ConfigPanel } from './ConfigPanel';
@@ -54,19 +54,34 @@ function SkeletonShell() {
 }
 
 /**
- * Refreshed, info-dense cockpit for /admin/dispatcher (#2805 Phase 1).
- * Layout:
+ * Refreshed, info-dense cockpit for /admin/dispatcher (#2805 Phase 1;
+ * layout restructured in #2823).
  *
- *   ┌─ h1 Dispatcher  · status pill · uptime · sha · host        · [controls] ─┐
- *   ├─ Queue: Agent-ready ─────────────┬─ Active agents ──────────────────────┤
- *   │   (top 10)                       │  (0-N rows)                          │
- *   ├─ Queue: Blocked ─────────────────┤                                      │
- *   │   (top 10)                       ├─ Recently completed ─────────────────┤
- *   │                                  │  (top 10)                            │
- *   ├─ Config strip ──────────────────────────────────────────────────────────┤
- *   │   cap [N] · backoff [Ns] · spawn frozen: —                              │
- *   ├─ Recent failures (last 24h) ────────────────────────────────────────────┤
- *   └──────────────────────────────────────────────────────────────────────────┘
+ * Layout is a two-column state-flow deck below the header strip. The
+ * columns encode the natural motion of work through the daemon:
+ *
+ *   Queue: Agent-ready  →   Active agents   →   Recently completed
+ *        (bottom-left)      (top-left)           (top-right)
+ *
+ * Claiming an issue moves it upward in the left column (queue → active).
+ * Completing an issue moves it rightward to the top of the right column
+ * (active → recently completed). Blocked issues live bottom-right —
+ * adjacent to the flow but not part of the active cycle. The two columns
+ * are independent vertical stacks, not a 2×2 grid — panels have their
+ * natural heights and do not line up horizontally across columns.
+ *
+ *   ┌─ h1 Dispatcher · status pill · uptime · sha · host · [controls] ─┐
+ *   ├─ Active agents ──────────────────┬─ Recently completed ──────────┤
+ *   │   (0-N rows)                     │   (top 10)                    │
+ *   ├─ Queue: Agent-ready ─────────────┼─ Queue: Blocked ──────────────┤
+ *   │   (top 10)                       │   (top 10)                    │
+ *   ├─ Config strip ──────────────────────────────────────────────────┤
+ *   │   cap [N] · backoff [Ns] · spawn frozen: —                      │
+ *   ├─ Recent failures (last 24h) ────────────────────────────────────┤
+ *   └──────────────────────────────────────────────────────────────────┘
+ *
+ * On mobile (`< lg`) the grid collapses to a single column in DOM order:
+ *   Active → Queue-ready → Recently-completed → Queue-blocked.
  */
 export function DispatcherDashboard() {
   const { user, loading: authLoading } = useAuth();
@@ -287,25 +302,36 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         <SkeletonShell />
       ) : (
         <>
-          <div className="grid grid-cols-1 gap-x-6 gap-y-6 lg:grid-cols-2">
-            {/* Left column: queue panels */}
-            <div className="space-y-6">
-              <QueuePanel
-                queueReady={state?.queueReady ?? []}
-                queueBlocked={state?.queueBlocked ?? []}
-              />
-            </div>
-
-            {/* Right column: active agents + recently completed */}
-            <div className="space-y-6">
+          <div
+            className="grid grid-cols-1 gap-x-6 gap-y-6 lg:grid-cols-2"
+            data-testid="dispatcher-two-column-deck"
+          >
+            {/*
+             * Left column: Active agents (top) → Queue: Agent-ready
+             * (bottom). An issue moves upward within this column as it
+             * transitions from "next" to "now". See file-level docstring
+             * for the full state-flow rationale (#2823).
+             */}
+            <div className="flex flex-col gap-6" data-testid="dispatcher-column-left">
               <ActiveAgentsTable
                 agents={state?.activeAgents ?? []}
                 disabled={controlLoading}
                 onAgentAction={handleAgentAction}
               />
+              <QueueReadyPanel items={state?.queueReady ?? []} />
+            </div>
+
+            {/*
+             * Right column: Recently completed (top) → Queue: Blocked
+             * (bottom). Work flows rightward from Active to Recently
+             * completed. Blocked sits bottom-right — adjacent to the flow
+             * but not part of the active cycle.
+             */}
+            <div className="flex flex-col gap-6" data-testid="dispatcher-column-right">
               <RecentCompletionsPanel
                 completions={state?.recentCompletions ?? []}
               />
+              <QueueBlockedPanel items={state?.queueBlocked ?? []} />
             </div>
           </div>
 
