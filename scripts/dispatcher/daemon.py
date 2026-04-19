@@ -2505,15 +2505,16 @@ class DispatcherDaemon:
 
         plan_output = self._read_phase_output(worktree, "plan")
         if plan_output is None:
-            self._log.warning(
-                "daemon.phase_output_missing",
-                extra={
-                    "event": "phase_output_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": "plan",
-                },
-            )
+            extra: dict[str, Any] = {
+                "event": "phase_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": "plan",
+            }
+            preview = self._extract_log_preview(worktree, "plan")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="planning", exit_code=exit_code
             )
@@ -2582,15 +2583,16 @@ class DispatcherDaemon:
 
         ralph_output = self._read_phase_output(worktree, "ralph")
         if ralph_output is None:
-            self._log.warning(
-                "daemon.phase_output_missing",
-                extra={
-                    "event": "phase_output_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": "ralph",
-                },
-            )
+            extra: dict[str, Any] = {
+                "event": "phase_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": "ralph",
+            }
+            preview = self._extract_log_preview(worktree, "ralph")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="ralph", exit_code=exit_code
             )
@@ -2731,15 +2733,16 @@ class DispatcherDaemon:
 
         summary_output = self._read_phase_output(worktree, "summary")
         if summary_output is None:
-            self._log.warning(
-                "daemon.phase_output_missing",
-                extra={
-                    "event": "phase_output_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": "summary",
-                },
-            )
+            extra: dict[str, Any] = {
+                "event": "phase_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": "summary",
+            }
+            preview = self._extract_log_preview(worktree, "summary")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="summary", exit_code=exit_code
             )
@@ -2987,6 +2990,32 @@ class DispatcherDaemon:
         if len(data) <= max_chars:
             return data
         return data[-max_chars:]
+
+    def _extract_log_preview(
+        self, worktree: Path, phase: str, max_chars: int = 200
+    ) -> str:
+        """Return a short preview of the phase log for triage-in-CloudWatch.
+
+        Mirrors the ``stderr_preview`` convention used by
+        :meth:`_create_worktree` and :meth:`ensure_baseline_clone`
+        (`(result.stderr or "").strip()[:200]`). For phase subprocesses the
+        stream is merged stdout+stderr (see
+        :meth:`_spawn_phase_subprocess` which redirects stderr to stdout into
+        ``{worktree}/tmp/claude-p-<phase>.log``) — we return the last
+        ``max_chars`` of the stripped log because failures surface at the
+        tail, not the head.
+
+        The full text is preserved on disk at ``claude-p-<phase>.log`` and
+        the structured output (when present) at ``dispatcher.phase_outputs``
+        — this helper is for triage, not archival. Callers should omit the
+        ``stderr_preview`` log field when this returns an empty string
+        (avoids `stderr_preview: ""` noise on CloudWatch for phases that
+        never produced a log, e.g. a preflight exception before spawn).
+
+        Issue #2809.
+        """
+        tail = self._log_tail(worktree, phase, max_chars=max_chars)
+        return tail.strip()[:max_chars]
 
     def _push_and_open_pr(
         self, agent_id: str, issue_number: int, worktree: Path
@@ -3854,15 +3883,16 @@ class DispatcherDaemon:
 
         fix_ci_output = self._read_phase_output(worktree, "fix-ci")
         if fix_ci_output is None:
-            self._log.warning(
-                "daemon.phase_output_missing",
-                extra={
-                    "event": "phase_output_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": "fix-ci",
-                },
-            )
+            extra: dict[str, Any] = {
+                "event": "phase_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": "fix-ci",
+            }
+            preview = self._extract_log_preview(worktree, "fix-ci")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_ci", exit_code=exit_code
             )
@@ -4417,15 +4447,16 @@ class DispatcherDaemon:
 
         verify_output = self._read_phase_output(worktree, "verify")
         if verify_output is None:
-            self._log.warning(
-                "daemon.phase_output_missing",
-                extra={
-                    "event": "phase_output_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": "verify",
-                },
-            )
+            extra: dict[str, Any] = {
+                "event": "phase_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": "verify",
+            }
+            preview = self._extract_log_preview(worktree, "verify")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_deploy", exit_code=exit_code
             )
@@ -4727,53 +4758,57 @@ class DispatcherDaemon:
                 "retro", worktree, agent_id
             )
         except subprocess.TimeoutExpired:
-            self._log.warning(
-                "daemon.retro_timeout",
-                extra={
-                    "event": "retro_timeout",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                },
-            )
+            extra: dict[str, Any] = {
+                "event": "retro_timeout",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+            }
+            preview = self._extract_log_preview(worktree, "retro")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.retro_timeout", extra=extra)
             self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
             return
         except (FileNotFoundError, OSError) as exc:
-            self._log.warning(
-                "daemon.retro_subprocess_error",
-                extra={
-                    "event": "retro_subprocess_error",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "detail": str(exc),
-                },
-            )
+            extra = {
+                "event": "retro_subprocess_error",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "detail": str(exc),
+            }
+            preview = self._extract_log_preview(worktree, "retro")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.retro_subprocess_error", extra=extra)
             self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
             return
 
         if exit_code != 0:
-            self._log.warning(
-                "daemon.retro_nonzero_exit",
-                extra={
-                    "event": "retro_nonzero_exit",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "exit_code": exit_code,
-                    "duration_s": duration_s,
-                },
-            )
+            extra = {
+                "event": "retro_nonzero_exit",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "exit_code": exit_code,
+                "duration_s": duration_s,
+            }
+            preview = self._extract_log_preview(worktree, "retro")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.retro_nonzero_exit", extra=extra)
             self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
             return
 
         retro_output = self._read_phase_output(worktree, "retro")
         if retro_output is None:
-            self._log.warning(
-                "daemon.retro_output_missing",
-                extra={
-                    "event": "retro_output_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                },
-            )
+            extra = {
+                "event": "retro_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+            }
+            preview = self._extract_log_preview(worktree, "retro")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.retro_output_missing", extra=extra)
             self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
             return
 
