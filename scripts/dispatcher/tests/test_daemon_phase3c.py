@@ -229,13 +229,20 @@ class TestCheckStuckAgents:
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
 
-        # Seeded row: one stale agent.
+        # Seeded row: one stale ralph agent. Elapsed 6000s = 100 min >
+        # 90 min (ralph default threshold). #2872 — the SELECT now
+        # returns (agent_id, issue_number, phase, elapsed_seconds) and
+        # the Python-side comparison applies the per-phase threshold.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph")],
+            [("agent-1", 42, "ralph", 6000.0)],
         ]
-        # Order inside _create_retry_marker: (1) COUNT prior markers,
-        # (2) read backoff_seconds config.
+        # Order inside _check_stuck_agents + _create_retry_marker:
+        # (1) stuck_timeout_s_by_phase override read (returns None → fall
+        # through to module defaults),
+        # (2) COUNT prior markers in _create_retry_marker,
+        # (3) read backoff_seconds config.
         conn.cursor_instance.fetch_queue = [
+            None,  # stuck_timeout_s_by_phase override — unset
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff schedule
         ]
@@ -300,14 +307,19 @@ class TestCheckStuckAgents:
 
     def test_multiple_stuck_agents_all_flagged(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
+        # Two stuck agents: ralph exceeds 90min threshold at 6000s,
+        # claiming exceeds 5min threshold at 600s. (#2872 per-phase
+        # thresholds replace the single 30min global.)
         conn.cursor_instance.fetchall_queue = [
             [
-                ("agent-1", 1, "ralph"),
-                ("agent-2", 2, "claiming"),
+                ("agent-1", 1, "ralph", 6000.0),
+                ("agent-2", 2, "claiming", 600.0),
             ],
         ]
-        # For each agent: prior count read + backoff config read.
+        # Queue: (1) stuck_timeout_s_by_phase override (unset),
+        # then for each agent (1) prior count (2) backoff config.
         conn.cursor_instance.fetch_queue = [
+            None,  # stuck_timeout_s_by_phase — unset
             (0,),
             ("[60,300,900]",),
             (0,),

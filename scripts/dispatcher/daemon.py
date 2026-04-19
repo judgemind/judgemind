@@ -502,13 +502,65 @@ DEFAULT_RETRO_LABELS = ("type/dx", "agent/ready", "priority/p2")
 # Phase 3C — failure detection + retry machinery (issue #2791)
 # --------------------------------------------------------------------------
 
-#: Supervisor-tick stuck-timeout window. Agents whose most-recent
+#: Supervisor-tick stuck-timeout window (fallback / default when no
+#: per-phase override applies). Agents whose most-recent
 #: ``dispatcher.phase_transitions.ts`` is older than this are flagged
 #: as ``stuck_timeout`` and flipped to ``status='crashed'`` so the retry
 #: marker processor can recover them. Matches spec §7 step 1. 30 min is
 #: generous for the long-tail ralph iteration (#2513, #2628) while still
 #: well under the 180-minute ``subprocess_timeout_s`` ceiling.
 STUCK_TIMEOUT_SECONDS = 30 * 60
+
+#: Per-phase stuck-timeout overrides. The #2872 restart cascade exposed
+#: that a single global threshold is too coarse — supervisor fired
+#: ``stuck_timeout`` on a 2.5-minute ralph and a 90-second plan because
+#: the stale ``MAX(ts)`` read from a pre-retry phase_transitions row
+#: was already 30+ minutes old. Two changes close that gap:
+#:
+#:  1. Retry reset now writes a fresh ``phase_transitions`` row so the
+#:     supervisor's ``MAX(ts)`` restarts its clock (see
+#:     :meth:`_process_retry_markers` + :meth:`_resume_retrying_agent`).
+#:  2. This table lets each phase declare its own "stuck after N
+#:     seconds" window, matching its expected runtime distribution.
+#:
+#: Values below are conservative upper bounds — honestly-stuck agents
+#: still trip the timer, but routine phase work never does. Any phase
+#: not listed here falls back to :data:`STUCK_TIMEOUT_SECONDS`.
+#:
+#: Operators can override via ``dispatcher.config.stuck_timeout_s_by_phase``
+#: (JSONB object merged into this default at read time — see
+#: :meth:`_stuck_timeout_for_phase`).
+STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
+    "claiming": 5 * 60,  # 5 min — claim is a single gh + psycopg call
+    "planning": 30 * 60,  # 30 min — plan is read-only LLM, typical 2-9 min
+    "plan": 30 * 60,  # alias for phase_transitions "plan" row
+    "ralph": 90 * 60,  # 90 min — ralph iterates, see #2513 107 min outlier
+    "summary": 30 * 60,  # 30 min — summary is single-pass LLM, typical 1-3 min
+    "awaiting_ci": 120 * 60,  # 2 hr — CI + any flaky retry headroom
+    "awaiting_deploy": 45 * 60,  # 45 min — dev deploy rolling wait
+    "fix_ci": 30 * 60,  # 30 min — single /task-v2-fix-ci run
+    "retro": 20 * 60,  # 20 min — single /task-v2-retro run
+    "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
+    "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
+}
+
+#: Terminal statuses on ``dispatcher.agents.status`` — the worker thread
+#: aborts at the next phase boundary if it observes one of these, even
+#: if the killswitch isn't engaged. Closes the #2872 Bug F zombie state:
+#: diagnoser / supervisor / circuit breaker can write a terminal status
+#: from outside the worker, but the pre-#2872 worker had no check for
+#: external terminal writes, so it kept executing phases against a
+#: ``failed`` row. See :meth:`_check_killswitch_and_abort`.
+TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "crashed", "plan_blocked", "needs_review"}
+)
+
+#: Failure category written when the daemon restart-recovery sweep
+#: reclaims a ``status='running'`` agent left behind by the previous
+#: daemon run. Tier-1 mechanical retry category — the agent gets a
+#: fresh worktree + a new run of the full phase pipeline. See
+#: :meth:`_recover_abandoned_agents` and #2872 Bug A.
+FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED = "daemon_restart_abandoned"
 
 #: GitHub API rate-limit threshold (spec §7 step 2). When ``gh api
 #: rate_limit --jq '.resources.core.remaining'`` reports fewer than this
@@ -567,6 +619,7 @@ AUTO_RETRY_CATEGORIES = frozenset(
         FAILURE_CATEGORY_STUCK_TIMEOUT,
         FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
         FAILURE_CATEGORY_SUBPROCESS_CRASH,
+        FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
     }
 )
 
@@ -3070,6 +3123,207 @@ class DispatcherDaemon:
             },
         )
 
+    def ensure_required_labels(self) -> int:
+        """Idempotently create labels the daemon's fallback paths depend on.
+
+        Issue #2872 Bug D. The diagnoser's escalate path adds
+        ``status/needs-human`` to flag an issue for an operator. If the
+        label doesn't exist in the repo, ``gh issue edit --add-label``
+        exits non-zero and the operator-visible signal is silently
+        lost (the DB terminal still lands, so correctness is preserved,
+        but nobody notices until the admin page is manually checked).
+
+        This method runs once at boot and creates any missing labels
+        using ``gh label create --force`` — idempotent: pre-existing
+        labels with identical colour/description are no-ops, different
+        ones are updated in place. Failures are logged but do not
+        block startup; the diagnoser path still works (the DB write is
+        authoritative), just without the GitHub-visible hint.
+
+        Returns the number of labels the method attempted to create.
+        """
+        required = [
+            (
+                "status/needs-human",
+                "B60205",
+                "Diagnoser flagged — needs operator review",
+            ),
+        ]
+        attempted = 0
+        for name, colour, description in required:
+            try:
+                subprocess.run(
+                    [
+                        "gh",
+                        "label",
+                        "create",
+                        name,
+                        "--repo",
+                        self._cfg.github_repo,
+                        "--color",
+                        colour,
+                        "--description",
+                        description,
+                        "--force",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                attempted += 1
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                self._log.warning(
+                    "daemon.ensure_label_failed",
+                    extra={
+                        "event": "ensure_label_failed",
+                        "run_id": self._run_id,
+                        "label": name,
+                        "detail": str(exc),
+                    },
+                )
+        self._log.info(
+            "daemon.ensure_required_labels",
+            extra={
+                "event": "ensure_required_labels",
+                "run_id": self._run_id,
+                "labels_attempted": attempted,
+            },
+        )
+        return attempted
+
+    def recover_abandoned_agents(self) -> int:
+        """On daemon boot, reclaim ``status='running'`` agents from prior runs.
+
+        Issue #2872 Bug A. Before this method existed, a daemon restart
+        mid-phase left the in-flight agent's row at ``status='running'``
+        with stale ``phase_transitions`` entries. The new daemon had no
+        explicit recovery path — instead, the supervisor's 30-minute
+        ``stuck_timeout`` eventually caught the abandoned agent (correct
+        intent), but the stale ``MAX(ts)`` made the retry loop cascade
+        (see #2872 Bugs B+E). Even with those fixed, depending on
+        stuck_timeout to reclaim restart-orphans is wrong: the agent's
+        phase subprocess died with the old daemon, so the retry is
+        knowable immediately — not 30 minutes later.
+
+        Call contract:
+
+        - Invoked ONCE at daemon startup, AFTER
+          :meth:`check_lease_and_register_run` has registered the new
+          ``dispatcher.runs`` row. Running this before the lease check
+          is wrong — the lease check is what guarantees we are the
+          sole daemon, and therefore authorized to reclaim running
+          agents.
+        - Finds every ``dispatcher.agents`` row with ``status='running'``
+          whose ``parent_run_id`` differs from the current run (or is
+          NULL). These are the abandoned agents.
+        - For each: write a ``dispatcher.failures`` row with
+          ``category='daemon_restart_abandoned'`` (a new tier-1
+          auto-retry category — see :data:`AUTO_RETRY_CATEGORIES`),
+          flip status to ``crashed``, set
+          ``phase='daemon_restart_abandoned'``, and enqueue a retry
+          marker. The standard retry flow then picks the agent up on
+          the next supervisor tick with a fresh worktree.
+
+        Returns the number of agents reclaimed. On any DB error the
+        method logs and returns 0 — startup must not block on a
+        recovery sweep failure. The existing stuck_timeout path is the
+        backstop; a reclaim miss just means the agent gets the 30m
+        treatment instead of the immediate one.
+        """
+        assert self._conn is not None, "connect() must run before recovery"
+        assert self._run_id is not None, "register run before recovery"
+
+        candidates: list[tuple[str, int | None, str | None]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, issue_number, phase "
+                    "FROM dispatcher.agents "
+                    "WHERE status = 'running' "
+                    "  AND (parent_run_id IS NULL "
+                    "       OR parent_run_id <> %s)",
+                    (self._run_id,),
+                )
+                for row in cur.fetchall():
+                    candidates.append(
+                        (
+                            str(row[0]),
+                            int(row[1]) if row[1] is not None else None,
+                            str(row[2]) if row[2] is not None else None,
+                        )
+                    )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.recover_scan_failed",
+                extra={
+                    "event": "recover_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+
+        if not candidates:
+            self._log.info(
+                "daemon.recover_no_abandoned",
+                extra={
+                    "event": "recover_no_abandoned",
+                    "run_id": self._run_id,
+                },
+            )
+            return 0
+
+        reclaimed = 0
+        for agent_id, issue_number, prior_phase in candidates:
+            try:
+                self._write_failure(
+                    agent_id=agent_id,
+                    category=FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+                    detected_by="boot_recovery",
+                    details={
+                        "prior_phase": prior_phase,
+                        "issue_number": issue_number,
+                        "new_run_id": self._run_id,
+                    },
+                )
+                self._mark_agent_terminal(
+                    agent_id,
+                    status="crashed",
+                    phase="daemon_restart_abandoned",
+                    exit_code=None,
+                    issue_number=issue_number,
+                )
+                self._create_retry_marker(
+                    agent_id=agent_id,
+                    reason=FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+                )
+                self._log.warning(
+                    "daemon.agent_recovered_from_restart",
+                    extra={
+                        "event": "agent_recovered_from_restart",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "prior_phase": prior_phase,
+                    },
+                )
+                reclaimed += 1
+            except Exception:
+                self._log.exception(
+                    "daemon.agent_recover_failed",
+                    extra={
+                        "event": "agent_recover_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                    },
+                )
+        return reclaimed
+
     def ensure_baseline_clone(self) -> None:
         """Clone or fetch the baseline git repo used for worktree creation.
 
@@ -3441,19 +3695,33 @@ class DispatcherDaemon:
         deleted. Nullable for historical rows and for phases that
         completed with no log content to capture. Housekeeping tick
         (#2778/#2779) prunes rows at 30 days along with ``output_json``.
+
+        ``attempt`` (added #2872, migration 30) is derived from the
+        agent's current ``retries_used`` counter so second/third plan
+        runs after retry reset produce distinct rows rather than
+        colliding on the old ``(agent_id, phase)`` unique index. Legacy
+        single-attempt callers saw the INSERT rolled back silently; now
+        every retry's output is preserved and the admin-page phase log
+        shows the full retry trail.
         """
         assert self._conn is not None, "connect() must run before persisting"
+        attempt = self._current_attempt_for(agent_id)
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO dispatcher.phase_outputs "
-                    "    (agent_id, phase, output_json, log_text) "
-                    "VALUES (%s, %s, %s, %s)",
+                    "    (agent_id, phase, output_json, log_text, attempt) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (agent_id, phase, attempt) DO UPDATE SET "
+                    "    output_json = EXCLUDED.output_json, "
+                    "    log_text    = EXCLUDED.log_text, "
+                    "    ts          = now()",
                     (
                         agent_id,
                         phase,
                         json.dumps(output_json, default=str),
                         log_text,
+                        attempt,
                     ),
                 )
                 cur.execute(
@@ -3471,12 +3739,47 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "phase": phase,
+                    "attempt": attempt,
                 },
             )
             try:
                 self._conn.rollback()
             except Exception:  # pragma: no cover
                 pass
+
+    def _current_attempt_for(self, agent_id: str) -> int:
+        """Return the current retry attempt number for an agent.
+
+        Reads ``dispatcher.agents.retries_used`` — 0 on a fresh claim,
+        bumps by 1 on each ``_process_retry_markers`` reset. Matches
+        the semantic of ``dispatcher.phase_outputs.attempt`` (migration
+        30): "retry number under which this phase ran". On read failure
+        falls back to 0 — preferring "assume initial run" over blowing
+        up the INSERT, because a wrong ``attempt`` in one row never
+        cascades (each phase re-derives), whereas a failed INSERT loses
+        the phase record.
+        """
+        assert self._conn is not None, "connect() must run before attempt read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT retries_used FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):  # pragma: no cover — defensive
+            return 0
 
     def _update_agent_phase(self, agent_id: str, phase: str) -> None:
         """UPDATE ``dispatcher.agents.phase`` so the scheduler + admin
@@ -3859,24 +4162,63 @@ class DispatcherDaemon:
         after_phase: str,
         issue_number: int | None = None,
     ) -> bool:
-        """If the operator flipped ``concurrency_cap=0``, abort the run (#2847).
+        """Abort the run between phases if a terminal signal was observed.
 
         Called between each orchestration phase. Returns True iff the
-        caller should stop — meaning ``_pause_requested`` was set when
-        the check fired, the agent has been marked terminal with
-        ``phase='paused_by_killswitch'``, and a structured
-        ``orchestration_paused`` event has been logged.
+        caller should stop. Two signals are checked in priority order:
+
+        1. **Terminal agent status (#2872 Bug F).** If an external actor
+           (supervisor ``_check_stuck_agents``, diagnoser
+           ``_consume_action_escalate``, or circuit breaker) has
+           written ``dispatcher.agents.status`` to one of
+           :data:`TERMINAL_AGENT_STATUSES`, the worker must stop at
+           the next phase boundary. Without this check the worker keeps
+           running phases against a row already marked ``failed`` —
+           producing the 2026-04-19 zombie state where the diagnoser
+           wrote ``failed`` at 20:09:44 and the worker thread still
+           completed a plan phase at 20:12:16 and tried to start ralph.
+           Does NOT re-mark the agent terminal — whoever wrote the
+           terminal status already has authority over the row.
+        2. **Operator killswitch (#2847).** ``_pause_requested`` is
+           set by the scheduler tick when ``concurrency_cap=0`` is
+           observed. On hit: mark agent terminal with
+           ``phase='paused_by_killswitch'`` and log
+           ``orchestration_paused``.
 
         ``after_phase`` is the phase that just completed — used in the
-        log event to show where in the pipeline the kill landed. For
-        the pre-plan check (a killswitch that fired during the claim
-        itself) pass ``"claiming"``.
+        log event to show where in the pipeline the abort landed. For
+        the pre-plan check (a killswitch / terminal that fired during
+        the claim itself) pass ``"claiming"``.
 
         ``issue_number`` threads through to :meth:`_mark_agent_terminal`
         so the claim-interlock ``status/in-progress`` label clears on
         killswitch teardown (issue #2866). Optional for backward
         compatibility with older call sites that don't know it.
         """
+        # Precedence: external-terminal check first. If the supervisor
+        # or diagnoser already flipped status, the killswitch check is
+        # moot — we only need one abort signal per phase boundary, and
+        # the external writer's ``phase`` + ``status`` should not be
+        # overwritten by the killswitch terminal.
+        external_terminal = self._observe_external_terminal(agent_id)
+        if external_terminal is not None:
+            self._log.warning(
+                "daemon.orchestration_terminated_externally",
+                extra={
+                    "event": "orchestration_terminated_externally",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "after_phase": after_phase,
+                    "observed_status": external_terminal,
+                    "detail": (
+                        "worker thread observed terminal dispatcher.agents.status "
+                        "written by an external actor (supervisor, diagnoser, or "
+                        "circuit breaker); aborting before next phase"
+                    ),
+                },
+            )
+            return True
+
         if not self._pause_requested.is_set():
             return False
 
@@ -3901,6 +4243,50 @@ class DispatcherDaemon:
             issue_number=issue_number,
         )
         return True
+
+    def _observe_external_terminal(self, agent_id: str) -> str | None:
+        """Return the observed terminal status if one is present.
+
+        SELECTs ``dispatcher.agents.status`` and returns its value iff it
+        falls in :data:`TERMINAL_AGENT_STATUSES`. ``None`` means the
+        agent is still in a non-terminal state (``running``, ``retrying``)
+        or the row cannot be read. On read failure returns ``None`` —
+        preferring "assume not terminal, continue phase" over a spurious
+        abort that corrupts in-flight work.
+
+        Separate method so tests can stub the observation without
+        needing a psycopg mock for the whole killswitch path. Issue
+        #2872 Bug F.
+        """
+        assert self._conn is not None, "connect() must run before terminal check"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.observe_external_terminal_failed",
+                extra={
+                    "event": "observe_external_terminal_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return None
+        if row is None or row[0] is None:
+            return None
+        status = str(row[0])
+        if status in TERMINAL_AGENT_STATUSES:
+            return status
+        return None
 
     def _resume_retrying_agent(self) -> bool:
         """Pick up one ``status='retrying'`` agent, rebuild worktree, re-run.
@@ -3958,6 +4344,11 @@ class DispatcherDaemon:
         # starting new work, so a crashed daemon mid-resume leaves a
         # normal stuck-timeout signal for the next supervisor tick to
         # pick up via the existing stuck detection path.
+        #
+        # #2872 — also write a fresh ``phase_transitions`` row so the
+        # stuck-timeout MAX(ts) starts from "now" and the per-phase
+        # threshold applies cleanly to the new run rather than the old
+        # one's stale timestamp.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -3965,6 +4356,12 @@ class DispatcherDaemon:
                     "SET status = 'running', phase = 'claiming' "
                     "WHERE agent_id = %s",
                     (agent_id,),
+                )
+                cur.execute(
+                    "INSERT INTO dispatcher.phase_transitions "
+                    "    (agent_id, phase) "
+                    "VALUES (%s, %s)",
+                    (agent_id, "resumed"),
                 )
             self._conn.commit()
         except Exception:
@@ -8014,14 +8411,95 @@ class DispatcherDaemon:
 
     # ── stuck-timeout detection ────────────────────────────────────────
 
+    def _stuck_timeout_for_phase(
+        self, phase: str | None, *, overrides: dict[str, int] | None = None
+    ) -> int:
+        """Return the stuck_timeout threshold in seconds for a given phase.
+
+        Resolution order (first hit wins):
+
+        1. ``overrides`` argument (a pre-read JSONB object from
+           ``dispatcher.config.stuck_timeout_s_by_phase`` — the
+           supervisor tick reads this once per sweep and passes it in).
+           Operators can live-edit any phase's threshold via this
+           config row without a redeploy.
+        2. :data:`STUCK_TIMEOUT_SECONDS_BY_PHASE` — module-level
+           defaults based on observed phase runtime distributions.
+        3. :data:`STUCK_TIMEOUT_SECONDS` — 30-minute fallback for any
+           phase not covered above.
+
+        A ``None`` or unknown phase falls back to the global default.
+        Issue #2872 Bug B.
+        """
+        key = (phase or "").strip()
+        if overrides and key and key in overrides:
+            try:
+                value = int(overrides[key])
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        if key and key in STUCK_TIMEOUT_SECONDS_BY_PHASE:
+            return STUCK_TIMEOUT_SECONDS_BY_PHASE[key]
+        return STUCK_TIMEOUT_SECONDS
+
+    def _read_stuck_timeout_overrides(self) -> dict[str, int]:
+        """Read the live ``stuck_timeout_s_by_phase`` config override.
+
+        Returns an empty dict on missing row, malformed JSON, or any
+        read error — the caller's fallback chain
+        (:meth:`_stuck_timeout_for_phase`) picks up the module defaults
+        cleanly in that case.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("stuck_timeout_s_by_phase",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return {}
+        if row is None or row[0] is None:
+            return {}
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def _check_stuck_agents(self) -> int:
-        """Find running agents with no phase transition in >30 min.
+        """Find running agents whose current phase has been stuck too long.
+
+        Per-phase thresholds (issue #2872 Bug B) replace the old single
+        30-minute global threshold. Each running agent's elapsed time
+        since the most-recent ``phase_transitions.ts`` (or
+        ``started_at`` if no transitions yet) is compared against the
+        threshold for its current ``phase`` —
+        :meth:`_stuck_timeout_for_phase` handles the lookup with live
+        config overrides.
 
         Each flagged agent gets a ``dispatcher.failures`` row with
-        ``category='stuck_timeout'`` and is flipped to
-        ``status='crashed'``. A retry marker is created so the next
-        ``_process_retry_markers`` pass can reset the agent with a
-        fresh worktree.
+        ``category='stuck_timeout'``, is flipped to ``status='crashed'``,
+        and enqueues a retry marker so
+        :meth:`_process_retry_markers` can reset it with a fresh
+        worktree.
 
         Returns the number of stuck agents flagged this tick (for
         logging). Exceptions are caught per-agent + logged; one bad
@@ -8029,35 +8507,36 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before stuck check"
 
-        stuck_rows: list[tuple[str, int | None, str | None]] = []
+        # Candidate rows: every running agent, regardless of elapsed
+        # time. The per-phase threshold comparison happens in Python
+        # so we can consult both the live config override and the
+        # module-level defaults without expressing them as SQL.
+        #
+        # Fields: agent_id, issue_number, phase, elapsed_seconds.
+        candidates: list[tuple[str, int | None, str | None, float]] = []
         try:
             with self._conn.cursor() as cur:
-                # Find agents with no recent phase transition. The
-                # LEFT JOIN + MAX handles agents whose first transition
-                # hasn't fired yet (e.g. wedged during `claiming`): in
-                # that case the MAX is NULL and we fall back to
-                # ``started_at`` — the agent is still stuck for the
-                # same operational reason.
                 cur.execute(
-                    "SELECT a.agent_id, a.issue_number, a.phase "
+                    "SELECT a.agent_id, a.issue_number, a.phase, "
+                    "       EXTRACT(EPOCH FROM ("
+                    "           now() - COALESCE(pt.last_ts, a.started_at)"
+                    "       )) AS elapsed_seconds "
                     "FROM dispatcher.agents a "
                     "LEFT JOIN LATERAL ("
                     "    SELECT MAX(ts) AS last_ts "
                     "    FROM dispatcher.phase_transitions "
                     "    WHERE agent_id = a.agent_id"
                     ") pt ON TRUE "
-                    "WHERE a.status = 'running' "
-                    "  AND COALESCE(pt.last_ts, a.started_at) "
-                    "      < now() - make_interval(secs => %s)",
-                    (STUCK_TIMEOUT_SECONDS,),
+                    "WHERE a.status = 'running'",
                 )
                 rows = cur.fetchall()
                 for row in rows:
-                    stuck_rows.append(
+                    candidates.append(
                         (
                             str(row[0]),
                             int(row[1]) if row[1] is not None else None,
                             str(row[2]) if row[2] is not None else None,
+                            float(row[3]) if row[3] is not None else 0.0,
                         )
                     )
             self._conn.commit()
@@ -8075,15 +8554,24 @@ class DispatcherDaemon:
                 pass
             return 0
 
+        # Read the per-phase override map once per sweep. Empty on
+        # missing row / malformed JSON — ``_stuck_timeout_for_phase``
+        # falls back to module defaults cleanly.
+        overrides = self._read_stuck_timeout_overrides()
+
         flagged = 0
-        for agent_id, issue_number, phase in stuck_rows:
+        for agent_id, issue_number, phase, elapsed_seconds in candidates:
+            threshold = self._stuck_timeout_for_phase(phase, overrides=overrides)
+            if elapsed_seconds < threshold:
+                continue
             try:
                 self._write_failure(
                     agent_id=agent_id,
                     category=FAILURE_CATEGORY_STUCK_TIMEOUT,
                     detected_by="supervisor",
                     details={
-                        "stuck_seconds": STUCK_TIMEOUT_SECONDS,
+                        "stuck_seconds": int(elapsed_seconds),
+                        "threshold_seconds": threshold,
                         "last_known_phase": phase,
                         "issue_number": issue_number,
                     },
@@ -8103,6 +8591,8 @@ class DispatcherDaemon:
                         "issue_number": issue_number,
                         "category": FAILURE_CATEGORY_STUCK_TIMEOUT,
                         "phase": phase,
+                        "stuck_seconds": int(elapsed_seconds),
+                        "threshold_seconds": threshold,
                     },
                 )
                 # Enqueue the tier-1 retry marker. The processor picks
@@ -8628,6 +9118,20 @@ class DispatcherDaemon:
                         "    ended_at = NULL "
                         "WHERE agent_id = %s",
                         (agent_id,),
+                    )
+                    # #2872 — write a fresh ``phase_transitions`` row so
+                    # the supervisor's stuck_timeout MAX(ts) comparison
+                    # restarts its clock. Without this, the stale
+                    # pre-retry ``plan`` transition from hours ago
+                    # remains the MAX(ts), and the next stuck_scan
+                    # fires ``stuck_timeout`` within seconds of the
+                    # reset — exactly the cascading loop observed in
+                    # the 2026-04-19 timeline.
+                    cur.execute(
+                        "INSERT INTO dispatcher.phase_transitions "
+                        "    (agent_id, phase) "
+                        "VALUES (%s, %s)",
+                        (agent_id, "retry_reset"),
                     )
                     cur.execute(
                         "UPDATE dispatcher.retry_markers "
@@ -11222,6 +11726,32 @@ def main(argv: list[str] | None = None) -> int:
         log.exception("daemon.register_failed", extra={"event": "register_failed"})
         daemon.close()
         return 1
+
+    # Idempotently create labels the diagnoser's escalate path depends
+    # on (issue #2872 Bug D). Non-fatal — the diagnoser's DB terminal
+    # is authoritative; this just keeps the operator-visible GitHub
+    # signal intact.
+    try:
+        daemon.ensure_required_labels()
+    except Exception:
+        log.exception(
+            "daemon.ensure_required_labels_failed",
+            extra={"event": "ensure_required_labels_failed"},
+        )
+
+    # Restart-recovery sweep (issue #2872). Reclaim any ``status=
+    # 'running'`` agents left behind by a prior daemon run. Marks each
+    # ``crashed`` with a restart-abandoned retry marker; the standard
+    # retry path then rebuilds the worktree and re-runs the phase
+    # pipeline. Failure here is non-fatal — the supervisor's
+    # stuck_timeout sweep is the backstop.
+    try:
+        daemon.recover_abandoned_agents()
+    except Exception:
+        log.exception(
+            "daemon.recover_abandoned_agents_failed",
+            extra={"event": "recover_abandoned_agents_failed"},
+        )
 
     # Bootstrap the baseline git clone before the first scheduler tick
     # so ``_create_worktree`` has a ``.git`` parent to run ``git -C ...

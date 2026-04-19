@@ -1041,6 +1041,10 @@ class TestPhaseInputOutput:
 class TestPersistPhaseOutput:
     def test_writes_phase_outputs_and_transitions(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
+        # #2872 migration 30: persist now reads retries_used first so it
+        # can pass the attempt number to the INSERT. Mock a retries_used=0
+        # fetch for the pre-INSERT SELECT.
+        conn.cursor_instance.fetch_queue = [(0,)]
         d._persist_phase_output("a", "plan", {"go": True})
         # Both INSERTs ran.
         insert_outputs = [
@@ -1055,7 +1059,10 @@ class TestPersistPhaseOutput:
         ]
         assert len(insert_outputs) == 1
         assert len(insert_transitions) == 1
-        assert conn.commits == 1
+        # Attempt=0 passed as the 5th INSERT parameter.
+        assert insert_outputs[0][1][4] == 0
+        # 2 commits: one for retries_used read, one for the INSERT batch.
+        assert conn.commits == 2
 
 
 # --------------------------------------------------------------------------
