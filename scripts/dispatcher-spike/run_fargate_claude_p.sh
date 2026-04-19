@@ -36,10 +36,10 @@ set -euo pipefail
 
 SCENARIO="${1:-success}"
 case "${SCENARIO}" in
-    success|turn_limit|auth_fail|mcp_probe|hook_latency|hook_failmode) ;;
+    success|turn_limit|auth_fail|mcp_probe|hook_latency|hook_failmode|git_gh) ;;
     *)
         echo "Error: unknown scenario '${SCENARIO}'." >&2
-        echo "Valid scenarios: success, turn_limit, auth_fail, mcp_probe, hook_latency, hook_failmode" >&2
+        echo "Valid scenarios: success, turn_limit, auth_fail, mcp_probe, hook_latency, hook_failmode, git_gh" >&2
         exit 2
         ;;
 esac

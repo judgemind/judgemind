@@ -29,19 +29,31 @@ FROM node:20-slim AS spike
 # System deps: ca-certificates for HTTPS (Anthropic + GitHub APIs),
 # git for any MCP server that needs it, Python 3 for the entrypoint's
 # JSON glue, pip + psycopg[binary] for the spike 0.2 PreToolUse hook
-# that writes directly to Postgres via `emit_failure.py`.
+# that writes directly to Postgres via `emit_failure.py`, and `gh` for
+# the spike 0.7 git/GitHub auth test (scripts/dispatcher-spike/test_git_gh.sh).
 #
 # We install psycopg v3 (the `psycopg` import name) to match the rest of
 # the repo (`packages/scraper-framework` depends on `psycopg[binary]>=3.1`).
 # The --break-system-packages flag is required on Debian bookworm's PEP
 # 668-marked python3; the spike image is throwaway and not a shared
 # system Python, so the safety rail doesn't apply here.
+#
+# `gh` comes from GitHub's official apt repo. We pin to the `cli` repo's
+# stable channel; the repo is a one-liner keyring + sources.list install.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
         python3 \
         python3-pip \
         curl \
+        gnupg \
+    && mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages 'psycopg[binary]>=3.1'
 
@@ -82,6 +94,18 @@ RUN chmod 0755 /usr/local/bin/dispatcher-spike-hook.sh
 COPY scripts/dispatcher/emit_failure.py \
      /usr/local/bin/emit_failure.py
 RUN chmod 0755 /usr/local/bin/emit_failure.py
+
+# Spike 0.7: ship the git + GitHub auth end-to-end test script plus the
+# production `scripts/check-issue-author.sh` trust-check it exercises.
+# Both live under /usr/local/bin so the container entrypoint can invoke
+# them without needing a checkout of the repo.
+COPY scripts/dispatcher-spike/test_git_gh.sh \
+     /usr/local/bin/dispatcher-spike-test-git-gh
+RUN chmod 0755 /usr/local/bin/dispatcher-spike-test-git-gh
+
+COPY scripts/check-issue-author.sh \
+     /usr/local/bin/check-issue-author.sh
+RUN chmod 0755 /usr/local/bin/check-issue-author.sh
 
 # Copy the in-container entrypoint that runs claude -p with the scenario.
 COPY scripts/dispatcher-spike/container-entry.sh \

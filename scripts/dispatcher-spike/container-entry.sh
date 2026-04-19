@@ -11,6 +11,12 @@
 #   hook_failmode — spike 0.2 failure mode: same as hook_latency but with a
 #                   deliberately bad DATABASE_URL; expect claude to complete
 #                   normally despite the hook's insert failing
+#   git_gh        — spike 0.7: run /usr/local/bin/dispatcher-spike-test-git-gh
+#                   which clones judgemind/judgemind, pushes a throwaway
+#                   branch, opens+closes a throwaway PR, runs
+#                   scripts/check-issue-author.sh, and deletes the branch.
+#                   Uses ${GITHUB_TOKEN} (wired from Secrets Manager via the
+#                   spike task definition). Does NOT invoke `claude -p`.
 #
 # Additional env vars the caller may set:
 #   CLAUDE_PROMPT        — override the prompt text
@@ -55,6 +61,30 @@ SPIKE_PROBE_FILE="${HOME}/spike-probe.txt"
 if [[ ! -f "${SPIKE_PROBE_FILE}" ]]; then
     printf 'spike-0.2 probe file — read by claude to fire the PreToolUse hook.\n' \
         > "${SPIKE_PROBE_FILE}"
+fi
+
+# Spike 0.7: git_gh scenario runs test_git_gh.sh instead of claude -p.
+# Short-circuit before building any claude args — the auth test is a
+# pure git/gh/curl pipeline, not a Claude invocation. This keeps the
+# scenario's failure modes unambiguous (a git push failure means a git
+# push failure, not a Claude prompt regression).
+if [[ "${SCENARIO}" == "git_gh" ]]; then
+    log "git_gh scenario: delegating to /usr/local/bin/dispatcher-spike-test-git-gh"
+    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+        log "ERROR: GITHUB_TOKEN is unset — the spike task definition must wire in the scoped PAT secret."
+        exit 2
+    fi
+    # The test script accepts an optional test-issue argument; default
+    # (2689) is the spike 0.7 issue itself, which is MEMBER-filed and
+    # thus must return TRUSTED.
+    SPIKE_TEST_ISSUE="${SPIKE_TEST_ISSUE:-2689}"
+    log "invoking dispatcher-spike-test-git-gh ${SPIKE_TEST_ISSUE}"
+    set +e
+    /usr/local/bin/dispatcher-spike-test-git-gh "${SPIKE_TEST_ISSUE}"
+    EC=$?
+    set -e
+    log "test-git-gh exited with code=${EC}"
+    exit "${EC}"
 fi
 
 # Default prompts per scenario.
