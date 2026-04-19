@@ -37,8 +37,14 @@ ALTER TABLE data_quality_metrics        SET SCHEMA telemetry;
 ALTER TABLE validation_results          SET SCHEMA telemetry;
 
 -- Set search_path so unqualified references still resolve.
--- This applies to the judgemind role (used by all services).
-ALTER DATABASE judgemind SET search_path = public, derived, telemetry, staging;
+-- Uses current_database() so the ALTER DATABASE targets whichever DB the
+-- migration is being applied to (dev/prod `judgemind`, throwaway test DBs,
+-- etc.) rather than hardcoding a single name.
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I SET search_path = public, derived, telemetry, staging',
+                 current_database());
+END $$;
 
 
 -- Down Migration
@@ -62,7 +68,11 @@ ALTER TABLE telemetry.scraper_runs                SET SCHEMA public;
 ALTER TABLE telemetry.data_quality_metrics        SET SCHEMA public;
 ALTER TABLE telemetry.validation_results          SET SCHEMA public;
 
-ALTER DATABASE judgemind SET search_path = public, staging;
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I SET search_path = public, staging',
+                 current_database());
+END $$;
 
 DROP SCHEMA IF EXISTS derived;
 DROP SCHEMA IF EXISTS telemetry;
