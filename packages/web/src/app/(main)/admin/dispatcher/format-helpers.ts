@@ -74,19 +74,42 @@ export function worktreeLogsUrl(worktreePath: string): string | null {
 }
 
 /**
+ * Epoch-origin sentinel threshold. Any timestamp at or before this date is
+ * treated as "unset / unknown" rather than a real past time. This catches
+ * the failure mode where a backend fallback uses `new Date(0).toISOString()`
+ * (or `0` as a ms epoch) to satisfy a non-nullable `DateTime!` GraphQL field
+ * — without this guard, the helper cheerfully formats it as "20562 d ago"
+ * (#2818).
+ *
+ * Threshold is 2000-01-01 UTC: the project has never emitted a legitimate
+ * timestamp older than this, and real-world calendar drift shouldn't push
+ * a genuine recent timestamp below it.
+ */
+const EPOCH_SANITY_THRESHOLD_MS = Date.UTC(2000, 0, 1);
+
+/**
  * Format a past timestamp as a short relative string like "3 min ago",
- * "2 h ago", "5 d ago". Returns `'—'` for invalid or future timestamps.
+ * "2 h ago", "5 d ago". Returns `'—'` for invalid, future, null, zero,
+ * or pre-2000 (epoch-sentinel) timestamps.
  *
  * Buckets:
  *   - < 60 s     → "Ns ago"
  *   - < 60 min   → "N min ago"
  *   - < 24 h     → "N h ago"
  *   - otherwise  → "N d ago"
+ *
+ * The null/zero/pre-2000 handling is defensive against backend fallbacks
+ * that substitute `new Date(0).toISOString()` for a missing upstream
+ * timestamp (#2818). Without it, callers see "20562 d ago" (≈56 years)
+ * for every such row, which is worse than showing nothing.
  */
 export function formatRelativeTime(iso: string | null, nowMs: number = Date.now()): string {
   if (!iso) return '—';
   const ts = new Date(iso).getTime();
   if (!Number.isFinite(ts)) return '—';
+  // Treat zero / pre-2000 timestamps as unset. See EPOCH_SANITY_THRESHOLD_MS
+  // above for the rationale.
+  if (ts <= EPOCH_SANITY_THRESHOLD_MS) return '—';
   const deltaMs = nowMs - ts;
   if (deltaMs < 0) return '—';
   const seconds = Math.floor(deltaMs / 1000);

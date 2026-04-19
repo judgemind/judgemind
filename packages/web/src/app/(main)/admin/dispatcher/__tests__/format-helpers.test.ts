@@ -62,6 +62,19 @@ describe('formatRelativeTime', () => {
     expect(formatRelativeTime(future, now)).toBe('—');
   });
 
+  // #2818 — defensive against backend fallbacks that emit
+  // `new Date(0).toISOString()` to satisfy a non-null `DateTime!` field.
+  // Without this guard, callers saw "20562 d ago" on every such row.
+  it('#2818: returns em-dash for the unix epoch (new Date(0))', () => {
+    expect(formatRelativeTime(new Date(0).toISOString(), now)).toBe('—');
+  });
+
+  it('#2818: returns em-dash for any pre-2000 timestamp (epoch sentinel)', () => {
+    expect(formatRelativeTime('1970-01-01T00:00:00.000Z', now)).toBe('—');
+    expect(formatRelativeTime('1985-06-15T12:00:00Z', now)).toBe('—');
+    expect(formatRelativeTime('1999-12-31T23:59:59Z', now)).toBe('—');
+  });
+
   it('formats seconds', () => {
     const ts = new Date(now - 5_000).toISOString();
     expect(formatRelativeTime(ts, now)).toBe('5s ago');
