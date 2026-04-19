@@ -513,6 +513,38 @@ class TestIssueAlreadyAttempted:
         conn.cursor_instance.execute = boom  # type: ignore[method-assign]
         assert d._issue_already_attempted(42) is True
 
+    def test_needs_review_row_blocks_repickup(self, tmp_path: Path) -> None:
+        """#2856: prior ``needs_review`` row keeps the issue out of the pickup loop.
+
+        When summary_unmet_criteria fires, the daemon opens a DRAFT PR
+        and terminates the agent as ``needs_review``. The issue stays
+        labelled ``agent/ready`` (the issue body still describes
+        requested work), so the next scheduler tick would otherwise
+        re-pick it and race two agent branches against the open draft.
+        ``ACTIVE_AGENT_STATUSES`` includes ``needs_review`` for
+        exactly this reason — the picker treats the prior row as
+        "issue has an in-flight artifact" until the operator merges,
+        closes, or edits.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        # Return a non-None row as if a needs_review agent row exists.
+        conn.cursor_instance.fetch_queue = [(1,)]
+        assert d._issue_already_attempted(42) is True
+        # Confirm the SELECT would have matched needs_review — the
+        # query binds ACTIVE_AGENT_STATUSES as the ANY() parameter.
+        select_calls = [
+            e
+            for e in conn.cursor_instance.executed
+            if "SELECT 1 FROM dispatcher.agents" in e[0]
+        ]
+        assert select_calls
+        # ACTIVE_AGENT_STATUSES is passed as the second param of the
+        # bind tuple: (issue_number, list(ACTIVE_AGENT_STATUSES)).
+        params = select_calls[0][1]
+        assert params is not None
+        # params is (issue_number, [statuses...]).
+        assert "needs_review" in params[1]
+
 
 # --------------------------------------------------------------------------
 # _issue_author_trusted (wraps scripts/check-issue-author.sh)
@@ -2172,3 +2204,633 @@ class TestClaimRace:
             if "INSERT INTO dispatcher.phase_outputs" in e[0]
         ]
         assert phase_inserts == []
+
+
+# --------------------------------------------------------------------------
+# #2856: summary_unmet_criteria opens a DRAFT PR + needs_review terminal
+#
+# Previously (pre-#2856) summary_unmet_criteria discarded all ralph work
+# by marking the agent failed with no PR. Now the daemon preserves
+# ralph's reviewer-approved output by opening a DRAFT PR with an
+# "Unmet acceptance criteria" section appended to the body, posts an
+# issue comment linking the draft, and marks the agent
+# ``status='needs_review'`` (a new terminal distinct from ``failed``).
+#
+# Tests cover: helper rendering (AC3: section text + sentinel); orchestration
+# path (AC1: draft flag, AC2: PR body section, AC4: status='needs_review',
+# AC5: issue comment with PR link). Parallel structure to the
+# plan_blocked tests above (#2857).
+# --------------------------------------------------------------------------
+
+
+class TestNeedsReviewHelpers:
+    """Direct tests for the needs_review rendering helpers (#2856)."""
+
+    def test_render_unmet_criteria_pr_section_includes_warning_heading(
+        self, tmp_path: Path
+    ) -> None:
+        """AC2: PR body section must include the ⚠️ Unmet AC heading."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        section = d._render_unmet_criteria_pr_section(["AC1 — foo", "AC2 — bar"])
+        # "\u26a0\ufe0f" is the warning-sign emoji (U+26A0 U+FE0F).
+        assert "\u26a0\ufe0f Unmet acceptance criteria" in section
+        # Each criterion rendered as a bullet verbatim.
+        assert "- AC1 \u2014 foo" in section
+        assert "- AC2 \u2014 bar" in section
+
+    def test_render_unmet_criteria_pr_section_drops_empty_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """Whitespace-only entries are dropped so the rendered list stays clean."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        section = d._render_unmet_criteria_pr_section(["real AC", "   ", ""])
+        assert "- real AC" in section
+        # Blank bullets must not appear.
+        assert "- \n" not in section
+        assert "- \n- " not in section
+
+    def test_render_unmet_criteria_pr_section_handles_all_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """Degenerate list → still renders the heading so the PR body is valid md."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        section = d._render_unmet_criteria_pr_section(["", "   "])
+        # Defensive fallback — should never happen via the normal path
+        # (the caller only invokes on non-empty) but keeps the helper total.
+        assert "\u26a0\ufe0f Unmet acceptance criteria" in section
+        assert "(none recorded)" in section
+
+    def test_render_needs_review_comment_has_sentinel_on_line_one(
+        self, tmp_path: Path
+    ) -> None:
+        """AC2/AC3: sentinel MUST be line 1 so a future dedupe can detect."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        body = d._render_needs_review_comment(
+            "aabbccdd-eeff-0011-2233-445566778899",
+            1234,
+            "https://github.com/judgemind/judgemind/pull/1234",
+            ["AC1 missing"],
+        )
+        first_line = body.splitlines()[0]
+        assert first_line == "<!-- dispatcher-needs-review -->"
+
+    def test_render_needs_review_comment_includes_pr_link(self, tmp_path: Path) -> None:
+        """AC4: the issue comment MUST link the draft PR."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        body = d._render_needs_review_comment(
+            "aabbccdd-eeff-0011-2233-445566778899",
+            1234,
+            "https://github.com/judgemind/judgemind/pull/1234",
+            ["AC1 missing"],
+        )
+        # GitHub autolinks the raw URL.
+        assert "https://github.com/judgemind/judgemind/pull/1234" in body
+
+    def test_render_needs_review_comment_falls_back_to_pr_number_on_missing_url(
+        self, tmp_path: Path
+    ) -> None:
+        """If ``gh pr create`` stdout parsing fails, fall back to #<num>."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        body = d._render_needs_review_comment(
+            "aabbccdd-eeff-0011-2233-445566778899",
+            1234,
+            "",
+            ["AC1 missing"],
+        )
+        assert "#1234" in body
+
+    def test_render_needs_review_comment_includes_unmet_bullets(
+        self, tmp_path: Path
+    ) -> None:
+        """Each unmet criterion rendered as its own bullet in the comment."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        body = d._render_needs_review_comment(
+            "aabbccdd-eeff-0011-2233-445566778899",
+            1234,
+            "https://github.com/judgemind/judgemind/pull/1234",
+            ["AC1 real fixture missing", "AC2 no deploy evidence"],
+        )
+        assert "- AC1 real fixture missing" in body
+        assert "- AC2 no deploy evidence" in body
+
+    def test_render_needs_review_comment_includes_short_agent_id(
+        self, tmp_path: Path
+    ) -> None:
+        """Operators can correlate comment with CloudWatch / DB row."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        body = d._render_needs_review_comment(
+            "aabbccdd-eeff-0011-2233-445566778899",
+            1234,
+            "https://github.com/judgemind/judgemind/pull/1234",
+            ["AC1"],
+        )
+        # First 8 hex chars of the UUID with dashes stripped.
+        assert "`aabbccdd`" in body
+
+
+class TestNeedsReviewCommentHandler:
+    """Direct tests for the needs_review comment-posting helpers (#2856)."""
+
+    def test_post_needs_review_comment_skips_when_sentinel_already_present(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Idempotence: pre-existing sentinel → no comment post, returns True."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        gh_comment_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.stdout = json.dumps(
+                    {
+                        "comments": [
+                            {"body": "<!-- dispatcher-needs-review -->\n## Prior\n"}
+                        ]
+                    }
+                )
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                gh_comment_calls.append(cmd)
+                r.stdout = ""
+                return r
+            r.stdout = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_needs_review_comment(
+            agent_id="aabbccdd-eeff-0011-2233-445566778899",
+            issue_number=42,
+            pr_number=1234,
+            pr_url="https://github.com/judgemind/judgemind/pull/1234",
+            unmet_criteria=["AC1"],
+            worktree=worktree,
+        )
+
+        assert ok is True
+        assert gh_comment_calls == []
+        assert handler.events("needs_review_comment_skipped_idempotent") != []
+
+    def test_post_needs_review_comment_posts_when_sentinel_absent(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Fresh issue: sentinel absent → comment posted with --body-file."""
+        d, _conn, handler = _make_daemon(tmp_path)
+        gh_comment_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.stdout = json.dumps({"comments": []})
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                gh_comment_calls.append(cmd)
+                r.stdout = ""
+                return r
+            r.stdout = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_needs_review_comment(
+            agent_id="aabbccdd-eeff-0011-2233-445566778899",
+            issue_number=42,
+            pr_number=1234,
+            pr_url="https://github.com/judgemind/judgemind/pull/1234",
+            unmet_criteria=["AC1 missing"],
+            worktree=worktree,
+        )
+
+        assert ok is True
+        assert len(gh_comment_calls) == 1
+        assert "--body-file" in gh_comment_calls[0]
+        body_idx = gh_comment_calls[0].index("--body-file") + 1
+        body_path = Path(gh_comment_calls[0][body_idx])
+        body = body_path.read_text(encoding="utf-8")
+        # Sentinel on line 1, PR link present, bullet present.
+        assert body.startswith("<!-- dispatcher-needs-review -->")
+        assert "https://github.com/judgemind/judgemind/pull/1234" in body
+        assert "- AC1 missing" in body
+        assert handler.events("needs_review_comment_posted") != []
+
+    def test_post_needs_review_comment_returns_false_on_gh_failure(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """gh issue comment non-zero → returns False, error logged."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.stdout = ""
+            r.stderr = "api error"
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                r.returncode = 1
+                return r
+            r.returncode = 0
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_needs_review_comment(
+            agent_id="aabbccdd-eeff-0011-2233-445566778899",
+            issue_number=42,
+            pr_number=1234,
+            pr_url="https://github.com/judgemind/judgemind/pull/1234",
+            unmet_criteria=["AC1"],
+            worktree=worktree,
+        )
+        assert ok is False
+        assert handler.events("needs_review_comment_failed") != []
+
+    def test_needs_review_sentinel_check_treats_gh_error_as_unknown(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``gh issue view`` non-zero → sentinel check returns None (fail-open)."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "api error"
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = d._needs_review_comment_already_posted(42)
+        assert result is None
+        assert handler.events("needs_review_sentinel_check_failed") != []
+
+    def test_needs_review_sentinel_check_treats_timeout_as_unknown(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """subprocess TimeoutExpired on sentinel check → returns None."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = d._needs_review_comment_already_posted(42)
+        assert result is None
+        assert handler.events("needs_review_sentinel_check_failed") != []
+
+    def test_needs_review_sentinel_check_treats_malformed_json_as_unknown(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Malformed JSON from ``gh issue view`` → returns None."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "not-json"
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = d._needs_review_comment_already_posted(42)
+        assert result is None
+        assert handler.events("needs_review_sentinel_check_failed") != []
+
+    def test_needs_review_sentinel_check_skips_non_dict_comments(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Non-dict entries in the comments array are skipped safely."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = json.dumps(
+                {
+                    "comments": [
+                        "not-a-dict",
+                        42,
+                        None,
+                        {"body": "ordinary comment"},
+                    ]
+                }
+            )
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert d._needs_review_comment_already_posted(42) is False
+
+    def test_post_needs_review_comment_handles_timeout(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """subprocess TimeoutExpired on ``gh issue comment`` → returns False, logs."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r = MagicMock()
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                r.stderr = ""
+                return r
+            # gh issue comment → timeout
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_needs_review_comment(
+            agent_id="aabbccdd-eeff-0011-2233-445566778899",
+            issue_number=42,
+            pr_number=1234,
+            pr_url="https://github.com/judgemind/judgemind/pull/1234",
+            unmet_criteria=["AC1"],
+            worktree=worktree,
+        )
+        assert ok is False
+        assert handler.events("needs_review_comment_failed") != []
+
+    def test_post_needs_review_comment_handles_body_write_failure(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """OSError writing the body file → returns False, logs error."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r = MagicMock()
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                r.stderr = ""
+                return r
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # Block the tmp/ directory creation by planting a file at that path.
+        (worktree / "tmp").write_text("not-a-dir")
+
+        ok = d._post_needs_review_comment(
+            agent_id="aabbccdd-eeff-0011-2233-445566778899",
+            issue_number=42,
+            pr_number=1234,
+            pr_url="https://github.com/judgemind/judgemind/pull/1234",
+            unmet_criteria=["AC1"],
+            worktree=worktree,
+        )
+        assert ok is False
+        assert handler.events("needs_review_comment_failed") != []
+
+
+class TestNeedsReviewOrchestration:
+    """End-to-end: summary with ``unmet_criteria`` → draft PR + needs_review (#2856)."""
+
+    def test_summary_unmet_opens_draft_pr_and_marks_needs_review(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """AC1/AC3/AC4: draft flag in gh create, status='needs_review', phase='needs_review'.
+
+        Previously summary_unmet_criteria hard-failed with no PR.
+        This test locks in the new contract: ralph's output is
+        preserved as a draft PR, agent terminates ``needs_review``,
+        and the PR body contains the ⚠️ Unmet AC section.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        # (1) Phase 3C resume — no retrying; (2) queue snapshot; (3) not-attempted.
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
+
+        monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
+        monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
+
+        summary_unmet = dict(_fixture_summary_output())
+        summary_unmet["unmet_criteria"] = [
+            "AC1 — real fixture must be committed",
+            "AC2 — deploy evidence posted",
+        ]
+
+        phase_outputs = {
+            "plan": _fixture_plan_output(),
+            "ralph": _fixture_ralph_output(),
+            "summary": summary_unmet,
+        }
+
+        gh_pr_create_calls: list[list[str]] = []
+        gh_issue_comment_calls: list[list[str]] = []
+        gh_issue_view_count = 0
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            nonlocal gh_issue_view_count
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[0].endswith("check-issue-author.sh"):
+                r.stdout = "TRUSTED: ...\n"
+                return r
+            if cmd[:3] == ["gh", "issue", "view"]:
+                gh_issue_view_count += 1
+                # All gh issue view calls (plan bundle + summary bundle +
+                # needs_review sentinel check) return an empty comments
+                # list so the sentinel check falls through to the post.
+                r.stdout = json.dumps(
+                    {
+                        "number": 42,
+                        "title": "Title",
+                        "body": "body",
+                        "labels": [{"name": "priority/p1"}],
+                        "comments": [],
+                    }
+                )
+                return r
+            if cmd[:3] == ["gh", "pr", "create"]:
+                gh_pr_create_calls.append(cmd)
+                r.stdout = "https://github.com/judgemind/judgemind/pull/9001\n"
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                gh_issue_comment_calls.append(cmd)
+                return r
+            if "worktree" in cmd and "add" in cmd:
+                add_idx = cmd.index("add")
+                Path(cmd[add_idx + 1]).mkdir(parents=True, exist_ok=True)
+                return r
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        def fake_spawn(phase: str, worktree: Path, agent_id: str) -> tuple[int, float]:
+            output_dir = worktree / "tmp" / "dispatcher-output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / f"{phase}.json").write_text(json.dumps(phase_outputs[phase]))
+            return 0, 0.1
+
+        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+
+        d._claim_and_orchestrate_one()
+
+        # --- AC1: draft flag present on gh pr create ---
+        assert len(gh_pr_create_calls) == 1
+        assert "--draft" in gh_pr_create_calls[0]
+
+        # --- AC2: PR body section present with unmet criteria ---
+        body_idx = gh_pr_create_calls[0].index("--body-file") + 1
+        body_path = Path(gh_pr_create_calls[0][body_idx])
+        body_text = body_path.read_text(encoding="utf-8")
+        assert "\u26a0\ufe0f Unmet acceptance criteria" in body_text
+        assert "- AC1 \u2014 real fixture must be committed" in body_text
+        assert "- AC2 \u2014 deploy evidence posted" in body_text
+
+        # --- AC5: issue comment posted linking the draft PR + listing unmet ---
+        assert len(gh_issue_comment_calls) == 1
+        assert "--body-file" in gh_issue_comment_calls[0]
+        comment_body_idx = gh_issue_comment_calls[0].index("--body-file") + 1
+        comment_body_path = Path(gh_issue_comment_calls[0][comment_body_idx])
+        comment_body = comment_body_path.read_text(encoding="utf-8")
+        assert "<!-- dispatcher-needs-review -->" in comment_body
+        assert "https://github.com/judgemind/judgemind/pull/9001" in comment_body
+        assert "- AC1 \u2014 real fixture must be committed" in comment_body
+
+        # --- AC4: terminal UPDATE sets status='needs_review' (not 'failed'). ---
+        needs_review_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "needs_review" in e[1]
+        ]
+        assert needs_review_updates, (
+            "expected UPDATE with status='needs_review'; got: "
+            f"{[e[1] for e in conn.cursor_instance.executed if 'UPDATE dispatcher.agents' in e[0]]}"
+        )
+
+        # summary_unmet_criteria event logged.
+        unmet_events = handler.events("summary_unmet_criteria")
+        assert unmet_events != []
+        assert unmet_events[0].terminal_status == "needs_review"
+
+        # pr_opened event carries is_draft=True so CloudWatch can filter.
+        pr_opened = handler.events("pr_opened")
+        assert pr_opened
+        assert pr_opened[0].pr_number == 9001
+
+        # Side-effect: comment posted event logged.
+        assert handler.events("needs_review_comment_posted") != []
+
+        # Ensure the happy-path ``running+awaiting_ci`` transition did
+        # NOT fire — the supervisor tick must not pick this up for
+        # auto-merge.
+        running_awaiting_ci_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "awaiting_ci" in e[1]
+            and "running" in e[1]
+        ]
+        assert running_awaiting_ci_updates == []
+
+    def test_summary_unmet_comment_failure_does_not_block_db_update(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issue-comment failure must NOT prevent status='needs_review' DB write.
+
+        DB update is the authoritative terminal-status write. A
+        GitHub outage on the issue-comment path must leave the agent
+        as ``needs_review`` (not stuck in ``push_and_pr``) so the
+        supervisor + admin cockpit see it consistently.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
+
+        monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
+        monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
+
+        summary_unmet = dict(_fixture_summary_output())
+        summary_unmet["unmet_criteria"] = ["AC1 missing"]
+
+        phase_outputs = {
+            "plan": _fixture_plan_output(),
+            "ralph": _fixture_ralph_output(),
+            "summary": summary_unmet,
+        }
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[0].endswith("check-issue-author.sh"):
+                r.stdout = "TRUSTED: ...\n"
+                return r
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.stdout = json.dumps(
+                    {
+                        "number": 42,
+                        "title": "T",
+                        "body": "",
+                        "labels": [],
+                        "comments": [],
+                    }
+                )
+                return r
+            if cmd[:3] == ["gh", "pr", "create"]:
+                r.stdout = "https://github.com/judgemind/judgemind/pull/9001\n"
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                # Comment post fails — DB update must still run.
+                r.returncode = 1
+                r.stderr = "api error"
+                return r
+            if "worktree" in cmd and "add" in cmd:
+                add_idx = cmd.index("add")
+                Path(cmd[add_idx + 1]).mkdir(parents=True, exist_ok=True)
+                return r
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        def fake_spawn(phase: str, worktree: Path, agent_id: str) -> tuple[int, float]:
+            output_dir = worktree / "tmp" / "dispatcher-output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / f"{phase}.json").write_text(json.dumps(phase_outputs[phase]))
+            return 0, 0.1
+
+        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+
+        d._claim_and_orchestrate_one()
+
+        # DB terminal-status update ran.
+        needs_review_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "needs_review" in e[1]
+        ]
+        assert needs_review_updates
+        # Failure event logged.
+        assert handler.events("needs_review_comment_failed") != []

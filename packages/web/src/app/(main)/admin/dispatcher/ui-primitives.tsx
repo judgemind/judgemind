@@ -90,19 +90,37 @@ export function PriorityBadge({ priority }: { priority: string | null }) {
 
 // ---------------------------------------------------------------------------
 // Outcome glyph pill — succeeded (✓ green), failed (✗ red), crashed (⚠ amber),
-// plan_blocked (⊘ neutral — #2857).
+// plan_blocked (⊘ neutral — #2857), needs_review (◐ yellow — #2856).
 //
-// Colour assignment intentionally keeps red/amber reserved for genuine
-// problems. `plan_blocked` ("plan correctly declined to proceed") is an
-// operator-informational correct-outcome state, so it uses the neutral
-// muted surface — the same treatment `priority/p2` gets above — per
-// BRAND.md §"Minimal accent use". A dashboard full of plan_blocked
-// chips must not look like a house on fire; it should look quiet.
+// Colour assignment intentionally keeps red reserved for genuine failure
+// and amber reserved for the crash-category anomaly. `plan_blocked`
+// ("plan correctly declined to proceed") is operator-informational, so
+// it uses the neutral muted surface — the same treatment `priority/p2`
+// gets above — per BRAND.md §"Minimal accent use". A dashboard full of
+// plan_blocked chips must not look like a house on fire.
+//
+// `needs_review` is the one correct-outcome terminal that DOES need
+// operator action (ralph produced reviewer-approved SHIP code but
+// summary flagged unmet AC; the daemon opened a draft PR that sits
+// for operator triage). It earns yellow — adjacent to amber on the
+// colour wheel but visually distinct from crashed's amber so the
+// operator can scan the "Recently completed" panel and quickly
+// separate "review my draft PR" from "something crashed, diagnose
+// this". The glyph ◐ (half-circle) is the semantic anchor: ralph
+// did half the work, you do the other half (review + merge).
 // ---------------------------------------------------------------------------
 
-type OutcomeStatus = 'succeeded' | 'failed' | 'crashed' | 'plan_blocked';
+type OutcomeStatus =
+  | 'succeeded'
+  | 'failed'
+  | 'crashed'
+  | 'plan_blocked'
+  | 'needs_review';
 
-const OUTCOME_STYLES: Record<OutcomeStatus, { glyph: string; className: string; label: string }> = {
+const OUTCOME_STYLES: Record<
+  OutcomeStatus,
+  { glyph: string; className: string; label: string }
+> = {
   succeeded: {
     glyph: '\u2713',
     className: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300',
@@ -124,6 +142,20 @@ const OUTCOME_STYLES: Record<OutcomeStatus, { glyph: string; className: string; 
     glyph: '\u2298',
     className: 'bg-muted text-foreground',
     label: 'plan blocked',
+  },
+  needs_review: {
+    // ◐ = "black circle with left half black" — ralph did half the work
+    // (implementation + reviewer SHIP), operator does the other half
+    // (review the draft, mark ready, merge). Deliberately distinct from
+    // ⚠ (crashed) and ⊘ (plan_blocked) at a glance.
+    glyph: '\u25D0',
+    // Yellow, not amber — yellow neighbours amber but is perceptibly
+    // separate so the two actionable-attention chips don't visually
+    // collapse into each other in a scan of the "Recently completed"
+    // panel. Uses the `text-yellow-900` foreground for AA contrast
+    // against the `bg-yellow-100` surface.
+    className: 'bg-yellow-100 text-yellow-900 dark:bg-yellow-900/30 dark:text-yellow-100',
+    label: 'needs review',
   },
 };
 

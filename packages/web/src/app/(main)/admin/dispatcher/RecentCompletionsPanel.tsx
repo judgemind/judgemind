@@ -17,10 +17,19 @@ interface RecentCompletionsPanelProps {
 
 /**
  * The "Recently completed" panel (#2805 §1.5). Newest terminal-state
- * agents (succeeded / failed / crashed / plan_blocked) in the operator's
- * recent history. Each row links to the issue and, when available, the PR.
- * `plan_blocked` (#2857) renders with a distinct neutral chip so
- * correct-outcome triage is visually separated from genuine failures.
+ * agents (succeeded / failed / crashed / plan_blocked / needs_review) in
+ * the operator's recent history. Each row links to the issue and, when
+ * available, the PR. The two correct-outcome triage terminals render
+ * with their own chips to keep them visually separated from genuine
+ * failures:
+ *
+ * - `plan_blocked` (#2857) — neutral muted chip (⊘). Operator-
+ *   informational; no action expected unless the issue needs reshaping.
+ * - `needs_review` (#2856) — yellow chip (◐). DOES need operator action:
+ *   a draft PR is open for review, ralph produced SHIP code but
+ *   summary flagged unmet AC. The yellow is distinct from amber
+ *   (`crashed`) so the operator can scan the panel and separate
+ *   "review my draft PR" from "something crashed, diagnose this".
  *
  * Borderless. Lives in the right column below Active agents.
  *
