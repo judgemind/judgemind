@@ -219,6 +219,17 @@ export const dispatcherTypeDefs = `#graphql
     config: [DispatcherConfigEntry!]!
     """\`dispatcher.config.value\` for \`spawn_frozen_until\` (§10), or null if not set."""
     spawnFrozenUntil: DateTime
+    """True when the overnight-safety circuit breaker is open
+    (\`dispatcher.config.cap_flipped_by\` == \`"circuit_breaker"\`).
+    Surfaces the open state in the admin cockpit so the operator sees
+    "Circuit open: N recent agents bad, cap held at 0" instead of a
+    silent cap=0. Issue #2860."""
+    circuitBreakerOpen: Boolean!
+    """Diagnostic trail for the last \`concurrency_cap\` flip. One of
+    \`"circuit_breaker"\` | \`"operator"\` | another identifier |
+    \`null\` (never set). Read from \`dispatcher.config.cap_flipped_by\`.
+    Issue #2860."""
+    capFlippedBy: String
   }
 
   # ---------------------------------------------------------------------------

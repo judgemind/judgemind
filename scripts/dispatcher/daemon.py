@@ -664,6 +664,59 @@ CIRCUIT_BREAKER_WINDOW_SECONDS = 24 * 60 * 60
 #: is missing or malformed. Matches the migration-26 seed ``0.30``.
 DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 0.30
 
+# --------------------------------------------------------------------------
+# Overnight-safety circuit breaker (#2860) — separate from the diagnoser
+# circuit breaker above. This one trips on a streak of bad terminal agent
+# outcomes (failed / crashed / plan_blocked / needs_review) and flips
+# ``concurrency_cap`` to 0 so the dispatcher auto-pauses instead of
+# burning $ all night on a cascading failure mode.
+# --------------------------------------------------------------------------
+
+#: Fallback "window minutes" when ``dispatcher.config.circuit_breaker_window_minutes``
+#: is missing or malformed. Matches the migration-29 seed.
+DEFAULT_OVERNIGHT_CB_WINDOW_MINUTES = 30
+
+#: Fallback "window size" (N in M-of-N) when the config row is missing
+#: or malformed. Matches the migration-29 seed.
+DEFAULT_OVERNIGHT_CB_WINDOW_SIZE = 10
+
+#: Fallback "bad outcome threshold" (M in M-of-N). Matches the migration-29
+#: seed. Trip opens when at least this many of the last ``window_size``
+#: terminal outcomes in the rolling ``window_minutes`` are in
+#: :data:`OVERNIGHT_CB_BAD_OUTCOME_STATUSES`.
+DEFAULT_OVERNIGHT_CB_BAD_OUTCOME_THRESHOLD = 5
+
+#: The classifier. Any terminal agent status NOT in this set counts as
+#: "bad" for the circuit-breaker threshold. ``succeeded`` is the only
+#: status treated as "good". This matches the spec's tolerant-classifier
+#: contract (#2860): if a future correct-outcome terminal ships before
+#: we update this set, it is conservatively counted as bad (better to
+#: open the breaker on an unknown new state than to let a cascading
+#: failure mode go undetected because the classifier didn't know about
+#: its status string).
+OVERNIGHT_CB_GOOD_OUTCOME_STATUSES: frozenset[str] = frozenset({"succeeded"})
+
+#: Sentinel value for ``dispatcher.config.cap_flipped_by`` when the
+#: overnight-safety circuit breaker opens. The scheduler tick's
+#: auto-close path looks for this exact value to decide whether a cap
+#: change back to ≥1 was operator-initiated (the flag gets cleared) vs
+#: the breaker's own flip (no-op — the breaker has already flipped cap).
+CAP_FLIPPED_BY_CIRCUIT_BREAKER = "circuit_breaker"
+
+#: Path to the Telegram notification helper. Invoked as a subprocess
+#: with ``--message-file <tmp>``. The helper exits 0 when Telegram is
+#: unconfigured (no-op), 2 when all sends fail — see
+#: ``scripts/notify-telegram.sh``. The daemon treats any non-zero exit
+#: as a warning, not a failure: the circuit-breaker flip has already
+#: happened regardless of whether the alert reaches the operator.
+NOTIFY_TELEGRAM_SCRIPT_RELPATH = "scripts/notify-telegram.sh"
+
+#: Hard timeout on the ``notify-telegram.sh`` subprocess. Short enough
+#: that a Telegram outage can't stall a terminal transition; long
+#: enough that AWS Secrets Manager + curl to the Bot API always fits
+#: on a healthy network.
+NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS = 30
+
 
 # --------------------------------------------------------------------------
 # Logging — structured JSON per line to stdout.
@@ -1330,6 +1383,26 @@ class DispatcherDaemon:
                     },
                 )
             self._pause_requested.clear()
+
+        # Overnight-safety circuit breaker auto-close (#2860). When the
+        # breaker previously opened it set ``cap_flipped_by='circuit_breaker'``
+        # and flipped ``concurrency_cap`` to 0. If the operator has
+        # since flipped cap back up to ≥1, log the close event and
+        # clear the flag. Runs only on cap>0 ticks so the common
+        # cap=0 path (Phase 2 steady state, most tests) adds zero
+        # cursor reads. Wrapped in try/except so a failure here cannot
+        # stall the scheduler tick.
+        if concurrency_cap is not None and concurrency_cap >= 1:
+            try:
+                self._check_circuit_breaker_auto_close(concurrency_cap)
+            except Exception:
+                self._log.exception(
+                    "daemon.circuit_breaker_auto_close_error",
+                    extra={
+                        "event": "circuit_breaker_auto_close_error",
+                        "run_id": self._run_id,
+                    },
+                )
 
         # Phase 2 spawn-safety guard: the spawn path does not exist yet,
         # but a future Phase 3 wiring mistake could activate it. Warn if
@@ -3440,6 +3513,35 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                         "agent_id": agent_id,
                         "status": status,
+                    },
+                )
+
+            # Overnight-safety circuit breaker (#2860): append the outcome
+            # to ``dispatcher.terminal_outcomes`` and evaluate the
+            # M-of-N rolling-window threshold. A breaker failure here
+            # cannot roll back the terminal-status update above — both
+            # side effects are independently wrapped.
+            try:
+                self._write_terminal_outcome(agent_id, status)
+            except Exception:
+                self._log.exception(
+                    "daemon.terminal_outcome_write_failed",
+                    extra={
+                        "event": "terminal_outcome_write_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "status": status,
+                    },
+                )
+            try:
+                self._evaluate_circuit_breaker(agent_id)
+            except Exception:
+                self._log.exception(
+                    "daemon.circuit_breaker_evaluate_failed",
+                    extra={
+                        "event": "circuit_breaker_evaluate_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
                     },
                 )
 
@@ -8522,6 +8624,531 @@ class DispatcherDaemon:
                 "total_diagnoses_24h": total_n,
                 "failed_diagnoses_24h": failed_n,
                 "min_diagnoses": CIRCUIT_BREAKER_MIN_DIAGNOSES,
+            },
+        )
+        return True
+
+    # ── Overnight-safety circuit breaker (#2860) ───────────────────────
+
+    def _cb_config_int(self, key: str, default: int) -> int:
+        """Read a numeric key from ``dispatcher.config`` with a fallback.
+
+        Shared helper for the three overnight-safety knobs
+        (``circuit_breaker_window_minutes``, ``_window_size``,
+        ``_bad_outcome_threshold``). Returns ``default`` on missing row,
+        malformed JSON, non-integer value, or DB error — the breaker
+        must never crash a terminal transition.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    (key,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return default
+        if row is None or row[0] is None:
+            return default
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return default
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return default
+        if n < 0:
+            return default
+        return n
+
+    def _cb_enabled(self) -> bool:
+        """Read ``dispatcher.config.circuit_breaker_enabled`` as a bool.
+
+        Defaults to ``True`` when the config row is missing or malformed —
+        the overnight-safety rail is the safe default. Operators who want
+        to disable it must explicitly set ``false``.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("circuit_breaker_enabled",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return True
+        if row is None or row[0] is None:
+            return True
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return True
+        if isinstance(raw, bool):
+            return raw
+        return True
+
+    def _read_cap_flipped_by(self) -> str | None:
+        """Read ``dispatcher.config.cap_flipped_by``. ``None`` if unset or error.
+
+        Used by the scheduler tick to detect when the operator has
+        manually flipped ``concurrency_cap`` back up after the breaker
+        opened (diagnostic trail cleared; breaker auto-closes).
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("cap_flipped_by",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None or row[0] is None:
+            return None
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        if isinstance(raw, str):
+            return raw
+        return None
+
+    def _write_terminal_outcome(self, agent_id: str, status: str) -> None:
+        """Append a row to ``dispatcher.terminal_outcomes``.
+
+        Called by :meth:`_mark_agent_terminal` for every terminal
+        status. ``issue_number`` is looked up from ``dispatcher.agents``
+        so the outcome row is self-contained (no JOIN needed at scan
+        time). Append-only: the ring-buffer semantics come from the
+        rolling-window scan in :meth:`_evaluate_circuit_breaker`, not
+        from deleting rows on write.
+        """
+        assert self._conn is not None, "connect() must run before outcome write"
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT issue_number FROM dispatcher.agents WHERE agent_id = %s",
+                (agent_id,),
+            )
+            row = cur.fetchone()
+            issue_number = (
+                int(row[0]) if row is not None and row[0] is not None else None
+            )
+            cur.execute(
+                "INSERT INTO dispatcher.terminal_outcomes "
+                "    (agent_id, issue_number, status, ended_at) "
+                "VALUES (%s, %s, %s, now())",
+                (agent_id, issue_number, status),
+            )
+        self._conn.commit()
+
+    def _is_bad_outcome(self, status: str) -> bool:
+        """Classify a terminal status for the overnight-safety breaker.
+
+        Tolerant classifier — any status not explicitly known to be
+        "good" (i.e. ``succeeded``) counts as bad. This matches the
+        issue #2860 scope note: if #2856 ships ``needs_review`` after
+        this PR merges (or a later PR adds another correct-outcome
+        terminal), that status is conservatively counted as bad until
+        :data:`OVERNIGHT_CB_GOOD_OUTCOME_STATUSES` is updated to
+        include it. Erring on the side of opening the breaker is the
+        safer bias for overnight operation.
+        """
+        return status not in OVERNIGHT_CB_GOOD_OUTCOME_STATUSES
+
+    def _evaluate_circuit_breaker(self, agent_id: str) -> bool:
+        """Trip the overnight-safety circuit breaker if the streak is bad.
+
+        Runs post-terminal-transition (called from
+        :meth:`_mark_agent_terminal`). Scans
+        ``dispatcher.terminal_outcomes`` for the last ``window_size``
+        rows whose ``ended_at`` falls inside the last ``window_minutes``,
+        counts how many are in :data:`OVERNIGHT_CB_GOOD_OUTCOME_STATUSES`-
+        complement via :meth:`_is_bad_outcome`, and flips
+        ``concurrency_cap`` to 0 when the bad count reaches the
+        threshold.
+
+        Idempotent: if ``concurrency_cap`` is already 0 the breaker
+        does nothing (no log spam, no duplicate Telegram alert). The
+        ``cap_flipped_by`` trail is always rewritten to
+        :data:`CAP_FLIPPED_BY_CIRCUIT_BREAKER` when the breaker triggers
+        so the admin cockpit shows the open banner even if the cap
+        happened to already be 0 (e.g. operator paused, then cascade
+        hit threshold).
+
+        Returns True when the breaker opened (or re-asserted an already-
+        open state) this call; False when the threshold was not met or
+        the breaker is disabled via config.
+        """
+        assert self._conn is not None, "connect() must run before breaker eval"
+
+        if not self._cb_enabled():
+            return False
+
+        window_minutes = self._cb_config_int(
+            "circuit_breaker_window_minutes", DEFAULT_OVERNIGHT_CB_WINDOW_MINUTES
+        )
+        window_size = self._cb_config_int(
+            "circuit_breaker_window_size", DEFAULT_OVERNIGHT_CB_WINDOW_SIZE
+        )
+        threshold = self._cb_config_int(
+            "circuit_breaker_bad_outcome_threshold",
+            DEFAULT_OVERNIGHT_CB_BAD_OUTCOME_THRESHOLD,
+        )
+
+        # Defensive: the seed rows should never produce these, but if
+        # an operator sets ``window_size=0`` or
+        # ``threshold=0`` via the config panel, treat the breaker as
+        # disabled rather than tripping on the empty-window edge case.
+        if window_size <= 0 or threshold <= 0:
+            return False
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM dispatcher.terminal_outcomes "
+                    "WHERE ended_at > now() - make_interval(mins => %s) "
+                    "ORDER BY ended_at DESC "
+                    "LIMIT %s",
+                    (window_minutes, window_size),
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_scan_failed",
+                extra={
+                    "event": "circuit_breaker_scan_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        statuses = [str(r[0]) for r in rows if r and r[0] is not None]
+        bad_count = sum(1 for s in statuses if self._is_bad_outcome(s))
+        if bad_count < threshold:
+            return False
+
+        # Threshold met. Flip ``concurrency_cap`` to 0 and stamp
+        # ``cap_flipped_by``. Use a single UPDATE per config row so a
+        # partial failure (e.g. the ``cap_flipped_by`` write 500s) does
+        # not roll back the cap flip — the cap flip is the safety
+        # action, the flag is the diagnostic trail.
+        current_cap = self._cb_config_int("concurrency_cap", -1)
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = '0', "
+                    "    updated_at = now(), "
+                    "    updated_by = %s "
+                    "WHERE key = 'concurrency_cap'",
+                    (CAP_FLIPPED_BY_CIRCUIT_BREAKER,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_flip_failed",
+                extra={
+                    "event": "circuit_breaker_flip_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "bad_count": bad_count,
+                    "window_size": window_size,
+                    "threshold": threshold,
+                    "window_minutes": window_minutes,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = %s, "
+                    "    updated_at = now(), "
+                    "    updated_by = %s "
+                    "WHERE key = 'cap_flipped_by'",
+                    (
+                        json.dumps(CAP_FLIPPED_BY_CIRCUIT_BREAKER),
+                        CAP_FLIPPED_BY_CIRCUIT_BREAKER,
+                    ),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_flag_failed",
+                extra={
+                    "event": "circuit_breaker_flag_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            # Continue — the cap flip above is the safety action; the
+            # flag is diagnostic. Still log the open event.
+
+        # Idempotence signal: if cap was already 0 we are re-asserting
+        # the same state, not opening fresh. The log level + Telegram
+        # alert branch downstream uses this to avoid notification spam.
+        was_already_open = current_cap == 0
+
+        self._log.warning(
+            "daemon.circuit_breaker_opened",
+            extra={
+                "event": "circuit_breaker_opened",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "bad_count": bad_count,
+                "window_size": window_size,
+                "threshold": threshold,
+                "window_minutes": window_minutes,
+                "previous_cap": current_cap,
+                "was_already_open": was_already_open,
+                "recent_statuses": statuses,
+            },
+        )
+
+        if not was_already_open:
+            # Only alert operator on fresh opens — re-asserting an
+            # already-open state is a no-op from the operator's
+            # perspective.
+            try:
+                self._send_circuit_breaker_telegram_alert(
+                    bad_count=bad_count,
+                    window_size=window_size,
+                    window_minutes=window_minutes,
+                    statuses=statuses,
+                )
+            except Exception:
+                self._log.exception(
+                    "daemon.circuit_breaker_telegram_failed",
+                    extra={
+                        "event": "circuit_breaker_telegram_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                    },
+                )
+        return True
+
+    def _send_circuit_breaker_telegram_alert(
+        self,
+        *,
+        bad_count: int,
+        window_size: int,
+        window_minutes: int,
+        statuses: list[str],
+    ) -> None:
+        """Fire a Telegram alert via ``scripts/notify-telegram.sh``.
+
+        Best-effort — the helper script exits 0 when Telegram is
+        unconfigured (secret missing, no allowed user IDs) so the
+        daemon never depends on Telegram being wired up in a given
+        environment. A non-zero exit is logged as a warning and the
+        breaker is still considered "opened" (the cap flip is the
+        safety action; the alert is operator-UX).
+        """
+        repo_root = self._repo_root_for_notify_script()
+        notify_script = repo_root / NOTIFY_TELEGRAM_SCRIPT_RELPATH
+        if not notify_script.exists():
+            self._log.info(
+                "daemon.circuit_breaker_telegram_skipped_no_script",
+                extra={
+                    "event": "circuit_breaker_telegram_skipped_no_script",
+                    "run_id": self._run_id,
+                    "script_path": str(notify_script),
+                },
+            )
+            return
+
+        # Write the message to a temp file and pass via --message-file
+        # so the daemon does not inline secret-ish content (bad status
+        # strings) into argv where it could leak to ps listings.
+        message = self._render_circuit_breaker_telegram_message(
+            bad_count=bad_count,
+            window_size=window_size,
+            window_minutes=window_minutes,
+            statuses=statuses,
+        )
+        tmp_dir = repo_root / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        msg_path = tmp_dir / f"circuit-breaker-alert-{self._run_id or 'unknown'}.txt"
+        msg_path.write_text(message, encoding="utf-8")
+
+        try:
+            result = subprocess.run(
+                [str(notify_script), "--message-file", str(msg_path)],
+                capture_output=True,
+                text=True,
+                timeout=NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.circuit_breaker_telegram_timeout",
+                extra={
+                    "event": "circuit_breaker_telegram_timeout",
+                    "run_id": self._run_id,
+                    "timeout_s": NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS,
+                },
+            )
+            return
+
+        if result.returncode == 0:
+            self._log.info(
+                "daemon.circuit_breaker_telegram_sent",
+                extra={
+                    "event": "circuit_breaker_telegram_sent",
+                    "run_id": self._run_id,
+                },
+            )
+        else:
+            self._log.warning(
+                "daemon.circuit_breaker_telegram_nonzero_exit",
+                extra={
+                    "event": "circuit_breaker_telegram_nonzero_exit",
+                    "run_id": self._run_id,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "")[-500:],
+                },
+            )
+
+    def _render_circuit_breaker_telegram_message(
+        self,
+        *,
+        bad_count: int,
+        window_size: int,
+        window_minutes: int,
+        statuses: list[str],
+    ) -> str:
+        """Render the Telegram alert body.
+
+        Plain text (``notify-telegram.sh`` uses ``parse_mode=HTML`` but
+        HTML entities would leak through as literal characters on a
+        misconfigured client — plain text is safer). The recent-status
+        list is comma-joined newest first so the operator can see the
+        cascade pattern at a glance.
+        """
+        recent = ", ".join(statuses[: min(window_size, 10)]) if statuses else "(none)"
+        return (
+            "Dispatcher circuit breaker OPENED\n"
+            f"{bad_count}/{window_size} of the last terminal outcomes in the "
+            f"last {window_minutes} min were bad.\n"
+            f"concurrency_cap has been set to 0 — the daemon will not spawn "
+            f"new agents.\n"
+            f"Recent statuses (newest first): {recent}\n"
+            "Manually flip cap back to ≥1 in the admin cockpit once you've "
+            "triaged the underlying failure pattern."
+        )
+
+    def _repo_root_for_notify_script(self) -> Path:
+        """Resolve the repo root for ``scripts/notify-telegram.sh``.
+
+        In production the daemon runs inside the Fargate container with
+        the repo at ``/var/lib/dispatcher/repo`` (see
+        :data:`DEFAULT_BASELINE_REPO_ROOT`). Tests inject a different
+        root by setting ``self._cfg.baseline_repo_root``. Fall back to
+        the daemon module's parent (``scripts/dispatcher/`` → two
+        levels up to the repo root) when neither is set.
+        """
+        baseline = getattr(self._cfg, "baseline_repo_root", None)
+        if baseline:
+            return Path(baseline)
+        return Path(__file__).resolve().parents[2]
+
+    def _check_circuit_breaker_auto_close(self, current_cap: int) -> bool:
+        """Auto-close the breaker if the operator manually raised the cap.
+
+        Called by scheduler_tick once the live ``concurrency_cap`` has
+        been read (passed as ``current_cap``). When:
+
+          - ``current_cap >= 1``, AND
+          - ``cap_flipped_by == 'circuit_breaker'``,
+
+        the operator has explicitly re-enabled the dispatcher after
+        the breaker opened — log ``daemon.circuit_breaker_closed`` and
+        clear ``cap_flipped_by`` back to null so subsequent cap flips
+        by the operator don't get mis-attributed to the breaker.
+
+        Returns True when the breaker was auto-closed this tick; False
+        otherwise. The common case (``cap_flipped_by`` null or not the
+        breaker) is a single SELECT + early return.
+        """
+        assert self._conn is not None, "connect() must run before auto-close"
+        if current_cap < 1:
+            return False
+
+        flipped_by = self._read_cap_flipped_by()
+        if flipped_by != CAP_FLIPPED_BY_CIRCUIT_BREAKER:
+            return False
+
+        # Operator manually raised cap — clear the flag.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = 'null', "
+                    "    updated_at = now(), "
+                    "    updated_by = 'circuit_breaker_auto_close' "
+                    "WHERE key = 'cap_flipped_by'",
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_auto_close_failed",
+                extra={
+                    "event": "circuit_breaker_auto_close_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        self._log.info(
+            "daemon.circuit_breaker_closed",
+            extra={
+                "event": "circuit_breaker_closed",
+                "run_id": self._run_id,
+                "new_cap": current_cap,
             },
         )
         return True

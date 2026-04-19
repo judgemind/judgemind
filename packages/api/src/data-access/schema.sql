@@ -558,6 +558,35 @@ CREATE SEQUENCE dispatcher.retry_markers_marker_id_seq
 ALTER SEQUENCE dispatcher.retry_markers_marker_id_seq OWNED BY dispatcher.retry_markers.marker_id;
 
 
+CREATE TABLE dispatcher.terminal_outcomes (
+    outcome_id bigint NOT NULL,
+    agent_id uuid,
+    issue_number integer,
+    status text NOT NULL,
+    ended_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+COMMENT ON TABLE dispatcher.terminal_outcomes IS 'Append-only ring buffer of terminal agent outcomes. Scanned by ``_evaluate_circuit_breaker`` over a rolling window to decide whether to auto-pause ``concurrency_cap``. Issue #2860.';
+
+
+COMMENT ON COLUMN dispatcher.terminal_outcomes.agent_id IS 'Nullable — synthetic test inputs may have no agent row. Production writes always carry this.';
+
+
+COMMENT ON COLUMN dispatcher.terminal_outcomes.status IS 'Free-form text (succeeded | failed | crashed | plan_blocked | needs_review | ...). Classifier in daemon decides which count as bad.';
+
+
+CREATE SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq OWNED BY dispatcher.terminal_outcomes.outcome_id;
+
+
 CREATE TABLE dispatcher.runs (
     run_id uuid DEFAULT gen_random_uuid() NOT NULL,
     started_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -758,6 +787,9 @@ ALTER TABLE ONLY dispatcher.phase_transitions ALTER COLUMN transition_id SET DEF
 ALTER TABLE ONLY dispatcher.retry_markers ALTER COLUMN marker_id SET DEFAULT nextval('dispatcher.retry_markers_marker_id_seq'::regclass);
 
 
+ALTER TABLE ONLY dispatcher.terminal_outcomes ALTER COLUMN outcome_id SET DEFAULT nextval('dispatcher.terminal_outcomes_outcome_id_seq'::regclass);
+
+
 ALTER TABLE ONLY telemetry.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('telemetry.data_quality_metrics_id_seq'::regclass);
 
 
@@ -883,6 +915,10 @@ ALTER TABLE ONLY dispatcher.queue_snapshots
 
 ALTER TABLE ONLY dispatcher.retry_markers
     ADD CONSTRAINT retry_markers_pkey PRIMARY KEY (marker_id);
+
+
+ALTER TABLE ONLY dispatcher.terminal_outcomes
+    ADD CONSTRAINT terminal_outcomes_pkey PRIMARY KEY (outcome_id);
 
 
 ALTER TABLE ONLY dispatcher.runs
@@ -1092,6 +1128,9 @@ CREATE INDEX idx_dispatcher_queue_snapshots_observed_at ON dispatcher.queue_snap
 
 
 CREATE INDEX idx_dispatcher_retry_markers_pending ON dispatcher.retry_markers USING btree (retry_after_ts) WHERE (resolved_at IS NULL);
+
+
+CREATE INDEX idx_dispatcher_terminal_outcomes_ended_at ON dispatcher.terminal_outcomes USING btree (ended_at DESC);
 
 
 CREATE INDEX idx_alert_events_sub_id ON public.alert_events USING btree (subscription_id);

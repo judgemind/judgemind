@@ -311,6 +311,25 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         />
       </div>
 
+      {state?.circuitBreakerOpen && (
+        <div
+          role="alert"
+          data-testid="circuit-breaker-banner"
+          className="mb-4 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-700 dark:bg-red-900/40 dark:text-red-200"
+        >
+          <div className="font-semibold">
+            Circuit breaker open — dispatcher auto-paused (#2860).
+          </div>
+          <div className="mt-1">
+            A streak of bad terminal outcomes tripped the overnight-safety rail.
+            <code className="mx-1 font-mono">concurrency_cap</code>
+            is held at 0. Review recent completions and failures below, then
+            raise cap back to ≥1 in the config strip once the underlying
+            pattern is triaged.
+          </div>
+        </div>
+      )}
+
       {commandError && (
         <div
           role="alert"

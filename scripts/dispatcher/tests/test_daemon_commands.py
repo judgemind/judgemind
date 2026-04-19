@@ -99,9 +99,9 @@ class _CapturingLogHandler(logging.Handler):
         return [r for r in self.records if getattr(r, "event", None) == name]
 
 
-def _make_daemon_with_capture() -> (
-    tuple[daemon.DispatcherDaemon, _FakeConnection, _CapturingLogHandler]
-):
+def _make_daemon_with_capture() -> tuple[
+    daemon.DispatcherDaemon, _FakeConnection, _CapturingLogHandler
+]:
     handler = _CapturingLogHandler()
     logger = logging.getLogger(f"dispatcher.test.commands.{id(handler)}")
     logger.handlers = [handler]
@@ -143,9 +143,7 @@ class TestHandleStart:
     def test_start_flips_cap_when_zero(self) -> None:
         d, conn, handler = _make_daemon_with_capture()
         # Stub fetchall to return one 'start' command.
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "start")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
         # concurrency_cap UPDATE: rowcount=1 (was 0, now 1).
         conn.cursor_instance.rowcount = 1
 
@@ -153,7 +151,8 @@ class TestHandleStart:
 
         assert count == 1
         updates = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.config" in e[0]
             and "concurrency_cap" in e[0]
             and "value = '1'" in e[0]
@@ -161,7 +160,8 @@ class TestHandleStart:
         assert len(updates) == 1
         # consumed_at set after handler.
         consumed_updates = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "SET consumed_at = now()" in e[0]
         ]
         assert len(consumed_updates) == 1
@@ -169,23 +169,22 @@ class TestHandleStart:
     def test_start_noop_when_cap_positive(self) -> None:
         """start when cap > 0 is a safe no-op (rowcount == 0)."""
         d, conn, _handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "start")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
         conn.cursor_instance.rowcount = 0  # already > 0, no rows updated
 
         count = d._consume_commands()
 
         assert count == 1
         updates = [
-            e for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.config" in e[0]
-            and "value = '1'" in e[0]
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0] and "value = '1'" in e[0]
         ]
         assert len(updates) == 1
         # Still consumed — a no-op is a valid success.
         consumed_updates = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "SET consumed_at = now()" in e[0]
         ]
         assert len(consumed_updates) == 1
@@ -201,15 +200,14 @@ class TestHandleStopAndDrain:
 
     def test_stop_sets_cap_zero(self) -> None:
         d, conn, _handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "stop")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "stop")]]
 
         count = d._consume_commands()
 
         assert count == 1
         updates = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.config" in e[0]
             and "value = '0'" in e[0]
             and "concurrency_cap" in e[0]
@@ -218,15 +216,14 @@ class TestHandleStopAndDrain:
 
     def test_drain_sets_cap_zero(self) -> None:
         d, conn, _handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "drain")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "drain")]]
 
         count = d._consume_commands()
 
         assert count == 1
         updates = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.config" in e[0]
             and "value = '0'" in e[0]
             and "concurrency_cap" in e[0]
@@ -244,15 +241,14 @@ class TestHandlePauseResume:
 
     def test_pause_upserts_paused_true(self) -> None:
         d, conn, _handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "pause")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "pause")]]
 
         count = d._consume_commands()
 
         assert count == 1
         upserts = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "INSERT INTO dispatcher.config" in e[0]
             and "'paused'" in e[0]
             and "'true'" in e[0]
@@ -263,15 +259,14 @@ class TestHandlePauseResume:
 
     def test_resume_upserts_paused_false(self) -> None:
         d, conn, _handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "resume")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "resume")]]
 
         count = d._consume_commands()
 
         assert count == 1
         upserts = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "INSERT INTO dispatcher.config" in e[0]
             and "'paused'" in e[0]
             and "'false'" in e[0]
@@ -302,14 +297,15 @@ class TestHandleRetry:
         assert count == 1
         # Agent flipped to 'retrying'.
         agent_updates = [
-            e for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.agents" in e[0]
-            and "'retrying'" in e[0]
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "'retrying'" in e[0]
         ]
         assert len(agent_updates) == 1
         # Retry marker inserted.
         marker_inserts = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "INSERT INTO dispatcher.retry_markers" in e[0]
         ]
         assert len(marker_inserts) == 1
@@ -334,7 +330,8 @@ class TestHandleRetry:
         assert conn.rollbacks >= 1
         # failures row inserted for invalid_command.
         failure_inserts = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "INSERT INTO dispatcher.failures" in e[0]
         ]
         assert len(failure_inserts) == 1
@@ -363,9 +360,9 @@ class TestHandleForceKill:
 
         assert count == 1
         updates = [
-            e for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.agents" in e[0]
-            and "'crashed'" in e[0]
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "'crashed'" in e[0]
         ]
         assert len(updates) == 1
 
@@ -381,7 +378,8 @@ class TestHandleForceKill:
         assert count == 0
         assert conn.rollbacks >= 1
         failure_inserts = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "INSERT INTO dispatcher.failures" in e[0]
         ]
         assert len(failure_inserts) == 1
@@ -400,9 +398,7 @@ class TestConsumeCommands:
     def test_consume_commands_marks_consumed_after_handler_success(self) -> None:
         """consumed_at is set in the same transaction as the handler's work."""
         d, conn, handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [
-            [_command_row(1, "stop")]
-        ]
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "stop")]]
 
         count = d._consume_commands()
 
@@ -439,7 +435,8 @@ class TestConsumeCommands:
         assert conn.rollbacks >= 1
         # No consumed_at UPDATE.
         consumed_updates = [
-            e for e in conn.cursor_instance.executed
+            e
+            for e in conn.cursor_instance.executed
             if "SET consumed_at = now()" in e[0]
         ]
         assert len(consumed_updates) == 0
@@ -466,9 +463,11 @@ class TestClaimGateRespectsPausedKey:
     def test_claim_gate_respects_paused_key(self) -> None:
         """When paused=true, orchestration must not fire even if cap > 0."""
         d, conn, handler = _make_daemon_with_capture()
-        # concurrency_cap = 1 (gate would normally proceed).
-        # _is_paused() SELECT returns ("true",) — JSONB string 'true'.
-        conn.cursor_instance.fetch_queue = [(1,), ("true",)]
+        # SELECTs (in scheduler_tick order, cap>0 branch):
+        #   1. concurrency_cap = 1 (gate would normally proceed)
+        #   2. cap_flipped_by = None (overnight CB auto-close #2860; no-op)
+        #   3. _is_paused() = "true" — JSONB string 'true'
+        conn.cursor_instance.fetch_queue = [(1,), None, ("true",)]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not spawn when paused")
@@ -484,8 +483,12 @@ class TestClaimGateRespectsPausedKey:
     def test_claim_gate_allows_spawn_when_not_paused(self) -> None:
         """When paused key is absent/false, normal spawn proceeds."""
         d, conn, _handler = _make_daemon_with_capture()
-        # concurrency_cap = 1; paused row absent (None); no active agent.
-        conn.cursor_instance.fetch_queue = [(1,), None, None]
+        # SELECTs (in scheduler_tick order, cap>0 branch):
+        #   1. concurrency_cap = 1
+        #   2. cap_flipped_by = None (overnight CB auto-close #2860; no-op)
+        #   3. _is_paused() = None (absent)
+        #   4. _has_active_agent() COUNT = None (no active agent)
+        conn.cursor_instance.fetch_queue = [(1,), None, None, None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=False,

@@ -91,6 +91,8 @@ function makeEmptyState() {
         },
       ],
       spawnFrozenUntil: null,
+      circuitBreakerOpen: false,
+      capFlippedBy: null,
     },
   };
 }
@@ -146,6 +148,8 @@ function makeActiveState() {
         },
       ],
       spawnFrozenUntil: null,
+      circuitBreakerOpen: false,
+      capFlippedBy: null,
     },
   };
 }
