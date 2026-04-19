@@ -866,6 +866,17 @@ class LeaseError(RuntimeError):
     """Another daemon is holding the active-heartbeat lease."""
 
 
+class CommandError(RuntimeError):
+    """A command handler received an invalid or inapplicable payload.
+
+    Raised by ``_handle_*`` methods when the command cannot be applied
+    (e.g. ``retry`` issued for an already-running agent, ``force_kill``
+    missing an ``agentId``). The caller catches this, rolls back, and
+    records a ``dispatcher.failures`` row so the command is left
+    unconsumed for visibility rather than silently discarded.
+    """
+
+
 # --------------------------------------------------------------------------
 # Daemon
 # --------------------------------------------------------------------------
@@ -880,8 +891,9 @@ class DispatcherDaemon:
           within the heartbeat window.
         * INSERT a ``dispatcher.runs`` row on boot.
         * Run the scheduler loop every ``tick_scheduler_seconds``:
-            - consume unconsumed ``dispatcher.commands`` (no-op handler
-              in shadow mode; commands drain so the queue stays small);
+            - consume unconsumed ``dispatcher.commands`` via
+              :meth:`_consume_commands`; each dispatched to its handler
+              with consumed_at set AFTER the handler (#2801);
             - read ``dispatcher.config.concurrency_cap``;
             - enforce the Phase 2 spawn-safety guard (warn if
               ``concurrency_cap != 0``);
@@ -1168,7 +1180,11 @@ class DispatcherDaemon:
         """Run one scheduler tick. Phase 2 = queue scan + spawn-safety guard.
 
         Steps (in order; DB work is one transaction per step for isolation):
-            1. Consume any pending ``dispatcher.commands`` (no-op handler).
+            1. Consume any pending ``dispatcher.commands`` via
+               :meth:`_consume_commands`. Each command is dispatched to
+               its handler; consumed_at is set AFTER the handler so a
+               crash leaves the command unconsumed for next-tick retry
+               (#2801).
             2. Read ``dispatcher.config.concurrency_cap``, record the
                observation, and SET (cap==0) or CLEAR (cap>0) the
                ``_pause_requested`` killswitch event for the worker thread
@@ -1210,20 +1226,14 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before ticks"
 
-        commands_consumed = 0
+        # 1. Consume any pending commands. Each command is dispatched to
+        # its handler; consumed_at is set AFTER the handler returns so
+        # a mid-handler crash leaves the command unconsumed for retry.
+        commands_consumed = self._consume_commands()
+
         concurrency_cap: int | None = None
 
         with self._conn.cursor() as cur:
-            # 1. Consume any pending commands. Phase 2 = no-op handler;
-            # mark consumed anyway so the queue drains and does not fill
-            # up during shadow mode.
-            cur.execute(
-                "UPDATE dispatcher.commands "
-                "SET consumed_at = now() "
-                "WHERE consumed_at IS NULL",
-            )
-            commands_consumed = cur.rowcount or 0
-
             # 2. Read concurrency_cap (for log observability + spawn guard).
             cur.execute(
                 "SELECT value FROM dispatcher.config WHERE key = %s",
@@ -1349,6 +1359,7 @@ class DispatcherDaemon:
         elif (
             concurrency_cap is not None
             and concurrency_cap > 0
+            and not self._is_paused()
             and not self._has_active_agent()
         ):
             try:
@@ -1396,6 +1407,372 @@ class DispatcherDaemon:
             "orchestration_thread_alive": 1 if orchestration_thread_alive else 0,
             "pause_requested": 1 if pause_requested else 0,
         }
+
+    # ── command consumption (#2801) ────────────────────────────────────
+
+    def _consume_commands(self) -> int:
+        """Drain unconsumed ``dispatcher.commands`` rows.
+
+        SELECTs all rows with ``consumed_at IS NULL`` ordered by
+        ``issued_at ASC``, dispatches each to its per-command handler,
+        and marks ``consumed_at = now()`` AFTER the handler returns so
+        that a mid-handler exception leaves the row unconsumed for
+        next-tick retry.
+
+        Handler exceptions are caught per-row: the transaction is
+        rolled back and a ``dispatcher.failures`` row with
+        ``category='handler_error'`` is inserted (best-effort) before
+        continuing to the next command.
+
+        Returns the number of commands successfully consumed.
+        """
+        assert self._conn is not None, "connect() must run before ticks"
+
+        _HANDLERS = {
+            "start": self._handle_start,
+            "stop": self._handle_stop,
+            "drain": self._handle_drain,
+            "pause": self._handle_pause,
+            "resume": self._handle_resume,
+            "retry": self._handle_retry,
+            "force_kill": self._handle_force_kill,
+        }
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT command_id, command, payload "
+                    "FROM dispatcher.commands "
+                    "WHERE consumed_at IS NULL "
+                    "ORDER BY issued_at ASC",
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.commands_scan_failed",
+                extra={
+                    "event": "commands_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return 0
+
+        consumed = 0
+        for row in rows:
+            command_id = int(row[0])
+            command = str(row[1])
+            raw_payload = row[2]
+            payload: dict[str, Any] = (
+                raw_payload if isinstance(raw_payload, dict) else {}
+            )
+
+            handler = _HANDLERS.get(command)
+            try:
+                if handler is None:
+                    raise CommandError(
+                        f"unknown command {command!r} — no handler registered"
+                    )
+                with self._conn.cursor() as cur:
+                    handler(cur, payload)
+                    cur.execute(
+                        "UPDATE dispatcher.commands "
+                        "SET consumed_at = now() "
+                        "WHERE command_id = %s",
+                        (command_id,),
+                    )
+                self._conn.commit()
+                self._log.info(
+                    "daemon.command_consumed",
+                    extra={
+                        "event": "command_consumed",
+                        "run_id": self._run_id,
+                        "command_id": command_id,
+                        "command": command,
+                    },
+                )
+                consumed += 1
+            except Exception as exc:
+                self._log.exception(
+                    "daemon.command_handler_failed",
+                    extra={
+                        "event": "command_handler_failed",
+                        "run_id": self._run_id,
+                        "command_id": command_id,
+                        "command": command,
+                        "detail": str(exc),
+                    },
+                )
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover — best-effort
+                    pass
+                # Record failure row so operator can see it.
+                category = (
+                    "invalid_command"
+                    if isinstance(exc, CommandError)
+                    else "handler_error"
+                )
+                self._write_failure(
+                    agent_id=None,
+                    category=category,
+                    detected_by="scheduler",
+                    details={
+                        "command_id": command_id,
+                        "command": command,
+                        "detail": str(exc),
+                    },
+                )
+        return consumed
+
+    def _handle_start(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``start`` command — flip ``concurrency_cap`` from 0 to 1.
+
+        Only applies when the current value is 0 (the killswitch state);
+        if the cap is already > 0 this is a safe no-op (rowcount == 0).
+        """
+        cur.execute(
+            "UPDATE dispatcher.config "
+            "SET value = '1', updated_at = now(), updated_by = 'daemon' "
+            "WHERE key = 'concurrency_cap' AND value::int = 0",
+        )
+        self._log.info(
+            "daemon.command_start_applied",
+            extra={
+                "event": "command_start_applied",
+                "run_id": self._run_id,
+                "rows_updated": cur.rowcount,
+            },
+        )
+
+    def _handle_stop(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``stop`` command — set ``concurrency_cap`` to 0 (killswitch)."""
+        cur.execute(
+            "UPDATE dispatcher.config "
+            "SET value = '0', updated_at = now(), updated_by = 'daemon' "
+            "WHERE key = 'concurrency_cap'",
+        )
+        self._log.info(
+            "daemon.command_stop_applied",
+            extra={
+                "event": "command_stop_applied",
+                "run_id": self._run_id,
+                "rows_updated": cur.rowcount,
+            },
+        )
+
+    def _handle_drain(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``drain`` command — same SQL as stop, distinct audit intent."""
+        cur.execute(
+            "UPDATE dispatcher.config "
+            "SET value = '0', updated_at = now(), updated_by = 'daemon' "
+            "WHERE key = 'concurrency_cap'",
+        )
+        self._log.info(
+            "daemon.command_drain_applied",
+            extra={
+                "event": "command_drain_applied",
+                "run_id": self._run_id,
+                "rows_updated": cur.rowcount,
+            },
+        )
+
+    def _handle_pause(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``pause`` command — UPSERT ``paused=true`` in config.
+
+        Does not change ``concurrency_cap``; the claim gate checks both
+        ``paused`` and ``concurrency_cap > 0``.
+        """
+        cur.execute(
+            "INSERT INTO dispatcher.config (key, value, updated_at, updated_by) "
+            "VALUES ('paused', 'true', now(), 'daemon') "
+            "ON CONFLICT (key) DO UPDATE "
+            "    SET value = 'true', updated_at = now(), updated_by = 'daemon'",
+        )
+        self._log.info(
+            "daemon.command_pause_applied",
+            extra={
+                "event": "command_pause_applied",
+                "run_id": self._run_id,
+            },
+        )
+
+    def _handle_resume(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``resume`` command — UPSERT ``paused=false`` in config."""
+        cur.execute(
+            "INSERT INTO dispatcher.config (key, value, updated_at, updated_by) "
+            "VALUES ('paused', 'false', now(), 'daemon') "
+            "ON CONFLICT (key) DO UPDATE "
+            "    SET value = 'false', updated_at = now(), updated_by = 'daemon'",
+        )
+        self._log.info(
+            "daemon.command_resume_applied",
+            extra={
+                "event": "command_resume_applied",
+                "run_id": self._run_id,
+            },
+        )
+
+    def _handle_retry(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``retry`` command — create a retry marker for a failed agent.
+
+        Requires ``payload['agentId']``. Verifies the agent exists with
+        ``status='failed'``; raises ``CommandError`` for any other status
+        (including already-running, already-retrying, or non-existent).
+        Flips the agent to ``status='retrying'`` and inserts a
+        ``dispatcher.retry_markers`` row so ``_process_retry_markers``
+        picks it up on the next supervisor tick.
+        """
+        agent_id = payload.get("agentId")
+        if not agent_id:
+            raise CommandError("retry command missing required payload.agentId")
+
+        cur.execute(
+            "SELECT status, retries_used FROM dispatcher.agents "
+            "WHERE agent_id = %s",
+            (agent_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise CommandError(
+                f"retry: agent {agent_id!r} not found in dispatcher.agents"
+            )
+        status = str(row[0])
+        retries_used = int(row[1]) if row[1] is not None else 0
+        if status != "failed":
+            raise CommandError(
+                f"retry: agent {agent_id!r} has status {status!r}; "
+                "can only retry agents with status='failed'"
+            )
+
+        cur.execute(
+            "UPDATE dispatcher.agents "
+            "SET status = 'retrying' "
+            "WHERE agent_id = %s",
+            (agent_id,),
+        )
+        cur.execute(
+            "INSERT INTO dispatcher.retry_markers "
+            "    (agent_id, reason, attempt, retry_after_ts) "
+            "VALUES (%s, 'operator_retry', %s, now())",
+            (agent_id, retries_used + 1),
+        )
+        self._log.info(
+            "daemon.command_retry_applied",
+            extra={
+                "event": "command_retry_applied",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "attempt": retries_used + 1,
+            },
+        )
+
+    def _handle_force_kill(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``force_kill`` command — crash a running agent immediately.
+
+        Requires ``payload['agentId']``. Updates the agent row to
+        ``status='crashed'``, sets ``ended_at = now()``. If the agent's
+        ``pid`` is known and ``os.kill(pid, SIGKILL)`` succeeds on this
+        host, the process is killed; a dead or foreign-host pid is not
+        an error.
+        """
+        agent_id = payload.get("agentId")
+        if not agent_id:
+            raise CommandError("force_kill command missing required payload.agentId")
+
+        cur.execute(
+            "SELECT pid FROM dispatcher.agents WHERE agent_id = %s",
+            (agent_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise CommandError(
+                f"force_kill: agent {agent_id!r} not found in dispatcher.agents"
+            )
+        pid = int(row[0]) if row[0] is not None else None
+
+        cur.execute(
+            "UPDATE dispatcher.agents "
+            "SET status = 'crashed', ended_at = now() "
+            "WHERE agent_id = %s",
+            (agent_id,),
+        )
+
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                self._log.info(
+                    "daemon.force_kill_signal_sent",
+                    extra={
+                        "event": "force_kill_signal_sent",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pid": pid,
+                    },
+                )
+            except ProcessLookupError:
+                # Process already gone — not an error.
+                pass
+            except PermissionError:
+                # Foreign host pid — not an error either.
+                pass
+
+        self._log.info(
+            "daemon.command_force_kill_applied",
+            extra={
+                "event": "command_force_kill_applied",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pid": pid,
+            },
+        )
+
+    def _is_paused(self) -> bool:
+        """Read ``dispatcher.config.paused`` and coerce to bool.
+
+        Returns ``True`` when the ``paused`` key exists and its value
+        is the JSON string ``'true'`` or boolean ``true``. Missing key,
+        ``null``, ``'false'``, or any other value is treated as
+        ``False`` so an absent row never blocks claims.
+
+        Called from the claim gate in :meth:`scheduler_tick` before
+        spawning an orchestration thread.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("paused",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return False
+
+        if row is None or row[0] is None:
+            return False
+        raw = row[0]
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, bool):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+            # Handle bare strings 'true'/'false' without JSON quotes.
+            return raw.lower() == "true"
+        return False
 
     # ── orchestration worker thread (#2847) ────────────────────────────
 

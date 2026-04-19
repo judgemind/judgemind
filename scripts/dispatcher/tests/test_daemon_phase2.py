@@ -51,6 +51,7 @@ class _FakeCursor:
     def __init__(self) -> None:
         self.executed: list[tuple[str, Any]] = []
         self.fetch_queue: list[Any] = []
+        self.fetchall_queue: list[list[Any]] = []
         self.rowcount = 0
 
     def __enter__(self) -> _FakeCursor:
@@ -66,6 +67,11 @@ class _FakeCursor:
         if not self.fetch_queue:
             return None
         return self.fetch_queue.pop(0)
+
+    def fetchall(self) -> list[Any]:
+        if not self.fetchall_queue:
+            return []
+        return self.fetchall_queue.pop(0)
 
 
 class _FakeConnection:

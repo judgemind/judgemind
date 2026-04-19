@@ -79,6 +79,7 @@ class _FakeCursor:
     def __init__(self) -> None:
         self.executed: list[tuple[str, Any]] = []
         self.fetch_queue: list[Any] = []
+        self.fetchall_queue: list[list[Any]] = []
         self.rowcount = 0
 
     def __enter__(self) -> _FakeCursor:
@@ -94,6 +95,11 @@ class _FakeCursor:
         if not self.fetch_queue:
             return None
         return self.fetch_queue.pop(0)
+
+    def fetchall(self) -> list[Any]:
+        if not self.fetchall_queue:
+            return []
+        return self.fetchall_queue.pop(0)
 
 
 class _FakeConnection:
@@ -250,8 +256,9 @@ class TestSchedulerGate:
 
     def test_claims_when_cap_nonzero_and_no_active_agent(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        # 1) config read returns 1; 2) _has_active_agent SELECT returns None.
-        conn.cursor_instance.fetch_queue = [(1,), None]
+        # 1) config read returns 1; 2) _is_paused SELECT returns None (not paused);
+        # 3) _has_active_agent SELECT returns None (no active agent).
+        conn.cursor_instance.fetch_queue = [(1,), None, None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -262,8 +269,9 @@ class TestSchedulerGate:
 
     def test_does_not_claim_when_active_agent_exists(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        # config=1 then _has_active_agent returns (1,) meaning active row exists.
-        conn.cursor_instance.fetch_queue = [(1,), (1,)]
+        # config=1; _is_paused returns None (not paused); _has_active_agent
+        # returns (1,) meaning active row exists.
+        conn.cursor_instance.fetch_queue = [(1,), None, (1,)]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not be called when agent active")
@@ -283,7 +291,9 @@ class TestSchedulerGate:
         :class:`TestOrchestrationWorkerThread`.
         """
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(1,), None]
+        # config=1; _is_paused returns None (not paused); _has_active_agent
+        # returns None (no active agent) — spawn path fires but throws.
+        conn.cursor_instance.fetch_queue = [(1,), None, None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         # Make the spawn path itself raise — covers the
         # ``orchestration_spawn_failed`` branch in the tick.
