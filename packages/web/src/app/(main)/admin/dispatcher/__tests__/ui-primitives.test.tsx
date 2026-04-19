@@ -11,6 +11,21 @@ describe('IssueLink', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
     expect(link.textContent).toBe('#2805');
   });
+
+  // Regression guard for #2816: `text-accent` in tailwind.config.ts maps
+  // to shadcn's hover-surface gray, not brand amber.  The correct tokens
+  // are `text-brand-accent` (light mode, amber-700) paired with
+  // `dark:text-brand-accent-light` (dark mode, amber-600).  Both must be
+  // present so link chrome is visible on both themes.
+  it('renders with the brand-accent token pair (light + dark)', () => {
+    render(<IssueLink number={2816} />);
+    const link = screen.getByTestId('issue-link-2816');
+    expect(link.className).toContain('text-brand-accent');
+    expect(link.className).toContain('dark:text-brand-accent-light');
+    // Bare `text-accent` must not appear — it would trigger the #2816
+    // readability regression where links render as low-contrast gray.
+    expect(link.className).not.toMatch(/(^|\s)text-accent(\s|$)/);
+  });
 });
 
 describe('PRLink', () => {
@@ -19,6 +34,15 @@ describe('PRLink', () => {
     const link = screen.getByTestId('pr-link-2740');
     expect(link).toHaveAttribute('href', 'https://github.com/judgemind/judgemind/pull/2740');
     expect(link.textContent).toBe('PR #2740');
+  });
+
+  // Regression guard for #2816 — see note on IssueLink above.
+  it('renders with the brand-accent token pair (light + dark)', () => {
+    render(<PRLink number={2811} />);
+    const link = screen.getByTestId('pr-link-2811');
+    expect(link.className).toContain('text-brand-accent');
+    expect(link.className).toContain('dark:text-brand-accent-light');
+    expect(link.className).not.toMatch(/(^|\s)text-accent(\s|$)/);
   });
 });
 

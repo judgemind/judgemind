@@ -327,7 +327,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
               href="https://github.com/judgemind/judgemind/issues/2801"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-accent underline-offset-2 hover:underline"
+              className="text-brand-accent dark:text-brand-accent-light underline-offset-2 hover:underline"
             >
               #2801
             </a>

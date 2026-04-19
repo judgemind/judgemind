@@ -13,6 +13,13 @@
 
 const REPO = 'judgemind/judgemind';
 
+// Brand amber token for hot links. Note: `text-accent` is shadcn's
+// hover-surface gray, NOT the brand amber — see docs/BRAND.md §Tailwind
+// Token Mapping and issue #2816. The canonical pattern lives in
+// `packages/web/src/components/Wordmark.tsx`.
+const BRAND_LINK_CLASSES =
+  'font-mono text-brand-accent dark:text-brand-accent-light underline-offset-2 hover:underline';
+
 /** Hot link to a GitHub issue. Opens in a new tab. */
 export function IssueLink({ number, className }: { number: number; className?: string }) {
   const href = `https://github.com/${REPO}/issues/${number}`;
@@ -21,7 +28,7 @@ export function IssueLink({ number, className }: { number: number; className?: s
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className={`font-mono text-accent underline-offset-2 hover:underline ${className ?? ''}`}
+      className={`${BRAND_LINK_CLASSES} ${className ?? ''}`}
       data-testid={`issue-link-${number}`}
     >
       #{number}
@@ -37,7 +44,7 @@ export function PRLink({ number, className }: { number: number; className?: stri
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className={`font-mono text-accent underline-offset-2 hover:underline ${className ?? ''}`}
+      className={`${BRAND_LINK_CLASSES} ${className ?? ''}`}
       data-testid={`pr-link-${number}`}
     >
       PR #{number}

@@ -88,7 +88,7 @@ function ActiveAgentRow({
             href={logsHref}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-accent underline-offset-2 hover:underline"
+            className="text-brand-accent dark:text-brand-accent-light underline-offset-2 hover:underline"
           >
             Logs &rarr;
           </a>
