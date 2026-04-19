@@ -297,6 +297,14 @@ FAILURE_CATEGORY_SUBPROCESS_CRASH = "subprocess_crash"
 FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT = "subprocess_turn_limit"
 FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL = "subprocess_auth_fail"
 
+#: Tier-3 failure category from spec §8 (``ci_red_after_retries``).
+#: Written by 3B's fix-CI exhaustion path when ``retries_used >=
+#: FIX_CI_MAX_RETRIES`` before the agent is marked failed. 3D's
+#: diagnoser picks it up on the next supervisor tick for immediate
+#: (tier-3) diagnosis — there is no mechanical retry that reliably
+#: fixes "the CI-fixing skill couldn't fix CI three times in a row".
+FAILURE_CATEGORY_CI_RED_AFTER_RETRIES = "ci_red_after_retries"
+
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
 #: ``subprocess_auth_fail`` (halt — no retry) are intentionally
@@ -330,6 +338,98 @@ _SUBPROCESS_STDERR_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"401\s+Unauthorized", FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL),
     (r"Reached max turns", FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT),
 )
+
+
+# --------------------------------------------------------------------------
+# Phase 3D — diagnoser (issue #2795, spec §8 "Diagnosis Step")
+# --------------------------------------------------------------------------
+
+#: Tier-2 categories that trigger the diagnoser ONLY after a tier-1
+#: mechanical retry has already fired once and the same failure category
+#: recurs for the same agent within a recent window. Matches spec §8:
+#: "only after the mechanical fix has been tried once and the failure
+#: recurs". ``stuck_timeout``, ``gh_rate_exhausted``, ``subprocess_crash``
+#: are tier-1 retry categories whose **recurrence** escalates to tier 2;
+#: ``subprocess_turn_limit`` is explicitly tier 2 on first occurrence
+#: (see §8 table — "Retry once with narrower scope hint; second trip
+#: escalates" — our policy is to diagnose on first occurrence so the
+#: diagnoser can choose retry_with_hint vs escalate).
+TIER_2_RECURRENCE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        FAILURE_CATEGORY_STUCK_TIMEOUT,
+        FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
+        FAILURE_CATEGORY_SUBPROCESS_CRASH,
+    }
+)
+
+#: Tier-2 categories that diagnose on **first** occurrence (no mechanical
+#: retry runs). Spec §8 table classifies ``subprocess_turn_limit`` as
+#: tier 2 with mechanical hint = "retry once with narrower scope"; we
+#: delegate that retry-vs-escalate choice to the diagnoser immediately
+#: rather than hard-coding one mechanical retry.
+TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT,
+    }
+)
+
+#: Tier-3 categories that diagnose on first occurrence (spec §8). Today
+#: only ``ci_red_after_retries`` qualifies — the 3B fix-CI loop has
+#: already burned its 3 mechanical retries, so there is no reliable
+#: mechanical remedy left.
+TIER_3_CATEGORIES: frozenset[str] = frozenset(
+    {
+        FAILURE_CATEGORY_CI_RED_AFTER_RETRIES,
+    }
+)
+
+#: Window inside which a recurring tier-2 failure for the same agent +
+#: category triggers the diagnoser. 24 h is generous enough to catch
+#: same-day pattern recurrences (e.g. a flaky external API that breaks
+#: again in the afternoon) while not re-triggering on unrelated failures
+#: weeks later.
+TIER_2_RECURRENCE_WINDOW_SECONDS = 24 * 60 * 60
+
+#: Hard wall-clock timeout for the ``/diagnose-failure`` subprocess
+#: (``claude -p``). Matches spec §8 "5-min hard wall-clock timeout".
+#: Timeout, non-zero exit, or malformed recommendation JSON → fall
+#: back to fixed mechanical escalation policy (spec §8 "Budget &
+#: safety").
+DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS = 5 * 60
+
+#: ``--max-turns`` value for the diagnoser. 30 is generous for a
+#: read-only reasoning task — the skill reads a JSONB context, maybe
+#: fetches an issue/PR/CI log, and writes a recommendation. Matches
+#: the frontmatter in ``.claude/skills/diagnose-failure/SKILL.md``.
+DIAGNOSER_MAX_TURNS = 30
+
+#: Default model for the diagnoser. Matches
+#: ``dispatcher.config.model_by_phase.diagnose`` seed (``opus``) from
+#: migration 21. The decision is low-frequency but high-impact —
+#: Opus's reasoning headroom is cheap insurance against a wrong
+#: ``close`` / ``reissue``.
+DIAGNOSER_MODEL = "opus"
+
+#: Valid ``action`` strings a diagnoser recommendation may set. The
+#: daemon's deterministic consumer switches on these; any other value
+#: falls through to ``escalate`` as a safe default (logged as
+#: ``daemon.diagnosis_action_unknown``).
+DIAGNOSER_ACTIONS: frozenset[str] = frozenset(
+    {"retry", "retry_with_hint", "reissue", "escalate", "close"}
+)
+
+#: Circuit-breaker bounds (spec §8 "Budget & safety"). When the
+#: fallback rate (diagnoses with ``status='failed'``) over the last 24 h
+#: exceeds the configured threshold AND at least this many diagnoses
+#: have run, the daemon flips ``dispatcher.config.diagnoser_enabled``
+#: to ``false``. Matches the spec's "≥5 diagnoses" floor so a single
+#: early failure cannot trip the breaker.
+CIRCUIT_BREAKER_MIN_DIAGNOSES = 5
+CIRCUIT_BREAKER_WINDOW_SECONDS = 24 * 60 * 60
+
+#: Default fallback-rate threshold when the ``dispatcher.config`` row
+#: is missing or malformed. Matches the migration-26 seed ``0.30``.
+DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 0.30
 
 
 # --------------------------------------------------------------------------
@@ -3148,6 +3248,23 @@ class DispatcherDaemon:
                     "retries_used": retries_used,
                 },
             )
+            # Phase 3D (#2795): write a tier-3 `ci_red_after_retries`
+            # failure row BEFORE flipping the agent to 'failed' so the
+            # supervisor tick's tier-3 detector can pick it up and
+            # spawn the diagnoser. The failure row carries just enough
+            # context for the diagnoser's context-bundle assembly to
+            # find the PR + CI log URL.
+            self._write_failure(
+                agent_id=agent_id,
+                category=FAILURE_CATEGORY_CI_RED_AFTER_RETRIES,
+                detected_by="scheduler",
+                details={
+                    "phase": "awaiting_ci",
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "retries_used": retries_used,
+                },
+            )
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_ci", exit_code=None
             )
@@ -4717,6 +4834,1251 @@ class DispatcherDaemon:
                     pass
         return processed
 
+    # ── Phase 3D (#2795): tier-2/3 diagnoser ───────────────────────────
+
+    def _diagnoser_enabled(self) -> bool:
+        """Read ``dispatcher.config.diagnoser_enabled`` and coerce to bool.
+
+        Defaults to ``True`` when the config row is missing or malformed.
+        The circuit breaker (:meth:`_check_diagnoser_circuit_breaker`)
+        flips this to ``false`` via UPDATE when the 24h fallback rate
+        exceeds :meth:`_diagnoser_fallback_threshold`.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("diagnoser_enabled",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return True
+
+        if row is None or row[0] is None:
+            return True
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return True
+        if isinstance(raw, bool):
+            return raw
+        # JSON ``true``/``false`` → Python bool; anything else (numbers,
+        # strings, dicts) is malformed — default to enabled.
+        return True
+
+    def _diagnoser_fallback_threshold(self) -> float:
+        """Read ``diagnoser_fallback_rate_threshold`` from ``dispatcher.config``.
+
+        Falls back to :data:`DEFAULT_CIRCUIT_BREAKER_THRESHOLD` (0.30)
+        on missing row, malformed JSON, or out-of-range value
+        (<0 or >1). The circuit breaker compares the 24h fallback
+        ratio against this and trips when ratio > threshold AND the
+        minimum diagnosis count is reached.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("diagnoser_fallback_rate_threshold",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+
+        if row is None or row[0] is None:
+            return DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+        try:
+            threshold = float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+        if threshold < 0.0 or threshold > 1.0:
+            return DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+        return threshold
+
+    def _check_diagnoser_circuit_breaker(self) -> bool:
+        """Trip the circuit breaker if the 24h fallback rate is too high.
+
+        Spec §8 "Budget & safety": when >30% of diagnoses in the last
+        24 h fell back (timeout, malformed JSON, subprocess crash) AND
+        at least :data:`CIRCUIT_BREAKER_MIN_DIAGNOSES` diagnoses have
+        run in the same window, flip
+        ``dispatcher.config.diagnoser_enabled`` to ``false`` and log a
+        ``daemon.diagnoser_circuit_breaker_tripped`` event. Operator
+        manually re-enables.
+
+        Returns True if the breaker was tripped this call, False
+        otherwise. Called once per supervisor tick (cheap — one COUNT
+        aggregation over a narrow time range).
+        """
+        assert self._conn is not None, "connect() must run before breaker check"
+
+        threshold = self._diagnoser_fallback_threshold()
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT "
+                    "    COUNT(*) FILTER (WHERE status = 'failed'), "
+                    "    COUNT(*) "
+                    "FROM dispatcher.diagnoses "
+                    "WHERE started_at > now() - make_interval(secs => %s)",
+                    (CIRCUIT_BREAKER_WINDOW_SECONDS,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_scan_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        if row is None:
+            return False
+        failed_n = int(row[0] or 0)
+        total_n = int(row[1] or 0)
+
+        if total_n < CIRCUIT_BREAKER_MIN_DIAGNOSES:
+            # Not enough samples to judge — noisy early runs must not
+            # trip the breaker. Spec §8 gates on both "rate > threshold"
+            # AND "total diagnoses ≥ 5".
+            return False
+
+        fallback_rate = failed_n / total_n if total_n else 0.0
+        if fallback_rate <= threshold:
+            return False
+
+        # Trip the breaker. Write the config update and log.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = 'false', "
+                    "    updated_at = now(), "
+                    "    updated_by = 'diagnoser_circuit_breaker' "
+                    "WHERE key = %s",
+                    ("diagnoser_enabled",),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_flip_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_flip_failed",
+                    "run_id": self._run_id,
+                    "fallback_rate": round(fallback_rate, 3),
+                    "total_diagnoses": total_n,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        self._log.warning(
+            "daemon.diagnoser_circuit_breaker_tripped",
+            extra={
+                "event": "diagnoser_circuit_breaker_tripped",
+                "run_id": self._run_id,
+                "fallback_rate": round(fallback_rate, 3),
+                "threshold": threshold,
+                "total_diagnoses_24h": total_n,
+                "failed_diagnoses_24h": failed_n,
+                "min_diagnoses": CIRCUIT_BREAKER_MIN_DIAGNOSES,
+            },
+        )
+        return True
+
+    def _find_diagnoser_candidates(self) -> list[dict[str, Any]]:
+        """Find tier-2/3 failures that need a diagnosis this tick.
+
+        A "candidate" is a ``dispatcher.failures`` row that:
+
+        * Has not yet triggered a diagnosis (no ``dispatcher.diagnoses``
+          row with matching ``failure_id``).
+        * Is in a tier-2 recurrence category with a prior failure of
+          the same category for the same agent within the recurrence
+          window, OR in :data:`TIER_2_FIRST_OCCURRENCE_CATEGORIES`,
+          OR in :data:`TIER_3_CATEGORIES`.
+
+        Returns a list of ``{failure_id, agent_id, category, tier,
+        issue_number, details, failure_ts}`` dicts, newest first.
+        Caller spawns one diagnoser subprocess per candidate.
+        """
+        assert self._conn is not None, "connect() must run before candidate scan"
+
+        all_trigger_categories = list(
+            TIER_2_RECURRENCE_CATEGORIES
+            | TIER_2_FIRST_OCCURRENCE_CATEGORIES
+            | TIER_3_CATEGORIES
+        )
+
+        candidates: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT f.failure_id, f.agent_id, f.category, f.details, f.ts "
+                    "FROM dispatcher.failures f "
+                    "LEFT JOIN dispatcher.diagnoses d "
+                    "    ON d.failure_id = f.failure_id "
+                    "WHERE d.failure_id IS NULL "
+                    "  AND f.agent_id IS NOT NULL "
+                    "  AND f.category = ANY(%s) "
+                    "  AND f.ts > now() - make_interval(secs => %s) "
+                    "ORDER BY f.ts DESC "
+                    "LIMIT 20",
+                    (all_trigger_categories, TIER_2_RECURRENCE_WINDOW_SECONDS),
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_candidate_scan_failed",
+                extra={
+                    "event": "diagnoser_candidate_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return []
+
+        for row in rows:
+            failure_id = int(row[0])
+            agent_id = str(row[1]) if row[1] is not None else None
+            category = str(row[2])
+            details = row[3] or {}
+            failure_ts = row[4]
+            if agent_id is None:
+                # Daemon-level failures (``gh_rate_exhausted`` with
+                # ``agent_id=NULL``) are never diagnosed — no agent to
+                # recover.
+                continue
+            # Parse details if it's a JSON string.
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except json.JSONDecodeError:
+                    details = {}
+
+            issue_number: int | None = None
+            if isinstance(details, dict):
+                issue_number = details.get("issue_number")
+                if issue_number is not None:
+                    try:
+                        issue_number = int(issue_number)
+                    except (TypeError, ValueError):
+                        issue_number = None
+
+            # Determine tier. First-occurrence and tier-3 categories
+            # diagnose immediately. Tier-2 recurrence categories
+            # diagnose ONLY if a prior failure of the same category
+            # exists for the same agent within the recurrence window.
+            tier: int
+            if category in TIER_3_CATEGORIES:
+                tier = 3
+            elif category in TIER_2_FIRST_OCCURRENCE_CATEGORIES:
+                tier = 2
+            elif category in TIER_2_RECURRENCE_CATEGORIES:
+                if not self._has_prior_same_category_failure(
+                    agent_id=agent_id,
+                    category=category,
+                    before_failure_id=failure_id,
+                ):
+                    # First occurrence of a tier-1 mechanical category —
+                    # the mechanical retry path handles it, not the
+                    # diagnoser.
+                    continue
+                tier = 2
+            else:
+                # Defensive: category was in the SQL filter but doesn't
+                # match any known bucket.
+                continue
+
+            candidates.append(
+                {
+                    "failure_id": failure_id,
+                    "agent_id": agent_id,
+                    "category": category,
+                    "tier": tier,
+                    "issue_number": issue_number,
+                    "details": details if isinstance(details, dict) else {},
+                    "failure_ts": failure_ts,
+                }
+            )
+        return candidates
+
+    def _has_prior_same_category_failure(
+        self, *, agent_id: str, category: str, before_failure_id: int
+    ) -> bool:
+        """True if the agent has a prior failure of ``category`` within the window.
+
+        Used by :meth:`_find_diagnoser_candidates` to gate tier-2
+        recurrence categories — the diagnoser only fires on the second
+        failure in the pair, not the first.
+        """
+        assert self._conn is not None, "connect() must run before recurrence check"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM dispatcher.failures "
+                    "WHERE agent_id = %s "
+                    "  AND category = %s "
+                    "  AND failure_id < %s "
+                    "  AND ts > now() - make_interval(secs => %s) "
+                    "LIMIT 1",
+                    (
+                        agent_id,
+                        category,
+                        before_failure_id,
+                        TIER_2_RECURRENCE_WINDOW_SECONDS,
+                    ),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+        return row is not None
+
+    def _build_diagnoser_context(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        """Assemble the JSONB context bundle passed to ``/diagnose-failure``.
+
+        The skill reads this via
+        ``SELECT context FROM dispatcher.diagnoses`` after the daemon
+        INSERTs the pending row. Shape matches the input contract in
+        ``.claude/skills/diagnose-failure/SKILL.md``.
+
+        All sub-queries are individually try/except'd and fall back to
+        empty/null on failure — a stale or missing context is better
+        than no diagnosis. The skill's decision-tree defaults to
+        ``escalate`` on sparse context.
+        """
+        assert self._conn is not None, "connect() must run before context build"
+
+        agent_id = candidate["agent_id"]
+        failure_id = candidate["failure_id"]
+
+        # Fetch the agent row for worktree_path + the failure envelope.
+        agent_row: dict[str, Any] = {}
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT issue_number, worktree_path, pr_number "
+                    "FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+            if row is not None:
+                agent_row = {
+                    "issue_number": int(row[0]) if row[0] is not None else None,
+                    "worktree_path": str(row[1]) if row[1] is not None else "",
+                    "pr_number": int(row[2]) if row[2] is not None else None,
+                }
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
+        issue_number = candidate.get("issue_number") or agent_row.get("issue_number")
+
+        # Recent phase transitions — last ~10.
+        phase_transitions: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT phase, ts FROM dispatcher.phase_transitions "
+                    "WHERE agent_id = %s "
+                    "ORDER BY ts DESC LIMIT 10",
+                    (agent_id,),
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+            for r in rows:
+                phase_transitions.append(
+                    {
+                        "phase": str(r[0]) if r[0] is not None else None,
+                        "ts": r[1].isoformat() if r[1] is not None else None,
+                    }
+                )
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
+        # Prior failures on the same issue — across all agents.
+        prior_failures: list[dict[str, Any]] = []
+        if issue_number is not None:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT f.failure_id, f.category, f.ts, f.details "
+                        "FROM dispatcher.failures f "
+                        "JOIN dispatcher.agents a "
+                        "    ON a.agent_id = f.agent_id "
+                        "WHERE a.issue_number = %s "
+                        "  AND f.failure_id <> %s "
+                        "ORDER BY f.ts DESC LIMIT 20",
+                        (issue_number, failure_id),
+                    )
+                    rows = cur.fetchall()
+                self._conn.commit()
+                for r in rows:
+                    prior_failures.append(
+                        {
+                            "failure_id": int(r[0]),
+                            "category": str(r[1]),
+                            "ts": r[2].isoformat() if r[2] is not None else None,
+                            "details": r[3] if isinstance(r[3], dict) else {},
+                        }
+                    )
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+
+        # ralph-done.txt content if present.
+        ralph_done_content: str | None = None
+        worktree_path = agent_row.get("worktree_path") or ""
+        if worktree_path:
+            ralph_done_path = Path(worktree_path) / "tmp" / "ralph" / "ralph-done.txt"
+            try:
+                if ralph_done_path.exists():
+                    ralph_done_content = ralph_done_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+            except Exception:  # pragma: no cover — best-effort read
+                ralph_done_content = None
+
+        # Issue title + body — fetch lazily via gh so the daemon does
+        # not duplicate the ``_fetch_issue_bundle`` MCP path. The skill
+        # can always re-fetch if the context is stale.
+        issue_title = ""
+        issue_body = ""
+        if issue_number is not None:
+            try:
+                result = subprocess.run(
+                    [
+                        "gh",
+                        "issue",
+                        "view",
+                        str(issue_number),
+                        "--repo",
+                        self._cfg.github_repo,
+                        "--json",
+                        "title,body",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout:
+                    payload = json.loads(result.stdout)
+                    issue_title = str(payload.get("title") or "")
+                    issue_body = str(payload.get("body") or "")
+            except (
+                FileNotFoundError,
+                subprocess.TimeoutExpired,
+                json.JSONDecodeError,
+            ):
+                pass
+
+        # prior_mechanical_fix — tier 2 only, describes what was tried.
+        prior_mechanical_fix: dict[str, Any] | None = None
+        if (
+            candidate["tier"] == 2
+            and candidate["category"] in TIER_2_RECURRENCE_CATEGORIES
+        ):
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT attempt, retry_after_ts, resolved_at "
+                        "FROM dispatcher.retry_markers "
+                        "WHERE agent_id = %s AND reason = %s "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (agent_id, candidate["category"]),
+                    )
+                    r = cur.fetchone()
+                self._conn.commit()
+                if r is not None:
+                    prior_mechanical_fix = {
+                        "category": candidate["category"],
+                        "attempt": int(r[0]) if r[0] is not None else None,
+                        "retry_after_ts": r[1].isoformat()
+                        if r[1] is not None
+                        else None,
+                        "outcome": "resolved" if r[2] is not None else "pending",
+                    }
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+
+        details = candidate.get("details") or {}
+        pr_number = agent_row.get("pr_number")
+        if pr_number is None and isinstance(details, dict):
+            pr_number = details.get("pr_number")
+        pr_url: str | None = None
+        if pr_number is not None:
+            pr_url = f"https://github.com/{self._cfg.github_repo}/pull/{pr_number}"
+        ci_log_url: str | None = None
+        if isinstance(details, dict):
+            ci_log_url = details.get("ci_log_url") or None
+
+        return {
+            "agent_id": agent_id,
+            "failure_id": failure_id,
+            "failure_category": candidate["category"],
+            "tier": candidate["tier"],
+            "issue_number": issue_number,
+            "issue_title": issue_title,
+            "issue_body": issue_body,
+            "recent_phase_transitions": phase_transitions,
+            "prior_failures": prior_failures,
+            "ralph_done_content": ralph_done_content,
+            "pr_url": pr_url,
+            "pr_number": pr_number,
+            "ci_log_url": ci_log_url,
+            "prior_mechanical_fix": prior_mechanical_fix,
+            "worktree_path": worktree_path,
+        }
+
+    def _insert_pending_diagnosis(
+        self,
+        *,
+        failure_id: int,
+        agent_id: str,
+        context: dict[str, Any],
+    ) -> int | None:
+        """INSERT a ``status='pending'`` row and return the new diagnosis_id.
+
+        Returns None on DB error. The caller falls back to the fixed
+        mechanical escalation policy when this returns None.
+        """
+        assert self._conn is not None, "connect() must run before diagnosis insert"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.diagnoses "
+                    "    (failure_id, agent_id, status, context) "
+                    "VALUES (%s, %s, 'pending', %s) "
+                    "RETURNING diagnosis_id",
+                    (failure_id, agent_id, json.dumps(context, default=str)),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnosis_insert_failed",
+                extra={
+                    "event": "diagnosis_insert_failed",
+                    "run_id": self._run_id,
+                    "failure_id": failure_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None:
+            return None
+        return int(row[0])
+
+    def _mark_diagnosis_failed(self, diagnosis_id: int, reason: str) -> None:
+        """UPDATE diagnosis row to ``status='failed'`` with a reason log event.
+
+        Used by every fallback path (timeout, non-zero exit, malformed
+        recommendation JSON, unknown action). The circuit breaker
+        counts these rows against the fallback threshold.
+        """
+        assert self._conn is not None, "connect() must run before diagnosis update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.diagnoses "
+                    "SET status = 'failed', "
+                    "    completed_at = now() "
+                    "WHERE diagnosis_id = %s",
+                    (diagnosis_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnosis_mark_failed_failed",
+                extra={
+                    "event": "diagnosis_mark_failed_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "reason": reason,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+        self._log.warning(
+            "daemon.diagnoser_fallback",
+            extra={
+                "event": "diagnoser_fallback",
+                "run_id": self._run_id,
+                "diagnosis_id": diagnosis_id,
+                "reason": reason,
+            },
+        )
+
+    def _spawn_diagnoser_subprocess(self, diagnosis_id: int) -> tuple[int | None, str]:
+        """Spawn ``claude -p /diagnose-failure <diagnosis_id>`` synchronously.
+
+        Returns ``(exit_code, stderr_tail)``. ``exit_code=None`` means
+        the subprocess timed out or could not be launched. Isolated
+        here so tests can monkeypatch ``subprocess.run`` without
+        touching the surrounding DB-write logic.
+        """
+        cmd = [
+            "claude",
+            "-p",
+            f"/diagnose-failure {diagnosis_id}",
+            "--max-turns",
+            str(DIAGNOSER_MAX_TURNS),
+            "--model",
+            DIAGNOSER_MODEL,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            tail = ""
+            if exc.stderr:
+                tail = (
+                    exc.stderr.decode("utf-8", errors="replace")
+                    if isinstance(exc.stderr, bytes)
+                    else str(exc.stderr)
+                )[-500:]
+            return None, tail
+        except FileNotFoundError:
+            return None, "claude binary not found"
+
+        stderr_tail = (result.stderr or "")[-500:]
+        return result.returncode, stderr_tail
+
+    def _read_recommendation(self, diagnosis_id: int) -> dict[str, Any] | None:
+        """Read ``dispatcher.diagnoses.recommendation`` for the given row.
+
+        Returns the recommendation dict, or None if the row is missing,
+        the recommendation column is NULL, or the JSON is malformed.
+        None means "fall back to mechanical escalation".
+        """
+        assert self._conn is not None, "connect() must run before recommendation read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT recommendation FROM dispatcher.diagnoses "
+                    "WHERE diagnosis_id = %s",
+                    (diagnosis_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        if row is None or row[0] is None:
+            return None
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        return raw
+
+    def _validate_recommendation(self, recommendation: dict[str, Any]) -> str | None:
+        """Return the action string if valid, None otherwise.
+
+        Shape check: ``action`` must be in :data:`DIAGNOSER_ACTIONS`.
+        ``retry_with_hint`` requires a non-empty string ``hint``;
+        ``reissue`` requires a non-empty string ``new_scope``. All
+        other fields are advisory.
+        """
+        action = recommendation.get("action")
+        if not isinstance(action, str) or action not in DIAGNOSER_ACTIONS:
+            return None
+        if action == "retry_with_hint":
+            hint = recommendation.get("hint")
+            if not isinstance(hint, str) or not hint.strip():
+                return None
+        if action == "reissue":
+            new_scope = recommendation.get("new_scope")
+            if not isinstance(new_scope, str) or not new_scope.strip():
+                return None
+        return action
+
+    def _consume_diagnosis(self, diagnosis_id: int, candidate: dict[str, Any]) -> str:
+        """Read the recommendation and execute the deterministic action.
+
+        Returns the action string that was consumed (one of
+        :data:`DIAGNOSER_ACTIONS`, or ``"escalate_fallback"`` when the
+        recommendation was malformed and we escalated mechanically).
+        """
+        recommendation = self._read_recommendation(diagnosis_id)
+        if recommendation is None:
+            self._mark_diagnosis_failed(
+                diagnosis_id, reason="recommendation_missing_or_malformed_json"
+            )
+            self._apply_mechanical_escalation(candidate)
+            return "escalate_fallback"
+
+        action = self._validate_recommendation(recommendation)
+        if action is None:
+            self._log.warning(
+                "daemon.diagnosis_action_unknown",
+                extra={
+                    "event": "diagnosis_action_unknown",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "raw_recommendation": recommendation,
+                },
+            )
+            self._mark_diagnosis_failed(
+                diagnosis_id, reason="recommendation_failed_validation"
+            )
+            self._apply_mechanical_escalation(candidate)
+            return "escalate_fallback"
+
+        # Valid action — dispatch.
+        agent_id = candidate["agent_id"]
+        issue_number = candidate.get("issue_number")
+        reasoning = str(recommendation.get("reasoning") or "")
+
+        self._log.info(
+            "daemon.diagnosis_consumed",
+            extra={
+                "event": "diagnosis_consumed",
+                "run_id": self._run_id,
+                "diagnosis_id": diagnosis_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "action": action,
+            },
+        )
+
+        if action == "retry":
+            self._consume_action_retry(agent_id=agent_id)
+        elif action == "retry_with_hint":
+            self._consume_action_retry_with_hint(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                hint=str(recommendation.get("hint") or ""),
+            )
+        elif action == "reissue":
+            self._consume_action_reissue(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                diagnosis_id=diagnosis_id,
+                reasoning=reasoning,
+                new_scope=str(recommendation.get("new_scope") or ""),
+            )
+        elif action == "escalate":
+            self._consume_action_escalate(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=reasoning,
+            )
+        elif action == "close":
+            self._consume_action_close(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=reasoning,
+            )
+
+        return action
+
+    def _consume_action_retry(self, *, agent_id: str) -> None:
+        """Create a tier-1-shaped retry marker via the existing machinery.
+
+        Reuses :data:`FAILURE_CATEGORY_SUBPROCESS_CRASH` as the marker
+        reason — all three :data:`AUTO_RETRY_CATEGORIES` are functionally
+        equivalent at this point (they share the backoff schedule and
+        the worktree-drop step), and ``subprocess_crash`` is the most
+        neutral category for a diagnoser-initiated retry.
+        """
+        self._create_retry_marker(
+            agent_id=agent_id, reason=FAILURE_CATEGORY_SUBPROCESS_CRASH
+        )
+
+    def _consume_action_retry_with_hint(
+        self, *, agent_id: str, issue_number: int | None, hint: str
+    ) -> None:
+        """Post the hint as an issue comment, then create a retry marker."""
+        if issue_number is not None and hint:
+            self._gh_issue_comment(issue_number, hint)
+        self._create_retry_marker(
+            agent_id=agent_id, reason=FAILURE_CATEGORY_SUBPROCESS_CRASH
+        )
+
+    def _consume_action_reissue(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        diagnosis_id: int,
+        reasoning: str,
+        new_scope: str,
+    ) -> None:
+        """Post diagnosis summary, replace issue body, ensure agent/ready, retry."""
+        if issue_number is not None:
+            summary = (
+                "## Diagnosis (3D reissue)\n\n"
+                f"{reasoning}\n\n"
+                "_Scope replaced below — see updated body._"
+            )
+            self._gh_issue_comment(issue_number, summary)
+            if new_scope:
+                self._gh_issue_set_body(issue_number, new_scope)
+            # Ensure agent/ready remains so the next scheduler tick can
+            # re-claim. --add-label is idempotent.
+            self._gh_issue_add_labels(issue_number, ["agent/ready"])
+        self._create_retry_marker(
+            agent_id=agent_id, reason=FAILURE_CATEGORY_SUBPROCESS_CRASH
+        )
+
+    def _consume_action_escalate(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        reasoning: str,
+    ) -> None:
+        """Add needs-human + p1 labels, post diagnosis, mark agent failed."""
+        if issue_number is not None:
+            summary = (
+                "## Diagnosis (3D escalation)\n\n"
+                f"{reasoning}\n\n"
+                "_Needs human review — diagnoser could not auto-resolve._"
+            )
+            self._gh_issue_comment(issue_number, summary)
+            self._gh_issue_add_labels(
+                issue_number, ["status/needs-human", "priority/p1"]
+            )
+        self._mark_agent_terminal(
+            agent_id, status="failed", phase="diagnoser_escalate", exit_code=None
+        )
+
+    def _consume_action_close(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        reasoning: str,
+    ) -> None:
+        """Add status/invalid, close with diagnosis as close comment."""
+        if issue_number is not None:
+            summary = (
+                "## Diagnosis (3D close)\n\n"
+                f"{reasoning}\n\n"
+                "_Diagnoser determined this issue is not actionable as filed._"
+            )
+            self._gh_issue_add_labels(issue_number, ["status/invalid"])
+            self._gh_issue_close(issue_number, comment=summary, reason="not planned")
+        self._mark_agent_terminal(
+            agent_id, status="failed", phase="diagnoser_close", exit_code=None
+        )
+
+    def _apply_mechanical_escalation(self, candidate: dict[str, Any]) -> None:
+        """Fallback path: behave like ``escalate`` with a canned reasoning.
+
+        Spec §8 "Budget & safety": diagnoser timeout / malformed JSON /
+        subprocess crash → fall back to fixed mechanical policy, which
+        for tier 2/3 means escalate-to-human. No retry — if the
+        diagnoser itself is broken, another retry won't help.
+        """
+        agent_id = candidate["agent_id"]
+        issue_number = candidate.get("issue_number")
+        category = candidate.get("category")
+        reasoning = (
+            f"Diagnoser fallback after {category} failure. "
+            "Diagnoser subprocess returned no valid recommendation "
+            "(timeout, non-zero exit, or malformed JSON). Escalating "
+            "to human review per spec §8 Budget & safety."
+        )
+        self._consume_action_escalate(
+            agent_id=agent_id,
+            issue_number=issue_number,
+            reasoning=reasoning,
+        )
+
+    def _gh_issue_comment(self, issue_number: int, body: str) -> None:
+        """Post a comment on the given issue via ``gh issue comment``.
+
+        Writes the body to a temp file first (CLAUDE.md preflight
+        blocks heredocs; shelling out with ``--body`` inline has quoting
+        pitfalls for markdown comments). Subprocess failures are logged
+        and swallowed — the diagnoser's decision already landed in the
+        DB, a missing comment is a visibility regression but not a
+        correctness regression.
+        """
+        tmp_file = self._write_gh_tmp_body(body, prefix="diagnoser-comment")
+        if tmp_file is None:
+            return
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--body-file",
+                    str(tmp_file),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.diagnoser_gh_comment_failed",
+                extra={
+                    "event": "diagnoser_gh_comment_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.diagnoser_gh_comment_nonzero",
+                extra={
+                    "event": "diagnoser_gh_comment_nonzero",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+
+    def _gh_issue_set_body(self, issue_number: int, new_body: str) -> None:
+        """Replace the issue body via ``gh issue edit --body-file``."""
+        tmp_file = self._write_gh_tmp_body(new_body, prefix="diagnoser-body")
+        if tmp_file is None:
+            return
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "edit",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--body-file",
+                    str(tmp_file),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.diagnoser_gh_body_failed",
+                extra={
+                    "event": "diagnoser_gh_body_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.diagnoser_gh_body_nonzero",
+                extra={
+                    "event": "diagnoser_gh_body_nonzero",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+
+    def _gh_issue_add_labels(self, issue_number: int, labels: list[str]) -> None:
+        """Add one or more labels via ``gh issue edit --add-label``.
+
+        ``gh`` accepts a comma-separated label list. Idempotent — adding
+        a label that already exists is a no-op.
+        """
+        if not labels:
+            return
+        label_csv = ",".join(labels)
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "edit",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--add-label",
+                    label_csv,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.diagnoser_gh_label_failed",
+                extra={
+                    "event": "diagnoser_gh_label_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.diagnoser_gh_label_nonzero",
+                extra={
+                    "event": "diagnoser_gh_label_nonzero",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+
+    def _gh_issue_close(self, issue_number: int, *, comment: str, reason: str) -> None:
+        """Close the issue via ``gh issue close`` with a close comment."""
+        tmp_file = self._write_gh_tmp_body(comment, prefix="diagnoser-close")
+        if tmp_file is None:
+            return
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "close",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--reason",
+                    reason,
+                    "--comment",
+                    comment,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.diagnoser_gh_close_failed",
+                extra={
+                    "event": "diagnoser_gh_close_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.diagnoser_gh_close_nonzero",
+                extra={
+                    "event": "diagnoser_gh_close_nonzero",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+
+    def _write_gh_tmp_body(self, body: str, *, prefix: str) -> Path | None:
+        """Write ``body`` to a temp file under the repo root's ``tmp/``.
+
+        Returns the Path on success or None on failure. Using the repo
+        root's tmp/ (rather than /tmp/ or each worktree's tmp/) keeps
+        diagnoser-generated comments inspectable after the worktree is
+        cleaned up.
+        """
+        try:
+            tmp_dir = self._repo_root() / "tmp" / "dispatcher-diagnoser"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            # Use monotonic time + pid to keep the filename unique across
+            # concurrent diagnoser calls in the same tick.
+            name = f"{prefix}-{int(time.time() * 1000)}-{os.getpid()}.txt"
+            tmp_file = tmp_dir / name
+            tmp_file.write_text(body, encoding="utf-8")
+            return tmp_file
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_tmp_body_write_failed",
+                extra={
+                    "event": "diagnoser_tmp_body_write_failed",
+                    "run_id": self._run_id,
+                    "prefix": prefix,
+                },
+            )
+            return None
+
+    def _run_diagnoser_pass(self) -> int:
+        """Find tier-2/3 candidates, spawn diagnosers, consume recommendations.
+
+        Returns the number of diagnoses that ran this tick (regardless
+        of action). Called from the supervisor tick. Gated on
+        ``dispatcher.config.diagnoser_enabled = true`` at the top —
+        a tripped circuit breaker short-circuits the whole pass. Each
+        candidate is handled independently so a bad subprocess crash
+        on one cannot stall the others.
+        """
+        if not self._diagnoser_enabled():
+            return 0
+
+        candidates = self._find_diagnoser_candidates()
+        if not candidates:
+            return 0
+
+        ran = 0
+        for candidate in candidates:
+            try:
+                context = self._build_diagnoser_context(candidate)
+                diagnosis_id = self._insert_pending_diagnosis(
+                    failure_id=candidate["failure_id"],
+                    agent_id=candidate["agent_id"],
+                    context=context,
+                )
+                if diagnosis_id is None:
+                    # Could not create the diagnosis row — fall back
+                    # directly without spawning.
+                    self._apply_mechanical_escalation(candidate)
+                    continue
+
+                self._log.info(
+                    "daemon.diagnoser_spawn",
+                    extra={
+                        "event": "diagnoser_spawn",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "failure_id": candidate["failure_id"],
+                        "agent_id": candidate["agent_id"],
+                        "category": candidate["category"],
+                        "tier": candidate["tier"],
+                    },
+                )
+
+                exit_code, stderr_tail = self._spawn_diagnoser_subprocess(diagnosis_id)
+                ran += 1
+
+                if exit_code is None:
+                    # Timeout or subprocess could not be launched.
+                    self._mark_diagnosis_failed(
+                        diagnosis_id,
+                        reason="subprocess_timeout_or_launch_failure",
+                    )
+                    self._apply_mechanical_escalation(candidate)
+                    continue
+                if exit_code != 0:
+                    self._log.warning(
+                        "daemon.diagnoser_nonzero_exit",
+                        extra={
+                            "event": "diagnoser_nonzero_exit",
+                            "run_id": self._run_id,
+                            "diagnosis_id": diagnosis_id,
+                            "exit_code": exit_code,
+                            "stderr_tail": stderr_tail,
+                        },
+                    )
+                    self._mark_diagnosis_failed(
+                        diagnosis_id, reason="subprocess_nonzero_exit"
+                    )
+                    self._apply_mechanical_escalation(candidate)
+                    continue
+
+                # Exit 0 — read the recommendation and consume it.
+                self._consume_diagnosis(diagnosis_id, candidate)
+            except Exception:
+                self._log.exception(
+                    "daemon.diagnoser_pass_iteration_failed",
+                    extra={
+                        "event": "diagnoser_pass_iteration_failed",
+                        "run_id": self._run_id,
+                        "failure_id": candidate.get("failure_id"),
+                        "agent_id": candidate.get("agent_id"),
+                    },
+                )
+                # Best-effort fallback — don't let one bad candidate
+                # block later ones.
+                try:
+                    self._apply_mechanical_escalation(candidate)
+                except Exception:
+                    self._log.exception(
+                        "daemon.diagnoser_pass_fallback_failed",
+                        extra={
+                            "event": "diagnoser_pass_fallback_failed",
+                            "run_id": self._run_id,
+                        },
+                    )
+
+        return ran
+
     # ── supervisor tick (every ``tick_supervisor_seconds``) ─────────────
 
     def supervisor_tick(self) -> dict[str, int]:
@@ -4852,6 +6214,39 @@ class DispatcherDaemon:
                 },
             )
 
+        # Phase 3D (#2795): circuit breaker + diagnoser pass. The
+        # breaker check runs FIRST so a bad 24h window disables the
+        # diagnoser before the pass tries to spawn more subprocesses.
+        # The pass is gated on ``dispatcher.config.diagnoser_enabled``
+        # inside :meth:`_run_diagnoser_pass`; rate-limit-skipped ticks
+        # still run the pass because diagnoses can proceed without
+        # calling ``gh`` when the issue + PR context is available via
+        # DB state alone. (The skill itself makes GH reads; the daemon
+        # side only writes comments/labels if the recommendation
+        # action requires them, and those are unavoidable regardless
+        # of budget.)
+        try:
+            self._check_diagnoser_circuit_breaker()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_circuit_breaker_check_failed",
+                extra={
+                    "event": "diagnoser_circuit_breaker_check_failed",
+                    "run_id": self._run_id,
+                },
+            )
+        diagnoses_ran = 0
+        try:
+            diagnoses_ran = self._run_diagnoser_pass()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_pass_failed",
+                extra={
+                    "event": "diagnoser_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
         self._supervisor_ticks += 1
         self._last_heartbeat_at = datetime.now(UTC)
 
@@ -4874,6 +6269,7 @@ class DispatcherDaemon:
                 "stuck_flagged": stuck_flagged,
                 "retry_markers_processed": retry_processed,
                 "rate_skip_active": rate_skip_active,
+                "diagnoses_ran": diagnoses_ran,
             },
         )
         return {
@@ -4883,6 +6279,7 @@ class DispatcherDaemon:
             "stuck_flagged": stuck_flagged,
             "retry_markers_processed": retry_processed,
             "rate_skip_active": 1 if rate_skip_active else 0,
+            "diagnoses_ran": diagnoses_ran,
         }
 
     # ── heartbeat metric emission (supervisor-tick step 3) ──────────────

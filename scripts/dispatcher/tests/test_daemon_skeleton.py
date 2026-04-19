@@ -258,7 +258,13 @@ class TestSupervisorTick:
         assert update_calls[0][1] == ("test-run-id",)
         # And the failures count must fire.
         assert any("dispatcher.failures" in sql for sql, _ in executed)
-        assert fake_conn.commits == 1
+        # At least one commit — the heartbeat + failures-count block.
+        # Later phases (3C, 3D) add optional DB reads inside the tick
+        # (stuck-agent scan, diagnoser gates, retry-marker scan) that
+        # each commit independently when the skeleton fake stubs have
+        # empty fetch queues. The exact count is not a contract; the
+        # "heartbeat round-trips at least once" signal is.
+        assert fake_conn.commits >= 1
         assert d._last_heartbeat_at is not None
 
 
