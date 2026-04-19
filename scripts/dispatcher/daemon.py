@@ -87,6 +87,19 @@ LEASE_HEARTBEAT_WINDOW_SECONDS = 60
 DEFAULT_SCHEDULER_TICK_SECONDS = 30
 DEFAULT_SUPERVISOR_TICK_SECONDS = 120
 
+#: Default housekeeping tick cadence — hourly. Cheap DELETEs that prune
+#: transient dispatcher tables. Separate from scheduler/supervisor so a
+#: slow DELETE (or DB hiccup) does not delay the hot-path queue scan or
+#: heartbeat. Issue #2778 (closes the TODO in migration 24).
+DEFAULT_HOUSEKEEPING_TICK_SECONDS = 3600
+
+#: Default retention window for ``dispatcher.queue_snapshots``. Matches
+#: the ``dispatcher_daemon`` CloudWatch log group default retention and
+#: covers the longest plausible multi-week post-mortem window. Overridable
+#: per-environment via the ``queue_snapshot_retention_days`` row in
+#: ``dispatcher.config`` (operator knob — no redeploy needed).
+DEFAULT_QUEUE_SNAPSHOT_RETENTION_DAYS = 30
+
 #: Default repo the daemon watches. Overridden by the ``GITHUB_REPO``
 #: env var, wired in the terraform module.
 DEFAULT_GITHUB_REPO = "judgemind/judgemind"
@@ -209,6 +222,10 @@ class DaemonConfig:
     database_url: str
     tick_scheduler_seconds: int = DEFAULT_SCHEDULER_TICK_SECONDS
     tick_supervisor_seconds: int = DEFAULT_SUPERVISOR_TICK_SECONDS
+    #: Housekeeping tick cadence (hourly by default). Controls how often
+    #: :meth:`DispatcherDaemon._housekeeping_tick` prunes transient
+    #: dispatcher tables. See ``DEFAULT_HOUSEKEEPING_TICK_SECONDS``.
+    tick_housekeeping_seconds: int = DEFAULT_HOUSEKEEPING_TICK_SECONDS
     log_level: str = "INFO"
     version_sha: str = "unknown"
     host: str = ""
@@ -273,6 +290,14 @@ class DispatcherDaemon:
               so the alarm defined in the terraform module
               (``infra/terraform/modules/dispatcher-daemon``) sees fresh
               data and does not fire.
+        * Run the housekeeping loop every ``tick_housekeeping_seconds``
+          (hourly by default):
+            - prune ``dispatcher.queue_snapshots`` rows older than
+              ``queue_snapshot_retention_days`` (default 30;
+              ``dispatcher.config`` overridable). Issue #2778.
+            - Additional tables (``phase_outputs``, ``notifications``)
+              plug into the same tick via the ``_HOUSEKEEPING_TARGETS``
+              table — issue #2779 extends it.
         * On SIGTERM / SIGINT, UPDATE ``dispatcher.runs.stopped_at`` and
           exit 0.
 
@@ -290,6 +315,7 @@ class DispatcherDaemon:
         self._stop = threading.Event()
         self._scheduler_ticks = 0
         self._supervisor_ticks = 0
+        self._housekeeping_ticks = 0
         self._last_heartbeat_at: datetime | None = None
         # CloudWatch client is created lazily on first publish so tests can
         # mock it via ``_make_cloudwatch_client``. Shared across supervisor
@@ -788,6 +814,142 @@ class DispatcherDaemon:
         )
         return True
 
+    # ── housekeeping tick (every ``tick_housekeeping_seconds``) ─────────
+
+    #: Retention targets the housekeeping tick prunes. Each entry is a
+    #: ``(table, timestamp_column, config_key, default_days)`` tuple.
+    #: - ``table``: short name under the ``dispatcher.`` schema.
+    #: - ``timestamp_column``: the column the cutoff compares against
+    #:   (``now() - INTERVAL 'N days'``).
+    #: - ``config_key``: row in ``dispatcher.config`` that overrides the
+    #:   default retention window. Missing or invalid value = fall back
+    #:   to ``default_days``.
+    #: - ``default_days``: hardcoded floor used when no config row is set.
+    #:
+    #: Table names and column names are hardcoded class constants (never
+    #: interpolated from user input or config), so composing the DELETE
+    #: with an f-string is safe from SQL injection here. Cutoff days are
+    #: parameterized normally via psycopg's ``%s`` placeholder.
+    #:
+    #: Extending: issue #2779 appends ``phase_outputs`` and
+    #: ``notifications`` entries here with their own retention keys.
+    _HOUSEKEEPING_TARGETS: tuple[tuple[str, str, str, int], ...] = (
+        (
+            "queue_snapshots",
+            "observed_at",
+            "queue_snapshot_retention_days",
+            DEFAULT_QUEUE_SNAPSHOT_RETENTION_DAYS,
+        ),
+    )
+
+    def _read_retention_days(self, config_key: str, default_days: int) -> int:
+        """Look up the retention override for ``config_key`` in ``dispatcher.config``.
+
+        Returns the configured value if present and castable to a
+        positive int, otherwise ``default_days``. The lookup runs in its
+        own tiny transaction so a missing/malformed row does not poison
+        the surrounding DELETE.
+        """
+        assert self._conn is not None, "connect() must run before reading config"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    (config_key,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            # Config read failure is non-fatal — the caller will fall
+            # back to the hardcoded default. Rollback is best-effort.
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return default_days
+
+        if row is None:
+            return default_days
+        value = row[0]
+        if value is None:
+            return default_days
+        try:
+            configured = int(value)
+        except (TypeError, ValueError):
+            return default_days
+        if configured <= 0:
+            return default_days
+        return configured
+
+    def _housekeeping_tick(self) -> dict[str, int]:
+        """Run one housekeeping tick. Prunes stale rows from dispatcher tables.
+
+        Iterates :attr:`_HOUSEKEEPING_TARGETS` and issues a DELETE per
+        target bounded by the target's retention window. Each target is
+        a separate transaction so one failure does not poison siblings.
+
+        Returns a mapping of ``table`` → ``rows_deleted`` (with ``-1``
+        sentinel on per-target failure). The return value is surfaced to
+        tests — the daemon itself just logs and continues.
+        """
+        assert self._conn is not None, "connect() must run before ticks"
+
+        per_table: dict[str, int] = {}
+        for (
+            table,
+            timestamp_column,
+            config_key,
+            default_days,
+        ) in self._HOUSEKEEPING_TARGETS:
+            cutoff_days = self._read_retention_days(config_key, default_days)
+            # ``table`` and ``timestamp_column`` are class constants
+            # (never user-controlled), so composing the SQL with f-string
+            # is safe. The cutoff is bound via %s.
+            delete_sql = (
+                f"DELETE FROM dispatcher.{table} "
+                f"WHERE {timestamp_column} < now() - make_interval(days => %s)"
+            )
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(delete_sql, (cutoff_days,))
+                    rows_deleted = cur.rowcount or 0
+                self._conn.commit()
+            except Exception as exc:
+                # DB hiccup on one table must not crash the daemon or
+                # starve sibling tables of their housekeeping. Log, roll
+                # back, record the sentinel, and keep going.
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover — best-effort
+                    pass
+                self._log.warning(
+                    "daemon.housekeeping_failed",
+                    extra={
+                        "event": "housekeeping_failed",
+                        "run_id": self._run_id,
+                        "table": table,
+                        "cutoff_days": cutoff_days,
+                        "detail": str(exc),
+                    },
+                )
+                per_table[table] = -1
+                continue
+
+            per_table[table] = rows_deleted
+            self._log.info(
+                "daemon.housekeeping_tick",
+                extra={
+                    "event": "housekeeping_tick",
+                    "run_id": self._run_id,
+                    "table": table,
+                    "rows_deleted": rows_deleted,
+                    "cutoff_days": cutoff_days,
+                },
+            )
+
+        self._housekeeping_ticks += 1
+        return per_table
+
     # ── signal handling ────────────────────────────────────────────────
 
     def request_stop(self, signum: int | None = None, _frame: Any = None) -> None:
@@ -811,14 +973,20 @@ class DispatcherDaemon:
 
         last_scheduler = 0.0
         last_supervisor = 0.0
+        last_housekeeping = 0.0
         # Tick once on boot so the first scheduler/supervisor cycle is
         # observable immediately in logs + DB, rather than after the
-        # first full cadence elapses.
+        # first full cadence elapses. Housekeeping is NOT fired on boot
+        # — it would double-emit on every deploy (rolling restart) and
+        # hourly cadence already bounds the worst-case staleness at 1h.
         try:
             self.scheduler_tick()
             last_scheduler = time.monotonic()
             self.supervisor_tick()
             last_supervisor = time.monotonic()
+            # Seed the housekeeping timer so the first prune happens
+            # after a full interval, not immediately.
+            last_housekeeping = time.monotonic()
         except Exception:
             self._log.exception("daemon.initial_tick_failed")
             return 1
@@ -833,6 +1001,9 @@ class DispatcherDaemon:
                 if now - last_supervisor >= self._cfg.tick_supervisor_seconds:
                     self.supervisor_tick()
                     last_supervisor = now
+                if now - last_housekeeping >= self._cfg.tick_housekeeping_seconds:
+                    self._housekeeping_tick()
+                    last_housekeeping = now
             except Exception:
                 # Any tick exception is logged and the loop continues —
                 # the next tick will try again. Real DB failure will
@@ -875,6 +1046,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SUPERVISOR_TICK_SECONDS,
         help="Seconds between supervisor ticks (default: 120).",
+    )
+    parser.add_argument(
+        "--tick-housekeeping-seconds",
+        type=int,
+        default=DEFAULT_HOUSEKEEPING_TICK_SECONDS,
+        help="Seconds between housekeeping ticks (default: 3600).",
     )
     parser.add_argument(
         "--log-level",
@@ -925,6 +1102,7 @@ def _build_config(
         database_url=database_url,
         tick_scheduler_seconds=args.tick_scheduler_seconds,
         tick_supervisor_seconds=args.tick_supervisor_seconds,
+        tick_housekeeping_seconds=args.tick_housekeeping_seconds,
         log_level=args.log_level,
         version_sha=version_sha,
         host=host,
@@ -984,6 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
             "pid": cfg.pid,
             "tick_scheduler_seconds": cfg.tick_scheduler_seconds,
             "tick_supervisor_seconds": cfg.tick_supervisor_seconds,
+            "tick_housekeeping_seconds": cfg.tick_housekeeping_seconds,
         },
     )
 
