@@ -2,7 +2,7 @@
 
 > **When to read this:** you are writing or editing a skill, agent doc, or CLAUDE.md section that interacts with GitHub, and need to choose between a `mcp__github__*` MCP tool and the `gh` CLI.
 >
-> **TL;DR:** prefer MCP for structured reads. Keep `gh` for writes (temporarily — see the write-path note below), for anything in the Gap rows of `docs/agent/gh-to-mcp-migration.md`, and for shell scripts where MCP is not reachable.
+> **TL;DR:** MCP for **single-object reads** (one issue, one PR, one file) — typed output, no jq, no shell quoting. For **lists** (`list_issues`, `list_pull_requests`) and **wide rollups** (status + check runs), prefer `gh --json <tight field list>` — it's 3–5× smaller than the MCP payload and sidesteps the MCP token ceiling, which a busy queue can exceed. Keep `gh` for writes (temporarily — see the write-path note below), for anything in the Gap rows of `docs/agent/gh-to-mcp-migration.md`, and for shell scripts where MCP is not reachable.
 
 ## Why this doc exists
 
@@ -12,15 +12,17 @@ Agents historically used `gh` for every GitHub operation, which forced a handful
 - Reads required `--json field1,field2,...` enumeration and often `-q .[0].databaseId` jq juggling.
 - The combination of shell quoting and `-q` mixed-quote rules tripped the platform's safety checks (see `docs/agent/unattended-patterns.md` §`gh` jq Quoting).
 
-The `github` MCP server exposes the REST API directly as structured tool calls — body is a native string, the response is parsed JSON, no shell escaping. For reads this is a clear win. For writes it will be a clear win once auth is configured (see below).
+The `github` MCP server exposes the REST API directly as structured tool calls — body is a native string, the response is parsed JSON, no shell escaping. **But MCP returns the full server-defined payload.** For narrow single-object reads that's a win (the extra fields are rarely wasted). For lists and wide rollups, a narrow `gh --json <tight field list>` is often 3–5× smaller and strictly better on token budget.
 
 ## Decision rule
 
 | Situation | Use | Why |
 |---|---|---|
-| Structured read of a single issue, PR, comment list, file contents | **MCP** (`get_issue`, `get_pull_request`, `get_pull_request_comments`, `get_file_contents`, etc.) | No `--json` enumeration, no `-q` jq. Returns full typed object in one call. |
-| Listing issues or PRs with filters (labels, state, assignee) | **MCP** (`list_issues`, `list_pull_requests`) | Native filter params, paginated response. |
-| PR status checks / review state | **MCP** (`get_pull_request_status`, `get_pull_request_reviews`, `get_pull_request_files`) | |
+| Structured read of a single issue, PR, comment list, file contents | **MCP** (`get_issue`, `get_pull_request`, `get_pull_request_comments`, `get_file_contents`, etc.) | No `--json` enumeration, no `-q` jq. Typed object, reasonable payload size. |
+| Listing issues or PRs with filters (labels, state, assignee) | **`gh` with narrow `--json`** (`gh issue list --json number,title,labels,assignees,createdAt --label agent/ready --limit 50`) | MCP `list_issues` returns the full issue payload (body, reactions, etc.) per item — a busy `agent/ready` queue can exceed 150K chars / the MCP token ceiling. The narrow `gh --json` shape is ~50K for the same queue. Use MCP `list_issues` only for small, filtered queries (single assignee, small label set). |
+| PR merge-readiness (`mergeable`, `mergeStateStatus`) | **MCP** (`get_pull_request`) | Single-object read. |
+| PR **full CI rollup** (Actions check runs, not just legacy commit statuses) | **`gh pr view <N> --json statusCheckRollup,mergeable,mergeStateStatus`** | MCP `get_pull_request_status` only covers legacy commit statuses (Vercel deploy etc.), not GitHub Actions check runs. Do not rely on it to gate a merge. |
+| PR file list or review history | **MCP** (`get_pull_request_files`, `get_pull_request_reviews`) | Single-object scoped reads. |
 | Search across the repo (issues, code, commits) | **MCP** (`search_issues`, `search_code`, `list_commits`) | |
 | Posting an issue comment or creating an issue/PR with a multi-line body | **`gh` (today) / MCP (once auth lands)** | See the write-path note below. Once the MCP server has a token, `add_issue_comment` and friends eliminate the tmp-file preamble. |
 | Adding/removing a single label | **`gh issue edit --add-label` / `--remove-label`** | MCP only supports full label replacement (`update_issue` with the full `labels` array). For an incremental add, `gh` is one call, MCP is two (read, then replace). |

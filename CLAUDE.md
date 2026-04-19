@@ -145,134 +145,30 @@ These rules govern how you work with the user in interactive sessions, not just 
 - **Zoom out before planning: root cause vs. symptom.** Before generating a plan or filing a batch of issues, ask: do these share a root cause? Have we fixed similar things before — and if so, why did it recur? Would a structural fix prevent the entire class of problem? Group by cause, not symptom. Present the reasoning to the user, not just the conclusion. Sometimes the honest answer is "this is just iteration on a sound approach" — that's fine — but if we keep re-treading the same ground, question the approach before adding more patches.
 - **Root Cause Over Symptoms (triage, spotcheck, investigation).** The rule above applies generally; this one is its triage/spotcheck/investigation specialization. Before filing a symptom-level ticket in those contexts, look one level deeper for the shared cause. If three sampled rulings from different counties all have the same wrong field, the bug is probably in shared enrichment code, not in three separate scrapers — file one root-cause issue, not three symptom issues. Do not propose soak periods, validation delays, or "let's observe for a week" unless the user asks for them — they add calendar time without adding information when the cause is knowable from the data already in hand.
 
-## PR Workflow (authoritative — applies to all task work)
+## PR Workflow
 
-**Single-issue rule:** each PR addresses exactly one issue. Do not combine unrelated changes in a single PR. If an issue is large or ambiguous, break it into sub-tasks first (see **Creating Sub-Tasks**), label them `agent/ready`, then pick up the first sub-task.
+**The authoritative step-by-step lives in `.claude/skills/task/SKILL.md` §A.3–A.9.** `/task` subagents follow that. The rules below are the ones every agent (task, dispatcher, interactive) must internalize.
 
-**All commits must be made on the worktree branch created in Step 2, never directly on `main`.** Every change goes through a PR — no direct pushes to `main`, ever.
-
-Complete every substep in order. A task is not done until substep 4.11 is finished. Do not ask the user for confirmation during any of these steps.
-
-#### 4.1 — Sync the worktree to latest main
-
-```
-git -C {worktree} fetch origin main
-git -C {worktree} rebase origin/main
-```
-
-#### 4.2 — Understand the problem
-
-- Read the issue thoroughly, including linked issues.
-- Check `docs/specs/` for relevant guidance.
-- Look at existing code for patterns. Be consistent with what's already there.
-- **Scope completeness check:** Before implementing, search the codebase for all locations affected by the change. If the issue mentions fixing or changing X in one file, grep for X across the entire codebase. List all locations that use, render, or implement the same pattern. If the issue's scope doesn't cover all of them, either expand scope to include them or file follow-up issues for the missed locations so they are tracked. Document the scope check results (what you searched for, what you found) in your implementation notes.
-- If you need a decision from the maintainer, comment on the issue, block it with `scripts/block-issue.sh <issue> <blocker>` (or just add `status/blocked` if there is no specific blocking issue), and pick up a different task.
-
-#### 4.3 — Implement and verify locally
-
-- **For testable code tasks** (Python, TypeScript): use the `/ralph` loop. See `.claude/skills/ralph/SKILL.md`.
-- **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks and review your own diff.
-- Fix any failures before proceeding.
-
-#### 4.4 — Push, open a PR, and immediately watch CI
-
-```
-git push -u origin <branch>
-```
-
-Before creating a PR, check for duplicates with `scripts/check-duplicate-pr.sh <N>` (a thin wrapper around `preflight_no_duplicate_pr` that avoids the `source && fn` preflight-hook friction). If a duplicate is found (return code 0), adopt the existing PR instead of creating a new one. If no duplicate (return code 1) or on error (return code 2), proceed normally:
-
-```
-gh pr create --repo judgemind/judgemind ...
-gh run list --repo judgemind/judgemind --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId'
-gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
-```
-
-**Never leave the CI watch step unfinished.** If CI is green, continue to 4.5. If CI fails, go to 4.7.
-
-#### 4.5 — Verify no merge conflicts
-
-```
-gh pr view <N> --repo judgemind/judgemind --json mergeable,mergeStateStatus
-```
-If `mergeable` is `CONFLICTING`, rebase onto main, resolve, push with `--force-with-lease`, return to 4.4.
-
-#### 4.6 — CI is green — confirm before proceeding
-
-```
-gh pr view <N> --repo judgemind/judgemind --json statusCheckRollup
-```
-All checks must show `SUCCESS` or `SKIPPED`. Any `FAILURE` goes to 4.7.
-
-#### 4.7 — Fix CI failures (repeat until green)
-
-Diagnose, fix locally, push again, return to 4.4. Repeat until CI is green.
-
-#### 4.8 — Update the PR test plan
-
-Fetch the PR body, check off **Automated checks** items that passed in CI. Do NOT check off **Post-deploy verification** items yet — those are checked after merge and deploy in step 4.10. Write updated body to `{worktree}/tmp/pr_body.txt` and update with `gh pr edit --body-file`.
-
-PR test plans must be structured with two sections:
-- **Automated checks** (lint, format, tests, CI) — checked when CI passes
-- **Post-deploy verification** (feature works on dev) — checked after deploy with concrete evidence
-
-#### 4.9 — Link the issue and request review
-
-Comment on the issue linking the PR. Add the `status/review` label.
-
-#### 4.10 — Verify deployment and post evidence (after merge, deployed services only)
-
-**A task is NOT done when the PR merges. A task is done when the change is deployed, verified working, AND verification evidence is posted.** The worktree stays alive until verification passes.
-
-Skip deploy watching only for pure library, tooling, docs, or CI-only changes that have no deployed component — but you must STILL post a verification evidence comment (see Step 3 below).
-
-**Step 1 — Watch the deploy workflow:**
-
-1. Watch the deploy workflow triggered by the merge to `main` (`gh run watch`).
-2. If deploy **fails**: file a `priority/p1` issue, reference the merged PR, add `agent/ready`. Do NOT consider the task complete.
-3. If deploy **succeeds**: continue to Step 2 (functional verification).
-
-For **web frontend** changes: Vercel deploys automatically — see `docs/agent/infrastructure-reference.md` for details.
-
-**Step 2 — Functional verification (required for deployed services):**
-
-A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional based on the change type:
-
-| Change type | Verification | Required evidence |
-|---|---|---|
-| **DB migration + code** | Confirm migration applied (column/table exists via `scripts/dev-db-query.sh`) AND service processes a request without errors | DB query output + successful request/response |
-| **API endpoint** | Hit the endpoint on dev (`curl https://dev.api.judgemind.org/graphql`), confirm expected response shape and no errors | Curl response (status code + relevant body snippet) |
-| **Ingestion pipeline** | Confirm the worker processes at least one message successfully. Prefer `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` against `/ecs/judgemind-ingestion-worker-dev` for an ad-hoc Insights query; fall back to `scripts/ecs-logs.sh /ecs/judgemind-ingestion-worker-dev --lines 50` for the recent-N-lines convenience or `--follow` for live tail. | Log lines showing successful processing |
-| **Scraper** | Check ECS logs for the next scheduled run, confirm documents are captured without errors. Same MCP-first pattern as ingestion (Insights query against `/ecs/judgemind-scraper-dev`). | Log lines showing successful capture |
-| **Frontend** | Confirm the affected page loads on `dev.judgemind.org` and renders the expected content | Screenshot or page content showing the feature |
-| **DX/tooling** | Run the tool in a representative scenario and confirm expected output | Command output showing correct behavior |
-| **Backfill / data migration script** | Execute the script against dev via `scripts/ecs-run-task.sh` (or locally if appropriate). Confirm the expected data changes applied — e.g., query dev DB via `scripts/dev-db-query.sh` to check row counts, null rates, or sample records. | DB query results showing the data changed |
-
-**Script-producing tasks:** If a task produces a backfill, migration, or one-off fixup script that is meant to be run, executing it on dev and verifying results is part of the definition of done. When filing issues that include "create a backfill script" or similar, always include "backfill executed on dev and results verified" in the acceptance criteria.
-
-If functional verification fails: diagnose the issue. If it's a simple fix, fix it in a follow-up PR. If it's complex, file a `priority/p1` issue with details of what's broken, reference the merged PR, and add `agent/ready`.
-
-**Step 3 — Post verification evidence comment (MANDATORY):**
-
-After verification succeeds (or after determining there is no deployed component), post a verification evidence comment on the issue. This is a hard gate — the task cannot proceed to 4.11 without this comment. Write the comment to `{worktree}/tmp/verification_evidence.txt`, then post it with `gh issue comment`.
-
-For deployed changes, include concrete evidence (curl output, DB query results, log lines, screenshots). For non-deployed changes, state the skip reason explicitly (e.g., "No deployed component — docs/CI only"). See `.claude/skills/task/SKILL.md` A.8 Step 3 for the full evidence format.
-
-After posting, update the PR test plan to check off the **Post-deploy verification** items.
-
-#### 4.11 — Remove your worktree
-
-**Only remove the worktree after deployment verification passes** (or after confirming the change has no deployed component). Never clean up immediately after merge — the worktree is needed for debugging if verification fails.
-
-For agents spawned with `isolation: "worktree"`, Claude Code handles cleanup automatically when the agent exits.
+- **Single-issue rule.** Each PR addresses exactly one issue. Break large/ambiguous issues into sub-tasks labeled `agent/ready` before picking up.
+- **All commits on the worktree branch.** Never directly on `main` during autonomous work. Every change goes through a PR.
+- **Scope completeness check before implementing.** Grep the codebase for all locations affected by the change. If the issue's scope doesn't cover all, either expand scope or file follow-ups.
+- **Ralph for testable code only** (Python, TypeScript). Non-testable tasks (Terraform, migrations, CI/CD, docs) implement directly, then run pre-PR checks and self-review the diff.
+- **Check for duplicate PRs before creating one** — `scripts/check-duplicate-pr.sh <N>`. Adopt an existing PR rather than filing a second.
+- **CI watch is non-negotiable.** `gh run watch <id> --interval 60 --exit-status --compact`. Fix and re-push until CI is green.
+- **Verify `mergeable: MERGEABLE` and `statusCheckRollup` all SUCCESS/SKIPPED before merging.**
+- **Verification evidence comment is MANDATORY on every task completion** — deployed or not. For deployed services, include concrete evidence (curl / DB query / log lines / screenshot). For docs/CI/tooling, state the skip reason explicitly. See task skill A.8 Step 3 for the evidence format and the change-type → verification mapping.
+- **Deploy before cleanup.** A task is done when the change is deployed, functionally verified, AND evidence posted — not when the PR merges. Worktree stays alive until verification passes.
+- **Never ask for user confirmation during the substeps.** Just execute.
 
 ## Tool Use Rules
 
 - **Use dedicated tools for file operations** — never use Bash for `cat`, `ls`, `grep`, `find`. Use Read, Glob, and Grep instead.
 - **Always Read before Write** — the Write tool requires this for existing files.
+- **Prefer Edit over Write for existing files.** Edit sends only the diff (old_string/new_string). Write sends the entire file content as output tokens — a 60KB file is ~20K output tokens, and a single large Write can trigger autocompact mid-task. Reserve Write for new files or genuine full rewrites. For a targeted change to a large file, always use Edit.
+- **Don't re-Read a file you already Read in full.** Keep the initial content in working memory. Re-reading different offsets of the same unmodified file to "double-check" burns ~5K cached tokens per call and adds nothing.
 - **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
-- **MCP-first for GitHub reads.** Prefer `mcp__github__*` tools (`get_issue`, `list_issues`, `get_pull_request`, `list_pull_requests`, `get_pull_request_files`, `get_pull_request_status`, `search_issues`, `search_code`) over `gh ... --json` for reads. MCP returns full typed objects in one call — no `--json` enumeration, no `-q` jq, no shell quoting. Tools are deferred; load via `ToolSearch query="select:mcp__github__get_issue,..."` before first use in a session. See `docs/agent/github-api-access.md` for the decision table and `docs/agent/gh-to-mcp-migration.md` for the full mapping.
-- **`gh` CLI is still the write path** (and the fill-in for MCP gaps). Writes — `gh issue create`, `gh issue comment`, `gh issue edit`, `gh issue close --reason`, `gh pr create`, `gh pr merge --squash --delete-branch`, `gh pr edit`, `gh pr review` — stay on `gh` until the MCP server has a `GITHUB_PERSONAL_ACCESS_TOKEN` (see `docs/agent/gh-to-mcp-migration.md` §Write-path status). Reads without an MCP equivalent also stay on `gh`: `gh run watch`, `gh run list --workflow`, `gh run view`, `gh pr diff`, `gh api rate_limit`, `gh auth status`. Do not invent MCP calls that do not exist.
+- **GitHub reads: MCP for single objects, `gh --json` for lists and wide rollups.** `mcp__github__get_issue` / `get_pull_request` / `get_file_contents` return typed objects with no jq or shell quoting — cleaner for one-shot lookups. But MCP returns the full server payload, which loses to a narrow `gh --json <tight field list>` on lists and wide rollups. A busy `agent/ready` queue is ~150K chars via `list_issues` vs ~50K via `gh issue list --json number,title,labels,assignees,createdAt` — sometimes the MCP response exceeds the token ceiling outright. `get_pull_request_status` only covers legacy commit statuses, not Actions check runs; for the full rollup use `gh pr view <N> --json statusCheckRollup,mergeable,mergeStateStatus`. Tools are deferred; load with `ToolSearch query="select:mcp__github__get_issue,..."` before first use. See `docs/agent/github-api-access.md` for the decision table and `docs/agent/gh-to-mcp-migration.md` for the full mapping.
+- **GitHub writes: `gh` CLI.** Writes — `gh issue create`, `gh issue comment`, `gh issue edit`, `gh issue close --reason`, `gh pr create`, `gh pr merge --squash --delete-branch`, `gh pr edit`, `gh pr review` — stay on `gh` until the MCP server has a `GITHUB_PERSONAL_ACCESS_TOKEN` (see `docs/agent/gh-to-mcp-migration.md` §Write-path status). Reads without an MCP equivalent also stay on `gh`: `gh run watch`, `gh run list --workflow`, `gh run view`, `gh pr diff`, `gh api rate_limit`, `gh auth status`. Do not invent MCP calls that do not exist.
 - **MCP-first for AWS reads (ECS + CloudWatch).** Prefer `mcp__awslabs_ecs-mcp-server__ecs_resource_management` for ECS reads (`DescribeServices`, `DescribeTasks`, `ListTasks`) and `mcp__awslabs_cloudwatch-mcp-server__*` for log discovery (`describe_log_groups`) and Logs Insights (`execute_log_insights_query`, `get_logs_insight_query_results`). MCP returns parsed JSON in one call — no `--query`/`-o json` shell juggling, no millisecond-epoch math. Tools are deferred; load via `ToolSearch query="select:mcp__awslabs_ecs-mcp-server__ecs_resource_management,mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query"` before first use. **Note the hyphenated server segment** (`awslabs_ecs-mcp-server`, `awslabs_cloudwatch-mcp-server`) — not underscores. See `docs/agent/aws-api-access.md` for the decision table and `docs/agent/aws-to-mcp-migration.md` for the full mapping.
 - **`scripts/ecs-*.sh` wrappers stay** for launch-and-stream-logs workflows (`scripts/ecs-run-task.sh` for oneshot Fargate tasks, `scripts/ecs-redeploy.sh` for service redeploys with rollout-wait, `scripts/ecs-logs.sh --follow` for live log tailing). The MCP `RunTask` is gated behind Phase B (`ALLOW_WRITE` IAM scoping) and would not include the stream-logs convenience even when unlocked.
 - **`aws` CLI for the rest:** writes (until Phase B), `aws s3 cp`/`ls`/`sync` for S3 (no MCP equivalent), `aws ecs execute-command` for interactive Exec via `scripts/dev-db-query.sh` and `scripts/ecs-run.sh` (interactive SSM streams are not MCP-replicable), and `aws sts`/`aws configure` for auth-state checks. Never call `aws secretsmanager get-secret-value` directly — use `scripts/with-secret.sh`.
