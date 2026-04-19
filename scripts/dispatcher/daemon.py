@@ -320,6 +320,24 @@ FIX_CI_LOG_TAIL_MAX_CHARS = 20000
 #:   all three paths eventually cycle the row out of this set.
 ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded", "needs_review")
 
+#: GitHub label added to an issue on claim (by either the daemon or the
+#: /task skill) and removed on terminal. Gives operators a GitHub-visible
+#: "this issue is being worked on right now — don't dispatch another
+#: agent on it" signal without querying ``dispatcher.agents``. Paired
+#: with the DB-side partial UNIQUE INDEX (#2783) and the /task-side row
+#: insert (#2866) for defense-in-depth against subagent↔daemon claim
+#: collisions. The queue-scan filter in :meth:`_fetch_agent_ready_issues`
+#: also excludes this label as a redundant safety — the DB row is the
+#: atomic interlock; the label is human + queue-scan visible.
+STATUS_IN_PROGRESS_LABEL = "status/in-progress"
+
+#: ``dispatcher.agents.kind`` value used by the ``/task`` skill's claim
+#: rows (issue #2866). Distinct from the daemon's default ``'task'``
+#: value so :meth:`_atomic_claim`'s UniqueViolation handler can emit a
+#: distinguishing ``already_claimed_by_task`` structured log — useful
+#: for identifying subagent↔daemon races in CloudWatch Logs Insights.
+TASK_SKILL_KIND = "task-skill"
+
 #: Sentinel HTML comment embedded as line 1 of the automated
 #: "plan returned go=false" issue comment. Lets the daemon detect that
 #: the comment has already been posted and skip re-posting on a retry
@@ -2099,11 +2117,17 @@ class DispatcherDaemon:
                 f"gh issue list returned non-list JSON: {type(issues).__name__}"
             )
 
-        # Defensive filter: drop rows that also carry ``status/blocked``.
-        # The ``gh --label agent/ready`` call returns issues that carry
-        # the label; a blocked issue that still has ``agent/ready``
-        # attached (e.g. mid-transition) should not inflate the queue
-        # depth because the daemon would never spawn on it.
+        # Defensive filter: drop rows that also carry ``status/blocked``
+        # or ``status/in-progress``. The ``gh --label agent/ready`` call
+        # returns issues that carry the label; a blocked or in-progress
+        # issue that still has ``agent/ready`` attached (e.g. mid-
+        # transition) should not inflate the queue depth because the
+        # daemon would never spawn on it. ``status/in-progress`` is the
+        # /task-skill↔daemon interlock signal (#2866) — an issue a
+        # ``/task`` subagent has just claimed carries it (and also has
+        # a row in ``dispatcher.agents`` — the DB write is atomic; the
+        # label is human-visible + queue-scan-visible) so the daemon
+        # should never pick it up as a candidate.
         filtered: list[dict[str, Any]] = []
         for issue in issues:
             if not isinstance(issue, dict):
@@ -2113,6 +2137,8 @@ class DispatcherDaemon:
                 entry.get("name") for entry in labels if isinstance(entry, dict)
             }
             if "status/blocked" in label_names:
+                continue
+            if STATUS_IN_PROGRESS_LABEL in label_names:
                 continue
             filtered.append(issue)
         return filtered
@@ -2812,21 +2838,40 @@ class DispatcherDaemon:
                 )
             self._conn.commit()
         except psycopg.errors.UniqueViolation:
-            # Another daemon claimed this issue first. Roll back and
-            # return False so the caller skips to the next candidate.
+            # Another daemon OR a /task subagent claimed this issue
+            # first. Roll back and return False so the caller skips to
+            # the next candidate. Look up the existing row's ``kind`` so
+            # the log distinguishes a daemon↔daemon race (``claim_lost``)
+            # from a /task-skill collision (#2866 —
+            # ``already_claimed_by_task``). Owner lookup is best-effort;
+            # failure to read it just falls back to the generic log.
             try:
                 self._conn.rollback()
             except Exception:  # pragma: no cover
                 pass
-            self._log.info(
-                "daemon.claim_lost",
-                extra={
-                    "event": "claim_lost",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "agent_id": agent_id,
-                },
-            )
+            owner_kind = self._lookup_active_owner_kind(issue_number)
+            if owner_kind == TASK_SKILL_KIND:
+                self._log.info(
+                    "daemon.candidate_skipped",
+                    extra={
+                        "event": "candidate_skipped",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                        "agent_id": agent_id,
+                        "reason": "already_claimed_by_task",
+                    },
+                )
+            else:
+                self._log.info(
+                    "daemon.claim_lost",
+                    extra={
+                        "event": "claim_lost",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                        "agent_id": agent_id,
+                        "owner_kind": owner_kind,
+                    },
+                )
             return False
         except Exception:
             try:
@@ -2844,6 +2889,15 @@ class DispatcherDaemon:
             )
             return False
 
+        # Atomic DB claim succeeded. Add the ``status/in-progress``
+        # label (#2866) so operators + the queue-scan filter see the
+        # issue is being worked on. The label is the human-visible half
+        # of the interlock; the DB row is the atomic half. Label-write
+        # failure is logged but does NOT roll back the DB claim —
+        # ``_mark_agent_terminal`` will still remove the label on
+        # completion even if the add failed (idempotent).
+        self._gh_issue_add_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
+
         self._log.info(
             "daemon.claim_succeeded",
             extra={
@@ -2854,6 +2908,40 @@ class DispatcherDaemon:
             },
         )
         return True
+
+    def _lookup_active_owner_kind(self, issue_number: int) -> str | None:
+        """Return the ``kind`` of the current active row for an issue, or None.
+
+        Used by :meth:`_atomic_claim`'s UniqueViolation handler to
+        distinguish daemon↔daemon races (``kind='task'``) from
+        daemon↔/task-skill races (``kind='task-skill'``). Best-effort —
+        returns None on DB error so the caller can fall back to the
+        generic ``claim_lost`` log event rather than crashing the tick.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT kind FROM dispatcher.agents "
+                    "WHERE issue_number = %s "
+                    "  AND status IN ('running', 'retrying') "
+                    "LIMIT 1",
+                    (issue_number,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None:
+            return None
+        kind = row[0]
+        if not isinstance(kind, str):
+            return None
+        return kind
 
     def _repo_root(self) -> Path:
         """Legacy "repo-shaped directory" used by non-git callers.
@@ -3423,6 +3511,7 @@ class DispatcherDaemon:
         phase: str,
         exit_code: int | None = None,
         pr_number: int | None = None,
+        issue_number: int | None = None,
     ) -> None:
         """UPDATE ``dispatcher.agents`` with terminal status + metadata.
 
@@ -3450,6 +3539,15 @@ class DispatcherDaemon:
         reached ralph) — the admin cockpit renders it with an
         amber/yellow "needs your eyes" chip because it IS actionable,
         unlike ``plan_blocked`` which is informational.
+
+        ``issue_number`` is optional (issue #2866). When provided, the
+        method clears the ``status/in-progress`` label on the issue so
+        the claim interlock releases. Call sites that don't pass it
+        (supervisor stuck-timeout sweep, generic retry paths) leave the
+        label attached — an operator / next scheduler cycle handles the
+        teardown, which is fine because those paths are rare edge cases
+        and the DB row is already marked terminal (the authoritative
+        interlock signal).
         """
         assert self._conn is not None, "connect() must run before update"
         terminal = status in (
@@ -3544,6 +3642,24 @@ class DispatcherDaemon:
                         "agent_id": agent_id,
                     },
                 )
+
+            # Issue #2866 claim-interlock teardown: on any terminal
+            # transition where the caller knows the issue number, remove
+            # the ``status/in-progress`` label so the issue stops being
+            # hidden from the queue scan filter and the operator-visible
+            # "in flight" signal clears. Wrapped in its own try/except so
+            # a GitHub API hiccup cannot roll back the DB write.
+            #
+            # The teardown is explicit-opt-in — callers thread
+            # ``issue_number`` through when they know it (orchestration
+            # hot path, diagnoser auto-fail). Call sites that don't
+            # (supervisor stuck-timeout sweep, generic retry paths)
+            # simply leave the label attached for the supervisor /
+            # operator to clean up. This keeps the hot DB path narrow
+            # (no extra SELECT, no test-fixture reshape) while still
+            # closing the common-case interlock.
+            if issue_number is not None:
+                self._gh_issue_remove_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
 
     def _spawn_phase_subprocess(
         self, phase: str, worktree: Path, agent_id: str
@@ -3689,7 +3805,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="claim", exit_code=None
+                agent_id,
+                status="failed",
+                phase="claim",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
 
@@ -3712,28 +3832,33 @@ class DispatcherDaemon:
         aborting before ralph / summary / push_and_pr leaves no
         GitHub-visible artifact.
         """
-        if self._check_killswitch_and_abort(agent_id, "claiming"):
+        if self._check_killswitch_and_abort(agent_id, "claiming", issue_number):
             return
         ok = self._run_plan_phase(agent_id, issue_number, worktree)
         if not ok:
             return
-        if self._check_killswitch_and_abort(agent_id, "planning"):
+        if self._check_killswitch_and_abort(agent_id, "planning", issue_number):
             return
         ok = self._run_ralph_phase(agent_id, issue_number, worktree)
         if not ok:
             return
-        if self._check_killswitch_and_abort(agent_id, "ralph"):
+        if self._check_killswitch_and_abort(agent_id, "ralph", issue_number):
             return
         ok = self._run_summary_phase(agent_id, issue_number, worktree)
         if not ok:
             return
-        if self._check_killswitch_and_abort(agent_id, "summary"):
+        if self._check_killswitch_and_abort(agent_id, "summary", issue_number):
             return
 
         # Daemon-side git commit + push + PR create.
         self._push_and_open_pr(agent_id, issue_number, worktree)
 
-    def _check_killswitch_and_abort(self, agent_id: str, after_phase: str) -> bool:
+    def _check_killswitch_and_abort(
+        self,
+        agent_id: str,
+        after_phase: str,
+        issue_number: int | None = None,
+    ) -> bool:
         """If the operator flipped ``concurrency_cap=0``, abort the run (#2847).
 
         Called between each orchestration phase. Returns True iff the
@@ -3746,6 +3871,11 @@ class DispatcherDaemon:
         log event to show where in the pipeline the kill landed. For
         the pre-plan check (a killswitch that fired during the claim
         itself) pass ``"claiming"``.
+
+        ``issue_number`` threads through to :meth:`_mark_agent_terminal`
+        so the claim-interlock ``status/in-progress`` label clears on
+        killswitch teardown (issue #2866). Optional for backward
+        compatibility with older call sites that don't know it.
         """
         if not self._pause_requested.is_set():
             return False
@@ -3768,6 +3898,7 @@ class DispatcherDaemon:
             status="failed",
             phase=KILLSWITCH_TERMINAL_PHASE,
             exit_code=None,
+            issue_number=issue_number,
         )
         return True
 
@@ -4531,7 +4662,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="planning", exit_code=None
+                agent_id,
+                status="failed",
+                phase="planning",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return False
 
@@ -4543,7 +4678,9 @@ class DispatcherDaemon:
         }
         self._write_phase_input(worktree, "plan", plan_input)
 
-        exit_code = self._run_subprocess_or_fail(agent_id, "plan", worktree)
+        exit_code = self._run_subprocess_or_fail(
+            agent_id, "plan", worktree, issue_number=issue_number
+        )
         if exit_code is None:
             return False
 
@@ -4560,7 +4697,11 @@ class DispatcherDaemon:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="planning", exit_code=exit_code
+                agent_id,
+                status="failed",
+                phase="planning",
+                exit_code=exit_code,
+                issue_number=issue_number,
             )
             return False
 
@@ -4610,7 +4751,11 @@ class DispatcherDaemon:
                 # failure of one does not prevent the others.
                 self._handle_plan_blocked(agent_id, issue_number, reason, worktree)
             self._mark_agent_terminal(
-                agent_id, status=status, phase="planning", exit_code=exit_code
+                agent_id,
+                status=status,
+                phase="planning",
+                exit_code=exit_code,
+                issue_number=issue_number,
             )
             return False
 
@@ -4636,7 +4781,9 @@ class DispatcherDaemon:
         }
         self._write_phase_input(worktree, "ralph", ralph_input)
 
-        exit_code = self._run_subprocess_or_fail(agent_id, "ralph", worktree)
+        exit_code = self._run_subprocess_or_fail(
+            agent_id, "ralph", worktree, issue_number=issue_number
+        )
         if exit_code is None:
             return False
 
@@ -4653,7 +4800,11 @@ class DispatcherDaemon:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="ralph", exit_code=exit_code
+                agent_id,
+                status="failed",
+                phase="ralph",
+                exit_code=exit_code,
+                issue_number=issue_number,
             )
             return False
 
@@ -4689,7 +4840,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="ralph", exit_code=exit_code
+                agent_id,
+                status="failed",
+                phase="ralph",
+                exit_code=exit_code,
+                issue_number=issue_number,
             )
             return False
 
@@ -4791,7 +4946,9 @@ class DispatcherDaemon:
         }
         self._write_phase_input(worktree, "summary", summary_input)
 
-        exit_code = self._run_subprocess_or_fail(agent_id, "summary", worktree)
+        exit_code = self._run_subprocess_or_fail(
+            agent_id, "summary", worktree, issue_number=issue_number
+        )
         if exit_code is None:
             return False
 
@@ -4808,7 +4965,11 @@ class DispatcherDaemon:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="summary", exit_code=exit_code
+                agent_id,
+                status="failed",
+                phase="summary",
+                exit_code=exit_code,
+                issue_number=issue_number,
             )
             return False
 
@@ -4861,7 +5022,11 @@ class DispatcherDaemon:
         return True
 
     def _run_subprocess_or_fail(
-        self, agent_id: str, phase: str, worktree: Path
+        self,
+        agent_id: str,
+        phase: str,
+        worktree: Path,
+        issue_number: int | None = None,
     ) -> int | None:
         """Run ``claude -p <phase>`` and log the outcome.
 
@@ -4880,6 +5045,11 @@ class DispatcherDaemon:
         fresh worktree. Tier-2/3 categories (``turn_limit`` → 3D;
         ``auth_fail`` → halt) leave the agent in ``status='failed'``
         for 3D's diagnoser to pick up.
+
+        ``issue_number`` threads through to :meth:`_mark_agent_terminal`
+        so the ``status/in-progress`` label clears on teardown
+        (issue #2866). Optional for backward compatibility with call
+        sites that don't know it yet.
         """
         try:
             exit_code, duration = self._spawn_phase_subprocess(
@@ -4904,6 +5074,7 @@ class DispatcherDaemon:
                 duration_s=None,
                 extra={"timeout_seconds": CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS},
                 worktree=worktree,
+                issue_number=issue_number,
             )
             return None
         except FileNotFoundError:
@@ -4931,7 +5102,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase=phase, exit_code=None
+                agent_id,
+                status="failed",
+                phase=phase,
+                exit_code=None,
+                issue_number=issue_number,
             )
             return None
         except Exception as exc:  # pragma: no cover — defensive catch
@@ -4947,7 +5122,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase=phase, exit_code=None
+                agent_id,
+                status="failed",
+                phase=phase,
+                exit_code=None,
+                issue_number=issue_number,
             )
             return None
 
@@ -4973,6 +5152,7 @@ class DispatcherDaemon:
                 duration_s=duration,
                 extra={},
                 worktree=worktree,
+                issue_number=issue_number,
             )
             return None
 
@@ -5000,6 +5180,7 @@ class DispatcherDaemon:
         duration_s: float | None,
         extra: dict[str, Any],
         worktree: Path | None = None,
+        issue_number: int | None = None,
     ) -> None:
         """Classify a subprocess failure, write failure row, enqueue retry.
 
@@ -5087,6 +5268,7 @@ class DispatcherDaemon:
             status="failed",
             phase=phase,
             exit_code=int(exit_code) if exit_code is not None else None,
+            issue_number=issue_number,
         )
 
         if category in AUTO_RETRY_CATEGORIES:
@@ -5247,7 +5429,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
 
@@ -5271,7 +5457,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
         if add_result.returncode != 0:
@@ -5286,7 +5476,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
 
@@ -5322,7 +5516,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
         if commit_result.returncode != 0:
@@ -5337,7 +5535,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
 
@@ -5371,7 +5573,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
         if push_result.returncode != 0:
@@ -5386,7 +5592,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
 
@@ -5432,7 +5642,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
         if pr_result.returncode != 0:
@@ -5447,7 +5661,11 @@ class DispatcherDaemon:
                 },
             )
             self._mark_agent_terminal(
-                agent_id, status="failed", phase="push_and_pr", exit_code=None
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
             )
             return
 
@@ -5491,6 +5709,7 @@ class DispatcherDaemon:
                 phase="needs_review",
                 exit_code=None,
                 pr_number=pr_number,
+                issue_number=issue_number,
             )
             return
 
@@ -10034,6 +10253,58 @@ class DispatcherDaemon:
                 "daemon.diagnoser_gh_label_nonzero",
                 extra={
                     "event": "diagnoser_gh_label_nonzero",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+
+    def _gh_issue_remove_labels(self, issue_number: int, labels: list[str]) -> None:
+        """Remove one or more labels via ``gh issue edit --remove-label``.
+
+        Mirror of :meth:`_gh_issue_add_labels`. Idempotent — removing a
+        label that is already absent is a no-op. Used by the claim
+        interlock (#2866) to drop the ``status/in-progress`` label on
+        agent terminal so the issue becomes re-claimable (for retries /
+        follow-ups) and operators see it is no longer active.
+        """
+        if not labels:
+            return
+        label_csv = ",".join(labels)
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "edit",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--remove-label",
+                    label_csv,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.label_remove_failed",
+                extra={
+                    "event": "label_remove_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.label_remove_nonzero",
+                extra={
+                    "event": "label_remove_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,

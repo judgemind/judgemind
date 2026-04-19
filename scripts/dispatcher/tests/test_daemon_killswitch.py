@@ -444,6 +444,7 @@ class TestOrchestrationPhasePause:
             status="failed",
             phase=daemon.KILLSWITCH_TERMINAL_PHASE,
             exit_code=None,
+            issue_number=42,
         )
         # Structured event logged so CloudWatch can confirm the abort.
         events = handler.events("orchestration_paused")
@@ -485,6 +486,7 @@ class TestOrchestrationPhasePause:
             status="failed",
             phase=daemon.KILLSWITCH_TERMINAL_PHASE,
             exit_code=None,
+            issue_number=42,
         )
         events = handler.events("orchestration_paused")
         assert len(events) == 1
@@ -653,6 +655,7 @@ class TestSyntheticMidClaimCapFlip:
                 status="failed",
                 phase=daemon.KILLSWITCH_TERMINAL_PHASE,
                 exit_code=None,
+                issue_number=42,
             )
             assert handler.events("orchestration_paused") != []
         finally:

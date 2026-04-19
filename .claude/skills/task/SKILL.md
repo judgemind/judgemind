@@ -154,6 +154,61 @@ Once MCP writes are unblocked (follow-up issue referenced from `docs/agent/gh-to
 - Format: `#<N> — <short title>` (drop any `[AREA]` prefix tag from the issue title)
 - Run: `/rename #<N> — <short title>`
 
+## Step 2a — Record claim in `dispatcher.agents` ledger (MANDATORY)
+
+**Why:** This is the shared claim interlock between `/task` subagents and the Fargate dispatcher daemon. Without it, a /task subagent you spawn on a `agent/ready` issue can race with the daemon's next queue scan — both will independently run the full plan → ralph → summary → PR pipeline on the same issue and produce duplicate PRs. Observed 2026-04-19 with #2856 (issue #2866). The daemon writes to `dispatcher.agents` via `_atomic_claim`; `/task` must do the same write so the partial UNIQUE INDEX on `(issue_number) WHERE status IN ('running', 'retrying')` catches the collision atomically in either direction.
+
+**Two-part interlock — both halves run here:**
+
+### Part A — DB row (atomic race detection)
+
+Run the helper (stays in the foreground — use `timeout: 1200000` since the ECS-Exec code path takes 2-4 s per call):
+
+```
+scripts/dispatcher/task_claim.py claim \
+    --issue <N> \
+    --agent-id <agent-id> \
+    --worktree-path {worktree}
+```
+
+The `<agent-id>` must be the id derived from the worktree directory name (e.g. `agent-a56f2e57`). Exit codes:
+
+- **`0`** — claim row inserted successfully. Continue to Part B.
+- **`2`** — **claim lost to a prior owner.** The helper printed a JSON payload on stdout with `owner_kind` (either `task` for the Fargate daemon or `task-skill` for another /task subagent) and `owner_agent_id`. Do **not** proceed — another worker owns this issue right now. Print the payload and stop. The operator will see the message and either wait for the other agent or cancel it.
+- **`1`** — unexpected error (DB down, dev-db-query.sh missing, auth problem). Surface the stderr message and stop.
+
+The helper uses `DATABASE_URL` when set (Fargate /task paths) and falls back to `scripts/dev-db-query.sh --rw` (laptop /task paths). Both shells write the same `kind='task-skill'` + `status='running'` row.
+
+### Part B — `status/in-progress` label (human-visible signal)
+
+Add the label so the operator sees the issue is being worked on AND the daemon's queue scan filter excludes it (belt-and-suspenders with Part A):
+
+```
+gh issue edit <N> --repo judgemind/judgemind --add-label status/in-progress
+```
+
+Idempotent — `gh` ignores the request if the label is already present.
+
+**MANDATORY teardown on terminal.** On any terminal state (PR merged, verification passed, blocker, investigation closed), run:
+
+```
+scripts/dispatcher/task_claim.py terminal \
+    --agent-id <agent-id> \
+    --status <succeeded|failed> \
+    [--pr-number <N>]
+
+gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+```
+
+Terminal status values:
+- `succeeded` — PR merged + deploy verified + evidence comment posted (normal success path).
+- `failed` — ralph STUCK, verification failed, task abandoned, or any other terminal non-success state.
+
+Both calls are idempotent and best-effort (exit 0 on rowcount=0 or label-already-absent).
+
+The teardown lives in the Path A/B per-step recipe below (A.8 step 4, B.2 step 3, and the STUCK-exit paths). Do not skip it — leaving the row at `status='running'` blocks the next /task or daemon claim on the same issue until the daemon's supervisor stuck-timeout sweep flips it to `crashed` (30 min), and the label keeps the issue hidden from the queue scan forever.
+
+---
 ---
 
 ## Step 3 — Create todo list for progress tracking
@@ -252,7 +307,12 @@ Skip this for Terraform-only or docs-only tasks.
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
 - **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see `docs/agent/code-standards.md` §Pre-PR Checks) and review your own diff before continuing.
 - **For ingestion/extraction pipeline tasks** (scraper changes, LLM prompt changes, enrichment logic): use the local dev stack to iterate. The local DB + S3 cache enables fast iteration without deploying to dev. Run `scripts/rebuild_db.sh --skip-reset` to re-process documents through the pipeline and verify data correctness against source documents. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify that extracted fields match the source document, not just that fields are populated.
-- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
+- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Before stopping, **release the claim interlock** (issue #2866) so the issue isn't permanently hidden from future agents:
+  ```
+  scripts/dispatcher/task_claim.py terminal --agent-id <agent-id> --status failed
+  gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+  ```
+  Then stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
 
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
@@ -427,6 +487,19 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 ```
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
+
+**Record terminal status in the `dispatcher.agents` ledger (issue #2866).** The claim row inserted in Step 2a must be closed out so the next /task or daemon claim on this issue can acquire the partial-UNIQUE-INDEX slot. Run this *before* A.8 deploy-watch so the slot releases promptly even if deploy verification drags:
+
+```
+scripts/dispatcher/task_claim.py terminal \
+    --agent-id <agent-id> \
+    --status succeeded \
+    --pr-number <PR-N>
+
+gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+```
+
+Best-effort — both commands exit 0 on no-op (row already terminal, label already absent). A failure here is logged but does not block A.8.
 
 #### A.8 — Verify deployment and post evidence (MANDATORY)
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
@@ -608,6 +681,18 @@ gh issue close <N> --repo judgemind/judgemind --reason completed
 ```
 
 **Close with a standard summary comment.** Only leave an investigation issue open if it genuinely requires human judgment that cannot be captured in a follow-up issue.
+
+**Record terminal status in the `dispatcher.agents` ledger (issue #2866).** The claim row inserted in Step 2a must be released so a future investigation or follow-up /task on this issue can acquire the partial-UNIQUE-INDEX slot:
+
+```
+scripts/dispatcher/task_claim.py terminal \
+    --agent-id <agent-id> \
+    --status succeeded
+
+gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+```
+
+Best-effort — both commands exit 0 on no-op (row already terminal, label already absent).
 
 #### B.3 — Unblock dependent issues
 
