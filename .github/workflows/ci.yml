@@ -76,6 +76,15 @@ jobs:
               # test_wait_for_rollout.sh fires on PRs that touch only the
               # composite action (which still calls the shared script).
               - '.github/actions/ecs-deploy/**'
+              # Dockerfile.dispatcher is the image the dispatcher daemon
+              # runs in; scripts-tests wires the check-dispatcher-image-deps
+              # guard that cross-checks its pip install list against
+              # scripts/dispatcher/**/*.py imports (#2776, motivated by
+              # the #2773 boto3 scope miss). Running scripts-tests on
+              # Dockerfile.dispatcher edits ensures that guard fires on
+              # PRs that only touch the Dockerfile (e.g. adding a new
+              # dep unrelated to a daemon code change).
+              - 'Dockerfile.dispatcher'
               # Also trigger when the scripts-tests job itself changes, so
               # regressions in the auto-discovery loop are caught on the
               # PR that introduces them (#2505). Mirrors the 'hooks' filter
@@ -558,6 +567,13 @@ jobs:
         run: scripts/check-no-inline-ecs-healthcheck.sh
       - name: Check docs describe the actual rebuild_db.py CLI
         run: scripts/check-no-rebuild-db-skip-reset.sh
+      # Cross-checks every non-stdlib import under scripts/dispatcher/ against
+      # the pip install step in Dockerfile.dispatcher. Motivated by the #2773
+      # boto3 scope miss (#2776): PR #2771 added `import boto3` but did not
+      # add boto3 to Dockerfile.dispatcher, and no test caught it because the
+      # daemon tests mock the client by method assignment.
+      - name: Verify dispatcher image installs every Python import used by the daemon
+        run: scripts/check-dispatcher-image-deps.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
       # that adding a new shell test is just `touch + chmod +x` — no

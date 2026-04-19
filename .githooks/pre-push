@@ -492,6 +492,38 @@ if [ -n "$changed_migrations" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Dispatcher image dependency drift — run when the daemon or its
+# Dockerfile changes (#2776)
+# -------------------------------------------------------------------
+# Cross-checks every non-stdlib import under scripts/dispatcher/ against
+# the pip install step in Dockerfile.dispatcher. Motivated by the #2773
+# boto3 scope miss: PR #2771 added `import boto3` inside the daemon but
+# did not add boto3 to Dockerfile.dispatcher. The daemon unit tests mock
+# the client by method assignment, so the image missing boto3 only
+# surfaced in production logs ~24h post-deploy. Mirrors the CI step so
+# the failure is caught locally before CI runs (~2 minute round trip).
+changed_dispatcher_deps=$(echo "$changed_files" \
+    | grep -E '^(scripts/dispatcher/.+\.py|Dockerfile\.dispatcher)$' || true)
+if [ -n "$changed_dispatcher_deps" ]; then
+    echo "pre-push: checking dispatcher image dependency drift..." >&2
+    if [ -x scripts/check-dispatcher-image-deps.sh ]; then
+        if ! scripts/check-dispatcher-image-deps.sh 2>&1; then
+            echo "" >&2
+            echo "  FAILED: scripts/check-dispatcher-image-deps.sh" >&2
+            echo "  A Python import under scripts/dispatcher/ is not installed" >&2
+            echo "  in Dockerfile.dispatcher. The dispatcher daemon will fail" >&2
+            echo "  at runtime with ModuleNotFoundError in production." >&2
+            echo "" >&2
+            echo "  Fix: add the missing package to the pip install step in" >&2
+            echo "  Dockerfile.dispatcher. See issue #2776 for background." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-dispatcher-image-deps.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Filename separator hygiene — always cheap, always run
 # -------------------------------------------------------------------
 # Flags same-directory filename pairs that differ only by `-` vs `_`
