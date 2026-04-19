@@ -1,4 +1,6 @@
-export const typeDefs = `#graphql
+import { dispatcherTypeDefs } from './dispatcher';
+
+const coreTypeDefs = `#graphql
   """A court jurisdiction. One row per court."""
   type Court {
     id: ID!
@@ -528,3 +530,8 @@ export const typeDefs = `#graphql
     toggleAlertSubscription(id: ID!, isActive: Boolean!): AlertSubscription!
   }
 `;
+
+// The dispatcher admin surface extends Query + Mutation via SDL `extend type`.
+// We concatenate rather than splitting into an array because Apollo Server 4
+// accepts either shape and this file's downstream importers assume a string.
+export const typeDefs = `${coreTypeDefs}\n\n${dispatcherTypeDefs}`;

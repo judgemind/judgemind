@@ -83,6 +83,16 @@ export const TEST_COUNTY_REGISTRY = {
     counties: [] as const,
     courtCodes: [] as const,
   },
+
+  /**
+   * dispatcher.integration.test.ts — dispatcher v2 admin GraphQL surface
+   *
+   * Does not seed court/county data — only user rows and dispatcher.* rows.
+   */
+  dispatcher: {
+    counties: [] as const,
+    courtCodes: [] as const,
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

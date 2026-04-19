@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 21 migrations.
+-- Generated from 22 migrations.
 
 
 
@@ -570,8 +570,12 @@ CREATE TABLE public.users (
     last_login_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    google_id text
+    google_id text,
+    is_admin boolean DEFAULT false NOT NULL
 );
+
+
+COMMENT ON COLUMN public.users.is_admin IS 'Grants access to the dispatcher admin GraphQL surface (§11). Orthogonal to users.role.';
 
 
 CREATE TABLE staging.captures (

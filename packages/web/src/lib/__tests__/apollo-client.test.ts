@@ -471,6 +471,85 @@ describe('createApolloClient', () => {
     expect(result!.cases.edges[2].node.id).toBe('case-3');
   });
 
+  it('caches multiple DispatcherFailure items without deduplication', async () => {
+    // Regression: DispatcherFailure has no `id` field — without the
+    // `keyFields: ['failureId']` entry in apollo-client.ts, Apollo would
+    // collapse distinct failure rows into a single cache entry (#1542).
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+    const { gql: clientGql } = await import('@apollo/client');
+    const stateQuery = clientGql`
+      query DispatcherState {
+        dispatcherState {
+          recentFailures {
+            failureId
+            category
+            detectedBy
+          }
+        }
+      }
+    `;
+    client.cache.writeQuery({
+      query: stateQuery,
+      data: {
+        dispatcherState: {
+          __typename: 'DispatcherState',
+          recentFailures: [
+            { __typename: 'DispatcherFailure', failureId: '1', category: 'hook_failure', detectedBy: 'hook:subagentstop' },
+            { __typename: 'DispatcherFailure', failureId: '2', category: 'hook_failure', detectedBy: 'hook:subagentstop' },
+            { __typename: 'DispatcherFailure', failureId: '3', category: 'subprocess_timeout', detectedBy: 'supervisor:timeout' },
+          ],
+        },
+      },
+    });
+    const result = client.cache.readQuery<{
+      dispatcherState: { recentFailures: Array<{ failureId: string; category: string }> };
+    }>({ query: stateQuery });
+    expect(result).not.toBeNull();
+    expect(result!.dispatcherState.recentFailures).toHaveLength(3);
+    const ids = result!.dispatcherState.recentFailures.map((f) => f.failureId);
+    expect(ids).toEqual(['1', '2', '3']);
+  });
+
+  it('caches multiple PhaseTransition items without deduplication', async () => {
+    const { createApolloClient } = await import('../apollo-client');
+    const client = createApolloClient();
+    const { gql: clientGql } = await import('@apollo/client');
+    const agentQuery = clientGql`
+      query DispatcherAgent($agentId: ID!) {
+        dispatcherAgent(agentId: $agentId) {
+          id
+          phaseTransitions { transitionId phase ts autocompactCount }
+        }
+      }
+    `;
+    client.cache.writeQuery({
+      query: agentQuery,
+      variables: { agentId: 'agent-1' },
+      data: {
+        dispatcherAgent: {
+          __typename: 'DispatcherAgent',
+          id: 'agent-1',
+          phaseTransitions: [
+            { __typename: 'PhaseTransition', transitionId: '10', phase: 'claiming', ts: '2026-04-18T19:00:00Z', autocompactCount: 0 },
+            { __typename: 'PhaseTransition', transitionId: '11', phase: 'ralph-worker', ts: '2026-04-18T19:05:00Z', autocompactCount: 0 },
+            { __typename: 'PhaseTransition', transitionId: '12', phase: 'pushing', ts: '2026-04-18T19:20:00Z', autocompactCount: 0 },
+          ],
+        },
+      },
+    });
+    const result = client.cache.readQuery<{
+      dispatcherAgent: { phaseTransitions: Array<{ transitionId: string; phase: string }> };
+    }>({ query: agentQuery, variables: { agentId: 'agent-1' } });
+    expect(result).not.toBeNull();
+    expect(result!.dispatcherAgent.phaseTransitions).toHaveLength(3);
+    expect(result!.dispatcherAgent.phaseTransitions.map((t) => t.phase)).toEqual([
+      'claiming',
+      'ralph-worker',
+      'pushing',
+    ]);
+  });
+
   it('caches multiple DataQualityOverview items without deduplication', async () => {
     const { createApolloClient } = await import('../apollo-client');
     const client = createApolloClient();

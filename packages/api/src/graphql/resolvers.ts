@@ -6,6 +6,7 @@ import type { AuthUser } from '../auth';
 import { authResolvers } from './auth-resolvers';
 import { alertResolvers } from './alert-resolvers';
 import { dataQualityResolvers } from './data-quality';
+import { dispatcherResolvers, dispatcherScalarResolvers } from './dispatcher';
 import { searchRulings } from '../search/search-rulings';
 import { getJudgeAnalytics, getMultipleJudgeAnalytics } from './judge-analytics';
 import { getPlatformStats } from './platform-stats-cache';
@@ -18,6 +19,12 @@ interface Context {
   reply: FastifyReply;
   cookieHeader: string;
   opensearch: Client;
+  /**
+   * `X-MFA-Token` header value, propagated per request. Consumed by the
+   * dispatcher admin surface for destructive-command re-auth. Null when
+   * the header is absent.
+   */
+  mfaToken: string | null;
 }
 
 type Row = Record<string, unknown>;
@@ -579,4 +586,17 @@ Object.assign(resolvers.Query, dataQualityResolvers.Query);
 Object.assign(resolvers, {
   DataQualityMetric: dataQualityResolvers.DataQualityMetric,
   DataQualityOverview: dataQualityResolvers.DataQualityOverview,
+});
+
+// Merge dispatcher admin resolvers (queries, mutation, nested types, scalars).
+// Queries + Mutations merge into the root objects; nested types (DispatcherState,
+// DispatcherAgent) are added alongside. Scalars (DateTime, JSON) are added as
+// their own top-level keys because Apollo Server looks them up by type name.
+Object.assign(resolvers.Query, dispatcherResolvers.Query);
+Object.assign(resolvers.Mutation, dispatcherResolvers.Mutation);
+Object.assign(resolvers, {
+  DispatcherState: dispatcherResolvers.DispatcherState,
+  DispatcherAgent: dispatcherResolvers.DispatcherAgent,
+  DateTime: dispatcherScalarResolvers.DateTime,
+  JSON: dispatcherScalarResolvers.JSON,
 });
