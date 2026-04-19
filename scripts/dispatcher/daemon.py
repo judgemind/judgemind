@@ -164,24 +164,69 @@ CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60
 
 #: Per-phase ``--max-turns`` values. Matches the frontmatter on each
 #: ``.claude/skills/task-v2-*/SKILL.md`` file. Sonnet-backed ralph gets
-#: the long tail; plan and summary stay tight.
+#: the long tail; plan and summary stay tight. Post-PR phases added
+#: in Phase 3B (#2787) — fix-ci is a targeted patch so 100 turns is
+#: generous; verify is read-mostly so 50 turns fits.
 PHASE_MAX_TURNS = {
     "plan": 50,
     "ralph": 500,
     "summary": 30,
+    "fix-ci": 100,
+    "verify": 50,
 }
 
 #: Per-phase ``--model`` values. Matches ``dispatcher.config.model_by_phase``
-#: seeded in migration 21.
+#: seeded in migration 21. Fix-ci uses Sonnet — the CI-fixing skill's
+#: own frontmatter selects it. Verify uses Haiku — it only reads the
+#: deploy status and poses structured evidence, no complex reasoning.
 PHASE_MODELS = {
     "plan": "opus",
     "ralph": "sonnet",
     "summary": "haiku",
+    "fix-ci": "sonnet",
+    "verify": "haiku",
 }
 
 #: The three happy-path phases 3A orchestrates, in execution order.
 #: Post-PR phases (``fix_ci``, ``verify``, ``retro``) are 3B-3E scope.
 PHASE_SEQUENCE = ("plan", "ralph", "summary")
+
+#: Maximum ``dispatcher.agents.retries_used`` before a fix-ci failure
+#: stops retrying and marks the agent failed. 3 matches spec §8 which
+#: also gates the diagnoser (``ci_red_after_retries``). After this
+#: ceiling the 3C/3D diagnoser escalation takes over.
+FIX_CI_MAX_RETRIES = 3
+
+#: Deploy workflow names we watch after a merge. If the merged commit
+#: triggers none of these (e.g. docs-only PR), the agent advances
+#: straight to verify with a "no deploy applicable" signal. Must match
+#: the ``name:`` field on each deploy workflow in ``.github/workflows/``.
+DEPLOY_WORKFLOW_NAMES = frozenset(
+    {
+        "Deploy API",
+        "Deploy Dispatcher",
+        "Deploy Scraper",
+        "Deploy Production",
+        "Deploy Production (Web)",
+        "Terraform",
+    }
+)
+
+#: Hard timeout on the ``gh pr view`` / ``gh run list`` / ``gh run view``
+#: / ``gh pr merge`` / ``gh issue comment`` subprocess calls used by
+#: ``_advance_running_agents``. Short enough to avoid leaking a
+#: supervisor tick (120s default) if GitHub is slow, long enough that
+#: a normal call (<3s) always finishes.
+GH_POLL_SUBPROCESS_TIMEOUT_SECONDS = 15
+
+#: Cap on how many ``failing_jobs`` entries we hand the fix-ci skill.
+#: Ten is already an unusually bad CI day and keeps the JSON payload
+#: bounded so the skill's context stays small.
+FIX_CI_MAX_FAILING_JOBS = 10
+
+#: Character cap per failing-job log tail handed to fix-ci. ~200 lines
+#: of CI output is typically well under this.
+FIX_CI_LOG_TAIL_MAX_CHARS = 20000
 
 #: Statuses that represent an in-flight claim. Mirrors the partial
 #: UNIQUE INDEX predicate in migration 25. Used by the candidate picker
@@ -379,11 +424,29 @@ class DispatcherDaemon:
           exit 0.
 
     What this daemon still does **NOT** do (deferred to later 3.x):
-        * Post-PR flow — CI watch, fix-ci, merge, deploy watch, verify,
-          retro (3B/3E).
-        * Retry markers / backoff (3C).
-        * Diagnoser (3D).
-        * Worktree cleanup (3E).
+        * Stuck-timeout detection (no phase transition for >30min) —
+          tracked in 3C.
+        * Retry markers / backoff for crash recovery — 3C.
+        * Diagnoser tier 2/3 (judgment-required failure analysis) — 3D.
+        * Retro spawn + worktree cleanup + ``concurrency_cap=1`` flip
+          — 3E.
+
+    **Phase 3B (#2787)** adds the post-PR transitions via
+    ``_advance_running_agents``, invoked from the supervisor tick:
+
+        * ``phase='awaiting_ci'`` → one-shot ``gh pr view`` poll:
+          pending → no-op; green → merge; red → spawn
+          ``/task-v2-fix-ci`` (up to ``FIX_CI_MAX_RETRIES`` times).
+        * ``phase='awaiting_deploy'`` → find the deploy runs triggered
+          by the merge commit, poll: in_progress → no-op;
+          success (or no applicable deploy) → spawn
+          ``/task-v2-verify`` and post evidence comment on the issue;
+          failure → mark agent failed for 3C/3D to handle.
+
+    Per-agent failures inside ``_advance_running_agents`` are caught
+    and logged as ``daemon.advance_failed``; the supervisor tick then
+    moves on to the next agent so one bad row cannot stall the
+    whole daemon.
     """
 
     def __init__(self, cfg: DaemonConfig, logger: logging.Logger):
@@ -2255,10 +2318,1346 @@ class DispatcherDaemon:
                 return int(match.group(1))
         return None
 
+    # ── Phase 3B post-PR orchestration (supervisor-tick step 3) ─────────
+    #
+    # 3B advances agents that 3A handed off in ``phase='awaiting_ci'``.
+    # Each supervisor tick calls ``_advance_running_agents``, which runs
+    # one-shot polls (no blocking ``gh run watch``) and promotes each
+    # agent by at most one state-machine step per tick. The 120s tick
+    # cadence is the effective poll interval.
+    #
+    #   awaiting_ci pending      → no-op (re-check next tick)
+    #   awaiting_ci all-green    → gh pr merge --squash → awaiting_deploy
+    #   awaiting_ci any-failed   → /task-v2-fix-ci subprocess
+    #       verdict=PATCHED      → git commit + push → awaiting_ci (retry)
+    #                              retries_used++; if > FIX_CI_MAX_RETRIES
+    #                              mark status=failed (3C/3D diagnoser)
+    #       verdict=BLOCKED      → mark status=failed with block_reason
+    #       verdict=FLAKY        → no-op; next tick re-polls (GitHub
+    #                              re-runs the flaky job on its own
+    #                              cadence or the operator nudges it)
+    #   awaiting_deploy pending  → no-op
+    #   awaiting_deploy success  → /task-v2-verify subprocess, post
+    #                              evidence comment, status=succeeded
+    #   awaiting_deploy no-run   → treat as "no deploy applicable",
+    #                              proceed to verify with skip-reason
+    #   awaiting_deploy failure  → mark status=failed (3C/3D escalates)
+    #
+    # All subprocess + ``gh`` operations happen in try/except wrappers;
+    # unhandled exceptions flip the agent to ``status='crashed'`` and
+    # the supervisor tick continues with the next agent.
+
+    def _list_advanceable_agents(self) -> list[dict[str, Any]]:
+        """Return agents waiting on CI or deploy, ready for a state step.
+
+        SELECT rows with ``status='running'`` and
+        ``phase IN ('awaiting_ci', 'awaiting_deploy')``. Returns a list
+        of small dicts with the fields the advance methods need —
+        ``agent_id``, ``issue_number``, ``phase``, ``pr_number``,
+        ``worktree_path``, ``retries_used``. An empty list is
+        returned on DB error (with a rollback), so the supervisor tick
+        can continue without this work.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+
+        agents: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, issue_number, phase, pr_number, "
+                    "       worktree_path, retries_used "
+                    "FROM dispatcher.agents "
+                    "WHERE status = 'running' "
+                    "  AND phase IN ('awaiting_ci', 'awaiting_deploy') "
+                    "ORDER BY started_at ASC",
+                )
+                for row in cur.fetchall():
+                    agents.append(
+                        {
+                            "agent_id": str(row[0]),
+                            "issue_number": int(row[1]),
+                            "phase": str(row[2]),
+                            "pr_number": int(row[3]) if row[3] is not None else None,
+                            "worktree_path": str(row[4]),
+                            "retries_used": int(row[5]) if row[5] is not None else 0,
+                        }
+                    )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.list_advanceable_failed",
+                extra={
+                    "event": "list_advanceable_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return []
+        return agents
+
+    def _advance_running_agents(self) -> int:
+        """Advance each running agent by at most one state-machine step.
+
+        Called from ``supervisor_tick``. One-shot polls only — no
+        blocking ``gh run watch``. Per-agent failures are caught and
+        logged as ``daemon.advance_failed`` with the agent flipped to
+        ``status='crashed'`` so 3C/3D can retry with a fresh worktree.
+
+        Returns the number of agents this tick touched (for logging).
+        The actual phase transition that each advance performed is
+        logged inline via ``daemon.pr_merged``, ``daemon.fix_ci_*``,
+        ``daemon.deploy_*``, and ``daemon.agent_completed`` events.
+        """
+        assert self._conn is not None, "connect() must run before advancing"
+
+        agents = self._list_advanceable_agents()
+        if not agents:
+            return 0
+
+        advanced = 0
+        for agent in agents:
+            agent_id = agent["agent_id"]
+            phase = agent["phase"]
+            try:
+                if phase == "awaiting_ci":
+                    self._advance_awaiting_ci(agent)
+                elif phase == "awaiting_deploy":
+                    self._advance_awaiting_deploy(agent)
+                else:  # pragma: no cover — SELECT filter guarantees this
+                    continue
+                advanced += 1
+            except Exception as exc:
+                # Unhandled exception in one agent's advance must not
+                # stall the daemon. Flip to ``status='crashed'`` so 3C
+                # picks it up with a fresh worktree.
+                self._log.exception(
+                    "daemon.advance_failed",
+                    extra={
+                        "event": "advance_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "phase": phase,
+                        "detail": str(exc),
+                    },
+                )
+                self._mark_agent_terminal(
+                    agent_id,
+                    status="crashed",
+                    phase=phase,
+                    exit_code=None,
+                )
+        return advanced
+
+    # ── awaiting_ci branch ──────────────────────────────────────────────
+
+    def _advance_awaiting_ci(self, agent: dict[str, Any]) -> None:
+        """One supervisor step for an ``awaiting_ci`` agent.
+
+        Polls the PR's combined check rollup via ``gh pr view``. Branches
+        on the aggregate state:
+
+        * **Pending** (any check in_progress/queued) — no-op; re-check
+          next supervisor tick.
+        * **Green** (all SUCCESS/SKIPPED + ``mergeable=MERGEABLE`` +
+          ``mergeStateStatus=CLEAN``) — merge with squash, transition
+          ``phase='awaiting_deploy'``.
+        * **Red** (any FAILURE/CANCELLED/TIMED_OUT/ACTION_REQUIRED) —
+          spawn ``/task-v2-fix-ci``. Verdict PATCHED applies the patch
+          + pushes + stays in awaiting_ci with ``retries_used++``.
+          Verdicts BLOCKED / max-retries-exceeded mark failed.
+        """
+        agent_id = agent["agent_id"]
+        pr_number = agent["pr_number"]
+
+        if pr_number is None:
+            # 3A should never produce an ``awaiting_ci`` row without a
+            # PR number. If it does, that's a 3A bug — mark failed and
+            # log so operators see it.
+            self._log.warning(
+                "daemon.awaiting_ci_missing_pr",
+                extra={
+                    "event": "awaiting_ci_missing_pr",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
+        pr_status = self._fetch_pr_status(pr_number)
+        if pr_status is None:
+            # Transient GitHub error — log and re-check next tick. No
+            # terminal transition; the agent keeps its awaiting_ci phase.
+            return
+
+        rollup_state = self._classify_check_rollup(pr_status)
+        self._log.info(
+            "daemon.ci_poll",
+            extra={
+                "event": "ci_poll",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "rollup_state": rollup_state,
+                "mergeable": pr_status.get("mergeable"),
+                "merge_state_status": pr_status.get("mergeStateStatus"),
+            },
+        )
+
+        if rollup_state == "pending":
+            return
+
+        if rollup_state == "green":
+            self._merge_pr_and_advance(agent, pr_status)
+            return
+
+        # rollup_state == "red"
+        self._run_fix_ci(agent, pr_status)
+
+    def _fetch_pr_status(self, pr_number: int) -> dict[str, Any] | None:
+        """Fetch the combined check rollup + merge state for a PR.
+
+        Runs ``gh pr view --json statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit``
+        as a one-shot call (no blocking watch). Returns the parsed JSON
+        dict, or ``None`` on subprocess failure (logged as a warning so
+        the supervisor can retry next tick).
+        """
+        cmd = [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--json",
+            "statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError:
+            self._log.warning(
+                "daemon.gh_missing",
+                extra={
+                    "event": "gh_missing",
+                    "run_id": self._run_id,
+                    "pr_number": pr_number,
+                },
+            )
+            return None
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.pr_view_timeout",
+                extra={
+                    "event": "pr_view_timeout",
+                    "run_id": self._run_id,
+                    "pr_number": pr_number,
+                },
+            )
+            return None
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.pr_view_failed",
+                extra={
+                    "event": "pr_view_failed",
+                    "run_id": self._run_id,
+                    "pr_number": pr_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+            return None
+
+        try:
+            return json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            self._log.warning(
+                "daemon.pr_view_invalid_json",
+                extra={
+                    "event": "pr_view_invalid_json",
+                    "run_id": self._run_id,
+                    "pr_number": pr_number,
+                },
+            )
+            return None
+
+    @staticmethod
+    def _classify_check_rollup(pr_status: dict[str, Any]) -> str:
+        """Return ``'green'``, ``'red'``, or ``'pending'`` for a PR status.
+
+        Logic:
+
+        * Any check in ``IN_PROGRESS`` / ``QUEUED`` / ``PENDING`` /
+          ``WAITING`` → ``'pending'`` (even if others failed — we must
+          wait for the full signal before deciding).
+        * If no pending and any check in ``FAILURE`` / ``CANCELLED`` /
+          ``TIMED_OUT`` / ``ACTION_REQUIRED`` → ``'red'``.
+        * All ``SUCCESS`` / ``SKIPPED`` / ``NEUTRAL`` / ``STALE`` AND
+          ``mergeable='MERGEABLE'`` AND ``mergeStateStatus='CLEAN'`` →
+          ``'green'``.
+        * Otherwise (mergeable=false, conflicting, etc.) → ``'red'``
+          so the fix-ci path runs.
+
+        Accepts both Actions-style (``status``/``conclusion``) and
+        legacy-commit-status-style (``state``) rollup entries so it
+        works with whatever mix ``gh pr view --json statusCheckRollup``
+        returns.
+        """
+        rollup = pr_status.get("statusCheckRollup") or []
+
+        pending_statuses = {"IN_PROGRESS", "QUEUED", "PENDING", "WAITING"}
+        # Values GitHub uses for a failed Actions check.
+        failure_conclusions = {
+            "FAILURE",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+        }
+        # Legacy commit-status states.
+        legacy_pending = {"PENDING", "EXPECTED"}
+        legacy_failure = {"FAILURE", "ERROR"}
+
+        has_pending = False
+        has_failure = False
+
+        for check in rollup:
+            if not isinstance(check, dict):
+                continue
+            # Actions-style.
+            raw_status = check.get("status")
+            raw_conclusion = check.get("conclusion")
+            if raw_status is not None:
+                status_up = str(raw_status).upper()
+                conclusion_up = (
+                    str(raw_conclusion).upper() if raw_conclusion is not None else ""
+                )
+                if status_up == "COMPLETED":
+                    if conclusion_up in failure_conclusions:
+                        has_failure = True
+                elif status_up in pending_statuses:
+                    has_pending = True
+                continue
+            # Legacy commit-status-style.
+            raw_state = check.get("state")
+            if raw_state is not None:
+                state_up = str(raw_state).upper()
+                if state_up in legacy_pending:
+                    has_pending = True
+                elif state_up in legacy_failure:
+                    has_failure = True
+
+        if has_pending:
+            return "pending"
+        if has_failure:
+            return "red"
+
+        mergeable = str(pr_status.get("mergeable") or "").upper()
+        merge_state = str(pr_status.get("mergeStateStatus") or "").upper()
+        if mergeable == "MERGEABLE" and merge_state == "CLEAN":
+            return "green"
+
+        # Checks all green but PR not mergeable (conflicts, branch
+        # protection unmet, etc.) — treat as red so fix-ci can try.
+        return "red"
+
+    def _merge_pr_and_advance(
+        self, agent: dict[str, Any], pr_status: dict[str, Any]
+    ) -> None:
+        """Squash-merge the PR, record the merge SHA, advance to deploy."""
+        agent_id = agent["agent_id"]
+        pr_number = agent["pr_number"]
+
+        cmd = [
+            "gh",
+            "pr",
+            "merge",
+            str(pr_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--squash",
+            "--delete-branch",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS * 2,
+                check=False,
+            )
+        except FileNotFoundError:
+            self._log.warning(
+                "daemon.gh_missing",
+                extra={
+                    "event": "gh_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            return
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.pr_merge_timeout",
+                extra={
+                    "event": "pr_merge_timeout",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                },
+            )
+            return
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.pr_merge_failed",
+                extra={
+                    "event": "pr_merge_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+            return
+
+        # Extract the merge commit SHA from the PR status if available;
+        # fall back to re-fetching once after the merge.
+        merge_sha = self._extract_merge_sha(pr_status)
+        if not merge_sha:
+            refreshed = self._fetch_pr_status(pr_number)
+            if refreshed is not None:
+                merge_sha = self._extract_merge_sha(refreshed)
+
+        self._update_agent_phase(agent_id, "awaiting_deploy")
+        self._log.info(
+            "daemon.pr_merged",
+            extra={
+                "event": "pr_merged",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "merge_sha": merge_sha,
+            },
+        )
+
+    @staticmethod
+    def _extract_merge_sha(pr_status: dict[str, Any]) -> str | None:
+        """Return the merge commit SHA from a ``gh pr view`` payload.
+
+        ``--json mergeCommit`` returns ``{"mergeCommit": {"oid": "..."}}``
+        for merged PRs. Before the merge lands it can be null. We fall
+        back to ``headRefOid`` as a last resort since squash-merges
+        produce a fresh commit on main, but the head SHA is at least
+        a useful correlation key for the deploy-run finder.
+        """
+        merge_commit = pr_status.get("mergeCommit")
+        if isinstance(merge_commit, dict):
+            oid = merge_commit.get("oid")
+            if isinstance(oid, str) and oid:
+                return oid
+        head = pr_status.get("headRefOid")
+        if isinstance(head, str) and head:
+            return head
+        return None
+
+    def _run_fix_ci(self, agent: dict[str, Any], pr_status: dict[str, Any]) -> None:
+        """Gather failing-job logs, spawn ``/task-v2-fix-ci``, handle verdict.
+
+        Escalates to ``status='failed'`` when ``retries_used >=
+        FIX_CI_MAX_RETRIES`` (spec §8 ``ci_red_after_retries``). On
+        ``PATCHED`` verdict, applies the patch via ``git add -A`` +
+        ``git commit`` + ``git push``, increments ``retries_used``, and
+        leaves the agent in ``awaiting_ci`` so the next supervisor
+        tick re-polls. On ``BLOCKED`` — mark failed. On ``FLAKY`` —
+        no-op; let the next tick re-poll (GitHub may re-run flaky jobs
+        automatically, or the operator can nudge).
+        """
+        agent_id = agent["agent_id"]
+        pr_number = agent["pr_number"]
+        issue_number = agent["issue_number"]
+        worktree = Path(agent["worktree_path"])
+        retries_used = agent["retries_used"]
+
+        if retries_used >= FIX_CI_MAX_RETRIES:
+            self._log.warning(
+                "daemon.fix_ci_max_retries_exceeded",
+                extra={
+                    "event": "fix_ci_max_retries_exceeded",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "retries_used": retries_used,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
+        # Build fix-ci input bundle.
+        failing_jobs = self._extract_failing_jobs(pr_status)
+        git_diff = self._fetch_pr_diff(worktree, pr_number)
+        branch = self._branch_for_agent(agent_id)
+
+        fix_ci_input = {
+            "agent_id": agent_id,
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "branch": branch,
+            "failing_jobs": failing_jobs,
+            "git_diff_base_to_head": git_diff,
+            "worktree_path": str(worktree),
+            "repo_root": str(worktree),
+            "previous_fix_attempts": retries_used,
+        }
+        self._write_phase_input(worktree, "fix-ci", fix_ci_input)
+
+        self._log.info(
+            "daemon.fix_ci_started",
+            extra={
+                "event": "fix_ci_started",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "failing_job_count": len(failing_jobs),
+                "retries_used": retries_used,
+            },
+        )
+
+        exit_code = self._run_subprocess_or_fail(agent_id, "fix-ci", worktree)
+        if exit_code is None:
+            # Subprocess infra failure — agent already marked failed
+            # inside _run_subprocess_or_fail. Stop.
+            return
+
+        fix_ci_output = self._read_phase_output(worktree, "fix-ci")
+        if fix_ci_output is None:
+            self._log.warning(
+                "daemon.phase_output_missing",
+                extra={
+                    "event": "phase_output_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": "fix-ci",
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=exit_code
+            )
+            return
+
+        self._persist_phase_output(agent_id, "fix-ci", fix_ci_output)
+        verdict = str(fix_ci_output.get("verdict") or "").upper()
+
+        if verdict == "PATCHED":
+            self._apply_fix_ci_patch(agent, fix_ci_output)
+            return
+        if verdict == "FLAKY":
+            # No code change. Next tick will re-poll; GitHub's flaky
+            # re-run path or a manual nudge resolves eventually.
+            self._log.info(
+                "daemon.fix_ci_flaky",
+                extra={
+                    "event": "fix_ci_flaky",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "flaky_evidence": fix_ci_output.get("flaky_evidence"),
+                },
+            )
+            return
+        # verdict == "BLOCKED" or unrecognized
+        self._log.warning(
+            "daemon.fix_ci_blocked",
+            extra={
+                "event": "fix_ci_blocked",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "verdict": verdict,
+                "block_reason": fix_ci_output.get("block_reason"),
+            },
+        )
+        self._mark_agent_terminal(
+            agent_id, status="failed", phase="awaiting_ci", exit_code=exit_code
+        )
+
+    @staticmethod
+    def _extract_failing_jobs(pr_status: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pull the failing check-run entries out of the PR rollup.
+
+        Returns a list of ``{name, conclusion, databaseId, detailsUrl}``
+        dicts — the daemon fills ``log_tail`` later via
+        ``_fetch_job_log_tail``. Capped at ``FIX_CI_MAX_FAILING_JOBS``
+        to bound the payload size handed to fix-ci.
+        """
+        failure_conclusions = {
+            "FAILURE",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+        }
+        rollup = pr_status.get("statusCheckRollup") or []
+        failing: list[dict[str, Any]] = []
+        for check in rollup:
+            if not isinstance(check, dict):
+                continue
+            conclusion = str(check.get("conclusion") or "").upper()
+            status = str(check.get("status") or "").upper()
+            if status == "COMPLETED" and conclusion in failure_conclusions:
+                failing.append(
+                    {
+                        "name": check.get("name") or check.get("context") or "",
+                        "conclusion": conclusion,
+                        "databaseId": check.get("databaseId"),
+                        "detailsUrl": check.get("detailsUrl"),
+                    }
+                )
+            if len(failing) >= FIX_CI_MAX_FAILING_JOBS:
+                break
+        return failing
+
+    def _fetch_pr_diff(self, worktree: Path, pr_number: int) -> str:
+        """Return the PR's full base-to-head diff, empty string on error."""
+        cmd = [
+            "gh",
+            "pr",
+            "diff",
+            str(pr_number),
+            "--repo",
+            self._cfg.github_repo,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout or ""
+
+    def _branch_for_agent(self, agent_id: str) -> str:
+        """Return the agent's branch name derived from agent_id."""
+        short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
+        return f"agent/{short_id}"
+
+    def _apply_fix_ci_patch(
+        self, agent: dict[str, Any], fix_ci_output: dict[str, Any]
+    ) -> None:
+        """Stage + commit + push the fix-ci patch; stay in awaiting_ci.
+
+        The fix-ci skill left the patch in the worktree's working tree;
+        ``changed_files`` is the list of files it touched. We run
+        ``git add -A`` (the skill may have created new files too),
+        ``git commit -F <msg-file>``, and ``git push``. On success,
+        increment ``retries_used`` and leave the agent in
+        ``awaiting_ci`` so the next supervisor tick re-polls.
+        """
+        agent_id = agent["agent_id"]
+        worktree = Path(agent["worktree_path"])
+        branch = self._branch_for_agent(agent_id)
+        retries_used = agent["retries_used"]
+
+        commit_message = str(fix_ci_output.get("commit_message") or "").strip()
+        if not commit_message:
+            self._log.warning(
+                "daemon.fix_ci_missing_commit_message",
+                extra={
+                    "event": "fix_ci_missing_commit_message",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
+        # git add -A
+        try:
+            add_result = subprocess.run(
+                ["git", "-C", str(worktree), "add", "-A"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.fix_ci_git_add_failed",
+                extra={
+                    "event": "fix_ci_git_add_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+        if add_result.returncode != 0:
+            self._log.warning(
+                "daemon.fix_ci_git_add_failed",
+                extra={
+                    "event": "fix_ci_git_add_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "exit_code": add_result.returncode,
+                    "stderr_tail": (add_result.stderr or "")[:200],
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
+        # git commit -F <file>
+        commit_msg_path = worktree / "tmp" / "commit_msg_fix_ci.txt"
+        commit_msg_path.parent.mkdir(parents=True, exist_ok=True)
+        commit_msg_path.write_text(commit_message)
+
+        try:
+            commit_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "commit",
+                    "-F",
+                    str(commit_msg_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.fix_ci_git_commit_failed",
+                extra={
+                    "event": "fix_ci_git_commit_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+        if commit_result.returncode != 0:
+            # ``git commit`` exits non-zero if nothing is staged —
+            # that means the skill reported PATCHED but wrote no diff.
+            # Treat as block.
+            self._log.warning(
+                "daemon.fix_ci_git_commit_failed",
+                extra={
+                    "event": "fix_ci_git_commit_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "exit_code": commit_result.returncode,
+                    "stderr_tail": (commit_result.stderr or "")[:200],
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
+        # git push
+        try:
+            push_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "push",
+                    "origin",
+                    branch,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.fix_ci_git_push_failed",
+                extra={
+                    "event": "fix_ci_git_push_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+        if push_result.returncode != 0:
+            self._log.warning(
+                "daemon.fix_ci_git_push_failed",
+                extra={
+                    "event": "fix_ci_git_push_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "exit_code": push_result.returncode,
+                    "stderr_tail": (push_result.stderr or "")[:200],
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
+        # Success — bump retries_used, leave awaiting_ci for next tick.
+        self._increment_retries_used(agent_id)
+        self._log.info(
+            "daemon.fix_ci_patched",
+            extra={
+                "event": "fix_ci_patched",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "new_retries_used": retries_used + 1,
+                "commit_message": commit_message,
+            },
+        )
+
+    def _increment_retries_used(self, agent_id: str) -> None:
+        """UPDATE ``dispatcher.agents.retries_used = retries_used + 1``."""
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET retries_used = retries_used + 1 "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.increment_retries_failed",
+                extra={
+                    "event": "increment_retries_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
+    # ── awaiting_deploy branch ──────────────────────────────────────────
+
+    def _advance_awaiting_deploy(self, agent: dict[str, Any]) -> None:
+        """One supervisor step for an ``awaiting_deploy`` agent.
+
+        Finds the deploy runs triggered by the merge commit, polls
+        their conclusions, and advances to verify on success / treats
+        doc-only PRs as "no deploy applicable".
+        """
+        agent_id = agent["agent_id"]
+        pr_number = agent["pr_number"]
+
+        if pr_number is None:  # pragma: no cover — 3A always sets pr_number
+            self._log.warning(
+                "daemon.awaiting_deploy_missing_pr",
+                extra={
+                    "event": "awaiting_deploy_missing_pr",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_deploy", exit_code=None
+            )
+            return
+
+        pr_status = self._fetch_pr_status(pr_number)
+        if pr_status is None:
+            return  # transient — retry next tick
+        merge_sha = self._extract_merge_sha(pr_status)
+        if not merge_sha:
+            self._log.warning(
+                "daemon.awaiting_deploy_no_merge_sha",
+                extra={
+                    "event": "awaiting_deploy_no_merge_sha",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                },
+            )
+            return  # next tick might see it
+
+        deploy_runs = self._find_deploy_runs(merge_sha)
+        # ``deploy_runs=[]`` means no matching deploy workflow fired on
+        # that SHA. Treat as "no deploy applicable" and proceed to verify.
+        deploy_state = self._classify_deploy_runs(deploy_runs)
+        self._log.info(
+            "daemon.deploy_poll",
+            extra={
+                "event": "deploy_poll",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "merge_sha": merge_sha,
+                "deploy_state": deploy_state,
+                "deploy_run_count": len(deploy_runs),
+            },
+        )
+        if deploy_state == "pending":
+            return
+        if deploy_state == "failure":
+            self._log.warning(
+                "daemon.deploy_failed",
+                extra={
+                    "event": "deploy_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "merge_sha": merge_sha,
+                    "deploy_runs": deploy_runs,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_deploy", exit_code=None
+            )
+            return
+
+        # deploy_state in ("success", "none") — run verify.
+        self._run_verify_and_complete(agent, pr_status, merge_sha, deploy_runs)
+
+    def _find_deploy_runs(self, merge_sha: str) -> list[dict[str, Any]]:
+        """Return deploy-workflow runs whose ``headSha`` equals ``merge_sha``.
+
+        Runs ``gh run list --commit <sha> --json
+        databaseId,workflowName,status,conclusion,createdAt`` and filters
+        by ``workflowName in DEPLOY_WORKFLOW_NAMES``. Returns an empty
+        list if no deploy workflow fired on that SHA (doc-only PRs)
+        or on subprocess failure.
+        """
+        cmd = [
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            self._cfg.github_repo,
+            "--commit",
+            merge_sha,
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt",
+            "--limit",
+            "20",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.run_list_failed",
+                extra={
+                    "event": "run_list_failed",
+                    "run_id": self._run_id,
+                    "merge_sha": merge_sha,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "")[:200],
+                },
+            )
+            return []
+        try:
+            payload = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        runs: list[dict[str, Any]] = []
+        for run in payload:
+            if not isinstance(run, dict):
+                continue
+            if run.get("workflowName") in DEPLOY_WORKFLOW_NAMES:
+                runs.append(run)
+        return runs
+
+    @staticmethod
+    def _classify_deploy_runs(runs: list[dict[str, Any]]) -> str:
+        """Return ``'pending'``, ``'success'``, ``'failure'``, or ``'none'``.
+
+        * ``none`` — no deploy run matched (doc-only PR etc.).
+        * ``pending`` — any run in a non-terminal state.
+        * ``failure`` — at least one run terminal with failure-type
+          conclusion.
+        * ``success`` — all runs terminal with success/skipped/neutral.
+        """
+        if not runs:
+            return "none"
+        success_conclusions = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+        has_pending = False
+        has_failure = False
+        for run in runs:
+            status = str(run.get("status") or "").upper()
+            if status != "COMPLETED":
+                # Any non-terminal status means the deploy is still
+                # running / queued / waiting. Classify as pending and
+                # re-poll next tick.
+                has_pending = True
+                continue
+            conclusion = str(run.get("conclusion") or "").upper()
+            if conclusion in success_conclusions:
+                continue
+            has_failure = True
+        if has_pending:
+            return "pending"
+        if has_failure:
+            return "failure"
+        return "success"
+
+    # ── verify (final) ──────────────────────────────────────────────────
+
+    def _run_verify_and_complete(
+        self,
+        agent: dict[str, Any],
+        pr_status: dict[str, Any],
+        merge_sha: str,
+        deploy_runs: list[dict[str, Any]],
+    ) -> None:
+        """Spawn ``/task-v2-verify``, post evidence comment, mark succeeded."""
+        agent_id = agent["agent_id"]
+        issue_number = agent["issue_number"]
+        pr_number = agent["pr_number"]
+        worktree = Path(agent["worktree_path"])
+
+        # Fetch the issue bundle for acceptance criteria. Best-effort —
+        # the verify skill tolerates an empty AC list with a failure row.
+        try:
+            bundle = self._fetch_issue_bundle(issue_number)
+        except RuntimeError:
+            bundle = {
+                "issue_number": issue_number,
+                "issue_title": "",
+                "issue_body": "",
+                "issue_comments": [],
+                "issue_labels": [],
+                "blocked_by": [],
+                "parent_issue": None,
+            }
+
+        acceptance_criteria = self._extract_acceptance_criteria(
+            bundle.get("issue_body") or ""
+        )
+
+        # Pick a representative deploy run for the input bundle. Prefer
+        # the first non-SKIPPED success; fall back to the first entry.
+        deploy_status = self._select_deploy_status(deploy_runs)
+        change_type = self._infer_change_type(deploy_runs)
+
+        verify_input = {
+            "agent_id": agent_id,
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "acceptance_criteria": acceptance_criteria,
+            "change_type": change_type,
+            "touched_services": self._touched_services_from_runs(deploy_runs),
+            "deploy_status": deploy_status,
+            "merged_commit_sha": merge_sha,
+            "worktree_path": str(worktree),
+            "repo_root": str(worktree),
+        }
+        self._write_phase_input(worktree, "verify", verify_input)
+
+        self._log.info(
+            "daemon.verify_started",
+            extra={
+                "event": "verify_started",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "change_type": change_type,
+                "deploy_applicable": deploy_status is not None,
+            },
+        )
+
+        exit_code = self._run_subprocess_or_fail(agent_id, "verify", worktree)
+        if exit_code is None:
+            return  # subprocess failure already marked failed
+
+        verify_output = self._read_phase_output(worktree, "verify")
+        if verify_output is None:
+            self._log.warning(
+                "daemon.phase_output_missing",
+                extra={
+                    "event": "phase_output_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": "verify",
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_deploy", exit_code=exit_code
+            )
+            return
+
+        self._persist_phase_output(agent_id, "verify", verify_output)
+
+        evidence_md = str(verify_output.get("evidence_md") or "").strip()
+        if evidence_md:
+            self._post_evidence_comment(agent_id, issue_number, worktree, evidence_md)
+        else:
+            self._log.warning(
+                "daemon.verify_missing_evidence_md",
+                extra={
+                    "event": "verify_missing_evidence_md",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+
+        verdict = str(verify_output.get("verdict") or "").upper()
+        if verdict == "FAILED":
+            self._log.warning(
+                "daemon.verify_failed",
+                extra={
+                    "event": "verify_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "failure_reason": verify_output.get("failure_reason"),
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="done", exit_code=exit_code
+            )
+            return
+
+        # VERIFIED or SKIPPED — either is a success for the daemon.
+        self._mark_agent_terminal(
+            agent_id, status="succeeded", phase="done", exit_code=0
+        )
+        self._log.info(
+            "daemon.agent_completed",
+            extra={
+                "event": "agent_completed",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "merge_sha": merge_sha,
+                "verdict": verdict,
+            },
+        )
+
+    @staticmethod
+    def _extract_acceptance_criteria(body: str) -> list[str]:
+        """Pull ``- [ ] …`` checkboxes out of the issue body.
+
+        Matches any task-list style checkbox (checked or unchecked), so
+        a partially-checked AC still ends up in the list. Returns the
+        text after the checkbox, stripped. Skips the verification
+        checkboxes that live under ``### Post-deploy verification`` or
+        under an ``### Automated checks`` heading, since those are
+        workflow chrome, not issue-level ACs.
+        """
+        import re  # noqa: PLC0415
+
+        lines = body.splitlines()
+        skip_sections = {"post-deploy verification", "automated checks", "test plan"}
+        in_skip_section = False
+        criteria: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                # Headings reset the skip-section state.
+                heading_text = stripped.lstrip("#").strip().lower()
+                in_skip_section = any(tag in heading_text for tag in skip_sections)
+                continue
+            if in_skip_section:
+                continue
+            match = re.match(r"^\s*-\s*\[[ xX]\]\s*(.+)$", line)
+            if match:
+                criteria.append(match.group(1).strip())
+        return criteria
+
+    @staticmethod
+    def _select_deploy_status(
+        deploy_runs: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Pick one deploy run to describe in the verify input bundle.
+
+        Returns ``None`` when no deploy fired (doc-only PR). Otherwise
+        returns ``{workflow_name, run_id, conclusion, duration_s}`` from
+        the first entry (deploy workflows are usually single-run per
+        commit; multiple runs get picked up pairwise for logging, but
+        verify only needs one for its ``deploy_status`` field).
+        """
+        if not deploy_runs:
+            return None
+        first = deploy_runs[0]
+        return {
+            "workflow_name": first.get("workflowName"),
+            "run_id": first.get("databaseId"),
+            "conclusion": first.get("conclusion"),
+            "duration_s": None,
+        }
+
+    @staticmethod
+    def _infer_change_type(deploy_runs: list[dict[str, Any]]) -> str:
+        """Map the first matching deploy workflow to a ``change_type`` tag.
+
+        The verify skill's ``change_type`` field drives its
+        verification path. If no deploy fired, return
+        ``no_deployed_component`` so the skill emits a SKIPPED verdict.
+        """
+        if not deploy_runs:
+            return "no_deployed_component"
+        # Most-specific match wins.
+        name_to_type = {
+            "Deploy API": "api",
+            "Deploy Dispatcher": "dx_tooling",
+            "Deploy Scraper": "scraper",
+            "Deploy Production": "web",
+            "Deploy Production (Web)": "web",
+            "Terraform": "dx_tooling",
+        }
+        for run in deploy_runs:
+            mapped = name_to_type.get(str(run.get("workflowName") or ""))
+            if mapped:
+                return mapped
+        return "dx_tooling"
+
+    @staticmethod
+    def _touched_services_from_runs(
+        deploy_runs: list[dict[str, Any]],
+    ) -> list[str]:
+        """Return the ECS service names the deploy workflows affected."""
+        name_to_service = {
+            "Deploy API": "judgemind-api-dev",
+            "Deploy Dispatcher": "judgemind-dispatcher-dev",
+            "Deploy Scraper": "judgemind-scraper-dev",
+        }
+        services: list[str] = []
+        for run in deploy_runs:
+            svc = name_to_service.get(str(run.get("workflowName") or ""))
+            if svc and svc not in services:
+                services.append(svc)
+        return services
+
+    def _post_evidence_comment(
+        self,
+        agent_id: str,
+        issue_number: int,
+        worktree: Path,
+        evidence_md: str,
+    ) -> None:
+        """Post the verify skill's ``evidence_md`` as an issue comment.
+
+        Uses ``gh issue comment --body-file`` to avoid shell-quoting the
+        markdown body. Writes the file into the worktree's ``tmp/`` so
+        every subprocess sees the same filesystem layout.
+        """
+        evidence_path = worktree / "tmp" / "verification_evidence.md"
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(evidence_md)
+
+        cmd = [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--body-file",
+            str(evidence_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            self._log.warning(
+                "daemon.evidence_comment_failed",
+                extra={
+                    "event": "evidence_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "reason": "subprocess",
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.evidence_comment_failed",
+                extra={
+                    "event": "evidence_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "")[:200],
+                },
+            )
+            return
+        self._log.info(
+            "daemon.evidence_comment_posted",
+            extra={
+                "event": "evidence_comment_posted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "evidence_chars": len(evidence_md),
+            },
+        )
+
     # ── supervisor tick (every ``tick_supervisor_seconds``) ─────────────
 
     def supervisor_tick(self) -> dict[str, int]:
-        """Run one supervisor tick. Writes heartbeat; emits CW metric."""
+        """Run one supervisor tick. Writes heartbeat; advances running agents.
+
+        Steps (in order):
+            1. UPDATE ``dispatcher.runs.heartbeat_ts`` — keeps the lease
+               alive and signals to the ``HeartbeatAge`` CloudWatch
+               alarm that the daemon is healthy.
+            2. Count ``dispatcher.failures`` rows in the last hour — the
+               read doubles as a connection smoke-test.
+            3. **Phase 3B (#2787):** call ``_advance_running_agents``.
+               Iterates agents in ``awaiting_ci``/``awaiting_deploy``
+               and drives each one forward by one state-machine step.
+               Errors are caught per-agent so one bad row cannot stall
+               siblings or crash the tick.
+            4. Emit the ``HeartbeatAge`` CloudWatch metric.
+
+        Returns a summary dict for logs + tests.
+        """
         assert self._conn is not None, "connect() must run before ticks"
         assert self._run_id is not None, "register the run before ticking"
 
@@ -2282,6 +3681,21 @@ class DispatcherDaemon:
                 failures_last_hour = int(row[0] or 0)
         self._conn.commit()
 
+        # Phase 3B (#2787): advance agents that are past push_and_pr.
+        # Wrapped in try/except — the heartbeat + metric emission below
+        # must still run even if the advance pass throws unexpectedly.
+        agents_advanced = 0
+        try:
+            agents_advanced = self._advance_running_agents()
+        except Exception:
+            self._log.exception(
+                "daemon.advance_pass_failed",
+                extra={
+                    "event": "advance_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
         self._supervisor_ticks += 1
         self._last_heartbeat_at = datetime.now(UTC)
 
@@ -2300,11 +3714,13 @@ class DispatcherDaemon:
                 "tick_n": self._supervisor_ticks,
                 "failures_last_hour": failures_last_hour,
                 "heartbeat_metric_emitted": metric_emitted,
+                "agents_advanced": agents_advanced,
             },
         )
         return {
             "failures_last_hour": failures_last_hour,
             "heartbeat_metric_emitted": 1 if metric_emitted else 0,
+            "agents_advanced": agents_advanced,
         }
 
     # ── heartbeat metric emission (supervisor-tick step 3) ──────────────
