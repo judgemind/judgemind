@@ -17,3 +17,13 @@ output "api_repository_url" {
   description = "ECR repository URL for API images"
   value       = aws_ecr_repository.api.repository_url
 }
+
+output "dispatcher_repository_url" {
+  description = "ECR repository URL for dispatcher v2 daemon images"
+  value       = aws_ecr_repository.dispatcher.repository_url
+}
+
+output "dispatcher_repository_arn" {
+  description = "ARN of the dispatcher v2 ECR repository"
+  value       = aws_ecr_repository.dispatcher.arn
+}

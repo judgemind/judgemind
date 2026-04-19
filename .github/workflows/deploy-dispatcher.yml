@@ -1,0 +1,99 @@
+name: Deploy Dispatcher
+
+# Builds and pushes the dispatcher v2 daemon image to ECR on merge to
+# main. Follows the `deploy-api.yml` pattern verbatim for the build job
+# — the dispatcher service runs at `desired_count=0` in Phase 1, so no
+# ECS deploy step is needed yet. Phase 2 will add a deploy-dev job that
+# flips the image on the existing task definition.
+#
+# Per `docs/specs/dispatcher-v2-spec.md` §14 and issue #2729.
+#
+# Build outputs:
+#   ECR image  `<acct>.dkr.ecr.us-west-2.amazonaws.com/judgemind/dispatcher:<sha7>`
+#   Tags: `<sha7>`, `latest`, `<branch>`, and optional `image_tag` input.
+#
+# Triggers:
+#   push to main when anything that affects the image content changes,
+#   plus workflow_dispatch for manual rebuild without a code change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.dispatcher"
+      - "scripts/dispatcher/**"
+      - "scripts/check-issue-author.sh"
+      - ".github/workflows/deploy-dispatcher.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: deploy-dispatcher-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/dispatcher
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          # `GIT_SHA` is baked into the image as an env var so the running
+          # daemon can self-report its build SHA into `dispatcher.runs.version_sha`.
+          docker build \
+              --build-arg "GIT_SHA=$SHA_TAG" \
+              -f Dockerfile.dispatcher \
+              "${TAGS[@]}" .
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"

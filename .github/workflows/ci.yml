@@ -544,6 +544,12 @@ jobs:
         run: npm install --no-save graphql@^16.8
       - name: Test
         run: pytest scripts/tests/ -v --tb=short
+      # Dispatcher v2 daemon skeleton tests (scripts/dispatcher/tests/).
+      # Separate invocation because these live in their own package dir
+      # (scripts/dispatcher/tests/) rather than under scripts/tests/.
+      # Mocks psycopg — no DB required in CI. See issue #2729.
+      - name: Test dispatcher daemon skeleton
+        run: pytest scripts/dispatcher/tests/ -v --tb=short
       - name: Check AWS CLI boolean flag usage
         run: scripts/check-aws-bool-flags.sh
       - name: Check for forbidden ECS services-stable waiter usage
