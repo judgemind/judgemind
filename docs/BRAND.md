@@ -29,12 +29,18 @@
 
 ### Accent
 
-| Name | Hex | Usage |
-|------|-----|-------|
-| Amber 700 | `#b45309` | Primary accent — links, active states, CTAs, wordmark |
-| Amber 600 | `#d97706` | Hover state for accent elements |
-| Amber 500 | `#f59e0b` | Lighter accent — highlights, selected states |
-| Amber 100 | `#fef3c7` | Accent surface — subtle backgrounds, badges |
+These amber hexes all map to the `brand-accent` Tailwind token (see
+§Tailwind Token Mapping below). **Never** write `text-accent`,
+`bg-accent`, etc. as bare utilities to get this colour — that token
+is a shadcn hover-surface gray. Use `text-brand-accent`.
+
+| Name | Hex | Tailwind token | Usage |
+|------|-----|----------------|-------|
+| Amber 700 | `#b45309` | `brand-accent` (DEFAULT) | Primary accent — links, active states, CTAs, wordmark (light mode) |
+| Amber 800 | `#92400e` | `brand-accent-hover` | Hover on brand-accent chrome |
+| Amber 600 | `#d97706` | `brand-accent-light` | Primary accent on dark mode |
+| Amber 500 | `#f59e0b` | `brand-accent-lighter` | Lighter accent — highlights, selected states |
+| Amber 100 | `#fef3c7` | `brand-accent-surface` | Accent surface — subtle backgrounds, badges |
 
 ### Semantic
 
@@ -53,14 +59,47 @@
 
 ## Tailwind Token Mapping
 
+> **Footgun — `accent` vs `brand-accent`.** shadcn's `accent` token
+> (`hsl(var(--accent))` in `packages/web/tailwind.config.ts`) is a
+> **near-gray hover surface**, not the brand amber. The brand amber
+> lives on the separate `brand-accent` token. The two classes are one
+> character apart — `text-accent` vs `text-brand-accent` — and the
+> shadcn one is nearly invisible on both light and dark backgrounds.
+>
+> - **Use `brand-accent` for always-visible brand chrome** — links,
+>   active states, wordmark accents. Canonical pattern:
+>   `text-brand-accent dark:text-brand-accent-light` (see
+>   `packages/web/src/components/Wordmark.tsx`).
+> - **Use `accent` only in shadcn hover / selected / focused idioms** —
+>   e.g. `hover:bg-accent hover:text-accent-foreground`,
+>   `data-[selected=true]:bg-accent`. Never as a bare class on an
+>   always-visible element.
+>
+> Regressions on `/admin/dispatcher` (#2816) prompted a CI guard
+> (`scripts/check-admin-dispatcher-brand-accent.sh`) that blocks bare
+> `*-accent` utilities on that surface. When in doubt, grep the
+> Wordmark component for the canonical pattern.
+
 ```
+// packages/web/tailwind.config.ts
 colors: {
   stone: { /* Tailwind's built-in stone scale */ },
+
+  // Brand amber — always-visible chrome (links, wordmark, emphasis).
+  'brand-accent': {
+    DEFAULT:    '#b45309',  // amber-700 — light-mode text / fill
+    hover:      '#92400e',  // amber-800
+    light:      '#d97706',  // amber-600 — dark-mode text / fill
+    lighter:    '#f59e0b',  // amber-500
+    surface:    '#fef3c7',  // amber-100 — badge / pill surface
+    foreground: '#ffffff',
+  },
+
+  // shadcn hover-surface token — gray by default, used ONLY with a
+  // modifier (hover:, focus:, data-[...]:). Never as bare `text-accent`.
   accent: {
-    DEFAULT: '#b45309',  // amber-700
-    hover: '#d97706',    // amber-600
-    light: '#f59e0b',    // amber-500
-    surface: '#fef3c7',  // amber-100
+    DEFAULT:    'hsl(var(--accent))',
+    foreground: 'hsl(var(--accent-foreground))',
   },
 }
 ```
