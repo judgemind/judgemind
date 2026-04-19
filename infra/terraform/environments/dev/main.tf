@@ -244,9 +244,15 @@ module "dispatcher_daemon" {
   # because `concurrency_cap=0` keeps the daemon from doing any DB
   # writes outside its own schema.
   #
+  # #2834 wires `anthropic_api_key_secret_arn` — Phase 3 (cap=1) needs
+  # the daemon's `claude -p` subprocess to authenticate, so
+  # `ANTHROPIC_API_KEY` must be present in the container environment.
+  # Reuses the shared `judgemind/anthropic/api-key` secret already used
+  # by the compute module (above) via the `data` block at the top.
+  #
   # Other ARNs stay empty until their owning sub-tasks land — the
   # module's `compact()` guard drops unset entries.
-  anthropic_api_key_secret_arn  = ""
+  anthropic_api_key_secret_arn  = data.aws_secretsmanager_secret.anthropic_api_key.arn
   db_connection_secret_arn      = module.database.db_connection_secret_arn
   github_token_secret_arn       = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
   telegram_bot_token_secret_arn = ""
