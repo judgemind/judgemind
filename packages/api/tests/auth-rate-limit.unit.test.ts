@@ -44,6 +44,10 @@ describe('checkLoginRateLimit', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.resetAllMocks();
+    // Ensure the real rate-limit path is exercised even if the ambient env
+    // (e.g. auth.integration.test.ts running in the same process, or a
+    // developer's shell) has set the opt-out flag. See issue #2744.
+    delete process.env.DISABLE_LOGIN_RATE_LIMIT;
   });
 
   it('allows the first request from an IP', async () => {
@@ -106,5 +110,42 @@ describe('checkLoginRateLimit', () => {
     expect(allowed).toBe(true);
     // incr should not be called since connection failed
     expect(mockIncr).not.toHaveBeenCalled();
+  });
+
+  it('bypasses the rate limit when DISABLE_LOGIN_RATE_LIMIT=1', async () => {
+    vi.resetModules();
+    setupRedisClient();
+    // Even if Redis would report the IP over the limit, the opt-out flag
+    // should short-circuit before any Redis call. See issue #2744.
+    mockIncr.mockResolvedValue(999);
+    process.env.DISABLE_LOGIN_RATE_LIMIT = '1';
+
+    try {
+      const { checkLoginRateLimit: freshCheck } = await import('../src/auth/rate-limit');
+      const allowed = await freshCheck('192.168.1.6');
+
+      expect(allowed).toBe(true);
+      expect(mockCreateClient).not.toHaveBeenCalled();
+      expect(mockIncr).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.DISABLE_LOGIN_RATE_LIMIT;
+    }
+  });
+
+  it('does not bypass the rate limit when DISABLE_LOGIN_RATE_LIMIT is set to something other than "1"', async () => {
+    vi.resetModules();
+    setupRedisClient();
+    mockIncr.mockResolvedValue(11); // over the limit
+    process.env.DISABLE_LOGIN_RATE_LIMIT = 'true'; // wrong value — not "1"
+
+    try {
+      const { checkLoginRateLimit: freshCheck } = await import('../src/auth/rate-limit');
+      const allowed = await freshCheck('192.168.1.7');
+
+      expect(allowed).toBe(false);
+      expect(mockIncr).toHaveBeenCalled();
+    } finally {
+      delete process.env.DISABLE_LOGIN_RATE_LIMIT;
+    }
   });
 });
