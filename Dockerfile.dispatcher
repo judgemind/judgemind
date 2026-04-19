@@ -145,6 +145,36 @@ RUN npm install -g @anthropic-ai/claude-code@2.1.114
 ENV HOME=/home/dispatcher
 RUN mkdir -p "$HOME"
 
+# ---------------------------------------------------------------------------
+# Baseline git checkout (issue #2804)
+#
+# Phase 3A (#2783) assumed the daemon's CWD has a `.git` parent so
+# `git -C <cwd> worktree add ...` could carve off per-agent worktrees.
+# The container image does NOT bake in a checkout — adding one here
+# would pin the image to a build-time commit, which breaks the "daemon
+# re-deploys across many merges and wants the latest origin/main for
+# every new worktree" property we actually want.
+#
+# Instead the daemon clones judgemind/judgemind into
+# DISPATCHER_BASELINE_REPO_ROOT at boot (via
+# `DispatcherDaemon.ensure_baseline_clone`), and carves worktrees off
+# that clone at `git -C <baseline> worktree add <abs_path>`. Worktrees
+# live in the sibling `/var/lib/dispatcher/worktrees/` directory so the
+# baseline clone itself is never mixed with per-agent state.
+#
+# We only pre-create the parent directory here; the daemon itself is
+# responsible for the clone (so a restart on already-populated
+# ephemeral storage just does a `git fetch origin main` instead of
+# re-cloning). Writable as root — the container stays on root per the
+# USER note above.
+#
+# Fargate ephemeral storage is 50 GiB (spike 0.6), baseline shallow
+# clone is ~100 MB, worktrees are ~700 MB each — easily fits even at
+# concurrency_cap=5.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /var/lib/dispatcher/worktrees
+ENV DISPATCHER_BASELINE_REPO_ROOT=/var/lib/dispatcher/repo
+
 WORKDIR /app
 
 # ---------------------------------------------------------------------------

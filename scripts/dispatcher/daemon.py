@@ -240,11 +240,15 @@ FIX_CI_LOG_TAIL_MAX_CHARS = 20000
 #: concurrent races via unique-violation).
 ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded")
 
-#: Relative path under the repo root where per-agent worktrees land.
-#: Mirrors the laptop-dispatcher convention from
-#: ``.claude/skills/task/SKILL.md`` so human operators can find a
-#: daemon-created worktree with the same ``git worktree list`` command
-#: they use locally.
+#: Relative path under the repo root where per-agent worktrees land in
+#: the local-dev fallback mode (``baseline_repo_root`` unset). Mirrors
+#: the laptop-dispatcher convention from ``.claude/skills/task/SKILL.md``
+#: so human operators can find a daemon-created worktree with the same
+#: ``git worktree list`` command they use locally. When the Fargate
+#: container sets ``DISPATCHER_BASELINE_REPO_ROOT`` (see
+#: :data:`DEFAULT_BASELINE_REPO_ROOT`), worktrees are placed under
+#: ``<baseline_repo_root>.parent / "worktrees" / agent-<uuid>`` instead
+#: and this constant is unused.
 WORKTREE_PARENT_DIR = Path(".claude/worktrees")
 
 #: Length of the short UUID used in worktree + branch names. 8 hex
@@ -252,6 +256,61 @@ WORKTREE_PARENT_DIR = Path(".claude/worktrees")
 #: the lifetime of the dispatcher is negligible and the short form
 #: keeps path lengths sane.
 AGENT_SHORT_ID_HEX_CHARS = 8
+
+#: Default absolute path for the daemon's baseline git clone inside the
+#: Fargate container. When ``DISPATCHER_BASELINE_REPO_ROOT`` is set in
+#: the environment (the Dockerfile wires this to the value below), the
+#: daemon clones ``judgemind/judgemind`` here at boot via
+#: :meth:`DispatcherDaemon.ensure_baseline_clone` and runs
+#: ``git -C <baseline> worktree add <abs_path>`` from it so worktree
+#: creation no longer depends on the container CWD having a ``.git``
+#: directory (issue #2804). Per-agent worktrees live in the sibling
+#: ``worktrees/`` directory so the baseline clone itself is never mixed
+#: with per-agent state. Fargate ephemeral storage is 50 GiB per task
+#: and the baseline shallow clone is ~100 MB; the combined footprint is
+#: well under the quota even at concurrency_cap=5.
+DEFAULT_BASELINE_REPO_ROOT = "/var/lib/dispatcher/repo"
+
+#: Authenticated HTTPS URL used by :meth:`DispatcherDaemon.ensure_baseline_clone`
+#: when the baseline clone is missing. The daemon runs ``gh auth setup-git``
+#: at boot so the GITHUB_TOKEN secret (scoped PAT from spike 0.7 / #2700)
+#: is consulted by git's credential helper automatically. The repo URL
+#: hard-codes ``judgemind/judgemind`` — the daemon is only ever
+#: responsible for that repo, and reading it from ``GITHUB_REPO`` would
+#: let a future test-env mis-config clone a different repo into the
+#: baseline path.
+BASELINE_CLONE_URL = "https://github.com/judgemind/judgemind.git"
+
+#: Hard wall-clock timeout on the boot-time ``git clone``. 300s is
+#: generous even on a slow CI-to-GitHub link for a shallow (~100 MB)
+#: clone; the daemon aborts startup on timeout (exit 1) so the ECS
+#: task restart loop provides a natural retry.
+BASELINE_CLONE_TIMEOUT_SECONDS = 300
+
+#: Hard wall-clock timeout on the ``git fetch origin main`` we run
+#: every time a baseline clone is reused (either at boot or just
+#: before ``git worktree add``). Much shorter than the initial clone
+#: because the delta since the last fetch is small.
+BASELINE_FETCH_TIMEOUT_SECONDS = 120
+
+#: Hard wall-clock timeout on the one-shot ``gh auth setup-git`` call
+#: at daemon boot. The subprocess just writes a credential-helper line
+#: to the container's git config — it is a local operation and should
+#: finish in milliseconds.
+GH_AUTH_SETUP_GIT_TIMEOUT_SECONDS = 10
+
+#: Per-issue cooldown — skip an issue from candidate selection if its
+#: most recent ``dispatcher.agents`` row (any status) was created
+#: within this many seconds. Prevents a systemically-broken issue from
+#: burning through the candidate queue in a failure loop when paired
+#: with the partial UNIQUE INDEX (which only blocks re-claim for
+#: ``running``/``retrying``, not ``failed``/``crashed`` — see spec
+#: §17 Risk 2 and issue #2804). 3600s (60 min) gives the diagnoser a
+#: clear window to file a follow-up or un-fail the agent before the
+#: scheduler retries. Tuned for the cap=1 cutover; a higher cap may
+#: want a shorter cooldown to avoid starving the queue on transient
+#: failures.
+FAILED_AGENT_COOLDOWN_SECONDS = 3600
 
 # --------------------------------------------------------------------------
 # Phase 3E — retro orchestration + worktree cleanup + diagnoser
@@ -604,6 +663,16 @@ class DaemonConfig:
     heartbeat_metric_namespace: str = DEFAULT_HEARTBEAT_METRIC_NAMESPACE
     #: AWS region for the CloudWatch client.
     aws_region: str = DEFAULT_AWS_REGION
+    #: Absolute path to the daemon's baseline git clone, or ``None`` when
+    #: the daemon should fall back to ``os.getcwd()`` as the git parent
+    #: (local-dev / unit-test mode). Populated from the
+    #: ``DISPATCHER_BASELINE_REPO_ROOT`` env var by :func:`_build_config`;
+    #: the Dockerfile wires this to :data:`DEFAULT_BASELINE_REPO_ROOT` so
+    #: the Fargate daemon always runs in baseline-clone mode (issue #2804).
+    #: When set, the daemon clones ``judgemind/judgemind`` here at boot
+    #: and places per-agent worktrees at ``baseline_repo_root.parent /
+    #: "worktrees" / agent-<uuid>`` (see :data:`DEFAULT_BASELINE_REPO_ROOT`).
+    baseline_repo_root: Path | None = None
     # Optional override used by tests to avoid os.environ mutation.
     config_override: dict[str, Any] = field(default_factory=dict)
 
@@ -1268,9 +1337,20 @@ class DispatcherDaemon:
 
         1. Skip if ``dispatcher.agents`` has a row for it with
            ``status IN ('running', 'retrying', 'succeeded')``. A
-           ``failed`` or ``crashed`` row does NOT block re-claim —
-           manual retry is a documented operator flow.
-        2. Run the trust check (``scripts/check-issue-author.sh``). Skip
+           ``failed`` or ``crashed`` row does NOT block re-claim via
+           the partial UNIQUE INDEX — manual retry is a documented
+           operator flow.
+        2. **Per-issue cooldown (issue #2804):** skip if any
+           ``dispatcher.agents`` row for this issue was created within
+           the last :data:`FAILED_AGENT_COOLDOWN_SECONDS`. Guards
+           against the failure-loop amplifier where a systemically-
+           broken issue (e.g. permanently-impossible worktree create,
+           flaky external dep) burns through dozens of agents per hour
+           because the partial UNIQUE INDEX only blocks ``running`` /
+           ``retrying``. The diagnoser gets a clean 60 min window to
+           make a judgment call (escalate / close / un-fail) before
+           the scheduler touches the issue again.
+        3. Run the trust check (``scripts/check-issue-author.sh``). Skip
            on any non-zero exit.
 
         Returns the chosen issue number, or ``None`` if no candidate is
@@ -1288,6 +1368,18 @@ class DispatcherDaemon:
                     },
                 )
                 continue
+            if self._issue_in_cooldown(issue_number):
+                self._log.info(
+                    "daemon.candidate_skipped",
+                    extra={
+                        "event": "candidate_skipped",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                        "reason": "cooldown",
+                        "cooldown_seconds": FAILED_AGENT_COOLDOWN_SECONDS,
+                    },
+                )
+                continue
             if not self._issue_author_trusted(issue_number):
                 self._log.info(
                     "daemon.candidate_skipped",
@@ -1301,6 +1393,51 @@ class DispatcherDaemon:
                 continue
             return issue_number
         return None
+
+    def _issue_in_cooldown(self, issue_number: int) -> bool:
+        """True if this issue's most recent ``dispatcher.agents`` row is fresh.
+
+        Freshness window is :data:`FAILED_AGENT_COOLDOWN_SECONDS`. All
+        statuses count (not just ``failed``/``crashed``) so a recent
+        ``running`` / ``succeeded`` agent also prevents immediate
+        re-claim — though in practice ``running`` is already caught by
+        :meth:`_issue_already_attempted` (partial UNIQUE INDEX), this
+        extra belt keeps the predicate simple + single-source-of-truth:
+        "did we touch this issue recently? skip".
+
+        Returns True (fail-closed — treat as in cooldown) on DB error
+        to avoid the failure-loop amplification the cooldown exists to
+        prevent.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM dispatcher.agents "
+                    "WHERE issue_number = %s "
+                    "  AND started_at > now() - make_interval(secs => %s) "
+                    "LIMIT 1",
+                    (issue_number, FAILED_AGENT_COOLDOWN_SECONDS),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.cooldown_check_failed",
+                extra={
+                    "event": "cooldown_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            # Fail closed — treat as in cooldown on a DB hiccup so we
+            # don't amplify a failure loop on top of a DB problem.
+            return True
+        return row is not None
 
     def _issue_already_attempted(self, issue_number: int) -> bool:
         """True if ``dispatcher.agents`` has any active/succeeded row for this issue.
@@ -1467,16 +1604,255 @@ class DispatcherDaemon:
         return True
 
     def _repo_root(self) -> Path:
-        """Repo root inside the dispatcher container.
+        """Legacy "repo-shaped directory" used by non-git callers.
 
-        The Dockerfile places the daemon code at ``/app/scripts/dispatcher/``
-        but the git working tree used for worktrees is cloned at
-        runtime into ``/app`` (via the startup hook in the Fargate task
-        definition). For unit tests the working directory is the
-        repo-root worktree. ``os.getcwd()`` returns the right thing in
-        both cases; the daemon never ``chdir``s away from it.
+        Returns ``os.getcwd()``. The Dockerfile places the daemon code
+        at ``/app/scripts/dispatcher/`` so the container CWD is ``/app``;
+        for unit tests the CWD is the repo-root worktree. The daemon
+        never ``chdir``s away from it.
+
+        **Not** the git parent for worktree ops. Phase 3A (#2783)
+        originally had ``_create_worktree`` run ``git -C <cwd> worktree
+        add ...``, but the container's ``/app`` has no ``.git`` child
+        and every worktree add failed at cap=1 cutover (#2804). The
+        baseline clone lives at :data:`DEFAULT_BASELINE_REPO_ROOT`
+        instead, and :meth:`_git_parent_root` returns that path when
+        :attr:`DaemonConfig.baseline_repo_root` is set. This method is
+        preserved for callers that need a repo-shaped directory for
+        non-git purposes (tmp file paths, optional script lookups) —
+        migrating every caller would be a larger refactor with the
+        same operational outcome.
         """
         return Path(os.getcwd())
+
+    def _git_parent_root(self) -> Path:
+        """Absolute path of the git directory ``git -C`` should target.
+
+        When ``baseline_repo_root`` is configured (production Fargate
+        path — issue #2804), this is the daemon's baseline clone at
+        :data:`DEFAULT_BASELINE_REPO_ROOT`. When unset, fall back to
+        :meth:`_repo_root` (the legacy local-dev / unit-test path that
+        uses ``os.getcwd()``).
+
+        Separate from :meth:`_repo_root` because existing callers (the
+        diagnoser, cleanup_worktree.sh invocations, etc.) already pass
+        ``self._repo_root()`` as a generic "repo-shaped directory" —
+        they do not all need to switch to the baseline clone. The git
+        parent is the narrow concept "where worktree adds run from".
+        """
+        if self._cfg.baseline_repo_root is not None:
+            return self._cfg.baseline_repo_root
+        return self._repo_root()
+
+    def _compute_worktree_path(self, short_id: str) -> Path:
+        """Absolute path for a new per-agent worktree.
+
+        Must match the path passed to ``git worktree add`` so the DB's
+        ``dispatcher.agents.worktree_path`` row points at the same
+        directory the supervisor / cleanup code later looks for
+        (otherwise the worktree is "orphaned from the DB's perspective"
+        — see spec §17 Risk 1).
+
+        When ``baseline_repo_root`` is set, the worktree lives in the
+        sibling ``worktrees/`` directory next to the baseline clone
+        (``/var/lib/dispatcher/worktrees/agent-<short_id>``). When unset,
+        fall back to the legacy ``<cwd>/.claude/worktrees/`` convention.
+        """
+        baseline = self._cfg.baseline_repo_root
+        if baseline is not None:
+            return baseline.parent / "worktrees" / f"agent-{short_id}"
+        return self._repo_root() / WORKTREE_PARENT_DIR / f"agent-{short_id}"
+
+    def _setup_git_credentials(self) -> None:
+        """Run ``gh auth setup-git`` once so git uses the GITHUB_TOKEN.
+
+        The Fargate task environment exposes a scoped PAT via
+        ``GITHUB_TOKEN`` (spike 0.7 / #2700). ``gh auth setup-git``
+        writes a credential-helper line to the container's git config
+        that makes subsequent ``git clone`` / ``git fetch`` / ``git push``
+        calls over HTTPS consult ``gh`` for credentials, which in turn
+        reads ``GITHUB_TOKEN``. This is idempotent — re-running it is
+        a no-op — so it is safe to call on every boot.
+
+        Any failure here is logged but does NOT abort startup: the
+        baseline clone may still succeed on a pre-auth'd container
+        image or via cached credentials, and the ECS task restart loop
+        will re-run this on the next boot if credentials genuinely are
+        broken. Only the baseline clone / fetch failing is a fatal
+        startup error.
+        """
+        cmd = ["gh", "auth", "setup-git"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_AUTH_SETUP_GIT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError:
+            self._log.warning(
+                "daemon.gh_setup_git_missing",
+                extra={
+                    "event": "gh_setup_git_missing",
+                    "run_id": self._run_id,
+                    "detail": "gh CLI not on PATH",
+                },
+            )
+            return
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.gh_setup_git_timeout",
+                extra={
+                    "event": "gh_setup_git_timeout",
+                    "run_id": self._run_id,
+                },
+            )
+            return
+
+        if result.returncode == 0:
+            self._log.info(
+                "daemon.gh_setup_git_ok",
+                extra={
+                    "event": "gh_setup_git_ok",
+                    "run_id": self._run_id,
+                },
+            )
+            return
+
+        self._log.warning(
+            "daemon.gh_setup_git_failed",
+            extra={
+                "event": "gh_setup_git_failed",
+                "run_id": self._run_id,
+                "exit_code": result.returncode,
+                "detail": (result.stderr or result.stdout or "").strip()[:200],
+            },
+        )
+
+    def ensure_baseline_clone(self) -> None:
+        """Clone or fetch the baseline git repo used for worktree creation.
+
+        Issue #2804. The dispatcher container image (``Dockerfile.dispatcher``)
+        does not bake in a git checkout; Phase 3A assumed the daemon's
+        CWD already had a ``.git`` parent, which is false in Fargate. At
+        boot the daemon must either clone ``judgemind/judgemind`` into
+        :attr:`DaemonConfig.baseline_repo_root` (first deploy or
+        ephemeral-storage wipe) or fetch ``origin/main`` (every
+        subsequent boot on the same task, though Fargate restarts always
+        start fresh — defensive either way).
+
+        Only runs when ``baseline_repo_root`` is configured. Local dev
+        and unit tests (where :meth:`_repo_root` points at an existing
+        worktree) skip this entirely and leave git operations on
+        whatever repo the developer is running inside.
+
+        Raises :class:`RuntimeError` on subprocess failure so
+        :func:`main` can log + exit 1 — the ECS task then restart-loops,
+        which is the correct handling for a transient network blip.
+        """
+        baseline = self._cfg.baseline_repo_root
+        if baseline is None:
+            self._log.info(
+                "daemon.baseline_clone_skipped",
+                extra={
+                    "event": "baseline_clone_skipped",
+                    "run_id": self._run_id,
+                    "detail": "baseline_repo_root unset (local-dev mode)",
+                },
+            )
+            return
+
+        self._setup_git_credentials()
+
+        if (baseline / ".git").exists():
+            # Existing clone — fetch so worktrees branch from up-to-date
+            # ``origin/main``. Cheap (shallow fetch) and prevents
+            # "worktree branched from a stale main" bugs as the daemon
+            # stays up across many merges.
+            self._baseline_fetch_origin_main()
+            self._log.info(
+                "daemon.baseline_clone_ready",
+                extra={
+                    "event": "baseline_clone_ready",
+                    "run_id": self._run_id,
+                    "baseline_repo_root": str(baseline),
+                    "action": "fetch",
+                },
+            )
+            return
+
+        # Fresh clone. Create the parent directory (e.g. /var/lib/dispatcher/)
+        # so the sibling worktrees directory can also be created later.
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "git",
+            "clone",
+            "--depth=1",
+            "--no-tags",
+            BASELINE_CLONE_URL,
+            str(baseline),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=BASELINE_CLONE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"git CLI not on PATH: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"git clone timed out after {BASELINE_CLONE_TIMEOUT_SECONDS}s"
+            ) from exc
+
+        if result.returncode != 0:
+            stderr_preview = (result.stderr or "").strip()[:200]
+            raise RuntimeError(f"git clone exit={result.returncode}: {stderr_preview}")
+
+        self._log.info(
+            "daemon.baseline_clone_ready",
+            extra={
+                "event": "baseline_clone_ready",
+                "run_id": self._run_id,
+                "baseline_repo_root": str(baseline),
+                "action": "clone",
+            },
+        )
+
+    def _baseline_fetch_origin_main(self) -> None:
+        """Run ``git -C <baseline> fetch origin main``. Raise on failure.
+
+        Called by :meth:`ensure_baseline_clone` on reboot and by
+        :meth:`_create_worktree` before each ``git worktree add`` so
+        the new worktree branches from up-to-date ``origin/main``.
+        """
+        baseline = self._cfg.baseline_repo_root
+        if baseline is None:  # pragma: no cover — guarded by callers
+            return
+
+        cmd = ["git", "-C", str(baseline), "fetch", "origin", "main"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=BASELINE_FETCH_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"git CLI not on PATH: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"git fetch timed out after {BASELINE_FETCH_TIMEOUT_SECONDS}s"
+            ) from exc
+
+        if result.returncode != 0:
+            stderr_preview = (result.stderr or "").strip()[:200]
+            raise RuntimeError(f"git fetch exit={result.returncode}: {stderr_preview}")
 
     def _create_worktree(self, agent_id: str) -> Path:
         """``git worktree add`` a fresh worktree + branch for this agent.
@@ -1484,16 +1860,33 @@ class DispatcherDaemon:
         Returns the absolute path to the new worktree. Raises
         :class:`RuntimeError` on subprocess failure so the caller can
         mark the agent failed.
+
+        When ``baseline_repo_root`` is configured (production Fargate
+        mode — issue #2804), runs ``git -C <baseline> fetch origin main``
+        first so the new worktree branches from the freshest possible
+        ``origin/main``; then invokes ``git -C <baseline> worktree add``
+        with an absolute worktree path under
+        :data:`DEFAULT_BASELINE_REPO_ROOT`'s sibling ``worktrees/`` dir.
+        In the legacy local-dev / unit-test mode (``baseline_repo_root``
+        unset), runs ``git -C <cwd> worktree add`` against
+        ``.claude/worktrees/`` as before.
         """
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
-        repo_root = self._repo_root()
-        worktree_path = repo_root / WORKTREE_PARENT_DIR / f"agent-{short_id}"
+        git_parent = self._git_parent_root()
+        worktree_path = self._compute_worktree_path(short_id)
         branch = f"agent/{short_id}"
+
+        # In baseline-clone mode, refresh ``origin/main`` before
+        # branching. Any fetch failure bubbles up as a RuntimeError so
+        # the caller marks the agent failed — consistent with the
+        # existing worktree-add failure path.
+        if self._cfg.baseline_repo_root is not None:
+            self._baseline_fetch_origin_main()
 
         cmd = [
             "git",
             "-C",
-            str(repo_root),
+            str(git_parent),
             "worktree",
             "add",
             str(worktree_path),
@@ -1899,8 +2292,7 @@ class DispatcherDaemon:
 
         agent_id = str(uuid.uuid4())
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
-        repo_root = self._repo_root()
-        worktree_path = repo_root / WORKTREE_PARENT_DIR / f"agent-{short_id}"
+        worktree_path = self._compute_worktree_path(short_id)
 
         self._log.info(
             "daemon.candidate_picked",
@@ -7558,6 +7950,15 @@ def _build_config(
     aws_region = (
         env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or DEFAULT_AWS_REGION
     )
+    # Baseline clone path is opt-in via env var. The Dockerfile sets it
+    # to :data:`DEFAULT_BASELINE_REPO_ROOT` so Fargate always runs in
+    # baseline-clone mode; local dev and unit tests leave it unset and
+    # the daemon falls back to ``os.getcwd()`` (preserves pre-#2804
+    # behavior). An empty-string value is treated the same as unset so
+    # operators can disable baseline-clone mode without touching the
+    # task definition.
+    raw_baseline = env.get("DISPATCHER_BASELINE_REPO_ROOT", "").strip()
+    baseline_repo_root = Path(raw_baseline) if raw_baseline else None
 
     override: dict[str, Any] = {}
     if args.config_override:
@@ -7583,6 +7984,7 @@ def _build_config(
         dispatcher_service_name=dispatcher_service_name,
         heartbeat_metric_namespace=heartbeat_namespace,
         aws_region=aws_region,
+        baseline_repo_root=baseline_repo_root,
         config_override=override,
     )
 
@@ -7660,6 +8062,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except Exception:
         log.exception("daemon.register_failed", extra={"event": "register_failed"})
+        daemon.close()
+        return 1
+
+    # Bootstrap the baseline git clone before the first scheduler tick
+    # so ``_create_worktree`` has a ``.git`` parent to run ``git -C ...
+    # worktree add`` from (issue #2804). No-op in local-dev / unit-test
+    # mode (``DISPATCHER_BASELINE_REPO_ROOT`` unset).
+    try:
+        daemon.ensure_baseline_clone()
+    except Exception:
+        log.exception(
+            "daemon.baseline_clone_failed",
+            extra={"event": "baseline_clone_failed"},
+        )
+        daemon.mark_stopped()
         daemon.close()
         return 1
 
