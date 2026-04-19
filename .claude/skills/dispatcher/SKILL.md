@@ -35,111 +35,64 @@ Enable dispatcher mode for the current interactive session. This transforms the 
 
 If Telegram is available (the MCP Telegram plugin is active and a chat_id is known), send a session started notification using `telegram__reply`. If no chat_id is available yet, skip — the user will see notifications once they send a message.
 
-### 2. Sweep stale worktree metadata
+### 2. Delegate heavy startup queries to `/dispatcher-startup`
 
-Orphan entries in `.git/worktrees/<name>/` can accumulate silently when
-a prior session exits between removing the worktree dir and pruning the
-metadata (hard crash, manual `rm -rf`, buggy cleanup). The reactive fix
-in `cleanup_worktree.sh` (#2388) only heals orphans that are explicitly
-passed to cleanup — it never fires for paths nothing ever names.
+Invoke `/dispatcher-startup` via the Skill tool to run the expensive one-shot startup work in an isolated subagent context. The subagent handles:
 
-Run `scripts/sweep_stale_worktrees.sh` once at startup to proactively
-clear orphan metadata. The script only removes entries whose on-disk
-worktree dir is missing — live worktrees (including locked ones) are
-never touched.
+- Stale worktree metadata sweep (`scripts/sweep_stale_worktrees.sh`)
+- Stale-assignment cleanup (unassign issues whose prior agents crashed)
+- Queue scan — `agent/ready` issues, priority-sorted
+- Author trust-check for the top `max_slots` candidates (untrusted issues moved to `status/triage`)
+- Orphan-PR triage (classify ready-to-merge / orphaned-conflicting / orphaned-CI-failing / other-contributor)
 
-```
-scripts/sweep_stale_worktrees.sh
-```
+Previously these ran inline and burned ~100k tokens of main-context on raw `gh` / `mcp__github__*` output before the first `/task` spawned. Running them in the subagent keeps the dispatcher's main context clear; the subagent returns only a ~40-line markdown summary.
 
-The last line of its output is always `Cleaned up N stale worktree
-entries`. Log that line so it is visible in the session transcript. If
-`N` is large (e.g. > 5), note it — a growing orphan count across
-successive startups is a useful health signal that something is
-mis-behaving in the cleanup path.
-
-### 3. Clean up stale issue assignments
-
-When a previous dispatcher or agent session ends unexpectedly (context window exhaustion, crash, terminal closed), issues assigned to the agent account may remain assigned with `agent/ready` but no agent working them. These look "in progress" but are actually abandoned, blocking future pickup.
-
-**Run this cleanup once at startup, before scanning the work queue.**
-
-1. List all open issues assigned to the agent account that have the `agent/ready` label. Use MCP (no `@me` filter — filter client-side on the `assignees` field, matching the agent account login e.g. `drewthaler`):
-   ```
-   mcp__github__list_issues
-     owner: "judgemind"
-     repo: "judgemind"
-     labels: ["agent/ready"]
-     state: "open"
-     per_page: 50
-   ```
-
-2. For each assigned issue, check whether an open PR exists that references it. Use MCP `search_issues` with a `repo:judgemind/judgemind is:pr is:open` qualifier, or reuse the PR list fetched in startup step 5 and match on branch names / body:
-   ```
-   mcp__github__search_issues
-     q: "repo:judgemind/judgemind is:pr is:open in:body #<N>"
-   ```
-   Alternatively, check the PR list from startup step 5 for branches containing the issue number.
-
-3. **If an open PR exists:** The work is partially complete. Unassign the issue so the next agent can adopt the existing PR, but leave the PR open as evidence of prior work.
-
-4. **If no open PR exists:** The assignment is fully stale — no work product exists. Unassign the issue:
-   ```
-   gh issue edit <N> --repo judgemind/judgemind --remove-assignee @me
-   ```
-
-5. Log each cleanup action. For example: `Cleaned up stale assignment: #107 "Fix OC scraper date parsing" (no open PR — unassigned)`
-
-6. If Telegram is available and any stale assignments were cleaned up, send a summary notification via `telegram__reply`.
-
-**Edge cases:**
-- An issue has an open PR but CI is failing and no agent is working it — still unassign so a fresh agent can pick it up and adopt the PR.
-- An issue was just assigned by another agent in the current session — unlikely at startup, but the "no open PR" heuristic handles this safely. New assignments will not have PRs yet, but the assigning agent will create one shortly. Even if the cleanup unassigns it prematurely, the agent will re-assign when it pushes its PR.
-
-### 4. Scan the work queue (startup only)
-
-List all open `agent/ready` issues sorted by priority (use MCP — `list_issues` returns full typed objects including labels and assignees):
+**Invocation:**
 
 ```
-mcp__github__list_issues
-  owner: "judgemind"
-  repo: "judgemind"
-  labels: ["agent/ready"]
-  state: "open"
-  per_page: 50
+Skill tool with:
+  skill: "dispatcher-startup"
+  args: "max_slots=<max_slots> [skip=<csv>] [only=#N1,#N2] [agent_account=<login>]"
 ```
 
-Priority order: `priority/p0` > `priority/p1` > `priority/p2` > `priority/p3`. Within the same priority, prefer lower issue numbers (older first).
+- Pass `max_slots=` with the value resolved from the current session's argument (default `5`).
+- Pass `only=#N1,#N2` when the dispatcher was invoked with specific issue numbers as arguments.
+- Pass `skip=<csv>` if the dispatcher session has skip patterns configured (usually omitted on a fresh startup).
+- Pass `agent_account=<login>` if the current agent account is not the default `drewthaler` — read the latest value from `~/.claude/projects/.../memory/MEMORY.md` rather than hardcoding.
 
-If specific issues were passed as arguments, filter to only those issues.
+**Returned summary:** The subagent writes `{worktree}/tmp/dispatcher-startup-summary.md` and prints it. Read the returned summary and log it. Sections include `Queue`, `Cleanups`, `Orphan PRs`, and `Skipped` (untrusted / filter / error). The main-context dispatcher never sees the raw `gh` / MCP output that produced the summary.
 
-**This initial scan is for startup orientation only.** Do NOT cache this list for use in later dispatch cycles. Each dispatch cycle in the main loop (step 6) must run its own fresh query. Issues may be unblocked, relabeled, or closed between cycles — working from a stale list causes the dispatcher to miss newly-available high-priority work.
+**Side effects performed by the subagent** (explicit allow-list — no other writes):
 
-### 5. Check for in-flight work
+- Worktree metadata removals via `scripts/sweep_stale_worktrees.sh`.
+- `gh issue edit <N> --remove-assignee <agent_account>` for stale assignments.
+- `gh issue edit <N> --remove-label agent/ready --add-label status/triage` for untrusted-author issues.
 
-Check for any existing open PRs or assigned issues that may need attention (stale CI, merge conflicts, etc.). Use MCP — returns full PR objects with head ref, mergeable state, and CI status all in one call:
+**Constraints enforced in the subagent:**
 
-```
-mcp__github__list_pull_requests
-  owner: "judgemind"
-  repo: "judgemind"
-  state: "open"
-  per_page: 50
-```
+- Does NOT write to `tmp/dispatcher_state.json` or `tmp/dispatcher_checkpoint.md` — those remain owned by the main dispatcher (see step 3 below and "Dispatcher Checkpoint File").
+- Does NOT spawn `/task` or any other Agent subagent.
+- Does NOT merge PRs, create issues, post issue comments, or close issues.
 
-For detailed CI status on a specific PR, use `mcp__github__get_pull_request` (for `mergeable` / `mergeable_state`) — **not** `get_pull_request_status`, which only returns legacy commit statuses (Vercel etc.) and misses GitHub Actions check runs. For the full check-run rollup, fall back to `gh pr view <N> --repo judgemind/judgemind --json statusCheckRollup,mergeable,mergeStateStatus`. Handle any in-flight PRs before launching new work (see "PR Merge Policy" below).
+**After the subagent returns:**
 
-### 6. Initialize audit counter
+- Log the summary line-for-line in the session transcript.
+- If the `Cleanups` section reports any stale-assignment unassigns and Telegram is available, send the **Stale assignments cleaned** template from the Message Templates table.
+- Use the `Queue` section as the initial orientation for the first dispatch cycle. **Do NOT cache it** — step 6 of the main loop must always run its own fresh `mcp__github__list_issues` query. The subagent's queue is a one-shot snapshot, not a permanent cache.
+
+See `.claude/skills/dispatcher-startup/SKILL.md` for the full subagent specification.
+
+### 3. Initialize audit counter
 
 Read `tmp/dispatcher_state.json` to recover the `prs_since_last_audit` counter from a previous session. If the file does not exist or the field is missing, initialize the counter to 0.
 
-### 7. Initialize context rotation counter
+### 4. Initialize context rotation counter
 
 Initialize `loop_iterations` to 0. This counter tracks how many main loop iterations have elapsed in this session. It is used to trigger a graceful exit before the context window fills up and causes compaction-related forgetfulness (see "Context-Aware Rotation" below).
 
 Also read `session_number` from `tmp/dispatcher_state.json` (default to 0 if missing). Increment it by 1 and persist it back — this tracks how many times the dispatcher has been restarted by the outer `while :; do` loop. The first invocation is session 1.
 
-### 8. Store max_slots for enforcement
+### 5. Store max_slots for enforcement
 
 Store the max slot count (from the argument, or 5 if not specified) in a variable `max_slots`. This value is used throughout the session for slot enforcement checks. **Do not change this value during the session** — it is set once at startup and used everywhere.
 
