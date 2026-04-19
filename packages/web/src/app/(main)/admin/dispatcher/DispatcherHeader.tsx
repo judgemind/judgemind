@@ -5,21 +5,21 @@ import { formatUptime } from './format-helpers';
 
 type DaemonStatus = 'running' | 'paused' | 'stopped' | 'unhealthy';
 
-// "Stopped" intentionally uses the neutral design tokens rather than a
-// status color — per BRAND.md, only running/paused/unhealthy carry
-// semantic significance, and a "stopped" daemon is a calm neutral state.
-const STATUS_STYLES: Record<DaemonStatus, string> = {
-  running: 'bg-green-100 border-green-300 text-green-800 dark:bg-green-900/30 dark:border-green-700 dark:text-green-300',
-  paused: 'bg-yellow-100 border-yellow-300 text-yellow-800 dark:bg-yellow-900/30 dark:border-yellow-700 dark:text-yellow-300',
-  stopped: 'bg-muted border-border text-muted-foreground',
-  unhealthy: 'bg-red-100 border-red-300 text-red-800 dark:bg-red-900/30 dark:border-red-700 dark:text-red-300',
-};
-
+// Per #2805 §2.3 the pill is informational status, not a CTA — kept
+// compact (text-xs) with a subtle colored dot + neutral surround rather
+// than the previous large filled badge. Borderless.
 const STATUS_DOT: Record<DaemonStatus, string> = {
   running: 'bg-green-500',
   paused: 'bg-yellow-500',
-  stopped: 'bg-muted-foreground/60',
+  stopped: 'bg-stone-400',
   unhealthy: 'bg-red-500',
+};
+
+const STATUS_TEXT: Record<DaemonStatus, string> = {
+  running: 'text-green-700 dark:text-green-300',
+  paused: 'text-yellow-700 dark:text-yellow-300',
+  stopped: 'text-muted-foreground',
+  unhealthy: 'text-red-700 dark:text-red-300',
 };
 
 /**
@@ -41,7 +41,6 @@ export function deriveDaemonStatus(
   if (!run) return 'stopped';
   if (run.stoppedAt) return 'stopped';
   const heartbeat = new Date(run.heartbeatTs).getTime();
-  // Malformed heartbeatTs → cannot verify liveness → treat as unhealthy.
   if (!Number.isFinite(heartbeat)) return 'unhealthy';
   const ageMs = nowMs - heartbeat;
   if (ageMs > 3 * 60 * 1000) return 'unhealthy';
@@ -54,6 +53,14 @@ interface DispatcherHeaderProps {
   nowMs?: number;
 }
 
+/**
+ * Compact left-cluster status block for the one-line header row
+ * (#2805 §1.1). Renders: status pill · uptime · version sha · host,
+ * all inline, borderless, muted/monospace metadata.
+ *
+ * The outer polite live region announces status-pill transitions
+ * without stepping on focused elements (#2805 §3.5).
+ */
 export function DispatcherHeader({ currentRun, nowMs }: DispatcherHeaderProps) {
   const status = deriveDaemonStatus(currentRun, nowMs);
   const uptime = currentRun && !currentRun.stoppedAt
@@ -62,43 +69,38 @@ export function DispatcherHeader({ currentRun, nowMs }: DispatcherHeaderProps) {
   const versionSha = currentRun?.versionSha ?? null;
 
   return (
-    <section
-      aria-labelledby="dispatcher-header-heading"
-      className="flex flex-wrap items-center gap-x-6 gap-y-3 rounded-lg border border-border bg-card p-4"
+    <div
+      aria-live="polite"
+      className="flex flex-wrap items-center gap-x-2 font-mono text-xs text-muted-foreground"
     >
-      <h2 id="dispatcher-header-heading" className="sr-only">
-        Daemon status
-      </h2>
-
       <span
         data-testid="daemon-status-pill"
-        className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm font-medium ${STATUS_STYLES[status]}`}
+        className="inline-flex items-center gap-1.5"
       >
         <span
           aria-hidden="true"
-          className={`inline-block h-2.5 w-2.5 rounded-full ${STATUS_DOT[status]}`}
+          className={`inline-block h-2 w-2 rounded-full ${STATUS_DOT[status]}`}
         />
-        <span className="capitalize">{status}</span>
-      </span>
-
-      <div className="text-sm">
-        <span className="text-muted-foreground">Uptime: </span>
-        <span className="font-medium text-foreground">{uptime ?? '—'}</span>
-      </div>
-
-      <div className="text-sm">
-        <span className="text-muted-foreground">Version: </span>
-        <span className="font-mono text-xs text-foreground">
-          {versionSha ? versionSha.slice(0, 8) : '—'}
+        <span className={`font-medium capitalize ${STATUS_TEXT[status]}`}>
+          {status}
         </span>
-      </div>
-
+      </span>
+      <span aria-hidden="true">&middot;</span>
+      <span>
+        uptime <span className="text-foreground">{uptime ?? '—'}</span>
+      </span>
+      <span aria-hidden="true">&middot;</span>
+      <span>
+        sha <span className="text-foreground">{versionSha ? versionSha.slice(0, 8) : '—'}</span>
+      </span>
       {currentRun?.host && (
-        <div className="text-sm">
-          <span className="text-muted-foreground">Host: </span>
-          <span className="font-mono text-xs text-foreground">{currentRun.host}</span>
-        </div>
+        <>
+          <span aria-hidden="true">&middot;</span>
+          <span>
+            host <span className="text-foreground">{currentRun.host}</span>
+          </span>
+        </>
       )}
-    </section>
+    </div>
   );
 }

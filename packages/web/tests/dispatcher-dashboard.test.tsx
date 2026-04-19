@@ -79,6 +79,17 @@ function makeEmptyState() {
       activeAgents: [],
       recentFailures: [],
       queueDepth: 0,
+      queueReady: [],
+      queueBlocked: [],
+      recentCompletions: [],
+      config: [
+        {
+          key: 'concurrency_cap',
+          value: '3',
+          updatedAt: '2026-04-18T00:00:00Z',
+          updatedBy: 'init',
+        },
+      ],
       spawnFrozenUntil: null,
     },
   };
@@ -123,6 +134,17 @@ function makeActiveState() {
         },
       ],
       queueDepth: 5,
+      queueReady: [],
+      queueBlocked: [],
+      recentCompletions: [],
+      config: [
+        {
+          key: 'concurrency_cap',
+          value: '3',
+          updatedAt: '2026-04-18T00:00:00Z',
+          updatedBy: 'init',
+        },
+      ],
       spawnFrozenUntil: null,
     },
   };
@@ -186,15 +208,15 @@ describe('DispatcherDashboard', () => {
     expect(screen.getByText(/No active agents\./i)).toBeInTheDocument();
     // Recent failures empty state
     expect(screen.getByText(/No failures in the last 24 hours\./i)).toBeInTheDocument();
-    // Queue depth section
-    expect(screen.getByText(/issues ready for pickup/i)).toBeInTheDocument();
-    // "0" appears in both "Active agents (0)" heading and queue panel — the
-    // heading carries the exact "Active agents (0)" text we want to assert.
+    // Queue empty state (split ready/blocked panels per #2805 §1.3)
+    expect(screen.getByText(/Queue empty/i)).toBeInTheDocument();
+    expect(screen.getByText(/No blocked issues\./i)).toBeInTheDocument();
+    // Recently-completed panel empty state (#2805 §1.5)
+    expect(screen.getByText(/No completed agents yet/i)).toBeInTheDocument();
+    // Active agents heading with zero count.
     expect(screen.getByText(/Active agents \(0\)/)).toBeInTheDocument();
-    // Config panel headings
-    expect(screen.getByText('Concurrency cap')).toBeInTheDocument();
-    expect(screen.getByText('Idle mode')).toBeInTheDocument();
-    expect(screen.getByText('Backoff seconds')).toBeInTheDocument();
+    // Config strip shows the inline cap button (editable via click).
+    expect(screen.getByTestId('config-value-concurrency_cap')).toBeInTheDocument();
     expect(notFoundCallCount).toBe(0);
   });
 
@@ -202,13 +224,17 @@ describe('DispatcherDashboard', () => {
     mockQueryResult.data = makeActiveState();
     mockQueryResult.loading = false;
     render(<DispatcherDashboard />);
-    // Agents table heading with count
+    // Agents row heading with count
     expect(screen.getByText(/Active agents \(1\)/)).toBeInTheDocument();
-    // "#2731" appears both in the agents row and the recent-failures row.
-    expect(screen.getAllByText('#2731').length).toBeGreaterThanOrEqual(1);
+    // Issue number is a hot link via IssueLink (#2805 §1.4).
+    // The same issue can appear in multiple panels (active + failures),
+    // so there may be more than one matching element.
+    const issueLinks = screen.getAllByTestId('issue-link-2731');
+    expect(issueLinks.length).toBeGreaterThanOrEqual(1);
+    expect(issueLinks[0]).toHaveAttribute('target', '_blank');
     expect(screen.getByText(/ralph-worker \(2\)/)).toBeInTheDocument();
-    // Short agent id
-    expect(screen.getByText(/agent-ac/i)).toBeInTheDocument();
+    // Short agent id truncated to 8 chars
+    expect(screen.getByText(/agent-ac…/)).toBeInTheDocument();
   });
 
   it('renders a "running" status pill for a healthy run', () => {

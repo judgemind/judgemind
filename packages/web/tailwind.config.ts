@@ -59,6 +59,12 @@ const config: Config = {
         md: 'calc(var(--radius) - 2px)',
         sm: 'calc(var(--radius) - 4px)',
       },
+      maxWidth: {
+        // Operator-cockpit width (#2805 §1.2). Not for reading pages —
+        // reserved for info-dense admin surfaces like /admin/dispatcher
+        // that need to show many panels side-by-side.
+        cockpit: '120rem',
+      },
       keyframes: {
         'accordion-down': {
           from: { height: '0' },

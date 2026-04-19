@@ -16,6 +16,13 @@ import type { Pool } from 'pg';
 import { GraphQLError, GraphQLScalarType, Kind } from 'graphql';
 import type { AuthUser } from '../../auth';
 import { DESTRUCTIVE_COMMANDS, requireDispatcherAdmin } from './auth';
+import {
+  extractPriority,
+  fetchIssues,
+  parseBlockedBy,
+  searchIssues,
+  type GitHubIssue,
+} from './github';
 
 // Minimal Context subset the dispatcher resolvers read.
 interface DispatcherContext {
@@ -170,6 +177,149 @@ async function queryQueueDepth(pool: Pool): Promise<number> {
   return typeof raw === 'number' ? raw : Number(raw);
 }
 
+async function queryLatestQueueSnapshotIssueNumbers(pool: Pool): Promise<number[]> {
+  const { rows } = await pool.query<{ issue_numbers: number[] | null }>(
+    `SELECT issue_numbers
+       FROM dispatcher.queue_snapshots
+       ORDER BY observed_at DESC
+       LIMIT 1`,
+  );
+  if (rows.length === 0) return [];
+  const raw = rows[0].issue_numbers;
+  return Array.isArray(raw) ? raw : [];
+}
+
+async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]> {
+  const { rows } = await pool.query<Row>(
+    `SELECT agent_id, issue_number, status, ended_at, pr_number
+       FROM dispatcher.agents
+      WHERE status IN ('succeeded', 'failed', 'crashed')
+        AND ended_at IS NOT NULL
+      ORDER BY ended_at DESC
+      LIMIT $1`,
+    [limit],
+  );
+  return rows;
+}
+
+async function queryConfig(pool: Pool): Promise<Row[]> {
+  const { rows } = await pool.query<Row>(
+    `SELECT key, value, updated_at, updated_by
+       FROM dispatcher.config
+      ORDER BY key ASC`,
+  );
+  return rows;
+}
+
+function configRowToGraphQL(row: Row): Record<string, unknown> {
+  // `value` is jsonb; serialize back to a JSON-encoded string so the
+  // client always sees the same on-wire shape (e.g. `"1"` for a number,
+  // `"\"on\""` for a string, `"[60,300]"` for an array).
+  return {
+    key: row.key,
+    value: JSON.stringify(row.value ?? null),
+    updatedAt: row.updated_at,
+    updatedBy: row.updated_by,
+  };
+}
+
+/**
+ * Fetch up to `limit` queue-ready QueueItem rows. Reads issue numbers
+ * from the most recent `dispatcher.queue_snapshots` row, then hits the
+ * GitHub API (cached) for title/labels/created_at/body.
+ *
+ * Graceful degradation: when the GitHub lookup fails we still return a
+ * minimal row with `title` = `(title unavailable — #N)` so the UI renders
+ * the hot link. Items for which `fetchIssue` returned null are dropped
+ * entirely to avoid polluting the queue with stale placeholders.
+ */
+async function queryQueueReady(pool: Pool, limit: number): Promise<Array<Record<string, unknown>>> {
+  const numbers = await queryLatestQueueSnapshotIssueNumbers(pool);
+  if (numbers.length === 0) return [];
+  const top = numbers.slice(0, limit);
+  const issues = await fetchIssues(top);
+  const result: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < top.length; i += 1) {
+    const number = top[i];
+    const issue = issues[i];
+    if (issue) {
+      result.push(queueItemFromIssue(issue, /* includeBlockedBy */ false));
+    } else {
+      // Placeholder when GitHub lookup failed — still renders as a hot
+      // link but with muted "(title unavailable)" copy.
+      result.push({
+        issueNumber: number,
+        title: '(title unavailable)',
+        priority: null,
+        labels: [],
+        createdAt: new Date(0).toISOString(),
+        blockedBy: [],
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Fetch up to `limit` queueBlocked QueueItem rows. `status/blocked` is
+ * not tracked in `dispatcher.queue_snapshots`, so this queries the
+ * GitHub search API (cached).
+ */
+async function queryQueueBlocked(limit: number): Promise<Array<Record<string, unknown>>> {
+  const issues = await searchIssues('label:status/blocked', undefined, limit);
+  const result: Array<Record<string, unknown>> = [];
+  for (const issue of issues) {
+    result.push(queueItemFromIssue(issue, /* includeBlockedBy */ true));
+  }
+  // Sort newest first per spec.
+  result.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return result;
+}
+
+function queueItemFromIssue(
+  issue: GitHubIssue,
+  includeBlockedBy: boolean,
+): Record<string, unknown> {
+  return {
+    issueNumber: issue.number,
+    title: issue.title,
+    priority: extractPriority(issue.labels),
+    labels: issue.labels,
+    createdAt: issue.createdAt,
+    blockedBy: includeBlockedBy ? parseBlockedBy(issue.body) : [],
+  };
+}
+
+async function recentCompletionsToGraphQL(
+  rows: readonly Row[],
+): Promise<Array<Record<string, unknown>>> {
+  const issueNumbers: number[] = [];
+  for (const row of rows) {
+    const n = row.issue_number;
+    if (typeof n === 'number') issueNumbers.push(n);
+  }
+  // Dedupe before the GitHub fetch — multiple completions may share a
+  // single issue number (retries).
+  const uniqueNumbers = Array.from(new Set(issueNumbers));
+  const issues = await fetchIssues(uniqueNumbers);
+  const titleByNumber = new Map<number, string>();
+  for (let i = 0; i < uniqueNumbers.length; i += 1) {
+    const issue = issues[i];
+    if (issue) titleByNumber.set(uniqueNumbers[i], issue.title);
+  }
+  return rows.map((row) => {
+    const number = typeof row.issue_number === 'number' ? row.issue_number : null;
+    return {
+      agentId: row.agent_id,
+      issueNumber: number,
+      issueTitle: number !== null ? (titleByNumber.get(number) ?? null) : null,
+      status: row.status,
+      endedAt: row.ended_at,
+      prNumber: row.pr_number ?? null,
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Data access — dispatcherAgent
 // ---------------------------------------------------------------------------
@@ -254,6 +404,100 @@ async function insertCommandIdempotent(
 }
 
 // ---------------------------------------------------------------------------
+// Data access — dispatcherSetConfig mutation (live-edit config + audit)
+// ---------------------------------------------------------------------------
+
+/**
+ * Server-side validation for `dispatcher.config` edits (#2805 §1.6). The
+ * admin UI restricts the inputs it shows, but we also enforce the
+ * constraints here so an unauthorised (but admin) bulk update can't
+ * corrupt the daemon. Return value is the parsed (JSON-native) value
+ * that will be written into the jsonb column. Throws a GraphQLError on
+ * invalid input.
+ */
+export function validateConfigValue(key: string, raw: unknown): unknown {
+  switch (key) {
+    case 'concurrency_cap': {
+      const n = typeof raw === 'number' ? raw : Number.NaN;
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > 5) {
+        throw new GraphQLError(
+          'concurrency_cap must be an integer in [0, 5]',
+          { extensions: { code: 'BAD_USER_INPUT' } },
+        );
+      }
+      return n;
+    }
+    case 'subprocess_timeout_s':
+    case 'idle_audit_every_n_prs': {
+      const n = typeof raw === 'number' ? raw : Number.NaN;
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        throw new GraphQLError(
+          `${key} must be a non-negative integer`,
+          { extensions: { code: 'BAD_USER_INPUT' } },
+        );
+      }
+      return n;
+    }
+    case 'backoff_seconds': {
+      if (
+        !Array.isArray(raw) ||
+        !raw.every((v) => typeof v === 'number' && Number.isInteger(v) && v >= 0)
+      ) {
+        throw new GraphQLError(
+          'backoff_seconds must be an array of non-negative integers',
+          { extensions: { code: 'BAD_USER_INPUT' } },
+        );
+      }
+      return raw;
+    }
+    case 'idle_spotcheck_cron': {
+      if (typeof raw !== 'string' || raw.length === 0) {
+        throw new GraphQLError(
+          'idle_spotcheck_cron must be a non-empty string',
+          { extensions: { code: 'BAD_USER_INPUT' } },
+        );
+      }
+      return raw;
+    }
+    case 'runner_by_phase':
+    case 'model_by_phase':
+    case 'runner_shadow': {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new GraphQLError(
+          `${key} must be a JSON object`,
+          { extensions: { code: 'BAD_USER_INPUT' } },
+        );
+      }
+      return raw;
+    }
+    default:
+      // Unknown keys are rejected — operators should not be able to
+      // freehand new config entries through the admin page.
+      throw new GraphQLError(`Unknown config key: ${key}`, {
+        extensions: { code: 'BAD_USER_INPUT' },
+      });
+  }
+}
+
+async function updateConfigEntry(
+  pool: Pool,
+  key: string,
+  value: unknown,
+  updatedBy: string,
+): Promise<Row | null> {
+  const { rows } = await pool.query<Row>(
+    `UPDATE dispatcher.config
+        SET value = $2::jsonb,
+            updated_at = NOW(),
+            updated_by = $3
+      WHERE key = $1
+    RETURNING key, value, updated_at, updated_by`,
+    [key, JSON.stringify(value), updatedBy],
+  );
+  return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Resolvers
 // ---------------------------------------------------------------------------
 
@@ -320,6 +564,41 @@ export const dispatcherResolvers = {
       );
       return commandRowToGraphQL(row, created);
     },
+
+    dispatcherSetConfig: async (
+      _: unknown,
+      { key, value }: { key: string; value: string },
+      { pool, user, mfaToken }: DispatcherContext,
+    ) => {
+      const admin = requireDispatcherAdmin(user);
+
+      // Config edits materially change daemon behaviour — require the
+      // same MFA placeholder gate as destructive commands (§17 Risk 6).
+      if (!mfaToken || mfaToken.trim().length === 0) {
+        throw new GraphQLError('MFA re-auth required for config updates', {
+          extensions: { code: 'MFA_REQUIRED' },
+        });
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(value);
+      } catch {
+        throw new GraphQLError('value must be a JSON-encoded string', {
+          extensions: { code: 'BAD_USER_INPUT' },
+        });
+      }
+
+      const validated = validateConfigValue(key, parsed);
+
+      const row = await updateConfigEntry(pool, key, validated, admin.email);
+      if (!row) {
+        throw new GraphQLError(`Unknown config key: ${key}`, {
+          extensions: { code: 'BAD_USER_INPUT' },
+        });
+      }
+      return configRowToGraphQL(row);
+    },
   },
 
   DispatcherState: {
@@ -349,6 +628,32 @@ export const dispatcherResolvers = {
     queueDepth: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
       requireDispatcherAdmin(user);
       return queryQueueDepth(pool);
+    },
+
+    queueReady: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
+      requireDispatcherAdmin(user);
+      return queryQueueReady(pool, 10);
+    },
+
+    queueBlocked: async (_: unknown, __: unknown, { user }: DispatcherContext) => {
+      requireDispatcherAdmin(user);
+      return queryQueueBlocked(10);
+    },
+
+    recentCompletions: async (
+      _: unknown,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      const rows = await queryRecentCompletions(pool, 10);
+      return recentCompletionsToGraphQL(rows);
+    },
+
+    config: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
+      requireDispatcherAdmin(user);
+      const rows = await queryConfig(pool);
+      return rows.map(configRowToGraphQL);
     },
 
     spawnFrozenUntil: (parent: Record<string, unknown>) => {
@@ -455,8 +760,12 @@ export const dispatcherScalarResolvers = {
 export {
   agentRowToGraphQL,
   commandRowToGraphQL,
+  configRowToGraphQL,
   failureRowToGraphQL,
   insertCommandIdempotent,
+  queueItemFromIssue,
+  recentCompletionsToGraphQL,
   runRowToGraphQL,
   transitionRowToGraphQL,
+  updateConfigEntry,
 };

@@ -11,9 +11,22 @@ import {
 import { Button } from '@/components/ui/button';
 import type { DispatcherCommand } from '@/lib/dispatcher-queries';
 
+/**
+ * Commands that can open the ConfirmDialog. Includes all
+ * `DESTRUCTIVE_COMMANDS` plus the synthetic `'lower_cap'` sentinel used
+ * by the config strip when the operator reduces `concurrency_cap`
+ * (#2805 §1.6; spec §17 Risk 6 Option A).
+ */
+export type ConfirmableCommand = DispatcherCommand | 'lower_cap';
+
 interface ConfirmDialogProps {
   /** Non-null when the dialog should be open for this command. */
-  command: DispatcherCommand | null;
+  command: ConfirmableCommand | null;
+  /**
+   * When `command === 'lower_cap'`, carries the before/after values so
+   * the dialog's copy can explain the transition. Ignored otherwise.
+   */
+  capDetail?: { current: number; next: number } | null;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -33,9 +46,26 @@ const DESCRIPTIONS: Partial<Record<DispatcherCommand, { title: string; body: str
   },
 };
 
-export function ConfirmDialog({ command, onConfirm, onCancel }: ConfirmDialogProps) {
+export function ConfirmDialog({
+  command,
+  capDetail,
+  onConfirm,
+  onCancel,
+}: ConfirmDialogProps) {
   const open = command !== null;
-  const content = command ? DESCRIPTIONS[command] : null;
+  let title = 'Confirm';
+  let body = '';
+  if (command === 'lower_cap' && capDetail) {
+    title = `Lower concurrency cap from ${capDetail.current} to ${capDetail.next}?`;
+    body =
+      'In-flight agents continue; the daemon stops claiming new ones until the cap is raised or slots free up.';
+  } else if (command && command !== 'lower_cap') {
+    const content = DESCRIPTIONS[command];
+    if (content) {
+      title = content.title;
+      body = content.body;
+    }
+  }
 
   return (
     <Dialog
@@ -46,8 +76,8 @@ export function ConfirmDialog({ command, onConfirm, onCancel }: ConfirmDialogPro
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{content?.title ?? 'Confirm'}</DialogTitle>
-          <DialogDescription>{content?.body ?? ''}</DialogDescription>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{body}</DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <Button type="button" variant="outline" size="sm" onClick={onCancel}>
