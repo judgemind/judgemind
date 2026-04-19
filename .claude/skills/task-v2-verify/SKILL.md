@@ -1,107 +1,211 @@
 ---
-description: (WIP — dispatcher v2 spike 0.3 stub) Verify phase for the per-phase /task-v2 pipeline. Reads merged PR + deploy status + AC list, produces a verification-evidence comment with per-criterion proof.
-argument-hint: ""
-maxTurns: 40
-model: opus
+description: Verify phase for the per-phase /task-v2 pipeline. Reads the merged PR plus deploy status plus acceptance criteria, produces a verification-evidence comment with per-criterion proof against dev.
+argument-hint: "<agent-id>"
+maxTurns: 50
+model: haiku
 ---
 
-# /task-v2-verify skill (WIP stub)
+# /task-v2-verify skill
 
-**Status:** WIP — extracted from `.claude/skills/task/SKILL.md` A.8 (deploy verification + evidence comment) for dispatcher v2 spike 0.3.
+Verify phase for the dispatcher v2 per-phase task pipeline (`docs/specs/dispatcher-v2-spec.md` §6a). Invoked by the daemon after the deploy workflow finishes green. Runs functional verification against dev and produces the per-criterion evidence comment the daemon will post on the issue (mandatory per `CLAUDE.md` §PR Workflow — every task completion requires concrete evidence or an explicit skip reason).
 
-**Goal:** After the daemon watches the deploy workflow to SUCCESS, this skill runs functional verification against dev and produces the per-criterion evidence comment the daemon will post on the issue.
+**Prerequisites:** The dispatcher daemon has already (a) merged the PR, (b) watched the deploy workflow (when applicable) to SUCCESS, (c) written the input bundle to `{worktree}/tmp/dispatcher-input/verify.json`.
 
-**Input:** `{worktree}/tmp/dispatcher-input/verify.json`:
-- `issue_number` (int)
-- `pr_number` (int)
-- `acceptance_criteria` (list of str) — from the plan
-- `change_type` (str) — `api`, `scraper`, `ingestion`, `web`, `db_migration`, `dx_tooling`, `backfill_script`, `no_deployed_component`
-- `touched_services` (list of str) — ECS service names / URL endpoints / DB tables affected
-- `worktree_path` (str)
-- `repo_root` (str)
+**Goal:** Produce `{worktree}/tmp/dispatcher-output/verify.json` with verdict=`VERIFIED`, `SKIPPED`, or `FAILED`, and the evidence markdown the daemon will post on the issue.
 
-**Output:** `{worktree}/tmp/dispatcher-output/verify.json`:
-- `verdict` (str) — `VERIFIED`, `FAILED`, `SKIPPED`
-- `evidence_md` (str) — the markdown comment to post on the issue
-- `per_criterion_results` (list of `{criterion, verified, evidence}`)
-- `failure_reason` (str or null) — if verdict=FAILED, what was broken
+**IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation.
+
+**IMPORTANT — Never deploy to production.** Verification runs against dev only. Production deploys are human-only per `CLAUDE.md`.
+
+**IMPORTANT — Post the comment? No.** The daemon posts the comment after reading this skill's output. This skill does not call `gh issue comment` — it only produces the markdown.
+
+---
+
+## Input contract
+
+Read `{worktree}/tmp/dispatcher-input/verify.json`. Required fields:
+
+- `agent_id` (str).
+- `issue_number` (int).
+- `pr_number` (int).
+- `acceptance_criteria` (list of str) — from plan output or extracted from issue body.
+- `change_type` (str) — one of `api`, `scraper`, `ingestion`, `web`, `db_migration`, `dx_tooling`, `backfill_script`, `docs`, `agent_skill`, `no_deployed_component`.
+- `touched_services` (list of str) — ECS service names, URL endpoints, or DB tables affected. Examples: `judgemind-api-dev`, `https://dev.api.judgemind.org/api/rulings`, `derived.documents`.
+- `deploy_status` (object) — `{workflow_name, run_id, conclusion, duration_s}` for the deploy run, or `null` if no-deploy change.
+- `merged_commit_sha` (str).
+- `worktree_path` (str).
+- `repo_root` (str).
+
+Optional:
+
+- `plan_text` (str) — from plan output; can clarify ambiguous criteria.
+- `scope_check` (list) — for context on what's intentionally out of scope.
+
+If the file is missing or malformed, exit 0 with verdict=`FAILED, failure_reason="input JSON missing or malformed"`.
+
+---
+
+## Output contract
+
+Write `{worktree}/tmp/dispatcher-output/verify.json`:
+
+```
+{
+  "agent_id": "<echo>",
+  "issue_number": <int>,
+  "pr_number": <int>,
+  "verdict": "VERIFIED" | "SKIPPED" | "FAILED",
+  "change_type": "<echo>",
+  "evidence_md": "<full markdown comment body the daemon will post>",
+  "per_criterion_results": [
+    {"criterion": "<text>", "verified": true|false, "evidence": "<1-3 lines of proof>"}
+  ],
+  "failure_reason": null | "<string>",
+  "unblock_issues": [<int>, ...]
+}
+```
+
+`unblock_issues` is a list of issue numbers this completion unblocks — the daemon passes them to `scripts/unblock-dependents.sh`. Typically empty unless the issue body contains `Unblocks: #N` references.
+
+Exit 0 regardless. Verdict comes from JSON.
 
 ---
 
 ## Step 1 — Determine verification path
 
-Use the change_type to pick the verification strategy:
+Use `change_type` to pick the verification strategy:
 
 | change_type | Verification approach | Required evidence |
 |---|---|---|
-| `api` | `curl` against `dev.api.judgemind.org`, confirm expected response | status code + body snippet |
-| `scraper` | Read ECS logs via `scripts/ecs-logs.sh /ecs/judgemind-scraper-dev --lines 50` | log lines showing successful capture |
-| `ingestion` | Read ECS logs `/ecs/judgemind-ingestion-worker-dev` | log lines showing successful processing |
-| `web` | Fetch page content from `dev.judgemind.org` | rendered HTML / screenshot |
-| `db_migration` | `scripts/dev-db-query.sh` to confirm column/table exists | DB query output |
-| `backfill_script` | Run script via `scripts/ecs-run-task.sh`, verify data changes | row counts / sample records |
-| `dx_tooling` | Run the tool in a representative scenario | command output |
-| `no_deployed_component` | Skip functional verification — go directly to Step 3 with verdict=SKIPPED | n/a |
+| `api` | `curl -fsS https://dev.api.judgemind.org/<endpoint>` — confirm expected response | status code + body snippet (first 500 chars) |
+| `scraper` | Read ECS logs via `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` against `/ecs/judgemind-scraper-dev` | log lines showing successful capture of the relevant court |
+| `ingestion` | Read ECS logs via MCP CloudWatch against `/ecs/judgemind-ingestion-worker-dev` | log lines showing successful document processing (plus sample downstream DB query confirming the row) |
+| `web` | Fetch a rendered page from `https://dev.judgemind.org/<path>`, or screenshot via `scripts/run-py.sh scripts/screenshot.py <url>` | rendered HTML or screenshot filepath |
+| `db_migration` | `scripts/dev-db-query.sh` to confirm the column/table/constraint exists and the schema matches | DB query output |
+| `backfill_script` | The daemon or prior step ran the script via `scripts/ecs-run-task.sh`. Verify row counts / sample records via `scripts/dev-db-query.sh` | before/after row counts, or sample rows |
+| `dx_tooling` | Run the tool in a representative scenario (e.g. invoke the new script on a known input) | command output demonstrating expected behavior |
+| `docs` | No functional verification possible. `verdict=SKIPPED` with reason. Optional: confirm `scripts/check-markdown-links.sh` passed in CI | n/a |
+| `agent_skill` | No runtime verification. Confirm the skill file is present on `main`, has production-ready frontmatter (not a stub marker), and (if feasible) a dry `claude -p /<skill> <fixture>` produces non-empty output | file-presence + content-shape check |
+| `no_deployed_component` | `verdict=SKIPPED` with reason | n/a |
+
+If `deploy_status` is `null` or `conclusion != 'success'` and `change_type` is deploy-requiring, set `verdict=FAILED` with `failure_reason="deploy did not reach SUCCESS: <conclusion>"`. Do not run functional checks against stale code.
 
 ## Step 2 — Per-criterion verification
 
-For each acceptance criterion, pick the right verification action and capture concrete evidence:
-- **Frontend criteria**: screenshot via `scripts/run-py.sh scripts/screenshot.py <url>`, or fetch page content.
-- **Data criteria**: run the specific SQL query (prefer `scripts/dev-db-query.sh`).
-- **API criteria**: hit the specific endpoint and confirm response.
-- **Behavior criteria**: trigger the scenario and capture result.
+For each acceptance criterion in `acceptance_criteria`, execute the verification action that the criterion's `Verify:` line names (per `docs/agent/issue-authoring.md`). Capture concrete evidence into `per_criterion_results[].evidence`:
 
-If any criterion fails to verify, set `verdict=FAILED` and include the diagnostic output in `failure_reason`.
+- **Frontend criteria** ("Verify: page renders without errors") — screenshot or page-fetch. Evidence = screenshot filepath or first 500 chars of rendered HTML.
+- **Data criteria** ("Verify: SELECT count(*) FROM derived.documents WHERE …") — run the exact SQL via `scripts/dev-db-query.sh`. Evidence = the query + result.
+- **API criteria** ("Verify: curl returns 200 with field `x`") — run the curl. Evidence = status code + relevant body fragment.
+- **Behavior criteria** ("Verify: ingestion worker processes a sample fixture without errors") — trigger the scenario (or find a recent occurrence in logs) and capture result.
+- **Log criteria** — MCP CloudWatch Logs Insights query; capture the matching log line(s). Limit to 5-10 lines per criterion to keep the evidence comment readable.
+
+If any criterion fails to verify, record `verified=false` in that row, and set the overall `verdict=FAILED` with `failure_reason` summarizing which criteria failed.
+
+For criteria that are explicitly "post-deploy only" and were marked `unmet` by summary, this phase is the one that resolves them.
 
 ## Step 3 — Build the evidence comment
 
-For verdict=VERIFIED:
+For `verdict=VERIFIED`:
 
 ```
 ## Verification Evidence
 
 **Change type:** <change_type>
 **Environment:** dev
+**PR:** #<PR-N> merged at <sha>
+**Deploy workflow:** <workflow_name> run <run_id> — SUCCESS in <duration>
 
-**Deployment health:**
-<curl/log/DB query output>
+### Deployment health
 
-**Acceptance criteria verification:**
+<curl output / log lines / DB query output demonstrating the service is live after deploy>
+
+### Acceptance criteria verification
 
 | # | Criterion | Verified | Evidence |
 |---|-----------|----------|----------|
-| 1 | <criterion> | Yes | <proof> |
+| 1 | <criterion> | Yes | <proof, 1-3 lines> |
 | 2 | <criterion> | Yes | <proof> |
 
-Post-deploy verification: PASSED
+**Post-deploy verification: PASSED**
 ```
 
-For verdict=SKIPPED (no deployed component):
+For `verdict=SKIPPED` (no deployed component):
 
 ```
 ## Verification Evidence
 
 **Change type:** <change_type>
-**Skip reason:** No deployed component — <docs/CI/tooling only, etc.>
+**PR:** #<PR-N> merged at <sha>
 
-Post-deploy verification: N/A (no deployed component)
+**Skip reason:** No deployed component — <docs / CI / tooling / agent config, specify which>
+
+### Acceptance criteria
+
+| # | Criterion | Status |
+|---|-----------|--------|
+| 1 | <criterion> | Merged to main — file present |
+| 2 | <criterion> | Merged to main — <description of static verification> |
+
+**Post-deploy verification: N/A (no deployed component)**
 ```
 
-For verdict=FAILED:
+For `verdict=FAILED`:
 
 ```
 ## Verification Evidence — FAILED
 
 **Change type:** <change_type>
+**PR:** #<PR-N> merged at <sha>
+**Deploy workflow:** <workflow_name> run <run_id> — <conclusion>
+
 **Failure:** <failure_reason>
 
-<diagnostic output>
+### Diagnostic output
 
-Post-deploy verification: FAILED — daemon will file priority/p1 follow-up issue.
 ```
+<log lines / curl error / DB query output showing the failure>
+```
+
+### Acceptance criteria verification
+
+| # | Criterion | Verified | Evidence |
+|---|-----------|----------|----------|
+| 1 | <criterion> | No | <why it failed> |
+
+**Post-deploy verification: FAILED — daemon will file priority/p1 follow-up issue for rollback or hotfix.**
+```
+
+Keep the comment under ~8000 characters. For long log dumps, truncate to the most relevant 20-30 lines.
+
+## Step 4 — Populate unblock_issues
+
+Check the issue body for `Unblocks: #<N>` lines (rare but useful for the spec's dependency graph). Add each to `unblock_issues`. The daemon runs `scripts/unblock-dependents.sh <issue_number>` after this phase, which uses GitHub's `Closes #N` + `Blocked by` mechanics — `unblock_issues` is an explicit override for cases where the automatic path misses.
+
+## Step 5 — Write the output JSON
+
+Emit `{worktree}/tmp/dispatcher-output/verify.json`. Exit 0.
+
+---
+
+## What this skill does NOT do
+
+- **Does not post the comment.** Daemon does that after reading this output.
+- **Does not deploy anything.** Daemon ran the deploy watch; this skill only verifies the already-deployed code.
+- **Does not close the issue.** The PR merge auto-closes via `Closes #N`. If verdict=`FAILED`, the issue is NOT reopened by this skill — the daemon decides whether to file a rollback/hotfix issue.
+- **Does not run backfills or data rewrites.** If verification reveals data needs repair, this skill reports that; a human or a follow-up task does the repair.
+
+## Verification quality notes
+
+- **Correctness > completeness** per `CLAUDE.md`. If the deployed code returns a field, check it against the source document / fixture — do not just confirm the field is populated.
+- **Use MCP first** for AWS reads: `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` is faster and cleaner than shelling out to `aws logs`. Load via `ToolSearch query="select:mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query,mcp__awslabs_cloudwatch-mcp-server__describe_log_groups"` before first use.
+- **Evidence must be reproducible.** Someone reading the comment should be able to copy the curl/SQL/log query and get the same result.
+- **Truncate, don't hide.** If a log dump is 200 lines long, show the 20 most relevant with `...` to indicate truncation. Never drop the evidence to "it worked".
 
 ## Reminders
 
-- Do not post the comment — the daemon does that after reading this skill's output.
-- Prefer MCP for AWS reads (`mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query`) over shelling out to `aws logs`.
-- No `$()`, no heredocs. All outputs go in the JSON file.
+- No `$()`, no heredocs, no `python -c`. See `CLAUDE.md` Critical Rules.
+- All temp files go in `{worktree}/tmp/`, never `/tmp/`.
+- Never call `aws secretsmanager get-secret-value` directly — use `scripts/with-secret.sh`.
+- Never run production scraping. Dev only.
+- If you need to run a data query, use `scripts/dev-db-query.sh` (ECS Exec path) — direct DB connection from the worktree is blocked by VPC per `CLAUDE.md` §Infrastructure.
