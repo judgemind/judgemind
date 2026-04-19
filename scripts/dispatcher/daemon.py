@@ -100,6 +100,17 @@ DEFAULT_HOUSEKEEPING_TICK_SECONDS = 3600
 #: ``dispatcher.config`` (operator knob — no redeploy needed).
 DEFAULT_QUEUE_SNAPSHOT_RETENTION_DAYS = 30
 
+#: Default retention window for ``dispatcher.phase_outputs``. Matches the
+#: queue-snapshot default so every dispatcher housekeeping target shares
+#: the same cutoff. Overridable via the ``phase_output_retention_days``
+#: row in ``dispatcher.config``. Issue #2779.
+DEFAULT_PHASE_OUTPUT_RETENTION_DAYS = 30
+
+#: Default retention window for ``dispatcher.notifications``. Matches the
+#: queue-snapshot default. Overridable via the
+#: ``notification_retention_days`` row in ``dispatcher.config``. Issue #2779.
+DEFAULT_NOTIFICATION_RETENTION_DAYS = 30
+
 #: Default repo the daemon watches. Overridden by the ``GITHUB_REPO``
 #: env var, wired in the terraform module.
 DEFAULT_GITHUB_REPO = "judgemind/judgemind"
@@ -295,9 +306,10 @@ class DispatcherDaemon:
             - prune ``dispatcher.queue_snapshots`` rows older than
               ``queue_snapshot_retention_days`` (default 30;
               ``dispatcher.config`` overridable). Issue #2778.
-            - Additional tables (``phase_outputs``, ``notifications``)
-              plug into the same tick via the ``_HOUSEKEEPING_TARGETS``
-              table — issue #2779 extends it.
+            - prune ``dispatcher.phase_outputs`` rows older than
+              ``phase_output_retention_days`` (default 30). Issue #2779.
+            - prune ``dispatcher.notifications`` rows older than
+              ``notification_retention_days`` (default 30). Issue #2779.
         * On SIGTERM / SIGINT, UPDATE ``dispatcher.runs.stopped_at`` and
           exit 0.
 
@@ -831,14 +843,28 @@ class DispatcherDaemon:
     #: with an f-string is safe from SQL injection here. Cutoff days are
     #: parameterized normally via psycopg's ``%s`` placeholder.
     #:
-    #: Extending: issue #2779 appends ``phase_outputs`` and
-    #: ``notifications`` entries here with their own retention keys.
+    #: Extending: issue #2779 added ``phase_outputs`` (ts column) and
+    #: ``notifications`` (created_at column). Both default to 30 days,
+    #: overridable via ``phase_output_retention_days`` and
+    #: ``notification_retention_days`` rows in ``dispatcher.config``.
     _HOUSEKEEPING_TARGETS: tuple[tuple[str, str, str, int], ...] = (
         (
             "queue_snapshots",
             "observed_at",
             "queue_snapshot_retention_days",
             DEFAULT_QUEUE_SNAPSHOT_RETENTION_DAYS,
+        ),
+        (
+            "phase_outputs",
+            "ts",
+            "phase_output_retention_days",
+            DEFAULT_PHASE_OUTPUT_RETENTION_DAYS,
+        ),
+        (
+            "notifications",
+            "created_at",
+            "notification_retention_days",
+            DEFAULT_NOTIFICATION_RETENTION_DAYS,
         ),
     )
 
