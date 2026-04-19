@@ -429,6 +429,67 @@ write_query_file "app/Page.tsx" '
 '
 assert_passes "Schema with escaped backticks in descriptions is parsed correctly"
 
+# ─── Test 15: Module schema files extend the core schema ─────────────
+# Mirrors the real layout where `packages/api/src/graphql/dispatcher/schema.ts`
+# declares `extend type Query` additions that the frontend references via
+# gql queries. The validator must concatenate all per-module SDL blocks so
+# those additions are visible.
+setup_repo
+write_schema '
+  type Query {
+    health: String!
+  }
+'
+# Write a per-module schema file that extends Query with a new field.
+mkdir -p "$TMPDIR_TEST/packages/api/src/graphql/dispatcher"
+cat > "$TMPDIR_TEST/packages/api/src/graphql/dispatcher/schema.ts" <<'MODULE_EOF'
+export const dispatcherTypeDefs = `#graphql
+  type DispatcherState {
+    queueDepth: Int!
+  }
+  extend type Query {
+    dispatcherState: DispatcherState!
+  }
+`;
+MODULE_EOF
+write_query_file "app/DispatcherPage.tsx" '
+  query DispatcherState {
+    dispatcherState {
+      queueDepth
+    }
+  }
+'
+assert_passes "Per-module schema.ts files extend the core schema"
+
+# ─── Test 16: Module schema referencing missing core type still fails ─
+setup_repo
+write_schema '
+  type Query {
+    health: String!
+  }
+'
+mkdir -p "$TMPDIR_TEST/packages/api/src/graphql/dispatcher"
+cat > "$TMPDIR_TEST/packages/api/src/graphql/dispatcher/schema.ts" <<'MODULE_EOF'
+export const dispatcherTypeDefs = `#graphql
+  type DispatcherState {
+    queueDepth: Int!
+  }
+  extend type Query {
+    dispatcherState: DispatcherState!
+  }
+`;
+MODULE_EOF
+# Query references a field not present in either core or module schema.
+write_query_file "app/DispatcherPage.tsx" '
+  query DispatcherState {
+    dispatcherState {
+      queueDepth
+      missingField
+    }
+  }
+'
+assert_fails "Module schema still surfaces invalid fields"
+
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "Results: $((TESTS - FAILURES))/$TESTS passed"

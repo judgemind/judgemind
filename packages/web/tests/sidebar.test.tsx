@@ -103,6 +103,26 @@ describe('Sidebar', () => {
     expect(href).toMatch(/^\/admin\/data-quality\/?$/);
   });
 
+  it('shows Dispatcher link for admin users', () => {
+    mockAuthResult.user = makeUser('admin');
+    render(<Sidebar />);
+    expect(screen.getByText('Dispatcher')).toBeInTheDocument();
+  });
+
+  it('admin Dispatcher link points to /admin/dispatcher/', () => {
+    mockAuthResult.user = makeUser('admin');
+    render(<Sidebar />);
+    const link = screen.getByText('Dispatcher');
+    const href = link.closest('a')?.getAttribute('href') ?? '';
+    expect(href).toMatch(/^\/admin\/dispatcher\/?$/);
+  });
+
+  it('does not show Dispatcher link for non-admin users', () => {
+    mockAuthResult.user = makeUser('user');
+    render(<Sidebar />);
+    expect(screen.queryByText('Dispatcher')).not.toBeInTheDocument();
+  });
+
   it('highlights the active route with accent styling', () => {
     mockPathname = '/search';
     render(<Sidebar />);
