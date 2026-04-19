@@ -130,4 +130,4 @@ When you add a migration that creates or drops a UNIQUE constraint:
    constraint from `schema.sql` and migration files — no manual update needed.
 2. Update this table above.
 3. If the constraint should also be in `schema.sql` for local dev, update
-   that file too (and the `check-schema-drift.sh` check will enforce it).
+   that file too (and the `check_schema_drift.sh` check will enforce it).
