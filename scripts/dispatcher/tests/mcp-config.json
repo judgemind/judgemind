@@ -1,0 +1,11 @@
+{
+  "_comment": "MCP config used by scripts/dispatcher/tests/test_mcp_github_integration.py to exercise mcp__github__* tool execution end-to-end (issue #2700). The test spawns `claude -p --mcp-config <this-file>` with GITHUB_TOKEN set from a real scoped PAT (via scripts/with-secret.sh in the manual/Fargate run; fetched from dev secrets in CI-bypass mode) and calls mcp__github__get_issue against a known closed test issue to prove the scoped-PAT + MCP-server pair round-trips correctly. The `github` MCP server package itself reads GITHUB_TOKEN (or GITHUB_PERSONAL_ACCESS_TOKEN) from the process env, so we pass `env: {}` here to let the subprocess inherit whichever is set — mirrors the spike 0.1 pattern (docs/investigations/dispatcher-v2-spike-0.1.md §4).",
+  "mcpServers": {
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {}
+    }
+  }
+}
