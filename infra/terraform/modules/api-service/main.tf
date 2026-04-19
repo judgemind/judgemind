@@ -165,6 +165,10 @@ resource "aws_iam_role_policy" "api_secrets" {
   name = "judgemind-api-secrets-${var.environment}"
   role = element(split("/", var.execution_role_arn), length(split("/", var.execution_role_arn)) - 1)
 
+  # `compact()` drops empty-string ARNs so environments that don't wire a
+  # given optional secret (e.g. a fresh stack with no dispatcher PAT) still
+  # produce a valid policy. Matches the `execution_secrets` pattern in
+  # `modules/dispatcher-daemon/main.tf` (#2700).
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -175,6 +179,7 @@ resource "aws_iam_role_policy" "api_secrets" {
         Resource = compact([
           var.db_connection_secret_arn,
           var.opensearch_credentials_secret_arn,
+          var.github_token_secret_arn,
         ])
       }
     ]
@@ -293,6 +298,19 @@ resource "aws_ecs_task_definition" "api" {
           {
             name      = "OPENSEARCH_PASSWORD"
             valueFrom = "${var.opensearch_credentials_secret_arn}:password::"
+          }
+        ] : [],
+        var.github_token_secret_arn != "" ? [
+          {
+            # GITHUB_TOKEN for the dispatcher admin GraphQL resolvers
+            # (packages/api/src/graphql/dispatcher/github.ts). Without it,
+            # the /admin/dispatcher page burns through the unauthenticated
+            # 60 req/hr rate limit within seconds and every row renders
+            # "(title unavailable)" + "20562 d ago" (#2818). The dev env
+            # reuses the dispatcher PAT at `judgemind/dispatcher/github-token`;
+            # other envs pass "" and this block is skipped.
+            name      = "GITHUB_TOKEN"
+            valueFrom = var.github_token_secret_arn
           }
         ] : []
       )

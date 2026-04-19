@@ -2,7 +2,6 @@
 
 import { SECTION_HEADING } from '@/lib/typography';
 import type { QueueItem } from '@/lib/dispatcher-queries';
-import { formatRelativeTime } from './format-helpers';
 import { IssueLink, PriorityBadge } from './ui-primitives';
 
 interface QueuePanelProps {
@@ -10,7 +9,12 @@ interface QueuePanelProps {
   queueReady: readonly QueueItem[];
   /** Open issues labelled `status/blocked`. */
   queueBlocked: readonly QueueItem[];
-  /** Override for deterministic tests. */
+  /**
+   * Override for deterministic tests. Currently unused after #2818 stripped
+   * the "filed N d ago" column — kept in the prop signature so existing
+   * callers (`DispatcherDashboard`, the test suite) don't need to refactor
+   * if we re-introduce a time-based cell later.
+   */
   nowMs?: number;
 }
 
@@ -21,26 +25,30 @@ interface QueuePanelProps {
  *
  * Capped server-side at 10 entries per panel; more is dispatcher-internal
  * scheduling state, not useful on the overview page.
+ *
+ * Row density (#2818 — operator density pass): each row shows only
+ *   `issue link + priority badge + title`.
+ * The previous design also rendered `#<slot>` (rank) on the ready side and
+ * `[N]` (blocked-by count) on the blocked side plus a `<N> d ago` filed-time
+ * column — stripped because (a) row position IS the rank, (b) the blocked-by
+ * tooltip belongs on the issue page, and (c) filed-time is never actionable
+ * from this page. Titles get the freed horizontal space; the title cell
+ * wraps onto a second line rather than ellipsis-truncating so the operator
+ * can read the full text without hovering.
  */
-export function QueuePanel({ queueReady, queueBlocked, nowMs }: QueuePanelProps) {
+export function QueuePanel({ queueReady, queueBlocked }: QueuePanelProps) {
   return (
     <div
       className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2"
       data-testid="queue-panels"
     >
-      <QueueReadyPanel items={queueReady} nowMs={nowMs} />
-      <QueueBlockedPanel items={queueBlocked} nowMs={nowMs} />
+      <QueueReadyPanel items={queueReady} />
+      <QueueBlockedPanel items={queueBlocked} />
     </div>
   );
 }
 
-function QueueReadyPanel({
-  items,
-  nowMs,
-}: {
-  items: readonly QueueItem[];
-  nowMs?: number;
-}) {
+function QueueReadyPanel({ items }: { items: readonly QueueItem[] }) {
   return (
     <section aria-labelledby="queue-ready-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
@@ -57,13 +65,8 @@ function QueueReadyPanel({
         </p>
       ) : (
         <ul className="divide-y divide-border">
-          {items.map((item, index) => (
-            <QueueRow
-              key={item.issueNumber}
-              item={item}
-              slot={index + 1}
-              nowMs={nowMs}
-            />
+          {items.map((item) => (
+            <QueueRow key={item.issueNumber} item={item} />
           ))}
         </ul>
       )}
@@ -71,13 +74,7 @@ function QueueReadyPanel({
   );
 }
 
-function QueueBlockedPanel({
-  items,
-  nowMs,
-}: {
-  items: readonly QueueItem[];
-  nowMs?: number;
-}) {
+function QueueBlockedPanel({ items }: { items: readonly QueueItem[] }) {
   return (
     <section aria-labelledby="queue-blocked-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
@@ -95,12 +92,7 @@ function QueueBlockedPanel({
       ) : (
         <ul className="divide-y divide-border">
           {items.map((item) => (
-            <QueueRow
-              key={item.issueNumber}
-              item={item}
-              nowMs={nowMs}
-              blocked
-            />
+            <QueueRow key={item.issueNumber} item={item} />
           ))}
         </ul>
       )}
@@ -108,57 +100,23 @@ function QueueBlockedPanel({
   );
 }
 
-function QueueRow({
-  item,
-  slot,
-  blocked,
-  nowMs,
-}: {
-  item: QueueItem;
-  slot?: number;
-  blocked?: boolean;
-  nowMs?: number;
-}) {
-  const timestamp = formatRelativeTime(item.createdAt, nowMs);
+function QueueRow({ item }: { item: QueueItem }) {
   return (
-    <li className="flex items-center gap-3 py-2 text-sm hover:bg-muted/50">
-      <div className="flex-shrink-0" data-testid="queue-row-number">
+    <li className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50">
+      <div className="flex-shrink-0 pt-0.5">
         <IssueLink number={item.issueNumber} />
       </div>
-      <div className="min-w-0 flex-1">
-        <span className="block truncate text-foreground" title={item.title}>
-          {item.title}
-        </span>
-      </div>
-      <div className="flex-shrink-0">
+      <div className="flex-shrink-0 pt-0.5">
         <PriorityBadge priority={item.priority} />
       </div>
-      <div
-        className="w-10 flex-shrink-0 text-right font-mono text-xs text-muted-foreground"
-        data-testid="queue-row-slot"
-      >
-        {blocked ? (
-          item.blockedBy.length > 0 ? (
-            <span
-              className="cursor-help"
-              title={item.blockedBy.map((n) => `#${n}`).join(', ')}
-            >
-              [{item.blockedBy.length}]
-            </span>
-          ) : (
-            <span>—</span>
-          )
-        ) : slot !== undefined ? (
-          <span>#{slot}</span>
-        ) : (
-          <span>—</span>
-        )}
-      </div>
-      <div
-        className="w-20 flex-shrink-0 text-right text-xs text-muted-foreground"
-        title={item.createdAt}
-      >
-        {timestamp}
+      <div className="min-w-0 flex-1">
+        <span
+          className="block break-words text-foreground"
+          data-testid="queue-row-title"
+          title={item.title}
+        >
+          {item.title}
+        </span>
       </div>
     </li>
   );

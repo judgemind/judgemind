@@ -166,6 +166,18 @@ module "api_service" {
   ses_configuration_set_name        = module.ses.configuration_set_name
   email_from                        = "no-reply@judgemind.org"
 
+  # #2818 — the dispatcher admin GraphQL resolvers (packages/api/src/graphql/
+  # dispatcher/github.ts) enrich queue/completion rows by hitting the GitHub
+  # REST API. Unauthenticated traffic caps at 60 req/hr, which the
+  # /admin/dispatcher page (polled every 2 s × up to ~40 issues per poll)
+  # exhausts in seconds — every row then renders "(title unavailable)" +
+  # "20562 d ago". Reuse the scoped PAT already provisioned for the
+  # dispatcher daemon (#2700) rather than creating a second secret; its
+  # scopes (contents:read, issues:write, pulls:write, actions:read,
+  # statuses:read) cover `GET /repos/{o}/{r}/issues/{n}` and
+  # `GET /search/issues` cleanly.
+  github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+
   # Dev: 0.25 vCPU, 512 MB, single replica
   task_cpu           = 256
   task_memory        = 512
