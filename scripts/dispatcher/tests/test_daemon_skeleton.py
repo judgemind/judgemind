@@ -62,6 +62,7 @@ class _FakeCursor:
     def __init__(self) -> None:
         self.executed: list[tuple[str, Any]] = []
         self.fetch_queue: list[Any] = []
+        self.fetchall_queue: list[list[Any]] = []
         self.rowcount = 0
 
     def __enter__(self) -> _FakeCursor:
@@ -77,6 +78,11 @@ class _FakeCursor:
         if not self.fetch_queue:
             return None
         return self.fetch_queue.pop(0)
+
+    def fetchall(self) -> list[Any]:
+        if not self.fetchall_queue:
+            return []
+        return self.fetchall_queue.pop(0)
 
 
 class _FakeConnection:
@@ -184,10 +190,9 @@ class TestSchedulerTick:
 
     def test_consumes_commands_and_reads_config(self) -> None:
         fake_conn = _FakeConnection()
-        # UPDATE returns rowcount=3; SELECT config returns concurrency_cap=0
-        # (the Phase 2 safe value — keeps the Phase 3A orchestration gate
-        # closed so this skeleton test isolates the command-drain + config-
-        # read path).
+        # SELECT config returns concurrency_cap=0 (the Phase 2 safe value —
+        # keeps the Phase 3A orchestration gate closed so this skeleton test
+        # isolates the command-drain + config-read path).
         fake_conn.cursor_instance.fetch_queue = [(0,)]
 
         d = _make_daemon(fake_conn=fake_conn)
@@ -195,34 +200,23 @@ class TestSchedulerTick:
         # not try to shell out to ``gh`` in this skeleton test.
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._fetch_blocked_issues = lambda: []  # type: ignore[method-assign]
-        # Set rowcount via a wrapper: execute() sets it before fetchone.
-        # _FakeCursor doesn't auto-populate rowcount, so set it directly
-        # between execute calls — the daemon calls execute then reads
-        # self._conn.cursor().rowcount, which is a single attribute, so
-        # we set rowcount on the cursor after the UPDATE by patching.
-
-        original_execute = fake_conn.cursor_instance.execute
-
-        def execute_with_rowcount(sql: str, params: Any = None) -> None:
-            original_execute(sql, params)
-            if sql.startswith("UPDATE dispatcher.commands"):
-                fake_conn.cursor_instance.rowcount = 3
-
-        fake_conn.cursor_instance.execute = execute_with_rowcount  # type: ignore[method-assign]
+        # Stub _consume_commands so this skeleton test stays focused on the
+        # config-read path. The full handler dispatch is tested in
+        # test_daemon_commands.py (#2801).
+        d._consume_commands = lambda: 3  # type: ignore[method-assign]
 
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 3
         assert summary["concurrency_cap"] == 0
         # Three commits on the first tick:
-        #   1. command-consumption + config read,
+        #   1. config read (command consumption is now its own transaction
+        #      managed by _consume_commands, which is stubbed here),
         #   2. queue_snapshots INSERT (Phase 2 addition, #2768),
         #   3. blocked_snapshots INSERT (#2820) — always runs on the
         #      first tick so the admin page has a populated blocked
         #      panel immediately after daemon boot.
-        # Each scan is isolated in its own transaction so a snapshot
-        # failure does not roll back a successful command drain. Phase
-        # 3A gate stays closed at ``concurrency_cap=0`` so no
-        # additional reads/commits happen.
+        # Each scan is isolated in its own transaction. Phase 3A gate stays
+        # closed at ``concurrency_cap=0`` so no additional reads/commits.
         assert fake_conn.commits == 3
         # Tick counter incremented.
         assert d._scheduler_ticks == 1

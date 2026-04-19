@@ -73,6 +73,7 @@ class _FakeCursor:
     def __init__(self) -> None:
         self.executed: list[tuple[str, Any]] = []
         self.fetch_queue: list[Any] = []
+        self.fetchall_queue: list[list[Any]] = []
         self.rowcount = 0
 
     def __enter__(self) -> _FakeCursor:
@@ -88,6 +89,11 @@ class _FakeCursor:
         if not self.fetch_queue:
             return None
         return self.fetch_queue.pop(0)
+
+    def fetchall(self) -> list[Any]:
+        if not self.fetchall_queue:
+            return []
+        return self.fetchall_queue.pop(0)
 
 
 class _FakeConnection:
@@ -281,7 +287,10 @@ class TestSchedulerCadenceDecoupling:
     def test_second_tick_while_worker_alive_skips_spawn(self, tmp_path: Path) -> None:
         """While a worker thread is alive, a second tick must not spawn a second."""
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(1,), None, (1,), None]
+        # Two scheduler ticks, each with: cap=1, is_paused=None, has_active=None.
+        # The second tick's gate passes but _maybe_spawn_orchestration_thread
+        # notices the thread is still alive and skips.
+        conn.cursor_instance.fetch_queue = [(1,), None, None, (1,), None, None]
 
         worker_blocker = threading.Event()
 
@@ -500,9 +509,10 @@ class TestSyntheticMidClaimCapFlip:
         """Tick sequence: cap=1 → worker starts → cap=0 → next tick sees 0."""
         d, conn, handler = _make_daemon(tmp_path)
         # Tick 1: cap read = 1 (spawns worker). Tick 2: cap read = 0.
-        # Note: the ``_has_active_agent`` check fires after the cap read
-        # on tick 1; on tick 2 cap=0 short-circuits that check.
-        conn.cursor_instance.fetch_queue = [(1,), None, (0,)]
+        # Note: the ``_is_paused`` and ``_has_active_agent`` checks fire after
+        # the cap read on tick 1; on tick 2 cap=0 short-circuits both.
+        # is_paused=None (not paused), has_active_agent=None (no active agent).
+        conn.cursor_instance.fetch_queue = [(1,), None, None, (0,)]
 
         worker_blocker = threading.Event()
 
@@ -539,6 +549,7 @@ class TestSyntheticMidClaimCapFlip:
         # even with no worker alive, cap=0 still blocks the spawn.
         conn.cursor_instance.fetch_queue = [
             (1,),
+            None,  # _is_paused on tick 1
             None,  # _has_active_agent on tick 1
             (0,),  # tick 2
             (0,),  # tick 3
