@@ -19,6 +19,15 @@ Ralph phase for the dispatcher v2 per-phase task pipeline (`docs/specs/dispatche
 
 **Implementation choice (per issue #2732):** This skill invokes the existing `/ralph` skill as its inner loop. `/ralph` already implements the worker + three-reviewer cycle with fresh-context Task-tool subagents and per-iteration state files under `{worktree}/tmp/ralph/`. `/task-v2-ralph` is the thin outer wrapper that (a) seeds `task.md` from `plan.json`, (b) invokes `/ralph`, (c) parses `{worktree}/tmp/ralph/ralph-done.txt` into the output JSON. Keeps the implementation in one place and ensures parity with the current `/task` workflow's ralph behavior.
 
+**Routing choice (per issue #2767) — Option B, skill-side short-circuit.** The underlying `/ralph` skill documents "When NOT to use: Terraform, DB migrations, CI/CD, docs, investigation tasks. For those, implement directly per CLAUDE.md." The original `/task` workflow (`.claude/skills/task/SKILL.md` §A.2) enforced this by only calling `/ralph` for testable code tasks — non-testable changes went through a direct-implementation path.
+
+In the dispatcher v2 per-phase pipeline, the equivalent routing must live somewhere. Two options were considered (see issue #2767):
+
+- **Option A — daemon-side routing.** The daemon inspects `plan.change_type` and skips invoking `/task-v2-ralph` entirely for non-testable values. Requires documenting the routing rules in the spec §6a and in daemon docs.
+- **Option B — skill-side short-circuit (chosen).** `/task-v2-ralph` itself checks `plan.change_type` in Step 0. If non-testable, it immediately emits a `SHIP` verdict with `iterations_used: 0` and exits. The daemon does not need to know about the distinction.
+
+**Option B was chosen** because it keeps the routing logic co-located with the skill that owns the testable-vs-non-testable contract, it mirrors where the testable-only rule lives today (inside `/ralph`'s own docs), and it avoids spreading the change-type taxonomy across two layers (daemon + skill). The daemon's only responsibility is to invoke `/task-v2-ralph` — the skill decides whether a full ralph loop is warranted.
+
 ---
 
 ## Input contract
@@ -46,24 +55,78 @@ Write `{worktree}/tmp/dispatcher-output/ralph.json` with these fields, then exit
   "agent_id": "<echo>",
   "issue_number": <int>,
   "verdict": "SHIP" | "BLOCKED",
-  "iterations_used": <int, 1..max_iterations>,
+  "iterations_used": <int, 0..max_iterations>,
   "block_reason": null | "<string>",
   "changed_files": ["<path>", ...],
   "summary": "<1-3 sentence implementation summary>",
-  "ralph_done_path": "<worktree>/tmp/ralph/ralph-done.txt",
-  "review_log_path": "<worktree>/tmp/ralph/review-log.jsonl"
+  "ralph_done_path": "<worktree>/tmp/ralph/ralph-done.txt" | null,
+  "review_log_path": "<worktree>/tmp/ralph/review-log.jsonl" | null
 }
 ```
 
 Always exit 0. BLOCKED is not a subprocess error — the daemon reads verdict from JSON.
 
-On SHIP: the worktree working tree contains the implementation diff. It may be staged or unstaged. The daemon stages + commits + pushes in the `summary` and `push_and_pr` phases.
+`iterations_used` is `0` when Step 0 short-circuits for a non-testable `change_type` (no worker ran). It is `1..max_iterations` when the ralph loop actually executed.
+
+`ralph_done_path` and `review_log_path` are `null` when Step 0 short-circuits (the ralph state directory was never populated). They are non-null when the ralph loop ran.
+
+On SHIP: the worktree working tree contains the implementation diff (or is clean, if the non-testable change was implemented directly by `/task-v2-plan` or is no-op). It may be staged or unstaged. The daemon stages + commits + pushes in the `summary` and `push_and_pr` phases.
 
 On BLOCKED: the working tree may contain partial work. The daemon decides whether to retry (fresh worktree) or diagnose (`§8` Tier 2/3 flow).
 
 ---
 
-## Step 0 — Seed ralph state directory
+## Step 0 — Change-type routing (short-circuit for non-testable types)
+
+Before seeding the ralph state directory or invoking `/ralph`, read `plan.change_type` from the input bundle and decide whether a test-driven iteration loop is warranted.
+
+**Non-testable change types** — short-circuit and emit an immediate SHIP:
+
+- `db_migration`
+- `docs`
+- `dx_tooling`
+- `no_deployed_component`
+
+These mirror the original `/task` skill's "non-testable tasks" list (Terraform, DB migrations, CI/CD, docs, investigation) and the underlying `/ralph` skill's "When NOT to use" contract. For these change types, the worker + three-reviewer cycle adds no value — there is no test suite to iterate against, and the reviewers have no acceptance-criteria-mapped-to-tests signal to evaluate. Running ralph on these types burns ~5-20 minutes of wall clock and ~5-10 reviewer Task-tool subagent contexts with nothing to show for it.
+
+**Testable change types** — proceed to Step 1 and run the full worker/reviewer loop:
+
+- `api`
+- `scraper`
+- `ingestion`
+- `web`
+- `backfill_script`
+- `agent_skill`
+
+For any value not in either list, treat it as testable and proceed to Step 1. The plan author (`/task-v2-plan`) owns the enumeration of valid `change_type` values in the spec; this skill fails open (runs the loop) when it sees an unfamiliar value rather than silently short-circuiting.
+
+### Short-circuit implementation
+
+If `plan.change_type` is one of the non-testable values above, emit the following JSON to `{worktree}/tmp/dispatcher-output/ralph.json` and exit 0. Do NOT create `{worktree}/tmp/ralph/`, do NOT invoke `/ralph`, do NOT spawn any worker or reviewer subagents.
+
+```
+{
+  "agent_id": "<echo>",
+  "issue_number": <int>,
+  "verdict": "SHIP",
+  "iterations_used": 0,
+  "block_reason": null,
+  "changed_files": [],
+  "summary": "Skipped — change_type=<X> does not need test-driven iteration (per /task-v2-ralph routing).",
+  "ralph_done_path": null,
+  "review_log_path": null
+}
+```
+
+Substitute `<X>` with the actual change type value. The `changed_files` list is empty because no worker ran; if the plan phase already applied diffs (e.g. pre-computed schema migration), the daemon picks them up directly from `git status` in its `summary` / `push_and_pr` phases.
+
+The daemon consumes this verdict and routes directly to `/task-v2-summary`, which generates the commit message, PR title, PR body, and process-summary issue comment from the plan + diff without needing a reviewer-approved SHIP signal.
+
+If `plan.change_type` is testable (or unrecognized), continue to Step 1.
+
+---
+
+## Step 1 — Seed ralph state directory
 
 Create `{worktree}/tmp/ralph/` if it does not exist. Write:
 
@@ -104,7 +167,7 @@ Create `{worktree}/tmp/ralph/` if it does not exist. Write:
 
 - `iteration.txt` — `1`
 
-## Step 1 — Invoke `/ralph`
+## Step 2 — Invoke `/ralph`
 
 Spawn the `/ralph` skill as a Task-tool subagent (so its own internal worker+reviewer subagents inherit fresh-context isolation). Pass:
 
@@ -120,7 +183,7 @@ Spawn the `/ralph` skill as a Task-tool subagent (so its own internal worker+rev
 
 Wait synchronously for the subagent to complete. Do not time out from the outer skill — the dispatcher owns the subprocess-wide timeout.
 
-## Step 2 — Parse ralph output
+## Step 3 — Parse ralph output
 
 Read `{worktree}/tmp/ralph/ralph-done.txt` and `{worktree}/tmp/ralph/review-log.jsonl` (optional, structured, may be empty).
 
@@ -141,7 +204,7 @@ Capture `changed_files` from `git -C {worktree} diff --name-only HEAD`. Do NOT c
 
 Compose `summary` as 1-3 sentences describing what was implemented. Pull from the worker's final status report or the Claude reviewer's SHIP justification.
 
-## Step 3 — Write output JSON and exit
+## Step 4 — Write output JSON and exit
 
 Use the Write tool to emit `{worktree}/tmp/dispatcher-output/ralph.json` with the fields above. Exit 0.
 
@@ -159,6 +222,8 @@ Expected peak: ~30-45k tokens across 5 iterations. Well inside the 200k limit.
 
 If real Fargate measurement (follow-up #2714) shows the outer ralph exceeds 100k tokens consistently, the spec §6a must sub-split into `/task-v2-ralph-worker` + `/task-v2-ralph-review`, with the daemon orchestrating the loop instead of a long-running outer `claude -p`. Spike 0.3 already pre-designed that sub-split; the shape is documented in `docs/investigations/dispatcher-v2-spike-0.3.md`.
 
+Non-testable short-circuit (Step 0) is effectively zero-cost: a single JSON read, a taxonomy check, and a single JSON write. No subagent spawn, no iteration overhead.
+
 ## What this skill does NOT do
 
 - **Does not install dependencies.** Daemon already did that in the `setup` phase.
@@ -167,9 +232,29 @@ If real Fargate measurement (follow-up #2714) shows the outer ralph exceeds 100k
 - **Does not watch CI or merge.** Daemon's `ci_watch` and `merge` phases handle that; if CI fails, the daemon spawns `/task-v2-fix-ci`.
 - **Does not run deploy verification.** `/task-v2-verify` owns that post-deploy.
 
+## Worked example — Step 0 short-circuit for a docs change
+
+Input `plan.json` has `change_type=docs` (the plan phase already produced a documentation diff in the worktree). Step 0 matches `docs` in the non-testable list and emits:
+
+```
+{
+  "agent_id": "<uuid>",
+  "issue_number": 2767,
+  "verdict": "SHIP",
+  "iterations_used": 0,
+  "block_reason": null,
+  "changed_files": [],
+  "summary": "Skipped — change_type=docs does not need test-driven iteration (per /task-v2-ralph routing).",
+  "ralph_done_path": null,
+  "review_log_path": null
+}
+```
+
+Elapsed time: under a second. The daemon proceeds to `/task-v2-summary` and picks up the plan-phase diff from `git status` for the commit.
+
 ## Worked example — ralph output for a clean 1-iteration SHIP
 
-Input `plan.json` has one-file scraper fix. Ralph invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1, exit.
+Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 falls through (testable), Step 1 seeds state, Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1, exit.
 
 Output `ralph.json`:
 
