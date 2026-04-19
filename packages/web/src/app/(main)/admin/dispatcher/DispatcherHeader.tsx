@@ -11,7 +11,7 @@ type DaemonStatus = 'running' | 'paused' | 'stopped' | 'unhealthy';
 const STATUS_DOT: Record<DaemonStatus, string> = {
   running: 'bg-green-500',
   paused: 'bg-yellow-500',
-  stopped: 'bg-stone-400',
+  stopped: 'bg-muted-foreground/60',
   unhealthy: 'bg-red-500',
 };
 

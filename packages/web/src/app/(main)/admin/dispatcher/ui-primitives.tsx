@@ -52,16 +52,20 @@ export function PRLink({ number, className }: { number: number; className?: stri
 // ---------------------------------------------------------------------------
 
 const PRIORITY_STYLES: Record<string, string> = {
+  // p0/p1 carry the only non-neutral colour weight (red for emergency,
+  // amber for "time-sensitive"). p2/p3 collapse to the neutral muted
+  // surface — differentiating them with a second shade of amber or
+  // stone would cede the BRAND.md "minimal accent use" principle.
   p0: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300',
   p1: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200',
-  p2: 'bg-stone-200 text-stone-700 dark:bg-stone-700 dark:text-stone-200',
-  p3: 'bg-stone-100 text-stone-500 dark:bg-stone-800 dark:text-stone-400',
+  p2: 'bg-muted text-foreground',
+  p3: 'bg-muted text-muted-foreground',
 };
 
 export function PriorityBadge({ priority }: { priority: string | null }) {
   if (!priority) {
     return (
-      <span className="inline-flex h-5 items-center rounded bg-stone-100 px-1.5 font-mono text-[10px] uppercase tracking-wide text-stone-400 dark:bg-stone-800 dark:text-stone-500">
+      <span className="inline-flex h-5 items-center rounded bg-muted px-1.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
         —
       </span>
     );
@@ -105,7 +109,7 @@ export function OutcomePill({ status }: { status: string }) {
   const info = OUTCOME_STYLES[status as OutcomeStatus];
   if (!info) {
     return (
-      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-stone-100 text-[10px] text-stone-500 dark:bg-stone-800 dark:text-stone-400">
+      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-muted text-[10px] text-muted-foreground">
         ?
       </span>
     );
