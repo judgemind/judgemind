@@ -5,7 +5,7 @@
  * admin tooling that needs to read or nudge the daemon. See
  * `docs/specs/dispatcher-v2-spec.md` §11.
  *
- * All queries and mutations are gated on `users.is_admin = true`. Non-admins
+ * All queries and mutations are gated on `users.role = 'admin'`. Non-admins
  * receive a generic "not found" error (no field-shape introspection of the
  * underlying tables — see §11 Auth).
  */

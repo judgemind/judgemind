@@ -335,7 +335,7 @@ Toggling any of these on/off is a single `UPDATE dispatcher.config` row — edit
 
 New route `packages/web/app/admin/dispatcher/`.
 
-**Auth:** gated on `users.is_admin = true` (new column, defaults false; seed drewthaler). Non-admins 404.
+**Auth:** gated on `users.role = 'admin'` (matches existing admin dashboard gate in `data-quality.ts`). Non-admins 404.
 
 **GraphQL additions** (`packages/api/src/graphql/dispatcher/`):
 

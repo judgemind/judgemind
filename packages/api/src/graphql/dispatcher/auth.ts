@@ -5,9 +5,13 @@
  * so the existence and field shape of the dispatcher endpoints is not
  * introspectable by non-admins (§11 Auth).
  *
- * Distinct from the `requireAdmin` helper in `data-quality.ts`, which gates
- * on `role='admin'` and returns an explicit FORBIDDEN error. The two gates
- * are intentionally separate — see `AuthUser.isAdmin` in middleware.ts.
+ * Gates on `user.role === 'admin'` — the same convention used by the
+ * existing data-quality admin dashboards (`data-quality.ts:27`). A single
+ * admin concept across all admin surfaces keeps the auth model simple.
+ * The only behavioural difference from `requireAdmin` in `data-quality.ts`
+ * is the response shape: this gate returns a generic NOT_FOUND so the
+ * dispatcher schema is not enumerable by non-admins, whereas data-quality
+ * returns an explicit FORBIDDEN.
  */
 
 import { GraphQLError } from 'graphql';
@@ -34,7 +38,7 @@ export function notFound(): never {
  * two in responses.
  */
 export function requireDispatcherAdmin(user: AuthUser | null): AuthUser {
-  if (!user || !user.isAdmin) {
+  if (!user || user.role !== 'admin') {
     notFound();
   }
   return user;
