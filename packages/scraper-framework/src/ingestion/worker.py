@@ -93,7 +93,13 @@ from .llm_extract import (
 )
 from .llm_providers import create_client as create_llm_client
 from .ruling_formatter import format_ruling_text
-from .ruling_guards import check_no_orphan_rulings, convert_extracted_rulings
+from .ruling_guards import (
+    NON_RULING_PDF_DROPPED_EVENT,
+    NON_RULING_PDF_DROPPED_METRIC,
+    check_no_orphan_rulings,
+    convert_extracted_rulings,
+    is_all_null_metadata,
+)
 from .ruling_summarizer import summarize_ruling
 from .text_cleanup import clean_ruling_text
 
@@ -2032,6 +2038,81 @@ class IngestionWorker:
                     except Exception:
                         pass
                 return
+
+        # ------------------------------------------------------------------
+        # Defense-in-depth: all-NULL metadata guard (#2676).
+        # ------------------------------------------------------------------
+        # Capture-side filters (#2486) skip non-ruling PDFs (admin notices,
+        # cover sheets, "no tentative rulings today" pages) before they
+        # ever reach this worker.  As a belt-and-suspenders fallback, we
+        # also check here: if every one of the six core metadata fields is
+        # NULL/empty (with ``UNKNOWN-*`` case_numbers treated as NULL),
+        # this is non-ruling noise that would pollute ``derived.rulings``.
+        # Drop it, emit telemetry, and return before the DB upsert.
+        _guard_ruling = {
+            "case_number": case_number,
+            "case_title": case_title,
+            "judge_name": judge_name,
+            "department": department,
+            "motion_type": motion_type,
+            "outcome": outcome,
+        }
+        if is_all_null_metadata(_guard_ruling):
+            s3_key_val = event_data.get("s3_key")
+            logger.warning(
+                "Pipeline-side guard: dropping non-ruling PDF with all-NULL metadata",
+                extra={
+                    "document_id": document_id,
+                    "county": county,
+                    "state": state,
+                    "scraper_id": scraper_id,
+                    "s3_key": s3_key_val,
+                    "telemetry_event": NON_RULING_PDF_DROPPED_EVENT,
+                },
+            )
+            # Best-effort telemetry write (savepoint-protected so a transient
+            # failure does not abort the caller's transaction).
+            try:
+                conn = self._get_connection()
+                with conn.cursor() as cur:
+                    cur.execute("SAVEPOINT non_ruling_pdf_metric")
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO data_quality_metrics
+                                (recorded_at, county, metric_name,
+                                 metric_value, metadata)
+                            VALUES (now(), %s, %s, %s, %s::jsonb)
+                            """,
+                            (
+                                county,
+                                NON_RULING_PDF_DROPPED_METRIC,
+                                1,
+                                json.dumps(
+                                    {
+                                        "document_id": document_id,
+                                        "s3_key": s3_key_val,
+                                        "state": state,
+                                        "scraper_id": scraper_id,
+                                    }
+                                ),
+                            ),
+                        )
+                        cur.execute("RELEASE SAVEPOINT non_ruling_pdf_metric")
+                    except Exception:  # noqa: BLE001 — best-effort
+                        cur.execute("ROLLBACK TO SAVEPOINT non_ruling_pdf_metric")
+                        raise
+                conn.commit()
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                logger.debug(
+                    "non_ruling_pdf_dropped telemetry write failed",
+                    exc_info=True,
+                )
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
 
         # For split events, each split ruling gets its own document row keyed
         # by the synthetic split document_id.  This ensures the FK from

@@ -1460,3 +1460,245 @@ def test_det_validation_multi_case_empty_text_split_rejected(
     # The fail record must be attached to the empty split's document_id,
     # not the parent's — this is the row that would have gone to DB.
     assert fail_calls[0].kwargs["document_id"] == "split-uuid-1"
+
+
+# ---------------------------------------------------------------------------
+# Tests: all-NULL metadata pipeline-side guard (#2676)
+# ---------------------------------------------------------------------------
+#
+# The guard is defense-in-depth for #2644 / #2674: even when the capture-side
+# URL filter fails to reject an admin-notice PDF, the worker drops the row
+# before it reaches ``derived.rulings`` and emits a
+# ``data_quality.non_ruling_pdf_dropped`` telemetry event.
+#
+# These tests mock ``run_deterministic_rules`` to return ``pass`` so the
+# worker reaches the guard.  In the real pipeline most admin-notice PDFs
+# would also be caught by deterministic validation (UNKNOWN case_number +
+# empty case_title → fail), but the guard exists for the minority that
+# slip through (e.g. an admin notice where the LLM synthesised a
+# non-UNKNOWN case_number from stray text).
+
+
+_DET_PASS_RESULT = "ingestion.worker.run_deterministic_rules"
+
+
+def _make_det_pass_result() -> MagicMock:
+    """Mock a ``DeterministicValidationResult`` that reports overall=pass."""
+    det_result = MagicMock()
+    det_result.overall = "pass"
+    det_result.failed_rules = []
+    det_result.flagged_rules = []
+    det_result.reasons = []
+    return det_result
+
+
+@patch("ingestion.worker.insert_document_and_ruling")
+@patch("ingestion.worker.extract_judge_name", return_value=None)
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DET_PASS_RESULT)
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_all_null_metadata_guard_drops_fresno_admin_notice(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_det_rules: MagicMock,
+    mock_insert_validation: MagicMock,
+    mock_extract_judge: MagicMock,
+    mock_insert_doc_ruling: MagicMock,
+) -> None:
+    """Synthetic Fresno admin-notice scenario (#2676).
+
+    With capture-side filters bypassed, a Fresno admin-notice PDF would
+    produce an event with all-NULL metadata (no case_number, no title,
+    no judge, no department, no motion_type, no outcome).  The worker's
+    pipeline-side guard must:
+
+    1. NOT call ``insert_document_and_ruling`` (no ``derived.rulings``
+       row written).
+    2. Write a ``non_ruling_pdf_dropped`` row into
+       ``telemetry.data_quality_metrics``.
+    3. Log a warning with ``telemetry_event`` ==
+       ``data_quality.non_ruling_pdf_dropped``.
+    """
+    mock_det_rules.return_value = _make_det_pass_result()
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    # Event where every metadata field is blank (admin-notice PDF slipping
+    # past the capture-side filter).  ``ruling_text`` is non-empty so
+    # deterministic validation doesn't trip ``ruling_text_not_empty``;
+    # the mock forces overall=pass anyway.
+    event = _make_event(
+        scraper_id="ca-fresno-tentatives",
+        county="Fresno",
+        case_number=None,
+        case_title=None,
+        department=None,
+        judge_name=None,
+        hearing_date=None,
+        ruling_text="ATTENTION: Fresno Superior Court is transitioning to a new e-Court system.",
+    )
+    event.pop("case_number", None)  # truly absent, not empty string
+    event.pop("case_title", None)
+    event.pop("department", None)
+    event.pop("judge_name", None)
+    event.pop("hearing_date", None)
+    event["motion_type"] = None
+    event["outcome"] = None
+
+    worker.process_event(event)
+
+    # 1. No ruling row written.
+    mock_insert_doc_ruling.assert_not_called()
+
+    # 2. data_quality_metrics row written with metric_name=non_ruling_pdf_dropped.
+    metric_inserts = [
+        call
+        for call in mock_cur.execute.call_args_list
+        if call.args
+        and isinstance(call.args[0], str)
+        and "data_quality_metrics" in call.args[0]
+        and "INSERT" in call.args[0]
+    ]
+    assert len(metric_inserts) >= 1, "expected a data_quality_metrics INSERT"
+    # The params tuple contains county, metric_name, metric_value, metadata_json.
+    metric_insert = metric_inserts[0]
+    params = metric_insert.args[1]
+    assert params[0] == "Fresno"
+    assert params[1] == "non_ruling_pdf_dropped"
+    assert params[2] == 1
+    # Fourth positional is the JSON-encoded metadata blob.
+    import json as _json
+
+    metadata = _json.loads(params[3])
+    assert metadata["s3_key"] == event["s3_key"]
+    assert metadata["state"] == "CA"
+    assert metadata["scraper_id"] == "ca-fresno-tentatives"
+    assert "document_id" in metadata
+
+    # 3. OpenSearch index not called — the ruling never made it past the guard.
+    os_mock.index.assert_not_called()
+
+
+@patch("ingestion.worker.insert_document_and_ruling")
+@patch("ingestion.worker.extract_judge_name", return_value=None)
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DET_PASS_RESULT)
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_all_null_metadata_guard_does_not_fire_with_case_title(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_det_rules: MagicMock,
+    mock_insert_validation: MagicMock,
+    mock_extract_judge: MagicMock,
+    mock_insert_doc_ruling: MagicMock,
+) -> None:
+    """Negative test: if even ONE metadata field is populated, the guard
+    does NOT fire and the ruling proceeds to the DB write path.
+
+    This is the critical regression guardrail — a real ruling with a
+    judge_name set but no other extracted fields must still be written.
+    """
+    mock_det_rules.return_value = _make_det_pass_result()
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    # upsert_court + upsert_case + insert_document fetches.
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.rowcount = 1
+
+    event = _make_event(
+        county="Fresno",
+        scraper_id="ca-fresno-tentatives",
+        case_number=None,
+        case_title="Smith v. Jones",  # populated → guard does NOT fire
+        judge_name=None,
+        department=None,
+        hearing_date=None,
+        motion_type=None,
+        outcome=None,
+    )
+
+    worker.process_event(event)
+
+    # The ruling proceeds to the DB write path.  No non_ruling_pdf_dropped
+    # metric row is written.
+    metric_inserts = [
+        call
+        for call in mock_cur.execute.call_args_list
+        if call.args
+        and isinstance(call.args[0], str)
+        and "non_ruling_pdf_dropped" in str(call.args)
+    ]
+    assert len(metric_inserts) == 0, (
+        "guard must not fire when case_title is populated; got "
+        f"{len(metric_inserts)} non_ruling_pdf_dropped inserts"
+    )
+
+
+@patch("ingestion.worker.insert_document_and_ruling")
+@patch("ingestion.worker.extract_judge_name", return_value=None)
+@patch("ingestion.worker.insert_validation_result")
+@patch(_DET_PASS_RESULT)
+@patch(_EXTRACT_LLM_MOCK, return_value=None)
+@patch(_SPLIT_MOCK, return_value=False)
+@patch("ingestion.worker.psycopg")
+def test_all_null_metadata_guard_survives_telemetry_db_failure(
+    mock_psycopg: MagicMock,
+    mock_split: MagicMock,
+    mock_extract_llm: MagicMock,
+    mock_det_rules: MagicMock,
+    mock_insert_validation: MagicMock,
+    mock_extract_judge: MagicMock,
+    mock_insert_doc_ruling: MagicMock,
+) -> None:
+    """If the telemetry INSERT raises, the worker still returns cleanly.
+
+    Telemetry is best-effort — a transient failure must not re-raise,
+    and the primary guard behaviour (skip upsert) must still hold.
+    """
+    mock_det_rules.return_value = _make_det_pass_result()
+    worker, os_mock = _make_worker()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+
+    # First execute is SAVEPOINT (succeeds); second (the INSERT) raises.
+    def _execute_side_effect(*args: object, **kwargs: object) -> None:
+        sql = args[0] if args else ""
+        if isinstance(sql, str) and "INSERT INTO data_quality_metrics" in sql:
+            raise RuntimeError("transient DB error")
+        return None
+
+    mock_cur.execute.side_effect = _execute_side_effect
+
+    event = _make_event(
+        county="Fresno",
+        scraper_id="ca-fresno-tentatives",
+        case_number=None,
+        case_title=None,
+        judge_name=None,
+        department=None,
+        hearing_date=None,
+        ruling_text="ATTENTION: e-Court transition notice.",
+    )
+    event["motion_type"] = None
+    event["outcome"] = None
+
+    # Should not raise despite telemetry INSERT failure.
+    worker.process_event(event)
+
+    # Primary guard behaviour still holds: no ruling row written.
+    mock_insert_doc_ruling.assert_not_called()
