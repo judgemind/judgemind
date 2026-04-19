@@ -16,13 +16,23 @@ import type { Pool } from 'pg';
 import { GraphQLError, GraphQLScalarType, Kind } from 'graphql';
 import type { AuthUser } from '../../auth';
 import { DESTRUCTIVE_COMMANDS, requireDispatcherAdmin } from './auth';
-import {
-  extractPriority,
-  fetchIssues,
-  parseBlockedBy,
-  searchIssues,
-  type GitHubIssue,
-} from './github';
+import { extractPriority, parseBlockedBy } from './parse-labels';
+
+/**
+ * Shape of a single entry in the enrichment JSON the daemon writes
+ * into ``dispatcher.queue_snapshots.issues_json`` /
+ * ``dispatcher.blocked_snapshots.issues_json`` (issue #2820). Must
+ * stay wire-compatible with ``_normalize_issue_enrichment`` in
+ * ``scripts/dispatcher/daemon.py``.
+ */
+interface SnapshotIssueRecord {
+  number: number;
+  title: string;
+  labels: string[];
+  createdAt: string;
+  /** Only populated for blocked snapshots (daemon omits on queue scan). */
+  body?: string | null;
+}
 
 // Minimal Context subset the dispatcher resolvers read.
 interface DispatcherContext {
@@ -177,21 +187,74 @@ async function queryQueueDepth(pool: Pool): Promise<number> {
   return typeof raw === 'number' ? raw : Number(raw);
 }
 
-async function queryLatestQueueSnapshotIssueNumbers(pool: Pool): Promise<number[]> {
-  const { rows } = await pool.query<{ issue_numbers: number[] | null }>(
-    `SELECT issue_numbers
+async function queryLatestQueueSnapshotIssuesJson(
+  pool: Pool,
+): Promise<SnapshotIssueRecord[]> {
+  const { rows } = await pool.query<{ issues_json: unknown }>(
+    `SELECT issues_json
        FROM dispatcher.queue_snapshots
        ORDER BY observed_at DESC
        LIMIT 1`,
   );
   if (rows.length === 0) return [];
-  const raw = rows[0].issue_numbers;
-  return Array.isArray(raw) ? raw : [];
+  return normalizeSnapshotJson(rows[0].issues_json);
+}
+
+async function queryLatestBlockedSnapshotIssuesJson(
+  pool: Pool,
+): Promise<SnapshotIssueRecord[]> {
+  const { rows } = await pool.query<{ issues_json: unknown }>(
+    `SELECT issues_json
+       FROM dispatcher.blocked_snapshots
+       ORDER BY observed_at DESC
+       LIMIT 1`,
+  );
+  if (rows.length === 0) return [];
+  return normalizeSnapshotJson(rows[0].issues_json);
+}
+
+/**
+ * Accept raw jsonb from psycopg's node equivalent — node-postgres
+ * returns parsed objects for jsonb columns by default, but be
+ * defensive in case a future pool config serializes as a string.
+ */
+function normalizeSnapshotJson(raw: unknown): SnapshotIssueRecord[] {
+  let value: unknown = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+  const result: SnapshotIssueRecord[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const number = record.number;
+    if (typeof number !== 'number') continue;
+    const title = typeof record.title === 'string' ? record.title : '';
+    const createdAt =
+      typeof record.createdAt === 'string' ? record.createdAt : '';
+    const labelsRaw = Array.isArray(record.labels) ? record.labels : [];
+    const labels = labelsRaw.filter((l): l is string => typeof l === 'string');
+    const body =
+      typeof record.body === 'string'
+        ? record.body
+        : record.body === null
+          ? null
+          : undefined;
+    const out: SnapshotIssueRecord = { number, title, labels, createdAt };
+    if (body !== undefined) out.body = body;
+    result.push(out);
+  }
+  return result;
 }
 
 async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]> {
   const { rows } = await pool.query<Row>(
-    `SELECT agent_id, issue_number, status, ended_at, pr_number
+    `SELECT agent_id, issue_number, issue_title, status, ended_at, pr_number
        FROM dispatcher.agents
       WHERE status IN ('succeeded', 'failed', 'crashed')
         AND ended_at IS NOT NULL
@@ -224,60 +287,52 @@ function configRowToGraphQL(row: Row): Record<string, unknown> {
 }
 
 /**
- * Fetch up to `limit` queue-ready QueueItem rows. Reads issue numbers
- * from the most recent `dispatcher.queue_snapshots` row, then hits the
- * GitHub API (cached) for title/labels/created_at/body.
+ * Fetch up to `limit` queue-ready QueueItem rows. Reads directly from
+ * ``dispatcher.queue_snapshots.issues_json`` — the daemon persists
+ * title/labels/createdAt for every issue it observes on each 30s
+ * scan (issue #2820). **No GitHub API calls from the API container**
+ * — the operator constraint is that the API must not have the
+ * ability to burn the shared PAT budget (see the deleted
+ * ``github.ts`` and the removed ``GITHUB_TOKEN`` secret from the API
+ * task-def).
  *
- * Graceful degradation: when the GitHub lookup fails we still return a
- * minimal row with `title` = `(title unavailable — #N)` so the UI renders
- * the hot link. Items for which `fetchIssue` returned null are dropped
- * entirely to avoid polluting the queue with stale placeholders.
+ * Graceful degradation: when the snapshot is empty (fresh deploy
+ * before the first daemon scan, or the daemon is down), the admin
+ * page renders an empty queue — which is the correct UX, because we
+ * really don't know the queue state.
  */
-async function queryQueueReady(pool: Pool, limit: number): Promise<Array<Record<string, unknown>>> {
-  const numbers = await queryLatestQueueSnapshotIssueNumbers(pool);
-  if (numbers.length === 0) return [];
-  const top = numbers.slice(0, limit);
-  const issues = await fetchIssues(top);
-  const result: Array<Record<string, unknown>> = [];
-  for (let i = 0; i < top.length; i += 1) {
-    const number = top[i];
-    const issue = issues[i];
-    if (issue) {
-      result.push(queueItemFromIssue(issue, /* includeBlockedBy */ false));
-    } else {
-      // Placeholder when GitHub lookup failed — still renders as a hot
-      // link but with muted "(title unavailable)" copy.
-      result.push({
-        issueNumber: number,
-        title: '(title unavailable)',
-        priority: null,
-        labels: [],
-        createdAt: new Date(0).toISOString(),
-        blockedBy: [],
-      });
-    }
-  }
-  return result;
+async function queryQueueReady(
+  pool: Pool,
+  limit: number,
+): Promise<Array<Record<string, unknown>>> {
+  const issues = await queryLatestQueueSnapshotIssuesJson(pool);
+  if (issues.length === 0) return [];
+  return issues
+    .slice(0, limit)
+    .map((issue) => queueItemFromSnapshot(issue, /* includeBlockedBy */ false));
 }
 
 /**
- * Fetch up to `limit` queueBlocked QueueItem rows. `status/blocked` is
- * not tracked in `dispatcher.queue_snapshots`, so this queries the
- * GitHub search API (cached).
+ * Fetch up to `limit` queueBlocked QueueItem rows from
+ * ``dispatcher.blocked_snapshots.issues_json`` (daemon-populated, no
+ * GitHub call; issue #2820). Blocked issues include ``body`` so
+ * ``parseBlockedBy`` can populate the inline blocker list.
  */
-async function queryQueueBlocked(limit: number): Promise<Array<Record<string, unknown>>> {
-  const issues = await searchIssues('label:status/blocked', undefined, limit);
-  const result: Array<Record<string, unknown>> = [];
-  for (const issue of issues) {
-    result.push(queueItemFromIssue(issue, /* includeBlockedBy */ true));
-  }
+async function queryQueueBlocked(
+  pool: Pool,
+  limit: number,
+): Promise<Array<Record<string, unknown>>> {
+  const issues = await queryLatestBlockedSnapshotIssuesJson(pool);
+  const result = issues.map((issue) =>
+    queueItemFromSnapshot(issue, /* includeBlockedBy */ true),
+  );
   // Sort newest first per spec.
   result.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-  return result;
+  return result.slice(0, limit);
 }
 
-function queueItemFromIssue(
-  issue: GitHubIssue,
+function queueItemFromSnapshot(
+  issue: SnapshotIssueRecord,
   includeBlockedBy: boolean,
 ): Record<string, unknown> {
   return {
@@ -290,29 +345,25 @@ function queueItemFromIssue(
   };
 }
 
-async function recentCompletionsToGraphQL(
+function recentCompletionsToGraphQL(
   rows: readonly Row[],
-): Promise<Array<Record<string, unknown>>> {
-  const issueNumbers: number[] = [];
-  for (const row of rows) {
-    const n = row.issue_number;
-    if (typeof n === 'number') issueNumbers.push(n);
-  }
-  // Dedupe before the GitHub fetch — multiple completions may share a
-  // single issue number (retries).
-  const uniqueNumbers = Array.from(new Set(issueNumbers));
-  const issues = await fetchIssues(uniqueNumbers);
-  const titleByNumber = new Map<number, string>();
-  for (let i = 0; i < uniqueNumbers.length; i += 1) {
-    const issue = issues[i];
-    if (issue) titleByNumber.set(uniqueNumbers[i], issue.title);
-  }
+): Array<Record<string, unknown>> {
   return rows.map((row) => {
-    const number = typeof row.issue_number === 'number' ? row.issue_number : null;
+    const number =
+      typeof row.issue_number === 'number' ? row.issue_number : null;
+    const title =
+      typeof row.issue_title === 'string' && row.issue_title.length > 0
+        ? row.issue_title
+        : null;
     return {
       agentId: row.agent_id,
       issueNumber: number,
-      issueTitle: number !== null ? (titleByNumber.get(number) ?? null) : null,
+      // Pulled from ``dispatcher.agents.issue_title`` (populated by the
+      // daemon at claim time from the queue-snapshot enrichment; issue
+      // #2820). Agents that claimed before migration 28 will have
+      // ``issue_title = NULL`` and the admin-page UI falls back to
+      // ``#<number>``.
+      issueTitle: title,
       status: row.status,
       endedAt: row.ended_at,
       prNumber: row.pr_number ?? null,
@@ -635,9 +686,9 @@ export const dispatcherResolvers = {
       return queryQueueReady(pool, 10);
     },
 
-    queueBlocked: async (_: unknown, __: unknown, { user }: DispatcherContext) => {
+    queueBlocked: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
       requireDispatcherAdmin(user);
-      return queryQueueBlocked(10);
+      return queryQueueBlocked(pool, 10);
     },
 
     recentCompletions: async (
@@ -763,9 +814,12 @@ export {
   configRowToGraphQL,
   failureRowToGraphQL,
   insertCommandIdempotent,
-  queueItemFromIssue,
+  normalizeSnapshotJson,
+  queueItemFromSnapshot,
   recentCompletionsToGraphQL,
   runRowToGraphQL,
   transitionRowToGraphQL,
   updateConfigEntry,
 };
+
+export type { SnapshotIssueRecord };

@@ -101,12 +101,6 @@ variable "opensearch_credentials_secret_arn" {
   default     = ""
 }
 
-variable "github_token_secret_arn" {
-  description = "Secrets Manager ARN for GITHUB_TOKEN — the scoped PAT used by the dispatcher admin GraphQL resolvers (packages/api/src/graphql/dispatcher/github.ts) to enrich queue/completion rows with issue titles (#2818). Unauthenticated GitHub API caps at 60 req/hr, which the /admin/dispatcher page burns through in seconds; an authenticated PAT lifts the cap to 5 000 req/hr. Dev reuses the dispatcher PAT at `judgemind/dispatcher/github-token` (same precedent as the dispatcher-daemon module, #2700). Empty-string default keeps environments without the secret (e.g. a fresh staging stack) plan-able; `compact()` in the execution-role policy drops unset entries."
-  type        = string
-  default     = ""
-}
-
 variable "cors_allowed_origins" {
   description = "Comma-separated list of allowed CORS origins"
   type        = string

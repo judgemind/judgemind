@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 26 migrations.
+-- Generated from 28 migrations.
 
 
 
@@ -326,7 +326,8 @@ CREATE TABLE dispatcher.agents (
     retries_used integer DEFAULT 0 NOT NULL,
     pid integer,
     runner_override jsonb,
-    model_override jsonb
+    model_override jsonb,
+    issue_title text
 );
 
 
@@ -337,6 +338,31 @@ COMMENT ON COLUMN dispatcher.agents.runner_override IS 'Per-agent override of di
 
 
 COMMENT ON COLUMN dispatcher.agents.model_override IS 'Per-agent override of dispatcher.config.model_by_phase; NULL = use config default.';
+
+
+COMMENT ON COLUMN dispatcher.agents.issue_title IS 'Issue title captured at claim time from the queue-snapshot enrichment. Lets the /admin/dispatcher recent-completions panel render a title without re-fetching from GitHub after the agent has completed and the issue may have left the active queue. Nullable — historical rows pre-dating issue #2820 have NULL and are not backfilled.';
+
+
+CREATE TABLE dispatcher.blocked_snapshots (
+    snapshot_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    blocked_depth integer NOT NULL,
+    issue_numbers integer[] NOT NULL,
+    issues_json jsonb DEFAULT '[]'::jsonb NOT NULL,
+    run_id uuid
+);
+
+
+COMMENT ON TABLE dispatcher.blocked_snapshots IS 'Append-only history of observed ``status/blocked`` issues, one row per daemon snapshot tick. Written less frequently than queue_snapshots (blocked list changes slowly). Source of truth for the /admin/dispatcher blocked panel (issue #2820).';
+
+
+COMMENT ON COLUMN dispatcher.blocked_snapshots.issue_numbers IS 'Issue numbers observed with label ``status/blocked`` and state=open.';
+
+
+COMMENT ON COLUMN dispatcher.blocked_snapshots.issues_json IS 'Enriched issue metadata: [{number, title, labels, createdAt, body}, ...]. ``body`` is included so the API can parse ``Blocked by #N`` lines without another GitHub call.';
+
+
+COMMENT ON COLUMN dispatcher.blocked_snapshots.run_id IS 'Owning daemon run. Cascade-deletes with the run row (same as queue_snapshots).';
 
 
 CREATE TABLE dispatcher.commands (
@@ -493,7 +519,8 @@ CREATE TABLE dispatcher.queue_snapshots (
     observed_at timestamp with time zone DEFAULT now() NOT NULL,
     queue_depth integer NOT NULL,
     issue_numbers integer[] NOT NULL,
-    run_id uuid
+    run_id uuid,
+    issues_json jsonb DEFAULT '[]'::jsonb NOT NULL
 );
 
 
@@ -504,6 +531,9 @@ COMMENT ON COLUMN dispatcher.queue_snapshots.issue_numbers IS 'Array of the obse
 
 
 COMMENT ON COLUMN dispatcher.queue_snapshots.run_id IS 'Owning daemon run. Snapshots cascade-delete with the run row so forensic queries after a crash stay clean.';
+
+
+COMMENT ON COLUMN dispatcher.queue_snapshots.issues_json IS 'Enriched issue metadata as observed at scan time: [{number, title, labels: [string], createdAt}, ...]. Populated by the daemon from the ``gh issue list --json number,title,labels,createdAt`` response. Source of truth for the /admin/dispatcher queue-ready panel (issue #2820). Kept in lock-step with ``issue_numbers`` — the two columns MUST describe the same issues in the same order.';
 
 
 CREATE TABLE dispatcher.retry_markers (
@@ -815,6 +845,10 @@ ALTER TABLE ONLY dispatcher.agents
     ADD CONSTRAINT agents_pkey PRIMARY KEY (agent_id);
 
 
+ALTER TABLE ONLY dispatcher.blocked_snapshots
+    ADD CONSTRAINT blocked_snapshots_pkey PRIMARY KEY (snapshot_id);
+
+
 ALTER TABLE ONLY dispatcher.commands
     ADD CONSTRAINT commands_pkey PRIMARY KEY (command_id);
 
@@ -1024,6 +1058,9 @@ CREATE INDEX idx_dispatcher_agents_issue_number ON dispatcher.agents USING btree
 CREATE INDEX idx_dispatcher_agents_running ON dispatcher.agents USING btree (status) WHERE (status = 'running'::text);
 
 
+CREATE INDEX idx_dispatcher_blocked_snapshots_observed_at ON dispatcher.blocked_snapshots USING btree (observed_at DESC);
+
+
 CREATE INDEX idx_dispatcher_commands_unconsumed ON dispatcher.commands USING btree (consumed_at) WHERE (consumed_at IS NULL);
 
 
@@ -1195,6 +1232,10 @@ ALTER TABLE ONLY derived.rulings
 
 ALTER TABLE ONLY dispatcher.agents
     ADD CONSTRAINT agents_parent_run_id_fkey FOREIGN KEY (parent_run_id) REFERENCES dispatcher.runs(run_id);
+
+
+ALTER TABLE ONLY dispatcher.blocked_snapshots
+    ADD CONSTRAINT blocked_snapshots_run_id_fkey FOREIGN KEY (run_id) REFERENCES dispatcher.runs(run_id) ON DELETE CASCADE;
 
 
 ALTER TABLE ONLY dispatcher.diagnoses

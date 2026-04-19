@@ -166,9 +166,18 @@ resource "aws_iam_role_policy" "api_secrets" {
   role = element(split("/", var.execution_role_arn), length(split("/", var.execution_role_arn)) - 1)
 
   # `compact()` drops empty-string ARNs so environments that don't wire a
-  # given optional secret (e.g. a fresh stack with no dispatcher PAT) still
-  # produce a valid policy. Matches the `execution_secrets` pattern in
-  # `modules/dispatcher-daemon/main.tf` (#2700).
+  # given optional secret (e.g. a fresh stack with no OpenSearch creds)
+  # still produce a valid policy. Matches the `execution_secrets` pattern
+  # in `modules/dispatcher-daemon/main.tf`.
+  #
+  # Note: the API container used to also read
+  # `judgemind/dispatcher/github-token` (#2818) for the `/admin/dispatcher`
+  # GraphQL resolvers' GitHub enrichment path. Issue #2820 moved that
+  # enrichment into the daemon, deleted `packages/api/src/graphql/
+  # dispatcher/github.ts`, and tore out the `GITHUB_TOKEN` secret
+  # wiring here so the API container cannot silently re-grow a
+  # rate-limit-burning fetch path. Absence of the credential is the
+  # strongest guarantee that absence of the fetch code is load-bearing.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -179,7 +188,6 @@ resource "aws_iam_role_policy" "api_secrets" {
         Resource = compact([
           var.db_connection_secret_arn,
           var.opensearch_credentials_secret_arn,
-          var.github_token_secret_arn,
         ])
       }
     ]
@@ -283,6 +291,14 @@ resource "aws_ecs_task_definition" "api" {
         }
       ]
 
+      # GITHUB_TOKEN was intentionally removed from this task-def in
+      # #2820. See the comment on `aws_iam_role_policy.api_secrets`
+      # above for the rationale — the API must not have the ability to
+      # burn the shared PAT budget. Daemon-side enrichment populates
+      # `dispatcher.queue_snapshots.issues_json` /
+      # `dispatcher.blocked_snapshots.issues_json` /
+      # `dispatcher.agents.issue_title`, and the admin-page resolvers
+      # read those DB columns directly.
       secrets = concat(
         [
           {
@@ -298,19 +314,6 @@ resource "aws_ecs_task_definition" "api" {
           {
             name      = "OPENSEARCH_PASSWORD"
             valueFrom = "${var.opensearch_credentials_secret_arn}:password::"
-          }
-        ] : [],
-        var.github_token_secret_arn != "" ? [
-          {
-            # GITHUB_TOKEN for the dispatcher admin GraphQL resolvers
-            # (packages/api/src/graphql/dispatcher/github.ts). Without it,
-            # the /admin/dispatcher page burns through the unauthenticated
-            # 60 req/hr rate limit within seconds and every row renders
-            # "(title unavailable)" + "20562 d ago" (#2818). The dev env
-            # reuses the dispatcher PAT at `judgemind/dispatcher/github-token`;
-            # other envs pass "" and this block is skipped.
-            name      = "GITHUB_TOKEN"
-            valueFrom = var.github_token_secret_arn
           }
         ] : []
       )

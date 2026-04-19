@@ -137,6 +137,23 @@ QUEUE_SCAN_PAGE_LIMIT = 200
 #: anything over ~10s here would conflict with the next tick's own call.
 QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS = 10
 
+#: How often the blocked-list scan runs, expressed as scheduler ticks.
+#: With the 30s scheduler tick default, 4 ticks = 120s ≈ 2 minutes. The
+#: blocked list changes slowly (new blockers added when PRs gate work;
+#: removed by the ``unblock-issues`` workflow), so a per-tick scan would
+#: waste GitHub budget. Issue #2820. Scheduler tick counts are 1-based
+#: after the first tick, so tick_n % N == 0 fires on ticks 4, 8, 12…
+#: Tick 1 (daemon boot) always runs the blocked scan so the admin page
+#: has a populated blocked panel immediately; every subsequent scan
+#: follows the modulo cadence.
+BLOCKED_SCAN_EVERY_N_TICKS = 4
+
+#: Max rows fetched by the blocked-list scan. The ``status/blocked``
+#: queue is typically < 30 but the upper bound comes from operator
+#: behaviour (bulk blocker spike) not normal workflow. Matches
+#: ``QUEUE_SCAN_PAGE_LIMIT`` so a single ``gh`` call always suffices.
+BLOCKED_SCAN_PAGE_LIMIT = 200
+
 #: Default CloudWatch metric namespace. Matches the terraform module's
 #: ``task_put_metric`` policy condition
 #: (``cloudwatch:namespace = Judgemind/Dispatcher``).
@@ -719,6 +736,65 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _normalize_issue_enrichment(
+    issue: dict[str, Any],
+    *,
+    include_body: bool = False,
+) -> dict[str, Any]:
+    """Project a ``gh issue list``-shaped dict into the enrichment record.
+
+    The admin-page API reads these records directly out of
+    ``dispatcher.queue_snapshots.issues_json`` /
+    ``dispatcher.blocked_snapshots.issues_json`` — any change here must
+    stay wire-compatible with
+    ``packages/api/src/graphql/dispatcher/resolvers.ts`` (issue #2820).
+
+    Output shape::
+
+        {
+          "number":    <int>,
+          "title":     <str>,           # "" when missing
+          "labels":    [<str>, ...],    # name-only, de-nested from gh's
+                                        # {id, name, description, color}
+                                        # label objects
+          "createdAt": <str>,           # ISO-8601 string as returned by gh;
+                                        # "" when missing
+          # when include_body=True (blocked snapshot only):
+          "body":      <str | null>,    # so the API can parse
+                                        # ``Blocked by #N`` without a
+                                        # GitHub call
+        }
+
+    ``gh`` sometimes omits keys on error responses; callers should
+    already have filtered to dict-shaped entries before calling this.
+    """
+    number = issue.get("number")
+    title = issue.get("title") if isinstance(issue.get("title"), str) else ""
+    created_at = (
+        issue.get("createdAt") if isinstance(issue.get("createdAt"), str) else ""
+    )
+    labels_raw = issue.get("labels") or []
+    labels: list[str] = []
+    for entry in labels_raw:
+        if isinstance(entry, str):
+            labels.append(entry)
+            continue
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            if isinstance(name, str):
+                labels.append(name)
+    record: dict[str, Any] = {
+        "number": number,
+        "title": title,
+        "labels": labels,
+        "createdAt": created_at,
+    }
+    if include_body:
+        body = issue.get("body")
+        record["body"] = body if isinstance(body, str) else None
+    return record
+
+
 class LeaseError(RuntimeError):
     """Another daemon is holding the active-heartbeat lease."""
 
@@ -1035,6 +1111,16 @@ class DispatcherDaemon:
         # and the next tick will try again (§15).
         queue_depth = self._scan_queue_and_snapshot()
 
+        # 3b. Scan the ``status/blocked`` list on a slower cadence
+        # (every ``BLOCKED_SCAN_EVERY_N_TICKS`` ticks — ~2min at the
+        # default 30s tick). The blocked list changes slowly, so per-
+        # tick polling would waste GitHub budget. Runs on the first
+        # tick so the admin page has a populated blocked panel
+        # immediately after daemon boot. Issue #2820.
+        blocked_depth = -1  # sentinel: "scan not attempted this tick"
+        if self._should_run_blocked_scan():
+            blocked_depth = self._scan_blocked_and_snapshot()
+
         # 4. Phase 3A orchestration gate (#2783).
         #
         # Only enter the claim + orchestrate path when (a) the live
@@ -1092,6 +1178,7 @@ class DispatcherDaemon:
                 "commands_consumed": commands_consumed,
                 "concurrency_cap": concurrency_cap,
                 "queue_depth": queue_depth,
+                "blocked_depth": blocked_depth,
                 "orchestration_attempted": orchestration_attempted,
             },
         )
@@ -1099,8 +1186,27 @@ class DispatcherDaemon:
             "commands_consumed": commands_consumed,
             "concurrency_cap": -1 if concurrency_cap is None else concurrency_cap,
             "queue_depth": queue_depth,
+            "blocked_depth": blocked_depth,
             "orchestration_attempted": 1 if orchestration_attempted else 0,
         }
+
+    def _should_run_blocked_scan(self) -> bool:
+        """Return True when this tick should run the blocked-list scan.
+
+        Fires on the very first tick (so the admin page has a populated
+        blocked panel immediately after daemon boot) and every
+        :data:`BLOCKED_SCAN_EVERY_N_TICKS` ticks thereafter. Checked
+        against the pre-increment :attr:`_scheduler_ticks` counter —
+        the counter is incremented at the end of the tick, so inside
+        the tick it reads as the index of the tick that just completed
+        successfully. First tick → counter is 0 on entry; fires.
+        """
+        if self._scheduler_ticks == 0:
+            return True
+        # +1 because we haven't incremented yet — so when the counter
+        # is currently 3, this is the 4th tick, which is when we want
+        # to fire at N=4.
+        return (self._scheduler_ticks + 1) % BLOCKED_SCAN_EVERY_N_TICKS == 0
 
     # ── queue scan (scheduler-tick step 3) ─────────────────────────────
 
@@ -1213,21 +1319,35 @@ class DispatcherDaemon:
             return -1
 
         issue_numbers: list[int] = []
+        issues_enriched: list[dict[str, Any]] = []
         for issue in issues:
             number = issue.get("number")
-            if isinstance(number, int):
-                issue_numbers.append(number)
+            if not isinstance(number, int):
+                continue
+            issue_numbers.append(number)
+            issues_enriched.append(_normalize_issue_enrichment(issue))
         queue_depth = len(issue_numbers)
 
         # Persist the snapshot. One INSERT per tick; the table is
         # append-only and the daemon is a singleton, so no race.
+        # ``issues_json`` is written alongside ``issue_numbers`` so the
+        # API's admin-page resolvers can render titles/labels/createdAt
+        # straight from the DB (issue #2820). The two columns MUST
+        # describe the same issues in the same order — they are derived
+        # from the same ``issues`` list here.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO dispatcher.queue_snapshots "
-                    "    (observed_at, queue_depth, issue_numbers, run_id) "
-                    "VALUES (now(), %s, %s, %s)",
-                    (queue_depth, issue_numbers, self._run_id),
+                    "    (observed_at, queue_depth, issue_numbers, "
+                    "     issues_json, run_id) "
+                    "VALUES (now(), %s, %s, %s::jsonb, %s)",
+                    (
+                        queue_depth,
+                        issue_numbers,
+                        json.dumps(issues_enriched),
+                        self._run_id,
+                    ),
                 )
             self._conn.commit()
         except Exception:
@@ -1257,6 +1377,154 @@ class DispatcherDaemon:
             },
         )
         return queue_depth
+
+    # ── blocked-list scan (scheduler-tick step 3b; #2820) ───────────────
+
+    def _fetch_blocked_issues(self) -> list[dict[str, Any]]:
+        """Call ``gh issue list`` for the ``status/blocked`` slice.
+
+        Returns a list of issue dicts with ``number, title, labels,
+        createdAt, body``. ``body`` is included (unlike the queue scan)
+        so the API can parse ``Blocked by #N`` lines without a
+        secondary GitHub call — the admin page renders the blockers
+        inline. Raises :class:`RuntimeError` on subprocess failure; the
+        caller wraps + logs.
+
+        Issue #2820. This is a thin wrapper so tests can monkeypatch it
+        cleanly, matching :meth:`_fetch_agent_ready_issues`.
+        """
+        cmd = [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            self._cfg.github_repo,
+            "--label",
+            "status/blocked",
+            "--state",
+            "open",
+            "--json",
+            "number,title,labels,createdAt,body",
+            "--limit",
+            str(BLOCKED_SCAN_PAGE_LIMIT),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"gh CLI not on PATH: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"gh issue list (blocked) timed out after "
+                f"{QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS}s"
+            ) from exc
+
+        if result.returncode != 0:
+            stderr_preview = (result.stderr or "").strip().splitlines()[:1]
+            raise RuntimeError(
+                f"gh issue list (blocked) exit={result.returncode}: "
+                f"{stderr_preview[0] if stderr_preview else '<no stderr>'}"
+            )
+
+        try:
+            issues = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"gh issue list (blocked) returned invalid JSON: {exc}"
+            ) from exc
+
+        if not isinstance(issues, list):
+            raise RuntimeError(
+                f"gh issue list (blocked) returned non-list JSON: "
+                f"{type(issues).__name__}"
+            )
+
+        filtered: list[dict[str, Any]] = []
+        for issue in issues:
+            if isinstance(issue, dict):
+                filtered.append(issue)
+        return filtered
+
+    def _scan_blocked_and_snapshot(self) -> int:
+        """One blocked-list scan + ``dispatcher.blocked_snapshots`` INSERT.
+
+        Returns the observed blocked depth, or ``-1`` if the scan
+        failed. Matches the error semantics of
+        :meth:`_scan_queue_and_snapshot` — no exceptions escape to the
+        scheduler tick. Issue #2820.
+        """
+        assert self._conn is not None, "connect() must run before scanning"
+
+        try:
+            issues = self._fetch_blocked_issues()
+        except RuntimeError as exc:
+            self._log.warning(
+                "daemon.blocked_scan_failed",
+                extra={
+                    "event": "blocked_scan_failed",
+                    "run_id": self._run_id,
+                    "detail": str(exc),
+                },
+            )
+            return -1
+
+        issue_numbers: list[int] = []
+        issues_enriched: list[dict[str, Any]] = []
+        for issue in issues:
+            number = issue.get("number")
+            if not isinstance(number, int):
+                continue
+            issue_numbers.append(number)
+            issues_enriched.append(
+                _normalize_issue_enrichment(issue, include_body=True)
+            )
+        blocked_depth = len(issue_numbers)
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.blocked_snapshots "
+                    "    (observed_at, blocked_depth, issue_numbers, "
+                    "     issues_json, run_id) "
+                    "VALUES (now(), %s, %s, %s::jsonb, %s)",
+                    (
+                        blocked_depth,
+                        issue_numbers,
+                        json.dumps(issues_enriched),
+                        self._run_id,
+                    ),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.blocked_snapshot_insert_failed",
+                extra={
+                    "event": "blocked_snapshot_insert_failed",
+                    "run_id": self._run_id,
+                    "blocked_depth": blocked_depth,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return -1
+
+        self._log.info(
+            "daemon.blocked_scan",
+            extra={
+                "event": "blocked_scan",
+                "run_id": self._run_id,
+                "count": blocked_depth,
+                "issues": issue_numbers,
+            },
+        )
+        return blocked_depth
 
     # ── Phase 3A orchestration (scheduler-tick step 4) ──────────────────
     #
@@ -1359,6 +1627,67 @@ class DispatcherDaemon:
         if not isinstance(issues, list):
             return []
         return [int(n) for n in issues if isinstance(n, int)]
+
+    def _latest_queue_snapshot_title_for(self, issue_number: int) -> str | None:
+        """Return the title for ``issue_number`` from the latest snapshot.
+
+        Reads ``dispatcher.queue_snapshots.issues_json`` (written by
+        :meth:`_scan_queue_and_snapshot` earlier in the same tick) and
+        picks out the title. Returns ``None`` when the issue is not in
+        the snapshot, the snapshot has no JSON (pre-#2820 rows), or the
+        read fails — the caller falls back to storing NULL in
+        ``dispatcher.agents.issue_title``. Issue #2820.
+
+        Using psycopg's native jsonb → python parsing: the cursor
+        returns a python list of dicts for jsonb columns, so we scan
+        in-Python without a round-trip ``->>`` query. The snapshot is
+        always short (<200 rows) so the O(n) scan is cheap.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT issues_json FROM dispatcher.queue_snapshots "
+                    "ORDER BY observed_at DESC "
+                    "LIMIT 1",
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.latest_snapshot_title_lookup_failed",
+                extra={
+                    "event": "latest_snapshot_title_lookup_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None:
+            return None
+        issues = row[0]
+        # psycopg returns jsonb as the parsed python value. Tests may
+        # also stub with a JSON string — handle both defensively.
+        if isinstance(issues, str):
+            try:
+                issues = json.loads(issues)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(issues, list):
+            return None
+        for entry in issues:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("number") == issue_number:
+                title = entry.get("title")
+                if isinstance(title, str) and title:
+                    return title
+                return None
+        return None
 
     def _pick_candidate_issue(self, candidates: list[int]) -> int | None:
         """Pick the first candidate that is trusted and not already claimed.
@@ -1564,7 +1893,11 @@ class DispatcherDaemon:
         return False
 
     def _atomic_claim(
-        self, issue_number: int, agent_id: str, worktree_path: str
+        self,
+        issue_number: int,
+        agent_id: str,
+        worktree_path: str,
+        issue_title: str | None = None,
     ) -> bool:
         """INSERT a new agent row; return True on success, False on race.
 
@@ -1574,6 +1907,13 @@ class DispatcherDaemon:
         INSERT into a ``psycopg.errors.UniqueViolation``. Catching that
         is the race-lost signal — do NOT pre-check + insert, which is
         not atomic.
+
+        ``issue_title`` is optional (nullable in the schema — migration
+        28, #2820). When provided, the daemon populates it at claim
+        time from the enrichment stored in
+        ``dispatcher.queue_snapshots.issues_json`` so the admin-page
+        recent-completions panel can render a title after the agent has
+        finished without a GitHub round-trip.
         """
         assert self._conn is not None, "connect() must run before claiming"
 
@@ -1586,9 +1926,16 @@ class DispatcherDaemon:
                 cur.execute(
                     "INSERT INTO dispatcher.agents "
                     "    (agent_id, parent_run_id, kind, issue_number, "
-                    "     worktree_path, phase, status) "
-                    "VALUES (%s, %s, 'task', %s, %s, 'claiming', 'running')",
-                    (agent_id, self._run_id, issue_number, worktree_path),
+                    "     issue_title, worktree_path, phase, status) "
+                    "VALUES (%s, %s, 'task', %s, %s, %s, 'claiming', "
+                    "        'running')",
+                    (
+                        agent_id,
+                        self._run_id,
+                        issue_number,
+                        issue_title,
+                        worktree_path,
+                    ),
                 )
             self._conn.commit()
         except psycopg.errors.UniqueViolation:
@@ -2376,6 +2723,12 @@ class DispatcherDaemon:
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         worktree_path = self._compute_worktree_path(short_id)
 
+        # Best-effort title lookup from the latest queue snapshot
+        # (issue #2820). A None result just means the admin-page
+        # recent-completions row renders with issue_title=NULL and the
+        # UI falls back to "#N" — not a blocker for the claim.
+        issue_title = self._latest_queue_snapshot_title_for(issue_number)
+
         self._log.info(
             "daemon.candidate_picked",
             extra={
@@ -2383,10 +2736,13 @@ class DispatcherDaemon:
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "issue_number": issue_number,
+                "issue_title_captured": issue_title is not None,
             },
         )
 
-        if not self._atomic_claim(issue_number, agent_id, str(worktree_path)):
+        if not self._atomic_claim(
+            issue_number, agent_id, str(worktree_path), issue_title=issue_title
+        ):
             # Race lost. Don't try the next candidate on this tick —
             # the next tick will re-scan the queue.
             return
@@ -7941,6 +8297,16 @@ class DispatcherDaemon:
     _HOUSEKEEPING_TARGETS: tuple[tuple[str, str, str, int], ...] = (
         (
             "queue_snapshots",
+            "observed_at",
+            "queue_snapshot_retention_days",
+            DEFAULT_QUEUE_SNAPSHOT_RETENTION_DAYS,
+        ),
+        (
+            # Same retention as queue_snapshots — append-only history
+            # with the same "latest row wins" admin-page read pattern.
+            # Issue #2820. Reuses the queue_snapshot_retention_days
+            # config key deliberately so operators only tune one knob.
+            "blocked_snapshots",
             "observed_at",
             "queue_snapshot_retention_days",
             DEFAULT_QUEUE_SNAPSHOT_RETENTION_DAYS,
