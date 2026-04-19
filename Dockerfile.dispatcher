@@ -92,15 +92,21 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # ---------------------------------------------------------------------------
 # Python dependencies
 #
-# Only psycopg[binary]>=3.1 is needed for the Phase 1 skeleton — all the
-# heavy packages (the scraper-framework itself, Playwright, etc.) are NOT
-# relevant to the daemon process. Pinning psycopg separately also keeps
-# the image layer small enough that future Phase 2 changes only bust the
-# COPY layers below.
+# - psycopg[binary]>=3.1 — Postgres driver for the dispatcher DB. Canonical
+#   interface is `import psycopg` with the `[binary]` extra for the bundled
+#   libpq (spike 0.2 / emit_failure.py), so no separate `libpq-dev` apt
+#   install is needed.
+# - boto3>=1.34 — AWS SDK, required by Phase 2's CloudWatch HeartbeatAge
+#   metric emission in `scripts/dispatcher/daemon.py` (#2773, scope miss
+#   from #2768 / PR #2771). The version floor matches the rest of the repo
+#   (`packages/scraper-framework/pyproject.toml`, `packages/nlp-pipeline/
+#   pyproject.toml`) so the daemon's boto3 stays in sync with the services
+#   the broader codebase targets.
 #
-# Per repo convention (spike 0.2 / emit_failure.py) the canonical
-# interface is `import psycopg` with the `[binary]` extra for the bundled
-# libpq — no separate `libpq-dev` apt install needed.
+# Both are pinned separately rather than combined into a requirements.txt
+# because Phase 1 deliberately keeps the dependency list tight — adding a
+# new layer only for a pip install step means future Phase 2+ changes bust
+# only the COPY layers below, not the Python install.
 # ---------------------------------------------------------------------------
 # Newer pip enforces PEP 668 "externally-managed-environment" on Debian's
 # system Python. We install at the system level (there is only one
@@ -110,7 +116,9 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # image (which doesn't enforce it because its Python comes from the
 # official `python` image, not Debian's system packages).
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
-RUN pip install --no-cache-dir "psycopg[binary]>=3.1,<4"
+RUN pip install --no-cache-dir \
+    "psycopg[binary]>=3.1,<4" \
+    "boto3>=1.34,<2"
 
 # ---------------------------------------------------------------------------
 # Claude Code CLI
