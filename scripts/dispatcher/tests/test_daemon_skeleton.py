@@ -184,8 +184,11 @@ class TestSchedulerTick:
 
     def test_consumes_commands_and_reads_config(self) -> None:
         fake_conn = _FakeConnection()
-        # UPDATE returns rowcount=3; SELECT config returns concurrency_cap=5.
-        fake_conn.cursor_instance.fetch_queue = [(5,)]
+        # UPDATE returns rowcount=3; SELECT config returns concurrency_cap=0
+        # (the Phase 2 safe value — keeps the Phase 3A orchestration gate
+        # closed so this skeleton test isolates the command-drain + config-
+        # read path).
+        fake_conn.cursor_instance.fetch_queue = [(0,)]
 
         d = _make_daemon(fake_conn=fake_conn)
         # Stub the queue-scan fetch so the scheduler tick does not try
@@ -208,11 +211,13 @@ class TestSchedulerTick:
 
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 3
-        assert summary["concurrency_cap"] == 5
+        assert summary["concurrency_cap"] == 0
         # Two commits per tick: one for command-consumption + config read,
         # one for the queue_snapshots INSERT (Phase 2 addition). The
         # scan is isolated in its own transaction so a queue-snapshot
-        # failure does not roll back a successful command drain.
+        # failure does not roll back a successful command drain. Phase 3A
+        # gate stays closed at ``concurrency_cap=0`` so no additional
+        # reads/commits happen.
         assert fake_conn.commits == 2
         # Tick counter incremented.
         assert d._scheduler_ticks == 1

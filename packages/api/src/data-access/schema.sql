@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 24 migrations.
+-- Generated from 25 migrations.
 
 
 
@@ -1006,6 +1006,12 @@ CREATE INDEX idx_rulings_posted_at ON derived.rulings USING btree (posted_at DES
 
 
 CREATE UNIQUE INDEX uq_rulings_case_text_hash ON derived.rulings USING btree (case_id, ruling_text_hash) WHERE (ruling_text_hash IS NOT NULL);
+
+
+CREATE UNIQUE INDEX idx_dispatcher_agents_active_issue ON dispatcher.agents USING btree (issue_number) WHERE (status = ANY (ARRAY['running'::text, 'retrying'::text]));
+
+
+COMMENT ON INDEX dispatcher.idx_dispatcher_agents_active_issue IS 'Atomic-claim uniqueness: at most one active (running/retrying) agent per issue. INSERT conflicts on this index mean another daemon claimed first.';
 
 
 CREATE INDEX idx_dispatcher_agents_issue_number ON dispatcher.agents USING btree (issue_number);
