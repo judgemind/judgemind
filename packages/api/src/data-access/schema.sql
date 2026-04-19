@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 20 migrations.
+-- Generated from 21 migrations.
 
 
 
@@ -19,6 +19,9 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 CREATE SCHEMA derived;
+
+
+CREATE SCHEMA dispatcher;
 
 
 CREATE SCHEMA staging;
@@ -308,6 +311,221 @@ COMMENT ON COLUMN derived.rulings.summary IS 'Cached AI summary. Served from cac
 COMMENT ON COLUMN derived.rulings.ruling_text_hash IS 'SHA-256 of normalized (lowercased, whitespace-collapsed) ruling text. Used for content-based dedup.';
 
 
+CREATE TABLE dispatcher.agents (
+    agent_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    parent_run_id uuid,
+    kind text DEFAULT 'task'::text NOT NULL,
+    issue_number integer NOT NULL,
+    worktree_path text NOT NULL,
+    phase text DEFAULT 'claiming'::text NOT NULL,
+    status text DEFAULT 'running'::text NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    ended_at timestamp with time zone,
+    exit_code integer,
+    pr_number integer,
+    retries_used integer DEFAULT 0 NOT NULL,
+    pid integer,
+    runner_override jsonb,
+    model_override jsonb
+);
+
+
+COMMENT ON TABLE dispatcher.agents IS 'One row per /task (or audit/spotcheck/security-review) agent invocation.';
+
+
+COMMENT ON COLUMN dispatcher.agents.runner_override IS 'Per-agent override of dispatcher.config.runner_by_phase; NULL = use config default.';
+
+
+COMMENT ON COLUMN dispatcher.agents.model_override IS 'Per-agent override of dispatcher.config.model_by_phase; NULL = use config default.';
+
+
+CREATE TABLE dispatcher.commands (
+    command_id bigint NOT NULL,
+    command text NOT NULL,
+    issued_by text NOT NULL,
+    issued_at timestamp with time zone DEFAULT now() NOT NULL,
+    consumed_at timestamp with time zone,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL
+);
+
+
+CREATE SEQUENCE dispatcher.commands_command_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.commands_command_id_seq OWNED BY dispatcher.commands.command_id;
+
+
+CREATE TABLE dispatcher.config (
+    key text NOT NULL,
+    value jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by text NOT NULL
+);
+
+
+CREATE TABLE dispatcher.diagnoses (
+    diagnosis_id bigint NOT NULL,
+    failure_id bigint NOT NULL,
+    agent_id uuid NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    context jsonb NOT NULL,
+    recommendation jsonb,
+    outcome jsonb,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone
+);
+
+
+CREATE SEQUENCE dispatcher.diagnoses_diagnosis_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.diagnoses_diagnosis_id_seq OWNED BY dispatcher.diagnoses.diagnosis_id;
+
+
+CREATE TABLE dispatcher.failures (
+    failure_id bigint NOT NULL,
+    agent_id uuid,
+    category text NOT NULL,
+    detected_by text NOT NULL,
+    details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    ts timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+COMMENT ON COLUMN dispatcher.failures.detected_by IS 'hook | scheduler | diagnoser — who wrote this row.';
+
+
+CREATE SEQUENCE dispatcher.failures_failure_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.failures_failure_id_seq OWNED BY dispatcher.failures.failure_id;
+
+
+CREATE TABLE dispatcher.notifications (
+    notification_id bigint NOT NULL,
+    kind text NOT NULL,
+    severity text NOT NULL,
+    issue_number integer,
+    pr_number integer,
+    body text NOT NULL,
+    issue_url text,
+    sent_at timestamp with time zone,
+    send_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+CREATE SEQUENCE dispatcher.notifications_notification_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.notifications_notification_id_seq OWNED BY dispatcher.notifications.notification_id;
+
+
+CREATE TABLE dispatcher.phase_outputs (
+    output_id bigint NOT NULL,
+    agent_id uuid NOT NULL,
+    phase text NOT NULL,
+    output_json jsonb NOT NULL,
+    ts timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+CREATE SEQUENCE dispatcher.phase_outputs_output_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.phase_outputs_output_id_seq OWNED BY dispatcher.phase_outputs.output_id;
+
+
+CREATE TABLE dispatcher.phase_transitions (
+    transition_id bigint NOT NULL,
+    agent_id uuid NOT NULL,
+    phase text NOT NULL,
+    ts timestamp with time zone DEFAULT now() NOT NULL,
+    autocompact_count integer DEFAULT 0 NOT NULL
+);
+
+
+COMMENT ON TABLE dispatcher.phase_transitions IS 'Append-only phase log; replaces tmp/agent-status/*.txt. Phase is free-form text; validation is daemon-side.';
+
+
+CREATE SEQUENCE dispatcher.phase_transitions_transition_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.phase_transitions_transition_id_seq OWNED BY dispatcher.phase_transitions.transition_id;
+
+
+CREATE TABLE dispatcher.retry_markers (
+    marker_id bigint NOT NULL,
+    agent_id uuid NOT NULL,
+    reason text NOT NULL,
+    attempt integer NOT NULL,
+    retry_after_ts timestamp with time zone NOT NULL,
+    resolved_at timestamp with time zone,
+    CONSTRAINT retry_markers_attempt_check CHECK (((attempt >= 1) AND (attempt <= 3)))
+);
+
+
+CREATE SEQUENCE dispatcher.retry_markers_marker_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.retry_markers_marker_id_seq OWNED BY dispatcher.retry_markers.marker_id;
+
+
+CREATE TABLE dispatcher.runs (
+    run_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    stopped_at timestamp with time zone,
+    heartbeat_ts timestamp with time zone DEFAULT now() NOT NULL,
+    version_sha text NOT NULL,
+    host text NOT NULL,
+    pid integer NOT NULL
+);
+
+
+COMMENT ON TABLE dispatcher.runs IS 'One row per daemon boot. Latest row is the active lease.';
+
+
+COMMENT ON COLUMN dispatcher.runs.heartbeat_ts IS 'Daemon updates every tick. CloudWatch alarm pages if stale > 5min.';
+
+
+COMMENT ON COLUMN dispatcher.runs.version_sha IS 'Git SHA of the daemon build; supports forensic questions after a crash.';
+
+
 CREATE TABLE public.alert_events (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     subscription_id uuid NOT NULL,
@@ -467,6 +685,27 @@ COMMENT ON COLUMN telemetry.validation_results.latency_ms IS 'Wall-clock time fo
 ALTER TABLE ONLY derived.court_directory_snapshots ALTER COLUMN id SET DEFAULT nextval('derived.court_directory_snapshots_id_seq'::regclass);
 
 
+ALTER TABLE ONLY dispatcher.commands ALTER COLUMN command_id SET DEFAULT nextval('dispatcher.commands_command_id_seq'::regclass);
+
+
+ALTER TABLE ONLY dispatcher.diagnoses ALTER COLUMN diagnosis_id SET DEFAULT nextval('dispatcher.diagnoses_diagnosis_id_seq'::regclass);
+
+
+ALTER TABLE ONLY dispatcher.failures ALTER COLUMN failure_id SET DEFAULT nextval('dispatcher.failures_failure_id_seq'::regclass);
+
+
+ALTER TABLE ONLY dispatcher.notifications ALTER COLUMN notification_id SET DEFAULT nextval('dispatcher.notifications_notification_id_seq'::regclass);
+
+
+ALTER TABLE ONLY dispatcher.phase_outputs ALTER COLUMN output_id SET DEFAULT nextval('dispatcher.phase_outputs_output_id_seq'::regclass);
+
+
+ALTER TABLE ONLY dispatcher.phase_transitions ALTER COLUMN transition_id SET DEFAULT nextval('dispatcher.phase_transitions_transition_id_seq'::regclass);
+
+
+ALTER TABLE ONLY dispatcher.retry_markers ALTER COLUMN marker_id SET DEFAULT nextval('dispatcher.retry_markers_marker_id_seq'::regclass);
+
+
 ALTER TABLE ONLY telemetry.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('telemetry.data_quality_metrics_id_seq'::regclass);
 
 
@@ -548,6 +787,46 @@ ALTER TABLE ONLY derived.case_parties
 
 ALTER TABLE ONLY derived.rulings
     ADD CONSTRAINT uq_rulings_document_id UNIQUE (document_id);
+
+
+ALTER TABLE ONLY dispatcher.agents
+    ADD CONSTRAINT agents_pkey PRIMARY KEY (agent_id);
+
+
+ALTER TABLE ONLY dispatcher.commands
+    ADD CONSTRAINT commands_pkey PRIMARY KEY (command_id);
+
+
+ALTER TABLE ONLY dispatcher.config
+    ADD CONSTRAINT config_pkey PRIMARY KEY (key);
+
+
+ALTER TABLE ONLY dispatcher.diagnoses
+    ADD CONSTRAINT diagnoses_pkey PRIMARY KEY (diagnosis_id);
+
+
+ALTER TABLE ONLY dispatcher.failures
+    ADD CONSTRAINT failures_pkey PRIMARY KEY (failure_id);
+
+
+ALTER TABLE ONLY dispatcher.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (notification_id);
+
+
+ALTER TABLE ONLY dispatcher.phase_outputs
+    ADD CONSTRAINT phase_outputs_pkey PRIMARY KEY (output_id);
+
+
+ALTER TABLE ONLY dispatcher.phase_transitions
+    ADD CONSTRAINT phase_transitions_pkey PRIMARY KEY (transition_id);
+
+
+ALTER TABLE ONLY dispatcher.retry_markers
+    ADD CONSTRAINT retry_markers_pkey PRIMARY KEY (marker_id);
+
+
+ALTER TABLE ONLY dispatcher.runs
+    ADD CONSTRAINT runs_pkey PRIMARY KEY (run_id);
 
 
 ALTER TABLE ONLY public.alert_events
@@ -707,6 +986,42 @@ CREATE INDEX idx_rulings_posted_at ON derived.rulings USING btree (posted_at DES
 CREATE UNIQUE INDEX uq_rulings_case_text_hash ON derived.rulings USING btree (case_id, ruling_text_hash) WHERE (ruling_text_hash IS NOT NULL);
 
 
+CREATE INDEX idx_dispatcher_agents_issue_number ON dispatcher.agents USING btree (issue_number);
+
+
+CREATE INDEX idx_dispatcher_agents_running ON dispatcher.agents USING btree (status) WHERE (status = 'running'::text);
+
+
+CREATE INDEX idx_dispatcher_commands_unconsumed ON dispatcher.commands USING btree (consumed_at) WHERE (consumed_at IS NULL);
+
+
+CREATE INDEX idx_dispatcher_diagnoses_agent_id ON dispatcher.diagnoses USING btree (agent_id);
+
+
+CREATE INDEX idx_dispatcher_diagnoses_pending ON dispatcher.diagnoses USING btree (status) WHERE (status = 'pending'::text);
+
+
+CREATE INDEX idx_dispatcher_failures_category_ts ON dispatcher.failures USING btree (category, ts DESC);
+
+
+CREATE INDEX idx_dispatcher_failures_ts ON dispatcher.failures USING btree (ts DESC);
+
+
+CREATE INDEX idx_dispatcher_notifications_created_at ON dispatcher.notifications USING btree (created_at DESC);
+
+
+CREATE INDEX idx_dispatcher_notifications_human_attention_unsent ON dispatcher.notifications USING btree (severity, sent_at) WHERE (severity = 'human_attention'::text);
+
+
+CREATE UNIQUE INDEX idx_dispatcher_phase_outputs_agent_phase ON dispatcher.phase_outputs USING btree (agent_id, phase);
+
+
+CREATE INDEX idx_dispatcher_phase_transitions_agent_ts ON dispatcher.phase_transitions USING btree (agent_id, ts DESC);
+
+
+CREATE INDEX idx_dispatcher_retry_markers_pending ON dispatcher.retry_markers USING btree (retry_after_ts) WHERE (resolved_at IS NULL);
+
+
 CREATE INDEX idx_alert_events_sub_id ON public.alert_events USING btree (subscription_id);
 
 
@@ -841,6 +1156,34 @@ ALTER TABLE ONLY derived.rulings
 
 ALTER TABLE ONLY derived.rulings
     ADD CONSTRAINT rulings_judge_id_fkey FOREIGN KEY (judge_id) REFERENCES derived.judges(id);
+
+
+ALTER TABLE ONLY dispatcher.agents
+    ADD CONSTRAINT agents_parent_run_id_fkey FOREIGN KEY (parent_run_id) REFERENCES dispatcher.runs(run_id);
+
+
+ALTER TABLE ONLY dispatcher.diagnoses
+    ADD CONSTRAINT diagnoses_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.diagnoses
+    ADD CONSTRAINT diagnoses_failure_id_fkey FOREIGN KEY (failure_id) REFERENCES dispatcher.failures(failure_id);
+
+
+ALTER TABLE ONLY dispatcher.failures
+    ADD CONSTRAINT failures_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.phase_outputs
+    ADD CONSTRAINT phase_outputs_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.phase_transitions
+    ADD CONSTRAINT phase_transitions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.retry_markers
+    ADD CONSTRAINT retry_markers_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
 
 
 ALTER TABLE ONLY public.alert_events
