@@ -5,17 +5,20 @@ import { formatUptime } from './format-helpers';
 
 type DaemonStatus = 'running' | 'paused' | 'stopped' | 'unhealthy';
 
+// "Stopped" intentionally uses the neutral design tokens rather than a
+// status color — per BRAND.md, only running/paused/unhealthy carry
+// semantic significance, and a "stopped" daemon is a calm neutral state.
 const STATUS_STYLES: Record<DaemonStatus, string> = {
   running: 'bg-green-100 border-green-300 text-green-800 dark:bg-green-900/30 dark:border-green-700 dark:text-green-300',
   paused: 'bg-yellow-100 border-yellow-300 text-yellow-800 dark:bg-yellow-900/30 dark:border-yellow-700 dark:text-yellow-300',
-  stopped: 'bg-stone-100 border-stone-300 text-stone-800 dark:bg-stone-800 dark:border-stone-600 dark:text-stone-300',
+  stopped: 'bg-muted border-border text-muted-foreground',
   unhealthy: 'bg-red-100 border-red-300 text-red-800 dark:bg-red-900/30 dark:border-red-700 dark:text-red-300',
 };
 
 const STATUS_DOT: Record<DaemonStatus, string> = {
   running: 'bg-green-500',
   paused: 'bg-yellow-500',
-  stopped: 'bg-stone-400',
+  stopped: 'bg-muted-foreground/60',
   unhealthy: 'bg-red-500',
 };
 

@@ -22,45 +22,90 @@ import { buildSchema, parse, validate } from 'graphql';
 
 const repoRoot = process.argv[2] || process.cwd();
 const schemaFile = join(repoRoot, 'packages/api/src/graphql/schema.ts');
+const graphqlDir = join(repoRoot, 'packages/api/src/graphql');
 const webSrcDir = join(repoRoot, 'packages/web/src');
 
 // ---------------------------------------------------------------------------
 // 1. Extract and build the GraphQL schema
 // ---------------------------------------------------------------------------
 
-function extractSchemaSDL(filePath) {
+/**
+ * Extract every `#graphql-tagged template literal from a file. The main
+ * schema file (packages/api/src/graphql/schema.ts) contains the core
+ * Query / Mutation types; per-module schema files under subdirectories
+ * (e.g. `dispatcher/schema.ts`) extend them via `extend type Query`.
+ * Returning an array lets the caller concatenate them all into a single
+ * SDL string for validation.
+ */
+function extractAllSchemaSDL(filePath) {
   const content = readFileSync(filePath, 'utf-8');
-  // The schema is exported as: export const typeDefs = `#graphql ... `;
-  // The template literal may contain escaped backticks (\`) in description
-  // strings. We need to match the full template literal including those.
-  // Strategy: find the opening `#graphql marker, then scan forward,
-  // skipping escaped backticks (\`) until we hit an unescaped backtick.
   const startMarker = '`#graphql\n';
-  const startIdx = content.indexOf(startMarker);
-  if (startIdx === -1) {
+  const results = [];
+  let cursor = 0;
+  while (cursor < content.length) {
+    const startIdx = content.indexOf(startMarker, cursor);
+    if (startIdx === -1) break;
+    const sdlStart = startIdx + startMarker.length;
+
+    // Scan for the closing backtick, skipping escaped ones.
+    let i = sdlStart;
+    while (i < content.length) {
+      if (content[i] === '\\' && i + 1 < content.length && content[i + 1] === '`') {
+        i += 2; // skip escaped backtick
+      } else if (content[i] === '`') {
+        break; // found unescaped closing backtick
+      } else {
+        i++;
+      }
+    }
+    if (i >= content.length) {
+      throw new Error(`Could not find closing backtick for schema in ${filePath}`);
+    }
+    const rawSDL = content.slice(sdlStart, i);
+    results.push(rawSDL.replace(/\\`/g, '`'));
+    cursor = i + 1;
+  }
+  return results;
+}
+
+/** Back-compat wrapper — returns the first SDL block. Preserves the
+ * original behaviour for callers (tests) that assume a single block. */
+function extractSchemaSDL(filePath) {
+  const blocks = extractAllSchemaSDL(filePath);
+  if (blocks.length === 0) {
     throw new Error(`Could not find #graphql template literal in ${filePath}`);
   }
-  const sdlStart = startIdx + startMarker.length;
+  return blocks[0];
+}
 
-  // Scan for the closing backtick, skipping escaped ones
-  let i = sdlStart;
-  while (i < content.length) {
-    if (content[i] === '\\' && i + 1 < content.length && content[i + 1] === '`') {
-      i += 2; // skip escaped backtick
-    } else if (content[i] === '`') {
-      break; // found unescaped closing backtick
-    } else {
-      i++;
+/** Collect SDL blocks from all module `schema.ts` files under the graphql/
+ * tree. Modules (e.g. dispatcher) declare their SDL alongside their
+ * resolvers; concatenating them gives the full schema the running API
+ * serves. */
+function collectModuleSchemaSDLs(baseDir) {
+  const blocks = [];
+  function walk(dir) {
+    for (const entry of readdirSync(dir)) {
+      const fullPath = join(dir, entry);
+      const stat = statSync(fullPath);
+      if (stat.isDirectory()) {
+        walk(fullPath);
+      } else if (entry === 'schema.ts') {
+        // Skip the top-level schema file — the caller handles it
+        // explicitly so the module schemas can be appended after it.
+        if (fullPath === schemaFile) continue;
+        try {
+          blocks.push(...extractAllSchemaSDL(fullPath));
+        } catch (_err) {
+          // Module schema files without a #graphql template literal are
+          // tolerated (e.g. a helper file that happened to be named
+          // schema.ts).
+        }
+      }
     }
   }
-
-  if (i >= content.length) {
-    throw new Error(`Could not find closing backtick for schema in ${filePath}`);
-  }
-
-  // Extract the SDL and unescape backticks
-  const rawSDL = content.slice(sdlStart, i);
-  return rawSDL.replace(/\\`/g, '`');
+  walk(baseDir);
+  return blocks;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,10 +169,16 @@ function extractGqlQueries(filePath) {
 // ---------------------------------------------------------------------------
 
 function main() {
-  // Build the schema
+  // Build the schema. Start with the core SDL block, then append per-module
+  // SDL blocks (e.g. `packages/api/src/graphql/dispatcher/schema.ts`) so
+  // `extend type Query` / `extend type Mutation` declarations in those
+  // modules are part of the schema the validator sees. This mirrors what
+  // `typeDefs` in `schema.ts` actually exports at runtime.
   let schema;
   try {
-    const sdl = extractSchemaSDL(schemaFile);
+    const coreBlocks = extractAllSchemaSDL(schemaFile);
+    const moduleBlocks = collectModuleSchemaSDLs(graphqlDir);
+    const sdl = [...coreBlocks, ...moduleBlocks].join('\n\n');
     schema = buildSchema(sdl);
   } catch (err) {
     console.error(`ERROR: Failed to build GraphQL schema: ${err.message}`);
