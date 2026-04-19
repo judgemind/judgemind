@@ -122,6 +122,49 @@ export const dispatcherTypeDefs = `#graphql
     phaseTransitions: [PhaseTransition!]!
     """Failures linked to this agent, newest first."""
     failures: [DispatcherFailure!]!
+    """Sum of \`tokens_input\` across every phase the agent ran (#2869).
+    Null when no phase row has recorded usage (e.g. the agent ran before
+    migration 31 landed, or every phase crashed before producing a JSON
+    envelope)."""
+    totalTokensInput: Float
+    """Sum of \`tokens_output\` across every phase the agent ran (#2869).
+    Null when no phase row has recorded usage."""
+    totalTokensOutput: Float
+    """Sum of \`cost_usd\` across every phase the agent ran (#2869). Null
+    when no phase row has recorded usage.
+
+    WARNING: this is Claude Code's list-price cost estimate, NOT the
+    Max plan-adjusted actual-billed amount. Useful for relative
+    run-to-run comparison, not for absolute spend accounting."""
+    totalCostUsd: Float
+    """Per-phase cost breakdown for this agent (#2869). One entry per
+    phase that emitted a usage block. Empty list when no phases have
+    recorded usage."""
+    phaseCostBreakdown: [PhaseCost!]!
+  }
+
+  """Per-phase aggregated token + cost totals for one agent. One entry
+  per phase that emitted a usage block from its \`claude -p
+  --output-format json\` invocation (#2869).
+
+  Summed across retry attempts (phase_outputs.attempt) so an agent that
+  hit a tier-1 retry mid-run shows a single row per phase with the
+  combined cost of both attempts — the operator cares about total spend
+  per phase, not per-attempt."""
+  type PhaseCost {
+    """One of plan | ralph | summary | fix_ci | verify | retro."""
+    phase: String!
+    tokensInput: Float
+    tokensOutput: Float
+    tokensCacheRead: Float
+    tokensCacheWrite: Float
+    """Same list-price caveat as \`DispatcherAgent.totalCostUsd\`."""
+    costUsd: Float
+    """The resolved model name observed on the LATEST attempt (most
+    recent \`ts\`). Distinct-per-phase because phase 3's \`model_by_phase\`
+    config sets one model per phase; if a retry attempted a different
+    model (operator override via \`model_override\`) the latest wins."""
+    modelUsed: String
   }
 
   """One row in the queue side-panels (#2805 §1.3). Capped at 10 server-side.
@@ -163,6 +206,17 @@ export const dispatcherTypeDefs = `#graphql
     rows (#2856) always have \`prNumber\` populated because the whole
     point of the terminal is that the daemon opened a draft PR."""
     prNumber: Int
+    """Sum of input+output tokens across every phase the agent ran
+    (#2869). Null when no phase row has recorded usage. Rendered as a
+    \`Nk tok\` footnote in the admin cockpit."""
+    totalTokens: Float
+    """Sum of \`cost_usd\` across every phase the agent ran (#2869).
+    Null when no phase row has recorded usage. Rendered as a \`~$X.XX\`
+    footnote in the admin cockpit.
+
+    WARNING: list-price estimate, NOT Max plan-adjusted. See
+    \`DispatcherAgent.totalCostUsd\`."""
+    totalCostUsd: Float
   }
 
   """One key/value entry from \`dispatcher.config\` (#2805 §1.6)."""

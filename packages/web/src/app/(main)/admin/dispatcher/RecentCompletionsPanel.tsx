@@ -70,6 +70,10 @@ export function RecentCompletionsPanel({
 }
 
 function RecentCompletionRow({ completion }: { completion: RecentCompletion }) {
+  const costFootnote = formatCostFootnote(
+    completion.totalCostUsd,
+    completion.totalTokens,
+  );
   return (
     <li className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50">
       <span className="flex-shrink-0 pt-0.5">
@@ -91,7 +95,63 @@ function RecentCompletionRow({ completion }: { completion: RecentCompletion }) {
         {completion.issueTitle ?? (
           <span className="italic text-muted-foreground">(title unavailable)</span>
         )}
+        {costFootnote !== null && (
+          <span
+            className="ml-2 text-xs text-muted-foreground"
+            data-testid="completion-row-cost"
+            title="List-price token estimate; NOT Max-plan-adjusted actual spend."
+          >
+            {costFootnote}
+          </span>
+        )}
       </span>
     </li>
   );
 }
+
+/** Render a compact cost footnote ("~$0.42, 123k tok") from the parent
+ * aggregate fields (#2869).
+ *
+ * Returns ``null`` when neither value is present — we render nothing at
+ * all rather than "$0.00 / 0 tok" so operators can distinguish "cheap
+ * agent" from "no metering signal on this row" (e.g. a pre-migration-31
+ * agent, or every phase crashed before emitting a JSON envelope).
+ *
+ * Design choices:
+ * - Cost is formatted with 2 decimals when ≥ $1, 4 decimals otherwise —
+ *   a cheap haiku verify phase lands at ~$0.0008 and would round to
+ *   "$0.00" under a blanket 2-decimal rule.
+ * - Tokens are formatted "Nk" for brevity; shows "<1k" for the rare
+ *   sub-1000-token agent so "0k" doesn't imply zero cost.
+ * - The "~" on cost signals "estimate, not billed" per the caveat
+ *   documented on `totalCostUsd`.
+ */
+function formatCostFootnote(
+  costUsd: number | null,
+  totalTokens: number | null,
+): string | null {
+  if (costUsd === null && totalTokens === null) return null;
+  const parts: string[] = [];
+  if (costUsd !== null) {
+    const decimals = Math.abs(costUsd) >= 1 ? 2 : 4;
+    parts.push(`~$${costUsd.toFixed(decimals)}`);
+  }
+  if (totalTokens !== null) {
+    parts.push(formatTokenCount(totalTokens));
+  }
+  return `(${parts.join(', ')})`;
+}
+
+function formatTokenCount(tokens: number): string {
+  if (tokens >= 1000) {
+    const k = tokens / 1000;
+    // >= 10k — drop the decimal; < 10k — keep one so "1.2k" reads better than "1k".
+    return k >= 10 ? `${Math.round(k)}k tok` : `${k.toFixed(1)}k tok`;
+  }
+  return `${tokens} tok`;
+}
+
+// Exported for unit testing; the helpers stay co-located with the
+// component because they are presentation-only and not reused elsewhere.
+// See ``__tests__/RecentCompletionsPanel.test.tsx``.
+export { formatCostFootnote, formatTokenCount };

@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 30 migrations.
+-- Generated from 31 migrations.
 
 
 
@@ -474,7 +474,13 @@ CREATE TABLE dispatcher.phase_outputs (
     output_json jsonb NOT NULL,
     ts timestamp with time zone DEFAULT now() NOT NULL,
     log_text text,
-    attempt integer DEFAULT 0 NOT NULL
+    attempt integer DEFAULT 0 NOT NULL,
+    tokens_input bigint,
+    tokens_output bigint,
+    tokens_cache_read bigint,
+    tokens_cache_write bigint,
+    cost_usd numeric(10,4),
+    model_used text
 );
 
 
@@ -482,6 +488,24 @@ COMMENT ON COLUMN dispatcher.phase_outputs.log_text IS 'Full ephemeral phase log
 
 
 COMMENT ON COLUMN dispatcher.phase_outputs.attempt IS 'Retry attempt counter — matches dispatcher.agents.retries_used at the moment this phase ran. 0 = initial run. Each retry reset (_process_retry_markers) bumps the effective attempt for the next phase run. Issue #2872.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.tokens_input IS 'Input tokens consumed by the phase (sum across all claude API turns). Parsed from the ``usage.input_tokens`` field of the ``claude -p --output-format json`` envelope. Nullable — historical rows and pre-JSON-envelope failures have no signal. Issue #2869.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.tokens_output IS 'Output tokens emitted by the phase. Parsed from ``usage.output_tokens``. Nullable. Issue #2869.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.tokens_cache_read IS 'Cache-read tokens (cheap tokens served from prompt-cache). Parsed from ``usage.cache_read_input_tokens``. Nullable. Issue #2869.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.tokens_cache_write IS 'Cache-creation tokens (prompt written to cache for reuse). Parsed from ``usage.cache_creation_input_tokens``. Nullable. Issue #2869.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.cost_usd IS 'Claude Code''s list-price cost estimate for the phase. Parsed from ``total_cost_usd``. NOT Max-plan-adjusted — comparable run-to-run but not actual billed spend. Nullable. Issue #2869.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.model_used IS 'The resolved Claude model the phase ran on (e.g. ``"sonnet"``, ``"claude-sonnet-4-5"``). Free-form text — adding a new model never requires a migration. Nullable. Issue #2869.';
 
 
 CREATE SEQUENCE dispatcher.phase_outputs_output_id_seq
@@ -562,6 +586,26 @@ CREATE SEQUENCE dispatcher.retry_markers_marker_id_seq
 ALTER SEQUENCE dispatcher.retry_markers_marker_id_seq OWNED BY dispatcher.retry_markers.marker_id;
 
 
+CREATE TABLE dispatcher.runs (
+    run_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    stopped_at timestamp with time zone,
+    heartbeat_ts timestamp with time zone DEFAULT now() NOT NULL,
+    version_sha text NOT NULL,
+    host text NOT NULL,
+    pid integer NOT NULL
+);
+
+
+COMMENT ON TABLE dispatcher.runs IS 'One row per daemon boot. Latest row is the active lease.';
+
+
+COMMENT ON COLUMN dispatcher.runs.heartbeat_ts IS 'Daemon updates every tick. CloudWatch alarm pages if stale > 5min.';
+
+
+COMMENT ON COLUMN dispatcher.runs.version_sha IS 'Git SHA of the daemon build; supports forensic questions after a crash.';
+
+
 CREATE TABLE dispatcher.terminal_outcomes (
     outcome_id bigint NOT NULL,
     agent_id uuid,
@@ -589,26 +633,6 @@ CREATE SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq
 
 
 ALTER SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq OWNED BY dispatcher.terminal_outcomes.outcome_id;
-
-
-CREATE TABLE dispatcher.runs (
-    run_id uuid DEFAULT gen_random_uuid() NOT NULL,
-    started_at timestamp with time zone DEFAULT now() NOT NULL,
-    stopped_at timestamp with time zone,
-    heartbeat_ts timestamp with time zone DEFAULT now() NOT NULL,
-    version_sha text NOT NULL,
-    host text NOT NULL,
-    pid integer NOT NULL
-);
-
-
-COMMENT ON TABLE dispatcher.runs IS 'One row per daemon boot. Latest row is the active lease.';
-
-
-COMMENT ON COLUMN dispatcher.runs.heartbeat_ts IS 'Daemon updates every tick. CloudWatch alarm pages if stale > 5min.';
-
-
-COMMENT ON COLUMN dispatcher.runs.version_sha IS 'Git SHA of the daemon build; supports forensic questions after a crash.';
 
 
 CREATE TABLE public.alert_events (
@@ -921,12 +945,12 @@ ALTER TABLE ONLY dispatcher.retry_markers
     ADD CONSTRAINT retry_markers_pkey PRIMARY KEY (marker_id);
 
 
-ALTER TABLE ONLY dispatcher.terminal_outcomes
-    ADD CONSTRAINT terminal_outcomes_pkey PRIMARY KEY (outcome_id);
-
-
 ALTER TABLE ONLY dispatcher.runs
     ADD CONSTRAINT runs_pkey PRIMARY KEY (run_id);
+
+
+ALTER TABLE ONLY dispatcher.terminal_outcomes
+    ADD CONSTRAINT terminal_outcomes_pkey PRIMARY KEY (outcome_id);
 
 
 ALTER TABLE ONLY public.alert_events
