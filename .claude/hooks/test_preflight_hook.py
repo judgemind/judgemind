@@ -878,6 +878,24 @@ run_test(
     "git log --grep=stash",
     0,
 )
+# The string "git stash pop" inside a quoted argument (e.g. PR title,
+# commit message) must not falsely trigger the check. Check 12 uses
+# $STRIPPED_COMMAND to exclude quoted content.
+run_test(
+    "'git stash pop' inside double-quoted PR title allowed (#2749)",
+    f"gh pr create --title {DQ}block bare git stash pop / apply{DQ} --body-file tmp/b.txt",
+    0,
+)
+run_test(
+    "'git stash apply' inside single-quoted commit message allowed (#2749)",
+    f"git commit -m {SQ}docs: mention git stash apply in note{SQ}",
+    0,
+)
+run_test(
+    "'git stash pop' inside body-file arg allowed (#2749)",
+    f"echo {DQ}description of git stash pop{DQ} > tmp/body.txt",
+    0,
+)
 
 # --- Summary ---
 print(f"\n{'='*50}")
