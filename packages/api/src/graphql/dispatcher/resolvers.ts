@@ -16,7 +16,7 @@ import type { Pool } from 'pg';
 import { GraphQLError, GraphQLScalarType, Kind } from 'graphql';
 import type { AuthUser } from '../../auth';
 import { DESTRUCTIVE_COMMANDS, requireDispatcherAdmin } from './auth';
-import { extractPriority, parseBlockedBy } from './parse-labels';
+import { extractPriority, parseBlockedBy, priorityRank } from './parse-labels';
 
 /**
  * Shape of a single entry in the enrichment JSON the daemon writes
@@ -307,9 +307,48 @@ async function queryQueueReady(
 ): Promise<Array<Record<string, unknown>>> {
   const issues = await queryLatestQueueSnapshotIssuesJson(pool);
   if (issues.length === 0) return [];
-  return issues
-    .slice(0, limit)
-    .map((issue) => queueItemFromSnapshot(issue, /* includeBlockedBy */ false));
+  return sortAndSliceQueueReady(issues, limit).map((issue) =>
+    queueItemFromSnapshot(issue, /* includeBlockedBy */ false),
+  );
+}
+
+/**
+ * Sort the enriched `issues` snapshot by `(priorityRank, createdAt ASC)`
+ * and return the first `limit` entries. Extracted so unit tests can
+ * exercise the ordering directly without a DB fixture (issue #2843).
+ *
+ * The daemon's queue-scan stores issues in gh CREATED_AT DESC order,
+ * which does NOT match the order the daemon actually picks them in
+ * (post-#2835 the daemon sorts by priority). The admin page's "top 10"
+ * must match the daemon's pick order so the operator sees what's
+ * coming up next — otherwise a p0 sitting at position 23-by-createdAt
+ * never appears, even though it's the next pick.
+ *
+ * Uses a copied array + stable-by-construction comparator — we do not
+ * mutate the input. Within a priority bucket the secondary key is
+ * `createdAt` ASC (older first), matching the Python daemon's
+ * ``key=(_priority_rank(labels), createdAt or "")`` at
+ * ``scripts/dispatcher/daemon.py:1708-1713``.
+ */
+function sortAndSliceQueueReady(
+  issues: readonly SnapshotIssueRecord[],
+  limit: number,
+): SnapshotIssueRecord[] {
+  const copy = issues.slice();
+  copy.sort((a, b) => {
+    const ra = priorityRank(a.labels);
+    const rb = priorityRank(b.labels);
+    if (ra !== rb) return ra - rb;
+    // Secondary key: createdAt ASC. Empty/missing createdAt sorts last
+    // within its priority bucket (same convention as the daemon).
+    const ca = a.createdAt || '';
+    const cb = b.createdAt || '';
+    if (ca === cb) return 0;
+    if (ca === '') return 1;
+    if (cb === '') return -1;
+    return ca < cb ? -1 : 1;
+  });
+  return copy.slice(0, limit);
 }
 
 /**
@@ -818,6 +857,7 @@ export {
   queueItemFromSnapshot,
   recentCompletionsToGraphQL,
   runRowToGraphQL,
+  sortAndSliceQueueReady,
   transitionRowToGraphQL,
   updateConfigEntry,
 };
