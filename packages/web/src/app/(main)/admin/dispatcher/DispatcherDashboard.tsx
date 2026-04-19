@@ -265,14 +265,21 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     return <SkeletonShell />;
   }
 
-  // GraphQL errors — the server returns NOT_FOUND for non-admins; that
-  // path is already handled by the admin check above, so any error here
-  // is an actual infrastructure problem.
-  if (error) {
+  const state = data?.dispatcherState;
+
+  // GraphQL errors — hard-fail only when we have no cached state to show.
+  // Apollo's polling contract is that `data` and `error` can both be
+  // populated simultaneously: `data` holds the last successful result and
+  // `error` holds the latest failure. If a transient polling refetch
+  // fails after we already rendered the page, we keep showing the cached
+  // state and surface a small "stale" indicator so the operator knows
+  // the latest poll failed — tearing down the entire page on every
+  // sub-2s blip is exactly the wrong behaviour during active agent
+  // phases (#2842).
+  if (error && !state) {
     return <ErrorBanner message="Failed to load dispatcher state." onRetry={() => void refetch()} />;
   }
 
-  const state = data?.dispatcherState;
   const showInitialLoad = loading && !state;
 
   return (
@@ -281,6 +288,21 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
           <h1 className={PAGE_TITLE}>Dispatcher</h1>
           <DispatcherHeader currentRun={state?.currentRun ?? null} />
+          {error && state && (
+            <span
+              data-testid="dispatcher-stale-indicator"
+              role="status"
+              aria-label="Last poll failed — showing cached state"
+              title="Last poll failed — showing cached state"
+              className="inline-flex items-center gap-1.5 font-mono text-xs text-yellow-700 dark:text-yellow-300"
+            >
+              <span
+                aria-hidden="true"
+                className="inline-block h-2 w-2 animate-pulse rounded-full bg-yellow-500 motion-reduce:animate-none"
+              />
+              stale
+            </span>
+          )}
         </div>
         <DispatcherControls
           currentRun={state?.currentRun ?? null}
