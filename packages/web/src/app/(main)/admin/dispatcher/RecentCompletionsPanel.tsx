@@ -17,8 +17,10 @@ interface RecentCompletionsPanelProps {
 
 /**
  * The "Recently completed" panel (#2805 §1.5). Newest terminal-state
- * agents (succeeded / failed / crashed) in the operator's recent history.
- * Each row links to the issue and, when available, the PR.
+ * agents (succeeded / failed / crashed / plan_blocked) in the operator's
+ * recent history. Each row links to the issue and, when available, the PR.
+ * `plan_blocked` (#2857) renders with a distinct neutral chip so
+ * correct-outcome triage is visually separated from genuine failures.
  *
  * Borderless. Lives in the right column below Active agents.
  *

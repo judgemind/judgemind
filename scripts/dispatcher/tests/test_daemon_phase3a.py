@@ -1255,9 +1255,16 @@ class TestHappyPathOrchestration:
 
 
 class TestPlanGoFalse:
-    def test_plan_go_false_with_block_reason_marks_failed(
+    def test_plan_go_false_with_block_reason_marks_plan_blocked(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """plan.go=false + populated block_reason → status='plan_blocked' (#2857).
+
+        Previously this path set status='failed'. #2857 introduced the
+        distinct terminal ``plan_blocked`` state for "plan correctly
+        declined to proceed" — reserved ``failed`` for real
+        infrastructure/subprocess failures.
+        """
         d, conn, handler = _make_daemon(tmp_path)
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
@@ -1316,20 +1323,33 @@ class TestPlanGoFalse:
         # Plan executed; ralph/summary did NOT.
         phases_succeeded = [r.phase for r in handler.events("phase_succeeded")]
         assert phases_succeeded == ["plan"]
-        assert handler.events("plan_go_false") != []
-        # Final UPDATE sets status='failed' with phase='planning'.
-        failed_updates = [
+        plan_go_false_events = handler.events("plan_go_false")
+        assert plan_go_false_events != []
+        assert plan_go_false_events[0].terminal_status == "plan_blocked"
+        # Final UPDATE sets status='plan_blocked' with phase='planning'.
+        plan_blocked_updates = [
             e
             for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.agents" in e[0]
             and e[1] is not None
-            and "failed" in e[1]
+            and "plan_blocked" in e[1]
         ]
-        assert failed_updates
+        assert plan_blocked_updates
+        # Side effects: comment posted, labels swapped.
+        assert handler.events("plan_blocked_comment_posted") != []
+        assert handler.events("plan_blocked_labels_swapped") != []
 
     def test_plan_go_false_no_block_reason_marks_succeeded(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """plan.go=false with empty block_reason → 'no work needed' = succeeded.
+
+        Preserves the pre-#2857 no-work path: when plan returns
+        go=false WITHOUT a block_reason, the interpretation is "there
+        is no work for this issue" (e.g. already fixed, duplicate), and
+        the agent terminates as ``succeeded``. No comment is posted
+        and no labels are swapped — the agent simply exits cleanly.
+        """
         d, conn, handler = _make_daemon(tmp_path)
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
@@ -1345,6 +1365,9 @@ class TestPlanGoFalse:
         plan_nowork = dict(_fixture_plan_output())
         plan_nowork["go"] = False
         plan_nowork["block_reason"] = None  # no work needed
+
+        gh_comment_calls: list[list[str]] = []
+        gh_edit_calls: list[list[str]] = []
 
         def fake_run(cmd: list[str], **kwargs: Any) -> Any:
             r = MagicMock()
@@ -1364,6 +1387,12 @@ class TestPlanGoFalse:
                         "comments": [],
                     }
                 )
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                gh_comment_calls.append(cmd)
+                return r
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                gh_edit_calls.append(cmd)
                 return r
             if "worktree" in cmd and "add" in cmd:
                 add_idx = cmd.index("add")
@@ -1393,6 +1422,539 @@ class TestPlanGoFalse:
             and "succeeded" in e[1]
         ]
         assert succeeded_updates
+        # No plan_blocked side effects on the no-work path.
+        assert gh_comment_calls == []
+        assert gh_edit_calls == []
+        assert handler.events("plan_blocked_comment_posted") == []
+        assert handler.events("plan_blocked_labels_swapped") == []
+
+
+# --------------------------------------------------------------------------
+# #2857: plan_blocked side effects (comment + label swap) —
+# direct tests of the helper methods, independent of the full orchestrator
+# path. Exercises the comment body template, idempotence via sentinel,
+# and the "each side effect wrapped independently" contract.
+# --------------------------------------------------------------------------
+
+
+class TestPlanBlockedHandler:
+    """Direct tests for ``_handle_plan_blocked`` + its subordinate helpers.
+
+    The orchestrator-level ``TestPlanGoFalse`` above exercises the
+    wiring through ``_claim_and_orchestrate_one``. These tests focus on
+    the helper methods in isolation so each side effect (comment post,
+    label swap) can be asserted cleanly without dragging in the whole
+    queue-snapshot / worktree-add / phase-spawn machinery.
+    """
+
+    def _make_handler_daemon(
+        self, tmp_path: Path
+    ) -> tuple[daemon.DispatcherDaemon, _FakeConnection, _CapturingLogHandler]:
+        """Make a daemon with the .tmp directory layout _post_plan_blocked_comment expects."""
+        return _make_daemon(tmp_path)
+
+    def test_render_plan_blocked_comment_has_sentinel_on_line_one(
+        self, tmp_path: Path
+    ) -> None:
+        """AC2: sentinel MUST be line 1 so a future operator tool can dedupe."""
+        d, _conn, _handler = self._make_handler_daemon(tmp_path)
+        body = d._render_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", "reason"
+        )
+        first_line = body.splitlines()[0]
+        assert first_line == "<!-- dispatcher-plan-blocked -->"
+
+    def test_render_plan_blocked_comment_includes_block_reason_as_blockquote(
+        self, tmp_path: Path
+    ) -> None:
+        """Multi-line block_reason rendered as a valid markdown blockquote."""
+        d, _conn, _handler = self._make_handler_daemon(tmp_path)
+        reason = "Issue bundles three distinct tracks.\n\nEach needs its own issue."
+        body = d._render_plan_blocked_comment("abcdef0012345678", reason)
+        # First line of the reason gets "> " prefix, blank line becomes ">"
+        # (keeps blockquote valid across blank lines).
+        assert "> Issue bundles three distinct tracks." in body
+        assert ">\n" in body
+        assert "> Each needs its own issue." in body
+
+    def test_render_plan_blocked_comment_includes_short_agent_id(
+        self, tmp_path: Path
+    ) -> None:
+        """Operators can correlate the comment with a CloudWatch / DB row."""
+        d, _conn, _handler = self._make_handler_daemon(tmp_path)
+        body = d._render_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", "reason"
+        )
+        # Short id is first 8 chars of the UUID with dashes removed.
+        assert "`aabbccdd`" in body
+
+    def test_post_plan_blocked_comment_skips_when_sentinel_already_present(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Idempotence: pre-existing sentinel → no comment post, returns True."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        gh_comment_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.stdout = json.dumps(
+                    {
+                        "comments": [
+                            {"body": "<!-- dispatcher-plan-blocked -->\n## Prior\n"}
+                        ]
+                    }
+                )
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                gh_comment_calls.append(cmd)
+                r.stdout = ""
+                return r
+            r.stdout = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", 42, "reason", worktree
+        )
+
+        assert ok is True
+        assert gh_comment_calls == []
+        assert handler.events("plan_blocked_comment_skipped_idempotent") != []
+
+    def test_post_plan_blocked_comment_posts_when_sentinel_absent(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Fresh issue: sentinel absent → comment posted with --body-file."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        gh_comment_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.stdout = json.dumps({"comments": []})
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                gh_comment_calls.append(cmd)
+                r.stdout = ""
+                return r
+            r.stdout = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", 42, "block_reason", worktree
+        )
+
+        assert ok is True
+        assert len(gh_comment_calls) == 1
+        assert "--body-file" in gh_comment_calls[0]
+        # Body file is written and contains the sentinel.
+        body_idx = gh_comment_calls[0].index("--body-file") + 1
+        body_path = Path(gh_comment_calls[0][body_idx])
+        body = body_path.read_text(encoding="utf-8")
+        assert body.startswith("<!-- dispatcher-plan-blocked -->")
+        assert "> block_reason" in body
+        assert handler.events("plan_blocked_comment_posted") != []
+
+    def test_post_plan_blocked_comment_returns_false_on_gh_failure(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """gh issue comment non-zero → returns False, error logged."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.stdout = ""
+            r.stderr = "api error"
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                r.returncode = 1
+                return r
+            r.returncode = 0
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", 42, "reason", worktree
+        )
+        assert ok is False
+        assert handler.events("plan_blocked_comment_failed") != []
+
+    def test_swap_plan_blocked_labels_calls_gh_issue_edit(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Happy path: gh issue edit --remove-label agent/ready --add-label status/triage."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                calls.append(cmd)
+                return r
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ok = d._swap_plan_blocked_labels("aabbccdd-eeff-0011-2233-445566778899", 42)
+
+        assert ok is True
+        assert len(calls) == 1
+        assert "--remove-label" in calls[0]
+        assert "agent/ready" in calls[0]
+        assert "--add-label" in calls[0]
+        assert "status/triage" in calls[0]
+        assert handler.events("plan_blocked_labels_swapped") != []
+
+    def test_swap_plan_blocked_labels_returns_false_on_gh_failure(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """gh issue edit non-zero → False, error logged."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "api error"
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ok = d._swap_plan_blocked_labels("aabbccdd-eeff-0011-2233-445566778899", 42)
+        assert ok is False
+        assert handler.events("plan_blocked_labels_failed") != []
+
+    def test_plan_blocked_sentinel_check_treats_gh_error_as_unknown(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``gh issue view`` non-zero → sentinel check returns None.
+
+        Fail-open: on a GitHub outage the cost of a duplicate comment
+        is lower than the cost of silently dropping the operator
+        signal. The caller proceeds with the post attempt.
+        """
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.stdout = ""
+            r.stderr = "api error"
+            r.returncode = 1
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = d._plan_blocked_comment_already_posted(42)
+        assert result is None
+        assert handler.events("plan_blocked_sentinel_check_failed") != []
+
+    def test_plan_blocked_sentinel_check_treats_timeout_as_unknown(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """subprocess TimeoutExpired on sentinel check → returns None."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = d._plan_blocked_comment_already_posted(42)
+        assert result is None
+        assert handler.events("plan_blocked_sentinel_check_failed") != []
+
+    def test_plan_blocked_sentinel_check_treats_malformed_json_as_unknown(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Malformed JSON from ``gh issue view`` → returns None."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "not-json"
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = d._plan_blocked_comment_already_posted(42)
+        assert result is None
+        assert handler.events("plan_blocked_sentinel_check_failed") != []
+
+    def test_plan_blocked_sentinel_check_skips_non_dict_comments(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Non-dict entries in the ``comments`` array are skipped safely."""
+        d, _conn, _handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = json.dumps(
+                {
+                    "comments": [
+                        "not-a-dict",
+                        42,
+                        None,
+                        {"body": "ordinary comment"},
+                    ]
+                }
+            )
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        # Sentinel not present among the valid dict entry → False.
+        result = d._plan_blocked_comment_already_posted(42)
+        assert result is False
+
+    def test_post_plan_blocked_comment_handles_timeout(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """subprocess TimeoutExpired on ``gh issue comment`` → returns False, logs."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r = MagicMock()
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                r.stderr = ""
+                return r
+            # gh issue comment → timeout
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        ok = d._post_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", 42, "reason", worktree
+        )
+        assert ok is False
+        assert handler.events("plan_blocked_comment_failed") != []
+
+    def test_swap_plan_blocked_labels_handles_timeout(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """subprocess TimeoutExpired on ``gh issue edit`` → False, logs."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ok = d._swap_plan_blocked_labels("aabbccdd-eeff-0011-2233-445566778899", 42)
+        assert ok is False
+        assert handler.events("plan_blocked_labels_failed") != []
+
+    def test_render_plan_blocked_comment_handles_empty_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """Edge case: empty block_reason still produces valid markdown.
+
+        The orchestrator path never calls this with an empty reason
+        (that branch routes to ``succeeded``), but defensive tests
+        prevent the helper from regressing into crash-on-empty.
+        """
+        d, _conn, _handler = self._make_handler_daemon(tmp_path)
+        body = d._render_plan_blocked_comment("aabbccdd" + "0" * 24, "")
+        # Sentinel still on line 1, blockquote still present.
+        assert body.startswith("<!-- dispatcher-plan-blocked -->")
+        assert "`aabbccdd`" in body
+
+    def test_post_plan_blocked_comment_handles_body_write_failure(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """OSError writing the body file → returns False, logs the error.
+
+        Exercises the mkdir/write_text error-handling arm so
+        filesystem-level failures (disk full, permission denied) don't
+        crash the orchestration.
+        """
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            # Sentinel check returns "not present".
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r = MagicMock()
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                r.stderr = ""
+                return r
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        # Pass a worktree whose ``tmp`` path already exists as a file —
+        # ``mkdir(parents=True, exist_ok=True)`` raises NotADirectoryError
+        # (an OSError subclass) because it cannot create a directory
+        # whose parent is a non-directory file.
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # Create a regular file where the ``tmp`` directory would be.
+        (worktree / "tmp").write_text("not-a-dir")
+
+        ok = d._post_plan_blocked_comment(
+            "aabbccdd-eeff-0011-2233-445566778899", 42, "reason", worktree
+        )
+        assert ok is False
+        assert handler.events("plan_blocked_comment_failed") != []
+
+    def test_handle_plan_blocked_comment_failure_does_not_block_label_swap(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Each side effect is independently wrapped: comment fail → labels still run."""
+        d, _conn, handler = self._make_handler_daemon(tmp_path)
+        label_edit_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            r = MagicMock()
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "view"]:
+                r.returncode = 0
+                r.stdout = json.dumps({"comments": []})
+                return r
+            if cmd[:3] == ["gh", "issue", "comment"]:
+                r.returncode = 1
+                return r
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                r.returncode = 0
+                label_edit_calls.append(cmd)
+                return r
+            r.returncode = 0
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # Handler returns None, does not raise.
+        result = d._handle_plan_blocked(
+            "aabbccdd-eeff-0011-2233-445566778899", 42, "reason", worktree
+        )
+        assert result is None
+        # Even though the comment failed, the label swap still ran.
+        assert len(label_edit_calls) == 1
+        assert handler.events("plan_blocked_comment_failed") != []
+        assert handler.events("plan_blocked_labels_swapped") != []
+
+    def test_plan_go_false_label_swap_fails_but_status_still_runs(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Orchestrator path: label swap fails → DB still writes plan_blocked.
+
+        The DB update is the authoritative terminal-status write. A
+        label-swap failure (e.g. GitHub outage, token expired) must not
+        prevent ``dispatcher.agents.status='plan_blocked'`` — otherwise
+        the agent row would be stuck in ``phase=planning`` forever and
+        the cooldown loop would not trip the stale-agent cleaner.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
+
+        monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
+        monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
+
+        plan_blocked = dict(_fixture_plan_output())
+        plan_blocked["go"] = False
+        plan_blocked["block_reason"] = "reason"
+
+        issue_view_call_count = 0
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            nonlocal issue_view_call_count
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[0].endswith("check-issue-author.sh"):
+                r.stdout = "TRUSTED: ...\n"
+                return r
+            if cmd[:3] == ["gh", "issue", "view"]:
+                # First call is the issue-bundle fetch (plan input);
+                # subsequent calls are the sentinel check. Both return
+                # empty comments.
+                issue_view_call_count += 1
+                r.stdout = json.dumps(
+                    {
+                        "number": 42,
+                        "title": "T",
+                        "body": "",
+                        "labels": [],
+                        "comments": [],
+                    }
+                )
+                return r
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                # Label swap: fail.
+                r.returncode = 1
+                r.stderr = "api error"
+                return r
+            if "worktree" in cmd and "add" in cmd:
+                add_idx = cmd.index("add")
+                Path(cmd[add_idx + 1]).mkdir(parents=True, exist_ok=True)
+                return r
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        def fake_spawn(phase: str, worktree: Path, agent_id: str) -> tuple[int, float]:
+            (worktree / "tmp" / "dispatcher-output").mkdir(parents=True, exist_ok=True)
+            (worktree / "tmp" / "dispatcher-output" / f"{phase}.json").write_text(
+                json.dumps(plan_blocked)
+            )
+            return 0, 0.1
+
+        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+
+        d._claim_and_orchestrate_one()
+
+        # DB still got the terminal-status update.
+        plan_blocked_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "plan_blocked" in e[1]
+        ]
+        assert plan_blocked_updates
+        # Label swap failure was logged.
+        assert handler.events("plan_blocked_labels_failed") != []
+        # Comment still got posted.
+        assert handler.events("plan_blocked_comment_posted") != []
 
 
 # --------------------------------------------------------------------------
