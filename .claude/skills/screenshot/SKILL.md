@@ -56,10 +56,13 @@ scripts/run-py.sh scripts/screenshot.py /rulings --wait 5000 --output tmp/ruling
 **Screenshot an admin page (requires authentication):**
 ```
 scripts/run-py.sh scripts/screenshot.py --auth /admin/data-quality --output tmp/dq.png
+scripts/run-py.sh scripts/screenshot.py --auth /admin/dispatcher --output tmp/dispatcher.png
 ```
 Then: `Read tmp/dq.png`
 
 The `--auth` flag fetches admin credentials from AWS Secrets Manager (`judgemind/dev/agent-admin`), logs in via the web login form, and then navigates to the target page. This is required for any page behind authentication (e.g. `/admin/*` routes).
+
+The `agent-admin` account on dev has `users.role = 'admin'`, so both admin dashboards (`/admin/data-quality`, `/admin/dispatcher`) render with full admin content. To add a new admin-gated page, gate on `user.role === 'admin'` and `--auth` will Just Work.
 
 ### Options
 
@@ -71,7 +74,7 @@ The `--auth` flag fetches admin credentials from AWS Secrets Manager (`judgemind
 | `--width` | 1280 | Viewport width in pixels |
 | `--height` | 720 | Viewport height in pixels |
 | `--wait` | 3000 | Wait time in ms after page load for JS rendering |
-| `--auth` | off | Log in as admin before taking the screenshot. Fetches credentials from AWS Secrets Manager (`judgemind/dev/agent-admin`). Required for admin pages. |
+| `--auth` | off | Log in as admin before taking the screenshot. Fetches credentials from AWS Secrets Manager (`judgemind/dev/agent-admin`, a `role='admin'` user on dev). Required for admin pages. |
 
 ---
 
