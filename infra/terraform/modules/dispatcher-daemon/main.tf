@@ -36,6 +36,23 @@ data "aws_caller_identity" "current" {}
 locals {
   service_name   = "judgemind-dispatcher-${var.environment}"
   log_group_name = "/ecs/judgemind-dispatcher-${var.environment}"
+
+  # Secret-ARN lists for the two policies below. `compact()` drops any empty
+  # string, so placeholder secrets that aren't yet provisioned (e.g.
+  # GITHUB_TOKEN before #2700, or the full Phase-1 inert wiring where all
+  # ARNs are "") do not leak into the policy's `Resource` list. If the
+  # compacted list is empty, the policy resource itself is skipped via
+  # `count = 0` — IAM rejects `Resource = []` with
+  # `MalformedPolicyDocument: Policy statement must contain resources`
+  # (see #2739).
+  execution_secret_arns = compact([
+    var.anthropic_api_key_secret_arn,
+    var.db_connection_secret_arn,
+    var.github_token_secret_arn,
+    var.telegram_bot_token_secret_arn,
+    var.gemini_api_key_secret_arn,
+  ])
+  task_db_secret_arns = compact([var.db_connection_secret_arn])
 }
 
 # ─── CloudWatch Log Group ───────────────────────────────────────────────────
@@ -107,10 +124,15 @@ resource "aws_iam_role_policy_attachment" "execution_managed" {
 }
 
 # Allow the execution role to fetch every secret wired into the task
-# definition. `compact()` drops any empty string, so placeholder secrets
-# that aren't yet provisioned (e.g. GITHUB_TOKEN before #2700) don't
-# generate an invalid empty-Resource statement.
+# definition. The secret-ARN list is pre-compacted into
+# `local.execution_secret_arns` so that empty-string placeholders
+# (e.g. GITHUB_TOKEN before #2700) are dropped. When no ARNs are wired
+# in — the Phase-1 inert wiring passes "" for all five — the policy
+# resource itself is skipped via `count = 0`; IAM rejects a statement
+# with `Resource = []` as `MalformedPolicyDocument` (see #2739).
 resource "aws_iam_role_policy" "execution_secrets" {
+  count = length(local.execution_secret_arns) > 0 ? 1 : 0
+
   name = "${local.service_name}-exec-secrets"
   role = aws_iam_role.execution.id
 
@@ -118,16 +140,10 @@ resource "aws_iam_role_policy" "execution_secrets" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ReadDispatcherSecrets"
-        Effect = "Allow"
-        Action = "secretsmanager:GetSecretValue"
-        Resource = compact([
-          var.anthropic_api_key_secret_arn,
-          var.db_connection_secret_arn,
-          var.github_token_secret_arn,
-          var.telegram_bot_token_secret_arn,
-          var.gemini_api_key_secret_arn,
-        ])
+        Sid      = "ReadDispatcherSecrets"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = local.execution_secret_arns
       }
     ]
   })
@@ -171,7 +187,14 @@ resource "aws_iam_role" "task" {
 # identity only needs to fetch its own connection secret at runtime (the
 # execution role already fetches it for env injection, but the daemon may
 # also want to rotate / re-fetch during long-running operation).
+#
+# Phase 1 passes `db_connection_secret_arn = ""`; the compacted
+# `local.task_db_secret_arns` is therefore empty and `count = 0` skips
+# the policy entirely. Same rationale as `execution_secrets` above —
+# IAM rejects `Resource = []` (see #2739).
 resource "aws_iam_role_policy" "task_read_db_secret" {
+  count = length(local.task_db_secret_arns) > 0 ? 1 : 0
+
   name = "${local.service_name}-task-read-db-secret"
   role = aws_iam_role.task.id
 
@@ -179,12 +202,10 @@ resource "aws_iam_role_policy" "task_read_db_secret" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ReadDispatcherDBSecret"
-        Effect = "Allow"
-        Action = "secretsmanager:GetSecretValue"
-        Resource = compact([
-          var.db_connection_secret_arn,
-        ])
+        Sid      = "ReadDispatcherDBSecret"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = local.task_db_secret_arns
       }
     ]
   })
