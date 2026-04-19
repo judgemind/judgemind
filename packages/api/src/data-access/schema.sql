@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 28 migrations.
+-- Generated from 30 migrations.
 
 
 
@@ -473,11 +473,15 @@ CREATE TABLE dispatcher.phase_outputs (
     phase text NOT NULL,
     output_json jsonb NOT NULL,
     ts timestamp with time zone DEFAULT now() NOT NULL,
-    log_text text
+    log_text text,
+    attempt integer DEFAULT 0 NOT NULL
 );
 
 
 COMMENT ON COLUMN dispatcher.phase_outputs.log_text IS 'Full ephemeral phase log (stdout+stderr) captured from {worktree}/tmp/claude-p-<phase>.log at phase-finish time. Nullable for historical rows and for phases that failed before producing a log. Housekeeping tick prunes at 30 days along with output_json. See #2821.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.attempt IS 'Retry attempt counter — matches dispatcher.agents.retries_used at the moment this phase ran. 0 = initial run. Each retry reset (_process_retry_markers) bumps the effective attempt for the next phase run. Issue #2872.';
 
 
 CREATE SEQUENCE dispatcher.phase_outputs_output_id_seq
@@ -1118,7 +1122,7 @@ CREATE INDEX idx_dispatcher_notifications_created_at ON dispatcher.notifications
 CREATE INDEX idx_dispatcher_notifications_human_attention_unsent ON dispatcher.notifications USING btree (severity, sent_at) WHERE (severity = 'human_attention'::text);
 
 
-CREATE UNIQUE INDEX idx_dispatcher_phase_outputs_agent_phase ON dispatcher.phase_outputs USING btree (agent_id, phase);
+CREATE UNIQUE INDEX idx_dispatcher_phase_outputs_agent_phase_attempt ON dispatcher.phase_outputs USING btree (agent_id, phase, attempt);
 
 
 CREATE INDEX idx_dispatcher_phase_transitions_agent_ts ON dispatcher.phase_transitions USING btree (agent_id, ts DESC);
