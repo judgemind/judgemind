@@ -675,6 +675,121 @@ class TestAtomicClaim:
         assert ok is False
         assert handler.events("claim_failed") != []
 
+    # ── #2866 claim-interlock tests ──────────────────────────────────
+
+    def test_happy_path_adds_status_in_progress_label(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Successful claim adds ``status/in-progress`` via ``gh issue edit``.
+
+        Issue #2866 — the label is the human-visible half of the
+        claim interlock. Add happens in :meth:`_atomic_claim` on
+        happy-path success AFTER the DB commit.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+        gh_edit_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                gh_edit_calls.append(cmd)
+                return r
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ok = d._atomic_claim(42, "agent-uuid", "/path")
+        assert ok is True
+        # Exactly one add-label call with the in-progress label.
+        assert len(gh_edit_calls) == 1
+        assert "--add-label" in gh_edit_calls[0]
+        assert daemon.STATUS_IN_PROGRESS_LABEL in gh_edit_calls[0]
+
+    def test_unique_violation_with_task_skill_owner_logs_already_claimed_by_task(
+        self, tmp_path: Path
+    ) -> None:
+        """UniqueViolation + owner.kind='task-skill' → ``candidate_skipped`` with ``already_claimed_by_task``.
+
+        Issue #2866 — daemon queue scan observes that a /task subagent
+        has already claimed the issue and logs a distinguishing reason
+        so CloudWatch Logs Insights queries can count collisions
+        separately from daemon↔daemon races.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        def insert_raises_select_returns_owner(sql: str, params: Any = None) -> None:
+            if "INSERT INTO dispatcher.agents" in sql:
+                raise psycopg.errors.UniqueViolation("dup")
+            # owner-lookup SELECT executes and returns ('task-skill',)
+
+        conn.cursor_instance.execute = (  # type: ignore[method-assign]
+            insert_raises_select_returns_owner
+        )
+        conn.cursor_instance.fetch_queue = [("task-skill",)]
+
+        ok = d._atomic_claim(42, "agent-uuid", "/path")
+        assert ok is False
+        # Distinguishing event: ``candidate_skipped`` reason matches
+        # ``already_claimed_by_task``. No generic ``claim_lost``.
+        skipped = handler.events("candidate_skipped")
+        assert skipped, "expected candidate_skipped event"
+        assert skipped[0].__dict__.get("reason") == "already_claimed_by_task"
+        assert handler.events("claim_lost") == []
+
+    def test_unique_violation_with_task_owner_logs_generic_claim_lost(
+        self, tmp_path: Path
+    ) -> None:
+        """UniqueViolation + owner.kind='task' (daemon↔daemon) → ``claim_lost``.
+
+        Issue #2866 — preserves pre-existing semantics for the common
+        daemon-on-daemon race case. Owner kind is surfaced on the log
+        envelope so operators can still see who won.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        def insert_raises_select_returns_owner(sql: str, params: Any = None) -> None:
+            if "INSERT INTO dispatcher.agents" in sql:
+                raise psycopg.errors.UniqueViolation("dup")
+
+        conn.cursor_instance.execute = (  # type: ignore[method-assign]
+            insert_raises_select_returns_owner
+        )
+        # Owner is another daemon-spawned agent (kind='task').
+        conn.cursor_instance.fetch_queue = [("task",)]
+
+        ok = d._atomic_claim(42, "agent-uuid", "/path")
+        assert ok is False
+        assert handler.events("claim_lost") != []
+        assert handler.events("candidate_skipped") == []
+
+    def test_unique_violation_with_no_owner_row_still_logs_claim_lost(
+        self, tmp_path: Path
+    ) -> None:
+        """Edge case: partial index released between INSERT and SELECT.
+
+        Owner lookup returns None because the row already completed +
+        was indexed out. We still log ``claim_lost`` so the operator
+        sees the race happened, but ``owner_kind`` is None in the
+        envelope.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        def insert_raises(sql: str, params: Any = None) -> None:
+            if "INSERT INTO dispatcher.agents" in sql:
+                raise psycopg.errors.UniqueViolation("dup")
+
+        conn.cursor_instance.execute = insert_raises  # type: ignore[method-assign]
+        # Empty fetch_queue → fetchone returns None → owner_kind=None.
+
+        ok = d._atomic_claim(42, "agent-uuid", "/path")
+        assert ok is False
+        lost = handler.events("claim_lost")
+        assert lost, "expected claim_lost event"
+        assert lost[0].__dict__.get("owner_kind") is None
+
 
 # --------------------------------------------------------------------------
 # _create_worktree / git subprocess
@@ -1466,7 +1581,14 @@ class TestPlanGoFalse:
         assert succeeded_updates
         # No plan_blocked side effects on the no-work path.
         assert gh_comment_calls == []
-        assert gh_edit_calls == []
+        # #2866 claim-interlock label calls ARE expected here:
+        # the ``status/in-progress`` label is added on claim and removed
+        # on terminal. Filter them out before asserting "no plan_blocked
+        # label swap happened".
+        non_interlock_edits = [
+            call for call in gh_edit_calls if "status/in-progress" not in call
+        ]
+        assert non_interlock_edits == []
         assert handler.events("plan_blocked_comment_posted") == []
         assert handler.events("plan_blocked_labels_swapped") == []
 
@@ -2834,3 +2956,215 @@ class TestNeedsReviewOrchestration:
         assert needs_review_updates
         # Failure event logged.
         assert handler.events("needs_review_comment_failed") != []
+
+
+# --------------------------------------------------------------------------
+# #2866 — claim interlock: ``status/in-progress`` label lifecycle +
+# daemon queue-scan filter + task-skill collision detection.
+# --------------------------------------------------------------------------
+
+
+class TestClaimInterlockLabel:
+    """Status label add on claim / remove on terminal (#2866)."""
+
+    def test_mark_agent_terminal_removes_label_when_issue_number_provided(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Terminal transition with ``issue_number`` → ``gh issue edit --remove-label``.
+
+        The explicit-opt-in contract: callers thread issue_number
+        through when they know it; otherwise the teardown is skipped.
+        This test covers the "thread through" path.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+        gh_edit_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                gh_edit_calls.append(cmd)
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        d._mark_agent_terminal(
+            "agent-uuid",
+            status="succeeded",
+            phase="done",
+            exit_code=0,
+            issue_number=42,
+        )
+        assert len(gh_edit_calls) == 1
+        assert "--remove-label" in gh_edit_calls[0]
+        assert daemon.STATUS_IN_PROGRESS_LABEL in gh_edit_calls[0]
+
+    def test_mark_agent_terminal_skips_label_when_issue_number_omitted(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Terminal transition without ``issue_number`` → no gh call.
+
+        Protects call sites that don't know the issue number
+        (supervisor retry paths, generic diagnoser hand-offs) from
+        making an expensive subprocess call that would pin the event
+        loop on a slow GitHub response.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+        gh_edit_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                gh_edit_calls.append(cmd)
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        d._mark_agent_terminal(
+            "agent-uuid",
+            status="failed",
+            phase="awaiting_ci",
+            exit_code=None,
+            # issue_number omitted
+        )
+        assert gh_edit_calls == []
+
+    def test_mark_agent_terminal_non_terminal_status_does_not_remove_label(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Non-terminal transitions (e.g. awaiting_ci hand-off) keep the label.
+
+        The label only clears when the agent is genuinely done; the
+        Phase 3A post-PR hand-off is still "running" with
+        ``phase='awaiting_ci'`` so the label must persist until the
+        final success/failed/crashed transition.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+        gh_edit_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            if cmd[:3] == ["gh", "issue", "edit"]:
+                gh_edit_calls.append(cmd)
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        d._mark_agent_terminal(
+            "agent-uuid",
+            status="running",
+            phase="awaiting_ci",
+            exit_code=None,
+            issue_number=42,
+        )
+        assert gh_edit_calls == []
+
+
+class TestQueueScanExcludesInProgressLabel:
+    """``_fetch_agent_ready_issues`` filters out ``status/in-progress`` (#2866)."""
+
+    def test_in_progress_label_excludes_issue_from_candidate_list(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issues carrying ``status/in-progress`` alongside ``agent/ready`` drop.
+
+        Belt-and-suspenders with the DB-side partial UNIQUE INDEX: the
+        label filter is redundant if the DB write is atomic, but a
+        ``gh`` output that races a /task skill's label add protects
+        against the daemon picking up an issue in the few-second
+        window before the DB row lands.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = json.dumps(
+                [
+                    {
+                        "number": 1,
+                        "labels": [{"name": "agent/ready"}],
+                        "title": "ok",
+                    },
+                    {
+                        "number": 2,
+                        "labels": [
+                            {"name": "agent/ready"},
+                            {"name": daemon.STATUS_IN_PROGRESS_LABEL},
+                        ],
+                        "title": "in-progress",
+                    },
+                    {
+                        "number": 3,
+                        "labels": [{"name": "agent/ready"}],
+                        "title": "ok2",
+                    },
+                ]
+            )
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        issues = d._fetch_agent_ready_issues()
+        # #2 drops; #1 + #3 remain.
+        assert [i["number"] for i in issues] == [1, 3]
+
+
+class TestGhIssueRemoveLabelsHelper:
+    """Thin helper tests for :meth:`_gh_issue_remove_labels` (#2866)."""
+
+    def test_empty_labels_is_a_noop(self, monkeypatch: Any, tmp_path: Path) -> None:
+        """No labels → no subprocess call."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        called: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **_kw: called.append(cmd) or MagicMock(returncode=0),
+        )
+        d._gh_issue_remove_labels(42, [])
+        assert called == []
+
+    def test_happy_path_shells_out_to_gh_issue_edit_remove_label(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """One label → one ``gh issue edit --remove-label LABEL`` subprocess call."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            captured.append(cmd)
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d._gh_issue_remove_labels(42, [daemon.STATUS_IN_PROGRESS_LABEL])
+        assert len(captured) == 1
+        assert captured[0][:3] == ["gh", "issue", "edit"]
+        assert "--remove-label" in captured[0]
+        assert daemon.STATUS_IN_PROGRESS_LABEL in captured[0]
+
+    def test_nonzero_exit_is_logged_not_raised(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``gh`` returning non-zero must not raise — DB write is authoritative."""
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "label not found\n"
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Must not raise.
+        d._gh_issue_remove_labels(42, [daemon.STATUS_IN_PROGRESS_LABEL])
+        assert handler.events("label_remove_nonzero") != []

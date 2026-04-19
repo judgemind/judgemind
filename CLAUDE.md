@@ -150,6 +150,7 @@ These rules govern how you work with the user in interactive sessions, not just 
 
 **The authoritative step-by-step lives in `.claude/skills/task/SKILL.md` §A.3–A.9.** `/task` subagents follow that. The rules below are the ones every agent (task, dispatcher, interactive) must internalize.
 
+- **Claim interlock (`dispatcher.agents` + `status/in-progress`).** On claim, `/task` writes a `dispatcher.agents` row (`kind='task-skill'`, `status='running'`) via `scripts/dispatcher/task_claim.py claim` AND adds the `status/in-progress` GitHub label. The daemon's `_atomic_claim` does the equivalent. The partial UNIQUE INDEX `idx_dispatcher_agents_active_issue` catches concurrent claims atomically (subagent↔daemon, daemon↔daemon, subagent↔subagent). On terminal, both sides update the row to `succeeded`/`failed` and remove the label. See `.claude/skills/task/SKILL.md` §2a + A.7 + B.2 for the exact commands. Issue #2866.
 - **Single-issue rule.** Each PR addresses exactly one issue. Break large/ambiguous issues into sub-tasks labeled `agent/ready` before picking up.
 - **All commits on the worktree branch.** Never directly on `main` during autonomous work. Every change goes through a PR.
 - **Scope completeness check before implementing.** Grep the codebase for all locations affected by the change. If the issue's scope doesn't cover all, either expand scope or file follow-ups.
