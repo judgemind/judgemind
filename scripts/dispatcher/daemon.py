@@ -173,6 +173,24 @@ DEFAULT_AWS_REGION = "us-west-2"
 #: continues to warn on any non-zero value.
 PHASE_2_REQUIRED_CONCURRENCY_CAP = 0
 
+#: Killswitch terminal phase name (#2847). When the scheduler observes
+#: ``concurrency_cap=0`` mid-orchestration, the worker thread aborts at
+#: the next phase boundary and ``_mark_agent_terminal`` is called with
+#: ``status='failed'`` + this phase name. The dedicated phase value
+#: distinguishes operator killswitches from real failures in retro /
+#: admin-page views and stops them from being mis-classified as
+#: tier-1/2/3 failures by the diagnoser.
+KILLSWITCH_TERMINAL_PHASE = "paused_by_killswitch"
+
+#: Maximum time :meth:`DispatcherDaemon.run_forever` waits for the
+#: orchestration worker thread to exit during shutdown (#2847). If the
+#: thread is mid-``subprocess.run`` for a ``claude -p`` phase, we cannot
+#: interrupt the subprocess cleanly — the thread will return only once
+#: the subprocess exits (or is killed by Fargate's SIGKILL fallback on
+#: task stop). This wait is a best-effort join; on timeout the daemon
+#: proceeds with ``mark_stopped`` anyway so the process does not hang.
+ORCHESTRATION_JOIN_TIMEOUT_SECONDS = 10
+
 #: Hard wall-clock timeout for each ``claude -p`` subprocess spawned
 #: from the orchestration path. Matches the 180-minute ceiling from
 #: spec §17 Risk 4a and the ``dispatcher.config.subprocess_timeout_s``
@@ -944,7 +962,17 @@ class DispatcherDaemon:
     def __init__(self, cfg: DaemonConfig, logger: logging.Logger):
         self._cfg = cfg
         self._log = logger
-        self._conn: Connection[Any] | None = None
+        # ``_conn`` is exposed as a property (below) that resolves to the
+        # current thread's psycopg connection. The main thread uses
+        # ``_main_conn``; the orchestration worker thread (#2847) opens
+        # its own connection in :meth:`_orchestration_worker_entry` and
+        # stashes it on ``_thread_state.conn``. This lets scheduler_tick
+        # on the main thread observe ``concurrency_cap`` at its 30s
+        # cadence without contending with the worker thread's per-phase
+        # DB transactions. Each thread owns its own psycopg Connection
+        # because psycopg3 Connections are not thread-safe.
+        self._main_conn: Connection[Any] | None = None
+        self._thread_state = threading.local()
         self._run_id: str | None = None
         self._stop = threading.Event()
         self._scheduler_ticks = 0
@@ -970,6 +998,56 @@ class DispatcherDaemon:
         # all time comparisons go through the same ``datetime.now(UTC)``
         # plumbing the rest of the daemon uses (see #2791 §2b).
         self._gh_rate_skip_until: datetime | None = None
+        # Killswitch plumbing (#2847). The orchestration worker thread
+        # runs ``_claim_and_orchestrate_one`` off the main loop so the
+        # scheduler observation cadence stays strict at 30s regardless
+        # of how long a phase takes. ``_pause_requested`` is set when
+        # scheduler_tick observes ``concurrency_cap=0`` and checked by
+        # the worker thread before each phase — a set event aborts the
+        # pipeline at the next phase boundary, marking the agent
+        # ``status='failed' phase='paused_by_killswitch'``. The lock
+        # guards only the ``_orchestration_thread`` handle (start,
+        # replace, join) — the actual orchestration work does not hold
+        # it.
+        self._orchestration_thread: threading.Thread | None = None
+        self._orchestration_thread_lock = threading.Lock()
+        self._pause_requested = threading.Event()
+        # Observation record: the most recent ``concurrency_cap`` value
+        # read by scheduler_tick and when (monotonic seconds since
+        # boot). Used by tests and by the ``daemon.scheduler_tick``
+        # structured log event to show the cadence + cap in one line
+        # for CloudWatch review.
+        self._last_cap_observed: int | None = None
+        self._last_cap_observed_monotonic: float | None = None
+
+    # ------------------------------------------------------------------
+    # Thread-aware connection accessor (#2847).
+    #
+    # The orchestration worker thread runs with its own psycopg
+    # Connection, stashed on ``_thread_state.conn`` at thread entry.
+    # Every existing ``self._conn`` reference in the codebase goes
+    # through this property and resolves to the correct connection for
+    # the current thread — no signature changes needed. When the main
+    # thread touches ``self._conn`` it still sees ``self._main_conn``.
+    # The setter preserves the ``self._conn = psycopg.connect(...)``
+    # call site in :meth:`connect` / :meth:`close` without a rename.
+    # ------------------------------------------------------------------
+
+    @property
+    def _conn(self) -> Connection[Any] | None:
+        thread_conn = getattr(self._thread_state, "conn", None)
+        if thread_conn is not None:
+            return thread_conn
+        return self._main_conn
+
+    @_conn.setter
+    def _conn(self, value: Connection[Any] | None) -> None:
+        # Only the main thread ever assigns ``self._conn`` (in
+        # ``connect`` / ``close``). The worker thread installs its
+        # connection via ``self._thread_state.conn`` directly so that
+        # its lifecycle is scoped to the thread entry-point's
+        # try/finally — not this setter.
+        self._main_conn = value
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -1091,16 +1169,44 @@ class DispatcherDaemon:
 
         Steps (in order; DB work is one transaction per step for isolation):
             1. Consume any pending ``dispatcher.commands`` (no-op handler).
-            2. Read ``dispatcher.config.concurrency_cap`` and fire the
-               Phase 2 spawn-safety guard.
-            3. Scan the GitHub ``agent/ready`` queue and write a row to
-               ``dispatcher.queue_snapshots``.
+            2. Read ``dispatcher.config.concurrency_cap``, record the
+               observation, and SET (cap==0) or CLEAR (cap>0) the
+               ``_pause_requested`` killswitch event for the worker thread
+               to observe between phases (#2847).
+            3. Fire the Phase 2 spawn-safety guard (log-only warning).
+            4. Scan the GitHub ``agent/ready`` queue and write a row to
+               ``dispatcher.queue_snapshots``; run the blocked-list scan
+               on its slower cadence.
+            5. If the gate allows, spawn the orchestration worker thread
+               (#2847). The spawn is non-blocking — the worker runs on a
+               dedicated thread with its own psycopg connection so this
+               tick returns promptly, preserving the 30s cadence even
+               when a multi-minute phase is in flight.
+
+        **Cadence invariant (#2847).** Before this change the tick
+        called ``_claim_and_orchestrate_one`` inline, which ran the
+        whole plan → ralph → summary → push pipeline synchronously and
+        blocked the main run loop for up to 180 minutes per phase. The
+        effect was that an operator cap=0 flip was not observed until
+        the next free tick — often 5-10 minutes later, sometimes much
+        longer. After this change the orchestration runs on a thread;
+        the tick always returns in milliseconds and the cap observation
+        happens on the strict ``tick_scheduler_seconds`` cadence
+        regardless of worker state.
 
         Returns a small summary dict for logging + tests. Keys:
 
             * ``commands_consumed``: int, rowcount from step 1.
             * ``concurrency_cap``: int, or ``-1`` sentinel if unset.
             * ``queue_depth``: int, ``-1`` if the scan failed.
+            * ``blocked_depth``: int, ``-1`` if the scan did not run
+              this tick or failed.
+            * ``orchestration_attempted``: 1 if a worker thread was
+              spawned this tick, 0 otherwise.
+            * ``orchestration_thread_alive``: 1 iff a worker thread is
+              still alive at end-of-tick (#2847).
+            * ``pause_requested``: 1 iff the killswitch event is set
+              at end-of-tick (#2847).
         """
         assert self._conn is not None, "connect() must run before ticks"
 
@@ -1128,6 +1234,39 @@ class DispatcherDaemon:
                 # Stored as JSONB — a bare number comes back as int.
                 concurrency_cap = int(row[0]) if row[0] is not None else None
         self._conn.commit()
+
+        # Killswitch observation (#2847). Update the observation state
+        # and the ``_pause_requested`` event so the orchestration worker
+        # thread (if one is running) can abort at the next phase
+        # boundary within ≤60s of an operator cap=0 commit. Cap==0
+        # (killswitch) SETS the event; any positive cap value CLEARS it
+        # so a cap=0 → cap=1 flip lets a fresh orchestration proceed
+        # normally on the next tick.
+        self._last_cap_observed = concurrency_cap
+        self._last_cap_observed_monotonic = time.monotonic()
+        if concurrency_cap == 0:
+            if not self._pause_requested.is_set():
+                self._log.info(
+                    "daemon.killswitch_engaged",
+                    extra={
+                        "event": "killswitch_engaged",
+                        "run_id": self._run_id,
+                        "observed_concurrency_cap": concurrency_cap,
+                        "orchestration_in_flight": self._orchestration_thread_alive(),
+                    },
+                )
+            self._pause_requested.set()
+        else:
+            if self._pause_requested.is_set():
+                self._log.info(
+                    "daemon.killswitch_cleared",
+                    extra={
+                        "event": "killswitch_cleared",
+                        "run_id": self._run_id,
+                        "observed_concurrency_cap": concurrency_cap,
+                    },
+                )
+            self._pause_requested.clear()
 
         # Phase 2 spawn-safety guard: the spawn path does not exist yet,
         # but a future Phase 3 wiring mistake could activate it. Warn if
@@ -1170,20 +1309,30 @@ class DispatcherDaemon:
         if self._should_run_blocked_scan():
             blocked_depth = self._scan_blocked_and_snapshot()
 
-        # 4. Phase 3A orchestration gate (#2783).
+        # 4. Phase 3A orchestration gate (#2783) — threaded spawn (#2847).
         #
         # Only enter the claim + orchestrate path when (a) the live
         # ``concurrency_cap`` is >0 AND (b) no agent is currently in
         # flight for this daemon run AND (c) Phase 3C's GitHub
-        # rate-limit skip flag is not active. Phase 3 runs at
-        # ``concurrency_cap=1`` (one subprocess at a time); Phase 3E
+        # rate-limit skip flag is not active AND (d) no orchestration
+        # worker thread from a prior tick is still alive. Phase 3 runs
+        # at ``concurrency_cap=1`` (one subprocess at a time); Phase 3E
         # flips the value from 0 to 1. Until then the gate stays
         # closed and this branch is a no-op.
         #
+        # Orchestration runs on a dedicated worker thread so this tick
+        # returns quickly (spawn + return = ~ms) and the main run loop
+        # can re-fire ``scheduler_tick`` at its 30s cadence while the
+        # worker runs its 5-90min phase pipeline. The worker checks
+        # ``self._pause_requested`` between phases; an operator cap=0
+        # flip propagates to an in-flight orchestration within one
+        # phase boundary (≤60s for plan; worst-case ~one ralph
+        # iteration for ralph).
+        #
         # Exceptions here are caught + logged but not re-raised — the
-        # scheduler tick must survive any orchestration failure so the
-        # next tick can try again. Orchestration work itself is wrapped
-        # in per-phase error handling inside ``_claim_and_orchestrate_one``.
+        # scheduler tick must survive any spawn failure so the next
+        # tick can try again. Worker-thread exceptions are caught in
+        # ``_orchestration_worker_entry``.
         orchestration_attempted = False
         rate_skip_active = self._gh_rate_skip_active()
         if rate_skip_active:
@@ -1202,22 +1351,23 @@ class DispatcherDaemon:
             and concurrency_cap > 0
             and not self._has_active_agent()
         ):
-            orchestration_attempted = True
             try:
-                self._claim_and_orchestrate_one()
+                orchestration_attempted = self._maybe_spawn_orchestration_thread()
             except Exception:
                 # Daemon survival takes precedence over any single
-                # orchestration run. The helper logs specific failures
+                # orchestration spawn. The helper logs specific failures
                 # internally; this is the belt-and-braces catch.
                 self._log.exception(
-                    "daemon.orchestration_failed",
+                    "daemon.orchestration_spawn_failed",
                     extra={
-                        "event": "orchestration_failed",
+                        "event": "orchestration_spawn_failed",
                         "run_id": self._run_id,
                     },
                 )
 
         self._scheduler_ticks += 1
+        orchestration_thread_alive = self._orchestration_thread_alive()
+        pause_requested = self._pause_requested.is_set()
         self._log.info(
             "daemon.scheduler_tick",
             extra={
@@ -1229,6 +1379,11 @@ class DispatcherDaemon:
                 "queue_depth": queue_depth,
                 "blocked_depth": blocked_depth,
                 "orchestration_attempted": orchestration_attempted,
+                # #2847: orchestration now runs on a worker thread; these
+                # two fields let CloudWatch Insights verify the cadence
+                # holds regardless of worker state.
+                "orchestration_thread_alive": orchestration_thread_alive,
+                "pause_requested": pause_requested,
             },
         )
         return {
@@ -1237,7 +1392,126 @@ class DispatcherDaemon:
             "queue_depth": queue_depth,
             "blocked_depth": blocked_depth,
             "orchestration_attempted": 1 if orchestration_attempted else 0,
+            # #2847 observability fields for tests and CloudWatch.
+            "orchestration_thread_alive": 1 if orchestration_thread_alive else 0,
+            "pause_requested": 1 if pause_requested else 0,
         }
+
+    # ── orchestration worker thread (#2847) ────────────────────────────
+
+    def _orchestration_thread_alive(self) -> bool:
+        """Return True iff an orchestration worker thread is currently alive.
+
+        Cheap — just checks the thread handle without acquiring the
+        lock. Callers that need a consistent snapshot (e.g.
+        :meth:`_maybe_spawn_orchestration_thread`) should take the
+        lock first. Safe to call from any thread.
+        """
+        thread = self._orchestration_thread
+        return thread is not None and thread.is_alive()
+
+    def _maybe_spawn_orchestration_thread(self) -> bool:
+        """Spawn the orchestration worker thread if the gate allows (#2847).
+
+        Returns True iff this call started a new thread. Returns False
+        when:
+            * the prior thread is still alive (caller will log
+              ``orchestration_in_progress``);
+            * a dead thread handle is present and cleaned up.
+
+        The lock scopes only the thread-handle read + swap — the
+        orchestration work itself does not hold the lock. This lets
+        ``scheduler_tick`` continue to run on its 30s cadence while
+        the worker thread is mid-``subprocess.run`` for a multi-minute
+        phase.
+
+        The worker thread receives ``daemon=True`` so it cannot block
+        process exit past :meth:`run_forever`'s join window — if a
+        SIGTERM arrives mid-phase and the ``claude -p`` subprocess
+        ignores cooperative pause, the thread dies when the process
+        does.
+        """
+        with self._orchestration_thread_lock:
+            thread = self._orchestration_thread
+            if thread is not None and thread.is_alive():
+                self._log.info(
+                    "daemon.orchestration_in_progress",
+                    extra={
+                        "event": "orchestration_in_progress",
+                        "run_id": self._run_id,
+                        "thread_name": thread.name,
+                    },
+                )
+                return False
+            # Clean up any dead handle so next tick's ``is_alive`` check
+            # does not re-log.
+            if thread is not None and not thread.is_alive():
+                self._orchestration_thread = None
+
+            new_thread = threading.Thread(
+                target=self._orchestration_worker_entry,
+                name=f"orchestration-{self._scheduler_ticks + 1}",
+                daemon=True,
+            )
+            self._orchestration_thread = new_thread
+
+        # Start the thread outside the lock — ``Thread.start`` is cheap
+        # but we do not want to hold the handle lock across the actual
+        # kickoff, and the is_alive check above already committed to
+        # owning the next slot.
+        new_thread.start()
+        self._log.info(
+            "daemon.orchestration_spawned",
+            extra={
+                "event": "orchestration_spawned",
+                "run_id": self._run_id,
+                "thread_name": new_thread.name,
+            },
+        )
+        return True
+
+    def _orchestration_worker_entry(self) -> None:
+        """Entry point for the orchestration worker thread (#2847).
+
+        Opens a fresh psycopg connection, stashes it on
+        ``self._thread_state.conn`` so every existing ``self._conn``
+        reference inside the claim + phase helpers resolves to this
+        thread's connection rather than the main thread's. Runs
+        :meth:`_claim_and_orchestrate_one`. On any exception, logs a
+        structured ``orchestration_worker_failed`` event — the daemon
+        must stay up.
+
+        The connection is always closed in the ``finally`` block. Even
+        a lingering exception from a DB error or a ``ctrl+C`` during
+        the ``claude -p`` subprocess cannot leak the connection or
+        starve the connection pool on the Fargate task.
+        """
+        import psycopg  # noqa: PLC0415 — lazy import; matches ``connect()``
+
+        worker_conn: Connection[Any] | None = None
+        try:
+            worker_conn = psycopg.connect(self._cfg.database_url, connect_timeout=10)
+            worker_conn.autocommit = False
+            self._thread_state.conn = worker_conn
+            self._claim_and_orchestrate_one()
+        except Exception:
+            # Never let a thread crash leak out silently — emitting a
+            # structured event here makes the failure observable in
+            # CloudWatch even when the main tick already moved on.
+            self._log.exception(
+                "daemon.orchestration_worker_failed",
+                extra={
+                    "event": "orchestration_worker_failed",
+                    "run_id": self._run_id,
+                },
+            )
+        finally:
+            self._thread_state.conn = None
+            if worker_conn is not None:
+                try:
+                    worker_conn.close()
+                except Exception:  # pragma: no cover — best-effort close
+                    pass
 
     def _should_run_blocked_scan(self) -> bool:
         """Return True when this tick should run the blocked-list scan.
@@ -2877,19 +3151,72 @@ class DispatcherDaemon:
         path (:meth:`_resume_retrying_agent`). Per-phase failure handling
         is owned by the individual ``_run_*_phase`` helpers; this
         method just wires them together.
+
+        Between each phase a killswitch check (#2847) inspects
+        :attr:`_pause_requested` — an operator cap=0 flip sets this
+        event via :meth:`scheduler_tick`, and the worker thread aborts
+        cleanly at the next phase boundary. ``plan`` is read-only, so
+        aborting before ralph / summary / push_and_pr leaves no
+        GitHub-visible artifact.
         """
+        if self._check_killswitch_and_abort(agent_id, "claiming"):
+            return
         ok = self._run_plan_phase(agent_id, issue_number, worktree)
         if not ok:
+            return
+        if self._check_killswitch_and_abort(agent_id, "planning"):
             return
         ok = self._run_ralph_phase(agent_id, issue_number, worktree)
         if not ok:
             return
+        if self._check_killswitch_and_abort(agent_id, "ralph"):
+            return
         ok = self._run_summary_phase(agent_id, issue_number, worktree)
         if not ok:
+            return
+        if self._check_killswitch_and_abort(agent_id, "summary"):
             return
 
         # Daemon-side git commit + push + PR create.
         self._push_and_open_pr(agent_id, issue_number, worktree)
+
+    def _check_killswitch_and_abort(self, agent_id: str, after_phase: str) -> bool:
+        """If the operator flipped ``concurrency_cap=0``, abort the run (#2847).
+
+        Called between each orchestration phase. Returns True iff the
+        caller should stop — meaning ``_pause_requested`` was set when
+        the check fired, the agent has been marked terminal with
+        ``phase='paused_by_killswitch'``, and a structured
+        ``orchestration_paused`` event has been logged.
+
+        ``after_phase`` is the phase that just completed — used in the
+        log event to show where in the pipeline the kill landed. For
+        the pre-plan check (a killswitch that fired during the claim
+        itself) pass ``"claiming"``.
+        """
+        if not self._pause_requested.is_set():
+            return False
+
+        self._log.info(
+            "daemon.orchestration_paused",
+            extra={
+                "event": "orchestration_paused",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "after_phase": after_phase,
+                "detail": (
+                    "concurrency_cap observed as 0 mid-pipeline; aborting "
+                    "before next phase to honor operator killswitch"
+                ),
+            },
+        )
+        self._mark_agent_terminal(
+            agent_id,
+            status="failed",
+            phase=KILLSWITCH_TERMINAL_PHASE,
+            exit_code=None,
+        )
+        return True
 
     def _resume_retrying_agent(self) -> bool:
         """Pick up one ``status='retrying'`` agent, rebuild worktree, re-run.
@@ -8600,6 +8927,34 @@ class DispatcherDaemon:
             self._stop.wait(1.0)
 
         self._log.info("daemon.shutdown_begin", extra={"event": "shutdown_begin"})
+        # #2847: signal the orchestration worker thread (if any) to
+        # abort at its next phase boundary, then give it a short
+        # window to exit cleanly. The thread is daemon=True so a
+        # hung ``claude -p`` subprocess will not block process exit
+        # past this timeout — the SIGTERM → exit path will still
+        # complete even if the subprocess is unresponsive.
+        self._pause_requested.set()
+        thread = self._orchestration_thread
+        if thread is not None and thread.is_alive():
+            self._log.info(
+                "daemon.orchestration_join_wait",
+                extra={
+                    "event": "orchestration_join_wait",
+                    "run_id": self._run_id,
+                    "thread_name": thread.name,
+                    "timeout_seconds": ORCHESTRATION_JOIN_TIMEOUT_SECONDS,
+                },
+            )
+            thread.join(timeout=ORCHESTRATION_JOIN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                self._log.warning(
+                    "daemon.orchestration_join_timeout",
+                    extra={
+                        "event": "orchestration_join_timeout",
+                        "run_id": self._run_id,
+                        "thread_name": thread.name,
+                    },
+                )
         self.mark_stopped()
         return 0
 

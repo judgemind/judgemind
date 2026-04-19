@@ -219,59 +219,82 @@ class TestPriorityRank:
 
 
 class TestSchedulerGate:
-    """``_claim_and_orchestrate_one`` runs only when the gate allows."""
+    """``_maybe_spawn_orchestration_thread`` runs only when the gate allows.
+
+    After #2847 the actual orchestration work runs on a background
+    thread spawned by :meth:`DispatcherDaemon._maybe_spawn_orchestration_thread`.
+    These tests cover the gate logic on the scheduler tick itself —
+    cap=0 / cap-missing / active-agent / orchestration-in-flight — by
+    mocking the spawn helper directly. The thread-side behavior is
+    covered by :class:`TestOrchestrationWorkerThread` in this file.
+    """
 
     def test_does_not_claim_when_concurrency_cap_zero(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [(0,)]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-        d._claim_and_orchestrate_one = MagicMock(  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not be called with cap=0")
         )
         summary = d.scheduler_tick()
         assert summary["orchestration_attempted"] == 0
-        assert d._claim_and_orchestrate_one.call_count == 0  # type: ignore[attr-defined]
+        assert d._maybe_spawn_orchestration_thread.call_count == 0  # type: ignore[attr-defined]
 
     def test_does_not_claim_when_concurrency_cap_missing(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-        d._claim_and_orchestrate_one = MagicMock()  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock()  # type: ignore[method-assign]
         d.scheduler_tick()
-        assert d._claim_and_orchestrate_one.call_count == 0  # type: ignore[attr-defined]
+        assert d._maybe_spawn_orchestration_thread.call_count == 0  # type: ignore[attr-defined]
 
     def test_claims_when_cap_nonzero_and_no_active_agent(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         # 1) config read returns 1; 2) _has_active_agent SELECT returns None.
         conn.cursor_instance.fetch_queue = [(1,), None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-        d._claim_and_orchestrate_one = MagicMock()  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
         summary = d.scheduler_tick()
         assert summary["orchestration_attempted"] == 1
-        assert d._claim_and_orchestrate_one.call_count == 1  # type: ignore[attr-defined]
+        assert d._maybe_spawn_orchestration_thread.call_count == 1  # type: ignore[attr-defined]
 
     def test_does_not_claim_when_active_agent_exists(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
         # config=1 then _has_active_agent returns (1,) meaning active row exists.
         conn.cursor_instance.fetch_queue = [(1,), (1,)]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-        d._claim_and_orchestrate_one = MagicMock(  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("must not be called when agent active")
         )
         summary = d.scheduler_tick()
         assert summary["orchestration_attempted"] == 0
 
     def test_orchestration_exception_does_not_crash_tick(self, tmp_path: Path) -> None:
+        """A spawn-path exception must not crash ``scheduler_tick`` (#2847).
+
+        After #2847 the orchestration work runs on a worker thread, so
+        an exception raised inside :meth:`_claim_and_orchestrate_one`
+        surfaces as ``orchestration_worker_failed`` from the thread
+        (not ``orchestration_failed`` from the main tick). This test
+        asserts the spawn path itself does not raise — the actual
+        thread-side failure is covered by
+        :class:`TestOrchestrationWorkerThread`.
+        """
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [(1,), None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-        d._claim_and_orchestrate_one = MagicMock(  # type: ignore[method-assign]
+        # Make the spawn path itself raise — covers the
+        # ``orchestration_spawn_failed`` branch in the tick.
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             side_effect=RuntimeError("boom")
         )
         # The tick must still return a summary, not raise.
         summary = d.scheduler_tick()
-        assert summary["orchestration_attempted"] == 1
-        assert handler.events("orchestration_failed") != []
+        assert handler.events("orchestration_spawn_failed") != []
+        # Spawn failed → no thread was actually started.
+        assert summary["orchestration_attempted"] == 0
 
 
 # --------------------------------------------------------------------------
