@@ -301,11 +301,24 @@ FIX_CI_MAX_FAILING_JOBS = 10
 #: of CI output is typically well under this.
 FIX_CI_LOG_TAIL_MAX_CHARS = 20000
 
-#: Statuses that represent an in-flight claim. Mirrors the partial
-#: UNIQUE INDEX predicate in migration 25. Used by the candidate picker
-#: to skip already-claimed issues client-side (the INSERT also catches
-#: concurrent races via unique-violation).
-ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded")
+#: Statuses that represent an in-flight claim or a prior-run row whose
+#: PR is still open / awaiting operator action. Mirrors the partial
+#: UNIQUE INDEX predicate in migration 25 plus two DB-only extensions
+#: (``succeeded``, ``needs_review``) the picker uses to avoid
+#: double-processing an issue whose artifact (PR) has not yet been
+#: merged-and-cleaned.
+#:
+#: * ``running`` / ``retrying`` — uniqueness enforced in DB.
+#: * ``succeeded`` — prior successful run whose PR has not yet been
+#:   merged + cleaned. Added client-side here so we don't re-pick
+#:   during the merge window.
+#: * ``needs_review`` (#2856) — prior run that produced a DRAFT PR
+#:   awaiting operator decision. Same logic: don't re-pick the issue
+#:   while the draft PR is open, or two agent branches collide on the
+#:   same issue. Operator either merges (→ PR close auto-unblocks),
+#:   closes (→ dispatcher housekeeping reclaims), or keeps editing —
+#:   all three paths eventually cycle the row out of this set.
+ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded", "needs_review")
 
 #: Sentinel HTML comment embedded as line 1 of the automated
 #: "plan returned go=false" issue comment. Lets the daemon detect that
@@ -320,6 +333,24 @@ PLAN_BLOCKED_COMMENT_SENTINEL = "<!-- dispatcher-plan-blocked -->"
 #: a hung GitHub request can't stall the scheduler tick for multiple
 #: minutes; loose enough that a normal call (<3s) always finishes.
 PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS = 30
+
+#: Sentinel HTML comment embedded as line 1 of the automated
+#: "summary flagged unmet acceptance criteria" issue comment. Issue
+#: #2856. Lets the daemon detect that the comment has already been
+#: posted and skip re-posting on a retry of the needs_review handler
+#: (idempotence). HTML comments survive GitHub's markdown rendering
+#: pipeline and are visible in ``gh issue view --json comments`` output.
+#: Parallel naming with :data:`PLAN_BLOCKED_COMMENT_SENTINEL` (#2857) —
+#: ``dispatcher.agents.status`` is free-text so the two correct-outcome
+#: terminals live alongside each other without a schema migration.
+NEEDS_REVIEW_COMMENT_SENTINEL = "<!-- dispatcher-needs-review -->"
+
+#: Timeout for the ``gh issue view``/``gh issue comment`` subprocess
+#: calls used by the needs_review handler. Mirrors
+#: :data:`PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS` — same tradeoffs
+#: (don't stall scheduler ticks on GitHub slowdowns, but don't
+#: false-positive a normal <3s call).
+NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS = 30
 
 #: Relative path under the repo root where per-agent worktrees land in
 #: the local-dev fallback mode (``baseline_repo_root`` unset). Mirrors
@@ -1016,6 +1047,14 @@ class DispatcherDaemon:
         self._agent_plan_output: dict[str, Any] | None = None
         self._agent_ralph_output: dict[str, Any] | None = None
         self._agent_summary_output: dict[str, Any] | None = None
+        #: Summary-phase ``unmet_criteria`` list. Populated by
+        #: :meth:`_run_summary_phase` when the summary skill flagged
+        #: criteria the ralph diff did not satisfy (#2856). When
+        #: non-empty, :meth:`_push_and_open_pr` opens a DRAFT PR with
+        #: the unmet list in the body and the agent terminates as
+        #: ``status='needs_review'`` rather than ``succeeded``. Reset
+        #: at the start of each orchestration run.
+        self._agent_unmet_criteria: list[str] | None = None
         # Phase 3C: GitHub rate-limit skip window. When set, ``now() <
         # self._gh_rate_skip_until`` → scheduler + supervisor ticks both
         # skip their hot paths. Cleared by
@@ -1646,8 +1685,7 @@ class DispatcherDaemon:
             raise CommandError("retry command missing required payload.agentId")
 
         cur.execute(
-            "SELECT status, retries_used FROM dispatcher.agents "
-            "WHERE agent_id = %s",
+            "SELECT status, retries_used FROM dispatcher.agents WHERE agent_id = %s",
             (agent_id,),
         )
         row = cur.fetchone()
@@ -1664,9 +1702,7 @@ class DispatcherDaemon:
             )
 
         cur.execute(
-            "UPDATE dispatcher.agents "
-            "SET status = 'retrying' "
-            "WHERE agent_id = %s",
+            "UPDATE dispatcher.agents SET status = 'retrying' WHERE agent_id = %s",
             (agent_id,),
         )
         cur.execute(
@@ -3318,22 +3354,38 @@ class DispatcherDaemon:
         """UPDATE ``dispatcher.agents`` with terminal status + metadata.
 
         Used for ``succeeded``, ``failed``, ``crashed``, ``plan_blocked``,
-        and the Phase 3A post-PR hand-off state (``status='running'``,
-        ``phase='awaiting_ci'``). For terminal statuses (``succeeded`` /
-        ``failed`` / ``crashed`` / ``plan_blocked``) also sets
-        ``ended_at`` so the admin page can compute duration AND writes
-        back the resolved outcome to any pending
-        ``dispatcher.diagnoses`` rows for this agent (Phase 3E #2798,
-        spec §8 line 305).
+        ``needs_review``, and the Phase 3A post-PR hand-off state
+        (``status='running'``, ``phase='awaiting_ci'``). For terminal
+        statuses (``succeeded`` / ``failed`` / ``crashed`` /
+        ``plan_blocked`` / ``needs_review``) also sets ``ended_at`` so
+        the admin page can compute duration AND writes back the
+        resolved outcome to any pending ``dispatcher.diagnoses`` rows
+        for this agent (Phase 3E #2798, spec §8 line 305).
 
         ``plan_blocked`` (issue #2857) is the "plan correctly declined
         to proceed" terminal — distinct from ``failed`` (genuine
         infrastructure/subprocess break) so the admin cockpit and
         reporting can separate correct-outcome triage from real
         failures.
+
+        ``needs_review`` (issue #2856) is the "ralph did real work but
+        summary flagged one or more unmet acceptance criteria"
+        terminal. The daemon opened a DRAFT PR preserving ralph's
+        output so the operator can decide whether to mark it ready +
+        merge, close, or iterate. Distinct from ``failed`` (which
+        discarded ralph's work) and from ``plan_blocked`` (which never
+        reached ralph) — the admin cockpit renders it with an
+        amber/yellow "needs your eyes" chip because it IS actionable,
+        unlike ``plan_blocked`` which is informational.
         """
         assert self._conn is not None, "connect() must run before update"
-        terminal = status in ("succeeded", "failed", "crashed", "plan_blocked")
+        terminal = status in (
+            "succeeded",
+            "failed",
+            "crashed",
+            "plan_blocked",
+            "needs_review",
+        )
         try:
             with self._conn.cursor() as cur:
                 if terminal:
@@ -3471,6 +3523,7 @@ class DispatcherDaemon:
         self._agent_plan_output = None
         self._agent_ralph_output = None
         self._agent_summary_output = None
+        self._agent_unmet_criteria = None
 
         # Phase 3C resume-retry path: pick up any retrying agent first.
         # If one exists, re-orchestrate it on a fresh worktree instead
@@ -4055,6 +4108,309 @@ class DispatcherDaemon:
         self._post_plan_blocked_comment(agent_id, issue_number, block_reason, worktree)
         self._swap_plan_blocked_labels(agent_id, issue_number)
 
+    # --------------------------------------------------------------------
+    # #2856: needs_review handlers — summary flagged unmet AC, daemon
+    # opens a DRAFT PR preserving ralph's work + posts an issue comment
+    # linking the draft. Parallel structure to the plan_blocked helpers
+    # above (#2857): shared sentinel pattern for idempotence, shared
+    # timeout constant, independent wrap per side-effect.
+    # --------------------------------------------------------------------
+
+    @staticmethod
+    def _render_unmet_criteria_pr_section(unmet_criteria: list[str]) -> str:
+        """Render the ``⚠️ Unmet acceptance criteria`` PR body section.
+
+        Issue #2856. Appended to the PR body by
+        :meth:`_push_and_open_pr` on the needs_review path so the
+        operator sees the summary-skill concerns inline on the draft
+        PR page without cross-referencing the issue. Each unmet
+        criterion is rendered verbatim as a bullet; multi-line entries
+        (explanations) stay bulleted so the block renders as a flat
+        list rather than a blockquote.
+
+        Format:
+
+            ## \u26a0\ufe0f Unmet acceptance criteria
+
+            The summary phase flagged the following acceptance
+            criteria as not satisfied by this change. Ralph produced
+            reviewer-approved (SHIP) code, but this subset remains
+            for operator review:
+
+            - <criterion 1 text>
+            - <criterion 2 text>
+        """
+        items = [(c or "").strip() for c in unmet_criteria]
+        # Drop any empty entries — skill contract should never emit them
+        # but defense-in-depth keeps the rendered section clean.
+        items = [c for c in items if c]
+        if not items:
+            # Caller only invokes this when non-empty; defensive return
+            # keeps the method total.
+            return "## \u26a0\ufe0f Unmet acceptance criteria\n\n(none recorded)\n"
+        bullets = "\n".join(f"- {c}" for c in items)
+        return (
+            "## \u26a0\ufe0f Unmet acceptance criteria\n"
+            "\n"
+            "The summary phase flagged the following acceptance "
+            "criteria as not satisfied by this change. Ralph produced "
+            "reviewer-approved (SHIP) code, but this subset remains "
+            "for operator review:\n"
+            "\n"
+            f"{bullets}"
+        )
+
+    def _render_needs_review_comment(
+        self,
+        agent_id: str,
+        pr_number: int | None,
+        pr_url: str,
+        unmet_criteria: list[str],
+    ) -> str:
+        """Render the needs_review issue comment body.
+
+        Issue #2856. Shape (sentinel MUST be line 1 — mirrors
+        :meth:`_render_plan_blocked_comment` for the plan_blocked
+        handler):
+
+            <!-- dispatcher-needs-review -->
+            ## Summary flagged unmet acceptance criteria — draft PR opened for review
+
+            Ralph completed with verdict=SHIP, but summary found AC
+            that the diff did not satisfy. Opened <pr_url> as a
+            **draft** so you can review before merge.
+
+            **Unmet acceptance criteria:**
+
+            - <criterion 1>
+            - <criterion 2>
+
+            Agent: `<short_id>`.
+
+        The PR URL is rendered raw (GitHub autolinks it); a
+        ``None``/missing URL falls back to the phrase "the dispatcher
+        draft PR" so the comment still reads if URL parsing fails.
+        """
+        short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
+        items = [(c or "").strip() for c in unmet_criteria]
+        items = [c for c in items if c]
+        if items:
+            bullets = "\n".join(f"- {c}" for c in items)
+        else:
+            bullets = "- (none recorded)"
+        pr_link_phrase = (
+            pr_url.strip() if pr_url and pr_url.strip() else "the dispatcher draft PR"
+        )
+        if (
+            pr_number is not None
+            and pr_number > 0
+            and (not pr_url or not pr_url.strip())
+        ):
+            # Reconstruct a stable link when gh stdout parsing fell
+            # through but we still know the PR number.
+            pr_link_phrase = f"#{pr_number}"
+        return (
+            f"{NEEDS_REVIEW_COMMENT_SENTINEL}\n"
+            f"## Summary flagged unmet acceptance criteria — draft PR "
+            f"opened for review\n"
+            f"\n"
+            f"Ralph completed with `verdict=SHIP` but the summary "
+            f"phase found acceptance criteria the diff did not "
+            f"satisfy. Opened {pr_link_phrase} as a **draft** so you "
+            f"can review before merge, close without merging, or "
+            f"request changes.\n"
+            f"\n"
+            f"**Unmet acceptance criteria:**\n"
+            f"\n"
+            f"{bullets}\n"
+            f"\n"
+            f"Agent: `{short_id}`.\n"
+        )
+
+    def _needs_review_comment_already_posted(self, issue_number: int) -> bool | None:
+        """Return True if the needs_review sentinel is already on the issue.
+
+        Issue #2856. Same fail-open / "unknown → proceed" contract as
+        :meth:`_plan_blocked_comment_already_posted` (#2857): a
+        GitHub outage that hides the sentinel causes at worst one
+        duplicate comment, which is preferable to silently dropping
+        the operator signal. Detection scans every comment body for
+        :data:`NEEDS_REVIEW_COMMENT_SENTINEL`.
+        """
+        cmd = [
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--json",
+            "comments",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.needs_review_sentinel_check_failed",
+                extra={
+                    "event": "needs_review_sentinel_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+            )
+            return None
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.needs_review_sentinel_check_failed",
+                extra={
+                    "event": "needs_review_sentinel_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_preview": (result.stderr or "").strip()[:200],
+                },
+            )
+            return None
+
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            self._log.warning(
+                "daemon.needs_review_sentinel_check_failed",
+                extra={
+                    "event": "needs_review_sentinel_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "error": f"invalid JSON: {exc}",
+                },
+            )
+            return None
+
+        for comment in payload.get("comments") or []:
+            if not isinstance(comment, dict):
+                continue
+            body = comment.get("body") or ""
+            if NEEDS_REVIEW_COMMENT_SENTINEL in body:
+                return True
+        return False
+
+    def _post_needs_review_comment(
+        self,
+        agent_id: str,
+        issue_number: int,
+        pr_number: int | None,
+        pr_url: str,
+        unmet_criteria: list[str],
+        worktree: Path,
+    ) -> bool:
+        """Post the needs_review issue comment via ``gh issue comment``.
+
+        Issue #2856. Idempotence: skip the post if the sentinel is
+        already present on the issue. Returns True when the comment is
+        present on the issue at return time (whether posted now or
+        found already). Returns False on hard subprocess failure so
+        the caller can log and continue — the DB terminal-status
+        update still runs regardless of this return value (authoritative
+        write rule, same as #2857).
+        """
+        already = self._needs_review_comment_already_posted(issue_number)
+        if already is True:
+            self._log.info(
+                "daemon.needs_review_comment_skipped_idempotent",
+                extra={
+                    "event": "needs_review_comment_skipped_idempotent",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+            return True
+
+        body = self._render_needs_review_comment(
+            agent_id, pr_number, pr_url, unmet_criteria
+        )
+        body_path = worktree / "tmp" / "needs-review-comment.md"
+        try:
+            body_path.parent.mkdir(parents=True, exist_ok=True)
+            body_path.write_text(body, encoding="utf-8")
+        except OSError as exc:
+            self._log.exception(
+                "daemon.needs_review_comment_failed",
+                extra={
+                    "event": "needs_review_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "error": f"write body file: {exc}",
+                },
+            )
+            return False
+
+        cmd = [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--body-file",
+            str(body_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.exception(
+                "daemon.needs_review_comment_failed",
+                extra={
+                    "event": "needs_review_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+            )
+            return False
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.needs_review_comment_failed",
+                extra={
+                    "event": "needs_review_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_preview": (result.stderr or "").strip()[:200],
+                },
+            )
+            return False
+
+        self._log.info(
+            "daemon.needs_review_comment_posted",
+            extra={
+                "event": "needs_review_comment_posted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+            },
+        )
+        return True
+
     def _run_plan_phase(self, agent_id: str, issue_number: int, worktree: Path) -> bool:
         """Run ``/task-v2-plan``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "planning")
@@ -4373,6 +4729,17 @@ class DispatcherDaemon:
 
         unmet = summary_output.get("unmet_criteria") or []
         if unmet:
+            # #2856: previously this path hard-failed and discarded all
+            # of ralph's work, even when ralph produced reviewer-approved
+            # (verdict=SHIP) code. Now we stash the unmet list and
+            # proceed to _push_and_open_pr which opens the PR as a
+            # DRAFT, appends an "Unmet acceptance criteria" section to
+            # the body, posts an issue comment linking the draft, and
+            # terminates the agent as ``status='needs_review'``
+            # (distinct from ``failed``). The draft PR sits for
+            # operator triage — auto-merge does NOT touch drafts, and
+            # ``needs_review`` is NOT in ``_list_advanceable_agents``'s
+            # SELECT so the supervisor tick leaves it alone.
             self._log.info(
                 "daemon.summary_unmet_criteria",
                 extra={
@@ -4380,12 +4747,13 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "unmet_criteria": unmet,
+                    "terminal_status": "needs_review",
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="summary", exit_code=exit_code
-            )
-            return False
+            # Coerce to list[str] so downstream rendering is total on
+            # malformed skill output (non-string entries get stringified
+            # rather than crashing the orchestration).
+            self._agent_unmet_criteria = [str(u) for u in unmet]
 
         self._agent_summary_output = summary_output
         return True
@@ -4727,15 +5095,42 @@ class DispatcherDaemon:
         """Run the final mechanical steps: commit, push, open PR.
 
         On failure at any step, the agent is marked ``failed``. On
-        success, ``phase='awaiting_ci'`` so Phase 3B knows where to
-        pick up, and ``status`` stays ``running``.
+        success (criteria all met), ``phase='awaiting_ci'`` so Phase 3B
+        knows where to pick up, and ``status`` stays ``running``.
+
+        **needs_review branch (#2856):** when
+        :attr:`_agent_unmet_criteria` is non-empty (set by
+        :meth:`_run_summary_phase`), the PR is opened as a DRAFT with
+        an ``⚠️ Unmet acceptance criteria`` section appended to the
+        body, an issue comment is posted linking the draft + listing
+        the unmet criteria, and the agent terminates as
+        ``status='needs_review', phase='needs_review'`` with
+        ``ended_at`` set. The draft PR is NOT picked up by Phase 3B
+        (``needs_review`` is outside the ``_list_advanceable_agents``
+        SELECT), so auto-merge cannot touch it — the operator reviews,
+        marks ready + merges, or closes.
         """
         self._update_agent_phase(agent_id, "push_and_pr")
+
+        unmet_criteria = self._agent_unmet_criteria or []
+        is_needs_review = bool(unmet_criteria)
 
         summary_output = self._agent_summary_output or {}
         commit_message = summary_output.get("commit_message") or ""
         pr_title = summary_output.get("pr_title") or ""
         pr_body_md = summary_output.get("pr_body_md") or ""
+        if is_needs_review:
+            # Append the unmet-criteria section so the operator sees the
+            # concerns inline on the draft PR page without opening the
+            # issue. Render once and reuse the rendered block for the
+            # issue comment (same content, different wrapper) to keep
+            # the two views in sync.
+            pr_body_md = (
+                pr_body_md.rstrip()
+                + "\n\n"
+                + self._render_unmet_criteria_pr_section(unmet_criteria)
+                + "\n"
+            )
 
         if not commit_message or not pr_title or not pr_body_md:
             self._log.warning(
@@ -4894,26 +5289,31 @@ class DispatcherDaemon:
             return
 
         # gh pr create with --body-file pointing to a scratch file in
-        # the worktree's tmp/.
+        # the worktree's tmp/. ``--draft`` is added on the needs_review
+        # path (#2856) so auto-merge cannot touch the PR until the
+        # operator marks it ready.
         pr_body_path = worktree / "tmp" / "pr_body.md"
         pr_body_path.write_text(pr_body_md)
+        pr_create_cmd = [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            self._cfg.github_repo,
+            "--title",
+            pr_title,
+            "--body-file",
+            str(pr_body_path),
+            "--base",
+            "main",
+            "--head",
+            branch,
+        ]
+        if is_needs_review:
+            pr_create_cmd.append("--draft")
         try:
             pr_result = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--title",
-                    pr_title,
-                    "--body-file",
-                    str(pr_body_path),
-                    "--base",
-                    "main",
-                    "--head",
-                    branch,
-                ],
+                pr_create_cmd,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -4964,8 +5364,33 @@ class DispatcherDaemon:
                 "issue_number": issue_number,
                 "pr_number": pr_number,
                 "pr_url": pr_url,
+                "is_draft": is_needs_review,
             },
         )
+
+        if is_needs_review:
+            # #2856: side-effect — post an issue comment linking the
+            # draft PR + listing the unmet criteria. Runs BEFORE the DB
+            # terminal-status update so a DB crash can't lose the
+            # operator-visible signal. Failure of the comment does NOT
+            # block the terminal transition; the DB update is the
+            # authoritative write.
+            self._post_needs_review_comment(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                unmet_criteria=unmet_criteria,
+                worktree=worktree,
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="needs_review",
+                phase="needs_review",
+                exit_code=None,
+                pr_number=pr_number,
+            )
+            return
 
         # Final state: keep status=running so Phase 3B picks it up.
         self._mark_agent_terminal(
@@ -7117,12 +7542,17 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before update"
 
         # ``plan_blocked`` (#2857) is the "plan correctly declined" terminal —
-        # operationally a correct outcome, not a failure. Classify it
-        # alongside ``succeeded`` for the retry_outcome enum so diagnoser
-        # effectiveness dashboards don't count correct-triage decisions
-        # against the retry-success rate.
+        # operationally a correct outcome, not a failure. ``needs_review``
+        # (#2856) likewise: ralph produced real reviewer-approved code
+        # and the draft PR + issue comment + label swap is a correct
+        # outcome — it is the operator's call whether to ship. Classify
+        # both alongside ``succeeded`` for the retry_outcome enum so
+        # diagnoser effectiveness dashboards don't count correct-triage
+        # decisions against the retry-success rate.
         retry_outcome = (
-            "succeeded" if final_status in ("succeeded", "plan_blocked") else "failed"
+            "succeeded"
+            if final_status in ("succeeded", "plan_blocked", "needs_review")
+            else "failed"
         )
         outcome = {
             "retry_outcome": retry_outcome,

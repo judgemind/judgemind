@@ -249,6 +249,30 @@ describe('recentCompletionsToGraphQL', () => {
     expect(result[0].status).toBe('plan_blocked');
     expect(result[0].agentId).toBe('uuid-planblocked');
   });
+
+  it('passes needs_review status through unchanged (#2856)', () => {
+    // needs_review is the "ralph produced SHIP code but summary
+    // flagged unmet AC" terminal — parallel to plan_blocked but
+    // operator-actionable (amber chip, not neutral). The mapper
+    // must pass it through with its prNumber intact because the
+    // whole point of the terminal is that the daemon opened a draft
+    // PR; dropping prNumber would hide the draft from the cockpit.
+    const rows = [
+      {
+        agent_id: 'uuid-needsreview',
+        issue_number: 2856,
+        issue_title: 'Summary flagged unmet AC',
+        status: 'needs_review',
+        ended_at: '2026-04-19T23:30:00Z',
+        pr_number: 9001,
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result).toHaveLength(1);
+    expect(result[0].status).toBe('needs_review');
+    expect(result[0].agentId).toBe('uuid-needsreview');
+    expect(result[0].prNumber).toBe(9001);
+  });
 });
 
 describe('parse-labels helpers (pure, no fetch)', () => {

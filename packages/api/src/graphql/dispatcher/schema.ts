@@ -93,14 +93,24 @@ export const dispatcherTypeDefs = `#graphql
     issueNumber: Int!
     worktreePath: String!
     phase: String!
-    """One of running | succeeded | failed | retrying | crashed | plan_blocked.
+    """One of running | succeeded | failed | retrying | crashed | plan_blocked | needs_review.
 
-    \`plan_blocked\` (#2857) is the "plan correctly declined to proceed"
-    terminal — semantically distinct from \`failed\` which is reserved
-    for genuine infrastructure/subprocess failures. Kept as \`String!\`
-    rather than a GraphQL enum so future correct-outcome terminals
-    (e.g. \`needs_review\` from #2856) slot in without a schema
-    migration.
+    Correct-outcome terminals (distinct from \`failed\` which is
+    reserved for genuine infrastructure/subprocess failures):
+
+    - \`plan_blocked\` (#2857) — plan phase correctly declined to proceed
+      (malformed issue, missing info, etc.). Admin cockpit renders with
+      a neutral muted chip — operator-informational, not alarming.
+    - \`needs_review\` (#2856) — ralph completed with verdict=SHIP but
+      the summary phase flagged unmet acceptance criteria. The daemon
+      opened a DRAFT PR preserving ralph's work; operator reviews, marks
+      ready + merges, closes, or iterates. Admin cockpit renders with
+      an amber/yellow chip — actionable, needs operator eyes.
+
+    Kept as \`String!\` rather than a GraphQL enum so future
+    correct-outcome terminals slot in without a schema migration
+    (\`dispatcher.agents.status\` is plain \`text\` in the DB — see
+    migration 25, no CHECK constraint).
     """
     status: String!
     startedAt: DateTime!
@@ -136,8 +146,8 @@ export const dispatcherTypeDefs = `#graphql
 
   """One row in the 'Recently completed' panel (#2805 §1.5). Derived from
   \`dispatcher.agents\` where status IN
-  ('succeeded','failed','crashed','plan_blocked'), newest first. Capped
-  at 10 server-side."""
+  ('succeeded','failed','crashed','plan_blocked','needs_review'), newest
+  first. Capped at 10 server-side."""
   type RecentCompletion {
     """Agent id (UUID)."""
     agentId: ID!
@@ -145,11 +155,13 @@ export const dispatcherTypeDefs = `#graphql
     issueNumber: Int!
     """Issue title (fetched live from GitHub; null if the lookup failed)."""
     issueTitle: String
-    """One of succeeded | failed | crashed | plan_blocked. See
-    \`DispatcherAgent.status\` for the semantics of each value."""
+    """One of succeeded | failed | crashed | plan_blocked | needs_review.
+    See \`DispatcherAgent.status\` for the semantics of each value."""
     status: String!
     endedAt: DateTime!
-    """PR number if the agent produced one; null otherwise."""
+    """PR number if the agent produced one; null otherwise. \`needs_review\`
+    rows (#2856) always have \`prNumber\` populated because the whole
+    point of the terminal is that the daemon opened a draft PR."""
     prNumber: Int
   }
 
@@ -200,8 +212,8 @@ export const dispatcherTypeDefs = `#graphql
     queueBlocked: [QueueItem!]!
     """Top 10 recently-completed agents (#2805 §1.5). Rows from
     \`dispatcher.agents\` where status IN
-    ('succeeded','failed','crashed','plan_blocked') ordered by
-    \`ended_at\` DESC."""
+    ('succeeded','failed','crashed','plan_blocked','needs_review')
+    ordered by \`ended_at\` DESC."""
     recentCompletions: [RecentCompletion!]!
     """All live-editable \`dispatcher.config\` entries (#2805 §1.6)."""
     config: [DispatcherConfigEntry!]!

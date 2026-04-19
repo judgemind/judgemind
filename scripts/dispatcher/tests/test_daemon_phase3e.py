@@ -1106,6 +1106,51 @@ class TestDiagnosisOutcomeWriteback:
         # diagnosis_outcome_written event logged.
         assert handler.events("diagnosis_outcome_written")
 
+    def test_needs_review_terminal_writes_succeeded_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """``needs_review`` (#2856) classifies as a correct-outcome retry.
+
+        Ralph produced reviewer-approved (SHIP) code and the summary
+        phase found unmet AC — the daemon opened a draft PR for
+        operator review. That IS the correct behavior of the pipeline,
+        so the retry_outcome enum records ``succeeded`` for diagnoser
+        effectiveness tracking (distinct from the agent row's own
+        ``status='needs_review'`` which drives the cockpit's distinct
+        chip). Mirrors the #2857 ``plan_blocked`` classification.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.rowcount = 1
+
+        d._mark_agent_terminal(
+            "agent-needs-review",
+            status="needs_review",
+            phase="needs_review",
+            exit_code=None,
+            pr_number=9001,
+        )
+
+        diag_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.diagnoses" in e[0]
+        ]
+        assert diag_updates
+        outcome_dict = json.loads(diag_updates[0][1][0])
+        assert outcome_dict["retry_outcome"] == "succeeded"
+        assert outcome_dict["final_status"] == "needs_review"
+        # Terminal bookkeeping ran: ended_at SET on the agent row.
+        agent_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "needs_review" in e[1]
+        ]
+        assert agent_updates
+        assert "ended_at = now()" in agent_updates[0][0]
+        assert handler.events("diagnosis_outcome_written")
+
     def test_non_terminal_status_skips_outcome_write(self, tmp_path: Path) -> None:
         # When the daemon transitions to e.g. awaiting_ci (non-terminal),
         # no diagnoses outcome write should happen.

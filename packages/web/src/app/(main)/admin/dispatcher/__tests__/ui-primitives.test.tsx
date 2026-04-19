@@ -108,6 +108,37 @@ describe('OutcomePill', () => {
     expect(pill.className).not.toMatch(/bg-amber/);
   });
 
+  // #2856: `needs_review` is the "ralph did real work but summary
+  // flagged unmet AC" terminal — the daemon opened a DRAFT PR for
+  // operator review. Uses a yellow chip (not neutral like
+  // plan_blocked) because it DOES need operator action, and not
+  // amber (reserved for crashed) so the operator can scan the panel
+  // and separate "review my draft PR" from "something crashed".
+  it('renders needs_review with a half-circle glyph', () => {
+    render(<OutcomePill status="needs_review" />);
+    const pill = screen.getByTestId('outcome-pill-needs_review');
+    expect(pill.getAttribute('aria-label')).toBe('needs review');
+    expect(pill.textContent).toBe('\u25D0');
+  });
+
+  it('renders needs_review with a yellow chip (actionable, not alarming)', () => {
+    render(<OutcomePill status="needs_review" />);
+    const pill = screen.getByTestId('outcome-pill-needs_review');
+    // Yellow — distinct from amber (`crashed`) and from the neutral
+    // muted chip (`plan_blocked`). Operator sees it and knows "there
+    // is a draft PR to review" without mistaking it for a crash.
+    expect(pill.className).toContain('bg-yellow');
+    // Must NOT collapse onto the red (failure) palette.
+    expect(pill.className).not.toMatch(/bg-red/);
+    // Must NOT reuse the amber crashed-chip palette — the whole point
+    // of the yellow/amber separation is to keep these two actionable
+    // states visually distinct.
+    expect(pill.className).not.toMatch(/bg-amber/);
+    // Must NOT reuse plan_blocked's neutral muted surface — that chip
+    // is for informational-only outcomes.
+    expect(pill.className).not.toMatch(/bg-muted/);
+  });
+
   it('renders a fallback for unknown status', () => {
     render(<OutcomePill status="bogus" />);
     expect(screen.getByText('?')).toBeInTheDocument();
