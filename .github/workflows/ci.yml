@@ -90,6 +90,14 @@ jobs:
               # PR that introduces them (#2505). Mirrors the 'hooks' filter
               # below which does the same for preflight-hook-test.
               - '.github/workflows/ci.yml'
+              # scripts/tests/test_task_v2_ralph_contract.py reads
+              # .claude/skills/task-v2-ralph/SKILL.md and
+              # .claude/skills/ralph/SKILL.md to assert the post-#2845
+              # architectural contract (no change-type short-circuit,
+              # non-testable branch present). Trigger scripts-tests on
+              # any skill-file edit so the guard fires on PRs that
+              # only touch .claude/skills/.
+              - '.claude/skills/**'
             ecs-oneshot:
               - 'scripts/*.py'
               - 'scripts/ecs-run-task.sh'
