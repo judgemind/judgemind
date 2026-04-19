@@ -1,21 +1,25 @@
 # Dispatcher daemon module — ECS Fargate service that runs the autonomous
-# dispatcher loop for Phase 1 of dispatcher v2 (see
+# dispatcher loop for dispatcher v2 (see
 # `docs/specs/dispatcher-v2-spec.md` §14).
 #
-# Phase 1 lands this module with `desired_count=0`: the service, task
-# definition, IAM roles, log group, and heartbeat alarm are all created, but
-# nothing runs until the daemon image lands (sub-task C, #2729) and Phase 2
-# flips `desired_count=1`.
+# Lifecycle:
+# - Phase 1 (#2725 epic): module lands with `desired_count=0`. Service,
+#   task definition, IAM roles, log group, and heartbeat alarm exist,
+#   but nothing runs until the daemon image lands and Phase 2 flips the
+#   replica count.
+# - Phase 2 shadow mode (#2768): `desired_count=1`,
+#   `dispatcher.config.concurrency_cap=0`. Daemon polls the
+#   `agent/ready` queue, writes `dispatcher.queue_snapshots`, and emits
+#   the `HeartbeatAge` CloudWatch metric. No subprocess spawning.
+# - Phase 3: daemon spawns per-phase `/task-v2-*` subprocesses once the
+#   shadow-mode observations confirm stability.
 #
-# Why this is wired up inert:
-# - Sub-task A (#2727) adds the `dispatcher.*` schema + `judgemind_dispatcher`
-#   role secret. Until it merges, `db_connection_secret_arn` is passed as the
-#   main `judgemind` role secret — safe because the service isn't running.
-# - Sub-task C (#2729) publishes the real `Dockerfile.dispatcher` image; until
-#   then `image_tag` defaults to `"latest"` against an ECR repo that may not
-#   yet contain the tag. `desired_count=0` keeps this from erroring.
-# - Phase 2 (shadow mode) flips `desired_count=1` but keeps
-#   `config.concurrency_cap=0` in the daemon — polling only, no spawning.
+# Callers pass `db_connection_secret_arn` from the environment's
+# `module.database` output (Phase 2 requirement — the daemon must reach
+# Postgres to persist `dispatcher.runs` and `dispatcher.queue_snapshots`).
+# Until the dedicated `judgemind_dispatcher` DB role lands (sub-task B
+# follow-up), the daemon connects as the main `judgemind` owner role —
+# safe while `concurrency_cap=0` keeps the spawn path dormant.
 #
 # Resources created:
 # - ECS service + task definition (1 vCPU, 2 GB RAM, 50 GB ephemeral storage
@@ -400,10 +404,11 @@ resource "aws_ecs_task_definition" "dispatcher" {
 }
 
 # ─── ECS Service ────────────────────────────────────────────────────────────
-# `desired_count=0` in Phase 1 — the service exists, but no tasks run. Phase 2
-# flips it to 1 to enter shadow mode. `ignore_changes = [task_definition]` is
-# the house pattern: CI redeploys bump the image tag via the AWS CLI without
-# rewriting the task def ARN every apply.
+# `desired_count` defaults to 0 (Phase 1). Phase 2 callers override to 1
+# for shadow mode (#2768). Never > 1 — the dispatcher is a singleton.
+# `ignore_changes = [task_definition]` is the house pattern: CI redeploys
+# bump the image tag via the AWS CLI without rewriting the task def ARN
+# every apply.
 
 resource "aws_ecs_service" "dispatcher" {
   name            = local.service_name
@@ -438,17 +443,17 @@ resource "aws_ecs_service" "dispatcher" {
 # Per §14 of the spec: heartbeat staleness > 5 min should page the operator
 # via SNS (email + Telegram). The daemon publishes a `HeartbeatAge` metric
 # (seconds since last `dispatcher.runs.heartbeat_ts` write) to the
-# `Judgemind/Dispatcher` namespace every tick — Phase 2 sub-task C wires
-# that up.
+# `Judgemind/Dispatcher` namespace on every supervisor tick (120s) — see
+# `scripts/dispatcher/daemon.py::_emit_heartbeat_metric`. Phase 2 (#2768)
+# lands the emission code; a healthy daemon emits `0` after each DB
+# heartbeat update so the `Maximum` aggregation stays below the
+# `heartbeat_stale_seconds` threshold.
 #
-# TODO (Phase 2, #2729): confirm the metric name / emission cadence match
-# once the daemon publishes. If the daemon publishes in the opposite polarity
-# (e.g. `HeartbeatFresh=1` as a liveness signal rather than `HeartbeatAge` in
-# seconds), flip the comparison + `treat_missing_data` on this alarm.
-#
-# During Phase 1 the alarm will be in INSUFFICIENT_DATA with
-# `treat_missing_data = "notBreaching"` — no false pages while the service
-# runs at desired_count=0.
+# During Phase 1 (`desired_count=0`) the alarm was in INSUFFICIENT_DATA
+# with `treat_missing_data = "notBreaching"` — no false pages. Phase 2+
+# keeps the same behaviour: if the daemon crashes and stops emitting,
+# the alarm fires because the last-published value ages past the
+# threshold (not because of missing-data handling).
 
 resource "aws_cloudwatch_metric_alarm" "heartbeat_stale" {
   count = var.enable_alerts ? 1 : 0

@@ -126,7 +126,10 @@ export const dispatcherTypeDefs = `#graphql
     activeAgents: [DispatcherAgent!]!
     """Failures from \`dispatcher.failures\` in the last \`sinceHours\` (default 24)."""
     recentFailures(sinceHours: Int = 24): [DispatcherFailure!]!
-    """Count of open \`agent/ready\` issues. Returns 0 in Phase 1 until the daemon queue scan lands."""
+    """Count of open \`agent/ready\` issues. Sourced from the most recent row in
+    \`dispatcher.queue_snapshots\`, written by the daemon on each 30s scheduler
+    tick (Phase 2+). Returns 0 before the daemon has booted or when every
+    recent scan has failed — the admin page treats that as "queue unknown / 0"."""
     queueDepth: Int!
     """\`dispatcher.config.value\` for \`spawn_frozen_until\` (§10), or null if not set."""
     spawnFrozenUntil: DateTime

@@ -211,18 +211,34 @@ module "dispatcher_daemon" {
   # scraper repo. Sub-task C (#2729) added the ECR resource + output.
   ecr_repository_url = module.ecr.dispatcher_repository_url
 
-  # Phase 1 = inert. Flipped to 1 in Phase 2 (shadow mode). Never > 1.
-  desired_count = 0
+  # Phase 2 shadow mode (#2768): daemon runs a single task that scans the
+  # `agent/ready` queue every 30s, writes snapshots to
+  # `dispatcher.queue_snapshots`, and emits the `HeartbeatAge` CloudWatch
+  # metric. `concurrency_cap=0` in `dispatcher.config` keeps the spawn
+  # path dormant (a defensive no-op guard in the daemon scheduler tick
+  # re-enforces this on every tick). Never > 1 — the dispatcher is a
+  # singleton and overlapping instances would double-spawn agents.
+  desired_count = 1
 
   # Secret ARNs — populated incrementally as their owning issues land.
   # #2700 wires `github_token_secret_arn` (this ARN is the scoped PAT from
   # spike 0.7, provisioned in Secrets Manager by the operator and pinned
   # here so the execution role's `execution_secrets` policy resolves
-  # against it). Other ARNs stay empty until their owning sub-tasks
-  # land — the module's `compact()` guard drops unset entries and the
-  # service is inert at `desired_count=0` anyway.
+  # against it).
+  #
+  # #2768 (Phase 2 shadow mode) wires `db_connection_secret_arn` — the
+  # daemon must now reach Postgres to INSERT into `dispatcher.runs`
+  # (lease / boot row) and `dispatcher.queue_snapshots` (per-tick queue
+  # observations). Until the dedicated `judgemind_dispatcher` DB role
+  # lands (sub-task B follow-up), we point at the main `judgemind`
+  # role's secret — same DB, owner-level privileges. Safe for Phase 2
+  # because `concurrency_cap=0` keeps the daemon from doing any DB
+  # writes outside its own schema.
+  #
+  # Other ARNs stay empty until their owning sub-tasks land — the
+  # module's `compact()` guard drops unset entries.
   anthropic_api_key_secret_arn  = ""
-  db_connection_secret_arn      = ""
+  db_connection_secret_arn      = module.database.db_connection_secret_arn
   github_token_secret_arn       = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
   telegram_bot_token_secret_arn = ""
   gemini_api_key_secret_arn     = ""

@@ -146,11 +146,28 @@ async function querySpawnFrozenUntil(pool: Pool): Promise<string | null> {
 }
 
 async function queryQueueDepth(pool: Pool): Promise<number> {
-  // Phase 1: no persisted queue table — always 0. When the daemon queue
-  // scan lands (sub-task C follow-up), swap this for a COUNT(*) against
-  // the real source. Returning 0 keeps the contract (Int!) honored.
-  void pool; // retain signature symmetry
-  return 0;
+  // Phase 2: return the most recent row's `queue_depth` from
+  // `dispatcher.queue_snapshots` (written by the daemon on each 30s
+  // scheduler tick — see `scripts/dispatcher/daemon.py` and migration
+  // `24_dispatcher-queue-snapshots.sql`).
+  //
+  // Fall back to 0 when:
+  //   - The daemon has never booted (no snapshots yet).
+  //   - The table exists but is empty (initial deploy before the first
+  //     successful scan).
+  //   - The daemon's GitHub API calls have failed for the full recent
+  //     history (transient — the next successful scan writes a row).
+  //
+  // Returning 0 keeps the GraphQL contract (`queueDepth: Int!`) honored.
+  const { rows } = await pool.query<{ queue_depth: number | string }>(
+    `SELECT queue_depth
+       FROM dispatcher.queue_snapshots
+       ORDER BY observed_at DESC
+       LIMIT 1`,
+  );
+  if (rows.length === 0) return 0;
+  const raw = rows[0].queue_depth;
+  return typeof raw === 'number' ? raw : Number(raw);
 }
 
 // ---------------------------------------------------------------------------

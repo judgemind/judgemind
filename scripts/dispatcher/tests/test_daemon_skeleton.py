@@ -173,7 +173,14 @@ class TestLeaseCheck:
 
 
 class TestSchedulerTick:
-    """§6 step 1 — consume any pending commands; Phase 1 stops there."""
+    """§6 step 1 — consume any pending commands.
+
+    Phase 2 additions (queue scan, heartbeat metric) live in
+    ``test_daemon_phase2.py``. These skeleton tests only exercise the
+    step-1 command-consumption + concurrency-cap-read path, and stub
+    ``_fetch_agent_ready_issues`` to isolate that path from the queue
+    scan added in #2768.
+    """
 
     def test_consumes_commands_and_reads_config(self) -> None:
         fake_conn = _FakeConnection()
@@ -181,6 +188,9 @@ class TestSchedulerTick:
         fake_conn.cursor_instance.fetch_queue = [(5,)]
 
         d = _make_daemon(fake_conn=fake_conn)
+        # Stub the queue-scan fetch so the scheduler tick does not try
+        # to shell out to ``gh`` in this skeleton test.
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         # Set rowcount via a wrapper: execute() sets it before fetchone.
         # _FakeCursor doesn't auto-populate rowcount, so set it directly
         # between execute calls — the daemon calls execute then reads
@@ -199,8 +209,11 @@ class TestSchedulerTick:
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 3
         assert summary["concurrency_cap"] == 5
-        # Exactly one commit per tick.
-        assert fake_conn.commits == 1
+        # Two commits per tick: one for command-consumption + config read,
+        # one for the queue_snapshots INSERT (Phase 2 addition). The
+        # scan is isolated in its own transaction so a queue-snapshot
+        # failure does not roll back a successful command drain.
+        assert fake_conn.commits == 2
         # Tick counter incremented.
         assert d._scheduler_ticks == 1
 
@@ -210,6 +223,7 @@ class TestSchedulerTick:
         fake_conn.cursor_instance.fetch_queue = [None]
 
         d = _make_daemon(fake_conn=fake_conn)
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 0
         assert summary["concurrency_cap"] == -1  # sentinel for "unset"
