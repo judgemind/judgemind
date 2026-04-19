@@ -492,6 +492,27 @@ if [ -n "$changed_migrations" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Filename separator hygiene — always cheap, always run
+# -------------------------------------------------------------------
+# Flags same-directory filename pairs that differ only by `-` vs `_`
+# (see #2751/#2754 for the incident: a broken hyphen variant of
+# check_schema_drift.sh coexisted with the correct underscore version,
+# agents picked the alphabetically-first wrong one). The check only
+# walks scripts/, packages/*/src/, packages/*/tests/, and infra/ — a
+# few hundred dirs on this repo — so it runs unconditionally rather
+# than behind a path filter.
+if [ -x scripts/check-hyphen-underscore-collision.sh ]; then
+    echo "pre-push: checking for filename separator collisions..." >&2
+    if ! scripts/check-hyphen-underscore-collision.sh 2>&1; then
+        echo "" >&2
+        echo "  FAILED: scripts/check-hyphen-underscore-collision.sh" >&2
+        echo "  Two files in the same directory differ only by '-' vs '_'" >&2
+        echo "  — rename one or delete the stale sibling. See #2751/#2754." >&2
+        failures=$((failures + 1))
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Script header marker check — run whenever scripts/*.py changes
 # -------------------------------------------------------------------
 # Mirrors the CI `script-headers-check` job so one-off/permanent marker
