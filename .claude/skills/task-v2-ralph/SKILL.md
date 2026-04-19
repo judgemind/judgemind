@@ -9,6 +9,28 @@ model: sonnet
 
 Ralph phase for the dispatcher v2 per-phase task pipeline (`docs/specs/dispatcher-v2-spec.md` §6a). Executes the plan produced by `/task-v2-plan` through an iterative worker + reviewer loop, and exits when the implementation is SHIP-ready (or blocked).
 
+## Invocation context
+
+This skill **MUST** be invoked from a context that has the `Task` tool available. Step 1 spawns `/ralph` as a Task-tool subagent, which in turn spawns its own worker and three reviewers as Task-tool subagents. Without the Task tool, this skill cannot run its core loop — it will exit cleanly with `verdict=BLOCKED` and a descriptive `block_reason`, but no implementation work happens.
+
+**Supported invocation paths:**
+
+- **Production (Phase 3+):** `claude -p /task-v2-ralph <agent-id>` from the dispatcher daemon running on Fargate. The daemon spawns each `/task-v2-*` phase as its own `claude -p` subprocess, so each phase gets a fresh top-level context with the full tool set (including `Task`).
+- **Local smoke testing:** run `claude -p /task-v2-ralph <agent-id>` directly from a terminal (not from inside another `claude` session). Seed `{worktree}/tmp/dispatcher-input/ralph.json` manually by hand or via a fixture script before invocation.
+
+**Unsupported — nested `Skill()` invocation.** Do not invoke this skill via the `Skill` tool from inside another `claude` session (e.g. from a general-purpose subagent running `Skill(skill="task-v2-ralph")`). Nested `Skill()` calls run in the parent agent's sub-context, which does **not** inherit the `Task` tool. The skill will detect the missing tool at Step 0.5 and exit with:
+
+```
+verdict=BLOCKED
+block_reason="/task-v2-ralph requires Task tool — invoke via `claude -p`, not nested Skill()"
+```
+
+This is the harness-limitation path surfaced by the Phase 1 gate smoke test (issue #2766). For smoke-testing, use `claude -p` directly; nested `Skill()` cannot exercise the ralph loop end-to-end.
+
+The non-testable change-type short-circuit in Step 0 runs **before** the Task-tool check, so `docs`, `db_migration`, `dx_tooling`, and `no_deployed_component` change types still SHIP cleanly even when invoked via nested `Skill()` (they don't need the Task tool because they don't run the loop).
+
+---
+
 **Prerequisites:** The dispatcher daemon has already (a) installed dependencies per `dependencies_to_install` from the plan output, (b) written the input bundle to `{worktree}/tmp/dispatcher-input/ralph.json`.
 
 **Goal:** Produce committed-ready code in the worktree's working tree (staged or unstaged — daemon stages + commits + pushes), plus `{worktree}/tmp/dispatcher-output/ralph.json` with a SHIP/BLOCKED verdict.
@@ -89,7 +111,7 @@ Before seeding the ralph state directory or invoking `/ralph`, read `plan.change
 
 These mirror the original `/task` skill's "non-testable tasks" list (Terraform, DB migrations, CI/CD, docs, investigation) and the underlying `/ralph` skill's "When NOT to use" contract. For these change types, the worker + three-reviewer cycle adds no value — there is no test suite to iterate against, and the reviewers have no acceptance-criteria-mapped-to-tests signal to evaluate. Running ralph on these types burns ~5-20 minutes of wall clock and ~5-10 reviewer Task-tool subagent contexts with nothing to show for it.
 
-**Testable change types** — proceed to Step 1 and run the full worker/reviewer loop:
+**Testable change types** — proceed to Step 0.5 and then Step 1 and run the full worker/reviewer loop:
 
 - `api`
 - `scraper`
@@ -98,7 +120,7 @@ These mirror the original `/task` skill's "non-testable tasks" list (Terraform, 
 - `backfill_script`
 - `agent_skill`
 
-For any value not in either list, treat it as testable and proceed to Step 1. The plan author (`/task-v2-plan`) owns the enumeration of valid `change_type` values in the spec; this skill fails open (runs the loop) when it sees an unfamiliar value rather than silently short-circuiting.
+For any value not in either list, treat it as testable and proceed to Step 0.5. The plan author (`/task-v2-plan`) owns the enumeration of valid `change_type` values in the spec; this skill fails open (runs the loop) when it sees an unfamiliar value rather than silently short-circuiting.
 
 ### Short-circuit implementation
 
@@ -122,7 +144,35 @@ Substitute `<X>` with the actual change type value. The `changed_files` list is 
 
 The daemon consumes this verdict and routes directly to `/task-v2-summary`, which generates the commit message, PR title, PR body, and process-summary issue comment from the plan + diff without needing a reviewer-approved SHIP signal.
 
-If `plan.change_type` is testable (or unrecognized), continue to Step 1.
+If `plan.change_type` is testable (or unrecognized), continue to Step 0.5.
+
+---
+
+## Step 0.5 — Task-tool availability check
+
+The testable path (Step 1 onward) requires the `Task` tool to spawn `/ralph` as a fresh-context subagent. If the skill was invoked via a nested `Skill()` call from another `claude` session (see the **Invocation context** section above), the `Task` tool is not available and the loop cannot run.
+
+Before Step 1, verify the `Task` tool is callable. The check is implementation-defined — a reasonable approach is to inspect the tool registry exposed to the skill runtime, or to attempt a trivial no-op Task call and catch the "tool not available" error. Do not spawn a real worker subagent just to probe availability.
+
+**If `Task` is unavailable**, emit the following JSON to `{worktree}/tmp/dispatcher-output/ralph.json` and exit 0. Do NOT create `{worktree}/tmp/ralph/`, do NOT invoke `/ralph`.
+
+```
+{
+  "agent_id": "<echo>",
+  "issue_number": <int>,
+  "verdict": "BLOCKED",
+  "iterations_used": 0,
+  "block_reason": "/task-v2-ralph requires Task tool — invoke via `claude -p`, not nested Skill()",
+  "changed_files": [],
+  "summary": "Skipped — Task tool unavailable in current invocation context.",
+  "ralph_done_path": null,
+  "review_log_path": null
+}
+```
+
+**If `Task` is available**, continue to Step 1.
+
+Note: Step 0's non-testable short-circuit runs **before** this check, so `docs` / `db_migration` / `dx_tooling` / `no_deployed_component` change types still SHIP cleanly from a nested `Skill()` harness — only the testable loop path needs the Task tool.
 
 ---
 
@@ -222,7 +272,7 @@ Expected peak: ~30-45k tokens across 5 iterations. Well inside the 200k limit.
 
 If real Fargate measurement (follow-up #2714) shows the outer ralph exceeds 100k tokens consistently, the spec §6a must sub-split into `/task-v2-ralph-worker` + `/task-v2-ralph-review`, with the daemon orchestrating the loop instead of a long-running outer `claude -p`. Spike 0.3 already pre-designed that sub-split; the shape is documented in `docs/investigations/dispatcher-v2-spike-0.3.md`.
 
-Non-testable short-circuit (Step 0) is effectively zero-cost: a single JSON read, a taxonomy check, and a single JSON write. No subagent spawn, no iteration overhead.
+Non-testable short-circuit (Step 0) is effectively zero-cost: a single JSON read, a taxonomy check, and a single JSON write. No subagent spawn, no iteration overhead. The Task-tool availability check (Step 0.5) is similarly cheap: a single tool-registry probe, no subprocess.
 
 ## What this skill does NOT do
 
@@ -254,7 +304,7 @@ Elapsed time: under a second. The daemon proceeds to `/task-v2-summary` and pick
 
 ## Worked example — ralph output for a clean 1-iteration SHIP
 
-Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 falls through (testable), Step 1 seeds state, Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1, exit.
+Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 falls through (testable), Step 0.5 confirms the Task tool is available, Step 1 seeds state, Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1, exit.
 
 Output `ralph.json`:
 
@@ -291,6 +341,26 @@ Output `ralph.json`:
 ```
 
 The daemon consumes BLOCKED, routes to the diagnoser (§8 Tier 2/3), which may `retry_with_hint` (tighter acceptance criterion on error handling) or `escalate` (ask human).
+
+## Worked example — BLOCKED on Task-tool unavailability (nested Skill())
+
+A local smoke test invokes `Skill(skill="task-v2-ralph")` from inside another `claude` session (e.g. from a general-purpose subagent). `plan.change_type=scraper` (testable), so Step 0 falls through. Step 0.5 detects the Task tool is unavailable and emits:
+
+```
+{
+  "agent_id": "<uuid>",
+  "issue_number": 2766,
+  "verdict": "BLOCKED",
+  "iterations_used": 0,
+  "block_reason": "/task-v2-ralph requires Task tool — invoke via `claude -p`, not nested Skill()",
+  "changed_files": [],
+  "summary": "Skipped — Task tool unavailable in current invocation context.",
+  "ralph_done_path": null,
+  "review_log_path": null
+}
+```
+
+Elapsed time: under a second. The operator re-runs the smoke test via `claude -p /task-v2-ralph <agent-id>` directly in a terminal, which has the Task tool available, and the loop runs normally.
 
 ## Reminders
 
