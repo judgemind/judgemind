@@ -736,6 +736,55 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+#: Map priority label name → rank used for candidate ordering. Lower
+#: ranks are picked first. Issue #2835: the daemon used to pick issues
+#: in gh's default ``created_at desc`` order, ignoring priority labels.
+#: Anything without a priority label sinks below p3 via
+#: :data:`_PRIORITY_RANK_NO_LABEL` so priority-labeled work always wins
+#: a head-to-head against unlabeled work, but unlabeled issues are
+#: still eligible once the labeled ones have been exhausted.
+_PRIORITY_LABEL_RANKS: dict[str, int] = {
+    "priority/p0": 0,
+    "priority/p1": 1,
+    "priority/p2": 2,
+    "priority/p3": 3,
+}
+_PRIORITY_RANK_NO_LABEL: int = 4
+
+
+def _priority_rank(labels: list[str] | Any) -> int:
+    """Return the lowest (highest-priority) rank implied by ``labels``.
+
+    Issue #2835. Used as the primary sort key in
+    :meth:`DispatcherDaemon._latest_queue_snapshot_issues` so the
+    daemon picks ``priority/p0`` issues before ``p1``, ``p1`` before
+    ``p2`` etc.
+
+    - ``priority/p0`` → 0
+    - ``priority/p1`` → 1
+    - ``priority/p2`` → 2
+    - ``priority/p3`` → 3
+    - No priority label → :data:`_PRIORITY_RANK_NO_LABEL` (4)
+
+    When an issue carries more than one priority label (shouldn't
+    happen, but defensive), the lowest rank wins — picking the most
+    urgent interpretation matches operator intent.
+
+    Tolerates non-list input (returns the no-label floor) so a
+    malformed ``issues_json`` row cannot crash the sort.
+    """
+    if not isinstance(labels, list):
+        return _PRIORITY_RANK_NO_LABEL
+    best = _PRIORITY_RANK_NO_LABEL
+    for entry in labels:
+        if not isinstance(entry, str):
+            continue
+        rank = _PRIORITY_LABEL_RANKS.get(entry)
+        if rank is not None and rank < best:
+            best = rank
+    return best
+
+
 def _normalize_issue_enrichment(
     issue: dict[str, Any],
     *,
@@ -1591,18 +1640,36 @@ class DispatcherDaemon:
         return row is not None
 
     def _latest_queue_snapshot_issues(self) -> list[int]:
-        """Return the issue numbers from the most recent queue snapshot.
+        """Return issue numbers from the most recent queue snapshot, priority-sorted.
 
-        The snapshot is written by ``_scan_queue_and_snapshot`` earlier
-        in the same tick, so this is almost always the list we just
-        observed. Returns an empty list if there is no snapshot yet
-        (first-tick edge case) or the read fails.
+        Issue #2835. The snapshot is written by
+        :meth:`_scan_queue_and_snapshot` earlier in the same tick, so
+        this is almost always the list we just observed.
+
+        Ordering: ``(priority_rank(labels) asc, createdAt asc)``. That
+        puts ``priority/p0`` before ``p1`` before ``p2`` before ``p3``
+        before unlabeled, with the older issue winning any tie (the
+        "waiting longest" issue gets next pick). The daemon used to
+        iterate the snapshot in ``gh issue list`` order — which is
+        ``created_at desc`` by default — so a freshly-filed p2 would
+        beat an older p0. With #2820's ``issues_json`` column now
+        carrying per-issue labels + createdAt, we can derive the sort
+        key without a second GitHub round-trip.
+
+        Falls back to the raw ``issue_numbers`` column (unsorted) when
+        ``issues_json`` is empty or malformed — e.g. pre-#2820 snapshot
+        rows, or a future schema hiccup. Operator visibility is
+        preserved by the log event's ``sorted`` field.
+
+        Returns an empty list if there is no snapshot yet (first-tick
+        edge case) or the read fails.
         """
         assert self._conn is not None, "connect() must run before reading"
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT issue_numbers FROM dispatcher.queue_snapshots "
+                    "SELECT issues_json, issue_numbers "
+                    "FROM dispatcher.queue_snapshots "
                     "ORDER BY observed_at DESC "
                     "LIMIT 1",
                 )
@@ -1623,10 +1690,42 @@ class DispatcherDaemon:
             return []
         if row is None:
             return []
-        issues = row[0]
-        if not isinstance(issues, list):
+        issues_json, issue_numbers = row[0], row[1]
+
+        # Primary path: sort by ``issues_json`` (per-issue labels +
+        # createdAt). psycopg returns jsonb as a parsed python list of
+        # dicts, but tests may stub with a JSON string — handle both.
+        if isinstance(issues_json, str):
+            try:
+                issues_json = json.loads(issues_json)
+            except json.JSONDecodeError:
+                issues_json = None
+
+        if isinstance(issues_json, list) and issues_json:
+            candidates: list[dict[str, Any]] = [
+                entry for entry in issues_json if isinstance(entry, dict)
+            ]
+            candidates.sort(
+                key=lambda entry: (
+                    _priority_rank(entry.get("labels")),
+                    entry.get("createdAt") or "",
+                )
+            )
+            sorted_numbers: list[int] = []
+            for entry in candidates:
+                number = entry.get("number")
+                if isinstance(number, int):
+                    sorted_numbers.append(number)
+            return sorted_numbers
+
+        # Fallback: pre-#2820 snapshot row with no ``issues_json``. Use
+        # the raw ``issue_numbers`` array in whatever order it was
+        # stored (no labels available to sort on without a GitHub
+        # round-trip, which we explicitly don't want here — see #2835
+        # rationale).
+        if not isinstance(issue_numbers, list):
             return []
-        return [int(n) for n in issues if isinstance(n, int)]
+        return [int(n) for n in issue_numbers if isinstance(n, int)]
 
     def _latest_queue_snapshot_title_for(self, issue_number: int) -> str | None:
         """Return the title for ``issue_number`` from the latest snapshot.
