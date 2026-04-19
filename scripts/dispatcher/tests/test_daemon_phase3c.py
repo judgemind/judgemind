@@ -1064,3 +1064,329 @@ class TestSchedulerTickRateLimit:
         assert summary["orchestration_attempted"] == 0
         assert d._claim_and_orchestrate_one.call_count == 0  # type: ignore[attr-defined]
         assert handler.events("claim_skipped_rate_limited")
+
+
+# --------------------------------------------------------------------------
+# #2821 — phase_failure_log secondary event + stderr_tail/preview 2000 cap
+# + cleanup uses _git_parent_root
+# --------------------------------------------------------------------------
+
+
+def _write_phase_log(worktree: Path, phase: str, body: str) -> None:
+    log_dir = worktree / "tmp"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"claude-p-{phase}.log").write_text(body)
+
+
+class TestPhaseFailureLogEvent:
+    """Full-log capture via secondary CloudWatch event (#2821).
+
+    Each ``daemon.subprocess_failed`` is followed by a
+    ``daemon.phase_failure_log`` event carrying up to 10k chars of the
+    full merged stdout+stderr log. Both share ``agent_id`` so a single
+    ``filter-log-events`` query returns the pair.
+    """
+
+    def test_emits_secondary_event_with_full_log_under_cap(
+        self, tmp_path: Path
+    ) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,), ("[60,300,900]",)]
+        worktree = tmp_path / "wt"
+        body = "short full log body"
+        _write_phase_log(worktree, "plan", body)
+
+        d._handle_subprocess_failure(
+            agent_id="a1",
+            phase="plan",
+            reason="nonzero_exit",
+            exit_code=1,
+            stderr_tail="tail here",
+            duration_s=1.0,
+            extra={},
+            worktree=worktree,
+        )
+
+        primary = handler.events("subprocess_failed")
+        secondary = handler.events("phase_failure_log")
+        assert primary and secondary, "both events must fire"
+        # Both share agent_id for the single-query triage pattern.
+        assert getattr(primary[0], "agent_id", None) == "a1"
+        assert getattr(secondary[0], "agent_id", None) == "a1"
+        assert getattr(secondary[0], "phase", None) == "plan"
+        assert getattr(secondary[0], "log_body", None) == body
+        assert getattr(secondary[0], "log_chars_total", None) == len(body)
+        assert getattr(secondary[0], "log_chars_emitted", None) == len(body)
+
+    def test_truncates_log_body_at_10k_chars(self, tmp_path: Path) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,), ("[60,300,900]",)]
+        worktree = tmp_path / "wt"
+        # 15k-char log: 10k emitted, 15k total.
+        body = "A" * 15000
+        _write_phase_log(worktree, "plan", body)
+
+        d._handle_subprocess_failure(
+            agent_id="a2",
+            phase="plan",
+            reason="nonzero_exit",
+            exit_code=1,
+            stderr_tail="...",
+            duration_s=1.0,
+            extra={},
+            worktree=worktree,
+        )
+
+        secondary = handler.events("phase_failure_log")
+        assert secondary
+        record = secondary[0]
+        emitted = getattr(record, "log_body", "")
+        assert len(emitted) == 10000
+        assert getattr(record, "log_chars_total", None) == 15000
+        assert getattr(record, "log_chars_emitted", None) == 10000
+        # Tail preserved — failures surface at the tail, not the head.
+        assert emitted == "A" * 10000
+
+    def test_secondary_event_skipped_when_log_empty(self, tmp_path: Path) -> None:
+        """No worktree log on disk → no secondary event.
+
+        Prevents the no-signal edge case (e.g. preflight exception
+        before subprocess spawn) from spamming CloudWatch with empty
+        ``phase_failure_log`` envelopes.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,), ("[60,300,900]",)]
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # No claude-p-plan.log written.
+
+        d._handle_subprocess_failure(
+            agent_id="a3",
+            phase="plan",
+            reason="timeout",
+            exit_code=None,
+            stderr_tail="",
+            duration_s=None,
+            extra={"timeout_seconds": 60},
+            worktree=worktree,
+        )
+
+        primary = handler.events("subprocess_failed")
+        secondary = handler.events("phase_failure_log")
+        assert primary, "primary event still fires"
+        assert not secondary, "secondary event must be skipped when log is empty"
+
+    def test_secondary_event_skipped_when_worktree_arg_omitted(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy callers that predate the worktree arg don't emit the event."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,), ("[60,300,900]",)]
+
+        d._handle_subprocess_failure(
+            agent_id="a4",
+            phase="plan",
+            reason="nonzero_exit",
+            exit_code=1,
+            stderr_tail="tail",
+            duration_s=1.0,
+            extra={},
+        )
+        assert handler.events("subprocess_failed")
+        assert not handler.events("phase_failure_log")
+
+
+class TestStderrTailSizeCap:
+    """Primary ``subprocess_failed`` event's ``stderr_tail`` capped at 2000 (#2821)."""
+
+    def test_stderr_tail_emitted_verbatim_at_2000_chars(self, tmp_path: Path) -> None:
+        """``_handle_subprocess_failure`` forwards the caller's tail verbatim.
+
+        The 2000-char cap is applied at the call-site via
+        ``_log_tail(max_chars=PHASE_STDERR_TAIL_MAX_CHARS)`` in
+        ``_run_subprocess_or_fail``. This test verifies the pipeline
+        preserves whatever size the caller hands in — the companion
+        test below exercises the call-site cap end-to-end.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,), ("[60,300,900]",)]
+        tail = "T" * 2000
+
+        d._handle_subprocess_failure(
+            agent_id="a5",
+            phase="plan",
+            reason="nonzero_exit",
+            exit_code=1,
+            stderr_tail=tail,
+            duration_s=1.0,
+            extra={},
+        )
+        primary = handler.events("subprocess_failed")
+        assert primary
+        assert getattr(primary[0], "stderr_tail", None) == tail
+        assert len(getattr(primary[0], "stderr_tail", "")) == 2000
+
+    def test_run_subprocess_or_fail_caps_tail_at_2000(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """The call-site tail read in ``_run_subprocess_or_fail`` honours
+        :data:`PHASE_STDERR_TAIL_MAX_CHARS` (2000)."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,), ("[60,300,900]",)]
+        worktree = tmp_path / "wt"
+        # 3000 chars — if the old 500 cap were still in place the tail
+        # would be 500; with 2000 the tail is 2000.
+        _write_phase_log(worktree, "plan", "X" * 3000)
+
+        monkeypatch.setattr(d, "_spawn_phase_subprocess", lambda *a, **k: (1, 1.0))
+        result = d._run_subprocess_or_fail("a6", "plan", worktree)
+        assert result is None  # subprocess failed
+
+        primary = handler.events("subprocess_failed")
+        assert primary
+        tail = getattr(primary[0], "stderr_tail", "")
+        assert len(tail) == 2000
+        assert tail == "X" * 2000
+
+
+class TestDropWorktreeBestEffortGitParent:
+    """#2821 — ``git worktree remove`` anchored to ``_git_parent_root``.
+
+    In Fargate, ``_repo_root()`` returns ``/app`` (container CWD), which
+    does NOT contain a ``.git`` directory — the baseline clone lives at
+    ``_git_parent_root()`` instead. Before this fix, the cleanup
+    fallback ran ``git -C /app worktree remove`` and failed with "fatal:
+    not a git repository".
+    """
+
+    def test_uses_git_parent_root_when_baseline_set(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        # Simulate Fargate layout: _repo_root = /app (no .git),
+        # _git_parent_root = baseline clone at /var/lib/.../judgemind.
+        repo_root = tmp_path / "app"
+        repo_root.mkdir()
+        baseline = tmp_path / "var" / "lib" / "dispatcher" / "judgemind"
+        baseline.mkdir(parents=True)
+        monkeypatch.setattr(d, "_repo_root", lambda: repo_root)
+        monkeypatch.setattr(d, "_git_parent_root", lambda: baseline)
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        # No cleanup_worktree.sh at the repo_root — forces git fallback.
+        assert d._drop_worktree_best_effort("/some/worktree") is True
+
+        # Only one call (the fallback), anchored to the baseline via -C.
+        git_remove = [c for c in captured if "worktree" in c and "remove" in c]
+        assert git_remove
+        cmd = git_remove[0]
+        assert cmd[0] == "git"
+        assert cmd[1] == "-C"
+        assert cmd[2] == str(baseline)  # NOT str(repo_root)
+
+    def test_uses_git_parent_root_even_when_cwd_outside_baseline(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Regression test for the actual #2821 symptom — ``git worktree
+        remove`` was running with no ``-C`` anchored correctly and
+        failing with "fatal: not a git repository" because the daemon's
+        CWD had no ``.git`` child. The fix anchors to
+        ``_git_parent_root()`` so the command works regardless of CWD.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        repo_root = tmp_path / "somewhere_else"
+        repo_root.mkdir()
+        baseline = tmp_path / "baseline_clone"
+        baseline.mkdir()
+        monkeypatch.setattr(d, "_repo_root", lambda: repo_root)
+        monkeypatch.setattr(d, "_git_parent_root", lambda: baseline)
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert d._drop_worktree_best_effort("/some/worktree") is True
+
+        git_remove = [c for c in captured if "worktree" in c and "remove" in c]
+        assert git_remove
+        assert git_remove[0][2] == str(baseline)
+        assert git_remove[0][2] != str(repo_root)
+
+
+class TestPersistPhaseOutputLogText:
+    """#2821 — ``dispatcher.phase_outputs.log_text`` column is written."""
+
+    def test_insert_includes_log_text_column(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        d._persist_phase_output(
+            agent_id="a1",
+            phase="plan",
+            output_json={"go": True},
+            log_text="the full phase log body",
+        )
+
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.phase_outputs" in e[0]
+        ]
+        assert inserts
+        sql, params = inserts[0]
+        assert "log_text" in sql
+        # Params ordering: (agent_id, phase, output_json_dumped, log_text)
+        assert params[0] == "a1"
+        assert params[1] == "plan"
+        assert params[3] == "the full phase log body"
+
+    def test_log_text_defaults_to_none_when_omitted(self, tmp_path: Path) -> None:
+        """Backwards-compat for any caller that forgot to pass log_text."""
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        d._persist_phase_output("a2", "plan", {"go": True})
+
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.phase_outputs" in e[0]
+        ]
+        assert inserts
+        _, params = inserts[0]
+        assert params[3] is None
+
+
+class TestReadFullPhaseLog:
+    """#2821 — full log body read helper."""
+
+    def test_returns_full_body_no_truncation(self, tmp_path: Path) -> None:
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        body = "Z" * 50000
+        _write_phase_log(worktree, "plan", body)
+        assert d._read_full_phase_log(worktree, "plan") == body
+
+    def test_returns_empty_when_log_missing(self, tmp_path: Path) -> None:
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        assert d._read_full_phase_log(worktree, "plan") == ""
