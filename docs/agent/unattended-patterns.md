@@ -34,6 +34,14 @@
 
   The script uses Python's `shutil.copy2()` internally, which bypasses the platform restriction. **Do not use `cp` directly** — it may also be blocked. This pattern applies to skill definitions (`SKILL.md`), hook scripts, and any other file under `.claude/`.
 
+## settings.json takes effect on NEXT session, not current
+
+The Claude Code CLI reads `.claude/settings.json` **once at session start**. Edits made to the file during a running session — including entries added via the `update-config` skill or by writing the file directly — do not apply to that session. They take effect only in future sessions. This includes `/task` subagents spawned with `isolation: "worktree"`, which start a fresh Claude session and will see the updated settings from the moment they launch.
+
+**How to verify:** confirm the file content is correct with `grep -n "<pattern>" .claude/settings.json`, then rely on the next `/task` or dispatcher-spawned agent to exercise the new allow entry naturally. Do **not** try to test the new entry from the same session that added it — it will not be active yet, and the test will give a false negative.
+
+_Origin: #2680 (allow entry added mid-session failed to suppress the prompt); fix landed in PR #2708. See that issue for the incident timeline._
+
 ## MCP Servers (github, telegram)
 
 MCP ("Model Context Protocol") servers expose structured tools — e.g. `mcp__github__get_issue`, `mcp__github__create_pull_request` — that return parsed JSON instead of the ad-hoc text output from `gh`. When available, MCP is the **preferred** tool for structured reads and writes against GitHub. It is **not a global replacement** for `gh`: commands like `gh run watch`, `gh pr merge`, `gh issue create --body-file` remain the canonical path. Use the right tool for the job — MCP for structured queries, `gh` for workflow-execution plumbing and anything without an MCP equivalent.
