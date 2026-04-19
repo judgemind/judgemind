@@ -162,6 +162,38 @@ PHASE_2_REQUIRED_CONCURRENCY_CAP = 0
 #: seed value (10800s). Enforced via ``subprocess.run(..., timeout=...)``.
 CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60
 
+#: Character cap on the ``stderr_tail`` field attached to
+#: ``daemon.subprocess_failed`` structured events. Previously 500; raised
+#: to 2000 (#2821) because the tail-oriented truncation loses signal for
+#: noisy failures where the useful "failed: X" line appears early — e.g.
+#: ralph running 1000 tests plus one real error, or terraform plan noise
+#: plus one actual error. 2000 covers most real failure modes without
+#: paying the cost of a full-log embed in the primary event. The full
+#: log is still durably captured via :data:`PHASE_FAILURE_LOG_MAX_CHARS`
+#: in the secondary ``phase_failure_log`` event and via
+#: ``dispatcher.phase_outputs.log_text``.
+PHASE_STDERR_TAIL_MAX_CHARS = 2000
+
+#: Character cap on the ``stderr_preview`` field attached to
+#: ``daemon.phase_output_missing`` and retro-failure structured events.
+#: Previously 200; raised to 2000 (#2821) for the same rationale as
+#: :data:`PHASE_STDERR_TAIL_MAX_CHARS`. Unlike ``stderr_tail``, the
+#: ``stderr_preview`` flows through
+#: :meth:`DispatcherDaemon._extract_log_preview` which additionally
+#: ``strip()``s the content, so the effective cap is still 2000 post-strip.
+PHASE_STDERR_PREVIEW_MAX_CHARS = 2000
+
+#: Character cap on the ``log_body`` field in the secondary
+#: ``daemon.phase_failure_log`` CloudWatch event emitted alongside each
+#: ``daemon.subprocess_failed`` (#2821). CloudWatch Logs allows up to
+#: 256KB per event but 10k is plenty for triage in practice. The primary
+#: failure event stays keyed on a small ``stderr_tail`` so common filter
+#: queries don't double-scan the full log body; the secondary event is
+#: the "full context when a human clicks in" payload. Both events share
+#: ``agent_id`` so ``aws logs filter-log-events --filter-pattern
+#: '<agent_id>'`` returns the pair.
+PHASE_FAILURE_LOG_MAX_CHARS = 10000
+
 #: Per-phase ``--max-turns`` values. Matches the frontmatter on each
 #: ``.claude/skills/task-v2-*/SKILL.md`` file. Sonnet-backed ralph gets
 #: the long tail; plan and summary stay tight. Post-PR phases added
@@ -1883,6 +1915,32 @@ class DispatcherDaemon:
         if self._cfg.baseline_repo_root is not None:
             self._baseline_fetch_origin_main()
 
+        # Defensive branch-delete — the tier-1 retry path (Phase 3C,
+        # #2791) re-runs ``_create_worktree`` against the same agent_id
+        # after a prior attempt's subprocess_crash. ``agent/<short_id>``
+        # is derived from agent_id so the retry would collide with the
+        # branch left behind by attempt 1 (`fatal: a branch named
+        # 'agent/<short_id>' already exists`). Deleting the branch first
+        # makes ``worktree add -b`` idempotent regardless of attempt
+        # number (#2821). Exit code is intentionally ignored: ``git
+        # branch -D`` returns 1 when the branch doesn't exist, which is
+        # the happy case on first attempt. The 10s timeout guards
+        # against a wedged git process without blocking normal flow.
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(git_parent),
+                "branch",
+                "-D",
+                branch,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
         cmd = [
             "git",
             "-C",
@@ -2055,22 +2113,40 @@ class DispatcherDaemon:
             return None
 
     def _persist_phase_output(
-        self, agent_id: str, phase: str, output_json: dict[str, Any]
+        self,
+        agent_id: str,
+        phase: str,
+        output_json: dict[str, Any],
+        log_text: str | None = None,
     ) -> None:
         """INSERT the phase's output into ``dispatcher.phase_outputs``
         and append a row to ``dispatcher.phase_transitions``.
 
         Both tables share a single transaction so the observed state
         stays consistent under partial failure.
+
+        ``log_text`` (added in #2821, migration 27) persists the full
+        ephemeral phase log body so operators can ``SELECT log_text FROM
+        dispatcher.phase_outputs WHERE agent_id = '<uuid>' ORDER BY ts
+        DESC`` at any time, even after the worktree has been cleaned up
+        and the ephemeral ``{worktree}/tmp/claude-p-<phase>.log`` file
+        deleted. Nullable for historical rows and for phases that
+        completed with no log content to capture. Housekeeping tick
+        (#2778/#2779) prunes rows at 30 days along with ``output_json``.
         """
         assert self._conn is not None, "connect() must run before persisting"
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO dispatcher.phase_outputs "
-                    "    (agent_id, phase, output_json) "
-                    "VALUES (%s, %s, %s)",
-                    (agent_id, phase, json.dumps(output_json, default=str)),
+                    "    (agent_id, phase, output_json, log_text) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (
+                        agent_id,
+                        phase,
+                        json.dumps(output_json, default=str),
+                        log_text,
+                    ),
                 )
                 cur.execute(
                     "INSERT INTO dispatcher.phase_transitions "
@@ -2207,6 +2283,13 @@ class DispatcherDaemon:
         :class:`subprocess.TimeoutExpired` on wall-clock timeout so the
         caller can mark the agent failed. Other subprocess errors bubble
         up as their native exception types.
+
+        The worktree is passed as the subprocess's CWD via
+        ``subprocess.run(..., cwd=...)`` — NOT as a ``--cwd`` flag. The
+        ``claude`` CLI does not accept a ``--cwd`` flag; passing one
+        makes every phase subprocess exit 1 within 400ms with
+        ``error: unknown option '--cwd'`` (#2821). Python's stdlib ``cwd=``
+        is the correct knob for "start the child process in this directory".
         """
         max_turns = PHASE_MAX_TURNS[phase]
         model = PHASE_MODELS[phase]
@@ -2217,8 +2300,6 @@ class DispatcherDaemon:
             "claude",
             "-p",
             f"/task-v2-{phase} {agent_id}",
-            "--cwd",
-            str(worktree),
             "--max-turns",
             str(max_turns),
             "--model",
@@ -2246,6 +2327,7 @@ class DispatcherDaemon:
                 text=True,
                 timeout=CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS,
                 check=False,
+                cwd=str(worktree),
             )
         duration = time.monotonic() - start
         return result.returncode, duration
@@ -2520,7 +2602,12 @@ class DispatcherDaemon:
             )
             return False
 
-        self._persist_phase_output(agent_id, "plan", plan_output)
+        self._persist_phase_output(
+            agent_id,
+            "plan",
+            plan_output,
+            log_text=self._read_full_phase_log(worktree, "plan") or None,
+        )
         self._log.info(
             "daemon.phase_succeeded",
             extra={
@@ -2598,7 +2685,12 @@ class DispatcherDaemon:
             )
             return False
 
-        self._persist_phase_output(agent_id, "ralph", ralph_output)
+        self._persist_phase_output(
+            agent_id,
+            "ralph",
+            ralph_output,
+            log_text=self._read_full_phase_log(worktree, "ralph") or None,
+        )
         verdict = ralph_output.get("verdict", "")
         self._log.info(
             "daemon.phase_succeeded",
@@ -2748,7 +2840,12 @@ class DispatcherDaemon:
             )
             return False
 
-        self._persist_phase_output(agent_id, "summary", summary_output)
+        self._persist_phase_output(
+            agent_id,
+            "summary",
+            summary_output,
+            log_text=self._read_full_phase_log(worktree, "summary") or None,
+        )
         self._log.info(
             "daemon.phase_succeeded",
             extra={
@@ -2808,15 +2905,21 @@ class DispatcherDaemon:
             # Timeout = subprocess runaway (spec §17 Risk 4). Treat as
             # a generic ``subprocess_crash`` — the subprocess didn't
             # actually crash but the next retry needs a fresh worktree
-            # just the same.
+            # just the same. Capture the log tail for triage — a runaway
+            # ralph spinning on a failing test still produces useful log
+            # output before the timeout fires.
+            tail = self._log_tail(
+                worktree, phase, max_chars=PHASE_STDERR_TAIL_MAX_CHARS
+            )
             self._handle_subprocess_failure(
                 agent_id=agent_id,
                 phase=phase,
                 reason="timeout",
                 exit_code=None,
-                stderr_tail="",
+                stderr_tail=tail,
                 duration_s=None,
                 extra={"timeout_seconds": CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS},
+                worktree=worktree,
             )
             return None
         except FileNotFoundError:
@@ -2871,7 +2974,12 @@ class DispatcherDaemon:
             # context but don't include verbatim in the structured
             # log envelope (may contain secrets). The classifier only
             # sees a short tail so a bad regex cannot echo a secret.
-            tail = self._log_tail(worktree, phase, max_chars=500)
+            # Tail size matches :data:`PHASE_STDERR_TAIL_MAX_CHARS` —
+            # 500 was too tight for noisy failures where the useful
+            # "failed: X" line appears early (#2821).
+            tail = self._log_tail(
+                worktree, phase, max_chars=PHASE_STDERR_TAIL_MAX_CHARS
+            )
             self._handle_subprocess_failure(
                 agent_id=agent_id,
                 phase=phase,
@@ -2880,6 +2988,7 @@ class DispatcherDaemon:
                 stderr_tail=tail,
                 duration_s=duration,
                 extra={},
+                worktree=worktree,
             )
             return None
 
@@ -2906,6 +3015,7 @@ class DispatcherDaemon:
         stderr_tail: str,
         duration_s: float | None,
         extra: dict[str, Any],
+        worktree: Path | None = None,
     ) -> None:
         """Classify a subprocess failure, write failure row, enqueue retry.
 
@@ -2919,6 +3029,15 @@ class DispatcherDaemon:
         diagnoser can pick up. Future: 3D may flip turn-limit to a
         single retry-with-hint — the classifier already returns the
         distinct category so that wiring is a one-line change.
+
+        When ``worktree`` is provided, a secondary
+        ``daemon.phase_failure_log`` event is emitted carrying up to
+        :data:`PHASE_FAILURE_LOG_MAX_CHARS` chars of the full phase log
+        body (#2821). Both events share ``agent_id`` so a single
+        CloudWatch filter-log-events query returns the pair. The full
+        log is the "click-in" payload for triage — the primary event's
+        ``stderr_tail`` stays narrow so filter queries against the
+        primary event don't double-scan the full body.
         """
         # ``claude`` is the Phase-3 default runner. When multi-runner
         # support lands (per dispatcher.config.runner_by_phase), this
@@ -2949,6 +3068,17 @@ class DispatcherDaemon:
         log_extra.update(extra)
         log_extra["stderr_tail"] = stderr_tail
         self._log.warning("daemon.subprocess_failed", extra=log_extra)
+
+        # Secondary event: full-log dump for triage (#2821). Emitted
+        # when we have a worktree reference (all real failure paths) and
+        # the log file actually has content. Cap at 10k chars — the tail
+        # is preserved because failures surface at the tail, not the
+        # head, and merged stdout+stderr logs commonly start with env
+        # dumps or prompt echoes that are noise.
+        if worktree is not None:
+            self._emit_phase_failure_log_event(
+                agent_id=agent_id, phase=phase, worktree=worktree
+            )
 
         self._write_failure(
             agent_id=agent_id,
@@ -2992,30 +3122,90 @@ class DispatcherDaemon:
         return data[-max_chars:]
 
     def _extract_log_preview(
-        self, worktree: Path, phase: str, max_chars: int = 200
+        self,
+        worktree: Path,
+        phase: str,
+        max_chars: int = PHASE_STDERR_PREVIEW_MAX_CHARS,
     ) -> str:
         """Return a short preview of the phase log for triage-in-CloudWatch.
 
-        Mirrors the ``stderr_preview`` convention used by
-        :meth:`_create_worktree` and :meth:`ensure_baseline_clone`
-        (`(result.stderr or "").strip()[:200]`). For phase subprocesses the
-        stream is merged stdout+stderr (see
+        For phase subprocesses the stream is merged stdout+stderr (see
         :meth:`_spawn_phase_subprocess` which redirects stderr to stdout into
         ``{worktree}/tmp/claude-p-<phase>.log``) — we return the last
         ``max_chars`` of the stripped log because failures surface at the
         tail, not the head.
 
-        The full text is preserved on disk at ``claude-p-<phase>.log`` and
-        the structured output (when present) at ``dispatcher.phase_outputs``
-        — this helper is for triage, not archival. Callers should omit the
+        The full text is preserved on disk at ``claude-p-<phase>.log``,
+        at ``dispatcher.phase_outputs.log_text`` (durable across worktree
+        cleanup — #2821), and in the secondary
+        ``daemon.phase_failure_log`` CloudWatch event — this helper is
+        for triage, not archival. Callers should omit the
         ``stderr_preview`` log field when this returns an empty string
         (avoids `stderr_preview: ""` noise on CloudWatch for phases that
         never produced a log, e.g. a preflight exception before spawn).
 
-        Issue #2809.
+        Default cap bumped from 200 → 2000 in #2821 — the old tail was
+        too tight for noisy failures where the useful line appeared
+        early. See :data:`PHASE_STDERR_PREVIEW_MAX_CHARS`. Introduced in
+        issue #2809.
         """
         tail = self._log_tail(worktree, phase, max_chars=max_chars)
         return tail.strip()[:max_chars]
+
+    def _read_full_phase_log(self, worktree: Path, phase: str) -> str:
+        """Return the full phase log text, or empty string on any error.
+
+        Unlike :meth:`_log_tail` / :meth:`_extract_log_preview`, this
+        returns the complete file with no truncation. Used to populate
+        ``dispatcher.phase_outputs.log_text`` (durable archival per
+        #2821) and as the input to :meth:`_emit_phase_failure_log_event`
+        which then applies the :data:`PHASE_FAILURE_LOG_MAX_CHARS` cap.
+        """
+        log_path = worktree / "tmp" / f"claude-p-{phase}.log"
+        if not log_path.exists():
+            return ""
+        try:
+            return log_path.read_text(errors="replace")
+        except Exception:  # pragma: no cover — defensive
+            return ""
+
+    def _emit_phase_failure_log_event(
+        self, agent_id: str, phase: str, worktree: Path
+    ) -> None:
+        """Emit ``daemon.phase_failure_log`` with up to 10k chars of full log.
+
+        Paired with each ``daemon.subprocess_failed`` event emitted by
+        :meth:`_handle_subprocess_failure` (#2821). Skipped when the
+        phase log is empty (avoids a blank event for phases that failed
+        before any output was produced). Tail-truncated at
+        :data:`PHASE_FAILURE_LOG_MAX_CHARS` — failures surface at the
+        tail, and merged stdout+stderr logs commonly start with env
+        dumps or prompt echoes that are noise.
+
+        The envelope carries both ``log_chars_total`` (full size) and
+        ``log_chars_emitted`` (what made it into this event) so
+        operators know whether the truncation lost context.
+        """
+        body = self._read_full_phase_log(worktree, phase)
+        if not body:
+            return
+        total = len(body)
+        if total <= PHASE_FAILURE_LOG_MAX_CHARS:
+            emitted_body = body
+        else:
+            emitted_body = body[-PHASE_FAILURE_LOG_MAX_CHARS:]
+        self._log.warning(
+            "daemon.phase_failure_log",
+            extra={
+                "event": "phase_failure_log",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": phase,
+                "log_chars_total": total,
+                "log_chars_emitted": len(emitted_body),
+                "log_body": emitted_body,
+            },
+        )
 
     def _push_and_open_pr(
         self, agent_id: str, issue_number: int, worktree: Path
@@ -3898,7 +4088,12 @@ class DispatcherDaemon:
             )
             return
 
-        self._persist_phase_output(agent_id, "fix-ci", fix_ci_output)
+        self._persist_phase_output(
+            agent_id,
+            "fix-ci",
+            fix_ci_output,
+            log_text=self._read_full_phase_log(worktree, "fix-ci") or None,
+        )
         verdict = str(fix_ci_output.get("verdict") or "").upper()
 
         if verdict == "PATCHED":
@@ -4462,7 +4657,12 @@ class DispatcherDaemon:
             )
             return
 
-        self._persist_phase_output(agent_id, "verify", verify_output)
+        self._persist_phase_output(
+            agent_id,
+            "verify",
+            verify_output,
+            log_text=self._read_full_phase_log(worktree, "verify") or None,
+        )
 
         evidence_md = str(verify_output.get("evidence_md") or "").strip()
         if evidence_md:
@@ -4814,7 +5014,12 @@ class DispatcherDaemon:
 
         # Persist the retro output to dispatcher.phase_outputs +
         # phase_transitions so the admin page sees the run.
-        self._persist_phase_output(agent_id, "retro", retro_output)
+        self._persist_phase_output(
+            agent_id,
+            "retro",
+            retro_output,
+            log_text=self._read_full_phase_log(worktree, "retro") or None,
+        )
 
         # File the retro issues. Each entry becomes a separate
         # ``gh issue create``. Honour the per-agent cap defensively —
@@ -5978,11 +6183,22 @@ class DispatcherDaemon:
         warning). The caller proceeds with the retry even on False —
         spec §8 calls this a mechanical fix, and an orphaned worktree
         is a much smaller problem than a stuck retry marker.
+
+        The cleanup-script lookup uses ``_repo_root()`` (the daemon's
+        CWD, which contains the ``scripts/`` tree in both the Fargate
+        image and local-dev mode). The ``git worktree remove`` fallback
+        uses ``_git_parent_root()`` instead — in Fargate, ``_repo_root()``
+        is ``/app`` (no ``.git`` child), while ``_git_parent_root()`` is
+        the baseline clone at ``/var/lib/dispatcher/judgemind``. Running
+        ``git worktree remove`` from ``/app`` fails with "not a git
+        repository" (#2821); running it with ``-C <git_parent>`` works
+        from any CWD.
         """
         if not worktree_path:
             return False
 
         repo_root = self._repo_root()
+        git_parent = self._git_parent_root()
         cleanup_script = repo_root / "scripts" / "cleanup_worktree.sh"
 
         if cleanup_script.exists():
@@ -6022,12 +6238,14 @@ class DispatcherDaemon:
         # bypass a safety check), but the retry marker processor has
         # already decided the worktree is toast — the only question is
         # whether we leave an orphan entry in ``git worktree list``.
+        # ``-C <git_parent>`` anchors the command to the baseline clone's
+        # ``.git`` rather than the daemon's CWD — see docstring.
         try:
             result = subprocess.run(
                 [
                     "git",
                     "-C",
-                    str(repo_root),
+                    str(git_parent),
                     "worktree",
                     "remove",
                     "--force",

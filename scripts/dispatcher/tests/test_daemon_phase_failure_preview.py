@@ -175,12 +175,13 @@ class TestExtractLogPreview:
     def test_truncates_at_max_chars(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
         worktree = tmp_path / "worktree"
-        # A log with 400 chars of tail content — preview should be 200.
-        tail = "X" * 400
+        # A log >2000 chars — preview caps at PHASE_STDERR_PREVIEW_MAX_CHARS
+        # (2000, raised from 200 in #2821).
+        tail = "X" * 3000
         _write_phase_log(worktree, "plan", tail)
         preview = d._extract_log_preview(worktree, "plan")
-        assert len(preview) == 200
-        assert preview == "X" * 200
+        assert len(preview) == 2000
+        assert preview == "X" * 2000
 
     def test_honours_custom_max_chars(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -551,13 +552,22 @@ class TestRetroFailurePreviews:
         assert preview is not None
         assert "JSON write failed" in preview
 
-    def test_preview_truncated_to_200_chars_on_retro_nonzero(
+    def test_preview_truncated_to_2000_chars_on_retro_nonzero(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """The preview cap was raised from 200 → 2000 in #2821.
+
+        Noisy failures (ralph running 1000 tests with one real error,
+        terraform plan with a single actual error) routinely push the
+        useful line past the old 200-char boundary. 2000 covers real
+        failure modes without pulling in the full log (the full log is
+        captured separately via ``daemon.phase_failure_log`` +
+        ``dispatcher.phase_outputs.log_text``).
+        """
         d, _conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
         worktree = Path(agent["worktree_path"])
-        _write_phase_log(worktree, "retro", "Z" * 500)
+        _write_phase_log(worktree, "retro", "Z" * 3000)
         self._prep(d, agent)
 
         def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
@@ -569,4 +579,4 @@ class TestRetroFailurePreviews:
         events = handler.events("retro_nonzero_exit")
         assert events
         preview = getattr(events[0], "stderr_preview", "")
-        assert len(preview) == 200
+        assert len(preview) == 2000

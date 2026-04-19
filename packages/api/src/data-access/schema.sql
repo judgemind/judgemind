@@ -446,8 +446,12 @@ CREATE TABLE dispatcher.phase_outputs (
     agent_id uuid NOT NULL,
     phase text NOT NULL,
     output_json jsonb NOT NULL,
-    ts timestamp with time zone DEFAULT now() NOT NULL
+    ts timestamp with time zone DEFAULT now() NOT NULL,
+    log_text text
 );
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.log_text IS 'Full ephemeral phase log (stdout+stderr) captured from {worktree}/tmp/claude-p-<phase>.log at phase-finish time. Nullable for historical rows and for phases that failed before producing a log. Housekeeping tick prunes at 30 days along with output_json. See #2821.';
 
 
 CREATE SEQUENCE dispatcher.phase_outputs_output_id_seq

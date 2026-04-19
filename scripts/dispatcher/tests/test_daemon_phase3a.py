@@ -436,10 +436,10 @@ class TestCreateWorktree:
     ) -> None:
         d, _conn, handler = _make_daemon(tmp_path)
 
-        captured: dict[str, Any] = {}
+        calls: list[list[str]] = []
 
         def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
-            captured["cmd"] = cmd
+            calls.append(cmd)
             r = MagicMock()
             r.returncode = 0
             r.stdout = ""
@@ -451,24 +451,84 @@ class TestCreateWorktree:
         agent_id = "aabbccdd-eeff-0011-2233-445566778899"
 
         wt = d._create_worktree(agent_id)
-        assert "git" == captured["cmd"][0]
-        assert "worktree" in captured["cmd"]
-        assert "add" in captured["cmd"]
+        # The defensive branch-delete (see #2821) runs first, then
+        # ``git worktree add``.
+        worktree_add = calls[-1]
+        assert "git" == worktree_add[0]
+        assert "worktree" in worktree_add
+        assert "add" in worktree_add
         # short id = first 8 of hex-collapsed uuid = "aabbccdd".
         assert str(wt).endswith(".claude/worktrees/agent-aabbccdd")
-        assert "-b" in captured["cmd"]
-        branch_idx = captured["cmd"].index("-b") + 1
-        assert captured["cmd"][branch_idx] == "agent/aabbccdd"
+        assert "-b" in worktree_add
+        branch_idx = worktree_add.index("-b") + 1
+        assert worktree_add[branch_idx] == "agent/aabbccdd"
         assert handler.events("worktree_created") != []
+
+    def test_defensive_branch_delete_precedes_worktree_add(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Retry-path branch collision fix (#2821).
+
+        The tier-1 retry path re-runs ``_create_worktree`` with the same
+        ``agent_id``. Without a defensive ``git branch -D`` first, the
+        second ``worktree add -b agent/<short_id>`` fails with ``fatal:
+        a branch named 'agent/<short_id>' already exists``. This test
+        asserts ``branch -D`` is called before ``worktree add``, with
+        the same branch name.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            calls.append(cmd)
+            r = MagicMock()
+            # ``branch -D`` can legitimately return 1 when the branch
+            # doesn't exist (first-attempt happy path) — the daemon
+            # must ignore the exit code. Simulate that here.
+            if "branch" in cmd and "-D" in cmd:
+                r.returncode = 1
+                r.stderr = "error: branch 'agent/aabbccdd' not found.\n"
+            else:
+                r.returncode = 0
+                r.stderr = ""
+            r.stdout = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        agent_id = "aabbccdd-eeff-0011-2233-445566778899"
+
+        # Should NOT raise despite branch -D returning 1.
+        d._create_worktree(agent_id)
+
+        # Ordering: branch -D, then worktree add.
+        branch_delete_idx = next(
+            (i for i, c in enumerate(calls) if "branch" in c and "-D" in c), None
+        )
+        worktree_add_idx = next(
+            (i for i, c in enumerate(calls) if "worktree" in c and "add" in c), None
+        )
+        assert branch_delete_idx is not None, "no branch -D call was made"
+        assert worktree_add_idx is not None, "no worktree add call was made"
+        assert branch_delete_idx < worktree_add_idx
+        # Branch name matches the same convention the worktree-add uses.
+        branch_delete_cmd = calls[branch_delete_idx]
+        assert branch_delete_cmd[-1] == "agent/aabbccdd"
 
     def test_git_failure_raises(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
 
         def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
             r = MagicMock()
-            r.returncode = 128
+            # Only the worktree-add failure should raise — the defensive
+            # branch-delete's exit code is intentionally ignored.
+            if "worktree" in cmd and "add" in cmd:
+                r.returncode = 128
+                r.stderr = "fatal: branch already exists\n"
+            else:
+                r.returncode = 1
+                r.stderr = ""
             r.stdout = ""
-            r.stderr = "fatal: branch already exists\n"
             return r
 
         monkeypatch.setattr(subprocess, "run", fake_run)
@@ -648,6 +708,7 @@ class TestSpawnPhaseSubprocess:
         def fake_run(cmd: list[str], **kwargs: Any) -> Any:
             captured["cmd"] = cmd
             captured["timeout"] = kwargs.get("timeout")
+            captured["cwd"] = kwargs.get("cwd")
             r = MagicMock()
             r.returncode = 0
             return r
@@ -660,8 +721,10 @@ class TestSpawnPhaseSubprocess:
         assert captured["cmd"][0] == "claude"
         assert "-p" in captured["cmd"]
         assert "/task-v2-plan agent-uuid" in captured["cmd"]
-        assert "--cwd" in captured["cmd"]
-        assert str(tmp_path) in captured["cmd"]
+        # --cwd is NOT a claude CLI flag; the worktree goes through
+        # subprocess.run's cwd= kwarg instead (#2821).
+        assert "--cwd" not in captured["cmd"]
+        assert captured["cwd"] == str(tmp_path)
         assert "--max-turns" in captured["cmd"]
         assert "50" in captured["cmd"]  # plan
         assert "--model" in captured["cmd"]
