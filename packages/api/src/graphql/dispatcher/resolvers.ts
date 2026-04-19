@@ -4,7 +4,7 @@
  * Phase 1 (the admin page polls every 2s per §11, and the tables are
  * small enough that a cache would hide more than it helps).
  *
- * Gated on `users.is_admin = true` via `requireDispatcherAdmin`. Non-admins
+ * Gated on `user.role === 'admin'` via `requireDispatcherAdmin`. Non-admins
  * receive a generic "not found" error (see `./auth.ts`).
  *
  * `dispatcherControl` is idempotent at the command-row level — identical
@@ -15,7 +15,7 @@
 import type { Pool } from 'pg';
 import { GraphQLError, GraphQLScalarType, Kind } from 'graphql';
 import type { AuthUser } from '../../auth';
-import { DESTRUCTIVE_COMMANDS, notFound, requireDispatcherAdmin } from './auth';
+import { DESTRUCTIVE_COMMANDS, requireDispatcherAdmin } from './auth';
 
 // Minimal Context subset the dispatcher resolvers read.
 interface DispatcherContext {
@@ -313,7 +313,7 @@ export const dispatcherResolvers = {
 
     activeAgents: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
       // Parent resolver already admin-gated; re-check for defence-in-depth.
-      if (!user || !user.isAdmin) notFound();
+      requireDispatcherAdmin(user);
       const rows = await queryActiveAgents(pool);
       return rows.map(agentRowToGraphQL);
     },
@@ -323,14 +323,14 @@ export const dispatcherResolvers = {
       { sinceHours }: { sinceHours?: number | null },
       { pool, user }: DispatcherContext,
     ) => {
-      if (!user || !user.isAdmin) notFound();
+      requireDispatcherAdmin(user);
       const hours = sinceHours ?? 24;
       const rows = await queryRecentFailures(pool, hours);
       return rows.map(failureRowToGraphQL);
     },
 
     queueDepth: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
-      if (!user || !user.isAdmin) notFound();
+      requireDispatcherAdmin(user);
       return queryQueueDepth(pool);
     },
 
@@ -345,7 +345,7 @@ export const dispatcherResolvers = {
       __: unknown,
       { pool, user }: DispatcherContext,
     ) => {
-      if (!user || !user.isAdmin) notFound();
+      requireDispatcherAdmin(user);
       const agentId = parent.__agent_id ?? parent.id;
       const rows = await queryPhaseTransitions(pool, String(agentId));
       return rows.map(transitionRowToGraphQL);
@@ -356,7 +356,7 @@ export const dispatcherResolvers = {
       __: unknown,
       { pool, user }: DispatcherContext,
     ) => {
-      if (!user || !user.isAdmin) notFound();
+      requireDispatcherAdmin(user);
       const agentId = parent.__agent_id ?? parent.id;
       const rows = await queryFailuresForAgent(pool, String(agentId));
       return rows.map(failureRowToGraphQL);

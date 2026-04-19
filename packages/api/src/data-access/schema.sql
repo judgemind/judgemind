@@ -570,12 +570,8 @@ CREATE TABLE public.users (
     last_login_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    google_id text,
-    is_admin boolean DEFAULT false NOT NULL
+    google_id text
 );
-
-
-COMMENT ON COLUMN public.users.is_admin IS 'Grants access to the dispatcher admin GraphQL surface (§11). Orthogonal to users.role.';
 
 
 CREATE TABLE staging.captures (

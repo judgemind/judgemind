@@ -1,5 +1,11 @@
 -- Up Migration
 --
+-- SUPERSEDED BY MIGRATION 23 (#2751). This migration ran on dev and prod
+-- history, so it is left intact — migration 23 drops the `is_admin` column
+-- and the dispatcher admin surface now gates on `users.role = 'admin'`
+-- instead. Do not copy this pattern; see 23_users-drop-is-admin.sql for the
+-- consolidation rationale.
+--
 -- Dispatcher v2 — Phase 1 Sub-task D. Adds the admin auth gate for the
 -- dispatcher admin GraphQL surface (`docs/specs/dispatcher-v2-spec.md` §11).
 --

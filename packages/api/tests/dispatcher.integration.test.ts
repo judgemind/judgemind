@@ -51,10 +51,10 @@ const insertedFailureIds: string[] = [];
 const insertedRunIds: string[] = [];
 
 async function seedData(): Promise<void> {
-  // Admin user — is_admin=true gates the dispatcher surface.
+  // Admin user — role='admin' gates the dispatcher surface.
   const { rows: adminRows } = await pool.query<{ id: string }>(
-    `INSERT INTO public.users (email, email_verified, role, password_hash, is_admin)
-     VALUES ($1, true, 'user', 'not-a-real-hash', true)
+    `INSERT INTO public.users (email, email_verified, role, password_hash)
+     VALUES ($1, true, 'admin', 'not-a-real-hash')
      RETURNING id`,
     [`${MARKER}-admin@test.com`],
   );
@@ -62,10 +62,10 @@ async function seedData(): Promise<void> {
   adminToken = signAccessToken({
     sub: adminUserId,
     email: `${MARKER}-admin@test.com`,
-    role: 'user',
+    role: 'admin',
   });
 
-  // Regular user — is_admin=false (default) must receive "not found".
+  // Regular user — role='user' (non-admin) must receive "not found".
   const { rows: userRows } = await pool.query<{ id: string }>(
     `INSERT INTO public.users (email, email_verified, role, password_hash)
      VALUES ($1, true, 'user', 'not-a-real-hash')
