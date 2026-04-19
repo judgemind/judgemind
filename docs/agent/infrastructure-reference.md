@@ -90,6 +90,93 @@ When adding a new module that wraps a resource with a maintenance window, check 
 
 See `docs/terraform-checklist.md` for the full checklist.
 
+## Dispatcher v2 Cutover
+
+The dispatcher v2 daemon is an opt-in production replacement for the laptop-dispatcher's `/dispatcher` skill. It runs on Fargate, claims `agent/ready` issues from GitHub, and drives each one end-to-end through `claude -p '/task-v2-*'` subprocesses (plan → ralph → summary → push → CI watch → merge → deploy watch → verify → retro → cleanup). Phase 3 (#2782) shipped all the orchestration code; Phase 3E (#2798) was the final code piece. **The cutover from `concurrency_cap=0` (cold) to `concurrency_cap=1` (one in-flight agent) is an explicit operator action — not part of any PR.**
+
+Spec: `docs/specs/dispatcher-v2-spec.md` §6 (state machine), §8 (failure taxonomy + diagnoser), §15 (Phase 3 gate).
+
+### Phase 3 cut-over: `concurrency_cap=0` → `1`
+
+**Prerequisites (all required):**
+
+- All Phase 3 sub-tasks merged: #2783 (3A), #2787 (3B), #2792 (3C), #2796 (3D), #2798 (3E).
+- `deploy-dispatcher.yml` workflow is green for the most recent commit on `main`.
+- Daemon stable on dev for ≥ 1 hour at `cap=0` with the new code (check the CloudWatch log group `/ecs/judgemind-dispatcher-dev` — only `daemon.scheduler_tick` / `daemon.supervisor_tick` events; no `daemon.advance_failed` / `daemon.subprocess_*_failed` events at the new code revision).
+- No active `dispatcher.agents` rows: the cutover assumes the next agent claimed will be the first new one to exercise the orchestration path end-to-end.
+  ```
+  scripts/dev-db-query.sh "SELECT count(*) FROM dispatcher.agents WHERE status IN ('running', 'retrying');"
+  ```
+  Expected: `0`.
+
+**Cut-over procedure:**
+
+1. Flip the cap (single-row UPDATE):
+   ```
+   scripts/dev-db-query.sh --rw "UPDATE dispatcher.config SET value = '1', updated_by = '<your-handle>', updated_at = now() WHERE key = 'concurrency_cap';"
+   ```
+   `updated_by` lets the next operator distinguish migration-seeded rows (`init`) from a manual cap flip.
+2. Watch daemon logs for the next ~1 hour. The first `daemon.candidate_picked` event indicates the daemon claimed an issue.
+   ```
+   scripts/ecs-logs.sh /ecs/judgemind-dispatcher-dev --follow
+   ```
+   Or a CloudWatch Logs Insights query: filter on `event = "candidate_picked"` to spot the first claim immediately.
+3. Watch the agent through every phase: plan → ralph → summary → PR open → CI watch → merge → deploy watch → verify → retro → cleanup. The expected event sequence in CloudWatch is:
+   - `daemon.candidate_picked` → `daemon.atomic_claim_inserted` → `daemon.phase_started phase=plan` → `daemon.phase_started phase=ralph` → `daemon.phase_started phase=summary` → `daemon.pr_opened` → `daemon.ci_poll` (one or more) → `daemon.pr_merged` → `daemon.deploy_poll` (one or more) → `daemon.verify_started` → `daemon.evidence_comment_posted` → `daemon.agent_completed` → `daemon.retro_started` → `daemon.retro_done` → `daemon.cleanup_done`.
+   - Any failure the diagnoser doesn't recover from = pause cutover by flipping `cap` back to `0` (see Rollback below).
+4. If the first agent reaches `phase='cleanup_done'` cleanly, the cutover is validated. Leave `cap=1` and let the daemon continue claiming one issue at a time. **Phase 4 (#2782 follow-up)** raises `cap` to `5` after enough single-agent runs accumulate to satisfy the gate criteria below.
+
+### Phase 3 gate (per spec §15 post-#2758 wording)
+
+Phase 3 is considered "done" once the daemon has:
+
+- ≥ 10 successful task completions (`dispatcher.agents.status='succeeded' AND PR merged AND phase IN ('cleanup_done', 'cleanup_blocked')`).
+- Zero stuck agents at the gate-check moment (`status='running' AND phase NOT IN ('done', 'retro_done', 'retro_failed', 'cleanup_done', 'cleanup_blocked')` for ≥ 30 min).
+- All retries resolved correctly — every `dispatcher.diagnoses` row from the gate window has a non-NULL `outcome` consistent with the agent's final status. The Phase 3E (#2798) effectiveness-tracking write-back guarantees this populates automatically; the operator only needs to confirm coverage.
+
+Quick gate-check SQL:
+
+```
+scripts/dev-db-query.sh "
+SELECT
+  count(*) FILTER (WHERE status = 'succeeded' AND phase IN ('cleanup_done', 'cleanup_blocked')) AS successes,
+  count(*) FILTER (WHERE status = 'running' AND phase NOT IN ('done', 'retro_done', 'retro_failed', 'cleanup_done', 'cleanup_blocked')
+                   AND started_at < now() - interval '30 minutes')                                AS stuck_running,
+  (SELECT count(*) FROM dispatcher.diagnoses WHERE outcome IS NULL AND completed_at IS NOT NULL) AS unresolved_diagnoses
+FROM dispatcher.agents
+WHERE started_at >= now() - interval '7 days';
+"
+```
+
+`successes ≥ 10`, `stuck_running = 0`, `unresolved_diagnoses = 0` ⇒ proceed to Phase 4. Otherwise stay at `cap=1` and investigate the gap.
+
+### Rollback (any time)
+
+```
+scripts/dev-db-query.sh --rw "UPDATE dispatcher.config SET value = '0', updated_by = '<your-handle>', updated_at = now() WHERE key = 'concurrency_cap';"
+```
+
+The daemon stops claiming new candidates on the next scheduler tick (≤ 30 s). Any in-flight agent finishes naturally — supervisor ticks continue advancing it through CI watch / merge / deploy / verify / retro / cleanup until it lands in a terminal phase. If the in-flight agent is stuck, the supervisor's `_check_stuck_agents` (Phase 3C, 30-min window) flips it to `crashed` and the retry-marker processor takes over.
+
+### Per-agent phase enumeration (Phase 3E)
+
+`dispatcher.agents.phase` is free-form `text` per migration 21 — no schema enum to maintain. The daemon-side enumeration (centralised in constants `PHASE_*` in `scripts/dispatcher/daemon.py`):
+
+| Phase | Status | Meaning |
+|---|---|---|
+| `claiming` | `running` | Initial state at INSERT. |
+| `planning` / `ralph` / `summary` | `running` | Mid-orchestration, `claude -p` subprocess in flight. |
+| `awaiting_ci` | `running` | Push + PR done; waiting on CI. |
+| `awaiting_deploy` | `running` | PR merged; waiting on deploy workflow. |
+| `done` | `succeeded` | Verify posted evidence; ready for retro. |
+| `retro_done` | `succeeded` | Retro phase ran cleanly; ready for cleanup. |
+| `retro_failed` | `succeeded` | Retro skill failed but agent itself succeeded; cleanup still runs. |
+| `cleanup_done` | `succeeded` | Final terminal state — worktree removed. |
+| `cleanup_blocked` | `succeeded` | Final terminal state — `cleanup_worktree.sh` refused (locked / no session log); operator sweep needed. |
+| `awaiting_*` / `claiming` | `crashed` / `failed` | Supervisor flipped status; phase preserved for diagnostics. |
+
+The daemon validates phase strings via the `PHASE_*` constants — adding a new phase value requires a code change but no migration. See `scripts/dispatcher/daemon.py` constants section for the canonical list.
+
 ## ECS Script Execution
 
 > **Important:** The dev database is in a private VPC and is not reachable from localhost. Do not attempt to connect to it locally using `scripts/with-secret.sh` with `DATABASE_URL` — the connection will fail. All data scripts must run inside the VPC via `ecs-run-task.sh`.

@@ -166,25 +166,31 @@ CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60
 #: ``.claude/skills/task-v2-*/SKILL.md`` file. Sonnet-backed ralph gets
 #: the long tail; plan and summary stay tight. Post-PR phases added
 #: in Phase 3B (#2787) — fix-ci is a targeted patch so 100 turns is
-#: generous; verify is read-mostly so 50 turns fits.
+#: generous; verify is read-mostly so 50 turns fits. Retro added in
+#: Phase 3E (#2798) — a read-only review producing zero-to-many issue
+#: bodies; 30 turns matches the retro skill's frontmatter.
 PHASE_MAX_TURNS = {
     "plan": 50,
     "ralph": 500,
     "summary": 30,
     "fix-ci": 100,
     "verify": 50,
+    "retro": 30,
 }
 
 #: Per-phase ``--model`` values. Matches ``dispatcher.config.model_by_phase``
 #: seeded in migration 21. Fix-ci uses Sonnet — the CI-fixing skill's
 #: own frontmatter selects it. Verify uses Haiku — it only reads the
 #: deploy status and poses structured evidence, no complex reasoning.
+#: Retro uses Haiku — a quick review of structured input that produces
+#: structured output; no complex reasoning required.
 PHASE_MODELS = {
     "plan": "opus",
     "ralph": "sonnet",
     "summary": "haiku",
     "fix-ci": "sonnet",
     "verify": "haiku",
+    "retro": "haiku",
 }
 
 #: The three happy-path phases 3A orchestrates, in execution order.
@@ -246,6 +252,62 @@ WORKTREE_PARENT_DIR = Path(".claude/worktrees")
 #: the lifetime of the dispatcher is negligible and the short form
 #: keeps path lengths sane.
 AGENT_SHORT_ID_HEX_CHARS = 8
+
+# --------------------------------------------------------------------------
+# Phase 3E — retro orchestration + worktree cleanup + diagnoser
+# effectiveness tracking (issue #2798)
+# --------------------------------------------------------------------------
+
+#: Phase value written to ``dispatcher.agents.phase`` after a successful
+#: ``/task-v2-retro`` invocation. The agent's ``status`` stays
+#: ``succeeded`` — only the post-success phase advances. Any retro
+#: issues the skill produced have already been filed by this point.
+PHASE_RETRO_DONE = "retro_done"
+
+#: Phase value written when ``/task-v2-retro`` fails (timeout, non-zero
+#: exit, missing/malformed output). The agent itself succeeded, so
+#: ``status='succeeded'`` is preserved — only the retro phase failed.
+#: Cleanup still runs from this terminal-with-retro-failed state.
+PHASE_RETRO_FAILED = "retro_failed"
+
+#: Phase value written after ``scripts/cleanup_worktree.sh`` succeeds.
+#: This is the final terminal phase for a successful agent — no further
+#: supervisor advances apply.
+PHASE_CLEANUP_DONE = "cleanup_done"
+
+#: Phase value written when ``scripts/cleanup_worktree.sh`` refuses to
+#: remove the worktree (locked, no session log, etc.). The daemon does
+#: NOT bypass the safety check with ``--force`` — an operator sweep can
+#: clean up the worktree manually. This is also a terminal phase.
+PHASE_CLEANUP_BLOCKED = "cleanup_blocked"
+
+#: Hard wall-clock timeout for the ``scripts/cleanup_worktree.sh``
+#: subprocess. The script does at most a single ``git worktree remove``
+#: + a JSONL inspection — 60s is generous.
+CLEANUP_WORKTREE_SUBPROCESS_TIMEOUT_SECONDS = 60
+
+#: Hard timeout on the ``gh issue create`` subprocess used by the retro
+#: phase to file follow-up issues. Short — the call is a single write
+#: against github.com with no pagination.
+RETRO_GH_ISSUE_CREATE_TIMEOUT_SECONDS = 15
+
+#: Cap on retro issues filed per agent. A retro that wants to file more
+#: than this is a strong signal something is wrong (the skill is meant
+#: to identify high-signal findings, not generate process theater) —
+#: log + truncate to keep DB load bounded if the skill misbehaves.
+MAX_RETRO_ISSUES_PER_AGENT = 20
+
+#: Max length on retro issue body files passed via ``--body-file``.
+#: Matches the skill's own "keep each issue body under 3000 characters
+#: where possible" guidance with 5x headroom for edge cases. Strictly
+#: a defensive cap — the daemon truncates with a "[truncated]" suffix
+#: rather than failing the file write.
+MAX_RETRO_ISSUE_BODY_CHARS = 15000
+
+#: Default labels added to every retro-filed issue when the retro skill
+#: omits ``labels``. Kept tight — the skill's own ``labels`` array is
+#: the authoritative source; this is just the fallback.
+DEFAULT_RETRO_LABELS = ("type/dx", "agent/ready", "priority/p2")
 
 # --------------------------------------------------------------------------
 # Phase 3C — failure detection + retry machinery (issue #2791)
@@ -607,13 +669,33 @@ class DispatcherDaemon:
         * On SIGTERM / SIGINT, UPDATE ``dispatcher.runs.stopped_at`` and
           exit 0.
 
-    What this daemon still does **NOT** do (deferred to later 3.x):
-        * Stuck-timeout detection (no phase transition for >30min) —
-          tracked in 3C.
-        * Retry markers / backoff for crash recovery — 3C.
-        * Diagnoser tier 2/3 (judgment-required failure analysis) — 3D.
-        * Retro spawn + worktree cleanup + ``concurrency_cap=1`` flip
-          — 3E.
+    What this daemon still does **NOT** do:
+        * Flip ``concurrency_cap`` from 0 to 1 — that is an explicit
+          operator action documented in
+          ``docs/agent/infrastructure-reference.md``. Phase 3E added
+          all the orchestration plumbing but left the flip to a
+          human-approved cutover.
+
+    **Phase 3E (#2798)** completes the per-agent lifecycle by adding
+    two more advance branches to ``_advance_running_agents`` for
+    ``status='succeeded'`` agents:
+
+        * ``phase='done'`` → spawn ``/task-v2-retro`` and file every
+          retro issue it produced via ``gh issue create``. Transition
+          to ``phase='retro_done'`` on success or ``phase='retro_failed'``
+          on subprocess failure. ``status='succeeded'`` is preserved.
+        * ``phase IN ('retro_done', 'retro_failed')`` → run
+          ``scripts/cleanup_worktree.sh``. Transition to
+          ``phase='cleanup_done'`` on success or
+          ``phase='cleanup_blocked'`` on safety-check refusal. Per
+          CLAUDE.md §Critical Rules the daemon never bypasses with
+          ``--force`` — operators sweep blocked worktrees manually.
+
+    Phase 3E also adds **diagnoser effectiveness tracking** (spec §8
+    line 305) — ``_mark_agent_terminal`` writes the resolved outcome
+    back to any pending ``dispatcher.diagnoses`` rows for that agent
+    so the weekly report can measure "diagnoser recommended X →
+    outcome Y". Idempotent under repeated terminal transitions.
 
     **Phase 3B (#2787)** adds the post-PR transitions via
     ``_advance_running_agents``, invoked from the supervisor tick:
@@ -1655,13 +1737,16 @@ class DispatcherDaemon:
     ) -> None:
         """UPDATE ``dispatcher.agents`` with terminal status + metadata.
 
-        Used for ``succeeded``, ``failed``, and the Phase 3A post-PR
-        hand-off state (``status='running'``, ``phase='awaiting_ci'``).
-        For terminal statuses (``succeeded`` / ``failed``) also sets
-        ``ended_at`` so the admin page can compute duration.
+        Used for ``succeeded``, ``failed``, ``crashed``, and the
+        Phase 3A post-PR hand-off state (``status='running'``,
+        ``phase='awaiting_ci'``). For terminal statuses (``succeeded`` /
+        ``failed`` / ``crashed``) also sets ``ended_at`` so the admin
+        page can compute duration AND writes back the resolved outcome
+        to any pending ``dispatcher.diagnoses`` rows for this agent
+        (Phase 3E #2798, spec §8 line 305).
         """
         assert self._conn is not None, "connect() must run before update"
-        terminal = status in ("succeeded", "failed")
+        terminal = status in ("succeeded", "failed", "crashed")
         try:
             with self._conn.cursor() as cur:
                 if terminal:
@@ -1696,6 +1781,28 @@ class DispatcherDaemon:
                 self._conn.rollback()
             except Exception:  # pragma: no cover
                 pass
+            return
+
+        # Phase 3E (#2798): diagnoser effectiveness tracking. After the
+        # agent reaches a terminal status, write the outcome back to
+        # any ``dispatcher.diagnoses`` rows for this agent that don't
+        # yet have an outcome set. Idempotent — running twice produces
+        # the same state because we filter on ``outcome IS NULL``.
+        # Wrapped in its own try/except so a write-back failure cannot
+        # roll back the terminal-status update above.
+        if terminal:
+            try:
+                self._write_diagnosis_outcome_for_agent(agent_id, status)
+            except Exception:
+                self._log.exception(
+                    "daemon.diagnosis_outcome_write_failed",
+                    extra={
+                        "event": "diagnosis_outcome_write_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "status": status,
+                    },
+                )
 
     def _spawn_phase_subprocess(
         self, phase: str, worktree: Path, agent_id: str
@@ -2794,15 +2901,25 @@ class DispatcherDaemon:
     # the supervisor tick continues with the next agent.
 
     def _list_advanceable_agents(self) -> list[dict[str, Any]]:
-        """Return agents waiting on CI or deploy, ready for a state step.
+        """Return agents waiting for the next state-machine step.
 
-        SELECT rows with ``status='running'`` and
-        ``phase IN ('awaiting_ci', 'awaiting_deploy')``. Returns a list
-        of small dicts with the fields the advance methods need —
-        ``agent_id``, ``issue_number``, ``phase``, ``pr_number``,
-        ``worktree_path``, ``retries_used``. An empty list is
-        returned on DB error (with a rollback), so the supervisor tick
-        can continue without this work.
+        SELECT covers two distinct branches:
+
+        * ``status='running' AND phase IN ('awaiting_ci', 'awaiting_deploy')``
+          — Phase 3B's CI watch + deploy watch + verify chain.
+        * ``status='succeeded' AND phase IN ('done', 'retro_failed')``
+          — Phase 3E's post-success retro + cleanup chain. ``phase='done'``
+          rows trigger the retro phase; ``phase='retro_done'`` and
+          ``phase='retro_failed'`` rows trigger the worktree cleanup.
+
+        Returns a list of small dicts with the fields the advance methods
+        need — ``agent_id``, ``issue_number``, ``phase``, ``status``,
+        ``pr_number``, ``worktree_path``, ``retries_used``. An empty
+        list is returned on DB error (with a rollback), so the
+        supervisor tick can continue without this work.
+
+        Cleanup_done / cleanup_blocked are deliberately excluded — they
+        are terminal phases with no further advance to perform.
         """
         assert self._conn is not None, "connect() must run before reading"
 
@@ -2811,10 +2928,12 @@ class DispatcherDaemon:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
-                    "       worktree_path, retries_used "
+                    "       worktree_path, retries_used, status "
                     "FROM dispatcher.agents "
-                    "WHERE status = 'running' "
-                    "  AND phase IN ('awaiting_ci', 'awaiting_deploy') "
+                    "WHERE (status = 'running' "
+                    "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
+                    "   OR (status = 'succeeded' "
+                    "       AND phase IN ('done', 'retro_done', 'retro_failed')) "
                     "ORDER BY started_at ASC",
                 )
                 for row in cur.fetchall():
@@ -2826,6 +2945,7 @@ class DispatcherDaemon:
                             "pr_number": int(row[3]) if row[3] is not None else None,
                             "worktree_path": str(row[4]),
                             "retries_used": int(row[5]) if row[5] is not None else 0,
+                            "status": str(row[6]) if len(row) > 6 else "running",
                         }
                     )
             self._conn.commit()
@@ -2867,18 +2987,40 @@ class DispatcherDaemon:
         for agent in agents:
             agent_id = agent["agent_id"]
             phase = agent["phase"]
+            status = agent.get("status", "running")
             try:
                 if phase == "awaiting_ci":
                     self._advance_awaiting_ci(agent)
                 elif phase == "awaiting_deploy":
                     self._advance_awaiting_deploy(agent)
+                elif phase == "done" and status == "succeeded":
+                    # Phase 3E (#2798): post-success retro phase.
+                    # ``status='succeeded'`` is preserved across this
+                    # advance — the retro is bookkeeping for a
+                    # successful run, not part of the success itself.
+                    self._run_retro_phase(agent)
+                elif (
+                    phase in (PHASE_RETRO_DONE, PHASE_RETRO_FAILED)
+                    and status == "succeeded"
+                ):
+                    # Phase 3E (#2798): post-retro worktree cleanup.
+                    # Fires regardless of whether the retro itself
+                    # succeeded or failed — both phases mean "the agent
+                    # is done with all the LLM work".
+                    self._cleanup_agent_worktree(agent)
                 else:  # pragma: no cover — SELECT filter guarantees this
                     continue
                 advanced += 1
             except Exception as exc:
                 # Unhandled exception in one agent's advance must not
-                # stall the daemon. Flip to ``status='crashed'`` so 3C
-                # picks it up with a fresh worktree.
+                # stall the daemon. For ``status='running'`` agents,
+                # flip to ``status='crashed'`` so 3C picks it up with a
+                # fresh worktree. For ``status='succeeded'`` agents
+                # (Phase 3E retro/cleanup branches), keep the success
+                # status — only log the failure. The agent itself
+                # succeeded; an unexpected exception in the post-success
+                # bookkeeping should not retroactively flip it to
+                # crashed.
                 self._log.exception(
                     "daemon.advance_failed",
                     extra={
@@ -2886,15 +3028,27 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                         "agent_id": agent_id,
                         "phase": phase,
+                        "status": status,
                         "detail": str(exc),
                     },
                 )
-                self._mark_agent_terminal(
-                    agent_id,
-                    status="crashed",
-                    phase=phase,
-                    exit_code=None,
-                )
+                if status == "succeeded":
+                    # Mark the post-success phase failed without
+                    # touching the success status. retro phase failure
+                    # → flip to retro_failed so cleanup still runs;
+                    # cleanup phase failure → flip to cleanup_blocked
+                    # so an operator can investigate.
+                    if phase == "done":
+                        self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+                    elif phase in (PHASE_RETRO_DONE, PHASE_RETRO_FAILED):
+                        self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
+                else:
+                    self._mark_agent_terminal(
+                        agent_id,
+                        status="crashed",
+                        phase=phase,
+                        exit_code=None,
+                    )
         return advanced
 
     # ── awaiting_ci branch ──────────────────────────────────────────────
@@ -4100,6 +4254,766 @@ class DispatcherDaemon:
                 "evidence_chars": len(evidence_md),
             },
         )
+
+    # ── Phase 3E retro orchestration + worktree cleanup (issue #2798) ──
+    #
+    # After an agent reaches ``status='succeeded' AND phase='done'``
+    # (the verify-success path in Phase 3B), the supervisor tick drives
+    # two more state-machine steps:
+    #
+    #   1. Retro phase. ``_run_retro_phase`` builds the input bundle
+    #      for ``/task-v2-retro``, spawns the subprocess, reads the
+    #      output, and files each retro issue via ``gh issue create``.
+    #      Transitions to ``phase='retro_done'`` on success or
+    #      ``phase='retro_failed'`` on subprocess failure.
+    #   2. Worktree cleanup. ``_cleanup_agent_worktree`` runs
+    #      ``scripts/cleanup_worktree.sh``. Transitions to
+    #      ``phase='cleanup_done'`` on success or
+    #      ``phase='cleanup_blocked'`` on safety-check refusal.
+    #      Never bypasses with ``--force`` (CLAUDE.md §Critical Rules).
+    #
+    # Both branches preserve ``status='succeeded'`` — the agent itself
+    # succeeded; only the post-success bookkeeping varies.
+
+    def _run_retro_phase(self, agent: dict[str, Any]) -> None:
+        """Spawn ``/task-v2-retro`` and file any retro issues it produces.
+
+        Reads ``dispatcher.phase_transitions`` + ``dispatcher.failures``
+        for this agent, writes the retro input bundle, runs the
+        subprocess, parses the output, and calls ``gh issue create``
+        once per entry in ``retro_issues``. Transitions the agent's
+        phase to :data:`PHASE_RETRO_DONE` on success or
+        :data:`PHASE_RETRO_FAILED` on subprocess / parse failure.
+
+        ``status='succeeded'`` is preserved across this advance — the
+        retro is bookkeeping for an already-successful run.
+        """
+        agent_id = agent["agent_id"]
+        issue_number = agent["issue_number"]
+        pr_number = agent.get("pr_number")
+        worktree = Path(agent["worktree_path"])
+
+        # Best-effort defense: if the worktree directory is gone (e.g.
+        # an operator manually removed it before retro ran), skip
+        # straight to cleanup_done — there is no LLM to spawn against.
+        if not worktree.exists():
+            self._log.warning(
+                "daemon.retro_worktree_missing",
+                extra={
+                    "event": "retro_worktree_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "worktree_path": str(worktree),
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_CLEANUP_DONE)
+            return
+
+        # Build the retro input bundle. The retro skill's SKILL.md
+        # documents the contract — we satisfy the required fields and
+        # the optional ones we can derive cheaply from DB state.
+        retro_input = self._build_retro_input(agent)
+        self._write_phase_input(worktree, "retro", retro_input)
+
+        self._log.info(
+            "daemon.retro_started",
+            extra={
+                "event": "retro_started",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "ralph_iterations": retro_input.get("ralph_iterations"),
+                "ci_attempts": retro_input.get("ci_attempts"),
+            },
+        )
+
+        # Spawn the retro subprocess. Failure here flips to retro_failed
+        # but does NOT touch the agent's succeeded status.
+        try:
+            exit_code, duration_s = self._spawn_phase_subprocess(
+                "retro", worktree, agent_id
+            )
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.retro_timeout",
+                extra={
+                    "event": "retro_timeout",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            return
+        except (FileNotFoundError, OSError) as exc:
+            self._log.warning(
+                "daemon.retro_subprocess_error",
+                extra={
+                    "event": "retro_subprocess_error",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "detail": str(exc),
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            return
+
+        if exit_code != 0:
+            self._log.warning(
+                "daemon.retro_nonzero_exit",
+                extra={
+                    "event": "retro_nonzero_exit",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "exit_code": exit_code,
+                    "duration_s": duration_s,
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            return
+
+        retro_output = self._read_phase_output(worktree, "retro")
+        if retro_output is None:
+            self._log.warning(
+                "daemon.retro_output_missing",
+                extra={
+                    "event": "retro_output_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            return
+
+        # Persist the retro output to dispatcher.phase_outputs +
+        # phase_transitions so the admin page sees the run.
+        self._persist_phase_output(agent_id, "retro", retro_output)
+
+        # File the retro issues. Each entry becomes a separate
+        # ``gh issue create``. Honour the per-agent cap defensively —
+        # the skill is supposed to produce only high-signal findings.
+        retro_issues = retro_output.get("retro_issues") or []
+        if not isinstance(retro_issues, list):
+            retro_issues = []
+        if len(retro_issues) > MAX_RETRO_ISSUES_PER_AGENT:
+            self._log.warning(
+                "daemon.retro_issue_cap_truncate",
+                extra={
+                    "event": "retro_issue_cap_truncate",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_count": len(retro_issues),
+                    "cap": MAX_RETRO_ISSUES_PER_AGENT,
+                },
+            )
+            retro_issues = retro_issues[:MAX_RETRO_ISSUES_PER_AGENT]
+
+        filed = 0
+        for entry in retro_issues:
+            if not isinstance(entry, dict):
+                continue
+            new_issue = self._file_retro_issue(agent_id, worktree, entry)
+            if new_issue is not None:
+                filed += 1
+
+        self._update_agent_phase(agent_id, PHASE_RETRO_DONE)
+        self._log.info(
+            "daemon.retro_done",
+            extra={
+                "event": "retro_done",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "no_findings": bool(retro_output.get("no_findings")),
+                "issues_filed": filed,
+                "issues_attempted": len(retro_issues),
+                "duration_s": duration_s,
+            },
+        )
+
+    def _build_retro_input(self, agent: dict[str, Any]) -> dict[str, Any]:
+        """Assemble the input bundle the retro skill reads.
+
+        Pulls ``phase_transitions`` + ``failures`` for this agent from
+        the DB, plus a few summary counters derived from those rows.
+        Optional fields like ``scope_check_followups`` /
+        ``plan_follow_ups`` are populated when the corresponding
+        ``dispatcher.phase_outputs`` row exists; missing data is fine
+        (the retro skill tolerates missing optional fields).
+        """
+        agent_id = agent["agent_id"]
+        worktree_path = str(agent["worktree_path"])
+
+        phase_transitions = self._fetch_phase_transitions(agent_id)
+        failures = self._fetch_failures_grouped(agent_id)
+
+        # Derive counters from the persisted phase_transitions log.
+        ralph_iterations = sum(
+            1 for p in phase_transitions if p.get("phase") == "ralph"
+        )
+        ci_attempts = sum(
+            1 for p in phase_transitions if p.get("phase") == "awaiting_ci"
+        )
+        fix_ci_attempts = sum(
+            1 for p in phase_transitions if p.get("phase") == "fix_ci"
+        )
+        # Floor of 1 for ralph_iterations + ci_attempts so a clean
+        # single-pass run still satisfies the retro skill's
+        # short-circuit (== 1) check. A successful agent ran ralph
+        # at least once and CI at least once even if the daemon's
+        # phase log only captured a single transition row.
+        if ralph_iterations < 1:
+            ralph_iterations = 1
+        if ci_attempts < 1:
+            ci_attempts = 1
+
+        # Wall-clock duration from started_at to now (the retro phase
+        # itself counts as the verify-completed marker — close enough
+        # for the weekly report).
+        total_duration_s = self._fetch_agent_total_duration_s(agent_id)
+
+        # Best-effort scope-check + plan-follow-ups extraction from the
+        # persisted plan output, if present.
+        plan_output = self._fetch_phase_output(agent_id, "plan")
+        scope_check_followups = []
+        plan_follow_ups = []
+        if isinstance(plan_output, dict):
+            scope_raw = plan_output.get("scope_check_followups") or []
+            if isinstance(scope_raw, list):
+                scope_check_followups = [str(x) for x in scope_raw if x]
+            follow_raw = (
+                plan_output.get("follow_ups")
+                or plan_output.get("plan_follow_ups")
+                or []
+            )
+            if isinstance(follow_raw, list):
+                plan_follow_ups = [str(x) for x in follow_raw if x]
+
+        # Verify evidence — derived from the verify phase output if
+        # persisted. The retro skill uses this to summarize the run
+        # for the weekly report.
+        verify_output = self._fetch_phase_output(agent_id, "verify")
+        verify_evidence_md = ""
+        if isinstance(verify_output, dict):
+            verify_evidence_md = str(verify_output.get("evidence_md") or "")
+
+        # diff_stats is left empty — it's optional in the retro
+        # contract and would require shelling out to git just for the
+        # input bundle. The retro skill tolerates missing fields.
+        diff_stats: dict[str, int] = {
+            "files_changed": 0,
+            "insertions": 0,
+            "deletions": 0,
+        }
+
+        return {
+            "agent_id": agent_id,
+            "issue_number": agent["issue_number"],
+            "pr_number": agent.get("pr_number"),
+            "phase_transitions": phase_transitions,
+            "failures": failures,
+            "ralph_iterations": ralph_iterations,
+            "ci_attempts": ci_attempts,
+            "fix_ci_attempts": fix_ci_attempts,
+            "total_duration_s": total_duration_s,
+            "diff_stats": diff_stats,
+            "worktree_path": worktree_path,
+            "repo_root": worktree_path,
+            "scope_check_followups": scope_check_followups,
+            "plan_follow_ups": plan_follow_ups,
+            "verify_evidence_md": verify_evidence_md,
+        }
+
+    def _fetch_phase_transitions(self, agent_id: str) -> list[dict[str, Any]]:
+        """SELECT ``dispatcher.phase_transitions`` rows for this agent.
+
+        Returns oldest-first list of ``{phase, ts}`` dicts. ``ts`` is
+        ISO-8601 string. Empty list on DB error (logged + rolled back).
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT phase, ts FROM dispatcher.phase_transitions "
+                    "WHERE agent_id = %s ORDER BY ts ASC",
+                    (agent_id,),
+                )
+                for row in cur.fetchall():
+                    rows.append(
+                        {
+                            "phase": str(row[0]) if row[0] is not None else "",
+                            "ts": (
+                                row[1].isoformat()
+                                if hasattr(row[1], "isoformat")
+                                else str(row[1])
+                            ),
+                        }
+                    )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.fetch_phase_transitions_failed",
+                extra={
+                    "event": "fetch_phase_transitions_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+        return rows
+
+    def _fetch_failures_grouped(self, agent_id: str) -> list[dict[str, Any]]:
+        """SELECT ``dispatcher.failures`` rows grouped by category for this agent.
+
+        Returns list of ``{category, count, first_seen, last_seen}``
+        dicts. Empty list on DB error.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT category, count(*), min(ts), max(ts) "
+                    "FROM dispatcher.failures "
+                    "WHERE agent_id = %s "
+                    "GROUP BY category "
+                    "ORDER BY count(*) DESC",
+                    (agent_id,),
+                )
+                for row in cur.fetchall():
+                    rows.append(
+                        {
+                            "category": str(row[0]) if row[0] is not None else "",
+                            "count": int(row[1] or 0),
+                            "first_seen": (
+                                row[2].isoformat()
+                                if hasattr(row[2], "isoformat")
+                                else str(row[2])
+                            ),
+                            "last_seen": (
+                                row[3].isoformat()
+                                if hasattr(row[3], "isoformat")
+                                else str(row[3])
+                            ),
+                        }
+                    )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.fetch_failures_failed",
+                extra={
+                    "event": "fetch_failures_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+        return rows
+
+    def _fetch_agent_total_duration_s(self, agent_id: str) -> int:
+        """Compute wall-clock seconds since the agent claimed."""
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXTRACT(EPOCH FROM (now() - started_at))::int "
+                    "FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.fetch_duration_failed",
+                extra={
+                    "event": "fetch_duration_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
+    def _fetch_phase_output(self, agent_id: str, phase: str) -> dict[str, Any] | None:
+        """SELECT a single ``dispatcher.phase_outputs`` row JSON, or None."""
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT output_json FROM dispatcher.phase_outputs "
+                    "WHERE agent_id = %s AND phase = %s",
+                    (agent_id, phase),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.fetch_phase_output_failed",
+                extra={
+                    "event": "fetch_phase_output_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": phase,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None:
+            return None
+        raw = row[0]
+        # psycopg returns JSONB as already-parsed Python objects when
+        # the connection is configured normally. Guard against the
+        # JSON-as-string case for tests that pass strings through.
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    def _file_retro_issue(
+        self,
+        agent_id: str,
+        worktree: Path,
+        entry: dict[str, Any],
+    ) -> int | None:
+        """Run ``gh issue create`` for one retro issue body.
+
+        Returns the new issue number on success, ``None`` on failure.
+        Failures log a warning but do not raise — one bad retro entry
+        should not block the others or stop the cleanup phase.
+        """
+        title = str(entry.get("title") or "").strip()
+        body = str(entry.get("body") or "").strip()
+        if not title or not body:
+            self._log.warning(
+                "daemon.retro_issue_missing_fields",
+                extra={
+                    "event": "retro_issue_missing_fields",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "has_title": bool(title),
+                    "has_body": bool(body),
+                },
+            )
+            return None
+
+        # Defensive truncation on body length.
+        if len(body) > MAX_RETRO_ISSUE_BODY_CHARS:
+            body = body[:MAX_RETRO_ISSUE_BODY_CHARS] + "\n\n[truncated]"
+
+        labels = entry.get("labels")
+        if not isinstance(labels, list) or not labels:
+            labels = list(DEFAULT_RETRO_LABELS)
+        labels = [str(label) for label in labels if label]
+
+        # Write body to a tmp file (no heredocs / inline body per
+        # CLAUDE.md). One file per retro issue keeps reads idempotent.
+        body_dir = worktree / "tmp" / "dispatcher-retro"
+        try:
+            body_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._log.warning(
+                "daemon.retro_body_dir_failed",
+                extra={
+                    "event": "retro_body_dir_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "detail": str(exc),
+                },
+            )
+            return None
+
+        # Filename uses a uuid suffix so multiple retro entries don't
+        # collide on disk if their titles happen to slugify the same.
+        body_path = body_dir / f"retro-{uuid.uuid4().hex[:8]}.md"
+        try:
+            body_path.write_text(body, encoding="utf-8")
+        except OSError as exc:
+            self._log.warning(
+                "daemon.retro_body_write_failed",
+                extra={
+                    "event": "retro_body_write_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "detail": str(exc),
+                },
+            )
+            return None
+
+        cmd = [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            self._cfg.github_repo,
+            "--title",
+            title,
+            "--body-file",
+            str(body_path),
+        ]
+        for label in labels:
+            cmd.extend(["--label", label])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=RETRO_GH_ISSUE_CREATE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.retro_issue_create_subprocess_error",
+                extra={
+                    "event": "retro_issue_create_subprocess_error",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "title": title,
+                    "detail": str(exc),
+                },
+            )
+            return None
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.retro_issue_create_failed",
+                extra={
+                    "event": "retro_issue_create_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "title": title,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "")[:200],
+                },
+            )
+            return None
+
+        # ``gh issue create`` prints the issue URL on stdout. Parse the
+        # trailing ``/issues/<N>`` segment for logging.
+        new_issue_number = self._parse_issue_url(result.stdout or "")
+        self._log.info(
+            "daemon.retro_issue_created",
+            extra={
+                "event": "retro_issue_created",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "title": title,
+                "labels": labels,
+                "new_issue_number": new_issue_number,
+            },
+        )
+        return new_issue_number
+
+    @staticmethod
+    def _parse_issue_url(stdout: str) -> int | None:
+        """Extract the trailing ``/issues/<N>`` integer from a gh URL."""
+        import re  # noqa: PLC0415 — lazy import
+
+        match = re.search(r"/issues/(\d+)", stdout)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):  # pragma: no cover — regex guarantees digits
+            return None
+
+    def _cleanup_agent_worktree(self, agent: dict[str, Any]) -> None:
+        """Run ``scripts/cleanup_worktree.sh`` against the agent's worktree.
+
+        Transitions to :data:`PHASE_CLEANUP_DONE` on success or
+        :data:`PHASE_CLEANUP_BLOCKED` on safety-check refusal. Per
+        CLAUDE.md §Critical Rules, never bypass with ``--force`` —
+        an operator can sweep blocked worktrees manually.
+        """
+        agent_id = agent["agent_id"]
+        worktree_path = str(agent.get("worktree_path") or "")
+
+        if not worktree_path:
+            self._log.warning(
+                "daemon.cleanup_missing_worktree_path",
+                extra={
+                    "event": "cleanup_missing_worktree_path",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
+            return
+
+        # Worktree may already be gone (operator manually cleaned, or
+        # cleanup ran in a prior tick that crashed before phase update).
+        # Treat missing-directory as cleanup_done — there's nothing
+        # left to remove.
+        if not Path(worktree_path).exists():
+            self._log.info(
+                "daemon.cleanup_already_gone",
+                extra={
+                    "event": "cleanup_already_gone",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "worktree_path": worktree_path,
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_CLEANUP_DONE)
+            return
+
+        repo_root = self._repo_root()
+        cleanup_script = repo_root / "scripts" / "cleanup_worktree.sh"
+
+        if not cleanup_script.exists():
+            self._log.warning(
+                "daemon.cleanup_script_missing",
+                extra={
+                    "event": "cleanup_script_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "expected_path": str(cleanup_script),
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
+            return
+
+        try:
+            result = subprocess.run(
+                [str(cleanup_script), worktree_path],
+                capture_output=True,
+                text=True,
+                timeout=CLEANUP_WORKTREE_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.cleanup_subprocess_error",
+                extra={
+                    "event": "cleanup_subprocess_error",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "worktree_path": worktree_path,
+                    "detail": str(exc),
+                },
+            )
+            self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
+            return
+
+        if result.returncode == 0:
+            self._update_agent_phase(agent_id, PHASE_CLEANUP_DONE)
+            self._log.info(
+                "daemon.cleanup_done",
+                extra={
+                    "event": "cleanup_done",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "worktree_path": worktree_path,
+                },
+            )
+            return
+
+        # Non-zero exit means the safety check refused (locked / no
+        # session log / etc.). Per CLAUDE.md §Critical Rules, do NOT
+        # bypass with ``--force``. An operator can sweep manually.
+        self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
+        self._log.warning(
+            "daemon.cleanup_blocked",
+            extra={
+                "event": "cleanup_blocked",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "worktree_path": worktree_path,
+                "exit_code": result.returncode,
+                "stderr_tail": (result.stderr or "").strip()[:200],
+                "stdout_tail": (result.stdout or "").strip()[:200],
+            },
+        )
+
+    def _write_diagnosis_outcome_for_agent(
+        self, agent_id: str, final_status: str
+    ) -> None:
+        """Write back the resolved outcome to pending diagnoser rows.
+
+        Per spec §8 line 305: "once a retry resolves (success,
+        escalation, or close), its outcome is written back to
+        ``dispatcher.diagnoses.outcome``."
+
+        Updates ``dispatcher.diagnoses.outcome`` for any rows where
+        ``agent_id = %s AND outcome IS NULL`` with the JSONB shape::
+
+            {
+              "retry_outcome": "succeeded" | "failed",
+              "final_status":  "<agent.status>",
+              "resolved_at":   "<ISO-8601 ts>"
+            }
+
+        Idempotent — the ``outcome IS NULL`` predicate prevents a
+        repeat call from overwriting existing outcome data.
+        """
+        assert self._conn is not None, "connect() must run before update"
+
+        retry_outcome = "succeeded" if final_status == "succeeded" else "failed"
+        outcome = {
+            "retry_outcome": retry_outcome,
+            "final_status": final_status,
+            "resolved_at": _now_iso(),
+        }
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.diagnoses "
+                    "SET outcome = %s::jsonb "
+                    "WHERE agent_id = %s AND outcome IS NULL",
+                    (json.dumps(outcome), agent_id),
+                )
+                rowcount = cur.rowcount or 0
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnosis_outcome_update_failed",
+                extra={
+                    "event": "diagnosis_outcome_update_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "final_status": final_status,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return
+
+        if rowcount > 0:
+            self._log.info(
+                "daemon.diagnosis_outcome_written",
+                extra={
+                    "event": "diagnosis_outcome_written",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "final_status": final_status,
+                    "retry_outcome": retry_outcome,
+                    "rows_updated": rowcount,
+                },
+            )
 
     # ── Phase 3C failure detection + retry machinery (supervisor-tick) ─
     #
