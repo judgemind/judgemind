@@ -22,6 +22,11 @@
     -d @{worktree}/tmp/query.json
   ```
 - **No quoted strings in compound shell commands:** a hook rejects commands that contain quoted characters combined with `&&` or `;`. Split into separate tool calls.
+- **Never bare `git stash pop` / `git stash apply` — the stash list is shared across worktrees:** `git stash` stores refs in `$GIT_DIR/refs/stash`, which is a single per-clone stack. Every worktree in the clone sees the same stash list, so a bare `git stash pop` in worktree A can silently apply a stash that was created by worktree B (or by an agent that was cleaned up weeks ago). The current worktree's edits get overwritten, and the other agent's WIP lands in your diff — where `git add -A` or similar broad staging can push it into your next commit. Observed during #2746 (see #2749). **Safer patterns:**
+  1. **Pop by explicit ref.** Run `git stash list --pretty=format:'%gd %s'` first, confirm the `stash@{0}` subject contains your current branch name, then pop with the explicit ref: `git stash pop stash@{0}`. Never trust `stash@{0}` without checking its subject.
+  2. **Skip stash entirely — use a throwaway commit.** `git commit -am "WIP"` → do the thing → `git reset --soft HEAD~1`. Throwaway commits live only on the worktree branch, have no shared global state, and can't be clobbered by a sibling worktree.
+
+  The preflight hook (`.claude/hooks/preflight-bash.sh` Check 12) blocks bare `git stash pop` and `git stash apply`. `git stash list`, `git stash show`, `git stash push`, `git stash drop`, and `git stash clear` are all allowed.
 - **Backgrounding long-running processes (daemons, watchers):** NEVER use shell `&`, `nohup`, `disown`, or multicommand tricks like `cmd 2>&1 & echo "done"`. These require compound commands that cannot be allowlisted and always trigger permission prompts. Use the Bash tool's `run_in_background: true` parameter instead — it runs the command as a background task natively, with no shell tricks needed.
 - **Writing to `.claude/` directories (skills, hooks, settings):** The Claude Code platform has a built-in deny on the `.claude/` directory — the Edit and Write tools will fail on any path under `.claude/`. This is a CLI-level restriction, not a user permission setting. To modify files in `.claude/`:
   1. Write the content to `{worktree}/tmp/` using the Write tool.

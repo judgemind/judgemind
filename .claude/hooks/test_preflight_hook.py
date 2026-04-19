@@ -765,6 +765,138 @@ run_test(
     cwd_override=WORKTREE_CWD,
 )
 
+# --- Check 12: bare git stash pop / git stash apply (#2749) ---
+# The stash list is shared across all worktrees in a clone, so a bare `git
+# stash pop` can silently apply a stash created by a different worktree — see
+# #2749 for the incident. Require an explicit stash@{N} reference.
+print("\nCheck 12: bare git stash pop / git stash apply (#2749)")
+
+# Bare pop / apply — should be BLOCKED
+run_test(
+    "bare 'git stash pop' blocked (#2749 AC1)",
+    "git stash pop",
+    2,
+)
+run_test(
+    "bare 'git stash apply' blocked (#2749 AC1)",
+    "git stash apply",
+    2,
+)
+run_test(
+    "'git stash pop --quiet' without ref blocked (flags don't count as refs)",
+    "git stash pop --quiet",
+    2,
+)
+run_test(
+    "'git stash apply --index' without ref blocked",
+    "git stash apply --index",
+    2,
+)
+run_test(
+    "'git -C /path stash pop' without ref blocked",
+    "git -C /some/worktree stash pop",
+    2,
+)
+run_test(
+    "'git -C /path stash apply' without ref blocked",
+    "git -C /some/worktree stash apply",
+    2,
+)
+
+# Explicit stash@{N} reference — should be ALLOWED
+run_test(
+    "'git stash pop stash@{0}' with explicit ref allowed (#2749 AC2)",
+    "git stash pop stash@{0}",
+    0,
+)
+run_test(
+    "'git stash pop stash@{2}' with higher index allowed",
+    "git stash pop stash@{2}",
+    0,
+)
+run_test(
+    "'git stash apply stash@{0}' with explicit ref allowed",
+    "git stash apply stash@{0}",
+    0,
+)
+run_test(
+    "'git stash pop --quiet stash@{0}' with ref + flag allowed",
+    "git stash pop --quiet stash@{0}",
+    0,
+)
+run_test(
+    "'git -C /path stash pop stash@{0}' with -C + ref allowed",
+    "git -C /some/worktree stash pop stash@{0}",
+    0,
+)
+
+# Non-pop/apply stash subcommands — should be ALLOWED even without a ref
+run_test(
+    "'git stash list' allowed (not a pop/apply)",
+    "git stash list",
+    0,
+)
+run_test(
+    "'git stash show' allowed",
+    "git stash show",
+    0,
+)
+run_test(
+    "'git stash push' allowed (creates, does not apply)",
+    "git stash push -m 'WIP on my-branch'",
+    0,
+)
+run_test(
+    "'git stash push --include-untracked' allowed",
+    "git stash push --include-untracked -m 'WIP'",
+    0,
+)
+run_test(
+    "'git stash drop stash@{0}' allowed (drop is not apply)",
+    "git stash drop stash@{0}",
+    0,
+)
+run_test(
+    "'git stash drop' without ref allowed (drops top of stack, not apply)",
+    "git stash drop",
+    0,
+)
+run_test(
+    "'git stash clear' allowed",
+    "git stash clear",
+    0,
+)
+# Unrelated commands that happen to contain the word 'stash' in a filename or
+# string must NOT trigger the check.
+run_test(
+    "'git add stash-helper.sh' allowed (filename contains stash)",
+    "git add scripts/stash-helper.sh",
+    0,
+)
+run_test(
+    "'git log --grep=stash' allowed (flag value contains stash)",
+    "git log --grep=stash",
+    0,
+)
+# The string "git stash pop" inside a quoted argument (e.g. PR title,
+# commit message) must not falsely trigger the check. Check 12 uses
+# $STRIPPED_COMMAND to exclude quoted content.
+run_test(
+    "'git stash pop' inside double-quoted PR title allowed (#2749)",
+    f"gh pr create --title {DQ}block bare git stash pop / apply{DQ} --body-file tmp/b.txt",
+    0,
+)
+run_test(
+    "'git stash apply' inside single-quoted commit message allowed (#2749)",
+    f"git commit -m {SQ}docs: mention git stash apply in note{SQ}",
+    0,
+)
+run_test(
+    "'git stash pop' inside body-file arg allowed (#2749)",
+    f"echo {DQ}description of git stash pop{DQ} > tmp/body.txt",
+    0,
+)
+
 # --- Summary ---
 print(f"\n{'='*50}")
 print(f"Results: {passed} passed, {failed} failed")
