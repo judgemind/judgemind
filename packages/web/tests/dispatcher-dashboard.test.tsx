@@ -292,5 +292,41 @@ describe('DispatcherDashboard', () => {
     mockQueryResult.error = new Error('network');
     render(<DispatcherDashboard />);
     expect(screen.getByText(/Failed to load dispatcher state/i)).toBeInTheDocument();
+    // Stale indicator is only shown when we have cached state — on
+    // initial-load failure the full error banner takes over instead
+    // (#2842).
+    expect(screen.queryByTestId('dispatcher-stale-indicator')).not.toBeInTheDocument();
+  });
+
+  it('keeps rendering the dashboard with a stale indicator when a polling refetch fails (#2842)', () => {
+    // Simulate Apollo's polling contract: `data` from the last successful
+    // fetch stays populated while `error` reflects the latest failure.
+    mockQueryResult.data = makeActiveState();
+    mockQueryResult.loading = false;
+    mockQueryResult.error = new Error('network blip');
+    render(<DispatcherDashboard />);
+    // Dashboard is still rendered — no ErrorBanner takeover.
+    expect(screen.getByRole('heading', { level: 1, name: /Dispatcher/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Failed to load dispatcher state/i)).not.toBeInTheDocument();
+    // Cached content is still visible (active agents row from makeActiveState).
+    expect(screen.getByText(/Active agents \(1\)/)).toBeInTheDocument();
+    // Stale indicator is visible so the operator knows the latest poll failed.
+    expect(screen.getByTestId('dispatcher-stale-indicator')).toBeInTheDocument();
+  });
+
+  it('clears the stale indicator when the next poll succeeds (#2842)', () => {
+    // First render: transient poll failure after a successful load.
+    mockQueryResult.data = makeActiveState();
+    mockQueryResult.loading = false;
+    mockQueryResult.error = new Error('network blip');
+    const { rerender } = render(<DispatcherDashboard />);
+    expect(screen.getByTestId('dispatcher-stale-indicator')).toBeInTheDocument();
+    // Second render: the next poll succeeds, so `error` clears while
+    // `data` stays populated.
+    mockQueryResult.error = undefined;
+    rerender(<DispatcherDashboard />);
+    expect(screen.queryByTestId('dispatcher-stale-indicator')).not.toBeInTheDocument();
+    // Dashboard is still rendered and there was no retry click.
+    expect(screen.getByRole('heading', { level: 1, name: /Dispatcher/i })).toBeInTheDocument();
   });
 });
