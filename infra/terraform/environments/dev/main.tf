@@ -189,6 +189,49 @@ module "ses" {
   sending_domain = "judgemind.org"
 }
 
+# ─── Dispatcher daemon (dispatcher v2, Phase 1) ─────────────────────────────
+# Per `docs/specs/dispatcher-v2-spec.md` §14. Landed at `desired_count=0` —
+# service, task definition, IAM, log group, and heartbeat alarm all exist,
+# but nothing runs until sub-task C (#2729) publishes the real image and
+# Phase 2 flips the replica count.
+#
+# Secrets wiring is deferred: the operator provisions
+# `judgemind/dev/dispatcher/*` secrets manually once this module merges.
+# Issue #2700 provisions the scoped `GITHUB_TOKEN` PAT. Leaving the ARNs as
+# empty strings until then is safe — the module's task definition uses
+# `compact()` to skip any unset secret and the service is inert at
+# `desired_count=0` anyway.
+module "dispatcher_daemon" {
+  source = "../../modules/dispatcher-daemon"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  ecs_cluster_arn    = module.compute.cluster_arn
+  ecr_repository_url = module.ecr.repository_url
+
+  # Phase 1 = inert. Flipped to 1 in Phase 2 (shadow mode). Never > 1.
+  desired_count = 0
+
+  # Secret ARNs — all empty during Phase 1. Operator populates after the
+  # module lands; wiring happens in sub-tasks C (#2729) / #2700 / follow-up
+  # telegram + dispatcher-role DB secret from sub-task A (#2727).
+  anthropic_api_key_secret_arn  = ""
+  db_connection_secret_arn      = ""
+  github_token_secret_arn       = ""
+  telegram_bot_token_secret_arn = ""
+  gemini_api_key_secret_arn     = ""
+
+  github_repo = "judgemind/judgemind"
+
+  # Heartbeat alarm wired to the shared SNS topic once the daemon starts
+  # emitting HeartbeatAge (Phase 2). Kept enabled in Phase 1 so the alarm
+  # resource lands with the rest of the module; `treat_missing_data =
+  # notBreaching` on the alarm keeps it from paging while desired_count=0.
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
+}
+
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url
@@ -367,4 +410,24 @@ output "api_alb_arn_suffix" {
 output "api_target_group_arn_suffix" {
   description = "Dev API target group ARN suffix (for CloudWatch metric queries)"
   value       = module.api_service.target_group_arn_suffix
+}
+
+output "dispatcher_daemon_service_name" {
+  description = "Dev dispatcher daemon ECS service name (Phase 1: desired_count=0)"
+  value       = module.dispatcher_daemon.service_name
+}
+
+output "dispatcher_daemon_log_group" {
+  description = "Dev CloudWatch log group for dispatcher daemon output"
+  value       = module.dispatcher_daemon.log_group_name
+}
+
+output "dispatcher_daemon_task_role_arn" {
+  description = "Dev dispatcher daemon task role ARN (assumed by the container at runtime)"
+  value       = module.dispatcher_daemon.task_role_arn
+}
+
+output "dispatcher_daemon_security_group_id" {
+  description = "Dev dispatcher daemon security group ID"
+  value       = module.dispatcher_daemon.security_group_id
 }
