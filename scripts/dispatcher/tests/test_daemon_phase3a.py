@@ -817,7 +817,10 @@ class TestHappyPathOrchestration:
 
         # 1. Queue snapshot read returns one candidate.
         # 2. _issue_already_attempted SELECT returns None (not attempted).
-        conn.cursor_instance.fetch_queue = [([42],), None]
+        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
+        # retrying agent; (2) latest queue_snapshot issue_numbers;
+        # (3) _issue_already_attempted SELECT — not attempted.
+        conn.cursor_instance.fetch_queue = [None, ([42],), None]
 
         # Trust check passes.
         def fake_check_run(cmd: list[str], **kwargs: Any) -> Any:
@@ -981,7 +984,10 @@ class TestPlanGoFalse:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [([42],), None]
+        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
+        # retrying agent; (2) latest queue_snapshot issue_numbers;
+        # (3) _issue_already_attempted SELECT — not attempted.
+        conn.cursor_instance.fetch_queue = [None, ([42],), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
@@ -1047,7 +1053,10 @@ class TestPlanGoFalse:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [([42],), None]
+        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
+        # retrying agent; (2) latest queue_snapshot issue_numbers;
+        # (3) _issue_already_attempted SELECT — not attempted.
+        conn.cursor_instance.fetch_queue = [None, ([42],), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
@@ -1113,7 +1122,10 @@ class TestPlanGoFalse:
 class TestRalphBlocked:
     def test_ralph_blocked_marks_failed(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [([42],), None]
+        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
+        # retrying agent; (2) latest queue_snapshot issue_numbers;
+        # (3) _issue_already_attempted SELECT — not attempted.
+        conn.cursor_instance.fetch_queue = [None, ([42],), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
@@ -1190,7 +1202,10 @@ class TestSubprocessNonZeroExit:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [([42],), None]
+        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
+        # retrying agent; (2) latest queue_snapshot issue_numbers;
+        # (3) _issue_already_attempted SELECT — not attempted.
+        conn.cursor_instance.fetch_queue = [None, ([42],), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
@@ -1252,7 +1267,10 @@ class TestClaimRace:
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         # Snapshot has one issue, not-attempted check returns None.
-        conn.cursor_instance.fetch_queue = [([42],), None]
+        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
+        # retrying agent; (2) latest queue_snapshot issue_numbers;
+        # (3) _issue_already_attempted SELECT — not attempted.
+        conn.cursor_instance.fetch_queue = [None, ([42],), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
 
         # Trust check passes.

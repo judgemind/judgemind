@@ -247,6 +247,90 @@ WORKTREE_PARENT_DIR = Path(".claude/worktrees")
 #: keeps path lengths sane.
 AGENT_SHORT_ID_HEX_CHARS = 8
 
+# --------------------------------------------------------------------------
+# Phase 3C — failure detection + retry machinery (issue #2791)
+# --------------------------------------------------------------------------
+
+#: Supervisor-tick stuck-timeout window. Agents whose most-recent
+#: ``dispatcher.phase_transitions.ts`` is older than this are flagged
+#: as ``stuck_timeout`` and flipped to ``status='crashed'`` so the retry
+#: marker processor can recover them. Matches spec §7 step 1. 30 min is
+#: generous for the long-tail ralph iteration (#2513, #2628) while still
+#: well under the 180-minute ``subprocess_timeout_s`` ceiling.
+STUCK_TIMEOUT_SECONDS = 30 * 60
+
+#: GitHub API rate-limit threshold (spec §7 step 2). When ``gh api
+#: rate_limit --jq '.resources.core.remaining'`` reports fewer than this
+#: many requests remaining, the supervisor writes a
+#: ``gh_rate_exhausted`` failure row and sets a daemon-level skip flag
+#: that suppresses both ``_claim_and_orchestrate_one`` (scheduler tick)
+#: and ``_advance_running_agents`` (supervisor tick) until the rate
+#: window resets. 100 matches the CLAUDE.md §GitHub API Rate Limit
+#: Awareness guidance.
+GH_RATE_LIMIT_THRESHOLD = 100
+
+#: Subprocess timeout for the ``gh api rate_limit`` rate-limit probe.
+#: Short because the call is a single read against github.com with no
+#: pagination or list-iteration.
+GH_RATE_CHECK_TIMEOUT_SECONDS = 10
+
+#: Hard cap on auto-retry attempts per agent+reason. Matches the CHECK
+#: constraint on ``dispatcher.retry_markers.attempt`` (migration 21) and
+#: spec §8 "give up after attempt 3".
+MAX_RETRY_ATTEMPTS = 3
+
+#: Fallback backoff schedule (seconds) when ``dispatcher.config
+#: .backoff_seconds`` is missing or malformed. Matches the migration-21
+#: seed ``[60, 300, 900]`` — 1 min, 5 min, 15 min. The Nth element is
+#: the delay BEFORE the Nth attempt (attempt 1 = 60s from now; attempt
+#: 2 = 300s from the marker-creation time of attempt 2; attempt 3 =
+#: 900s from marker-creation time of attempt 3).
+DEFAULT_BACKOFF_SECONDS: tuple[int, ...] = (60, 300, 900)
+
+#: Failure categories from spec §8 Tier-1 mechanical-fix table. The
+#: daemon writes ``dispatcher.failures.category`` rows using these
+#: exact strings so the weekly summary report (§7 step 4) and the
+#: admin page can group them consistently.
+FAILURE_CATEGORY_STUCK_TIMEOUT = "stuck_timeout"
+FAILURE_CATEGORY_GH_RATE_EXHAUSTED = "gh_rate_exhausted"
+FAILURE_CATEGORY_SUBPROCESS_CRASH = "subprocess_crash"
+FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT = "subprocess_turn_limit"
+FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL = "subprocess_auth_fail"
+
+#: Which failure categories auto-create a retry marker (tier 1 per
+#: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
+#: ``subprocess_auth_fail`` (halt — no retry) are intentionally
+#: excluded; 3D's diagnoser owns the escalation path for both.
+#: ``stuck_timeout``, ``gh_rate_exhausted``, and ``subprocess_crash``
+#: are the three that retry mechanically.
+AUTO_RETRY_CATEGORIES = frozenset(
+    {
+        FAILURE_CATEGORY_STUCK_TIMEOUT,
+        FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
+        FAILURE_CATEGORY_SUBPROCESS_CRASH,
+    }
+)
+
+#: Cross-runner subprocess exit-code → category table. Claude-p exits
+#: with 1 for essentially every non-success case (see spec §8 intro +
+#: spike 0.1 #2683), so exit code alone is insufficient — the stderr
+#: regex fallback classifies further. Gemini CLI uses distinct codes
+#: per spike 0.4 #2686: 41 = auth missing, 53 = turn limit.
+GEMINI_EXIT_CODE_TO_CATEGORY: dict[int, str] = {
+    41: FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL,
+    53: FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT,
+}
+
+#: Subprocess stderr/stdout tail regexes. First match wins. Pattern is
+#: compiled case-insensitive; the input is already the last ~500 chars
+#: of the log (see ``_log_tail``). Order matters — auth-fail catches
+#: the 401 before the generic crash category takes over.
+_SUBPROCESS_STDERR_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"Invalid API key", FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL),
+    (r"401\s+Unauthorized", FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL),
+    (r"Reached max turns", FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT),
+)
+
 
 # --------------------------------------------------------------------------
 # Logging — structured JSON per line to stdout.
@@ -470,6 +554,14 @@ class DispatcherDaemon:
         self._agent_plan_output: dict[str, Any] | None = None
         self._agent_ralph_output: dict[str, Any] | None = None
         self._agent_summary_output: dict[str, Any] | None = None
+        # Phase 3C: GitHub rate-limit skip window. When set, ``now() <
+        # self._gh_rate_skip_until`` → scheduler + supervisor ticks both
+        # skip their hot paths. Cleared by
+        # ``_gh_rate_skip_active`` once the reset epoch elapses.
+        # Represented as a UTC-aware datetime (not an epoch seconds) so
+        # all time comparisons go through the same ``datetime.now(UTC)``
+        # plumbing the rest of the daemon uses (see #2791 §2b).
+        self._gh_rate_skip_until: datetime | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -664,16 +756,30 @@ class DispatcherDaemon:
         #
         # Only enter the claim + orchestrate path when (a) the live
         # ``concurrency_cap`` is >0 AND (b) no agent is currently in
-        # flight for this daemon run. Phase 3 runs at ``concurrency_cap=1``
-        # (one subprocess at a time); Phase 3E flips the value from 0 to
-        # 1. Until then the gate stays closed and this branch is a no-op.
+        # flight for this daemon run AND (c) Phase 3C's GitHub
+        # rate-limit skip flag is not active. Phase 3 runs at
+        # ``concurrency_cap=1`` (one subprocess at a time); Phase 3E
+        # flips the value from 0 to 1. Until then the gate stays
+        # closed and this branch is a no-op.
         #
         # Exceptions here are caught + logged but not re-raised — the
         # scheduler tick must survive any orchestration failure so the
         # next tick can try again. Orchestration work itself is wrapped
         # in per-phase error handling inside ``_claim_and_orchestrate_one``.
         orchestration_attempted = False
-        if (
+        rate_skip_active = self._gh_rate_skip_active()
+        if rate_skip_active:
+            self._log.info(
+                "daemon.claim_skipped_rate_limited",
+                extra={
+                    "event": "claim_skipped_rate_limited",
+                    "run_id": self._run_id,
+                    "skip_until": self._gh_rate_skip_until.isoformat()
+                    if self._gh_rate_skip_until is not None
+                    else None,
+                },
+            )
+        elif (
             concurrency_cap is not None
             and concurrency_cap > 0
             and not self._has_active_agent()
@@ -1550,6 +1656,14 @@ class DispatcherDaemon:
         The public entry point for Phase 3A. Called by the scheduler
         tick when ``concurrency_cap > 0`` AND no agent is in flight.
         All branching lives here so the tick stays flat.
+
+        **Phase 3C (#2791):** before claiming a new candidate, check for
+        any ``status='retrying'`` agent this daemon previously left
+        behind. The retry marker processor (§7 step 5) resets agents to
+        ``status='retrying' phase='claiming'`` after a tier-1
+        mechanical failure's backoff elapses. Picking them up here is
+        the "3A's claim path catches it next tick" half of the retry
+        loop — without this, the retrying row would sit idle forever.
         """
         # Reset within-tick handoff so a prior run's partial state
         # cannot leak into the next attempt (defense-in-depth; the
@@ -1557,6 +1671,15 @@ class DispatcherDaemon:
         self._agent_plan_output = None
         self._agent_ralph_output = None
         self._agent_summary_output = None
+
+        # Phase 3C resume-retry path: pick up any retrying agent first.
+        # If one exists, re-orchestrate it on a fresh worktree instead
+        # of claiming a new issue. Returning after a resume means this
+        # scheduler tick spent its single concurrency slot on the
+        # retry, which matches the "concurrency_cap=1" invariant.
+        resumed = self._resume_retrying_agent()
+        if resumed:
+            return
 
         candidates = self._latest_queue_snapshot_issues()
         if not candidates:
@@ -1607,7 +1730,18 @@ class DispatcherDaemon:
             )
             return
 
-        # Run the three phases in sequence.
+        self._run_orchestration_phases(agent_id, issue_number, worktree)
+
+    def _run_orchestration_phases(
+        self, agent_id: str, issue_number: int, worktree: Path
+    ) -> None:
+        """Run the plan → ralph → summary → push+PR sequence.
+
+        Shared between the fresh-claim path and the Phase 3C resume
+        path (:meth:`_resume_retrying_agent`). Per-phase failure handling
+        is owned by the individual ``_run_*_phase`` helpers; this
+        method just wires them together.
+        """
         ok = self._run_plan_phase(agent_id, issue_number, worktree)
         if not ok:
             return
@@ -1620,6 +1754,121 @@ class DispatcherDaemon:
 
         # Daemon-side git commit + push + PR create.
         self._push_and_open_pr(agent_id, issue_number, worktree)
+
+    def _resume_retrying_agent(self) -> bool:
+        """Pick up one ``status='retrying'`` agent, rebuild worktree, re-run.
+
+        Phase 3C (#2791). Completes the mechanical-retry loop: the
+        supervisor's retry marker processor resets agents to
+        ``status='retrying' phase='claiming'`` after backoff; this
+        method catches them on the next scheduler tick, flips them to
+        ``running``, creates a fresh worktree, and re-runs the
+        plan → ralph → summary → PR pipeline.
+
+        Returns True when a retrying agent was picked up (the caller
+        must skip the new-claim path on the same tick). Returns False
+        when no retrying agent exists.
+        """
+        assert self._conn is not None, "connect() must run before resume"
+
+        agent_id: str | None = None
+        issue_number: int | None = None
+        try:
+            with self._conn.cursor() as cur:
+                # Oldest retrying agent first — FIFO fairness if multiple
+                # ever pile up (shouldn't at concurrency_cap=1 but cheap
+                # to order the right way anyway).
+                cur.execute(
+                    "SELECT agent_id, issue_number FROM dispatcher.agents "
+                    "WHERE status = 'retrying' "
+                    "ORDER BY started_at ASC "
+                    "LIMIT 1",
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+            if row is None:
+                return False
+            agent_id = str(row[0])
+            issue_number = int(row[1]) if row[1] is not None else None
+        except Exception:
+            self._log.exception(
+                "daemon.resume_scan_failed",
+                extra={
+                    "event": "resume_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        if agent_id is None or issue_number is None:  # pragma: no cover — SELECT filter
+            return False
+
+        # Flip status back to ``running`` + phase ``claiming`` BEFORE
+        # starting new work, so a crashed daemon mid-resume leaves a
+        # normal stuck-timeout signal for the next supervisor tick to
+        # pick up via the existing stuck detection path.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'running', phase = 'claiming' "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.resume_update_failed",
+                extra={
+                    "event": "resume_update_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        # Fresh worktree for the retry attempt. The prior worktree was
+        # dropped by ``_process_retry_markers`` — create a new one here
+        # so the retrying phases see a clean tree.
+        try:
+            worktree = self._create_worktree(agent_id)
+        except RuntimeError as exc:
+            self._log.warning(
+                "daemon.resume_worktree_create_failed",
+                extra={
+                    "event": "resume_worktree_create_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="claiming", exit_code=None
+            )
+            return True  # claim-slot consumed; do not also try a new issue
+
+        self._log.info(
+            "daemon.resume_retrying_agent",
+            extra={
+                "event": "resume_retrying_agent",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "worktree_path": str(worktree),
+            },
+        )
+
+        self._run_orchestration_phases(agent_id, issue_number, worktree)
+        return True
 
     def _run_plan_phase(self, agent_id: str, issue_number: int, worktree: Path) -> bool:
         """Run ``/task-v2-plan``. Returns True to continue, False to stop."""
@@ -1938,37 +2187,56 @@ class DispatcherDaemon:
         so any non-zero code is an infrastructure failure). Returns
         ``None`` on subprocess timeout or other non-exit-code failure
         modes, AND marks the agent failed.
+
+        **Phase 3C (#2791):** non-zero exits are classified into the §8
+        tier-1 category table (``subprocess_crash``,
+        ``subprocess_turn_limit``, ``subprocess_auth_fail``) via
+        :meth:`_classify_subprocess_failure`. Tier-1 auto-retry
+        categories (currently ``subprocess_crash``) get a retry marker
+        enqueued so the next supervisor tick re-arms the agent with a
+        fresh worktree. Tier-2/3 categories (``turn_limit`` → 3D;
+        ``auth_fail`` → halt) leave the agent in ``status='failed'``
+        for 3D's diagnoser to pick up.
         """
         try:
             exit_code, duration = self._spawn_phase_subprocess(
                 phase, worktree, agent_id
             )
         except subprocess.TimeoutExpired:
-            self._log.warning(
-                "daemon.subprocess_failed",
-                extra={
-                    "event": "subprocess_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": phase,
-                    "reason": "timeout",
-                    "timeout_seconds": CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS,
-                },
-            )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Timeout = subprocess runaway (spec §17 Risk 4). Treat as
+            # a generic ``subprocess_crash`` — the subprocess didn't
+            # actually crash but the next retry needs a fresh worktree
+            # just the same.
+            self._handle_subprocess_failure(
+                agent_id=agent_id,
                 phase=phase,
+                reason="timeout",
                 exit_code=None,
+                stderr_tail="",
+                duration_s=None,
+                extra={"timeout_seconds": CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS},
             )
             return None
         except FileNotFoundError:
+            # ``claude`` not on PATH is a dispatcher-image problem, not
+            # an agent problem. Still write the failure row so operators
+            # see it on the admin page; do NOT enqueue a retry — the
+            # next attempt will hit the same missing binary.
             self._log.error(
                 "daemon.subprocess_failed",
                 extra={
                     "event": "subprocess_failed",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
+                    "phase": phase,
+                    "reason": "claude_not_on_path",
+                },
+            )
+            self._write_failure(
+                agent_id=agent_id,
+                category=FAILURE_CATEGORY_SUBPROCESS_CRASH,
+                detected_by="scheduler",
+                details={
                     "phase": phase,
                     "reason": "claude_not_on_path",
                 },
@@ -1996,24 +2264,20 @@ class DispatcherDaemon:
 
         if exit_code != 0:
             # Per-phase skills always exit 0 — a non-zero code is an
-            # infra failure (claude-p crash, OOM, harness error). Tail
-            # the log for forensic context but don't include verbatim
-            # in the structured log (may contain secrets).
+            # infra failure (claude-p crash, OOM, harness error, auth
+            # error, turn-limit trip). Tail the log for forensic
+            # context but don't include verbatim in the structured
+            # log envelope (may contain secrets). The classifier only
+            # sees a short tail so a bad regex cannot echo a secret.
             tail = self._log_tail(worktree, phase, max_chars=500)
-            self._log.warning(
-                "daemon.subprocess_failed",
-                extra={
-                    "event": "subprocess_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "phase": phase,
-                    "exit_code": exit_code,
-                    "duration_s": round(duration, 2),
-                    "stderr_tail": tail,
-                },
-            )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase=phase, exit_code=exit_code
+            self._handle_subprocess_failure(
+                agent_id=agent_id,
+                phase=phase,
+                reason="nonzero_exit",
+                exit_code=exit_code,
+                stderr_tail=tail,
+                duration_s=duration,
+                extra={},
             )
             return None
 
@@ -2029,6 +2293,88 @@ class DispatcherDaemon:
             },
         )
         return exit_code
+
+    def _handle_subprocess_failure(
+        self,
+        *,
+        agent_id: str,
+        phase: str,
+        reason: str,
+        exit_code: int | None,
+        stderr_tail: str,
+        duration_s: float | None,
+        extra: dict[str, Any],
+    ) -> None:
+        """Classify a subprocess failure, write failure row, enqueue retry.
+
+        Phase 3C (#2791). Centralized so ``_run_subprocess_or_fail``'s
+        timeout / non-zero-exit branches share the same structured-log +
+        failure-insert + retry-marker logic.
+
+        Auto-retries ``subprocess_crash`` (tier 1). Tier 2/3 categories
+        (``subprocess_turn_limit``, ``subprocess_auth_fail``) land a
+        failure row but leave the agent in ``status='failed'`` so 3D's
+        diagnoser can pick up. Future: 3D may flip turn-limit to a
+        single retry-with-hint — the classifier already returns the
+        distinct category so that wiring is a one-line change.
+        """
+        # ``claude`` is the Phase-3 default runner. When multi-runner
+        # support lands (per dispatcher.config.runner_by_phase), this
+        # will read the agent's runner override — until then the
+        # classifier's claude-first path is always correct.
+        category = self._classify_subprocess_failure(
+            runner="claude",
+            exit_code=int(exit_code) if exit_code is not None else 0,
+            stderr_tail=stderr_tail,
+        )
+
+        # Build the failure-log envelope. Keep the stderr tail in the
+        # row payload (JSONB) rather than the top-level log message so
+        # CloudWatch Insights queries can filter it out when scanning
+        # for recurring categories.
+        log_extra: dict[str, Any] = {
+            "event": "subprocess_failed",
+            "run_id": self._run_id,
+            "agent_id": agent_id,
+            "phase": phase,
+            "reason": reason,
+            "category": category,
+        }
+        if exit_code is not None:
+            log_extra["exit_code"] = int(exit_code)
+        if duration_s is not None:
+            log_extra["duration_s"] = round(duration_s, 2)
+        log_extra.update(extra)
+        log_extra["stderr_tail"] = stderr_tail
+        self._log.warning("daemon.subprocess_failed", extra=log_extra)
+
+        self._write_failure(
+            agent_id=agent_id,
+            category=category,
+            detected_by="scheduler",
+            details={
+                "phase": phase,
+                "reason": reason,
+                "exit_code": int(exit_code) if exit_code is not None else None,
+                "duration_s": round(duration_s, 2) if duration_s is not None else None,
+                "stderr_tail": stderr_tail,
+                **extra,
+            },
+        )
+
+        # Status transition — tier-1 retry categories still move to
+        # ``failed`` temporarily; the retry marker processor flips the
+        # agent back to ``retrying`` when the backoff elapses. Tier-2/3
+        # categories stay in ``failed`` for 3D.
+        self._mark_agent_terminal(
+            agent_id,
+            status="failed",
+            phase=phase,
+            exit_code=int(exit_code) if exit_code is not None else None,
+        )
+
+        if category in AUTO_RETRY_CATEGORIES:
+            self._create_retry_marker(agent_id=agent_id, reason=category)
 
     def _log_tail(self, worktree: Path, phase: str, max_chars: int = 500) -> str:
         """Return the last ``max_chars`` of the phase log, or an empty string."""
@@ -3638,6 +3984,739 @@ class DispatcherDaemon:
             },
         )
 
+    # ── Phase 3C failure detection + retry machinery (supervisor-tick) ─
+    #
+    # Issue #2791. Three supervisor-tick checks detect failures and
+    # enqueue retry markers; a fourth processor drains the marker table
+    # and resets agents. Each check is independent and wrapped in
+    # try/except so one check's failure cannot kill siblings.
+    #
+    #   _check_stuck_agents     → stuck_timeout   failures + retry markers
+    #   _check_gh_rate_limit    → gh_rate_exhausted failure + skip flag
+    #   _process_retry_markers  → agent reset via fresh worktree
+    #
+    # The subprocess classifier (_classify_subprocess_failure) is called
+    # from _run_subprocess_or_fail (Phase 3A/3B entry points) — it
+    # returns the §8 tier-1 category so the retry path can decide
+    # whether to enqueue a marker or escalate.
+
+    def _write_failure(
+        self,
+        *,
+        agent_id: str | None,
+        category: str,
+        detected_by: str,
+        details: dict[str, Any],
+    ) -> None:
+        """INSERT one row into ``dispatcher.failures``.
+
+        ``agent_id=None`` is permitted (the schema allows it) and used by
+        the GitHub rate-limit guard which is a daemon-level signal not
+        attributable to any single agent. Failures here are best-effort:
+        a DB hiccup logs + rolls back but does not propagate, mirroring
+        the hook-side behaviour in ``emit_failure.py`` (§9).
+        """
+        assert self._conn is not None, "connect() must run before failure write"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.failures "
+                    "    (agent_id, category, detected_by, details) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (agent_id, category, detected_by, json.dumps(details, default=str)),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.failure_insert_failed",
+                extra={
+                    "event": "failure_insert_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "category": category,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+
+    @staticmethod
+    def _classify_subprocess_failure(
+        runner: str, exit_code: int, stderr_tail: str
+    ) -> str:
+        """Classify a non-zero subprocess exit per spec §8 table.
+
+        Runner-aware: Gemini CLI returns distinct exit codes per spike
+        0.4 (#2686) so the exit code alone classifies; Claude-p returns 1
+        for everything and we fall back to stderr/stdout regex. An
+        unknown runner is treated as ``claude`` (the Phase-3 default).
+
+        Returns one of ``FAILURE_CATEGORY_*``:
+
+        * ``subprocess_turn_limit`` — ``Reached max turns`` in stderr
+          (Claude) or exit 53 (Gemini).
+        * ``subprocess_auth_fail`` — ``Invalid API key`` /
+          ``401 Unauthorized`` (Claude) or exit 41 (Gemini).
+        * ``subprocess_crash`` — catch-all for non-zero exit that does
+          not match a known pattern.
+        """
+        if runner == "gemini":
+            mapped = GEMINI_EXIT_CODE_TO_CATEGORY.get(int(exit_code))
+            if mapped is not None:
+                return mapped
+            return FAILURE_CATEGORY_SUBPROCESS_CRASH
+
+        # Claude-p: stderr regex fallback. ``re.IGNORECASE`` so casing
+        # differences in vendor error formats do not slip past us.
+        import re  # noqa: PLC0415 — lazy import
+
+        tail = stderr_tail or ""
+        for pattern, category in _SUBPROCESS_STDERR_PATTERNS:
+            if re.search(pattern, tail, re.IGNORECASE):
+                return category
+        return FAILURE_CATEGORY_SUBPROCESS_CRASH
+
+    # ── stuck-timeout detection ────────────────────────────────────────
+
+    def _check_stuck_agents(self) -> int:
+        """Find running agents with no phase transition in >30 min.
+
+        Each flagged agent gets a ``dispatcher.failures`` row with
+        ``category='stuck_timeout'`` and is flipped to
+        ``status='crashed'``. A retry marker is created so the next
+        ``_process_retry_markers`` pass can reset the agent with a
+        fresh worktree.
+
+        Returns the number of stuck agents flagged this tick (for
+        logging). Exceptions are caught per-agent + logged; one bad
+        row cannot stall the scan.
+        """
+        assert self._conn is not None, "connect() must run before stuck check"
+
+        stuck_rows: list[tuple[str, int | None, str | None]] = []
+        try:
+            with self._conn.cursor() as cur:
+                # Find agents with no recent phase transition. The
+                # LEFT JOIN + MAX handles agents whose first transition
+                # hasn't fired yet (e.g. wedged during `claiming`): in
+                # that case the MAX is NULL and we fall back to
+                # ``started_at`` — the agent is still stuck for the
+                # same operational reason.
+                cur.execute(
+                    "SELECT a.agent_id, a.issue_number, a.phase "
+                    "FROM dispatcher.agents a "
+                    "LEFT JOIN LATERAL ("
+                    "    SELECT MAX(ts) AS last_ts "
+                    "    FROM dispatcher.phase_transitions "
+                    "    WHERE agent_id = a.agent_id"
+                    ") pt ON TRUE "
+                    "WHERE a.status = 'running' "
+                    "  AND COALESCE(pt.last_ts, a.started_at) "
+                    "      < now() - make_interval(secs => %s)",
+                    (STUCK_TIMEOUT_SECONDS,),
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    stuck_rows.append(
+                        (
+                            str(row[0]),
+                            int(row[1]) if row[1] is not None else None,
+                            str(row[2]) if row[2] is not None else None,
+                        )
+                    )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.stuck_scan_failed",
+                extra={
+                    "event": "stuck_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return 0
+
+        flagged = 0
+        for agent_id, issue_number, phase in stuck_rows:
+            try:
+                self._write_failure(
+                    agent_id=agent_id,
+                    category=FAILURE_CATEGORY_STUCK_TIMEOUT,
+                    detected_by="supervisor",
+                    details={
+                        "stuck_seconds": STUCK_TIMEOUT_SECONDS,
+                        "last_known_phase": phase,
+                        "issue_number": issue_number,
+                    },
+                )
+                self._mark_agent_terminal(
+                    agent_id,
+                    status="crashed",
+                    phase=phase or "unknown",
+                    exit_code=None,
+                )
+                self._log.warning(
+                    "daemon.failure_detected",
+                    extra={
+                        "event": "failure_detected",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "category": FAILURE_CATEGORY_STUCK_TIMEOUT,
+                        "phase": phase,
+                    },
+                )
+                # Enqueue the tier-1 retry marker. The processor picks
+                # it up on the next supervisor tick once the backoff
+                # window elapses.
+                self._create_retry_marker(
+                    agent_id=agent_id,
+                    reason=FAILURE_CATEGORY_STUCK_TIMEOUT,
+                )
+                flagged += 1
+            except Exception:
+                # Per-agent failure must not stall the whole scan.
+                self._log.exception(
+                    "daemon.stuck_flag_failed",
+                    extra={
+                        "event": "stuck_flag_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                    },
+                )
+        return flagged
+
+    # ── GitHub rate-limit guard ────────────────────────────────────────
+
+    def _gh_rate_skip_active(self) -> bool:
+        """Return True if the GitHub rate-limit skip window is still active.
+
+        Clears ``self._gh_rate_skip_until`` in place once the reset
+        epoch has elapsed so subsequent calls return False without the
+        caller needing to reset it explicitly.
+        """
+        if self._gh_rate_skip_until is None:
+            return False
+        if datetime.now(UTC) >= self._gh_rate_skip_until:
+            self._log.info(
+                "daemon.gh_rate_skip_cleared",
+                extra={
+                    "event": "gh_rate_skip_cleared",
+                    "run_id": self._run_id,
+                    "cleared_at": _now_iso(),
+                },
+            )
+            self._gh_rate_skip_until = None
+            return False
+        return True
+
+    def _check_gh_rate_limit(self) -> dict[str, Any] | None:
+        """Probe ``gh api rate_limit`` and set the skip flag when low.
+
+        Returns a dict with ``remaining`` + ``reset_ts`` on success, or
+        ``None`` on subprocess failure. Subprocess failures are logged
+        as warnings but do not block the tick — the daemon must survive
+        transient GitHub hiccups.
+
+        When ``remaining < GH_RATE_LIMIT_THRESHOLD``, writes a failure
+        row with ``agent_id=NULL, category='gh_rate_exhausted'`` and
+        sets ``self._gh_rate_skip_until`` to the UTC datetime equivalent
+        of the ``reset`` epoch. On subsequent ticks,
+        ``_gh_rate_skip_active`` returns True until that time passes.
+        """
+        cmd = [
+            "gh",
+            "api",
+            "rate_limit",
+            "--jq",
+            ".resources.core",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_RATE_CHECK_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except FileNotFoundError:
+            self._log.warning(
+                "daemon.gh_missing",
+                extra={
+                    "event": "gh_missing",
+                    "run_id": self._run_id,
+                    "detail": "rate_limit probe",
+                },
+            )
+            return None
+        except subprocess.TimeoutExpired:
+            self._log.warning(
+                "daemon.gh_rate_probe_timeout",
+                extra={
+                    "event": "gh_rate_probe_timeout",
+                    "run_id": self._run_id,
+                },
+            )
+            return None
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.gh_rate_probe_failed",
+                extra={
+                    "event": "gh_rate_probe_failed",
+                    "run_id": self._run_id,
+                    "exit_code": result.returncode,
+                    "stderr_tail": (result.stderr or "").strip()[:200],
+                },
+            )
+            return None
+
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            self._log.warning(
+                "daemon.gh_rate_probe_invalid_json",
+                extra={
+                    "event": "gh_rate_probe_invalid_json",
+                    "run_id": self._run_id,
+                },
+            )
+            return None
+
+        remaining = payload.get("remaining")
+        reset_epoch = payload.get("reset")
+        if not isinstance(remaining, int) or not isinstance(reset_epoch, int):
+            # Malformed payload — treat as "can't say", skip enforcement.
+            return None
+
+        if remaining >= GH_RATE_LIMIT_THRESHOLD:
+            # Healthy. If we had a prior skip window it already cleared
+            # itself in ``_gh_rate_skip_active``; nothing to do here.
+            self._log.info(
+                "daemon.gh_rate_check",
+                extra={
+                    "event": "gh_rate_check",
+                    "run_id": self._run_id,
+                    "remaining": remaining,
+                    "threshold": GH_RATE_LIMIT_THRESHOLD,
+                },
+            )
+            return {"remaining": remaining, "reset_ts": reset_epoch}
+
+        # Budget exhausted. Write the failure row and set the skip flag.
+        reset_dt = datetime.fromtimestamp(reset_epoch, tz=UTC)
+        self._write_failure(
+            agent_id=None,
+            category=FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
+            detected_by="supervisor",
+            details={
+                "remaining": remaining,
+                "threshold": GH_RATE_LIMIT_THRESHOLD,
+                "reset_ts": reset_dt.isoformat(),
+                "reset_epoch": reset_epoch,
+            },
+        )
+        self._gh_rate_skip_until = reset_dt
+        self._log.warning(
+            "daemon.gh_rate_limited",
+            extra={
+                "event": "gh_rate_limited",
+                "run_id": self._run_id,
+                "remaining": remaining,
+                "threshold": GH_RATE_LIMIT_THRESHOLD,
+                "reset_ts": reset_dt.isoformat(),
+            },
+        )
+        return {"remaining": remaining, "reset_ts": reset_epoch}
+
+    # ── retry markers ──────────────────────────────────────────────────
+
+    def _backoff_seconds(self) -> tuple[int, ...]:
+        """Read the ``backoff_seconds`` schedule from ``dispatcher.config``.
+
+        Falls back to :data:`DEFAULT_BACKOFF_SECONDS` on any malformed
+        row (missing key, non-list JSON, non-int entries, wrong length).
+        The schedule must have exactly one entry per attempt (1..3) so
+        `_create_retry_marker` can index by attempt number.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("backoff_seconds",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return DEFAULT_BACKOFF_SECONDS
+
+        if row is None or row[0] is None:
+            return DEFAULT_BACKOFF_SECONDS
+        raw = row[0]
+        # psycopg returns JSONB as the already-decoded Python object.
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return DEFAULT_BACKOFF_SECONDS
+        if not isinstance(raw, list) or len(raw) != MAX_RETRY_ATTEMPTS:
+            return DEFAULT_BACKOFF_SECONDS
+        try:
+            parsed = tuple(int(x) for x in raw)
+        except (TypeError, ValueError):
+            return DEFAULT_BACKOFF_SECONDS
+        if any(x <= 0 for x in parsed):
+            return DEFAULT_BACKOFF_SECONDS
+        return parsed
+
+    def _create_retry_marker(self, *, agent_id: str, reason: str) -> int | None:
+        """Enqueue a retry for ``agent_id`` at the next backoff interval.
+
+        Returns the new ``attempt`` (1..3) on success, or ``None`` if
+        the 3-attempt cap has been reached for this ``agent_id+reason``
+        pair. When capped, the agent is flipped to ``status='failed'``
+        and a structured ``daemon.retry_escalated`` log line fires so
+        3D's diagnoser can pick it up.
+
+        ``reason`` must be a tier-1 auto-retry category — see
+        :data:`AUTO_RETRY_CATEGORIES`. Passing a non-retry category
+        (e.g. ``subprocess_auth_fail``) is a caller bug; the method
+        logs + returns None without writing.
+        """
+        assert self._conn is not None, "connect() must run before marker insert"
+
+        if reason not in AUTO_RETRY_CATEGORIES:
+            # Defensive: callers should gate on AUTO_RETRY_CATEGORIES
+            # already, but a typo or future category addition should not
+            # silently create retry markers for tier-2/3 failures.
+            self._log.warning(
+                "daemon.retry_marker_skipped",
+                extra={
+                    "event": "retry_marker_skipped",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "reason": reason,
+                    "detail": "not a tier-1 auto-retry category",
+                },
+            )
+            return None
+
+        # Count existing markers for this agent+reason pair. The CHECK
+        # constraint caps attempt at 3, so a fourth retry would fail
+        # the INSERT anyway — catch it here first with a structured log
+        # line so operators see the escalation.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM dispatcher.retry_markers "
+                    "WHERE agent_id = %s AND reason = %s",
+                    (agent_id, reason),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.retry_count_failed",
+                extra={
+                    "event": "retry_count_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        prior_count = int(row[0] or 0) if row else 0
+        next_attempt = prior_count + 1
+
+        if next_attempt > MAX_RETRY_ATTEMPTS:
+            self._log.warning(
+                "daemon.retry_escalated",
+                extra={
+                    "event": "retry_escalated",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "reason": reason,
+                    "attempts_used": prior_count,
+                    "detail": (
+                        "max retries exceeded — 3D diagnoser picks up from failed"
+                    ),
+                },
+            )
+            # Flip to 'failed' so 3D's diagnoser picks it up. Preserve
+            # the existing phase so operators can see where it got
+            # stuck.
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="retry_exhausted", exit_code=None
+            )
+            return None
+
+        backoff = self._backoff_seconds()
+        # next_attempt is 1-indexed; backoff is 0-indexed.
+        delay_seconds = backoff[next_attempt - 1]
+        retry_after = datetime.now(UTC).timestamp() + delay_seconds
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.retry_markers "
+                    "    (agent_id, reason, attempt, retry_after_ts) "
+                    "VALUES (%s, %s, %s, to_timestamp(%s))",
+                    (agent_id, reason, next_attempt, retry_after),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.retry_marker_insert_failed",
+                extra={
+                    "event": "retry_marker_insert_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "reason": reason,
+                    "attempt": next_attempt,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        self._log.info(
+            "daemon.retry_marker_created",
+            extra={
+                "event": "retry_marker_created",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "reason": reason,
+                "attempt": next_attempt,
+                "delay_seconds": delay_seconds,
+                "retry_after_ts": datetime.fromtimestamp(
+                    retry_after, tz=UTC
+                ).isoformat(),
+            },
+        )
+        return next_attempt
+
+    def _drop_worktree_best_effort(self, worktree_path: str) -> bool:
+        """Remove the agent's worktree so the retry starts from a fresh tree.
+
+        Tries ``scripts/cleanup_worktree.sh`` first (the laptop-dispatcher
+        convention — it handles stray lock files, uncommitted state, and
+        submodule detritus). Falls back to ``git worktree remove --force``.
+        Returns True on success, False on any failure (logged as a
+        warning). The caller proceeds with the retry even on False —
+        spec §8 calls this a mechanical fix, and an orphaned worktree
+        is a much smaller problem than a stuck retry marker.
+        """
+        if not worktree_path:
+            return False
+
+        repo_root = self._repo_root()
+        cleanup_script = repo_root / "scripts" / "cleanup_worktree.sh"
+
+        if cleanup_script.exists():
+            try:
+                result = subprocess.run(
+                    [str(cleanup_script), worktree_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return True
+                self._log.warning(
+                    "daemon.cleanup_worktree_nonzero",
+                    extra={
+                        "event": "cleanup_worktree_nonzero",
+                        "run_id": self._run_id,
+                        "worktree_path": worktree_path,
+                        "exit_code": result.returncode,
+                        "stderr_tail": (result.stderr or "").strip()[:200],
+                    },
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                self._log.warning(
+                    "daemon.cleanup_worktree_subprocess_error",
+                    extra={
+                        "event": "cleanup_worktree_subprocess_error",
+                        "run_id": self._run_id,
+                        "worktree_path": worktree_path,
+                        "detail": str(exc),
+                    },
+                )
+
+        # Fall back to raw ``git worktree remove --force``. This bypasses
+        # ``cleanup_worktree.sh``'s safety checks (see CLAUDE.md §Never
+        # bypass a safety check), but the retry marker processor has
+        # already decided the worktree is toast — the only question is
+        # whether we leave an orphan entry in ``git worktree list``.
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.worktree_remove_subprocess_error",
+                extra={
+                    "event": "worktree_remove_subprocess_error",
+                    "run_id": self._run_id,
+                    "worktree_path": worktree_path,
+                    "detail": str(exc),
+                },
+            )
+            return False
+        if result.returncode == 0:
+            return True
+        self._log.warning(
+            "daemon.worktree_remove_nonzero",
+            extra={
+                "event": "worktree_remove_nonzero",
+                "run_id": self._run_id,
+                "worktree_path": worktree_path,
+                "exit_code": result.returncode,
+                "stderr_tail": (result.stderr or "").strip()[:200],
+            },
+        )
+        return False
+
+    def _process_retry_markers(self) -> int:
+        """Drain due retry markers, reset each agent, resolve the marker.
+
+        Called from the supervisor tick. For each unresolved marker
+        whose ``retry_after_ts`` has elapsed:
+
+        1. Best-effort drop the existing worktree (see
+           :meth:`_drop_worktree_best_effort`).
+        2. UPDATE the agent to ``status='retrying' phase='claiming'``.
+           The next scheduler tick's claim path sees the retry state
+           and re-orchestrates (creates a fresh worktree via 3A's
+           ``_create_worktree``). Incrementing ``retries_used`` tracks
+           the total retries across all reasons for the admin page.
+        3. Mark the retry marker ``resolved_at = now()``.
+
+        Returns the number of markers processed this tick. DB errors on
+        any single marker are logged + rolled back; the loop continues.
+        """
+        assert self._conn is not None, "connect() must run before marker drain"
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT m.marker_id, m.agent_id, m.reason, m.attempt, "
+                    "       a.worktree_path, a.issue_number "
+                    "FROM dispatcher.retry_markers m "
+                    "JOIN dispatcher.agents a ON a.agent_id = m.agent_id "
+                    "WHERE m.resolved_at IS NULL "
+                    "  AND m.retry_after_ts <= now() "
+                    "ORDER BY m.retry_after_ts ASC",
+                )
+                due = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.retry_marker_scan_failed",
+                extra={
+                    "event": "retry_marker_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+
+        processed = 0
+        for row in due:
+            marker_id = int(row[0])
+            agent_id = str(row[1])
+            reason = str(row[2])
+            attempt = int(row[3])
+            worktree_path = str(row[4]) if row[4] is not None else ""
+            issue_number = int(row[5]) if row[5] is not None else None
+
+            try:
+                self._drop_worktree_best_effort(worktree_path)
+
+                with self._conn.cursor() as cur:
+                    # Reset the agent for a fresh claim. ``started_at``
+                    # stays pinned to the original claim so elapsed-time
+                    # dashboards keep working; ``retries_used``
+                    # increments so the 3B fix-ci cap and 3D diagnoser
+                    # tier-3 (``ci_red_after_retries``) see the full
+                    # retry history.
+                    cur.execute(
+                        "UPDATE dispatcher.agents "
+                        "SET status = 'retrying', "
+                        "    phase = 'claiming', "
+                        "    retries_used = retries_used + 1, "
+                        "    exit_code = NULL, "
+                        "    ended_at = NULL "
+                        "WHERE agent_id = %s",
+                        (agent_id,),
+                    )
+                    cur.execute(
+                        "UPDATE dispatcher.retry_markers "
+                        "SET resolved_at = now() "
+                        "WHERE marker_id = %s",
+                        (marker_id,),
+                    )
+                self._conn.commit()
+                self._log.info(
+                    "daemon.retry_processed",
+                    extra={
+                        "event": "retry_processed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "reason": reason,
+                        "attempt": attempt,
+                        "marker_id": marker_id,
+                    },
+                )
+                processed += 1
+            except Exception:
+                self._log.exception(
+                    "daemon.retry_process_failed",
+                    extra={
+                        "event": "retry_process_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "marker_id": marker_id,
+                    },
+                )
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+        return processed
+
     # ── supervisor tick (every ``tick_supervisor_seconds``) ─────────────
 
     def supervisor_tick(self) -> dict[str, int]:
@@ -3649,12 +4728,23 @@ class DispatcherDaemon:
                alarm that the daemon is healthy.
             2. Count ``dispatcher.failures`` rows in the last hour — the
                read doubles as a connection smoke-test.
-            3. **Phase 3B (#2787):** call ``_advance_running_agents``.
+            3. **Phase 3C (#2791):** run the failure-detection +
+               retry-marker passes. Each pass is independent + wrapped
+               in try/except so one bad scan cannot stall siblings.
+               Stuck-timeout detection writes ``stuck_timeout`` failure
+               rows + enqueues retry markers; the GitHub rate-limit
+               guard sets ``self._gh_rate_skip_until`` when the budget
+               is low.
+            4. **Phase 3B (#2787):** call ``_advance_running_agents``.
                Iterates agents in ``awaiting_ci``/``awaiting_deploy``
                and drives each one forward by one state-machine step.
                Errors are caught per-agent so one bad row cannot stall
-               siblings or crash the tick.
-            4. Emit the ``HeartbeatAge`` CloudWatch metric.
+               siblings or crash the tick. Skipped when the rate-limit
+               flag is set — every advance does a ``gh pr view``.
+            5. **Phase 3C (#2791):** drain due retry markers — reset the
+               corresponding agent back to ``claiming`` so the next
+               scheduler tick re-orchestrates with a fresh worktree.
+            6. Emit the ``HeartbeatAge`` CloudWatch metric.
 
         Returns a summary dict for logs + tests.
         """
@@ -3681,17 +4771,83 @@ class DispatcherDaemon:
                 failures_last_hour = int(row[0] or 0)
         self._conn.commit()
 
+        # Phase 3C (#2791): stuck-timeout scan. Runs first so any newly
+        # crashed agents land retry markers early in the tick, giving
+        # _process_retry_markers a chance to re-arm them later in the
+        # same tick if their backoff is already zero (not the common
+        # case — all tier-1 backoffs are ≥60s — but it keeps the code
+        # robust to future schedule edits).
+        stuck_flagged = 0
+        try:
+            stuck_flagged = self._check_stuck_agents()
+        except Exception:
+            self._log.exception(
+                "daemon.stuck_check_failed",
+                extra={
+                    "event": "stuck_check_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Phase 3C (#2791): rate-limit guard. Write the failure row +
+        # set the skip flag before the 3B advance pass so this tick
+        # already respects the flag.
+        try:
+            self._check_gh_rate_limit()
+        except Exception:
+            self._log.exception(
+                "daemon.gh_rate_check_failed",
+                extra={
+                    "event": "gh_rate_check_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        rate_skip_active = self._gh_rate_skip_active()
+
         # Phase 3B (#2787): advance agents that are past push_and_pr.
         # Wrapped in try/except — the heartbeat + metric emission below
         # must still run even if the advance pass throws unexpectedly.
+        # Skipped when the rate-limit flag is set (every advance step
+        # calls ``gh pr view`` or ``gh run list`` which would burn the
+        # remaining budget and delay the reset).
         agents_advanced = 0
+        if rate_skip_active:
+            self._log.info(
+                "daemon.advance_skipped_rate_limited",
+                extra={
+                    "event": "advance_skipped_rate_limited",
+                    "run_id": self._run_id,
+                    "skip_until": self._gh_rate_skip_until.isoformat()
+                    if self._gh_rate_skip_until is not None
+                    else None,
+                },
+            )
+        else:
+            try:
+                agents_advanced = self._advance_running_agents()
+            except Exception:
+                self._log.exception(
+                    "daemon.advance_pass_failed",
+                    extra={
+                        "event": "advance_pass_failed",
+                        "run_id": self._run_id,
+                    },
+                )
+
+        # Phase 3C (#2791): drain due retry markers. Runs AFTER the
+        # advance pass so a marker created earlier in this tick (via
+        # _check_stuck_agents) can still be caught on the NEXT tick —
+        # the backoff interval (≥60s) always keeps the processor from
+        # firing on a marker created in the same tick.
+        retry_processed = 0
         try:
-            agents_advanced = self._advance_running_agents()
+            retry_processed = self._process_retry_markers()
         except Exception:
             self._log.exception(
-                "daemon.advance_pass_failed",
+                "daemon.retry_process_pass_failed",
                 extra={
-                    "event": "advance_pass_failed",
+                    "event": "retry_process_pass_failed",
                     "run_id": self._run_id,
                 },
             )
@@ -3715,12 +4871,18 @@ class DispatcherDaemon:
                 "failures_last_hour": failures_last_hour,
                 "heartbeat_metric_emitted": metric_emitted,
                 "agents_advanced": agents_advanced,
+                "stuck_flagged": stuck_flagged,
+                "retry_markers_processed": retry_processed,
+                "rate_skip_active": rate_skip_active,
             },
         )
         return {
             "failures_last_hour": failures_last_hour,
             "heartbeat_metric_emitted": 1 if metric_emitted else 0,
             "agents_advanced": agents_advanced,
+            "stuck_flagged": stuck_flagged,
+            "retry_markers_processed": retry_processed,
+            "rate_skip_active": 1 if rate_skip_active else 0,
         }
 
     # ── heartbeat metric emission (supervisor-tick step 3) ──────────────
