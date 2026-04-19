@@ -195,12 +195,11 @@ module "ses" {
 # but nothing runs until sub-task C (#2729) publishes the real image and
 # Phase 2 flips the replica count.
 #
-# Secrets wiring is deferred: the operator provisions
-# `judgemind/dev/dispatcher/*` secrets manually once this module merges.
-# Issue #2700 provisions the scoped `GITHUB_TOKEN` PAT. Leaving the ARNs as
-# empty strings until then is safe — the module's task definition uses
-# `compact()` to skip any unset secret and the service is inert at
-# `desired_count=0` anyway.
+# Secrets wiring lands incrementally. #2700 wires `GITHUB_TOKEN` (the
+# scoped PAT from spike 0.7, stored in `judgemind/dispatcher/github-token`).
+# The remaining ARNs stay as empty strings until their owning sub-tasks
+# land — the module's task definition uses `compact()` to skip any unset
+# secret and the service is inert at `desired_count=0` anyway.
 module "dispatcher_daemon" {
   source = "../../modules/dispatcher-daemon"
 
@@ -215,12 +214,16 @@ module "dispatcher_daemon" {
   # Phase 1 = inert. Flipped to 1 in Phase 2 (shadow mode). Never > 1.
   desired_count = 0
 
-  # Secret ARNs — all empty during Phase 1. Operator populates after the
-  # module lands; wiring happens in sub-tasks C (#2729) / #2700 / follow-up
-  # telegram + dispatcher-role DB secret from sub-task A (#2727).
+  # Secret ARNs — populated incrementally as their owning issues land.
+  # #2700 wires `github_token_secret_arn` (this ARN is the scoped PAT from
+  # spike 0.7, provisioned in Secrets Manager by the operator and pinned
+  # here so the execution role's `execution_secrets` policy resolves
+  # against it). Other ARNs stay empty until their owning sub-tasks
+  # land — the module's `compact()` guard drops unset entries and the
+  # service is inert at `desired_count=0` anyway.
   anthropic_api_key_secret_arn  = ""
   db_connection_secret_arn      = ""
-  github_token_secret_arn       = ""
+  github_token_secret_arn       = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
   telegram_bot_token_secret_arn = ""
   gemini_api_key_secret_arn     = ""
 

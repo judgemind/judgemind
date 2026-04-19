@@ -38,11 +38,14 @@ locals {
   log_group_name = "/ecs/judgemind-dispatcher-${var.environment}"
 
   # Secret-ARN lists for the two policies below. `compact()` drops any empty
-  # string, so placeholder secrets that aren't yet provisioned (e.g.
-  # GITHUB_TOKEN before #2700, or the full Phase-1 inert wiring where all
-  # ARNs are "") do not leak into the policy's `Resource` list. If the
-  # compacted list is empty, the policy resource itself is skipped via
-  # `count = 0` — IAM rejects `Resource = []` with
+  # string, so placeholder secrets that aren't yet provisioned (e.g. the
+  # Phase-1 inert wiring where some sub-task owners haven't landed their
+  # ARN yet) do not leak into the policy's `Resource` list. As of #2700
+  # the dev wiring pins `github_token_secret_arn`, so the compacted list
+  # is non-empty in dev — the count-guard still matters for callers that
+  # stand up the module with all ARNs blank. If the compacted list is
+  # empty, the policy resource itself is skipped via `count = 0` — IAM
+  # rejects `Resource = []` with
   # `MalformedPolicyDocument: Policy statement must contain resources`
   # (see #2739).
   execution_secret_arns = compact([
@@ -126,10 +129,13 @@ resource "aws_iam_role_policy_attachment" "execution_managed" {
 # Allow the execution role to fetch every secret wired into the task
 # definition. The secret-ARN list is pre-compacted into
 # `local.execution_secret_arns` so that empty-string placeholders
-# (e.g. GITHUB_TOKEN before #2700) are dropped. When no ARNs are wired
-# in — the Phase-1 inert wiring passes "" for all five — the policy
+# (e.g. sub-tasks that haven't landed their secret yet) are dropped.
+# When no ARNs are wired in — a fully blank test stack — the policy
 # resource itself is skipped via `count = 0`; IAM rejects a statement
-# with `Resource = []` as `MalformedPolicyDocument` (see #2739).
+# with `Resource = []` as `MalformedPolicyDocument` (see #2739). The
+# dev env (#2700) wires `github_token_secret_arn`, so the compacted
+# list is non-empty and this policy is created with `GITHUB_TOKEN`'s
+# ARN in the `Resource` array.
 resource "aws_iam_role_policy" "execution_secrets" {
   count = length(local.execution_secret_arns) > 0 ? 1 : 0
 

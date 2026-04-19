@@ -78,8 +78,9 @@ variable "log_retention_days" {
 # Each `*_secret_arn` is the Secrets Manager ARN that will be injected into
 # the container as the corresponding env var. Leave empty to skip wiring
 # that secret — useful during Phase 1 when some of these don't exist yet
-# (e.g. the dispatcher-role DB secret is created by sub-task A, #2727, and
-# the scoped GitHub PAT is provisioned by #2700).
+# (e.g. the dispatcher-role DB secret is created by sub-task A, #2727).
+# The scoped GitHub PAT (#2700) is wired in `environments/dev/main.tf`
+# against `judgemind/dispatcher/github-token`.
 
 variable "anthropic_api_key_secret_arn" {
   description = "Secrets Manager ARN for ANTHROPIC_API_KEY. Required for the daemon to spawn `claude -p` subprocesses."
@@ -94,7 +95,7 @@ variable "db_connection_secret_arn" {
 }
 
 variable "github_token_secret_arn" {
-  description = "Secrets Manager ARN for GITHUB_TOKEN (scoped PAT from spike 0.7). Populated by #2700; placeholder empty string is safe while desired_count=0."
+  description = "Secrets Manager ARN for GITHUB_TOKEN (scoped PAT from spike 0.7). Wired in dev by #2700 to `judgemind/dispatcher/github-token`; the `github` MCP server reads this env var to authenticate `mcp__github__*` tool calls. Empty-string default stays supported so environments without the secret (e.g. a fresh `staging` / throwaway test stack) can still plan the module; the execution role's `execution_secrets` policy uses `compact()` to drop unset entries."
   type        = string
   default     = ""
 }
