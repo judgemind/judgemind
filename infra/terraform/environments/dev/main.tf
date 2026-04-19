@@ -32,6 +32,15 @@ data "aws_secretsmanager_secret" "capsolver_api_key" {
   name = "judgemind/capsolver/api-key"
 }
 
+# Dispatcher v2 Spike 0.7 — scoped GitHub PAT wired into the dispatcher-spike
+# Fargate task so inside-container `git push`, `gh pr create/view/close`, and
+# `scripts/check-issue-author.sh` can authenticate. Throwaway along with the
+# rest of the spike infrastructure. See #2689 and
+# docs/investigations/dispatcher-v2-spike-0.7.md.
+data "aws_secretsmanager_secret" "dispatcher_spike_github_token" {
+  name = "judgemind/dev/dispatcher-spike/github-token"
+}
+
 module "networking" {
   source      = "../../modules/networking"
   environment = "dev"
@@ -199,10 +208,12 @@ module "dispatcher_spike" {
   environment                  = "dev"
   anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
   db_connection_secret_arn     = module.database.db_connection_secret_arn
-  # github_token_secret_arn intentionally unset — the spike's mcp_probe
-  # scenario runs without a GitHub token to observe the explicit failure
-  # mode of the github MCP server, which itself answers Open Question 2
-  # in docs/specs/dispatcher-v2-spec.md §17.
+  # Spike 0.7 — wire a scoped GitHub PAT secret in so `git push`, `gh pr *`,
+  # and `scripts/check-issue-author.sh` can authenticate from inside the
+  # container. The prior spike 0.1 finding that `mcp_probe` discovers tool
+  # names without a token is unaffected — the GITHUB_TOKEN is only consumed
+  # when an operation actually calls GitHub's API.
+  github_token_secret_arn = data.aws_secretsmanager_secret.dispatcher_spike_github_token.arn
 }
 
 output "dispatcher_spike_ecr_url" {
