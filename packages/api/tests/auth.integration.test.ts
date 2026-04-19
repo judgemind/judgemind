@@ -30,7 +30,15 @@ let app: FastifyInstance;
 // Unique email prefix to avoid collisions with other test runs
 const PREFIX = `test-${Date.now()}`;
 
+// This file makes > 10 login-style requests from the shared 127.0.0.1 IP
+// that app.inject reports. The production login rate limit (MAX_ATTEMPTS = 10
+// per 15 minutes) would trip partway through, causing flaky failures against
+// a locally-running Redis that persists rate-limit keys across test runs.
+// Opt out of the rate limit for the duration of this file; the dedicated unit
+// tests in auth-rate-limit.unit.test.ts still exercise the real rate-limit
+// path. See issue #2744.
 beforeAll(async () => {
+  process.env.DISABLE_LOGIN_RATE_LIMIT = '1';
   applyMigrations();
   app = await buildApp(pool);
 }, 30_000);
@@ -41,6 +49,7 @@ afterAll(async () => {
   await pool.query(`DELETE FROM users WHERE email LIKE $1`, [`${PREFIX}%`]);
   await app?.close();
   await pool.end();
+  delete process.env.DISABLE_LOGIN_RATE_LIMIT;
 }, 15_000);
 
 // ---------------------------------------------------------------------------

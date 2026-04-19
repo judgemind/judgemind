@@ -24,8 +24,17 @@ async function getRedis(): Promise<RedisClientType | null> {
 /**
  * Check and increment the login attempt counter for an IP address.
  * Returns true if the request should be allowed, false if rate-limited.
+ *
+ * Set `DISABLE_LOGIN_RATE_LIMIT=1` to bypass the check — intended for the
+ * integration test harness (tests/auth.integration.test.ts makes > 10 login
+ * calls from the shared 127.0.0.1 IP, which otherwise trips the limit and
+ * causes flaky failures against a locally-running Redis). See issue #2744.
+ * The dedicated unit tests in tests/auth-rate-limit.unit.test.ts still
+ * exercise the real rate-limit path by explicitly clearing this env var.
  */
 export async function checkLoginRateLimit(ip: string): Promise<boolean> {
+  if (process.env.DISABLE_LOGIN_RATE_LIMIT === '1') return true;
+
   const redis = await getRedis();
   if (!redis) return true; // fail open
 
