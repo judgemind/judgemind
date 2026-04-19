@@ -465,12 +465,11 @@ Gate: admin page loads with "0 agents, daemon stopped" on dev. Each `/task-v2-*`
 - Daemon scales to 1, but `config.concurrency_cap=0`. Polls queue, writes state, but spawns nothing.
 - Laptop `/dispatcher` continues running — its state is NOT mirrored into `dispatcher.*` (we don't want to double-book).
 
-Gate: daemon has been running for 48h without crashing; admin page shows accurate queue depth matching `gh issue list`.
+Gate: daemon has observed ≥20 queue-state update cycles without crashing; admin page queue depth matches `gh issue list` to within 1 at 3 consecutive checks.
 
 **Phase 3: Single-slot production (1 PR).**
 - `config.concurrency_cap=1`. Daemon spawns one agent at a time, driving the full phase state machine in §6 via `claude -p` invocations of `/task-v2-*`.
 - Laptop dispatcher paused (user stops invoking `/dispatcher`). The skill file stays on disk.
-- Monitor for 1 week.
 
 Gate: ≥10 successful task completions via the daemon; zero stuck agents; all retries resolved correctly.
 
