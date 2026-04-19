@@ -895,6 +895,20 @@ jobs:
         run: scripts/check-script-headers.sh
 
   # ---------------------------------------------------------------
+  # Filename separator hygiene: flag same-directory filename pairs that
+  # differ only by `-` vs `_`. Prevents the #2751 / #2754 recurrence
+  # where `scripts/check-schema-drift.sh` (hyphen, broken) coexisted
+  # with `scripts/check_schema_drift.sh` (underscore, canonical) and
+  # agents picked the alphabetically-first wrong one.
+  # ---------------------------------------------------------------
+  filename-separator-hygiene-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Filename separator hygiene
+        run: scripts/check-hyphen-underscore-collision.sh
+
+  # ---------------------------------------------------------------
   # Markdown link guard: internal .md pointers in CLAUDE.md, docs/,
   # .claude/skills/, packages/*/README.md, packages/*/docs/,
   # infra/, and .github/ must point to files that exist (#2425, #2428)
