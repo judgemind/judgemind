@@ -8710,6 +8710,17 @@ class DispatcherDaemon:
         Used by the scheduler tick to detect when the operator has
         manually flipped ``concurrency_cap`` back up after the breaker
         opened (diagnostic trail cleared; breaker auto-closes).
+
+        **JSONB handling.** psycopg3 natively decodes jsonb → Python
+        values — a JSONB string like ``"circuit_breaker"`` comes back
+        as the Python string ``"circuit_breaker"`` (quotes unwrapped);
+        JSONB ``null`` comes back as Python ``None``; JSONB number /
+        bool / array / object come back as their Python equivalents.
+        Test fixtures sometimes feed us the raw JSONB bytes (e.g.
+        ``'"circuit_breaker"'`` — JSON-encoded with quotes) via the
+        fake cursor, so we try ``json.loads`` first on strings and
+        fall back to the raw string if that fails. Either shape
+        resolves to the same Python string.
         """
         assert self._conn is not None, "connect() must run before config read"
         try:
@@ -8730,12 +8741,19 @@ class DispatcherDaemon:
             return None
         raw = row[0]
         if isinstance(raw, str):
+            # Try to JSON-decode first. If the string is a JSON-encoded
+            # string literal (fake-cursor test path) ``json.loads``
+            # gives us the unwrapped value. If it is already the
+            # unwrapped Python string (psycopg3 production path) the
+            # decode fails with ``JSONDecodeError`` and we use the raw
+            # string directly.
             try:
-                raw = json.loads(raw)
+                decoded = json.loads(raw)
             except json.JSONDecodeError:
-                return None
-        if isinstance(raw, str):
-            return raw
+                return raw
+            if isinstance(decoded, str):
+                return decoded
+            return None
         return None
 
     def _write_terminal_outcome(self, agent_id: str, status: str) -> None:

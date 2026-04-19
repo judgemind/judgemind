@@ -510,6 +510,47 @@ class TestIdempotence:
 # --------------------------------------------------------------------------
 
 
+class TestReadCapFlippedBy:
+    """``_read_cap_flipped_by`` handles both psycopg3 and fake-cursor JSONB shapes.
+
+    psycopg3 unwraps jsonb scalars to their Python equivalents: a JSONB
+    string ``"circuit_breaker"`` (9 bytes in Postgres) becomes the
+    Python string ``"circuit_breaker"`` (no quotes). Test fake cursors
+    may pass the pre-decode shape ``'"circuit_breaker"'``. Both must
+    resolve identically.
+    """
+
+    def test_returns_none_when_row_absent(self, tmp_path: Path) -> None:
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [None]
+        assert d._read_cap_flipped_by() is None
+
+    def test_returns_none_when_json_null(self, tmp_path: Path) -> None:
+        """JSONB null → psycopg3 → Python None."""
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(None,)]
+        assert d._read_cap_flipped_by() is None
+
+    def test_returns_unwrapped_string_production_shape(self, tmp_path: Path) -> None:
+        """psycopg3 production shape: JSONB string → Python string (no quotes)."""
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [("circuit_breaker",)]
+        assert d._read_cap_flipped_by() == "circuit_breaker"
+
+    def test_returns_unwrapped_string_fake_cursor_shape(self, tmp_path: Path) -> None:
+        """Test fixtures may pass JSON-encoded bytes — accepted equivalently."""
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [('"circuit_breaker"',)]
+        assert d._read_cap_flipped_by() == "circuit_breaker"
+
+    def test_returns_none_for_non_string_value(self, tmp_path: Path) -> None:
+        """A JSON number / bool / null where we expected a string is a
+        malformed row — return None."""
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(42,)]
+        assert d._read_cap_flipped_by() is None
+
+
 class TestAutoClose:
     """``_check_circuit_breaker_auto_close`` clears the flag on operator re-flip."""
 
@@ -532,8 +573,8 @@ class TestAutoClose:
     def test_does_nothing_when_flag_is_operator_string(self, tmp_path: Path) -> None:
         """Flag was set by something other than the breaker — don't touch it."""
         d, conn, _h = _make_daemon(tmp_path)
-        # JSONB-encoded string value as returned from Postgres.
-        conn.cursor_instance.fetch_queue = [('"operator"',)]
+        # psycopg3 unwraps JSONB scalar strings to Python str in production.
+        conn.cursor_instance.fetch_queue = [("operator",)]
 
         closed = d._check_circuit_breaker_auto_close(current_cap=1)
 
@@ -555,8 +596,8 @@ class TestAutoClose:
     ) -> None:
         """Operator re-flip: flag=circuit_breaker + cap=1 → log + clear flag."""
         d, conn, handler = _make_daemon(tmp_path)
-        # JSONB-encoded string value as returned from Postgres.
-        conn.cursor_instance.fetch_queue = [('"circuit_breaker"',)]
+        # psycopg3 unwraps JSONB scalar strings to Python str in production.
+        conn.cursor_instance.fetch_queue = [("circuit_breaker",)]
 
         closed = d._check_circuit_breaker_auto_close(current_cap=1)
 
@@ -686,8 +727,8 @@ class TestAcceptanceCriteria:
     def test_ac_operator_reflip_closes_circuit(self, tmp_path: Path) -> None:
         """AC: operator raises cap=1 after open → flag cleared, close logged."""
         d, conn, handler = _make_daemon(tmp_path)
-        # JSONB-encoded string value as returned from Postgres.
-        conn.cursor_instance.fetch_queue = [('"circuit_breaker"',)]
+        # psycopg3 unwraps JSONB scalar strings to Python str in production.
+        conn.cursor_instance.fetch_queue = [("circuit_breaker",)]
 
         closed = d._check_circuit_breaker_auto_close(current_cap=1)
 
