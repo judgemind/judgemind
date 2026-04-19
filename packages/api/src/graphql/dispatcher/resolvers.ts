@@ -253,10 +253,15 @@ function normalizeSnapshotJson(raw: unknown): SnapshotIssueRecord[] {
 }
 
 async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]> {
+  // Terminal-status filter includes `plan_blocked` (#2857) so the
+  // admin cockpit's "Recently completed" panel surfaces
+  // correct-outcome-triage agents alongside the genuine failures and
+  // successes. Future correct-outcome states (e.g. `needs_review`
+  // from #2856) slot into this IN list.
   const { rows } = await pool.query<Row>(
     `SELECT agent_id, issue_number, issue_title, status, ended_at, pr_number
        FROM dispatcher.agents
-      WHERE status IN ('succeeded', 'failed', 'crashed')
+      WHERE status IN ('succeeded', 'failed', 'crashed', 'plan_blocked')
         AND ended_at IS NOT NULL
       ORDER BY ended_at DESC
       LIMIT $1`,

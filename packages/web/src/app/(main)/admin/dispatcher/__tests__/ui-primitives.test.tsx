@@ -87,6 +87,27 @@ describe('OutcomePill', () => {
     expect(pill.textContent).toBe('\u26A0');
   });
 
+  // #2857: `plan_blocked` is the "plan correctly declined" terminal —
+  // distinct from `failed` (real infrastructure break). Uses a muted
+  // neutral chip (not red/amber) because it is operator-informational,
+  // not alarming.
+  it('renders plan_blocked with a circled-division-slash glyph', () => {
+    render(<OutcomePill status="plan_blocked" />);
+    const pill = screen.getByTestId('outcome-pill-plan_blocked');
+    expect(pill.getAttribute('aria-label')).toBe('plan blocked');
+    expect(pill.textContent).toBe('\u2298');
+  });
+
+  it('renders plan_blocked with the neutral muted chip (not red/amber)', () => {
+    render(<OutcomePill status="plan_blocked" />);
+    const pill = screen.getByTestId('outcome-pill-plan_blocked');
+    // Neutral stone treatment — signals "informational, not alarming".
+    expect(pill.className).toContain('bg-muted');
+    // Must NOT use the failure/warning colour tokens.
+    expect(pill.className).not.toMatch(/bg-red/);
+    expect(pill.className).not.toMatch(/bg-amber/);
+  });
+
   it('renders a fallback for unknown status', () => {
     render(<OutcomePill status="bogus" />);
     expect(screen.getByText('?')).toBeInTheDocument();

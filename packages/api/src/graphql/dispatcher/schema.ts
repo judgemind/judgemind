@@ -93,7 +93,15 @@ export const dispatcherTypeDefs = `#graphql
     issueNumber: Int!
     worktreePath: String!
     phase: String!
-    """One of running | succeeded | failed | retrying | crashed."""
+    """One of running | succeeded | failed | retrying | crashed | plan_blocked.
+
+    \`plan_blocked\` (#2857) is the "plan correctly declined to proceed"
+    terminal — semantically distinct from \`failed\` which is reserved
+    for genuine infrastructure/subprocess failures. Kept as \`String!\`
+    rather than a GraphQL enum so future correct-outcome terminals
+    (e.g. \`needs_review\` from #2856) slot in without a schema
+    migration.
+    """
     status: String!
     startedAt: DateTime!
     endedAt: DateTime
@@ -127,8 +135,9 @@ export const dispatcherTypeDefs = `#graphql
   }
 
   """One row in the 'Recently completed' panel (#2805 §1.5). Derived from
-  \`dispatcher.agents\` where status IN ('succeeded','failed','crashed'),
-  newest first. Capped at 10 server-side."""
+  \`dispatcher.agents\` where status IN
+  ('succeeded','failed','crashed','plan_blocked'), newest first. Capped
+  at 10 server-side."""
   type RecentCompletion {
     """Agent id (UUID)."""
     agentId: ID!
@@ -136,7 +145,8 @@ export const dispatcherTypeDefs = `#graphql
     issueNumber: Int!
     """Issue title (fetched live from GitHub; null if the lookup failed)."""
     issueTitle: String
-    """One of succeeded | failed | crashed."""
+    """One of succeeded | failed | crashed | plan_blocked. See
+    \`DispatcherAgent.status\` for the semantics of each value."""
     status: String!
     endedAt: DateTime!
     """PR number if the agent produced one; null otherwise."""
@@ -189,8 +199,9 @@ export const dispatcherTypeDefs = `#graphql
     when nothing is blocked."""
     queueBlocked: [QueueItem!]!
     """Top 10 recently-completed agents (#2805 §1.5). Rows from
-    \`dispatcher.agents\` where status IN ('succeeded','failed','crashed')
-    ordered by \`ended_at\` DESC."""
+    \`dispatcher.agents\` where status IN
+    ('succeeded','failed','crashed','plan_blocked') ordered by
+    \`ended_at\` DESC."""
     recentCompletions: [RecentCompletion!]!
     """All live-editable \`dispatcher.config\` entries (#2805 §1.6)."""
     config: [DispatcherConfigEntry!]!

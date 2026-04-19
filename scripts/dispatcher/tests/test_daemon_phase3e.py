@@ -1060,6 +1060,52 @@ class TestDiagnosisOutcomeWriteback:
         assert outcome_dict["retry_outcome"] == "failed"
         assert outcome_dict["final_status"] == "crashed"
 
+    def test_plan_blocked_terminal_writes_succeeded_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """``plan_blocked`` (#2857) is a terminal status that classifies as a
+        correct-outcome retry (not a failure) for diagnoser effectiveness
+        tracking.
+
+        The agent row's ``status`` is ``plan_blocked`` (visible in the
+        admin cockpit as a distinct chip), but the retry-outcome
+        classification for dashboards/reporting is ``succeeded`` —
+        declining to proceed on a malformed issue is the correct thing
+        for the diagnoser to have surfaced.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.rowcount = 1
+
+        d._mark_agent_terminal(
+            "agent-plan-blocked",
+            status="plan_blocked",
+            phase="planning",
+            exit_code=0,
+        )
+
+        diag_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.diagnoses" in e[0]
+        ]
+        assert diag_updates
+        outcome_dict = json.loads(diag_updates[0][1][0])
+        assert outcome_dict["retry_outcome"] == "succeeded"
+        assert outcome_dict["final_status"] == "plan_blocked"
+        # Terminal bookkeeping ran: ended_at SET on the agent row.
+        agent_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "plan_blocked" in e[1]
+        ]
+        assert agent_updates
+        # The SET clause of the terminal update writes ended_at.
+        assert "ended_at = now()" in agent_updates[0][0]
+        # diagnosis_outcome_written event logged.
+        assert handler.events("diagnosis_outcome_written")
+
     def test_non_terminal_status_skips_outcome_write(self, tmp_path: Path) -> None:
         # When the daemon transitions to e.g. awaiting_ci (non-terminal),
         # no diagnoses outcome write should happen.

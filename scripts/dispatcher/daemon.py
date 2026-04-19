@@ -307,6 +307,20 @@ FIX_CI_LOG_TAIL_MAX_CHARS = 20000
 #: concurrent races via unique-violation).
 ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded")
 
+#: Sentinel HTML comment embedded as line 1 of the automated
+#: "plan returned go=false" issue comment. Lets the daemon detect that
+#: the comment has already been posted and skip re-posting on a retry
+#: of the plan_blocked handler (idempotence — see issue #2857).
+#: HTML comments survive GitHub's markdown rendering pipeline and are
+#: visible in ``gh issue view --json comments`` output.
+PLAN_BLOCKED_COMMENT_SENTINEL = "<!-- dispatcher-plan-blocked -->"
+
+#: Timeout for the ``gh issue view``/``gh issue comment``/``gh issue edit``
+#: subprocess calls used by the plan_blocked handler. Tight enough that
+#: a hung GitHub request can't stall the scheduler tick for multiple
+#: minutes; loose enough that a normal call (<3s) always finishes.
+PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS = 30
+
 #: Relative path under the repo root where per-agent worktrees land in
 #: the local-dev fallback mode (``baseline_repo_root`` unset). Mirrors
 #: the laptop-dispatcher convention from ``.claude/skills/task/SKILL.md``
@@ -3303,16 +3317,23 @@ class DispatcherDaemon:
     ) -> None:
         """UPDATE ``dispatcher.agents`` with terminal status + metadata.
 
-        Used for ``succeeded``, ``failed``, ``crashed``, and the
-        Phase 3A post-PR hand-off state (``status='running'``,
+        Used for ``succeeded``, ``failed``, ``crashed``, ``plan_blocked``,
+        and the Phase 3A post-PR hand-off state (``status='running'``,
         ``phase='awaiting_ci'``). For terminal statuses (``succeeded`` /
-        ``failed`` / ``crashed``) also sets ``ended_at`` so the admin
-        page can compute duration AND writes back the resolved outcome
-        to any pending ``dispatcher.diagnoses`` rows for this agent
-        (Phase 3E #2798, spec §8 line 305).
+        ``failed`` / ``crashed`` / ``plan_blocked``) also sets
+        ``ended_at`` so the admin page can compute duration AND writes
+        back the resolved outcome to any pending
+        ``dispatcher.diagnoses`` rows for this agent (Phase 3E #2798,
+        spec §8 line 305).
+
+        ``plan_blocked`` (issue #2857) is the "plan correctly declined
+        to proceed" terminal — distinct from ``failed`` (genuine
+        infrastructure/subprocess break) so the admin cockpit and
+        reporting can separate correct-outcome triage from real
+        failures.
         """
         assert self._conn is not None, "connect() must run before update"
-        terminal = status in ("succeeded", "failed", "crashed")
+        terminal = status in ("succeeded", "failed", "crashed", "plan_blocked")
         try:
             with self._conn.cursor() as cur:
                 if terminal:
@@ -3710,6 +3731,330 @@ class DispatcherDaemon:
         self._run_orchestration_phases(agent_id, issue_number, worktree)
         return True
 
+    def _plan_blocked_comment_already_posted(self, issue_number: int) -> bool | None:
+        """Return True if the plan-blocked sentinel comment is already on the issue.
+
+        Used by :meth:`_handle_plan_blocked` for idempotence — if a
+        prior invocation successfully posted the comment but failed
+        mid-sequence (label swap crashed, DB update crashed), the next
+        run would otherwise double-post. Detects by scanning the body
+        of every comment on the issue for
+        :data:`PLAN_BLOCKED_COMMENT_SENTINEL`.
+
+        Returns ``None`` on subprocess failure — the caller treats that
+        as "unknown" and proceeds with the post attempt (the cost of a
+        duplicate comment on a GitHub outage is lower than the cost of
+        silently dropping the operator signal).
+        """
+        cmd = [
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--json",
+            "comments",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.plan_blocked_sentinel_check_failed",
+                extra={
+                    "event": "plan_blocked_sentinel_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+            )
+            return None
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.plan_blocked_sentinel_check_failed",
+                extra={
+                    "event": "plan_blocked_sentinel_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_preview": (result.stderr or "").strip()[:200],
+                },
+            )
+            return None
+
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            self._log.warning(
+                "daemon.plan_blocked_sentinel_check_failed",
+                extra={
+                    "event": "plan_blocked_sentinel_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "error": f"invalid JSON: {exc}",
+                },
+            )
+            return None
+
+        for comment in payload.get("comments") or []:
+            if not isinstance(comment, dict):
+                continue
+            body = comment.get("body") or ""
+            if PLAN_BLOCKED_COMMENT_SENTINEL in body:
+                return True
+        return False
+
+    def _render_plan_blocked_comment(self, agent_id: str, block_reason: str) -> str:
+        """Render the plan-blocked issue comment body.
+
+        Shape (sentinel MUST be line 1 — see issue #2857 AC2):
+
+            <!-- dispatcher-plan-blocked -->
+            ## Plan phase output — `go=false` (autonomous dispatcher run <ISO-8601>)
+
+            The dispatcher picked this up and plan returned `go=false`. Block reason:
+
+            > <block_reason, each line prefixed with `> `>
+
+            Moving this out of `agent/ready` pending operator triage. Agent: `<short>`.
+
+        The block_reason is rendered as a markdown blockquote. Each
+        line is prefixed with ``> `` so multi-line reasons stay valid
+        blockquote markup. Empty lines inside the reason become ``>`` to
+        keep the blockquote from breaking at the first blank line.
+        """
+        short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        quoted_lines: list[str] = []
+        for line in (block_reason or "").splitlines() or [""]:
+            if line == "":
+                quoted_lines.append(">")
+            else:
+                quoted_lines.append(f"> {line}")
+        quoted_reason = "\n".join(quoted_lines)
+        return (
+            f"{PLAN_BLOCKED_COMMENT_SENTINEL}\n"
+            f"## Plan phase output — `go=false` "
+            f"(autonomous dispatcher run {now_iso})\n"
+            f"\n"
+            f"The dispatcher picked this up and plan returned "
+            f"`go=false`. Block reason:\n"
+            f"\n"
+            f"{quoted_reason}\n"
+            f"\n"
+            f"Moving this out of `agent/ready` pending operator triage. "
+            f"Agent: `{short_id}`.\n"
+        )
+
+    def _post_plan_blocked_comment(
+        self,
+        agent_id: str,
+        issue_number: int,
+        block_reason: str,
+        worktree: Path,
+    ) -> bool:
+        """Post the plan-blocked issue comment via ``gh issue comment``.
+
+        Skips the post if the sentinel is already present on the issue
+        (idempotence). Returns True when the comment is present on the
+        issue at return time (whether we posted it now or found it
+        already there). Returns False on a hard subprocess failure so
+        the caller can log and continue — label swap and DB update
+        still run regardless of this return value.
+        """
+        already = self._plan_blocked_comment_already_posted(issue_number)
+        if already is True:
+            self._log.info(
+                "daemon.plan_blocked_comment_skipped_idempotent",
+                extra={
+                    "event": "plan_blocked_comment_skipped_idempotent",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+            return True
+
+        body = self._render_plan_blocked_comment(agent_id, block_reason)
+        body_path = worktree / "tmp" / "plan-blocked-comment.md"
+        try:
+            body_path.parent.mkdir(parents=True, exist_ok=True)
+            body_path.write_text(body, encoding="utf-8")
+        except OSError as exc:
+            self._log.exception(
+                "daemon.plan_blocked_comment_failed",
+                extra={
+                    "event": "plan_blocked_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "error": f"write body file: {exc}",
+                },
+            )
+            return False
+
+        cmd = [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--body-file",
+            str(body_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.exception(
+                "daemon.plan_blocked_comment_failed",
+                extra={
+                    "event": "plan_blocked_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+            )
+            return False
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.plan_blocked_comment_failed",
+                extra={
+                    "event": "plan_blocked_comment_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_preview": (result.stderr or "").strip()[:200],
+                },
+            )
+            return False
+
+        self._log.info(
+            "daemon.plan_blocked_comment_posted",
+            extra={
+                "event": "plan_blocked_comment_posted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+            },
+        )
+        return True
+
+    def _swap_plan_blocked_labels(self, agent_id: str, issue_number: int) -> bool:
+        """Remove ``agent/ready`` and add ``status/triage`` via ``gh issue edit``.
+
+        Idempotent by construction — ``gh issue edit --remove-label`` is
+        a no-op when the label is already absent and ``--add-label`` is
+        a no-op when the label is already present. Returns True on
+        subprocess success; False on failure. Failure is logged and
+        does NOT block the caller's DB update.
+        """
+        cmd = [
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--remove-label",
+            "agent/ready",
+            "--add-label",
+            "status/triage",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.exception(
+                "daemon.plan_blocked_labels_failed",
+                extra={
+                    "event": "plan_blocked_labels_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+            )
+            return False
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.plan_blocked_labels_failed",
+                extra={
+                    "event": "plan_blocked_labels_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_preview": (result.stderr or "").strip()[:200],
+                },
+            )
+            return False
+
+        self._log.info(
+            "daemon.plan_blocked_labels_swapped",
+            extra={
+                "event": "plan_blocked_labels_swapped",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+            },
+        )
+        return True
+
+    def _handle_plan_blocked(
+        self,
+        agent_id: str,
+        issue_number: int,
+        block_reason: str,
+        worktree: Path,
+    ) -> None:
+        """Automation for ``plan_go_false`` with a populated ``block_reason``.
+
+        Issue #2857. Performs three side effects in sequence; each is
+        independently wrapped so a failure of one does not prevent the
+        others:
+
+        1. **Comment.** Post the standard plan-blocked comment (with the
+           ``<!-- dispatcher-plan-blocked -->`` sentinel as line 1) so
+           the operator can see why plan declined without opening the
+           admin cockpit or CloudWatch. Idempotent: if the sentinel is
+           already present, skip the post.
+        2. **Labels.** Remove ``agent/ready``, add ``status/triage`` so
+           the cooldown-expiry re-pickup loop stops claiming the issue.
+        3. **(caller handles DB update.)** The ``_mark_agent_terminal``
+           call with ``status='plan_blocked'`` runs in the caller so
+           this method can remain side-effect-only and the DB write
+           survives comment/label failures.
+
+        All failures are logged with structured events; none raise. The
+        contract is "fire-and-forget for the three external effects —
+        the DB update is the authoritative terminal-status write".
+        """
+        self._post_plan_blocked_comment(agent_id, issue_number, block_reason, worktree)
+        self._swap_plan_blocked_labels(agent_id, issue_number)
+
     def _run_plan_phase(self, agent_id: str, issue_number: int, worktree: Path) -> bool:
         """Run ``/task-v2-plan``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "planning")
@@ -3783,9 +4128,13 @@ class DispatcherDaemon:
         if not plan_output.get("go"):
             reason = plan_output.get("block_reason") or ""
             # A missing block_reason means "no work needed" —
-            # succeed. A populated block_reason indicates a hard
-            # problem — fail so operators see it.
-            status = "failed" if reason else "succeeded"
+            # succeed. A populated block_reason indicates plan
+            # correctly declined to proceed ("plan_blocked" — #2857).
+            # Distinct from ``failed`` which is reserved for real
+            # infrastructure / subprocess failures so the admin
+            # cockpit and reporting can separate correct-outcome
+            # triage from genuine breakage.
+            status = "plan_blocked" if reason else "succeeded"
             self._log.info(
                 "daemon.plan_go_false",
                 extra={
@@ -3796,6 +4145,12 @@ class DispatcherDaemon:
                     "terminal_status": status,
                 },
             )
+            if status == "plan_blocked":
+                # Side-effects: comment + label swap. Run BEFORE the DB
+                # update so a DB crash can't lose the operator-visible
+                # work. Each side-effect is individually wrapped so a
+                # failure of one does not prevent the others.
+                self._handle_plan_blocked(agent_id, issue_number, reason, worktree)
             self._mark_agent_terminal(
                 agent_id, status=status, phase="planning", exit_code=exit_code
             )
@@ -6761,7 +7116,14 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before update"
 
-        retry_outcome = "succeeded" if final_status == "succeeded" else "failed"
+        # ``plan_blocked`` (#2857) is the "plan correctly declined" terminal —
+        # operationally a correct outcome, not a failure. Classify it
+        # alongside ``succeeded`` for the retry_outcome enum so diagnoser
+        # effectiveness dashboards don't count correct-triage decisions
+        # against the retry-success rate.
+        retry_outcome = (
+            "succeeded" if final_status in ("succeeded", "plan_blocked") else "failed"
+        )
         outcome = {
             "retry_outcome": retry_outcome,
             "final_status": final_status,

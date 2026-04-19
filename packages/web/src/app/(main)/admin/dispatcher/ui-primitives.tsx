@@ -89,10 +89,18 @@ export function PriorityBadge({ priority }: { priority: string | null }) {
 }
 
 // ---------------------------------------------------------------------------
-// Outcome glyph pill — succeeded (✓ green), failed (✗ red), crashed (⚠ amber).
+// Outcome glyph pill — succeeded (✓ green), failed (✗ red), crashed (⚠ amber),
+// plan_blocked (⊘ neutral — #2857).
+//
+// Colour assignment intentionally keeps red/amber reserved for genuine
+// problems. `plan_blocked` ("plan correctly declined to proceed") is an
+// operator-informational correct-outcome state, so it uses the neutral
+// muted surface — the same treatment `priority/p2` gets above — per
+// BRAND.md §"Minimal accent use". A dashboard full of plan_blocked
+// chips must not look like a house on fire; it should look quiet.
 // ---------------------------------------------------------------------------
 
-type OutcomeStatus = 'succeeded' | 'failed' | 'crashed';
+type OutcomeStatus = 'succeeded' | 'failed' | 'crashed' | 'plan_blocked';
 
 const OUTCOME_STYLES: Record<OutcomeStatus, { glyph: string; className: string; label: string }> = {
   succeeded: {
@@ -109,6 +117,13 @@ const OUTCOME_STYLES: Record<OutcomeStatus, { glyph: string; className: string; 
     glyph: '\u26A0',
     className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200',
     label: 'crashed',
+  },
+  plan_blocked: {
+    // ⊘ = "circled division slash" — signals "declined to proceed"
+    // without overlapping the ✗/⚠ iconography reserved for failures.
+    glyph: '\u2298',
+    className: 'bg-muted text-foreground',
+    label: 'plan blocked',
   },
 };
 

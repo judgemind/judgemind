@@ -229,6 +229,26 @@ describe('recentCompletionsToGraphQL', () => {
     // Synchronous return — not a Promise.
     expect(Array.isArray(result)).toBe(true);
   });
+
+  it('passes plan_blocked status through unchanged (#2857)', () => {
+    // plan_blocked is a new terminal status parallel to failed/crashed;
+    // the mapper must pass it through so the admin cockpit's
+    // OutcomePill can render it with its distinct chip/colour.
+    const rows = [
+      {
+        agent_id: 'uuid-planblocked',
+        issue_number: 2857,
+        issue_title: 'Plan correctly declined',
+        status: 'plan_blocked',
+        ended_at: '2026-04-19T20:00:00Z',
+        pr_number: null,
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result).toHaveLength(1);
+    expect(result[0].status).toBe('plan_blocked');
+    expect(result[0].agentId).toBe('uuid-planblocked');
+  });
 });
 
 describe('parse-labels helpers (pure, no fetch)', () => {
