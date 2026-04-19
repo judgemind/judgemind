@@ -185,14 +185,17 @@ export function createApolloClient(): ApolloClient<unknown> {
         DataQualityMetricEdge: { keyFields: false },
 
         // ---------------------------------------------------------------------
-        // Dispatcher admin types (#2730). DispatcherAgent uses `id`, so it
-        // auto-normalizes — no keyFields needed. The rest lack `id`:
+        // Dispatcher admin types (#2730, #2805). DispatcherAgent uses `id`,
+        // so it auto-normalizes — no keyFields needed. The rest lack `id`:
         //
         // - DispatcherRun: unique by `runId` (single-response in DispatcherState).
         // - DispatcherFailure: unique by `failureId` (appears inside arrays).
         // - PhaseTransition: unique by `transitionId` (appears inside arrays).
         // - DispatcherCommandResult: unique by `commandId` (mutation result).
         // - DispatcherState: singleton root object (no arrays of it); opt out.
+        // - QueueItem: unique by `issueNumber` (#2805 §1.3).
+        // - RecentCompletion: unique by `agentId` (#2805 §1.5).
+        // - DispatcherConfigEntry: unique by `key` (#2805 §1.6).
         // ---------------------------------------------------------------------
 
         DispatcherRun: {
@@ -208,6 +211,15 @@ export function createApolloClient(): ApolloClient<unknown> {
           keyFields: ['commandId'],
         },
         DispatcherState: { keyFields: false },
+        QueueItem: {
+          keyFields: ['issueNumber'],
+        },
+        RecentCompletion: {
+          keyFields: ['agentId'],
+        },
+        DispatcherConfigEntry: {
+          keyFields: ['key'],
+        },
 
         // ---------------------------------------------------------------------
         // Types that intentionally do NOT need keyFields:

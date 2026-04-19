@@ -47,6 +47,36 @@ export const DISPATCHER_STATE_QUERY = gql`
         issueNumber
       }
       queueDepth
+      queueReady {
+        issueNumber
+        title
+        priority
+        labels
+        createdAt
+        blockedBy
+      }
+      queueBlocked {
+        issueNumber
+        title
+        priority
+        labels
+        createdAt
+        blockedBy
+      }
+      recentCompletions {
+        agentId
+        issueNumber
+        issueTitle
+        status
+        endedAt
+        prNumber
+      }
+      config {
+        key
+        value
+        updatedAt
+        updatedBy
+      }
       spawnFrozenUntil
     }
   }
@@ -62,6 +92,17 @@ export const DISPATCHER_CONTROL_MUTATION = gql`
       consumedAt
       payload
       created
+    }
+  }
+`;
+
+export const DISPATCHER_SET_CONFIG_MUTATION = gql`
+  mutation DispatcherSetConfig($key: String!, $value: String!) {
+    dispatcherSetConfig(key: $key, value: $value) {
+      key
+      value
+      updatedAt
+      updatedBy
     }
   }
 `;
@@ -105,12 +146,47 @@ export interface DispatcherFailure {
   issueNumber: number | null;
 }
 
+export interface QueueItem {
+  issueNumber: number;
+  title: string;
+  priority: string | null;
+  labels: string[];
+  createdAt: string;
+  blockedBy: number[];
+}
+
+export interface RecentCompletion {
+  agentId: string;
+  issueNumber: number;
+  issueTitle: string | null;
+  /** One of `succeeded | failed | crashed`. */
+  status: string;
+  endedAt: string;
+  prNumber: number | null;
+}
+
+export interface DispatcherConfigEntry {
+  key: string;
+  /** JSON-encoded string — e.g. `"1"`, `"\"on\""`, `"[60,300]"`. */
+  value: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
 export interface DispatcherState {
   currentRun: DispatcherRun | null;
   activeAgents: DispatcherAgent[];
   recentFailures: DispatcherFailure[];
   queueDepth: number;
+  queueReady: QueueItem[];
+  queueBlocked: QueueItem[];
+  recentCompletions: RecentCompletion[];
+  config: DispatcherConfigEntry[];
   spawnFrozenUntil: string | null;
+}
+
+export interface DispatcherSetConfigData {
+  dispatcherSetConfig: DispatcherConfigEntry;
 }
 
 export interface DispatcherStateData {

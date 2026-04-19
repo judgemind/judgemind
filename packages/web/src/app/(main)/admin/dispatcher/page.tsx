@@ -15,8 +15,11 @@ import { DispatcherDashboard } from './DispatcherDashboard';
  * session.
  */
 export default function DispatcherPage() {
+  // max-w-cockpit (120rem / 1920px) lifts the reading-width constraint so
+  // the two-column operator deck has room to breathe on wide displays
+  // (#2805 §1.2). Other pages keep the narrower content widths.
   return (
-    <div className="mx-auto max-w-6xl">
+    <div className="mx-auto max-w-cockpit px-4">
       <DispatcherDashboard />
     </div>
   );

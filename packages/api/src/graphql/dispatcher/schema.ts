@@ -106,6 +106,53 @@ export const dispatcherTypeDefs = `#graphql
     failures: [DispatcherFailure!]!
   }
 
+  """One row in the queue side-panels (#2805 §1.3). Capped at 10 server-side.
+
+  - \`queueReady\` entries are open issues labelled \`agent/ready\` + not
+    assigned + not blocked. Sorted by priority asc then created_at asc.
+  - \`queueBlocked\` entries are open issues labelled \`status/blocked\`.
+    Sorted by created_at desc. \`blockedBy\` is parsed from the issue body's
+    \`Blocked by #N\` lines.
+  """
+  type QueueItem {
+    issueNumber: Int!
+    title: String!
+    """One of p0 | p1 | p2 | p3 | null (parsed from priority/pN label)."""
+    priority: String
+    labels: [String!]!
+    createdAt: DateTime!
+    """Issue numbers this issue is blocked by (from the 'Blocked by #N' lines
+    in the body). Empty for queueReady items."""
+    blockedBy: [Int!]!
+  }
+
+  """One row in the 'Recently completed' panel (#2805 §1.5). Derived from
+  \`dispatcher.agents\` where status IN ('succeeded','failed','crashed'),
+  newest first. Capped at 10 server-side."""
+  type RecentCompletion {
+    """Agent id (UUID)."""
+    agentId: ID!
+    """Issue the agent was working on."""
+    issueNumber: Int!
+    """Issue title (fetched live from GitHub; null if the lookup failed)."""
+    issueTitle: String
+    """One of succeeded | failed | crashed."""
+    status: String!
+    endedAt: DateTime!
+    """PR number if the agent produced one; null otherwise."""
+    prNumber: Int
+  }
+
+  """One key/value entry from \`dispatcher.config\` (#2805 §1.6)."""
+  type DispatcherConfigEntry {
+    key: String!
+    """JSON-encoded string — the on-disk jsonb \`value\` column.
+    Clients parse this on read and send a JSON-encoded string on write."""
+    value: String!
+    updatedAt: DateTime!
+    updatedBy: String!
+  }
+
   """Result of \`dispatcherControl\` — the command row that was written (or an existing one, if idempotent hit)."""
   type DispatcherCommandResult {
     commandId: ID!
@@ -131,6 +178,22 @@ export const dispatcherTypeDefs = `#graphql
     tick (Phase 2+). Returns 0 before the daemon has booted or when every
     recent scan has failed — the admin page treats that as "queue unknown / 0"."""
     queueDepth: Int!
+    """Top 10 ready-for-pickup issues (#2805 §1.3). Sourced from the most
+    recent \`dispatcher.queue_snapshots\` row, joined with a GitHub API
+    lookup for title/labels. Empty list when the queue is empty OR when
+    the daemon has not yet written a snapshot."""
+    queueReady: [QueueItem!]!
+    """Top 10 blocked issues (#2805 §1.3). Fetched live from the GitHub
+    API — \`status/blocked\` issues are not tracked in
+    \`dispatcher.queue_snapshots\`. Empty list when the lookup fails or
+    when nothing is blocked."""
+    queueBlocked: [QueueItem!]!
+    """Top 10 recently-completed agents (#2805 §1.5). Rows from
+    \`dispatcher.agents\` where status IN ('succeeded','failed','crashed')
+    ordered by \`ended_at\` DESC."""
+    recentCompletions: [RecentCompletion!]!
+    """All live-editable \`dispatcher.config\` entries (#2805 §1.6)."""
+    config: [DispatcherConfigEntry!]!
     """\`dispatcher.config.value\` for \`spawn_frozen_until\` (§10), or null if not set."""
     spawnFrozenUntil: DateTime
   }
@@ -172,5 +235,23 @@ export const dispatcherTypeDefs = `#graphql
       include \`agentId\`. For others, \`{}\` is fine."""
       payload: JSON
     ): DispatcherCommandResult!
+
+    """Update a single \`dispatcher.config\` entry (#2805 §1.6). Writes the
+    new value as JSONB, stamps \`updated_at\`, and records the admin's email
+    in \`updated_by\` for audit. Like \`dispatcherControl\`, this requires a
+    non-empty \`X-MFA-Token\` header — config edits can materially change
+    daemon behaviour (e.g. lowering \`concurrency_cap\` mid-flight).
+
+    Admin-only; non-admins receive "not found".
+    """
+    dispatcherSetConfig(
+      """The \`dispatcher.config.key\` to update. Must match an existing row."""
+      key: String!
+      """The new value, as a JSON-encoded string (e.g. \`"1"\` for a number,
+      \`"\\"on\\""\` for a string, \`"[60,300]"\` for an array). The server
+      validates the parsed value per-key — see resolver for the per-key
+      constraints."""
+      value: String!
+    ): DispatcherConfigEntry!
   }
 `;

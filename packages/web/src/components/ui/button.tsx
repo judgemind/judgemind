@@ -19,6 +19,10 @@ const buttonVariants = cva(
       size: {
         default: 'h-10 px-4 py-2',
         sm: 'h-9 rounded-md px-3',
+        // Extra-small — dense per-row action buttons (#2805 §DESIGN_SYSTEM
+        // additions). 28 px tall with tiny text, for tables/rows where
+        // the default 36-40 px sizes cede row density.
+        xs: 'h-7 rounded-md px-2 text-xs',
         lg: 'h-11 rounded-md px-8',
         icon: 'h-10 w-10',
       },

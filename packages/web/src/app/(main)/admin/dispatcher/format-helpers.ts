@@ -74,6 +74,32 @@ export function worktreeLogsUrl(worktreePath: string): string | null {
 }
 
 /**
+ * Format a past timestamp as a short relative string like "3 min ago",
+ * "2 h ago", "5 d ago". Returns `'—'` for invalid or future timestamps.
+ *
+ * Buckets:
+ *   - < 60 s     → "Ns ago"
+ *   - < 60 min   → "N min ago"
+ *   - < 24 h     → "N h ago"
+ *   - otherwise  → "N d ago"
+ */
+export function formatRelativeTime(iso: string | null, nowMs: number = Date.now()): string {
+  if (!iso) return '—';
+  const ts = new Date(iso).getTime();
+  if (!Number.isFinite(ts)) return '—';
+  const deltaMs = nowMs - ts;
+  if (deltaMs < 0) return '—';
+  const seconds = Math.floor(deltaMs / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} d ago`;
+}
+
+/**
  * Group failures by the `category` field and return an ordered list of
  * `{ category, count, mostRecent }` entries, sorted by count desc. Used
  * by the Recent failures panel.
