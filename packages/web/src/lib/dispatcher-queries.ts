@@ -70,6 +70,8 @@ export const DISPATCHER_STATE_QUERY = gql`
         status
         endedAt
         prNumber
+        totalTokens
+        totalCostUsd
       }
       config {
         key
@@ -165,6 +167,15 @@ export interface RecentCompletion {
   status: string;
   endedAt: string;
   prNumber: number | null;
+  /** Sum of input+output tokens across every phase the agent ran
+   * (#2869). Null when no phase row has recorded usage — rendered as
+   * "no cost data" rather than a misleading 0. */
+  totalTokens: number | null;
+  /** Sum of `cost_usd` across every phase the agent ran (#2869). Null
+   * when no phase row has recorded usage.
+   *
+   * WARNING: list-price estimate, NOT Max plan-adjusted. */
+  totalCostUsd: number | null;
 }
 
 export interface DispatcherConfigEntry {

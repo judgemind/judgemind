@@ -3680,6 +3680,7 @@ class DispatcherDaemon:
         phase: str,
         output_json: dict[str, Any],
         log_text: str | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> None:
         """INSERT the phase's output into ``dispatcher.phase_outputs``
         and append a row to ``dispatcher.phase_transitions``.
@@ -3703,25 +3704,48 @@ class DispatcherDaemon:
         single-attempt callers saw the INSERT rolled back silently; now
         every retry's output is preserved and the admin-page phase log
         shows the full retry trail.
+
+        ``usage`` (added #2869, migration 31) is the parsed
+        ``{tokens_input, tokens_output, tokens_cache_read,
+        tokens_cache_write, cost_usd, model_used}`` dict produced by
+        :meth:`_parse_phase_usage`. All six fields are nullable. When
+        ``usage`` is ``None`` (no metering signal — phase crashed before
+        claude emitted its JSON envelope, or the envelope was malformed)
+        every metering column is set to NULL and the INSERT still runs.
         """
         assert self._conn is not None, "connect() must run before persisting"
         attempt = self._current_attempt_for(agent_id)
+        u = usage or {}
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO dispatcher.phase_outputs "
-                    "    (agent_id, phase, output_json, log_text, attempt) "
-                    "VALUES (%s, %s, %s, %s, %s) "
+                    "    (agent_id, phase, output_json, log_text, attempt, "
+                    "     tokens_input, tokens_output, tokens_cache_read, "
+                    "     tokens_cache_write, cost_usd, model_used) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "ON CONFLICT (agent_id, phase, attempt) DO UPDATE SET "
-                    "    output_json = EXCLUDED.output_json, "
-                    "    log_text    = EXCLUDED.log_text, "
-                    "    ts          = now()",
+                    "    output_json         = EXCLUDED.output_json, "
+                    "    log_text            = EXCLUDED.log_text, "
+                    "    tokens_input        = EXCLUDED.tokens_input, "
+                    "    tokens_output       = EXCLUDED.tokens_output, "
+                    "    tokens_cache_read   = EXCLUDED.tokens_cache_read, "
+                    "    tokens_cache_write  = EXCLUDED.tokens_cache_write, "
+                    "    cost_usd            = EXCLUDED.cost_usd, "
+                    "    model_used          = EXCLUDED.model_used, "
+                    "    ts                  = now()",
                     (
                         agent_id,
                         phase,
                         json.dumps(output_json, default=str),
                         log_text,
                         attempt,
+                        u.get("tokens_input"),
+                        u.get("tokens_output"),
+                        u.get("tokens_cache_read"),
+                        u.get("tokens_cache_write"),
+                        u.get("cost_usd"),
+                        u.get("model_used"),
                     ),
                 )
                 cur.execute(
@@ -3967,13 +3991,29 @@ class DispatcherDaemon:
     def _spawn_phase_subprocess(
         self, phase: str, worktree: Path, agent_id: str
     ) -> tuple[int, float]:
-        """Run ``claude -p '/task-v2-<phase> <agent_id>'`` synchronously.
+        """Run ``claude -p '/task-v2-<phase> <agent_id>' --output-format json``.
 
-        Captures stdout + stderr to ``{worktree}/tmp/claude-p-<phase>.log``.
         Returns ``(exit_code, duration_seconds)``. Raises
         :class:`subprocess.TimeoutExpired` on wall-clock timeout so the
         caller can mark the agent failed. Other subprocess errors bubble
         up as their native exception types.
+
+        **Output capture layout (#2869).** ``--output-format json`` makes
+        stdout a single JSON envelope with ``{result, usage,
+        total_cost_usd, ...}``; if stderr merged into it the JSON would
+        be corrupted and unparseable. We split:
+
+        - stdout → ``{worktree}/tmp/claude-p-<phase>.stdout.json`` (pure
+          JSON, parsed by :meth:`_parse_phase_usage` for metering).
+        - stderr → ``{worktree}/tmp/claude-p-<phase>.stderr.log`` (normal
+          text, preserved for triage).
+        - After the subprocess exits we also write a combined view to
+          ``{worktree}/tmp/claude-p-<phase>.log`` (stderr first, then a
+          separator, then stdout). This preserves the pre-#2869 filename
+          invariant so triage helpers (:meth:`_log_tail`,
+          :meth:`_read_full_phase_log`, :meth:`_emit_phase_failure_log_event`)
+          keep working unchanged, and operators can still ``cat``,
+          ``tail``, or ``grep`` a single file during incident triage.
 
         The worktree is passed as the subprocess's CWD via
         ``subprocess.run(..., cwd=...)`` — NOT as a ``--cwd`` flag. The
@@ -3985,6 +4025,8 @@ class DispatcherDaemon:
         max_turns = PHASE_MAX_TURNS[phase]
         model = PHASE_MODELS[phase]
         log_path = worktree / "tmp" / f"claude-p-{phase}.log"
+        stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
+        stderr_path = worktree / "tmp" / f"claude-p-{phase}.stderr.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -3995,6 +4037,8 @@ class DispatcherDaemon:
             str(max_turns),
             "--model",
             model,
+            "--output-format",
+            "json",
         ]
 
         start = time.monotonic()
@@ -4007,21 +4051,141 @@ class DispatcherDaemon:
                 "phase": phase,
                 "model": model,
                 "max_turns": max_turns,
+                "output_format": "json",
             },
         )
 
-        with log_path.open("w", encoding="utf-8") as log_file:
-            result = subprocess.run(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-                cwd=str(worktree),
+        try:
+            with (
+                stdout_path.open("w", encoding="utf-8") as stdout_file,
+                stderr_path.open("w", encoding="utf-8") as stderr_file,
+            ):
+                result = subprocess.run(
+                    cmd,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=True,
+                    timeout=CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS,
+                    check=False,
+                    cwd=str(worktree),
+                )
+            duration = time.monotonic() - start
+        finally:
+            # Always compose the combined ``.log`` view, even on timeout /
+            # non-zero exit — triage helpers read it. Whatever partial
+            # content the two streams produced before the fault is useful.
+            self._compose_phase_log(
+                log_path=log_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
             )
-        duration = time.monotonic() - start
         return result.returncode, duration
+
+    @staticmethod
+    def _compose_phase_log(
+        log_path: Path, stdout_path: Path, stderr_path: Path
+    ) -> None:
+        """Concatenate stderr + stdout files into the combined ``.log`` file.
+
+        Written after every ``_spawn_phase_subprocess`` exit so the
+        legacy single-file triage path (``claude-p-<phase>.log``)
+        continues to surface both streams to operators. stderr comes
+        first because the rare content there (claude CLI crash messages,
+        boot errors) is almost always what operators want at the head of
+        the triage file; stdout (which is the JSON envelope post-#2869)
+        follows behind a thin separator so it's still grep-able but not
+        mistaken for stderr.
+        """
+        parts: list[str] = []
+        try:
+            if stderr_path.exists():
+                stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+                if stderr_text:
+                    parts.append("=== stderr ===\n")
+                    parts.append(stderr_text)
+                    if not stderr_text.endswith("\n"):
+                        parts.append("\n")
+            if stdout_path.exists():
+                stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+                if stdout_text:
+                    parts.append("=== stdout (JSON envelope) ===\n")
+                    parts.append(stdout_text)
+                    if not stdout_text.endswith("\n"):
+                        parts.append("\n")
+        except Exception:  # pragma: no cover — defensive
+            # Never let log composition break the phase. The phase's
+            # structured output path is separate; this is triage-only.
+            return
+        try:
+            log_path.write_text("".join(parts), encoding="utf-8")
+        except Exception:  # pragma: no cover — defensive
+            return
+
+    def _parse_phase_usage(self, worktree: Path, phase: str) -> dict[str, Any] | None:
+        """Parse the ``claude -p --output-format json`` usage envelope.
+
+        Reads ``{worktree}/tmp/claude-p-<phase>.stdout.json`` — the
+        single JSON object Claude Code writes to stdout when
+        ``--output-format json`` is passed. Extracts the fields we
+        persist on ``dispatcher.phase_outputs``:
+
+        - ``tokens_input`` ← ``usage.input_tokens``
+        - ``tokens_output`` ← ``usage.output_tokens``
+        - ``tokens_cache_read`` ← ``usage.cache_read_input_tokens``
+        - ``tokens_cache_write`` ← ``usage.cache_creation_input_tokens``
+        - ``cost_usd`` ← ``total_cost_usd``
+        - ``model_used`` ← ``model`` (falls back to ``PHASE_MODELS[phase]``)
+
+        Returns ``None`` on any error — the stdout file is missing,
+        empty, not JSON, or the envelope has no ``usage`` block. The
+        caller treats ``None`` the same as "no metering signal": the
+        new columns stay NULL, the row still inserts. Issue #2869.
+        """
+        stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
+        if not stdout_path.exists():
+            return None
+        try:
+            raw = stdout_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:  # pragma: no cover — defensive
+            return None
+        if not raw:
+            return None
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(envelope, dict):
+            return None
+        usage = envelope.get("usage")
+        if not isinstance(usage, dict):
+            # Some Claude Code versions emit a usage-less envelope for
+            # errors; persist nothing rather than guessing.
+            return None
+        cost_raw = envelope.get("total_cost_usd")
+        try:
+            cost_usd: float | None = float(cost_raw) if cost_raw is not None else None
+        except (TypeError, ValueError):
+            cost_usd = None
+        model_used = envelope.get("model")
+        if not isinstance(model_used, str) or not model_used:
+            model_used = PHASE_MODELS.get(phase)
+
+        def _int_or_none(v: Any) -> int | None:
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "tokens_input": _int_or_none(usage.get("input_tokens")),
+            "tokens_output": _int_or_none(usage.get("output_tokens")),
+            "tokens_cache_read": _int_or_none(usage.get("cache_read_input_tokens")),
+            "tokens_cache_write": _int_or_none(
+                usage.get("cache_creation_input_tokens")
+            ),
+            "cost_usd": cost_usd,
+            "model_used": model_used,
+        }
 
     def _claim_and_orchestrate_one(self) -> None:
         """Claim one issue and run the plan → ralph → summary → PR flow.
@@ -5107,6 +5271,7 @@ class DispatcherDaemon:
             "plan",
             plan_output,
             log_text=self._read_full_phase_log(worktree, "plan") or None,
+            usage=self._parse_phase_usage(worktree, "plan"),
         )
         self._log.info(
             "daemon.phase_succeeded",
@@ -5210,6 +5375,7 @@ class DispatcherDaemon:
             "ralph",
             ralph_output,
             log_text=self._read_full_phase_log(worktree, "ralph") or None,
+            usage=self._parse_phase_usage(worktree, "ralph"),
         )
         verdict = ralph_output.get("verdict", "")
         self._log.info(
@@ -5375,6 +5541,7 @@ class DispatcherDaemon:
             "summary",
             summary_output,
             log_text=self._read_full_phase_log(worktree, "summary") or None,
+            usage=self._parse_phase_usage(worktree, "summary"),
         )
         self._log.info(
             "daemon.phase_succeeded",
@@ -6750,6 +6917,7 @@ class DispatcherDaemon:
             "fix-ci",
             fix_ci_output,
             log_text=self._read_full_phase_log(worktree, "fix-ci") or None,
+            usage=self._parse_phase_usage(worktree, "fix-ci"),
         )
         verdict = str(fix_ci_output.get("verdict") or "").upper()
 
@@ -7319,6 +7487,7 @@ class DispatcherDaemon:
             "verify",
             verify_output,
             log_text=self._read_full_phase_log(worktree, "verify") or None,
+            usage=self._parse_phase_usage(worktree, "verify"),
         )
 
         evidence_md = str(verify_output.get("evidence_md") or "").strip()
@@ -7676,6 +7845,7 @@ class DispatcherDaemon:
             "retro",
             retro_output,
             log_text=self._read_full_phase_log(worktree, "retro") or None,
+            usage=self._parse_phase_usage(worktree, "retro"),
         )
 
         # File the retro issues. Each entry becomes a separate

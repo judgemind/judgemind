@@ -18,10 +18,13 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  coerceNullableNumber,
   normalizeSnapshotJson,
+  phaseCostRowsToGraphQL,
   queueItemFromSnapshot,
   recentCompletionsToGraphQL,
   sortAndSliceQueueReady,
+  sumPhaseCost,
   type SnapshotIssueRecord,
 } from '../src/graphql/dispatcher/resolvers';
 import {
@@ -174,6 +177,8 @@ describe('recentCompletionsToGraphQL', () => {
         status: 'succeeded',
         ended_at: '2026-04-18T12:00:00Z',
         pr_number: 2824,
+        total_tokens: 12345,
+        total_cost_usd: '0.0420',
       },
     ];
     const result = recentCompletionsToGraphQL(rows);
@@ -185,8 +190,31 @@ describe('recentCompletionsToGraphQL', () => {
         status: 'succeeded',
         endedAt: '2026-04-18T12:00:00Z',
         prNumber: 2824,
+        totalTokens: 12345,
+        totalCostUsd: 0.042,
       },
     ]);
+  });
+
+  it('emits totalTokens=null and totalCostUsd=null for pre-migration-31 rows', () => {
+    // Rows whose agent ran before migration 31 (or whose phases all
+    // crashed before producing a JSON envelope) have NULL metering —
+    // the UI renders "no cost data" rather than a misleading $0.00.
+    const rows = [
+      {
+        agent_id: 'uuid-1',
+        issue_number: 100,
+        issue_title: 'Pre-migration agent',
+        status: 'succeeded',
+        ended_at: '2026-04-18T12:00:00Z',
+        pr_number: 2824,
+        total_tokens: null,
+        total_cost_usd: null,
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].totalTokens).toBeNull();
+    expect(result[0].totalCostUsd).toBeNull();
   });
 
   it('emits issueTitle=null for rows with NULL/empty issue_title (pre-migration-28)', () => {
@@ -507,5 +535,132 @@ describe('sortAndSliceQueueReady', () => {
 
     expect(result).toHaveLength(2);
     expect(result.map((r) => r.number)).toEqual([1, 2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metering helpers (#2869) — coerceNullableNumber, sumPhaseCost,
+// phaseCostRowsToGraphQL. These back the new DispatcherAgent fields
+// ``totalTokensInput``, ``totalTokensOutput``, ``totalCostUsd``, and
+// ``phaseCostBreakdown``.
+// ---------------------------------------------------------------------------
+
+describe('coerceNullableNumber (#2869)', () => {
+  it('returns the value unchanged for finite numbers', () => {
+    expect(coerceNullableNumber(42)).toBe(42);
+    expect(coerceNullableNumber(0)).toBe(0);
+    expect(coerceNullableNumber(-3.14)).toBe(-3.14);
+  });
+
+  it('coerces pg numeric strings (cost_usd is returned as a string)', () => {
+    // pg's default numeric→string mapping preserves precision. The
+    // resolver must coerce to Number so the GraphQL scalar serializes
+    // as a JSON number, not a quoted string.
+    expect(coerceNullableNumber('0.0420')).toBe(0.042);
+    expect(coerceNullableNumber('12345')).toBe(12345);
+  });
+
+  it('coerces bigint to Number', () => {
+    // Token counts fit in 53 bits well under any plausible phase usage;
+    // bigint → Number is safe.
+    expect(coerceNullableNumber(12345n)).toBe(12345);
+  });
+
+  it('returns null for null / undefined / unparseable', () => {
+    expect(coerceNullableNumber(null)).toBeNull();
+    expect(coerceNullableNumber(undefined)).toBeNull();
+    expect(coerceNullableNumber('nope')).toBeNull();
+    expect(coerceNullableNumber({})).toBeNull();
+    expect(coerceNullableNumber(NaN)).toBeNull();
+  });
+});
+
+describe('sumPhaseCost (#2869)', () => {
+  it('sums a column across rows, ignoring nulls', () => {
+    const rows = [
+      { tokens_input: 100, tokens_output: 50, cost_usd: '0.01' },
+      { tokens_input: 200, tokens_output: null, cost_usd: '0.02' },
+      { tokens_input: null, tokens_output: 30, cost_usd: null },
+    ];
+    expect(sumPhaseCost(rows, 'tokens_input')).toBe(300);
+    expect(sumPhaseCost(rows, 'tokens_output')).toBe(80);
+    expect(sumPhaseCost(rows, 'cost_usd')).toBeCloseTo(0.03, 10);
+  });
+
+  it('returns null when every row is null (no metering signal)', () => {
+    // Distinct from returning 0 — the UI must be able to distinguish
+    // "this agent actually spent $0" from "we have no data for this
+    // agent". Pre-migration-31 agents all have NULL across the board.
+    const rows = [
+      { tokens_input: null, tokens_output: null, cost_usd: null },
+      { tokens_input: null, tokens_output: null, cost_usd: null },
+    ];
+    expect(sumPhaseCost(rows, 'tokens_input')).toBeNull();
+    expect(sumPhaseCost(rows, 'tokens_output')).toBeNull();
+    expect(sumPhaseCost(rows, 'cost_usd')).toBeNull();
+  });
+
+  it('returns 0 when at least one row has a zero value (distinct from null)', () => {
+    const rows = [
+      { tokens_input: 0, tokens_output: null, cost_usd: '0' },
+    ];
+    expect(sumPhaseCost(rows, 'tokens_input')).toBe(0);
+    // tokens_output is entirely null → null sentinel.
+    expect(sumPhaseCost(rows, 'tokens_output')).toBeNull();
+    expect(sumPhaseCost(rows, 'cost_usd')).toBe(0);
+  });
+
+  it('returns null for an empty row list', () => {
+    expect(sumPhaseCost([], 'tokens_input')).toBeNull();
+    expect(sumPhaseCost([], 'cost_usd')).toBeNull();
+  });
+});
+
+describe('phaseCostRowsToGraphQL (#2869)', () => {
+  it('maps snake_case columns to camelCase GraphQL fields with nullable Number coercion', () => {
+    const rows = [
+      {
+        phase: 'plan',
+        tokens_input: '1000',
+        tokens_output: '200',
+        tokens_cache_read: '3000',
+        tokens_cache_write: '400',
+        cost_usd: '0.0123',
+        model_used: 'claude-opus-4-5',
+      },
+      {
+        phase: 'ralph',
+        tokens_input: null,
+        tokens_output: null,
+        tokens_cache_read: null,
+        tokens_cache_write: null,
+        cost_usd: null,
+        model_used: null,
+      },
+    ];
+    expect(phaseCostRowsToGraphQL(rows)).toEqual([
+      {
+        phase: 'plan',
+        tokensInput: 1000,
+        tokensOutput: 200,
+        tokensCacheRead: 3000,
+        tokensCacheWrite: 400,
+        costUsd: 0.0123,
+        modelUsed: 'claude-opus-4-5',
+      },
+      {
+        phase: 'ralph',
+        tokensInput: null,
+        tokensOutput: null,
+        tokensCacheRead: null,
+        tokensCacheWrite: null,
+        costUsd: null,
+        modelUsed: null,
+      },
+    ]);
+  });
+
+  it('returns an empty array for an empty row list', () => {
+    expect(phaseCostRowsToGraphQL([])).toEqual([]);
   });
 });

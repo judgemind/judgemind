@@ -280,12 +280,34 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
   // slot into this IN list without a schema migration —
   // `dispatcher.agents.status` is plain text (migration 25, no CHECK
   // constraint).
+  //
+  // #2869: LEFT JOIN the per-agent token + cost rollup from
+  // `dispatcher.phase_outputs` so the admin cockpit can render a cost
+  // footnote on each row without an N+1 query. SUM across attempts and
+  // phases — the row is one "finished agent", not one phase. Rows that
+  // predate migration 31 have NULL metering columns, so SUM returns
+  // NULL (not 0), which the UI renders as "no cost data" rather than a
+  // misleading "$0.00".
   const { rows } = await pool.query<Row>(
-    `SELECT agent_id, issue_number, issue_title, status, ended_at, pr_number
-       FROM dispatcher.agents
-      WHERE status IN ('succeeded', 'failed', 'crashed', 'plan_blocked', 'needs_review')
-        AND ended_at IS NOT NULL
-      ORDER BY ended_at DESC
+    `SELECT a.agent_id,
+            a.issue_number,
+            a.issue_title,
+            a.status,
+            a.ended_at,
+            a.pr_number,
+            po.total_tokens,
+            po.total_cost_usd
+       FROM dispatcher.agents a
+       LEFT JOIN (
+         SELECT agent_id,
+                SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)) AS total_tokens,
+                SUM(cost_usd) AS total_cost_usd
+           FROM dispatcher.phase_outputs
+          GROUP BY agent_id
+       ) po ON po.agent_id = a.agent_id
+      WHERE a.status IN ('succeeded', 'failed', 'crashed', 'plan_blocked', 'needs_review')
+        AND a.ended_at IS NOT NULL
+      ORDER BY a.ended_at DESC
       LIMIT $1`,
     [limit],
   );
@@ -433,8 +455,36 @@ function recentCompletionsToGraphQL(
       status: row.status,
       endedAt: row.ended_at,
       prNumber: row.pr_number ?? null,
+      // #2869: metering fields. Coerced to Number because pg returns
+      // numeric-type columns as strings on some platforms; null stays
+      // null so the UI renders "no data" instead of "$0.00".
+      totalTokens: coerceNullableNumber(row.total_tokens),
+      totalCostUsd: coerceNullableNumber(row.total_cost_usd),
     };
   });
+}
+
+/** Coerce a pg numeric/bigint column to a JS Number or null.
+ *
+ * pg's default mapping returns ``numeric`` as a string (to preserve
+ * arbitrary precision) and ``bigint`` as a string on platforms where
+ * Number would lose precision. The dispatcher metering columns are
+ * always small enough for a Number (token counts fit in 53 bits of
+ * precision well under any plausible phase usage), so we coerce.
+ * Null / undefined / NaN pass through as null — the GraphQL schema
+ * keeps every metering field nullable exactly for this "no signal"
+ * case. Issue #2869.
+ */
+function coerceNullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string' || typeof value === 'bigint') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -816,8 +866,137 @@ export const dispatcherResolvers = {
       const rows = await queryFailuresForAgent(pool, String(agentId));
       return rows.map(failureRowToGraphQL);
     },
+
+    // #2869: per-agent token + cost aggregates. Four fields share a
+    // single per-phase SELECT via DataLoader-style caching on the
+    // parent object — the first field to resolve primes
+    // `__phase_cost_rows` on the parent so subsequent sibling fields
+    // reuse the same query result instead of issuing three more
+    // SELECTs. dispatcherAgent() is a single-object query so this
+    // optimization only matters for the one-field-per-render paths,
+    // but it keeps the admin cockpit cheap when polling.
+    totalTokensInput: async (
+      parent: Record<string, unknown>,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      const rows = await _memoPhaseCostRows(pool, parent);
+      return sumPhaseCost(rows, 'tokens_input');
+    },
+
+    totalTokensOutput: async (
+      parent: Record<string, unknown>,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      const rows = await _memoPhaseCostRows(pool, parent);
+      return sumPhaseCost(rows, 'tokens_output');
+    },
+
+    totalCostUsd: async (
+      parent: Record<string, unknown>,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      const rows = await _memoPhaseCostRows(pool, parent);
+      return sumPhaseCost(rows, 'cost_usd');
+    },
+
+    phaseCostBreakdown: async (
+      parent: Record<string, unknown>,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      const rows = await _memoPhaseCostRows(pool, parent);
+      return phaseCostRowsToGraphQL(rows);
+    },
   },
 };
+
+async function _memoPhaseCostRows(
+  pool: Pool,
+  parent: Record<string, unknown>,
+): Promise<Row[]> {
+  const cached = parent.__phase_cost_rows;
+  if (Array.isArray(cached)) return cached as Row[];
+  const agentId = parent.__agent_id ?? parent.id;
+  const rows = await queryPhaseCostBreakdown(pool, String(agentId));
+  parent.__phase_cost_rows = rows;
+  return rows;
+}
+
+async function queryPhaseCostBreakdown(
+  pool: Pool,
+  agentId: string,
+): Promise<Row[]> {
+  // #2869: one row per phase, summed across retry attempts. The
+  // "latest model_used per phase" picks the most recent attempt
+  // deterministically via DISTINCT ON — retries that swap models
+  // (model_override operator knob) report the model that actually
+  // produced the final result.
+  const { rows } = await pool.query<Row>(
+    `SELECT po.phase,
+            SUM(po.tokens_input)       AS tokens_input,
+            SUM(po.tokens_output)      AS tokens_output,
+            SUM(po.tokens_cache_read)  AS tokens_cache_read,
+            SUM(po.tokens_cache_write) AS tokens_cache_write,
+            SUM(po.cost_usd)           AS cost_usd,
+            (SELECT model_used
+               FROM dispatcher.phase_outputs po2
+              WHERE po2.agent_id = po.agent_id
+                AND po2.phase    = po.phase
+                AND po2.model_used IS NOT NULL
+              ORDER BY po2.ts DESC
+              LIMIT 1) AS model_used
+       FROM dispatcher.phase_outputs po
+      WHERE po.agent_id = $1
+      GROUP BY po.agent_id, po.phase
+      ORDER BY MIN(po.ts) ASC`,
+    [agentId],
+  );
+  return rows;
+}
+
+function phaseCostRowsToGraphQL(
+  rows: readonly Row[],
+): Array<Record<string, unknown>> {
+  return rows.map((row) => ({
+    phase: row.phase,
+    tokensInput: coerceNullableNumber(row.tokens_input),
+    tokensOutput: coerceNullableNumber(row.tokens_output),
+    tokensCacheRead: coerceNullableNumber(row.tokens_cache_read),
+    tokensCacheWrite: coerceNullableNumber(row.tokens_cache_write),
+    costUsd: coerceNullableNumber(row.cost_usd),
+    modelUsed: typeof row.model_used === 'string' ? row.model_used : null,
+  }));
+}
+
+/** Sum a single nullable-numeric column across phase rows.
+ *
+ * Returns null when every row's value is null — the "no metering
+ * signal" case for an agent whose phases all ran before migration 31
+ * or all failed before producing a JSON envelope. Returns a Number
+ * (possibly 0) when at least one row has a non-null value, which the
+ * UI renders literally. Issue #2869.
+ */
+function sumPhaseCost(
+  rows: readonly Row[],
+  column: 'tokens_input' | 'tokens_output' | 'cost_usd',
+): number | null {
+  let total = 0;
+  let anyPresent = false;
+  for (const row of rows) {
+    const v = coerceNullableNumber(row[column]);
+    if (v === null) continue;
+    total += v;
+    anyPresent = true;
+  }
+  return anyPresent ? total : null;
+}
 
 // ---------------------------------------------------------------------------
 // Scalar shims — DateTime and JSON are declared but otherwise pass-through.
@@ -892,15 +1071,18 @@ export const dispatcherScalarResolvers = {
 // Internal exports for unit testing.
 export {
   agentRowToGraphQL,
+  coerceNullableNumber,
   commandRowToGraphQL,
   configRowToGraphQL,
   failureRowToGraphQL,
   insertCommandIdempotent,
   normalizeSnapshotJson,
+  phaseCostRowsToGraphQL,
   queueItemFromSnapshot,
   recentCompletionsToGraphQL,
   runRowToGraphQL,
   sortAndSliceQueueReady,
+  sumPhaseCost,
   transitionRowToGraphQL,
   updateConfigEntry,
 };

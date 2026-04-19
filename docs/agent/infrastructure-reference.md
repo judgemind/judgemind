@@ -214,6 +214,51 @@ Nonsensical values (threshold ≤ 0, window_size ≤ 0) are treated as "breaker 
 
 The daemon validates phase strings via the `PHASE_*` constants — adding a new phase value requires a code change but no migration. See `scripts/dispatcher/daemon.py` constants section for the canonical list.
 
+### Dispatcher v2 — per-phase token + cost telemetry (#2869)
+
+Migration 31 added `tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_write`, `cost_usd`, and `model_used` columns to `dispatcher.phase_outputs`. The daemon runs each phase as `claude -p /task-v2-<phase> --output-format json ...`, parses the JSON envelope that ships on stdout (`{usage: {...}, total_cost_usd: ..., model: ...}`), and writes those six fields alongside each `phase_outputs` row.
+
+> **Caveat — list-price, not Max plan.** `total_cost_usd` emitted by Claude Code is the list-price cost estimated against posted Anthropic rates. It does NOT reflect Max plan discounts (which are what the operator is actually billed under). Numbers here are useful for *relative* run-to-run comparison ("is ralph on sonnet cheaper than on haiku?") but NOT for absolute spend accounting.
+
+Two standard dashboards live below. Run them via `scripts/dev-db-query.sh` (or copy into any psql session that has `dispatcher.*` access).
+
+**Last 10 PRs — cost + token totals.** Answers "what did the last day of PR-landing agents cost?" For drilling into why a single agent was expensive, switch to the per-phase breakdown from `DispatcherAgent.phaseCostBreakdown` in the admin cockpit.
+
+```sql
+-- Last-day completed PRs, ordered by cost (most expensive first).
+-- Pre-migration-31 agents appear with pr_cost_usd = NULL (no signal) —
+-- COALESCE would misleadingly sort them as "$0" ahead of real cheap runs.
+SELECT a.pr_number,
+       a.issue_number,
+       SUM(po.cost_usd)                                      AS pr_cost_usd,
+       SUM(COALESCE(po.tokens_input, 0) + COALESCE(po.tokens_output, 0)) AS pr_tokens
+  FROM dispatcher.agents a
+  JOIN dispatcher.phase_outputs po ON po.agent_id = a.agent_id
+ WHERE a.pr_number IS NOT NULL
+   AND a.ended_at > now() - interval '1 day'
+ GROUP BY a.pr_number, a.issue_number
+ ORDER BY pr_cost_usd DESC NULLS LAST
+ LIMIT 10;
+```
+
+**Cost-by-phase, last 24h.** Answers "which phase is the cost bottleneck?" — the canonical tuning question. A consistently-expensive ralph means "swap ralph model" is a meaningful lever; a consistently-expensive plan means "opus on plan is priced out of proportion to the triage quality it provides."
+
+```sql
+-- Per-phase cost rollup — total spend + average per-run + runs-so-far.
+-- Sorted by total_cost DESC so the biggest line item is on top.
+SELECT phase,
+       SUM(cost_usd) AS total_cost,
+       AVG(cost_usd) AS avg_cost,
+       COUNT(*)      AS n_runs
+  FROM dispatcher.phase_outputs
+ WHERE ts > now() - interval '1 day'
+   AND cost_usd IS NOT NULL
+ GROUP BY phase
+ ORDER BY total_cost DESC;
+```
+
+Both queries filter `cost_usd IS NOT NULL` (or sort NULLS LAST) so pre-migration-31 rows don't corrupt the averages or take up slots in the top-10 view.
+
 ## ECS Script Execution
 
 > **Important:** The dev database is in a private VPC and is not reachable from localhost. Do not attempt to connect to it locally using `scripts/with-secret.sh` with `DATABASE_URL` — the connection will fail. All data scripts must run inside the VPC via `ecs-run-task.sh`.
