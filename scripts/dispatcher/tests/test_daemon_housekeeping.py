@@ -659,7 +659,12 @@ class TestHousekeepingTickAllLiveTargets:
         # One housekeeping_tick event per live target.
         ticks = handler.events("housekeeping_tick")
         tick_tables = {t.table for t in ticks}
-        assert tick_tables == {"queue_snapshots", "phase_outputs", "notifications"}
+        assert tick_tables == {
+            "queue_snapshots",
+            "blocked_snapshots",
+            "phase_outputs",
+            "notifications",
+        }
 
         # One DELETE per live target, and each uses the right column.
         deletes_by_table = {}
@@ -670,11 +675,13 @@ class TestHousekeepingTickAllLiveTargets:
                 deletes_by_table[table] = (sql, params)
         assert set(deletes_by_table) == {
             "queue_snapshots",
+            "blocked_snapshots",
             "phase_outputs",
             "notifications",
         }
         # Per-target column assertions — matches the migration schema.
         assert "observed_at <" in deletes_by_table["queue_snapshots"][0]
+        assert "observed_at <" in deletes_by_table["blocked_snapshots"][0]
         assert "ts <" in deletes_by_table["phase_outputs"][0]
         assert "created_at <" in deletes_by_table["notifications"][0]
 

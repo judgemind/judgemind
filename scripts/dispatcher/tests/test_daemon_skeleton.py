@@ -191,9 +191,10 @@ class TestSchedulerTick:
         fake_conn.cursor_instance.fetch_queue = [(0,)]
 
         d = _make_daemon(fake_conn=fake_conn)
-        # Stub the queue-scan fetch so the scheduler tick does not try
-        # to shell out to ``gh`` in this skeleton test.
+        # Stub the queue/blocked scan fetches so the scheduler tick does
+        # not try to shell out to ``gh`` in this skeleton test.
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._fetch_blocked_issues = lambda: []  # type: ignore[method-assign]
         # Set rowcount via a wrapper: execute() sets it before fetchone.
         # _FakeCursor doesn't auto-populate rowcount, so set it directly
         # between execute calls — the daemon calls execute then reads
@@ -212,13 +213,17 @@ class TestSchedulerTick:
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 3
         assert summary["concurrency_cap"] == 0
-        # Two commits per tick: one for command-consumption + config read,
-        # one for the queue_snapshots INSERT (Phase 2 addition). The
-        # scan is isolated in its own transaction so a queue-snapshot
-        # failure does not roll back a successful command drain. Phase 3A
-        # gate stays closed at ``concurrency_cap=0`` so no additional
-        # reads/commits happen.
-        assert fake_conn.commits == 2
+        # Three commits on the first tick:
+        #   1. command-consumption + config read,
+        #   2. queue_snapshots INSERT (Phase 2 addition, #2768),
+        #   3. blocked_snapshots INSERT (#2820) — always runs on the
+        #      first tick so the admin page has a populated blocked
+        #      panel immediately after daemon boot.
+        # Each scan is isolated in its own transaction so a snapshot
+        # failure does not roll back a successful command drain. Phase
+        # 3A gate stays closed at ``concurrency_cap=0`` so no
+        # additional reads/commits happen.
+        assert fake_conn.commits == 3
         # Tick counter incremented.
         assert d._scheduler_ticks == 1
 
@@ -229,6 +234,7 @@ class TestSchedulerTick:
 
         d = _make_daemon(fake_conn=fake_conn)
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._fetch_blocked_issues = lambda: []  # type: ignore[method-assign]
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 0
         assert summary["concurrency_cap"] == -1  # sentinel for "unset"

@@ -333,10 +333,22 @@ class TestScanQueueAndSnapshot:
     def test_writes_snapshot_row_and_logs(self) -> None:
         d, conn, handler = _make_daemon_with_capture()
 
-        # Patch the fetch path to return a canned list.
+        # Patch the fetch path to return a canned list, including the
+        # title/labels/createdAt fields the daemon now persists into
+        # ``issues_json`` (issue #2820).
         d._fetch_agent_ready_issues = lambda: [  # type: ignore[method-assign]
-            {"number": 10, "labels": [{"name": "agent/ready"}]},
-            {"number": 42, "labels": [{"name": "agent/ready"}]},
+            {
+                "number": 10,
+                "title": "Do thing A",
+                "labels": [{"name": "agent/ready"}, {"name": "priority/p1"}],
+                "createdAt": "2026-04-18T10:00:00Z",
+            },
+            {
+                "number": 42,
+                "title": "Do thing B",
+                "labels": [{"name": "agent/ready"}],
+                "createdAt": "2026-04-18T11:00:00Z",
+            },
         ]
 
         depth = d._scan_queue_and_snapshot()
@@ -349,8 +361,28 @@ class TestScanQueueAndSnapshot:
             if "INSERT INTO dispatcher.queue_snapshots" in e[0]
         ]
         assert len(inserts) == 1
-        _sql, params = inserts[0]
-        assert params == (2, [10, 42], "test-run-id")
+        sql, params = inserts[0]
+        # SQL mentions the new issues_json column.
+        assert "issues_json" in sql
+        # Params: (queue_depth, issue_numbers, issues_json_str, run_id).
+        assert params[0] == 2
+        assert params[1] == [10, 42]
+        enriched = json.loads(params[2])
+        assert enriched == [
+            {
+                "number": 10,
+                "title": "Do thing A",
+                "labels": ["agent/ready", "priority/p1"],
+                "createdAt": "2026-04-18T10:00:00Z",
+            },
+            {
+                "number": 42,
+                "title": "Do thing B",
+                "labels": ["agent/ready"],
+                "createdAt": "2026-04-18T11:00:00Z",
+            },
+        ]
+        assert params[3] == "test-run-id"
         assert conn.commits == 1
         # Structured log emitted.
         scans = handler.events("queue_scan")
@@ -372,7 +404,11 @@ class TestScanQueueAndSnapshot:
         ]
         assert len(inserts) == 1
         _sql, params = inserts[0]
-        assert params == (0, [], "test-run-id")
+        assert params[0] == 0
+        assert params[1] == []
+        # Empty queue → ``[]`` in issues_json, ``test-run-id`` in run_id.
+        assert json.loads(params[2]) == []
+        assert params[3] == "test-run-id"
 
         scans = handler.events("queue_scan")
         assert len(scans) == 1 and scans[0].count == 0
