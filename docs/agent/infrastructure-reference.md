@@ -158,6 +158,43 @@ scripts/dev-db-query.sh --rw "UPDATE dispatcher.config SET value = '0', updated_
 
 The daemon stops claiming new candidates on the next scheduler tick (≤ 30 s). Any in-flight agent finishes naturally — supervisor ticks continue advancing it through CI watch / merge / deploy / verify / retro / cleanup until it lands in a terminal phase. If the in-flight agent is stuck, the supervisor's `_check_stuck_agents` (Phase 3C, 30-min window) flips it to `crashed` and the retry-marker processor takes over.
 
+### Overnight-safety circuit breaker (#2860)
+
+The daemon auto-pauses (`concurrency_cap` → 0) when a streak of bad terminal outcomes hits the threshold — currently 5 of the last 10 agent terminals in a rolling 30-minute window. "Bad" is the complement of the `OVERNIGHT_CB_GOOD_OUTCOME_STATUSES` set in `scripts/dispatcher/daemon.py` (only `succeeded` is good today; `failed`, `crashed`, `plan_blocked`, `needs_review`, and unknown future terminals all count as bad).
+
+When the breaker opens:
+
+1. `UPDATE dispatcher.config SET value = '0' WHERE key = 'concurrency_cap'` with `updated_by = 'circuit_breaker'`.
+2. `UPDATE dispatcher.config SET value = '"circuit_breaker"' WHERE key = 'cap_flipped_by'` — diagnostic trail.
+3. Structured CloudWatch event `daemon.circuit_breaker_opened` with the agent list, bad count, threshold, and window.
+4. Telegram alert via `scripts/notify-telegram.sh` (best-effort — a missing secret is a silent no-op).
+5. Admin cockpit renders the red "Circuit breaker open" banner above the two-column deck.
+
+**Recovering from an open breaker.** The breaker does not auto-close. Investigate the underlying cascade first — run `scripts/dev-db-query.sh "SELECT * FROM dispatcher.terminal_outcomes ORDER BY ended_at DESC LIMIT 20"` to see the recent outcomes and `scripts/ecs-logs.sh /ecs/judgemind-dispatcher-dev --lines 200` for the open event context. Common triggers:
+
+- Gemini API rate limit → every ralph review SKIPPED → summary flags unmet → N `needs_review` in a row.
+- Upstream `main` CI red → every PR fails CI → fix-ci retries exhausted → N `failed` in a row.
+- Skill regression on plan-phase → every plan returns go=false → N `plan_blocked` in a row.
+
+After addressing the root cause, flip cap back up from the admin cockpit (preferred) or via SQL:
+
+```
+scripts/dev-db-query.sh --rw "UPDATE dispatcher.config SET value = '1', updated_by = '<your-handle>', updated_at = now() WHERE key = 'concurrency_cap';"
+```
+
+The next scheduler tick observes `cap_flipped_by = 'circuit_breaker' AND concurrency_cap >= 1`, logs `daemon.circuit_breaker_closed`, and clears `cap_flipped_by` back to `null`. New agents start claiming on the following tick.
+
+**Tuning the knobs.** All four thresholds live in `dispatcher.config` and are live-editable:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `circuit_breaker_enabled` | `true` | Kill switch. Flip to `false` only for controlled chaos testing. |
+| `circuit_breaker_window_minutes` | `30` | Rolling window the M-of-N scan considers. |
+| `circuit_breaker_window_size` | `10` | N (how many most-recent terminals). |
+| `circuit_breaker_bad_outcome_threshold` | `5` | M (bad-outcome count needed to trip). |
+
+Nonsensical values (threshold ≤ 0, window_size ≤ 0) are treated as "breaker disabled" so the rail fails-open rather than tripping on an empty window.
+
 ### Per-agent phase enumeration (Phase 3E)
 
 `dispatcher.agents.phase` is free-form `text` per migration 21 — no schema enum to maintain. The daemon-side enumeration (centralised in constants `PHASE_*` in `scripts/dispatcher/daemon.py`):

@@ -78,6 +78,8 @@ export const DISPATCHER_STATE_QUERY = gql`
         updatedBy
       }
       spawnFrozenUntil
+      circuitBreakerOpen
+      capFlippedBy
     }
   }
 `;
@@ -183,6 +185,10 @@ export interface DispatcherState {
   recentCompletions: RecentCompletion[];
   config: DispatcherConfigEntry[];
   spawnFrozenUntil: string | null;
+  /** True when the overnight-safety circuit breaker is open (#2860). */
+  circuitBreakerOpen: boolean;
+  /** Diagnostic trail for the last `concurrency_cap` flip (#2860). */
+  capFlippedBy: string | null;
 }
 
 export interface DispatcherSetConfigData {

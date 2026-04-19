@@ -162,6 +162,26 @@ async function querySpawnFrozenUntil(pool: Pool): Promise<string | null> {
   return null;
 }
 
+/**
+ * Read ``dispatcher.config.cap_flipped_by`` — the diagnostic trail for
+ * the last `concurrency_cap` flip. Returns the raw string (e.g.
+ * `"circuit_breaker"`) or null when the row is unset or contains JSON
+ * `null`. Used by the admin cockpit to render the overnight-safety
+ * circuit breaker's open banner (#2860).
+ */
+async function queryCapFlippedBy(pool: Pool): Promise<string | null> {
+  const { rows } = await pool.query<{ value: unknown }>(
+    `SELECT value FROM dispatcher.config WHERE key = 'cap_flipped_by'`,
+  );
+  if (rows.length === 0) return null;
+  const raw = rows[0].value;
+  if (raw === null || raw === undefined) return null;
+  // pg's jsonb parser unwraps scalars: JSON `"circuit_breaker"` → the
+  // JS string `'circuit_breaker'`; JSON `null` → JS `null`.
+  if (typeof raw === 'string') return raw;
+  return null;
+}
+
 async function queryQueueDepth(pool: Pool): Promise<number> {
   // Phase 2: return the most recent row's `queue_depth` from
   // `dispatcher.queue_snapshots` (written by the daemon on each 30s
@@ -606,14 +626,16 @@ export const dispatcherResolvers = {
       { pool, user }: DispatcherContext,
     ) => {
       requireDispatcherAdmin(user);
-      const [currentRunRow, spawnFrozenUntil] = await Promise.all([
+      const [currentRunRow, spawnFrozenUntil, capFlippedBy] = await Promise.all([
         queryCurrentRun(pool),
         querySpawnFrozenUntil(pool),
+        queryCapFlippedBy(pool),
       ]);
       return {
         // Nested fields defer to DispatcherState field resolvers.
         __currentRun: currentRunRow,
         __spawnFrozenUntil: spawnFrozenUntil,
+        __capFlippedBy: capFlippedBy,
       };
     },
 
@@ -755,6 +777,20 @@ export const dispatcherResolvers = {
 
     spawnFrozenUntil: (parent: Record<string, unknown>) => {
       return (parent.__spawnFrozenUntil as string | null) ?? null;
+    },
+
+    capFlippedBy: (parent: Record<string, unknown>) => {
+      return (parent.__capFlippedBy as string | null) ?? null;
+    },
+
+    /**
+     * True when the overnight-safety circuit breaker is open
+     * (#2860). Derived from `cap_flipped_by === 'circuit_breaker'` so
+     * the admin cockpit can show a banner without parsing the raw
+     * config value client-side.
+     */
+    circuitBreakerOpen: (parent: Record<string, unknown>) => {
+      return parent.__capFlippedBy === 'circuit_breaker';
     },
   },
 

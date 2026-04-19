@@ -97,6 +97,8 @@ const BASE_STATE = {
     },
   ],
   spawnFrozenUntil: null,
+  circuitBreakerOpen: false,
+  capFlippedBy: null,
 };
 
 import { DispatcherDashboard } from '../DispatcherDashboard';
@@ -298,5 +300,59 @@ describe('DispatcherDashboard — #2823 state-flow two-column layout', () => {
       'recent-completions-heading',
       'queue-blocked-heading',
     ]);
+  });
+});
+
+describe('DispatcherDashboard — #2860 circuit-breaker banner', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+  });
+
+  it('renders the banner when circuitBreakerOpen is true', () => {
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        circuitBreakerOpen: true,
+        capFlippedBy: 'circuit_breaker',
+      },
+    };
+    renderDashboard();
+    const banner = screen.getByTestId('circuit-breaker-banner');
+    expect(banner).toBeInTheDocument();
+    expect(banner.textContent).toMatch(/Circuit breaker open/i);
+    expect(banner.textContent).toMatch(/concurrency_cap/);
+    // Red by design — overnight-safety rail is a loud signal.
+    expect(banner.className).toMatch(/bg-red/);
+    expect(banner.getAttribute('role')).toBe('alert');
+  });
+
+  it('does not render the banner when circuitBreakerOpen is false', () => {
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        circuitBreakerOpen: false,
+        capFlippedBy: null,
+      },
+    };
+    renderDashboard();
+    expect(screen.queryByTestId('circuit-breaker-banner')).not.toBeInTheDocument();
+  });
+
+  it('does not render the banner when operator-paused (capFlippedBy != "circuit_breaker")', () => {
+    // Operator hit Pause — concurrency_cap is 0, but circuitBreakerOpen is
+    // false because the breaker did not trip it. The banner must stay
+    // hidden so the operator does not see a misleading "circuit open"
+    // signal for their own deliberate pause.
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        circuitBreakerOpen: false,
+        capFlippedBy: 'operator',
+      },
+    };
+    renderDashboard();
+    expect(screen.queryByTestId('circuit-breaker-banner')).not.toBeInTheDocument();
   });
 });
