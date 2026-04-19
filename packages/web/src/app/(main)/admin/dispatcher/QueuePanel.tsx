@@ -19,9 +19,9 @@ interface QueuePanelProps {
 }
 
 /**
- * Two sibling queue panels (#2805 §1.3) — agent-ready on the left,
- * blocked on the right. Each panel is borderless with a subtle heading
- * divider, and each row is a `Link`-able hot link via `IssueLink`.
+ * Two sibling queue panels (#2805 §1.3) — agent-ready and blocked. Each
+ * panel is borderless with a subtle heading divider, and each row is a
+ * `Link`-able hot link via `IssueLink`.
  *
  * Capped server-side at 10 entries per panel; more is dispatcher-internal
  * scheduling state, not useful on the overview page.
@@ -35,6 +35,14 @@ interface QueuePanelProps {
  * from this page. Titles get the freed horizontal space; the title cell
  * wraps onto a second line rather than ellipsis-truncating so the operator
  * can read the full text without hovering.
+ *
+ * Layout note (#2823 — state-flow two-column layout): the two sub-panels
+ * are exposed as independent named exports (`QueueReadyPanel`,
+ * `QueueBlockedPanel`) so the dashboard can place them in different
+ * columns of the state-flow layout — ready sits bottom-left (below Active)
+ * and blocked sits bottom-right (below Recently completed). The wrapping
+ * `QueuePanel` component is retained for backwards compatibility with the
+ * existing test suite but is no longer used by the dashboard itself.
  */
 export function QueuePanel({ queueReady, queueBlocked }: QueuePanelProps) {
   return (
@@ -48,7 +56,7 @@ export function QueuePanel({ queueReady, queueBlocked }: QueuePanelProps) {
   );
 }
 
-function QueueReadyPanel({ items }: { items: readonly QueueItem[] }) {
+export function QueueReadyPanel({ items }: { items: readonly QueueItem[] }) {
   return (
     <section aria-labelledby="queue-ready-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
@@ -74,7 +82,7 @@ function QueueReadyPanel({ items }: { items: readonly QueueItem[] }) {
   );
 }
 
-function QueueBlockedPanel({ items }: { items: readonly QueueItem[] }) {
+export function QueueBlockedPanel({ items }: { items: readonly QueueItem[] }) {
   return (
     <section aria-labelledby="queue-blocked-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">

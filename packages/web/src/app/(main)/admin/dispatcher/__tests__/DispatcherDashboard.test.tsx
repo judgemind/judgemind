@@ -7,6 +7,9 @@
  *   - Config-edit mutations always inject `X-MFA-Token`.
  *   - Lowering `concurrency_cap` pops the ConfirmDialog before committing.
  *   - Raising `concurrency_cap` commits immediately without dialog.
+ *   - State-flow two-column layout (#2823): Active → Queue-ready (left),
+ *     Recently-completed → Queue-blocked (right). Mobile collapses to
+ *     a single column in the same order.
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
@@ -222,5 +225,78 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     // First slot updated; subsequent retry delays preserved.
     expect(JSON.parse(call.variables.value)).toEqual([120, 300, 900]);
     expect(call.context?.headers).toEqual({ 'X-MFA-Token': 'phase1-placeholder' });
+  });
+});
+
+describe('DispatcherDashboard — #2823 state-flow two-column layout', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+  });
+
+  it('renders both columns inside a single `lg:grid-cols-2` deck', () => {
+    renderDashboard();
+    const deck = screen.getByTestId('dispatcher-two-column-deck');
+    // Outer container is a 1-col grid on mobile, 2-col grid at `lg`.
+    expect(deck.className).toMatch(/grid-cols-1/);
+    expect(deck.className).toMatch(/lg:grid-cols-2/);
+    // Both columns are present.
+    expect(screen.getByTestId('dispatcher-column-left')).toBeInTheDocument();
+    expect(screen.getByTestId('dispatcher-column-right')).toBeInTheDocument();
+  });
+
+  it('left column is a vertical flex stack of Active agents (top) then Queue: Agent-ready (bottom)', () => {
+    renderDashboard();
+    const left = screen.getByTestId('dispatcher-column-left');
+    // Column uses `flex flex-col gap-*` for variable-height panels, not a
+    // fixed-row grid (#2823: panels have natural heights).
+    expect(left.className).toMatch(/\bflex\b/);
+    expect(left.className).toMatch(/flex-col/);
+    // Locate the Active and Ready section headings within the column.
+    const active = left.querySelector('#active-agents-heading');
+    const ready = left.querySelector('#queue-ready-heading');
+    expect(active).not.toBeNull();
+    expect(ready).not.toBeNull();
+    // Active must come before Ready in DOM order.
+    expect(active!.compareDocumentPosition(ready!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Blocked is NOT in the left column.
+    expect(left.querySelector('#queue-blocked-heading')).toBeNull();
+  });
+
+  it('right column is a vertical flex stack of Recently completed (top) then Queue: Blocked (bottom)', () => {
+    renderDashboard();
+    const right = screen.getByTestId('dispatcher-column-right');
+    expect(right.className).toMatch(/\bflex\b/);
+    expect(right.className).toMatch(/flex-col/);
+    const completed = right.querySelector('#recent-completions-heading');
+    const blocked = right.querySelector('#queue-blocked-heading');
+    expect(completed).not.toBeNull();
+    expect(blocked).not.toBeNull();
+    expect(
+      completed!.compareDocumentPosition(blocked!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // Ready is NOT in the right column.
+    expect(right.querySelector('#queue-ready-heading')).toBeNull();
+  });
+
+  it('on mobile collapse (single column), panel DOM order is Active → Queue-ready → Recently-completed → Queue-blocked', () => {
+    // The CSS grid reflows to a single column at `< lg`, but the
+    // document order is stable and determines the mobile stack. Assert
+    // the four section headings appear in the required order.
+    renderDashboard();
+    const deck = screen.getByTestId('dispatcher-two-column-deck');
+    const headings = Array.from(
+      deck.querySelectorAll(
+        '#active-agents-heading, #queue-ready-heading, #recent-completions-heading, #queue-blocked-heading',
+      ),
+    ).map((el) => el.id);
+    expect(headings).toEqual([
+      'active-agents-heading',
+      'queue-ready-heading',
+      'recent-completions-heading',
+      'queue-blocked-heading',
+    ]);
   });
 });
