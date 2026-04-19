@@ -83,13 +83,24 @@ def perform_login(page: Page, email: str, password: str) -> None:
     and waits for the post-login redirect. After this returns, the page's
     browser context holds the auth cookies for subsequent navigation.
 
+    The login form posts a GraphQL ``login`` mutation to dev.api.judgemind.org,
+    which returns an access token and sets the ``refreshToken`` HTTP-only
+    cookie on the api subdomain. The React handler then calls
+    ``router.push('/')`` on success, redirecting to the home page.
+
+    This function waits for that redirect to land on ``/`` before returning —
+    waiting for a broader pattern like ``{BASE_URL}/**`` would match the
+    login page itself and return immediately before the mutation completes,
+    leaving the caller navigating away before the cookie is set (see #2760).
+
     Args:
         page: A Playwright Page object.
         email: The login email address.
         password: The login password.
 
     Raises:
-        TimeoutError: If the login redirect does not complete in time.
+        TimeoutError: If the login redirect does not complete in time
+            (most commonly because the credentials were rejected).
     """
     login_url = f"{BASE_URL}/auth/login"
     print(f"Authenticating via {login_url} ...")
@@ -99,9 +110,11 @@ def perform_login(page: Page, email: str, password: str) -> None:
     page.fill('input[name="password"]', password)
     page.click('button[type="submit"]')
 
-    # Wait for the post-login redirect (the login page navigates to / on success).
-    # Use a glob pattern to accept any path on the allowed host after login.
-    page.wait_for_url(f"{BASE_URL}/**", timeout=15000)
+    # Wait for the post-login redirect. The login page navigates to "/" on
+    # success (router.push('/')), so wait for exactly that URL — a glob like
+    # "/**" would also match "/auth/login" itself and return immediately
+    # without actually waiting for the mutation/redirect to complete.
+    page.wait_for_url(f"{BASE_URL}/", timeout=15000)
     print("Authentication successful.")
 
 

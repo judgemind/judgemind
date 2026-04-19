@@ -258,3 +258,18 @@ scripts/with-secret.sh -e DB_USER=judgemind/dev/db/connection:.username -e DB_PA
 ```
 
 The `-e VAR=secret-id` form uses the raw SecretString. The `-e VAR=secret-id:.field` form extracts a JSON key. Multiple `-e` flags can be chained.
+
+## Dev admin account (screenshot + auth-gated flows)
+
+`scripts/screenshot.py --auth` logs into `dev.judgemind.org` using credentials stored in AWS Secrets Manager at `judgemind/dev/agent-admin`. The account has `users.role = 'admin'` on the dev database, so admin-gated pages (e.g. `/admin/data-quality`, `/admin/dispatcher`) render with full admin content rather than the "Access Denied" / 404 fallback. See `.claude/skills/screenshot/SKILL.md` for usage.
+
+The secret's `email` and `password` keys are used by the script; any other consumer needing authenticated dev access should fetch them via `scripts/with-secret.sh`:
+
+```
+scripts/with-secret.sh \
+    -e AGENT_EMAIL=judgemind/dev/agent-admin:.email \
+    -e AGENT_PASSWORD=judgemind/dev/agent-admin:.password \
+    -- <command>
+```
+
+To rotate the password, generate a new strong random value, update both `public.users.password_hash` on dev (via `scripts/dev-db-query.sh --rw`, using a bcrypt cost-12 hash — see `packages/api/src/auth/passwords.ts`) and the `password` field in the Secrets Manager entry. The existing `email` should stay stable unless you are also rotating the account identity.

@@ -127,13 +127,23 @@ class TestPerformLogin:
             perform_login(mock_page, "admin@example.com", "wrong")
 
     def test_wait_for_url_pattern(self) -> None:
-        """Verify the URL pattern used for post-login redirect detection."""
+        """Verify the URL pattern used for post-login redirect detection.
+
+        Regression test for #2760: the previous ``{BASE_URL}/**`` glob also
+        matched ``/auth/login`` itself, so ``wait_for_url`` returned
+        immediately without actually waiting for the post-login redirect,
+        causing the caller to navigate away before the refresh-token cookie
+        was set. The fixed pattern is an exact match on the home page URL,
+        which is where the login page's ``router.push('/')`` sends the user.
+        """
         mock_page = MagicMock()
         perform_login(mock_page, "a@b.com", "pw")
 
-        # Should wait for any page on the allowed host
         args, kwargs = mock_page.wait_for_url.call_args
-        assert "dev.judgemind.org" in args[0]
+        # Must wait for exactly the home page, not a glob that also matches
+        # the login page itself.
+        assert args[0] == "https://dev.judgemind.org/"
+        assert "**" not in args[0]
         assert kwargs.get("timeout") == 15000
 
 
