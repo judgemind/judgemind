@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Search, FileText, FolderOpen, Gavel, BarChart3 } from 'lucide-react';
+import { Search, FileText, FolderOpen, Gavel, BarChart3, Activity } from 'lucide-react';
 import { useAuth } from '@/providers/AuthProvider';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -79,6 +79,14 @@ function useNavItems(): NavItem[] {
       icon: <BarChart3 className="h-4 w-4" aria-hidden="true" />,
       label: 'Data Health',
       activeFn: (p) => p.startsWith('/admin/data-quality'),
+      group: 'admin',
+      adminOnly: true,
+    });
+    items.push({
+      href: '/admin/dispatcher/',
+      icon: <Activity className="h-4 w-4" aria-hidden="true" />,
+      label: 'Dispatcher',
+      activeFn: (p) => p.startsWith('/admin/dispatcher'),
       group: 'admin',
       adminOnly: true,
     });
