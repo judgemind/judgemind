@@ -22,7 +22,9 @@ function mockRequest(authorization?: string): FastifyRequest {
   } as unknown as FastifyRequest;
 }
 
-function mockPool(rows: Array<{ id: string; email: string; role: string }>): Pool {
+function mockPool(
+  rows: Array<{ id: string; email: string; role: string; is_admin?: boolean }>,
+): Pool {
   return {
     query: vi.fn().mockResolvedValue({
       rows,
@@ -65,19 +67,45 @@ describe('extractUser', () => {
   });
 
   it('returns the user when token is valid and user exists', async () => {
-    const user = { id: 'user-1', email: 'alice@example.com', role: 'user' };
+    const row = { id: 'user-1', email: 'alice@example.com', role: 'user', is_admin: false };
     mockVerifyAccessToken.mockReturnValue({ sub: 'user-1' });
-    const pool = mockPool([user]);
+    const pool = mockPool([row]);
 
     const req = mockRequest('Bearer valid-token');
     const result = await extractUser(req, pool);
 
-    expect(result).toEqual(user);
+    expect(result).toEqual({
+      id: 'user-1',
+      email: 'alice@example.com',
+      role: 'user',
+      isAdmin: false,
+    });
     expect(mockVerifyAccessToken).toHaveBeenCalledWith('valid-token');
     expect(pool.query).toHaveBeenCalledWith(
-      'SELECT id, email, role FROM users WHERE id = $1 AND is_active = true',
+      'SELECT id, email, role, is_admin FROM users WHERE id = $1 AND is_active = true',
       ['user-1'],
     );
+  });
+
+  it('returns isAdmin=true when the DB row has is_admin=true', async () => {
+    const row = {
+      id: 'admin-1',
+      email: 'admin@example.com',
+      role: 'user',
+      is_admin: true,
+    };
+    mockVerifyAccessToken.mockReturnValue({ sub: 'admin-1' });
+    const pool = mockPool([row]);
+
+    const req = mockRequest('Bearer admin-token');
+    const result = await extractUser(req, pool);
+
+    expect(result).toEqual({
+      id: 'admin-1',
+      email: 'admin@example.com',
+      role: 'user',
+      isAdmin: true,
+    });
   });
 
   it('returns null when token is valid but user does not exist in DB', async () => {

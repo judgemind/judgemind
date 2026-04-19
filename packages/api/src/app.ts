@@ -95,7 +95,27 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
           const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
           const cookieHeader =
             typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
-          return { pool, loaders: createLoaders(pool), user, ip, reply, cookieHeader, opensearch };
+          // X-MFA-Token propagates the admin re-auth challenge token for
+          // destructive dispatcherControl commands (§17 Risk 6). Phase 1
+          // placeholder — any non-empty value is accepted; sub-task E wires
+          // the real MFA challenge flow.
+          const mfaTokenHeader = req.headers['x-mfa-token'];
+          const mfaToken =
+            typeof mfaTokenHeader === 'string'
+              ? mfaTokenHeader
+              : Array.isArray(mfaTokenHeader)
+                ? mfaTokenHeader[0]
+                : null;
+          return {
+            pool,
+            loaders: createLoaders(pool),
+            user,
+            ip,
+            reply,
+            cookieHeader,
+            opensearch,
+            mfaToken,
+          };
         },
       });
 

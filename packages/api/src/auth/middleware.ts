@@ -6,6 +6,13 @@ export interface AuthUser {
   id: string;
   email: string;
   role: string;
+  /**
+   * Grants access to the dispatcher admin GraphQL surface (§11).
+   * Orthogonal to `role` — a user may have is_admin=true without role='admin'
+   * (or vice versa). The existing data-quality admin pages gate on
+   * `role='admin'`; the dispatcher admin surface gates on `is_admin`.
+   */
+  isAdmin: boolean;
 }
 
 /**
@@ -25,11 +32,18 @@ export async function extractUser(
   try {
     const payload = verifyAccessToken(token);
     // Verify user still exists and is active
-    const { rows } = await pool.query<{ id: string; email: string; role: string }>(
-      'SELECT id, email, role FROM users WHERE id = $1 AND is_active = true',
+    const { rows } = await pool.query<{
+      id: string;
+      email: string;
+      role: string;
+      is_admin: boolean;
+    }>(
+      'SELECT id, email, role, is_admin FROM users WHERE id = $1 AND is_active = true',
       [payload.sub],
     );
-    return rows[0] ?? null;
+    const row = rows[0];
+    if (!row) return null;
+    return { id: row.id, email: row.email, role: row.role, isAdmin: row.is_admin };
   } catch {
     return null;
   }
