@@ -154,6 +154,66 @@ def _make_daemon(
 
 
 # --------------------------------------------------------------------------
+# _priority_rank (issue #2835)
+# --------------------------------------------------------------------------
+
+
+class TestPriorityRank:
+    """``_priority_rank`` maps label lists to sort ranks (p0 → 0, ...)."""
+
+    def test_p0_returns_zero(self) -> None:
+        assert daemon._priority_rank(["priority/p0"]) == 0
+
+    def test_p1_returns_one(self) -> None:
+        assert daemon._priority_rank(["priority/p1"]) == 1
+
+    def test_p2_returns_two(self) -> None:
+        assert daemon._priority_rank(["priority/p2"]) == 2
+
+    def test_p3_returns_three(self) -> None:
+        assert daemon._priority_rank(["priority/p3"]) == 3
+
+    def test_no_priority_label_returns_floor(self) -> None:
+        assert (
+            daemon._priority_rank(["area/devops", "type/bug"])
+            == daemon._PRIORITY_RANK_NO_LABEL
+        )
+
+    def test_empty_labels_returns_floor(self) -> None:
+        assert daemon._priority_rank([]) == daemon._PRIORITY_RANK_NO_LABEL
+
+    def test_non_list_returns_floor(self) -> None:
+        """Malformed ``labels`` (None, str, dict, etc.) cannot crash the sort."""
+        assert daemon._priority_rank(None) == daemon._PRIORITY_RANK_NO_LABEL
+        assert daemon._priority_rank("priority/p0") == daemon._PRIORITY_RANK_NO_LABEL
+        assert (
+            daemon._priority_rank({"priority/p0": 1}) == daemon._PRIORITY_RANK_NO_LABEL
+        )
+
+    def test_multiple_priority_labels_picks_lowest_rank(self) -> None:
+        """If both p0 and p2 are attached, p0 wins (most-urgent interpretation)."""
+        assert daemon._priority_rank(["priority/p2", "priority/p0"]) == 0
+        assert daemon._priority_rank(["priority/p3", "priority/p1"]) == 1
+
+    def test_non_string_label_entries_are_ignored(self) -> None:
+        assert daemon._priority_rank([{"name": "priority/p0"}, 42, None]) == (
+            daemon._PRIORITY_RANK_NO_LABEL
+        )
+
+    def test_rank_ordering_is_p0_lt_p1_lt_p2_lt_p3_lt_floor(self) -> None:
+        """Document the end-to-end ordering contract in one assertion."""
+        ranks = [
+            daemon._priority_rank(["priority/p0"]),
+            daemon._priority_rank(["priority/p1"]),
+            daemon._priority_rank(["priority/p2"]),
+            daemon._priority_rank(["priority/p3"]),
+            daemon._priority_rank([]),
+        ]
+        assert ranks == sorted(ranks)
+        assert ranks == [0, 1, 2, 3, daemon._PRIORITY_RANK_NO_LABEL]
+
+
+# --------------------------------------------------------------------------
 # Gate in scheduler_tick: orchestration only runs when cap>0 and no agent
 # --------------------------------------------------------------------------
 
@@ -249,8 +309,11 @@ class TestHasActiveAgent:
 
 class TestLatestQueueSnapshot:
     def test_returns_issue_numbers_from_most_recent_row(self, tmp_path: Path) -> None:
+        """Pre-#2820 fallback path: empty ``issues_json`` → raw ``issue_numbers`` order."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [([100, 200, 300],)]
+        # (issues_json, issue_numbers) — issues_json None triggers the
+        # fallback to the raw issue_numbers column.
+        conn.cursor_instance.fetch_queue = [(None, [100, 200, 300])]
         assert d._latest_queue_snapshot_issues() == [100, 200, 300]
 
     def test_returns_empty_when_no_snapshots(self, tmp_path: Path) -> None:
@@ -267,6 +330,129 @@ class TestLatestQueueSnapshot:
         conn.cursor_instance.execute = boom  # type: ignore[method-assign]
         assert d._latest_queue_snapshot_issues() == []
         assert conn.rollbacks >= 1
+
+    # Issue #2835 — priority-based ordering when issues_json is populated.
+
+    def test_sorts_by_priority_p0_before_p1_before_p2(self, tmp_path: Path) -> None:
+        """Mixed priorities: p0 wins, then p1, then p2."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        issues_json = [
+            {
+                "number": 100,
+                "labels": ["priority/p2", "area/devops"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+            {
+                "number": 200,
+                "labels": ["priority/p0"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+            {
+                "number": 300,
+                "labels": ["priority/p1"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+        ]
+        conn.cursor_instance.fetch_queue = [(issues_json, [100, 200, 300])]
+        assert d._latest_queue_snapshot_issues() == [200, 300, 100]
+
+    def test_created_at_asc_is_tiebreaker_within_priority(self, tmp_path: Path) -> None:
+        """Two p1s with different ``createdAt`` → older (asc) picked first."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        issues_json = [
+            {
+                "number": 100,
+                "labels": ["priority/p1"],
+                "createdAt": "2026-04-19T00:00:00Z",  # newer
+            },
+            {
+                "number": 200,
+                "labels": ["priority/p1"],
+                "createdAt": "2026-03-01T00:00:00Z",  # older — wins
+            },
+        ]
+        conn.cursor_instance.fetch_queue = [(issues_json, [100, 200])]
+        assert d._latest_queue_snapshot_issues() == [200, 100]
+
+    def test_no_priority_label_is_lowest_rank(self, tmp_path: Path) -> None:
+        """Unlabeled issues sit below every priority/p* — picked only last."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        issues_json = [
+            {
+                "number": 100,
+                "labels": ["area/devops"],  # no priority/* label
+                "createdAt": "2026-01-01T00:00:00Z",  # oldest — doesn't help
+            },
+            {
+                "number": 200,
+                "labels": ["priority/p3"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+            {
+                "number": 300,
+                "labels": ["priority/p2"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+        ]
+        conn.cursor_instance.fetch_queue = [(issues_json, [100, 200, 300])]
+        # 300 (p2) < 200 (p3) < 100 (no priority).
+        assert d._latest_queue_snapshot_issues() == [300, 200, 100]
+
+    def test_handles_jsonb_returned_as_string(self, tmp_path: Path) -> None:
+        """Defensive: psycopg returns jsonb parsed, but tests / edge paths may stub strings."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        issues_json_str = json.dumps(
+            [
+                {
+                    "number": 100,
+                    "labels": ["priority/p2"],
+                    "createdAt": "2026-04-19T00:00:00Z",
+                },
+                {
+                    "number": 200,
+                    "labels": ["priority/p0"],
+                    "createdAt": "2026-04-19T00:00:00Z",
+                },
+            ]
+        )
+        conn.cursor_instance.fetch_queue = [(issues_json_str, [100, 200])]
+        assert d._latest_queue_snapshot_issues() == [200, 100]
+
+    def test_falls_back_to_issue_numbers_when_issues_json_is_empty_list(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty ``issues_json`` → raw ``issue_numbers`` (unsorted fallback)."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [([], [100, 200, 300])]
+        assert d._latest_queue_snapshot_issues() == [100, 200, 300]
+
+    def test_falls_back_when_issues_json_is_malformed_string(
+        self, tmp_path: Path
+    ) -> None:
+        """Malformed JSON string → fallback to ``issue_numbers``."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [("not-json{", [100, 200, 300])]
+        assert d._latest_queue_snapshot_issues() == [100, 200, 300]
+
+    def test_skips_non_dict_entries_in_issues_json(self, tmp_path: Path) -> None:
+        """Defensive: stray non-dict entries in ``issues_json`` are ignored."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        issues_json = [
+            "not-a-dict",
+            {
+                "number": 100,
+                "labels": ["priority/p1"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+            42,
+            {
+                "number": 200,
+                "labels": ["priority/p0"],
+                "createdAt": "2026-04-19T00:00:00Z",
+            },
+        ]
+        conn.cursor_instance.fetch_queue = [(issues_json, [100, 200])]
+        assert d._latest_queue_snapshot_issues() == [200, 100]
 
 
 # --------------------------------------------------------------------------
@@ -883,7 +1069,10 @@ class TestHappyPathOrchestration:
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
-        conn.cursor_instance.fetch_queue = [None, ([42],), None]
+        # Queue snapshot read now returns (issues_json, issue_numbers) —
+        # issues_json=None triggers the pre-#2820 fallback which uses
+        # the raw issue_numbers array (issue #2835).
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         # Trust check passes.
         def fake_check_run(cmd: list[str], **kwargs: Any) -> Any:
@@ -1050,7 +1239,10 @@ class TestPlanGoFalse:
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
-        conn.cursor_instance.fetch_queue = [None, ([42],), None]
+        # Queue snapshot read now returns (issues_json, issue_numbers) —
+        # issues_json=None triggers the pre-#2820 fallback which uses
+        # the raw issue_numbers array (issue #2835).
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
@@ -1119,7 +1311,10 @@ class TestPlanGoFalse:
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
-        conn.cursor_instance.fetch_queue = [None, ([42],), None]
+        # Queue snapshot read now returns (issues_json, issue_numbers) —
+        # issues_json=None triggers the pre-#2820 fallback which uses
+        # the raw issue_numbers array (issue #2835).
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
@@ -1188,7 +1383,10 @@ class TestRalphBlocked:
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
-        conn.cursor_instance.fetch_queue = [None, ([42],), None]
+        # Queue snapshot read now returns (issues_json, issue_numbers) —
+        # issues_json=None triggers the pre-#2820 fallback which uses
+        # the raw issue_numbers array (issue #2835).
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
@@ -1268,7 +1466,10 @@ class TestSubprocessNonZeroExit:
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
-        conn.cursor_instance.fetch_queue = [None, ([42],), None]
+        # Queue snapshot read now returns (issues_json, issue_numbers) —
+        # issues_json=None triggers the pre-#2820 fallback which uses
+        # the raw issue_numbers array (issue #2835).
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
@@ -1333,7 +1534,10 @@ class TestClaimRace:
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
-        conn.cursor_instance.fetch_queue = [None, ([42],), None]
+        # Queue snapshot read now returns (issues_json, issue_numbers) —
+        # issues_json=None triggers the pre-#2820 fallback which uses
+        # the raw issue_numbers array (issue #2835).
+        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
 
         # Trust check passes.
