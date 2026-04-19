@@ -12,6 +12,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | E-04 | Venv must be local to worktree | Manual / script check | `preflight_venv_local` |
 | E-05 | Never push to main/master | PreToolUse hook blocks | `preflight_not_on_main` |
 | E-06 | No `git worktree add` inside worktrees | PreToolUse hook blocks | — |
+| E-07 | No bare `git stash pop` / `git stash apply` (#2749) | PreToolUse hook blocks | — |
 
 ## Shell Command Rules
 
@@ -25,6 +26,7 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 | SH-06 | Use `git -C` for remote paths | `cd /path && git ...` | `git -C /absolute/path <subcommand>` |
 | SH-07 | Temp files in worktree only | `/tmp/` in file paths | Use `{worktree}/tmp/` instead |
 | SH-08 | No Edit/Write to `.claude/` | Edit or Write tool targeting `.claude/` paths | Write to `{worktree}/tmp/`, then `scripts/write-claude-file.sh` to copy into `.claude/` |
+| SH-09 | No bare `git stash pop` / `git stash apply` | `git stash pop` or `git stash apply` without an explicit `stash@{N}` ref | `git stash list` first; confirm subject matches current branch; then `git stash pop stash@{N}`. Or use a throwaway commit (`git commit -am WIP` / `git reset --soft HEAD~1`). Stash refs are shared per-clone, so bare pops can apply another worktree's stash (#2749). |
 
 ## File Operation Rules
 
