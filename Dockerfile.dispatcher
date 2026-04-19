@@ -1,0 +1,181 @@
+# Dispatcher v2 daemon container image.
+#
+# Phase 1 scaffolding (issue #2729 / docs/specs/dispatcher-v2-spec.md §14).
+# Packages the long-running dispatcher daemon (`scripts/dispatcher/daemon.py`)
+# together with the `@anthropic-ai/claude-code` CLI so that Phase 2+ can
+# spawn per-phase `/task-v2-*` subprocesses. Phase 1 itself does not spawn
+# anything — the image just has to boot, tick, heartbeat, and exit cleanly
+# on SIGTERM.
+#
+# Base image choice — `node:20-slim`:
+# - Spike 0.1 (docs/investigations/dispatcher-v2-spike-0.1.md) validated
+#   this exact base for `claude -p` on Fargate.
+# - Python is installed on top via apt. The dispatcher is Python 3.12; the
+#   Claude Code CLI is a Node binary published as
+#   `@anthropic-ai/claude-code`. Running both from one image avoids a
+#   second-language multi-stage build.
+# - We do NOT layer this on top of `packages/scraper-framework/Dockerfile`
+#   (which is `python:3.12-slim`) because the scraper image carries
+#   Playwright + Chromium — ~400 MB of browser binaries the daemon has no
+#   use for. Starting from `node:20-slim` keeps the image under ~600 MB
+#   even after pip installs.
+#
+# $HOME policy:
+# - The base image lands at `/root`; we override to `/home/dispatcher` so
+#   a future non-root switch is a one-line `USER` change without rewriting
+#   every path that depends on `$HOME`. Per-subprocess isolation (spec
+#   §14) happens via `HOME=/tmp/agents/<agent_id>` env overrides on the
+#   daemon's per-phase spawn — NOT by mutating this container-level
+#   `$HOME`. The container-level value is only used by the daemon process
+#   itself, which does not touch `~/.claude/` since it does not run
+#   `claude -p` at Phase 1.
+#
+# Build (from repo root):
+#     docker build -f Dockerfile.dispatcher -t judgemind-dispatcher-local \
+#         --build-arg GIT_SHA=$(git rev-parse --short HEAD) .
+#
+# Run locally (requires DATABASE_URL reachable from the container):
+#     docker run --rm \
+#         -e DATABASE_URL="postgres://..." \
+#         judgemind-dispatcher-local \
+#         --tick-scheduler-seconds 5 --tick-supervisor-seconds 10
+
+FROM node:20-slim
+
+# ---------------------------------------------------------------------------
+# System deps: Python 3 (Debian bookworm ships Python 3.11, which is fine
+# — the daemon only uses 3.11-compatible features: `datetime.UTC` landed
+# in 3.11, no 3.12-only syntax is used. See `pyproject.toml` /
+# `.python-version` in the repo for local dev on 3.12; the Fargate image
+# pinning 3.11 means we can keep the single `node:20-slim` base without
+# needing to install Python from source or pull in deadsnakes).
+#
+# Also installed: git + gh CLI (needed by future /task-v2-* phases —
+# spike 0.7 wired these into the spike image and confirmed
+# `gh auth setup-git` + `git push` work with the scoped PAT secret),
+# plus ca-certificates and curl for the claude-code install and any
+# outbound HTTPS (GitHub API, Anthropic API, ECR, Telegram, Secrets
+# Manager).
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        git \
+        python3 \
+        python3-venv \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the GitHub CLI from the official apt repository. The
+# `cli.github.com` keyring + source pattern is the same one spike 0.7
+# used and is the path `gh auth setup-git` depends on for its
+# `credential.https://github.com.helper = !gh auth git-credential`
+# configuration.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make `python` resolve to the installed system python3 so
+# `python -m scripts.dispatcher.daemon` in the CMD below always picks
+# the interpreter we installed (node:20-slim has no `python` alias
+# out-of-the-box).
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+#
+# Only psycopg[binary]>=3.1 is needed for the Phase 1 skeleton — all the
+# heavy packages (the scraper-framework itself, Playwright, etc.) are NOT
+# relevant to the daemon process. Pinning psycopg separately also keeps
+# the image layer small enough that future Phase 2 changes only bust the
+# COPY layers below.
+#
+# Per repo convention (spike 0.2 / emit_failure.py) the canonical
+# interface is `import psycopg` with the `[binary]` extra for the bundled
+# libpq — no separate `libpq-dev` apt install needed.
+# ---------------------------------------------------------------------------
+# Newer pip enforces PEP 668 "externally-managed-environment" on Debian's
+# system Python. We install at the system level (there is only one
+# Python process in the container and it is the daemon itself), so
+# opt out of the marker explicitly — same pattern used by the public
+# `claude-code` Dockerfile and the python:3.12-slim base of our scraper
+# image (which doesn't enforce it because its Python comes from the
+# official `python` image, not Debian's system packages).
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN pip install --no-cache-dir "psycopg[binary]>=3.1,<4"
+
+# ---------------------------------------------------------------------------
+# Claude Code CLI
+#
+# Pinned to 2.1.114 — the version spike 0.1 validated end-to-end on
+# Fargate. Phase 2+ bumps this whenever we re-spike a newer CLI.
+# ---------------------------------------------------------------------------
+RUN npm install -g @anthropic-ai/claude-code@2.1.114
+
+# ---------------------------------------------------------------------------
+# Dispatcher user + HOME
+#
+# We stay on root for Phase 1 (ECS Fargate isolates the task at the
+# kernel level; an in-container non-root boundary adds complexity for no
+# additional security benefit against the attacker the daemon actually
+# faces — compromised issue content). Setting HOME explicitly so:
+#   (a) the daemon's `socket.gethostname()` + env lookups are predictable;
+#   (b) any Node/NPM global caches from `claude-code` live somewhere
+#       other than /root, simplifying a future non-root switch.
+# Per-subprocess HOME isolation for the `/task-v2-*` workers happens on
+# spawn (spec §14) — the daemon sets HOME=/tmp/agents/<agent_id> on each
+# child process so ~/.claude/ state cannot leak across agents.
+# ---------------------------------------------------------------------------
+ENV HOME=/home/dispatcher
+RUN mkdir -p "$HOME"
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Application code
+#
+# COPY scripts/dispatcher/ (the daemon + emit_failure hook + tests)
+# plus scripts/check-issue-author.sh (used by Phase 2 before spawning
+# /task-v2-plan on an issue per §Step 1b of the /task skill).
+#
+# We deliberately do not COPY the whole `scripts/` directory — those
+# scripts are laptop-side helpers that don't need to ship in the daemon
+# image. Keeping the COPY list tight reduces layer churn from unrelated
+# scripts/*.py edits.
+# ---------------------------------------------------------------------------
+COPY scripts/dispatcher/ /app/scripts/dispatcher/
+COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
+RUN chmod +x /app/scripts/check-issue-author.sh
+
+# ---------------------------------------------------------------------------
+# Image provenance — GIT_SHA from build-args (CI sets it to the merge
+# commit SHA). The daemon reads GIT_SHA from the environment at startup
+# and persists it to `dispatcher.runs.version_sha` so post-hoc crash
+# forensics can map a run to a specific image.
+# ---------------------------------------------------------------------------
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+#
+# `python -m scripts.dispatcher.daemon` so the module path resolves with
+# `/app` on sys.path (the default CWD). Any CLI flags passed via ECS
+# `command` override just follow through as argv. Tick-scheduler and
+# tick-supervisor default to the spec's 30s / 120s.
+#
+# NOTE: `node:20-slim` inherits a `docker-entrypoint.sh` that wraps
+# every CMD with `exec node`; ours runs Python, not Node, so we reset
+# ENTRYPOINT explicitly. Without this, `docker run <img> --help` would
+# route the `--help` to node and print Node's help text.
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["python", "-m", "scripts.dispatcher.daemon"]
+CMD []

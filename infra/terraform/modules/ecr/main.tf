@@ -1,8 +1,9 @@
 # ECR repositories for Judgemind container images.
 #
-# Each service (scraper, api) gets its own repository following the
-# org/service naming pattern (judgemind/scraper, judgemind/api).
-# Repositories are shared across environments via image tags (e.g. staging, latest).
+# Each service (scraper, api, dispatcher) gets its own repository following
+# the org/service naming pattern (judgemind/scraper, judgemind/api,
+# judgemind/dispatcher). Repositories are shared across environments via
+# image tags (e.g. staging, latest).
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
@@ -120,6 +121,76 @@ resource "aws_ecr_lifecycle_policy" "api" {
 resource "aws_ecr_repository_policy" "api" {
   count      = var.enable_pull_policy ? 1 : 0
   repository = aws_ecr_repository.api.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowECSTaskExecutionPull"
+        Effect = "Allow"
+        Principal = {
+          AWS = var.ecs_task_execution_role_arn
+        }
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+      }
+    ]
+  })
+}
+
+# ─── Dispatcher Repository ───────────────────────────────────────────────────
+# Dispatcher v2 daemon image (spec §14, issue #2729). Same lifecycle +
+# pull-policy pattern as the scraper and api repos. The dispatcher-daemon
+# Terraform module wires this URL into the ECS task definition via
+# `ecr_repository_url`; CI pushes images on merge to main (see
+# `.github/workflows/deploy-dispatcher.yml`).
+
+resource "aws_ecr_repository" "dispatcher" {
+  name                 = "judgemind/dispatcher"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "dispatcher" {
+  repository = aws_ecr_repository.dispatcher.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Purge untagged images after 1 day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Retain last 10 tagged images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["v", "staging", "prod", "sha-"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 10
+        }
+        action = { type = "expire" }
+      }
+    ]
+  })
+}
+
+resource "aws_ecr_repository_policy" "dispatcher" {
+  count      = var.enable_pull_policy ? 1 : 0
+  repository = aws_ecr_repository.dispatcher.name
 
   policy = jsonencode({
     Version = "2012-10-17"

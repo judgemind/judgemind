@@ -208,7 +208,9 @@ module "dispatcher_daemon" {
   vpc_id             = module.networking.vpc_id
   private_subnet_ids = module.networking.private_subnet_ids
   ecs_cluster_arn    = module.compute.cluster_arn
-  ecr_repository_url = module.ecr.repository_url
+  # Dispatcher has its own ECR repo (`judgemind/dispatcher`) — NOT the
+  # scraper repo. Sub-task C (#2729) added the ECR resource + output.
+  ecr_repository_url = module.ecr.dispatcher_repository_url
 
   # Phase 1 = inert. Flipped to 1 in Phase 2 (shadow mode). Never > 1.
   desired_count = 0
@@ -430,4 +432,9 @@ output "dispatcher_daemon_task_role_arn" {
 output "dispatcher_daemon_security_group_id" {
   description = "Dev dispatcher daemon security group ID"
   value       = module.dispatcher_daemon.security_group_id
+}
+
+output "dispatcher_ecr_repository_url" {
+  description = "Dev ECR repository URL for dispatcher v2 daemon images"
+  value       = module.ecr.dispatcher_repository_url
 }
