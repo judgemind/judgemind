@@ -10022,6 +10022,17 @@ class DispatcherDaemon:
         if not worktree_path:
             return False
 
+        if not Path(worktree_path).exists():
+            self._log.info(
+                "daemon.worktree_already_gone",
+                extra={
+                    "event": "worktree_already_gone",
+                    "run_id": self._run_id,
+                    "worktree_path": worktree_path,
+                },
+            )
+            return True
+
         repo_root = self._repo_root()
         git_parent = self._git_parent_root()
         cleanup_script = repo_root / "scripts" / "cleanup_worktree.sh"
@@ -10134,6 +10145,29 @@ class DispatcherDaemon:
         Returns the number of markers processed this tick. DB errors on
         any single marker are logged + rolled back; the loop continues.
 
+        **Infra-preemption terminal-and-reclaim branch (issue #2925).**
+        When the marker's reason is in :data:`_INFRA_PREEMPTION_CATEGORIES`
+        (``daemon_restart_abandoned``, ``paused_by_killswitch``), the method
+        takes a different path instead of resetting to ``retrying``:
+
+        1. Call :meth:`_mark_agent_terminal` with ``status='failed'``,
+           ``phase=reason`` — sets ``ended_at=now()``, drops the row from
+           the active-issue partial UNIQUE INDEX, and removes
+           ``status/in-progress`` from the issue.
+        2. Add ``agent/ready`` back to the issue so the next
+           ``_scan_queue_and_snapshot`` tick re-discovers it.
+        3. Resolve the marker via ``UPDATE dispatcher.retry_markers
+           SET resolved_at = now()``.
+        4. Skip the ``phase_transitions ('retry_reset')`` insert — the row
+           is terminal, so no future stuck_timeout MAX(ts) reset is needed.
+        5. Emit ``daemon.retry_terminal_and_reclaim`` (distinct from
+           ``retry_processed``) so CloudWatch can separate the two paths.
+
+        For non-infra reasons (``subprocess_crash``, ``stuck_timeout``,
+        ``gh_rate_exhausted``), the existing reset-to-retrying behavior is
+        unchanged — that path is exercised by 3D's diagnoser and the
+        ``_resume_retrying_agent`` handoff in steady state.
+
         The emitted ``daemon.retry_processed`` log event includes a
         ``retry_counted`` boolean so CloudWatch queries can separate
         budgeted retries (``retry_counted=true``) from free infra
@@ -10187,35 +10221,63 @@ class DispatcherDaemon:
             try:
                 self._drop_worktree_best_effort(worktree_path)
 
+                if not retry_counted:
+                    # ── Infra-preemption terminal-and-reclaim (#2925) ──
+                    # Mark the old row terminal so ``idx_dispatcher_agents_active_issue``
+                    # releases its slot and ``status/in-progress`` is removed.
+                    # Then re-add ``agent/ready`` so the scheduler re-discovers
+                    # the issue without a zombie retrying row lingering.
+                    # Skip the ``phase_transitions('retry_reset')`` insert —
+                    # the row is terminal and no future stuck_timeout clock
+                    # reset is needed.
+                    self._mark_agent_terminal(
+                        agent_id,
+                        status="failed",
+                        phase=reason,
+                        exit_code=None,
+                        issue_number=issue_number,
+                    )
+                    if issue_number is not None:
+                        self._gh_issue_add_labels(issue_number, ["agent/ready"])
+                    with self._conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE dispatcher.retry_markers "
+                            "SET resolved_at = now() "
+                            "WHERE marker_id = %s",
+                            (marker_id,),
+                        )
+                    self._conn.commit()
+                    self._log.info(
+                        "daemon.retry_terminal_and_reclaim",
+                        extra={
+                            "event": "retry_terminal_and_reclaim",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "reason": reason,
+                            "attempt": attempt,
+                            "marker_id": marker_id,
+                        },
+                    )
+                    processed += 1
+                    continue
+
+                # ── Budgeted retry: reset to retrying/claiming ──
                 # Two near-identical UPDATE statements — the difference
                 # is the ``retries_used`` clause. Keeping them as
                 # distinct string literals (rather than a dynamic
                 # join) preserves the grep-ability of SQL statements
                 # in the daemon, which the fakes in
                 # ``test_daemon_phase3c.py`` rely on.
-                if retry_counted:
-                    reset_sql = (
-                        "UPDATE dispatcher.agents "
-                        "SET status = 'retrying', "
-                        "    phase = 'claiming', "
-                        "    retries_used = retries_used + 1, "
-                        "    exit_code = NULL, "
-                        "    ended_at = NULL "
-                        "WHERE agent_id = %s"
-                    )
-                else:
-                    # Preserve ``retries_used`` — infra preemption is
-                    # not an agent-driven failure, so it must not
-                    # consume the retry budget. See
-                    # :data:`_INFRA_PREEMPTION_CATEGORIES`.
-                    reset_sql = (
-                        "UPDATE dispatcher.agents "
-                        "SET status = 'retrying', "
-                        "    phase = 'claiming', "
-                        "    exit_code = NULL, "
-                        "    ended_at = NULL "
-                        "WHERE agent_id = %s"
-                    )
+                reset_sql = (
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'retrying', "
+                    "    phase = 'claiming', "
+                    "    retries_used = retries_used + 1, "
+                    "    exit_code = NULL, "
+                    "    ended_at = NULL "
+                    "WHERE agent_id = %s"
+                )
 
                 with self._conn.cursor() as cur:
                     cur.execute(reset_sql, (agent_id,))

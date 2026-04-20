@@ -728,16 +728,18 @@ class TestProcessRetryMarkers:
     # log event for CloudWatch observability.
     # ------------------------------------------------------------------
 
-    def test_daemon_restart_preserves_prior_attempt(
+    def test_daemon_restart_takes_terminal_and_reclaim_path(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        """An agent at attempt=2 preempted by daemon restart stays at attempt=2.
+        """After #2925: ``daemon_restart_abandoned`` takes the terminal-and-reclaim path.
 
-        The marker's reason is ``daemon_restart_abandoned`` — classified
-        as infra preemption — so ``_process_retry_markers`` must reset
-        the agent without incrementing ``retries_used``. The
-        ``daemon.retry_processed`` log event records
-        ``retry_counted=false``.
+        Before #2925 this test asserted the old reset-to-retrying behavior.
+        After #2925 infra-preemption markers call ``_mark_agent_terminal``
+        (status='failed', phase=reason) and re-add ``agent/ready`` instead
+        of resetting to ``status='retrying'``. The ``retry_processed`` event
+        is no longer emitted; ``retry_terminal_and_reclaim`` takes its place.
+        The ``retries_used`` column is still not incremented (preservation
+        semantics carry over to the terminal-and-reclaim path).
         """
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
@@ -753,12 +755,12 @@ class TestProcessRetryMarkers:
             ],
         ]
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: None)
 
         processed = d._process_retry_markers()
         assert processed == 1
 
-        # The reset UPDATE must NOT include the retries_used++
-        # clause — the agent's prior attempt count is preserved.
+        # retries_used must NOT be incremented.
         incremented = [
             e
             for e in conn.cursor_instance.executed
@@ -766,40 +768,36 @@ class TestProcessRetryMarkers:
             and "retries_used = retries_used + 1" in e[0]
         ]
         assert incremented == [], (
-            "daemon_restart_abandoned retry must not increment retries_used"
+            "daemon_restart_abandoned must not increment retries_used"
         )
 
-        # A reset UPDATE did run — status='retrying', phase='claiming',
-        # and retries_used absent from the SET clause.
-        preserved_resets = [
+        # No reset to status='retrying' — the new path marks the row terminal.
+        retrying_resets = [
             e
             for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.agents" in e[0]
             and "status = 'retrying'" in e[0]
-            and "phase = 'claiming'" in e[0]
-            and "retries_used" not in e[0]
         ]
-        assert preserved_resets, (
-            "infra-preemption retry should still reset agent to retrying/claiming"
+        assert retrying_resets == [], (
+            "infra-preemption path must not emit retrying reset after #2925"
         )
 
-        # retry_processed event with retry_counted=false.
-        events = handler.events("retry_processed")
-        assert len(events) == 1
-        assert events[0].retry_counted is False
-        assert events[0].reason == daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
-        assert events[0].attempt == 2
+        # retry_terminal_and_reclaim event emitted; NOT retry_processed.
+        reclaim = handler.events("retry_terminal_and_reclaim")
+        assert len(reclaim) == 1
+        assert getattr(reclaim[0], "reason", None) == (
+            daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
+        )
+        assert handler.events("retry_processed") == []
 
-    def test_killswitch_preserves_prior_attempt(
+    def test_killswitch_takes_terminal_and_reclaim_path(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        """Killswitch-preempted agent at attempt=2 stays at attempt=2.
+        """After #2925: ``paused_by_killswitch`` takes the terminal-and-reclaim path.
 
-        Parallel to the daemon-restart case. Uses
-        :data:`FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH` (added in this
-        PR) as the marker reason — any future killswitch retry path
-        that tags itself with this constant gets the correct
-        preservation semantics.
+        Parallel to the daemon-restart case. Before #2925 this test
+        asserted reset-to-retrying behavior; after #2925 it asserts
+        the terminal path.
         """
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
@@ -815,6 +813,7 @@ class TestProcessRetryMarkers:
             ],
         ]
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: None)
 
         processed = d._process_retry_markers()
         assert processed == 1
@@ -826,13 +825,23 @@ class TestProcessRetryMarkers:
             and "retries_used = retries_used + 1" in e[0]
         ]
         assert incremented == [], (
-            "paused_by_killswitch retry must not increment retries_used"
+            "paused_by_killswitch must not increment retries_used"
         )
 
-        events = handler.events("retry_processed")
-        assert len(events) == 1
-        assert events[0].retry_counted is False
-        assert events[0].reason == daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
+        retrying_resets = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+        ]
+        assert retrying_resets == []
+
+        reclaim = handler.events("retry_terminal_and_reclaim")
+        assert len(reclaim) == 1
+        assert getattr(reclaim[0], "reason", None) == (
+            daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
+        )
+        assert handler.events("retry_processed") == []
 
     def test_subprocess_crash_increments_attempt_at_2(
         self, monkeypatch: Any, tmp_path: Path
@@ -909,6 +918,125 @@ class TestProcessRetryMarkers:
             == daemon.KILLSWITCH_TERMINAL_PHASE
             == "paused_by_killswitch"
         )
+
+
+# --------------------------------------------------------------------------
+# Issue #2925 — budgeted retries still use the reset-to-retrying path
+# --------------------------------------------------------------------------
+
+
+class TestProcessRetryMarkersBudgetedRetriesUnchanged:
+    """Regression guard: non-infra retries still reset to retrying/claiming.
+
+    After #2925 added the terminal-and-reclaim branch for infra-preemption,
+    the budgeted paths (``subprocess_crash``, ``stuck_timeout``) must
+    continue to use the original reset-to-retrying flow, including:
+    - ``UPDATE dispatcher.agents SET status='retrying' phase='claiming'
+      retries_used = retries_used + 1``
+    - ``INSERT INTO dispatcher.phase_transitions (retry_reset)``
+    - ``daemon.retry_processed`` log event (not ``retry_terminal_and_reclaim``)
+    """
+
+    def _make_budgeted_row(
+        self,
+        tmp_path: Path,
+        reason: str,
+    ) -> tuple[Any, Any, Any]:
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [
+                (
+                    10,  # marker_id
+                    "agent-budgeted",
+                    reason,
+                    1,  # attempt
+                    str(tmp_path / "worktrees" / "agent-budgeted"),
+                    99,  # issue_number
+                ),
+            ],
+        ]
+        return d, conn, handler
+
+    def test_subprocess_crash_still_resets_to_retrying(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``subprocess_crash`` takes the reset-to-retrying path, not terminal."""
+        d, conn, handler = self._make_budgeted_row(
+            tmp_path, daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        # status='retrying' reset emitted with retries_used++.
+        retrying_resets = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert retrying_resets, (
+            "subprocess_crash must still emit retrying/claiming reset with retries_used++"
+        )
+
+        # retry_reset phase_transition inserted.
+        retry_reset_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.phase_transitions" in e[0]
+            and e[1] is not None
+            and "retry_reset" in str(e[1])
+        ]
+        assert retry_reset_inserts, (
+            "subprocess_crash must insert retry_reset phase_transition"
+        )
+
+        # retry_processed event (not terminal_and_reclaim).
+        assert handler.events("retry_processed"), (
+            "subprocess_crash must emit retry_processed, not terminal_and_reclaim"
+        )
+        assert handler.events("retry_terminal_and_reclaim") == [], (
+            "subprocess_crash must NOT emit retry_terminal_and_reclaim"
+        )
+
+    def test_stuck_timeout_still_resets_to_retrying(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``stuck_timeout`` takes the reset-to-retrying path, not terminal."""
+        d, conn, handler = self._make_budgeted_row(
+            tmp_path, daemon.FAILURE_CATEGORY_STUCK_TIMEOUT
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        retrying_resets = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert retrying_resets, (
+            "stuck_timeout must still emit retrying/claiming reset with retries_used++"
+        )
+
+        retry_reset_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.phase_transitions" in e[0]
+            and e[1] is not None
+            and "retry_reset" in str(e[1])
+        ]
+        assert retry_reset_inserts, (
+            "stuck_timeout must insert retry_reset phase_transition"
+        )
+
+        assert handler.events("retry_processed")
+        assert handler.events("retry_terminal_and_reclaim") == []
 
 
 # --------------------------------------------------------------------------
