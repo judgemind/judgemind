@@ -60,6 +60,7 @@ Create the state directory and seed the task file:
 ├── adversarial-feedback.md    # Gemini adversarial detailed findings (testable only)
 ├── iteration.txt              # current iteration number (written before each iteration)
 ├── review-log.jsonl           # structured review log (appended by gemini_review.py and the loop)
+├── touched-packages.txt       # Python packages with code changes (written by worker step 4)
 └── ralph-done.txt             # completion signal for the calling /task workflow
 ```
 
@@ -125,9 +126,16 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > 1. Read the task and feedback files.
 > 2. Examine existing code and test patterns in the relevant packages.
 > 3. If this is iteration 1, write failing tests first, then implement. If this is iteration 2+, focus on addressing the reviewer's feedback — read the existing implementation, apply the requested changes, and re-run tests.
-> 4. Run ALL pre-PR checks for every package you touched:
->    - Python: `.venv/bin/ruff check src/ tests/`, `.venv/bin/ruff format --check src/ tests/`, `.venv/bin/pytest tests/ -v --tb=short`
->    - TypeScript: `npm run lint`, `npm run typecheck`, `npm test`
+> 4. **Derive touched packages and run the full test suite for each.**
+>    - Run `python3 {worktree}/scripts/ralph_touched_packages.py {worktree}` and write the output to `{worktree}/tmp/ralph/touched-packages.txt`.
+>    - Run `python3 {worktree}/scripts/ralph_touched_packages.py --ts {worktree}` to get the list of touched TypeScript packages.
+>    - For each Python package listed in `touched-packages.txt`: if no `.venv` exists, run `{worktree}/scripts/install-package-venv.sh <pkg>` first. Then run the full test suite: `packages/<pkg>/.venv/bin/pytest packages/<pkg>/tests/ -v --tb=short`.
+>    - For each touched TypeScript package: run `npm run lint`, `npm run typecheck`, and `npm test` in that package directory.
+>    - Aggregate test results to `{worktree}/tmp/ralph/pre-push-preview.txt` (one line per package: `PASS packages/<pkg>` or `FAIL packages/<pkg> — <reason>`).
+>    - Any failure → do NOT write COMPLETE. Fix the failures, then re-run.
+>    - **Also run ALL pre-PR checks for every package you touched:**
+>      - Python: `.venv/bin/ruff check src/ tests/`, `.venv/bin/ruff format --check src/ tests/`
+>      - TypeScript: `npm run lint`, `npm run typecheck`, `npm test`
 > 5. Fix any failures. Auto-fix lint with `.venv/bin/ruff check --fix src/ tests/` then `.venv/bin/ruff format src/ tests/`.
 > 6. **Run diff-coverage check for every Python package you touched** (catches CI diff-coverage failures locally):
 >    - Install diff-cover if not already available: `.venv/bin/pip install diff-cover --quiet`
@@ -162,13 +170,17 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > 1. Read the task and feedback files. Focus on the "## Plan (from /task-v2-plan)" section's "What will change" subsection — this is the concrete list of edits to make.
 > 2. Examine the existing structure of the files you will edit. For docs, follow the existing headings and tone. For scripts, follow the existing `# venv:` / `# one-off:` / `# permanent:` header conventions (see `docs/agent/code-standards.md` §Python scripts). For migrations, follow the existing migration file naming and schema patterns.
 > 3. Apply the edits. If this is iteration 2+, focus on addressing the reviewer's feedback from `feedback.md` — read the existing implementation, apply the requested changes.
-> 4. Run the pre-PR checks that apply to the files you actually touched:
->    - Any `.py` file touched → `.venv/bin/ruff check <file>`, `.venv/bin/ruff format --check <file>` in the owning package. (Pytest and diff-coverage are **skipped** — this is a non-testable change.)
->    - Any `.md` file touched → `scripts/check-markdown-links.sh` (reads every `.md` in the push, not just the diff).
->    - Any `.tf` file touched → `terraform fmt -check -recursive` in the touched module.
->    - Any `.yml` / `.yaml` under `.github/workflows/` touched → `scripts/check-ci-job-skipped.sh` (the #2410/#2505 footgun guard).
->    - Any `.sql` migration touched → verify the filename numbering and schema match existing migrations; no runtime check required.
->    - No matching file type → no pre-PR checks needed. Skip to step 5.
+> 4. **Derive touched packages and run pre-PR checks for each.**
+>    - Run `python3 {worktree}/scripts/ralph_touched_packages.py {worktree}` and write the output to `{worktree}/tmp/ralph/touched-packages.txt`.
+>    - Run the pre-PR checks that apply to the files you actually touched:
+>      - Any `.py` file touched → for each package in `touched-packages.txt`: `.venv/bin/ruff check <file>`, `.venv/bin/ruff format --check <file>` in the owning package. (Pytest and diff-coverage are **skipped** — this is a non-testable change.)
+>      - Any `.md` file touched → `scripts/check-markdown-links.sh` (reads every `.md` in the push, not just the diff).
+>      - Any `.tf` file touched → `terraform fmt -check -recursive` in the touched module.
+>      - Any `.yml` / `.yaml` under `.github/workflows/` touched → `scripts/check-ci-job-skipped.sh` (the #2410/#2505 footgun guard).
+>      - Any `.sql` migration touched → verify the filename numbering and schema match existing migrations; no runtime check required.
+>      - No matching file type → no pre-PR checks needed. Skip to step 5.
+>    - Aggregate check results to `{worktree}/tmp/ralph/pre-push-preview.txt` (one line per package or check: `PASS <check>` or `FAIL <check> — <reason>`).
+>    - Any failure → do NOT write COMPLETE. Fix the failures, then re-run.
 > 5. **Self-verify acceptance criteria before completing.** Read `{worktree}/tmp/ralph/task.md` and find every acceptance criterion (the `- [ ]` checkboxes). For EACH criterion, describe how your implementation satisfies it — reference the specific file, section, or edit. If any criterion cannot be verified locally (e.g., requires post-deploy or post-merge observation), note it as "requires post-deploy verification." If any criterion is NOT addressed by your implementation, do NOT write COMPLETE — instead, note the gap and continue implementing.
 > 6. Write your acceptance criteria self-check to `{worktree}/tmp/ralph/acceptance-check.txt` with a table mapping each criterion to its evidence.
 > 7. When all applicable pre-PR checks pass AND all locally-verifiable acceptance criteria are addressed, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
@@ -307,11 +319,12 @@ The Claude reviewer prompt applies to both branches:
 >    - If ANY locally-verifiable criterion is **not met**, the review MUST be **REVISE**, regardless of code quality. List the unmet criteria in your feedback.
 > 5. Evaluate against these additional criteria:
 >    - **Correctness**: Does the implementation satisfy the acceptance criteria in task.md?
+>    - **Full-package test coverage (MANDATORY for testable changes):** Read `{worktree}/tmp/ralph/pre-push-preview.txt`. Verify that every package listed in `{worktree}/tmp/ralph/touched-packages.txt` has a `PASS packages/<pkg>` entry in `pre-push-preview.txt`. If `pre-push-preview.txt` is missing, or if any touched package has a `FAIL` entry or is absent from the preview, issue **REVISE** and explain which package's full test suite was not run or did not pass. "I only ran tests for the new file" is not sufficient — the worker must run the full `packages/<pkg>/tests/` suite for every touched package and document the result. Skip this check entirely for non-testable changes (`## Testable: no`).
 >    - **Test coverage** (testable only — skip for non-testable): Are there tests for each acceptance criterion and obvious edge cases? For **non-testable** changes (`## Testable: no`), do **not** flag "no tests added" as a REVISE reason. Tests are not expected on a docs-only or migration-only diff. Verify acceptance criteria against the diff, the plan's "What will change" section, and any updated documentation instead.
 >    - **Scope completeness**: Does the change need to be applied in other locations too? Search the codebase (using Grep) for other files that use, render, or implement the same pattern being changed. If the fix or feature was applied to one file but the same pattern exists elsewhere without the change, flag it as a REVISE reason. For example, if a rendering fix was applied to `ComponentA.tsx`, check whether `ComponentB.tsx` or other components render the same data and need the same fix.
 >    - **Scope creep**: Are there changes unrelated to the issue (extra refactors, unrelated fixes)?
 >    - **Code quality**: Does it follow existing patterns? Any debug code, hardcoded values, or forgotten TODOs?
->    - **Missing pieces**: Are there files that should have been created or modified but weren't?
+>    - **Missing pieces**: Are there files that should have been created or modified but wouldn't?
 >    - **Stale references**: Do comments, imports, or docstrings reference things that changed?
 >    - **Documentation consistency**: If the change modifies behavior, configuration, or interfaces — do related docs (`docs/`, `CLAUDE.md`, `.claude/skills/`, `README.md`, `CONTRIBUTING.md`) need corresponding updates? Flag any docs that reference the old behavior.
 >    - **Performance** (testable only — skip for non-testable): Are there obvious bottlenecks? Sequential I/O that could be parallelized? O(n^2) patterns (e.g. LIMIT/OFFSET pagination, nested loops over large datasets)? Missing connection pooling or batching for network calls (DB, S3, HTTP)?
@@ -332,6 +345,7 @@ The Claude reviewer prompt applies to both branches:
 > - Don't request changes outside the scope of the task.
 > - Don't flag pre-existing patterns not introduced by this diff.
 > - **Unmet acceptance criteria are always REVISE.** Never SHIP if any locally-verifiable acceptance criterion is not satisfied.
+> - **Missing or failed full-package test run is always REVISE (testable only).** If `pre-push-preview.txt` is absent or any touched package's full test suite did not pass, issue REVISE. The worker must document passing results for every touched package.
 > - **Do not REVISE for "no tests added" on non-testable changes.** The `## Testable: no` branch does not require tests; applying a test-coverage standard to a docs-only or migration-only diff is a category error that would deadlock the loop.
 > - If you say REVISE, your feedback must be specific enough that the worker can act on it without guessing.
 > - **Unchecked test plan items are always blockers.** Never approve a PR with unchecked test plan checkboxes.
