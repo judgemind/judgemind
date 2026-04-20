@@ -110,9 +110,17 @@ jobs:
               - '.github/playwright-browser-check/**'
             migrations:
               - 'packages/api/migrations/**'
+              # Include ci.yml so that edits to the migration-* jobs below
+              # (migration-files-check, migration-collision-check,
+              # schema-drift-check, migration-notice) are actually exercised
+              # on the PR that introduces them. Without this, the paths
+              # filter would make those jobs SKIP on their own PR — the
+              # #2410 / #2505 footgun. See scripts/check-ci-job-skipped.py.
+              - '.github/workflows/ci.yml'
             schema:
               - 'packages/api/migrations/**'
               - 'packages/api/src/data-access/schema.sql'
+              - '.github/workflows/ci.yml'
             hooks:
               - '.claude/hooks/**'
               # Also trigger when the preflight-hook-test job itself changes,
@@ -935,6 +943,33 @@ jobs:
         run: scripts/check-migration-files.sh
 
   # ---------------------------------------------------------------
+  # Cross-PR migration number guard: detect when two open PRs both
+  # claim the same migration number (see #2916). `migration-files-check`
+  # only sees the current PR's diff; this job compares against every
+  # other open PR via `gh pr list --json number,title,files`.
+  # ---------------------------------------------------------------
+  migration-collision-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Need history for `git merge-base HEAD origin/main` to find the
+          # diff base; fetch-depth: 0 pulls full history.
+          fetch-depth: 0
+      - name: Fetch origin/main for diff base
+        run: git fetch origin main --depth=50
+      - name: Check cross-PR migration number claims
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF: ${{ github.ref }}
+        run: scripts/check-migration-number-collision.sh --base origin/main
+
+  # ---------------------------------------------------------------
   # ECS oneshot import guard: prevent scripts/ from importing siblings
   # ---------------------------------------------------------------
   oneshot-imports-check:
@@ -1243,7 +1278,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
