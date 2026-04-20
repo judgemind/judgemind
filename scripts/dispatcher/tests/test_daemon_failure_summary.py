@@ -309,6 +309,245 @@ class TestBuildFailureSummary:
         )
         assert summary is None
 
+    # ----------------------------------------------------------------
+    # Issue #2924 — no-tail categories + JSON-envelope filter + phase
+    # echo dedup
+    # ----------------------------------------------------------------
+
+    def test_paused_by_killswitch_skips_tail(self, tmp_path: Path) -> None:
+        """``category='paused_by_killswitch'`` yields a short neutral
+        string with no JSON dump, no phase echo, no category paren.
+
+        Regression for issue #2924. Observed on dev 2026-04-20 for agent
+        ``de44c316-...`` (issue #2564): the admin tooltip rendered the
+        raw ``claude -p`` JSON result envelope because ``phase_outputs
+        .log_text`` contained the stdout success blob (the agent was
+        paused mid-run, not crashed)."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        # Feed a log_text that contains the raw JSON envelope — the
+        # exact shape observed in the #2564 tooltip. If the fix regresses
+        # the envelope will leak through and the assertion fails.
+        conn.cursor_instance.fetch_queue = [
+            ("paused_by_killswitch", {}),
+            (
+                "=== stdout ===\n"
+                '{"type":"result","subtype":"success","is_error":false,'
+                '"duration_ms":212725,"num_turns":38,"result":"Plan written"}\n',
+            ),
+        ]
+        summary = d._build_failure_summary(
+            agent_id="agent-killswitch",
+            status="failed",
+            phase="paused_by_killswitch",
+            exit_code=0,
+        )
+        assert summary == "paused by killswitch"
+        # Belt-and-suspenders — no JSON in the output.
+        assert "{" not in summary
+        assert "result" not in summary
+        # No phase echo — the word "paused_by_killswitch" must not appear
+        # twice or show up parenthesized as a category.
+        assert summary.count("killswitch") == 1
+
+    def test_daemon_restart_abandoned_skips_tail(self, tmp_path: Path) -> None:
+        """``category='daemon_restart_abandoned'`` same as killswitch:
+        short neutral string, no JSON, no phase echo.
+
+        Regression for the ``7c28b8e1-...`` pattern (issue #2899) — the
+        tooltip read ``"daemon_restart_abandoned crashed at
+        daemon_restart_abandoned (daemon_restart_abandoned)"`` because
+        every template slot resolved to the same word."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("daemon_restart_abandoned", {}),
+            ("=== stdout ===\nprior log blob\n",),
+        ]
+        summary = d._build_failure_summary(
+            agent_id="agent-restart",
+            status="crashed",
+            phase="daemon_restart_abandoned",
+            exit_code=None,
+        )
+        assert summary == "daemon restart abandoned"
+        assert "{" not in summary
+        # Phase word appears exactly once — no tautological repetition.
+        # (Count the underscored form since the summary uses the
+        # humanized spaced form.)
+        assert "daemon_restart_abandoned" not in summary
+
+    def test_subprocess_turn_limit_tail_skips_json_envelope(
+        self, tmp_path: Path
+    ) -> None:
+        """For normal subprocess-crash categories, the tail still comes
+        from ``log_text`` — but JSON-envelope lines are skipped so the
+        tail falls back to the nearest real stderr line.
+
+        Issue #2924 AC verify-line: "synthesize a row with a log_text
+        containing mixed JSON-envelope lines and one stderr-style line;
+        assert the summary ends with the stderr line, not the JSON."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        mixed_log = (
+            "=== stderr ===\n"
+            "Traceback (most recent call last):\n"
+            "RuntimeError: subprocess exceeded turn budget\n"
+            "=== stdout ===\n"
+            '{"type":"result","subtype":"error","is_error":true,'
+            '"api_error_status":"overloaded","duration_ms":600000}\n'
+        )
+        conn.cursor_instance.fetch_queue = [
+            # Failure row has no stderr_tail in details — forces the
+            # template down the log_text path.
+            ("subprocess_turn_limit", {}),
+            (mixed_log,),
+        ]
+        summary = d._build_failure_summary(
+            agent_id="agent-mixed",
+            status="crashed",
+            phase="ralph-reviewer (3)",
+            exit_code=124,
+        )
+        assert summary is not None
+        # Tail ends with the stderr line, NOT the JSON envelope.
+        assert summary.endswith("RuntimeError: subprocess exceeded turn budget")
+        # No raw JSON envelope leaked through.
+        assert '{"type"' not in summary
+        assert "api_error_status" not in summary
+        assert len(summary) <= 240
+
+    def test_subprocess_crash_tail_omitted_when_only_json(self, tmp_path: Path) -> None:
+        """When ``log_text`` contains ONLY JSON-envelope lines (no real
+        stderr), the tail falls back to ``exit_code=<N>`` instead of
+        leaking the envelope."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        json_only = (
+            '{"type":"result","subtype":"success","is_error":false}\n'
+            '{"type":"message_stop","num_turns":10}\n'
+        )
+        conn.cursor_instance.fetch_queue = [
+            ("subprocess_crash", {}),
+            (json_only,),
+        ]
+        summary = d._build_failure_summary(
+            agent_id="agent-json-only",
+            status="crashed",
+            phase="ralph-worker (1)",
+            exit_code=1,
+        )
+        assert summary is not None
+        # Should fall back to exit_code, not leak the envelope.
+        assert "exit_code=1" in summary
+        assert '{"type"' not in summary
+
+    def test_phase_echo_dedup_collapses_tautology(self, tmp_path: Path) -> None:
+        """Phase echo collapse — when ``phase_group`` and
+        ``phase_humanized`` would resolve to the same string, the
+        template emits ``<phase> <status>`` once, not twice.
+
+        Synthesize a ``phase='daemon_restart_abandoned'`` row without
+        the no-tail short-circuit (use a non-tautology-triggering
+        category so only the phase-echo fix applies). The summary must
+        NOT contain the phase word twice."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            # Use a non-no-tail category so the phase-echo path fires.
+            ("subprocess_crash", {"detail": "something went wrong"}),
+            (None,),
+        ]
+        summary = d._build_failure_summary(
+            agent_id="agent-echo",
+            status="crashed",
+            phase="daemon_restart_abandoned",
+            exit_code=1,
+        )
+        assert summary is not None
+        # The phase word appears exactly once — no ``<phase> crashed at
+        # <phase>`` tautology.
+        assert summary.count("daemon_restart_abandoned") == 1
+        # Full expected shape: "daemon_restart_abandoned crashed
+        # (subprocess_crash): something went wrong".
+        assert summary.startswith("daemon_restart_abandoned crashed")
+        assert " at daemon_restart_abandoned" not in summary
+
+    def test_phase_echo_preserved_for_multi_iteration_phases(
+        self, tmp_path: Path
+    ) -> None:
+        """Phase echo collapse ONLY fires when the two positions resolve
+        to the same string. ``ralph-reviewer (3)`` humanizes to
+        ``ralph-reviewer iteration 3`` while its phase-group is just
+        ``ralph`` — those differ, so the ``at …`` clause is preserved
+        because it adds information (the iteration count)."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("subprocess_turn_limit", {"stderr_tail": "turns exceeded"}),
+            (None,),
+        ]
+        summary = d._build_failure_summary(
+            agent_id="agent-ralph",
+            status="crashed",
+            phase="ralph-reviewer (3)",
+            exit_code=124,
+        )
+        assert summary is not None
+        # ``ralph crashed at ralph-reviewer iteration 3`` — both
+        # positions present because they differ.
+        assert "ralph crashed at ralph-reviewer iteration 3" in summary
+
+
+# --------------------------------------------------------------------------
+# _extract_stderr_tail — JSON-envelope filter
+# --------------------------------------------------------------------------
+
+
+class TestExtractStderrTailJsonFilter:
+    """Issue #2924 — the tail extractor must skip lines that parse as
+    JSON objects/arrays. The ``claude -p`` success envelope is emitted
+    as a one-line JSON object on stdout; before this fix it was being
+    surfaced as the failure-summary tail for paused/restarted agents."""
+
+    def test_skips_json_object_line(self) -> None:
+        """A JSON object on the last line is skipped."""
+        log = (
+            "=== stderr ===\n"
+            "runtime error: something broke\n"
+            "=== stdout ===\n"
+            '{"type":"result","subtype":"success"}\n'
+        )
+        tail = daemon.DispatcherDaemon._extract_stderr_tail(log)
+        assert tail == "runtime error: something broke"
+
+    def test_skips_json_array_line(self) -> None:
+        """A JSON array on the last line is also skipped."""
+        log = "previous error\n[1, 2, 3]\n"
+        tail = daemon.DispatcherDaemon._extract_stderr_tail(log)
+        assert tail == "previous error"
+
+    def test_preserves_bare_scalar_lines(self) -> None:
+        """Bare scalars (``42``, ``"foo"``) are NOT treated as
+        envelopes — a real stderr line could plausibly contain a bare
+        token. Only object/array shapes are filtered."""
+        log = "something went wrong\n42\n"
+        tail = daemon.DispatcherDaemon._extract_stderr_tail(log)
+        # ``42`` is a real (if unusual) stderr line — it is NOT an
+        # envelope, so it surfaces as the tail.
+        assert tail == "42"
+
+    def test_preserves_json_like_prose(self) -> None:
+        """A line that starts with a ``{`` but isn't valid JSON is
+        kept — we only filter what actually parses."""
+        log = "error: invalid config {foo=bar}\n"
+        tail = daemon.DispatcherDaemon._extract_stderr_tail(log)
+        assert tail == "error: invalid config {foo=bar}"
+
+    def test_empty_log_returns_empty_string(self) -> None:
+        assert daemon.DispatcherDaemon._extract_stderr_tail(None) == ""
+        assert daemon.DispatcherDaemon._extract_stderr_tail("") == ""
+
+    def test_all_json_returns_empty(self) -> None:
+        """When every line is a JSON envelope, the tail falls back to
+        an empty string so the caller can use ``exit_code`` instead."""
+        log = '{"type":"result","subtype":"success"}\n{"type":"message_stop"}\n'
+        assert daemon.DispatcherDaemon._extract_stderr_tail(log) == ""
+
 
 # --------------------------------------------------------------------------
 # _mark_agent_terminal integration — writes failure_summary on failure

@@ -4133,6 +4133,25 @@ class DispatcherDaemon:
     #: write-time; anything longer is truncated with an ellipsis.
     _FAILURE_SUMMARY_MAX_CHARS = 240
 
+    #: Failure categories where the log tail is meaningless — the
+    #: terminal was not caused by a subprocess crash or stderr-emitting
+    #: error, so the tail of ``phase_outputs.log_text`` is just the
+    #: Anthropic JSON success envelope from the last phase that did run.
+    #: For these categories we emit a short human-readable summary with
+    #: no tail segment. Issue #2924.
+    _NO_TAIL_CATEGORIES = frozenset(
+        {"paused_by_killswitch", "daemon_restart_abandoned"}
+    )
+
+    #: Human-readable summaries for the no-tail categories. Keyed by
+    #: category; the value is the complete ``failure_summary`` string
+    #: (no phase/status/category parens — those would repeat the same
+    #: word). Issue #2924.
+    _NO_TAIL_CATEGORY_SUMMARIES = {
+        "paused_by_killswitch": "paused by killswitch",
+        "daemon_restart_abandoned": "daemon restart abandoned",
+    }
+
     @staticmethod
     def _humanize_phase(phase: str) -> str:
         """Turn ``"ralph-reviewer (3)"`` into ``"ralph-reviewer iteration 3"``.
@@ -4155,13 +4174,21 @@ class DispatcherDaemon:
 
     @staticmethod
     def _extract_stderr_tail(log_text: str | None) -> str:
-        """Pull the last non-empty line out of a ``phase_outputs.log_text``.
+        """Pull the last non-empty, non-JSON line out of a ``log_text``.
 
         ``log_text`` is the composed stdout+stderr blob from
         :meth:`_compose_phase_log` — begins with ``=== stderr ===`` when
         both streams had content. We search from the end for the first
-        non-blank, non-separator line. Empty string when the log has no
-        usable tail.
+        non-blank, non-separator, non-JSON-envelope line. Empty string
+        when the log has no usable tail.
+
+        Issue #2924: the admin cockpit tooltip was rendering the raw
+        ``claude -p`` JSON result envelope (``{"type":"result",...}``)
+        as the failure summary tail. A completed phase writes its
+        success envelope as stdout, which ends up as the last line of
+        ``log_text`` — useless as a "what went wrong" tail. We skip
+        lines that parse as JSON objects so the tail falls back to the
+        nearest real stderr line.
         """
         if not log_text:
             return ""
@@ -4171,8 +4198,37 @@ class DispatcherDaemon:
                 continue
             if line.startswith("===") and line.endswith("==="):
                 continue
+            if DispatcherDaemon._looks_like_json_envelope(line):
+                continue
             return line
         return ""
+
+    @staticmethod
+    def _looks_like_json_envelope(line: str) -> bool:
+        """True if ``line`` parses as a JSON object/array (envelope).
+
+        Used by :meth:`_extract_stderr_tail` to skip past the Anthropic
+        ``claude -p`` success envelope that lives in stdout. We only
+        treat objects/arrays as envelopes — a bare JSON scalar
+        (``"foo"`` or ``42``) could plausibly be a real stderr token
+        and we want to preserve it. Non-JSON lines fail the ``json.loads``
+        call and return False immediately. Issue #2924.
+        """
+        if not line:
+            return False
+        # Quick structural filter — only object/array-shaped lines can be
+        # the multi-line JSON envelope we want to skip. Avoids a parse
+        # attempt for every log line (cheap but not free).
+        first = line[0]
+        if first not in "{[":
+            return False
+        import json  # noqa: PLC0415 — lazy; only on terminal path
+
+        try:
+            json.loads(line)
+        except (ValueError, TypeError):
+            return False
+        return True
 
     @staticmethod
     def _extract_details_message(details: Any) -> str:
@@ -4289,6 +4345,14 @@ class DispatcherDaemon:
                 pass
             return None
 
+        # Issue #2924: for killswitch / restart-abandoned categories
+        # there IS no meaningful stderr tail — the agent did not crash,
+        # it was administratively terminated. Emit a short neutral
+        # summary instead of dumping the raw JSON success envelope from
+        # the last phase that did complete.
+        if category in self._NO_TAIL_CATEGORIES:
+            return self._NO_TAIL_CATEGORY_SUMMARIES[category]
+
         phase_humanized = self._humanize_phase(phase)
         # Phase-group = first token before a dash or space. ``ralph-reviewer``
         # → ``ralph``; ``push_and_pr`` → ``push_and_pr`` (no dash).
@@ -4306,12 +4370,29 @@ class DispatcherDaemon:
 
         # Verb phrase — ``plan_blocked`` is its own thing per the issue
         # examples; other failure statuses are "crashed" / "failed".
+        #
+        # Issue #2924: collapse the ``<phase-group> <verb> at
+        # <phase-humanized>`` form to just ``<phase> <verb>`` when the
+        # two positions resolve to the same string. Sibling #2914
+        # already flagged the tautological case — e.g.
+        # ``"daemon_restart_abandoned crashed at daemon_restart_abandoned"``
+        # just reads as the same word twice. Short-phase rows (``plan``,
+        # ``push_and_pr``, ``daemon_restart_abandoned``) hit this every
+        # time; only multi-iteration phases like ``ralph-reviewer (3)``
+        # preserve the ``at …`` clause because the humanized version
+        # adds new information (``ralph`` vs ``ralph-reviewer iteration 3``).
         if status == "plan_blocked":
             verb_phrase = "plan phase returned go=false"
         elif status == "crashed":
-            verb_phrase = f"{phase_group} crashed at {phase_humanized}"
+            if phase_group == phase_humanized:
+                verb_phrase = f"{phase_humanized} crashed"
+            else:
+                verb_phrase = f"{phase_group} crashed at {phase_humanized}"
         else:  # status == "failed"
-            verb_phrase = f"{phase_group} failed at {phase_humanized}"
+            if phase_group == phase_humanized:
+                verb_phrase = f"{phase_humanized} failed"
+            else:
+                verb_phrase = f"{phase_group} failed at {phase_humanized}"
 
         # Compose. Category is parenthesized; detail trails a colon so
         # a scanner can pattern-match on either end of the string.
