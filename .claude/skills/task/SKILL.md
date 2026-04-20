@@ -162,12 +162,13 @@ Once MCP writes are unblocked (follow-up issue referenced from `docs/agent/gh-to
 
 ### Part A — DB row (atomic race detection)
 
-Run the helper (stays in the foreground — use `timeout: 1200000` since the ECS-Exec code path takes 2-4 s per call). **Pass the issue title** you already fetched from GitHub in Step 1 (the `title` field from `mcp__github__get_issue` / `mcp__github__list_issues`) — without it, the `dispatcher.agents` row is inserted with `issue_title=NULL` and the admin cockpit's Recently Completed panel renders the row as "(title unavailable)" (issue #2898). The daemon's own `_atomic_claim` caller (`scripts/dispatcher/daemon.py`) already supplies `issue_title`; `/task` must match that behavior.
+Run the helper (stays in the foreground — use `timeout: 1200000` since the ECS-Exec code path takes 2-4 s per call). **Pass the issue title** you already fetched from GitHub in Step 1 (the `title` field from `mcp__github__get_issue` / `mcp__github__list_issues`) — without it, the `dispatcher.agents` row is inserted with `issue_title=NULL` and the admin cockpit's Recently Completed panel renders the row as "(title unavailable)" (issue #2898). **Also pass the priority** derived from the issue's `priority/pN` label (`--issue-priority p0|p1|p2|p3`) — without it, the admin cockpit's Active-agents and Recently-completed panels render the priority badge as an em-dash instead of the actual p0/p1/p2/p3 chip (issue #2899). Omit `--issue-priority` only when the issue carries no priority label at all. The daemon's own `_atomic_claim` caller (`scripts/dispatcher/daemon.py`) already supplies both; `/task` must match that behavior.
 
 ```
 python3 {worktree}/scripts/dispatcher/task_claim.py claim \
     --issue <N> \
     --issue-title "<issue-title>" \
+    --issue-priority <p0|p1|p2|p3> \
     --worktree-path {worktree}
 ```
 

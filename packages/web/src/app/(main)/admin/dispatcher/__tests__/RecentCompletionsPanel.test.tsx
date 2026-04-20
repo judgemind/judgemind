@@ -14,6 +14,7 @@ function completion(overrides: Partial<RecentCompletion>): RecentCompletion {
     agentId: 'agent-1',
     issueNumber: 2805,
     issueTitle: 'wire dispatcher admin dashboard',
+    priority: 'p2',
     status: 'succeeded',
     endedAt: '2026-04-18T11:55:00Z',
     prNumber: 2811,
@@ -30,13 +31,23 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.getByText(/no completed agents yet/i)).toBeInTheDocument();
   });
 
-  it('renders outcome glyph + issue link + PR link + title', () => {
+  it('renders outcome glyph + issue link + priority badge + PR link + title', () => {
     const items = [completion({})];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
     expect(screen.getByTestId('outcome-pill-succeeded')).toBeInTheDocument();
     expect(screen.getByTestId('issue-link-2805')).toBeInTheDocument();
+    // #2899: unified `(issue, priority, [pr,] title)` prefix — priority
+    // badge sits between the issue link and the PR link.
+    expect(screen.getByTestId('priority-badge-p2')).toBeInTheDocument();
     expect(screen.getByTestId('pr-link-2811')).toBeInTheDocument();
     expect(screen.getByText('wire dispatcher admin dashboard')).toBeInTheDocument();
+  });
+
+  it('#2899: renders the em-dash priority placeholder when priority is null', () => {
+    const items = [completion({ priority: null, agentId: 'agent-pnull' })];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    // PriorityBadge's em-dash placeholder.
+    expect(screen.getByText('—')).toBeInTheDocument();
   });
 
   // --- #2818 — density pass: "(no PR)" filler and "N min ago" column removed.

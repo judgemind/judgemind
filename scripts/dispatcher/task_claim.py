@@ -182,6 +182,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Optional issue title to store for admin-page rendering.",
     )
+    claim.add_argument(
+        "--issue-priority",
+        default=None,
+        choices=["p0", "p1", "p2", "p3"],
+        help=(
+            "Optional priority label (p0|p1|p2|p3) to store in "
+            "dispatcher.agents.priority for admin-page rendering (#2899). "
+            "Omit when the issue carries no priority/pN label."
+        ),
+    )
 
     term = sub.add_parser("terminal", help="UPDATE the row to a terminal status.")
     term.add_argument(
@@ -315,6 +325,7 @@ def _claim_via_psycopg(
     agent_id: str,
     worktree_path: str,
     issue_title: str | None,
+    issue_priority: str | None = None,
 ) -> None:
     """INSERT a claim row via psycopg. Raises :class:`ClaimLost` on UniqueViolation."""
     import psycopg  # noqa: PLC0415 — lazy import
@@ -325,14 +336,16 @@ def _claim_via_psycopg(
                 cur.execute(
                     "INSERT INTO dispatcher.agents "
                     "    (agent_id, kind, issue_number, "
-                    "     issue_title, worktree_path, phase, status) "
-                    "VALUES (%s, %s, %s, %s, %s, 'claiming', 'running')",
+                    "     issue_title, worktree_path, phase, status, "
+                    "     priority) "
+                    "VALUES (%s, %s, %s, %s, %s, 'claiming', 'running', %s)",
                     (
                         agent_id,
                         TASK_SKILL_KIND,
                         issue_number,
                         issue_title,
                         worktree_path,
+                        issue_priority,
                     ),
                 )
             conn.commit()
@@ -385,6 +398,7 @@ def _claim_via_db_query_sh(
     agent_id: str,
     worktree_path: str,
     issue_title: str | None,
+    issue_priority: str | None = None,
 ) -> None:
     """INSERT a claim row via the ``dev-db-query.sh --rw`` wrapper.
 
@@ -399,12 +413,14 @@ def _claim_via_db_query_sh(
     # already SETs the session to read-write; INSERT returns no rows so
     # the wrapper prints ``{"rowcount": 1}`` on success.
     title_sql = _sql_literal(issue_title) if issue_title else "NULL"
+    priority_sql = _sql_literal(issue_priority) if issue_priority else "NULL"
     sql = (
         "INSERT INTO dispatcher.agents "
-        "(agent_id, kind, issue_number, issue_title, worktree_path, phase, status) "
+        "(agent_id, kind, issue_number, issue_title, worktree_path, phase, "
+        "status, priority) "
         f"VALUES ({_sql_literal(agent_id)}, {_sql_literal(TASK_SKILL_KIND)}, "
         f"{int(issue_number)}, {title_sql}, {_sql_literal(worktree_path)}, "
-        "'claiming', 'running')"
+        f"'claiming', 'running', {priority_sql})"
     )
     try:
         _run_sql_via_db_query_sh(sql)
@@ -651,6 +667,7 @@ def do_claim(
     agent_id: str | None,
     worktree_path: str,
     issue_title: str | None,
+    issue_priority: str | None = None,
 ) -> int:
     """Orchestrate the claim INSERT. Returns the process exit code.
 
@@ -660,6 +677,10 @@ def do_claim(
     supplied, we validate it's a UUID before issuing the INSERT so a
     bad caller argument produces a clear error rather than surfacing
     as ``invalid input syntax for type uuid`` (issue #2892).
+
+    ``issue_priority`` is stored in ``dispatcher.agents.priority``
+    (migration 33, #2899). Values are ``'p0'`` | ``'p1'`` | ``'p2'`` |
+    ``'p3'`` | None; the admin-page renders this as a coloured badge.
     """
     # Generate or validate agent_id up front so an obviously-broken
     # caller gets a clear error before we round-trip to the DB.
@@ -680,10 +701,21 @@ def do_claim(
     try:
         if use_psycopg:
             _claim_via_psycopg(
-                database_url, issue_number, agent_id, worktree_path, issue_title
+                database_url,
+                issue_number,
+                agent_id,
+                worktree_path,
+                issue_title,
+                issue_priority,
             )
         else:
-            _claim_via_db_query_sh(issue_number, agent_id, worktree_path, issue_title)
+            _claim_via_db_query_sh(
+                issue_number,
+                agent_id,
+                worktree_path,
+                issue_title,
+                issue_priority,
+            )
     except ClaimLost:
         # Look up the current owner so the /task skill can tell the operator
         # who owns the issue right now.
@@ -805,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
             args.agent_id,
             args.worktree_path,
             args.issue_title,
+            args.issue_priority,
         )
     if args.subcommand == "terminal":
         return do_terminal(

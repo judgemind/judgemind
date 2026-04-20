@@ -2,7 +2,7 @@
 
 import { SECTION_HEADING } from '@/lib/typography';
 import type { RecentCompletion } from '@/lib/dispatcher-queries';
-import { IssueLink, OutcomePill, PRLink } from './ui-primitives';
+import { IssueLink, OutcomePill, PriorityBadge, PRLink } from './ui-primitives';
 
 interface RecentCompletionsPanelProps {
   completions: readonly RecentCompletion[];
@@ -86,8 +86,13 @@ function RecentCompletionRow({ completion }: { completion: RecentCompletion }) {
           failureSummary={completion.failureSummary}
         />
       </span>
+      {/* Unified (issue, priority, [pr,] title) prefix — matches
+          ActiveAgentsTable and QueuePanel (#2899). */}
       <span className="flex-shrink-0 pt-0.5">
         <IssueLink number={completion.issueNumber} />
+      </span>
+      <span className="flex-shrink-0 pt-0.5">
+        <PriorityBadge priority={completion.priority} />
       </span>
       {completion.prNumber !== null && (
         <span className="flex-shrink-0 pt-0.5">

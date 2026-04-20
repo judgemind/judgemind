@@ -994,6 +994,35 @@ _PRIORITY_LABEL_RANKS: dict[str, int] = {
 _PRIORITY_RANK_NO_LABEL: int = 4
 
 
+def _extract_priority(labels: Any) -> str | None:
+    """Extract the priority label value (``'p0'`` | ``'p1'`` | ``'p2'`` | ``'p3'``).
+
+    Issue #2899. Used at claim time to populate
+    ``dispatcher.agents.priority`` from the per-issue ``labels`` array
+    stored in ``dispatcher.queue_snapshots.issues_json``.
+
+    When an issue carries more than one priority label (shouldn't
+    happen, but defensive), the most urgent (lowest-numbered) wins —
+    the same convention as :func:`_priority_rank`.
+
+    Tolerates non-list input (returns None) so a malformed
+    ``issues_json`` row cannot crash the claim path.
+    """
+    if not isinstance(labels, list):
+        return None
+    best: str | None = None
+    best_rank = _PRIORITY_RANK_NO_LABEL
+    for entry in labels:
+        if not isinstance(entry, str):
+            continue
+        rank = _PRIORITY_LABEL_RANKS.get(entry)
+        if rank is not None and rank < best_rank:
+            best_rank = rank
+            # The label is ``priority/pN``; the stored value is ``pN``.
+            best = entry.split("/", 1)[1] if "/" in entry else None
+    return best
+
+
 def _priority_rank(labels: list[str] | Any) -> int:
     """Return the lowest (highest-priority) rank implied by ``labels``.
 
@@ -2787,6 +2816,65 @@ class DispatcherDaemon:
                 return None
         return None
 
+    def _latest_queue_snapshot_priority_for(self, issue_number: int) -> str | None:
+        """Return the priority label for ``issue_number`` from the latest snapshot.
+
+        Reads the same ``dispatcher.queue_snapshots.issues_json`` blob
+        as :meth:`_latest_queue_snapshot_title_for` and picks the
+        priority label out of the per-issue ``labels`` array. Returns
+        ``'p0'`` | ``'p1'`` | ``'p2'`` | ``'p3'`` or None when the
+        issue carries no ``priority/pN`` label, is absent from the
+        snapshot, or the read fails.
+
+        Written for the admin cockpit's table-unification pass (#2899).
+        Keeping the read separate from :meth:`_latest_queue_snapshot_title_for`
+        is deliberate: each call is one lightweight cursor round-trip
+        (~1 ms against RDS), the two lookups happen once per claim, and
+        a combined helper would force every future caller that only
+        needs one field to fetch both.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT issues_json FROM dispatcher.queue_snapshots "
+                    "ORDER BY observed_at DESC "
+                    "LIMIT 1",
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.latest_snapshot_priority_lookup_failed",
+                extra={
+                    "event": "latest_snapshot_priority_lookup_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None:
+            return None
+        issues = row[0]
+        if isinstance(issues, str):
+            try:
+                issues = json.loads(issues)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(issues, list):
+            return None
+        for entry in issues:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("number") == issue_number:
+                labels = entry.get("labels")
+                return _extract_priority(labels)
+        return None
+
     def _pick_candidate_issue(self, candidates: list[int]) -> int | None:
         """Pick the first candidate that is trusted and not already claimed.
 
@@ -2996,6 +3084,7 @@ class DispatcherDaemon:
         agent_id: str,
         worktree_path: str,
         issue_title: str | None = None,
+        priority: str | None = None,
     ) -> bool:
         """INSERT a new agent row; return True on success, False on race.
 
@@ -3012,6 +3101,13 @@ class DispatcherDaemon:
         ``dispatcher.queue_snapshots.issues_json`` so the admin-page
         recent-completions panel can render a title after the agent has
         finished without a GitHub round-trip.
+
+        ``priority`` is optional (nullable in the schema — migration
+        33, #2899). Values are ``'p0'`` | ``'p1'`` | ``'p2'`` | ``'p3'``
+        | None, parsed from the issue's label set at claim time. The
+        admin cockpit's Active-agents and Recently-completed panels
+        render this as a coloured badge; pre-migration-33 rows render
+        an em-dash placeholder.
         """
         assert self._conn is not None, "connect() must run before claiming"
 
@@ -3024,15 +3120,17 @@ class DispatcherDaemon:
                 cur.execute(
                     "INSERT INTO dispatcher.agents "
                     "    (agent_id, parent_run_id, kind, issue_number, "
-                    "     issue_title, worktree_path, phase, status) "
+                    "     issue_title, worktree_path, phase, status, "
+                    "     priority) "
                     "VALUES (%s, %s, 'task', %s, %s, %s, 'claiming', "
-                    "        'running')",
+                    "        'running', %s)",
                     (
                         agent_id,
                         self._run_id,
                         issue_number,
                         issue_title,
                         worktree_path,
+                        priority,
                     ),
                 )
             self._conn.commit()
@@ -4687,6 +4785,11 @@ class DispatcherDaemon:
         # recent-completions row renders with issue_title=NULL and the
         # UI falls back to "#N" — not a blocker for the claim.
         issue_title = self._latest_queue_snapshot_title_for(issue_number)
+        # Best-effort priority lookup from the same snapshot (#2899).
+        # A None result renders an em-dash placeholder — identical to
+        # the pre-migration-33 fallback — so a missing snapshot never
+        # blocks the claim.
+        issue_priority = self._latest_queue_snapshot_priority_for(issue_number)
 
         self._log.info(
             "daemon.candidate_picked",
@@ -4696,11 +4799,16 @@ class DispatcherDaemon:
                 "agent_id": agent_id,
                 "issue_number": issue_number,
                 "issue_title_captured": issue_title is not None,
+                "issue_priority": issue_priority,
             },
         )
 
         if not self._atomic_claim(
-            issue_number, agent_id, str(worktree_path), issue_title=issue_title
+            issue_number,
+            agent_id,
+            str(worktree_path),
+            issue_title=issue_title,
+            priority=issue_priority,
         ):
             # Race lost. Don't try the next candidate on this tick —
             # the next tick will re-scan the queue.

@@ -168,12 +168,14 @@ describe('queueItemFromSnapshot', () => {
 });
 
 describe('recentCompletionsToGraphQL', () => {
-  it('passes ``issue_title`` through from the agents row', () => {
+  it('passes ``issue_title`` and ``priority`` through from the agents row', () => {
     const rows = [
       {
         agent_id: 'uuid-1',
         issue_number: 100,
         issue_title: 'Fix the thing',
+        // #2899 — priority is captured at claim time.
+        priority: 'p2',
         status: 'succeeded',
         ended_at: '2026-04-18T12:00:00Z',
         pr_number: 2824,
@@ -187,6 +189,7 @@ describe('recentCompletionsToGraphQL', () => {
         agentId: 'uuid-1',
         issueNumber: 100,
         issueTitle: 'Fix the thing',
+        priority: 'p2',
         status: 'succeeded',
         endedAt: '2026-04-18T12:00:00Z',
         prNumber: 2824,
@@ -274,6 +277,34 @@ describe('recentCompletionsToGraphQL', () => {
     expect(result[0].failureSummary).toBe(
       'ralph crashed (stuck_timeout): no log tail',
     );
+  });
+
+  it('emits priority=null for pre-migration-33 rows (#2899)', () => {
+    // Rows whose claim predates migration 34 (the one #2899 adds) have
+    // ``priority`` = NULL from pg; the UI renders an em-dash placeholder.
+    const rows = [
+      {
+        agent_id: 'uuid-1',
+        issue_number: 100,
+        issue_title: 'Legacy agent',
+        priority: null,
+        status: 'succeeded',
+        ended_at: '2026-04-18T12:00:00Z',
+        pr_number: null,
+      },
+      {
+        agent_id: 'uuid-2',
+        issue_number: 101,
+        issue_title: 'Agent on unlabelled issue',
+        // column missing entirely (defensive — pg result shape drift)
+        status: 'succeeded',
+        ended_at: '2026-04-18T13:00:00Z',
+        pr_number: null,
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].priority).toBeNull();
+    expect(result[1].priority).toBeNull();
   });
 
   it('emits totalTokens=null and totalCostUsd=null for pre-migration-31 rows', () => {

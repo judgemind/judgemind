@@ -173,17 +173,42 @@ class TestClaimViaPsycopg:
             agent_id="aabbccdd-eeff-0011-2233-445566778899",
             worktree_path="/tmp/wt",
             issue_title="title",
+            issue_priority="p1",
         )
 
         assert len(cur.executed) == 1
         sql, params = cur.executed[0]
         assert "INSERT INTO dispatcher.agents" in sql
+        assert "priority" in sql
         assert params[0] == "aabbccdd-eeff-0011-2233-445566778899"
         assert params[1] == task_claim.TASK_SKILL_KIND
         assert params[2] == 2866
         assert params[3] == "title"
         assert params[4] == "/tmp/wt"
+        # New in #2899 — priority lands as the last positional param.
+        assert params[5] == "p1"
         assert conn.commits == 1
+
+    def test_happy_path_with_null_priority(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #2899 — priority is nullable. Pre-migration-33 rows and
+        issues with no priority/pN label both land here.
+        """
+        cur = _FakeCursor()
+        _patch_psycopg_connect(monkeypatch, cur)
+
+        task_claim._claim_via_psycopg(
+            "postgres://fake",
+            issue_number=2866,
+            agent_id="aabbccdd-eeff-0011-2233-445566778899",
+            worktree_path="/tmp/wt",
+            issue_title="title",
+            issue_priority=None,
+        )
+
+        sql, params = cur.executed[0]
+        assert params[5] is None
 
     def test_unique_violation_is_translated_to_claim_lost(
         self, monkeypatch: pytest.MonkeyPatch
@@ -199,6 +224,7 @@ class TestClaimViaPsycopg:
                 agent_id="abc",
                 worktree_path="/tmp/wt",
                 issue_title=None,
+                issue_priority=None,
             )
         assert conn.rollbacks == 1
 
@@ -270,8 +296,14 @@ class TestClaimViaDbQuerySh:
             agent_id="abc",
             worktree_path="/tmp/wt",
             issue_title=None,
+            issue_priority="p1",
         )
         assert len(captured) == 1
+        # #2899 — the INSERT SQL includes a ``priority`` column and the
+        # literal value is rendered inline (wrapped in single quotes).
+        sql_blob = captured[0][-1]
+        assert "priority" in sql_blob
+        assert "'p1'" in sql_blob
         assert captured[0][0] == "bash"
         assert captured[0][1].endswith("scripts/dev-db-query.sh")
         assert "--rw" in captured[0]
@@ -296,6 +328,7 @@ class TestClaimViaDbQuerySh:
                 agent_id="abc",
                 worktree_path="/tmp/wt",
                 issue_title=None,
+                issue_priority=None,
             )
 
     def test_non_unique_violation_error_raises_runtime_error(
@@ -315,7 +348,44 @@ class TestClaimViaDbQuerySh:
                 agent_id="abc",
                 worktree_path="/tmp/wt",
                 issue_title=None,
+                issue_priority=None,
             )
+
+    def test_null_priority_renders_sql_NULL_not_quoted_string(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #2899 — priority is nullable.
+
+        When the /task skill doesn't know the priority (no priority/pN
+        label on the issue, or a pre-migration-33 call path), the
+        INSERT must render a bare ``NULL`` literal, not the string
+        ``'NULL'`` (which would be accepted by PostgreSQL as a valid
+        non-null TEXT value).
+        """
+
+        captured: list[str] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd[-1])
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = '{"rowcount": 1}'
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        task_claim._claim_via_db_query_sh(
+            issue_number=2866,
+            agent_id="abc",
+            worktree_path="/tmp/wt",
+            issue_title=None,
+            issue_priority=None,
+        )
+        sql = captured[0]
+        # The priority clause renders as the bare SQL literal NULL.
+        assert ", NULL)" in sql
+        # It is NOT a quoted string ``'NULL'``.
+        assert ", 'NULL')" not in sql
 
     def test_invalid_uuid_error_raises_configuration_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -351,6 +421,7 @@ class TestClaimViaDbQuerySh:
                 agent_id="agent-a5d7e546",
                 worktree_path="/tmp/wt",
                 issue_title=None,
+                issue_priority=None,
             )
 
     def test_json_parser_strips_ecs_exec_trailer(
@@ -521,18 +592,24 @@ class TestDoClaimUuidGeneration:
         monkeypatch.setenv("DATABASE_URL", "postgres://fake")
         captured_agent_ids: list[str] = []
 
+        captured_priorities: list[str | None] = []
+
         def fake_claim(
             database_url: str,
             issue_number: int,
             agent_id: str,
             worktree_path: str,
             issue_title: str | None,
+            issue_priority: str | None,
         ) -> None:
             captured_agent_ids.append(agent_id)
+            captured_priorities.append(issue_priority)
 
         monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
-        rc = task_claim.do_claim(2866, None, str(tmp_path), None)
+        rc = task_claim.do_claim(2866, None, str(tmp_path), None, "p1")
         assert rc == 0
+        # #2899 — do_claim forwards issue_priority through to the DB call.
+        assert captured_priorities == ["p1"]
         assert len(captured_agent_ids) == 1
         generated = captured_agent_ids[0]
         assert task_claim._is_uuid(generated)
@@ -553,7 +630,7 @@ class TestDoClaimUuidGeneration:
         """Regression test: ``agent-a5d7e546`` (the exact shape #2892
         documents in SKILL.md) must fail fast at the validator, not
         round-trip to the DB."""
-        rc = task_claim.do_claim(2892, "agent-a5d7e546", "/tmp/wt", None)
+        rc = task_claim.do_claim(2892, "agent-a5d7e546", "/tmp/wt", None, None)
         assert rc == 3
         err = capsys.readouterr().err
         assert "agent-a5d7e546" in err
@@ -574,7 +651,7 @@ class TestDoClaimUuidGeneration:
             raise task_claim.ClaimConfigurationError("invalid input syntax")
 
         monkeypatch.setattr(task_claim, "_claim_via_psycopg", raise_cfg)
-        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None, None)
         assert rc == 3
         err = capsys.readouterr().err
         assert "configuration error" in err.lower()
@@ -898,12 +975,53 @@ class TestMain:
     def test_claim_subcommand_dispatches_to_do_claim(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        captured: list[tuple[int, str, str, str | None]] = []
+        captured: list[tuple[int, str, str, str | None, str | None]] = []
 
         def fake_do_claim(
-            issue: int, agent_id: str, worktree_path: str, issue_title: str | None
+            issue: int,
+            agent_id: str,
+            worktree_path: str,
+            issue_title: str | None,
+            issue_priority: str | None,
         ) -> int:
-            captured.append((issue, agent_id, worktree_path, issue_title))
+            captured.append(
+                (issue, agent_id, worktree_path, issue_title, issue_priority)
+            )
+            return 0
+
+        monkeypatch.setattr(task_claim, "do_claim", fake_do_claim)
+        rc = task_claim.main(
+            [
+                "claim",
+                "--issue",
+                "2866",
+                "--agent-id",
+                "abc",
+                "--worktree-path",
+                "/tmp/wt",
+                "--issue-priority",
+                "p1",
+            ]
+        )
+        assert rc == 0
+        assert captured == [(2866, "abc", "/tmp/wt", None, "p1")]
+
+    def test_claim_subcommand_without_issue_priority_passes_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#2899 — ``--issue-priority`` is optional. Omitting it should
+        result in ``do_claim`` receiving ``issue_priority=None``.
+        """
+        captured: list[str | None] = []
+
+        def fake_do_claim(
+            issue: int,
+            agent_id: str,
+            worktree_path: str,
+            issue_title: str | None,
+            issue_priority: str | None,
+        ) -> int:
+            captured.append(issue_priority)
             return 0
 
         monkeypatch.setattr(task_claim, "do_claim", fake_do_claim)
@@ -919,7 +1037,22 @@ class TestMain:
             ]
         )
         assert rc == 0
-        assert captured == [(2866, "abc", "/tmp/wt", None)]
+        assert captured == [None]
+
+    def test_claim_subcommand_rejects_invalid_priority(self) -> None:
+        """#2899 — ``--issue-priority`` must be one of p0|p1|p2|p3."""
+        with pytest.raises(SystemExit):
+            task_claim.main(
+                [
+                    "claim",
+                    "--issue",
+                    "2866",
+                    "--worktree-path",
+                    "/tmp/wt",
+                    "--issue-priority",
+                    "urgent",  # not a valid priority label
+                ]
+            )
 
     def test_terminal_subcommand_dispatches_to_do_terminal(
         self, monkeypatch: pytest.MonkeyPatch
