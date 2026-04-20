@@ -617,6 +617,19 @@ TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
 #: :meth:`_recover_abandoned_agents` and #2872 Bug A.
 FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED = "daemon_restart_abandoned"
 
+#: Failure-category mirror of :data:`KILLSWITCH_TERMINAL_PHASE` (issue
+#: #2936). The string value matches the phase name verbatim so any
+#: future retry-marker path fired by operator killswitch / circuit-
+#: breaker cap-flip can tag itself with this category and be recognized
+#: by :data:`_INFRA_PREEMPTION_CATEGORIES`. Today no retry-marker path
+#: uses it — :meth:`_check_killswitch_and_abort` flips the agent to
+#: ``status='failed' phase='paused_by_killswitch'`` terminally — but
+#: introducing the constant now lets the preemption classifier handle
+#: the category the moment a killswitch retry flow lands. Killswitch
+#: events are infrastructure preemption, not agent-driven failures,
+#: and must not burn the retry budget.
+FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH = KILLSWITCH_TERMINAL_PHASE
+
 #: GitHub API rate-limit threshold (spec §7 step 2). When ``gh api
 #: rate_limit --jq '.resources.core.remaining'`` reports fewer than this
 #: many requests remaining, the supervisor writes a
@@ -675,6 +688,33 @@ AUTO_RETRY_CATEGORIES = frozenset(
         FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
         FAILURE_CATEGORY_SUBPROCESS_CRASH,
         FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+    }
+)
+
+#: Retry reasons that represent **infrastructure preemption** — the
+#: daemon container restarted mid-flight, the operator engaged the
+#: killswitch, the circuit breaker flipped the concurrency cap to 0.
+#: None of these indicate an actual problem with the agent's code or
+#: runtime, so the retry they trigger must NOT count toward the
+#: per-agent attempt budget surfaced by
+#: :meth:`DispatcherDaemon._current_attempt_for` (read from
+#: ``dispatcher.agents.retries_used``). Issue #2936 — during a stretch
+#: of 5+ dispatcher redeploys on 2026-04-20 a single agent caught two
+#: ``daemon_restart_abandoned`` events and burned 2 of its 3 retries
+#: before executing any real work.
+#:
+#: :meth:`DispatcherDaemon._process_retry_markers` branches on this
+#: set: when the marker's ``reason`` is in the frozenset, the reset
+#: preserves ``retries_used`` (the agent re-enters the pipeline at the
+#: same attempt number it was at when preempted); for any other
+#: reason, ``retries_used`` increments as before. The
+#: ``daemon.retry_processed`` log event records the decision in a
+#: ``retry_counted`` boolean so CloudWatch queries can distinguish
+#: free retries from budgeted ones.
+_INFRA_PREEMPTION_CATEGORIES = frozenset(
+    {
+        FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+        FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH,
     }
 )
 
@@ -9934,12 +9974,27 @@ class DispatcherDaemon:
         2. UPDATE the agent to ``status='retrying' phase='claiming'``.
            The next scheduler tick's claim path sees the retry state
            and re-orchestrates (creates a fresh worktree via 3A's
-           ``_create_worktree``). Incrementing ``retries_used`` tracks
-           the total retries across all reasons for the admin page.
+           ``_create_worktree``).
+
+           ``retries_used`` increments only when the retry's reason is
+           **not** in :data:`_INFRA_PREEMPTION_CATEGORIES`. Infra-
+           preemption retries (daemon restart, operator killswitch)
+           preserve the prior attempt count so that an agent which
+           caught two dispatcher redeploys during a rapid-merge stretch
+           doesn't burn its retry budget on infrastructure churn
+           (issue #2936). Budgeted retries (``subprocess_crash``,
+           ``stuck_timeout``, ``gh_rate_exhausted``) still increment so
+           the 3B fix-ci cap and 3D diagnoser tier-3
+           (``ci_red_after_retries``) see the full retry history.
         3. Mark the retry marker ``resolved_at = now()``.
 
         Returns the number of markers processed this tick. DB errors on
         any single marker are logged + rolled back; the loop continues.
+
+        The emitted ``daemon.retry_processed`` log event includes a
+        ``retry_counted`` boolean so CloudWatch queries can separate
+        budgeted retries (``retry_counted=true``) from free infra
+        preemption retries (``retry_counted=false``).
         """
         assert self._conn is not None, "connect() must run before marker drain"
 
@@ -9979,26 +10034,48 @@ class DispatcherDaemon:
             worktree_path = str(row[4]) if row[4] is not None else ""
             issue_number = int(row[5]) if row[5] is not None else None
 
+            # Classify the retry: infra-preemption reasons are "free"
+            # — the agent never ran under its own power, so the retry
+            # should leave ``retries_used`` untouched. Any other
+            # reason is an actual runtime problem and counts toward
+            # the attempt budget (issue #2936).
+            retry_counted = reason not in _INFRA_PREEMPTION_CATEGORIES
+
             try:
                 self._drop_worktree_best_effort(worktree_path)
 
-                with self._conn.cursor() as cur:
-                    # Reset the agent for a fresh claim. ``started_at``
-                    # stays pinned to the original claim so elapsed-time
-                    # dashboards keep working; ``retries_used``
-                    # increments so the 3B fix-ci cap and 3D diagnoser
-                    # tier-3 (``ci_red_after_retries``) see the full
-                    # retry history.
-                    cur.execute(
+                # Two near-identical UPDATE statements — the difference
+                # is the ``retries_used`` clause. Keeping them as
+                # distinct string literals (rather than a dynamic
+                # join) preserves the grep-ability of SQL statements
+                # in the daemon, which the fakes in
+                # ``test_daemon_phase3c.py`` rely on.
+                if retry_counted:
+                    reset_sql = (
                         "UPDATE dispatcher.agents "
                         "SET status = 'retrying', "
                         "    phase = 'claiming', "
                         "    retries_used = retries_used + 1, "
                         "    exit_code = NULL, "
                         "    ended_at = NULL "
-                        "WHERE agent_id = %s",
-                        (agent_id,),
+                        "WHERE agent_id = %s"
                     )
+                else:
+                    # Preserve ``retries_used`` — infra preemption is
+                    # not an agent-driven failure, so it must not
+                    # consume the retry budget. See
+                    # :data:`_INFRA_PREEMPTION_CATEGORIES`.
+                    reset_sql = (
+                        "UPDATE dispatcher.agents "
+                        "SET status = 'retrying', "
+                        "    phase = 'claiming', "
+                        "    exit_code = NULL, "
+                        "    ended_at = NULL "
+                        "WHERE agent_id = %s"
+                    )
+
+                with self._conn.cursor() as cur:
+                    cur.execute(reset_sql, (agent_id,))
                     # #2872 — write a fresh ``phase_transitions`` row so
                     # the supervisor's stuck_timeout MAX(ts) comparison
                     # restarts its clock. Without this, the stale
@@ -10030,6 +10107,7 @@ class DispatcherDaemon:
                         "reason": reason,
                         "attempt": attempt,
                         "marker_id": marker_id,
+                        "retry_counted": retry_counted,
                     },
                 )
                 processed += 1
