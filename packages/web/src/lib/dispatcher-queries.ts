@@ -42,6 +42,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         failureId
         agentId
         category
+        displayCategory
         detectedBy
         details
         ts
@@ -159,7 +160,20 @@ export interface DispatcherAgent {
 export interface DispatcherFailure {
   failureId: string;
   agentId: string | null;
+  /** Stored machine-readable category token (e.g.
+   * `subprocess_turn_limit`, `daemon_restart_abandoned`). Used by
+   * CloudWatch queries, SQL filters, and retry classification. The
+   * admin cockpit surfaces this via the table cell's `title` tooltip
+   * so operators can still copy-paste the raw token for debugging
+   * even when the cell renders `displayCategory`. */
   category: string;
+  /** Operator-friendly rephrasing of `category` computed server-side
+   * from the display-name map in the API resolver, which mirrors
+   * `_CATEGORY_DISPLAY_NAMES` in `scripts/dispatcher/daemon.py`.
+   * Categories not in the map fall through to the raw token. Issue
+   * #2948 — keeps Recent Failures table labels consistent with the
+   * Recently Completed tooltips introduced in #2935. */
+  displayCategory: string;
   detectedBy: string;
   details: Record<string, unknown>;
   ts: string;

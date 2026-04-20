@@ -85,7 +85,23 @@ export const dispatcherTypeDefs = `#graphql
   type DispatcherFailure {
     failureId: ID!
     agentId: ID
+    """Stored machine-readable category token (e.g.
+    \`subprocess_turn_limit\`, \`daemon_restart_abandoned\`). Used by
+    CloudWatch queries, SQL filters, and retry classification — keep
+    this field available for operator tooling even when surfacing
+    \`displayCategory\` in the UI."""
     category: String!
+    """Operator-friendly rephrasing of \`category\` (e.g.
+    \`subprocess_turn_limit\` → \`turn limit reached\`). Computed
+    server-side from the display-name map in
+    packages/api/src/graphql/dispatcher/resolvers.ts (which mirrors
+    DispatcherDaemon._CATEGORY_DISPLAY_NAMES and
+    _NO_TAIL_CATEGORY_SUMMARIES in scripts/dispatcher/daemon.py).
+    Categories not in the map fall through to the raw token
+    verbatim. Issue #2948 — keeps the admin cockpit's Recent
+    Failures table consistent with the Recently Completed tooltips
+    introduced in #2935/#2939."""
+    displayCategory: String!
     detectedBy: String!
     """Opaque category-specific JSON payload."""
     details: JSON!

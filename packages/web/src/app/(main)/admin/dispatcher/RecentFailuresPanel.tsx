@@ -39,6 +39,17 @@ const FAILURE_CHIP_CLASSES =
  * ``paused_by_killswitch``) render ↺ amber; every other failure
  * category renders ✗ red. Matches the outcome-pill vocabulary in
  * ``RecentCompletionsPanel`` so the two panels read together.
+ *
+ * #2948: the Category column renders the operator-friendly
+ * `displayCategory` string (e.g. "turn limit reached") instead of the
+ * raw token (`subprocess_turn_limit`), matching the Recently Completed
+ * tooltip rephrasing from #2935/#2939. The raw token is preserved on
+ * the cell's `title` attribute and as a `data-category` attribute so
+ * operators can still grab the exact string they need for CloudWatch
+ * queries / SQL filters. Unknown categories (not in the server-side
+ * display map) fall through to the raw token — the backend returns
+ * `category` verbatim as `displayCategory` in that case, so the UI
+ * doesn't need a fallback.
  */
 export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProps) {
   const groups = groupFailuresByCategory(failures);
@@ -95,8 +106,18 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
                     </span>
                   </td>
                   <td className="py-2">
-                    <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
-                      {group.category}
+                    <span
+                      // #2948: title + data-category preserve the raw
+                      // machine-readable token for operator debugging
+                      // (CloudWatch queries, SQL filters, copy-paste)
+                      // while the visible pill text shows the
+                      // operator-friendly `displayCategory` string.
+                      className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+                      title={group.category}
+                      data-category={group.category}
+                      data-testid={`failure-category-pill-${group.category}`}
+                    >
+                      {group.mostRecent.displayCategory}
                     </span>
                   </td>
                   <td className="py-2 font-mono text-foreground">{group.count}</td>
