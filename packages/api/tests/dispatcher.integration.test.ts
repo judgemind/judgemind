@@ -373,7 +373,7 @@ describe('dispatcherState — admin', () => {
       details: { hook: 'subagentstop', note: MARKER },
     });
     const body = await gql(
-      `{ dispatcherState { recentFailures(sinceHours: 1) { failureId category detectedBy agentId details } } }`,
+      `{ dispatcherState { recentFailures(sinceHours: 1) { failureId category displayCategory detectedBy agentId details } } }`,
       undefined,
       adminToken,
     );
@@ -384,6 +384,9 @@ describe('dispatcherState — admin', () => {
     const ours = failures.find((f) => (f.agentId as string) === agentId);
     expect(ours).toBeDefined();
     expect(ours!.category).toBe('hook_failure');
+    // #2948: unknown categories (like the test's synthetic
+    // `hook_failure`) fall through to the raw token as `displayCategory`.
+    expect(ours!.displayCategory).toBe('hook_failure');
     expect(ours!.detectedBy).toBe('hook:subagentstop');
     // details round-trips as JSON
     expect((ours!.details as Record<string, unknown>).note).toBe(MARKER);

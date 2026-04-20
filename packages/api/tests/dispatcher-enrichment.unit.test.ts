@@ -18,7 +18,10 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  CATEGORY_DISPLAY_NAMES,
   coerceNullableNumber,
+  displayCategoryFor,
+  failureRowToGraphQL,
   normalizeSnapshotJson,
   phaseCostRowsToGraphQL,
   queueItemFromSnapshot,
@@ -1112,5 +1115,139 @@ describe('phaseCostRowsToGraphQL (#2869)', () => {
 
   it('returns an empty array for an empty row list', () => {
     expect(phaseCostRowsToGraphQL([])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Category display-name rephrasing (issue #2948)
+// ---------------------------------------------------------------------------
+
+describe('CATEGORY_DISPLAY_NAMES (#2948 — Recent Failures table rephrase)', () => {
+  it('locks the full map so a typo or accidental deletion fails the test', () => {
+    // Must stay in sync with DispatcherDaemon._CATEGORY_DISPLAY_NAMES
+    // and DispatcherDaemon._NO_TAIL_CATEGORY_SUMMARIES in
+    // scripts/dispatcher/daemon.py. If a new category is added on the
+    // Python side, adding its LHS here (and updating this assertion) is
+    // part of the rephrase. If the Python map changes but this one
+    // doesn't, the Recent Failures table falls back to the raw token
+    // for the new category — acceptable degradation, but the mismatch
+    // is surfaced by the Python side's
+    // ``test_category_display_names_map_contents`` test.
+    expect(CATEGORY_DISPLAY_NAMES).toEqual({
+      subprocess_turn_limit: 'turn limit reached',
+      subprocess_crash: 'subprocess crashed',
+      subprocess_auth_fail: 'auth failed',
+      ci_red_after_retries: 'CI failed after retries',
+      gh_rate_exhausted: 'GitHub rate limit',
+      stuck_timeout: 'timed out',
+      paused_by_killswitch: 'manually stopped',
+      daemon_restart_abandoned: 'dispatcher restarted',
+    });
+  });
+
+  it('displayCategoryFor rephrases known tokens', () => {
+    expect(displayCategoryFor('subprocess_turn_limit')).toBe('turn limit reached');
+    expect(displayCategoryFor('daemon_restart_abandoned')).toBe('dispatcher restarted');
+    expect(displayCategoryFor('paused_by_killswitch')).toBe('manually stopped');
+    expect(displayCategoryFor('ci_red_after_retries')).toBe('CI failed after retries');
+  });
+
+  it('displayCategoryFor falls through to the raw token for unknown categories', () => {
+    // Acceptance criterion #3: unknown category (future additions not
+    // yet in the map) falls through to the raw token as today.
+    expect(displayCategoryFor('some_new_category')).toBe('some_new_category');
+    expect(displayCategoryFor('')).toBe('');
+  });
+});
+
+describe('failureRowToGraphQL (#2948 — displayCategory field)', () => {
+  it('exposes displayCategory alongside the raw category token', () => {
+    const row = {
+      failure_id: 'failure-1',
+      agent_id: 'agent-1',
+      category: 'subprocess_turn_limit',
+      detected_by: 'supervisor:turn_limit',
+      details: { note: 'ran out of turns' },
+      ts: '2026-04-20T12:00:00Z',
+      issue_number: 2948,
+    };
+    expect(failureRowToGraphQL(row)).toEqual({
+      failureId: 'failure-1',
+      agentId: 'agent-1',
+      category: 'subprocess_turn_limit',
+      displayCategory: 'turn limit reached',
+      detectedBy: 'supervisor:turn_limit',
+      details: { note: 'ran out of turns' },
+      ts: '2026-04-20T12:00:00Z',
+      issueNumber: 2948,
+    });
+  });
+
+  it('passes unknown categories through to displayCategory verbatim', () => {
+    const row = {
+      failure_id: 'failure-2',
+      agent_id: null,
+      category: 'some_future_category',
+      detected_by: 'hook:unknown',
+      details: null,
+      ts: '2026-04-20T12:00:00Z',
+      issue_number: null,
+    };
+    const out = failureRowToGraphQL(row);
+    expect(out.category).toBe('some_future_category');
+    expect(out.displayCategory).toBe('some_future_category');
+    // null details round-trips to an empty object (consistent with
+    // pre-#2948 behavior — `details: JSON!` is non-nullable on the
+    // schema).
+    expect(out.details).toEqual({});
+    expect(out.issueNumber).toBeNull();
+  });
+
+  it('rephrases the display-only alias categories (_NO_TAIL_CATEGORY_SUMMARIES)', () => {
+    // paused_by_killswitch and daemon_restart_abandoned come from
+    // Python's _NO_TAIL_CATEGORY_SUMMARIES map, not the main
+    // _CATEGORY_DISPLAY_NAMES map — but they still appear as raw
+    // category tokens in dispatcher.failures rows, so the Recent
+    // Failures table needs to rephrase them too (issue #2948).
+    expect(
+      failureRowToGraphQL({
+        failure_id: 'f1',
+        agent_id: 'a1',
+        category: 'paused_by_killswitch',
+        detected_by: 'supervisor:killswitch',
+        details: {},
+        ts: '2026-04-20T12:00:00Z',
+        issue_number: null,
+      }).displayCategory,
+    ).toBe('manually stopped');
+
+    expect(
+      failureRowToGraphQL({
+        failure_id: 'f2',
+        agent_id: 'a2',
+        category: 'daemon_restart_abandoned',
+        detected_by: 'supervisor:daemon_restart',
+        details: {},
+        ts: '2026-04-20T12:00:00Z',
+        issue_number: null,
+      }).displayCategory,
+    ).toBe('dispatcher restarted');
+  });
+
+  it('coerces a non-string category to empty + empty displayCategory', () => {
+    // Defensive — the resolver type-guards category before passing it
+    // through. A malformed row (null category, which should never
+    // happen under the NOT NULL constraint) should collapse cleanly.
+    const out = failureRowToGraphQL({
+      failure_id: 'f3',
+      agent_id: null,
+      category: null as unknown as string,
+      detected_by: 'hook',
+      details: {},
+      ts: '2026-04-20T12:00:00Z',
+      issue_number: null,
+    });
+    expect(out.category).toBe('');
+    expect(out.displayCategory).toBe('');
   });
 });

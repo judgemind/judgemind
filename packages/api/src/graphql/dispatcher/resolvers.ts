@@ -86,12 +86,66 @@ function runRowToGraphQL(row: Row): Record<string, unknown> {
   };
 }
 
+/**
+ * Operator-friendly rephrasing of the machine-readable category tokens
+ * stored in ``dispatcher.failures.category``. Mirrors two Python maps in
+ * ``scripts/dispatcher/daemon.py`` so the admin cockpit renders a single
+ * consistent string whether the category surfaces as a Recently
+ * Completed tooltip (``failure_summary`` — server-rendered in Python)
+ * or as a Recent Failures table cell (``displayCategory`` — rendered
+ * here and returned by the GraphQL surface).
+ *
+ * - ``DispatcherDaemon._CATEGORY_DISPLAY_NAMES`` — daemon.py:4173
+ * - ``DispatcherDaemon._NO_TAIL_CATEGORY_SUMMARIES`` — daemon.py:4156
+ *   (these are short-circuits used inline by ``_build_failure_summary``
+ *   in Python; their LHS tokens also want operator-friendly phrasing
+ *   when rendered in the Recent Failures table)
+ *
+ * Drift risk: this map lives in TypeScript because the GraphQL layer is
+ * TypeScript, so there are two copies of the dictionary — one per
+ * language. Precedent: ``FAILURE_SUMMARY_STATUSES`` above already
+ * mirrors ``_FAILURE_SUMMARY_STATUSES`` from Python. A new token only
+ * needs a rephrase on one side (the operator cares about the rendered
+ * string, not the stored token); if this map goes stale the UI just
+ * falls through to the raw token until it's updated. The Python side is
+ * guarded by ``test_category_display_names_map_contents`` in
+ * ``scripts/dispatcher/tests/test_daemon_failure_summary.py``; the
+ * TypeScript side is guarded by
+ * ``packages/api/tests/dispatcher-enrichment.unit.test.ts``.
+ *
+ * Issue #2948.
+ */
+const CATEGORY_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  // From _CATEGORY_DISPLAY_NAMES (daemon.py:4173):
+  subprocess_turn_limit: 'turn limit reached',
+  subprocess_crash: 'subprocess crashed',
+  subprocess_auth_fail: 'auth failed',
+  ci_red_after_retries: 'CI failed after retries',
+  gh_rate_exhausted: 'GitHub rate limit',
+  stuck_timeout: 'timed out',
+  // From _NO_TAIL_CATEGORY_SUMMARIES (daemon.py:4156) — these are the
+  // "display-only alias" categories that bypass Python's tail-appending
+  // logic. Their LHS tokens still show up in dispatcher.failures.category
+  // rows, so we rephrase them here too for the Recent Failures table:
+  paused_by_killswitch: 'manually stopped',
+  daemon_restart_abandoned: 'dispatcher restarted',
+};
+
+/** Rephrase a raw category token for display. Unknown tokens fall
+ * through verbatim so the operator always sees *something* (and the
+ * cell's `title` attribute preserves the raw token for debugging). */
+function displayCategoryFor(category: string): string {
+  return CATEGORY_DISPLAY_NAMES[category] ?? category;
+}
+
 /** Convert a `dispatcher.failures` row into the GraphQL `DispatcherFailure` shape. */
 function failureRowToGraphQL(row: Row): Record<string, unknown> {
+  const category = typeof row.category === 'string' ? row.category : '';
   return {
     failureId: row.failure_id,
     agentId: row.agent_id,
-    category: row.category,
+    category,
+    displayCategory: displayCategoryFor(category),
     detectedBy: row.detected_by,
     details: row.details ?? {},
     ts: row.ts,
@@ -1195,9 +1249,11 @@ export const dispatcherScalarResolvers = {
 // Internal exports for unit testing.
 export {
   agentRowToGraphQL,
+  CATEGORY_DISPLAY_NAMES,
   coerceNullableNumber,
   commandRowToGraphQL,
   configRowToGraphQL,
+  displayCategoryFor,
   failureRowToGraphQL,
   insertCommandIdempotent,
   normalizeSnapshotJson,
