@@ -2,6 +2,12 @@
 
 End-to-end pipeline from court website to user query. For the full architecture specification, see `docs/specs/architecture-spec-v1.md`.
 
+This document follows the same convention as the architecture spec: **Today** describes what is implemented and running in production. **Direction** describes what is planned but not yet built. When a stage is partially built, the shipped part appears in Today and the unbuilt part appears in Direction.
+
+---
+
+# Today — Implemented and Running
+
 ## Pipeline Overview
 
 ```
@@ -111,19 +117,30 @@ The Next.js app (`packages/web/`) is a GraphQL client. It server-renders pages f
 - Search -- full-text search across rulings with filters
 - Admin -- data quality dashboard, scraper health overview
 
-## NLP Pipeline (nlp-pipeline) -- Current State
-
-The `nlp-pipeline` package (`packages/nlp-pipeline/`) contains modules for classification, entity extraction, summarization, embedding generation, and version diffing. Currently:
-
-- **Integrated:** Document classification and entity extraction logic are defined but the production field extraction runs inline in the `scraper-framework` ingestion worker (Tier 2 LLM extraction).
-- **Planned:** The pipeline will consume `document.validated` events from Redis Streams and run as independent processing stages. This will add:
-  - Document summarization (cached in `rulings.summary`)
-  - Vector embedding generation (stored in Qdrant for semantic search)
-  - Version classification for revised documents (substantive vs. cosmetic)
-
-
 ## Reingestion
 
 Historical documents can be reprocessed through the full three-tier extraction pipeline using `scripts/reingest_from_s3.py`. This reads archived documents from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. Used after extraction logic improvements or to backfill fields for documents ingested before LLM extraction was available.
 
 **Important:** `reingest_from_s3.py` operates on **existing database records only** — it queries the `documents` table to find S3 keys to reprocess. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead, which discovers documents directly from S3 keys without requiring pre-existing database records.
+
+---
+
+# Direction — Planned, Not Yet Built
+
+## Independent NLP Pipeline
+
+The `nlp-pipeline` package (`packages/nlp-pipeline/`) contains modules for classification, entity extraction, summarization, embedding generation, and version diffing. Today, the production field extraction runs **inline** in the `scraper-framework` ingestion worker (Tier 2 LLM extraction) — the `nlp-pipeline` package is not wired into the runtime event bus.
+
+The plan is for `nlp-pipeline` to run as independent processing stages consuming `document.validated` events from Redis Streams. When built, it will add:
+
+- **Document summarization** — ruling summaries cached in `rulings.summary`. Source lives at `packages/nlp-pipeline/src/judgemind_nlp/summarizer/ruling_summarizer.py` and is env-gated off in production.
+- **Vector embedding generation** — stored in Qdrant for semantic search.
+- **Version classification** — for revised documents, classify substantive vs. cosmetic changes.
+
+Until these stages are wired up and serving users, none of them are part of the Today pipeline.
+
+## Validation Stage
+
+A Validation Agent stage is planned between capture and ingestion. It would consume `document.captured`, apply per-field quality checks, and re-emit `document.validated` (the event the independent NLP pipeline would consume). Today, the ingestion worker reads `document.captured` directly — there is no validation stage between them.
+
+See `docs/specs/architecture-spec-v1.md` §4.1 for the validation agent design, and §4.2 for Qdrant/embeddings.

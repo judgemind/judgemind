@@ -27,6 +27,7 @@ These are the most frequently violated rules. **A PreToolUse hook enforces the s
 - **NEVER** share venvs between worktrees. Each worktree gets its own `.venv`.
 - **NEVER** create additional worktrees from inside a worktree via `git worktree add`. Subagents must work in their assigned worktree only. If the worktree gets into a bad state, fix it (e.g., `git checkout -- .`, `git clean -fd`) rather than creating a new one. Child worktrees become orphaned — `cleanup_worktree.sh` cannot track them, and the dispatcher does not know about them.
 - **NEVER** close a task or remove a worktree without posting a verification evidence comment on the issue. Every task completion requires concrete evidence that the change works (deployed services) or an explicit skip reason (docs/CI/tooling). See §4.10 Step 3.
+- **NEVER** merge user-visible affordances that haven't been exercised end-to-end. A button, menu item, form, API endpoint, config flag, or schema field only lands in `main` when someone has actually used it and observed the downstream effect — clicked the stop button and confirmed the task was killed, hit the endpoint and verified the DB row changed, toggled the flag and saw the behavior switch. "The page renders" / "the service returns 200" is not evidence that a control works. If a feature can't be exercised today, it is feature-flagged off, kept out of the UI, or not merged. Half-built behind a flag is fine; half-built and reachable by users is the bug. The verification evidence comment (§4.10 Step 3, task skill A.8) must show the affordance being *exercised*, not just rendered.
 - **NEVER** bypass a safety check (e.g. `cleanup_worktree.sh`, preflight hooks, `.githooks/pre-push`) with `--force` or a manual workaround. When a check blocks you, trust it: skip and retry later, or investigate the root cause. The check is usually right and you are usually wrong about what is happening.
 - **NEVER** run `gh auth switch` or change the active GitHub CLI account without an explicit user instruction. If `gh` fails on auth, report the problem — don't swap accounts as a workaround. A subagent doing this once caused a ghost-PR incident that derailed an agent for multiple iterations.
 
@@ -91,6 +92,28 @@ Consult these docs before making changes in their domain:
 | `docs/agent/gh-to-mcp-migration.md` | Full tool-by-tool `gh` → `mcp__github__*` mapping, including the known gaps |
 | `docs/agent/aws-api-access.md` | When to use the AWS MCP servers vs the `aws` CLI vs `scripts/ecs-*.sh` — MCP-first for ECS/CloudWatch reads, scripts for launch-and-stream, CLI for writes/S3/secrets |
 | `docs/agent/aws-to-mcp-migration.md` | Full tool-by-tool `aws` → `mcp__awslabs_*` mapping, including the known gaps |
+
+### Writing Specs and Long-Lived Design Docs
+
+Every architecture or product spec separates **Today** (what exists and is running in production) from **Direction** (aspirational, planned, or not yet built). Readers of a spec must never have to guess whether a component, API, schema, or feature actually exists — because past conflation has repeatedly caused agents and humans to build on foundations that weren't there (Qdrant vector DB, federal court scrapers that weren't wired up, judge analytics before the data was trustworthy).
+
+Structure every new spec as:
+
+```
+# 1. Principles           (cross-cutting, stable)
+# 2. System Overview      (describes current reality, not aspiration)
+# 3. Today                (everything below here is implemented and running)
+#     3.x subsystems...
+# 4. Direction            (everything below here is not yet built)
+#     4.x planned items...
+```
+
+Rules:
+- **Don't mix.** A Today section describes only what exists. A Direction section describes only what doesn't. No "partially implemented" hedge prose sprinkled inside Today — if it's partial, name the shipped part in Today and the unbuilt part in Direction.
+- **Speculative ideas** ("we'll probably want X") go in Direction or a separate roadmap doc. Never in Today.
+- **Principles and cross-cutting constraints** (cost-awareness, archive-first, security) stay in §1 — they apply regardless of which items are shipped.
+
+`docs/specs/architecture-spec-v1.md` and `docs/data-flow.md` are the reference patterns. When adding a new spec or materially editing an existing one, follow their structure.
 
 ## Starting a New Session
 
@@ -159,6 +182,7 @@ These rules govern how you work with the user in interactive sessions, not just 
 - **CI watch is non-negotiable.** `gh run watch <id> --interval 60 --exit-status --compact`. Fix and re-push until CI is green.
 - **Verify `mergeable: MERGEABLE` and `statusCheckRollup` all SUCCESS/SKIPPED before merging.**
 - **Verification evidence comment is MANDATORY on every task completion** — deployed or not. For deployed services, include concrete evidence (curl / DB query / log lines / screenshot). For docs/CI/tooling, state the skip reason explicitly. See task skill A.8 Step 3 for the evidence format and the change-type → verification mapping.
+- **For new user-visible affordances, the evidence must be the affordance exercised** — not "the page loads" or "the service returns 200." A stop button requires log lines showing the process was killed AND a DB/state snapshot showing the task transitioned to stopped. A new endpoint requires the request-response pair AND the state change it caused. A new config flag requires toggling it and observing both branches of the behavior. Rendering is not evidence. See task skill A.8 Step 2 verification table.
 - **Deploy before cleanup.** A task is done when the change is deployed, functionally verified, AND evidence posted — not when the PR merges. Worktree stays alive until verification passes.
 - **Never ask for user confirmation during the substeps.** Just execute.
 
