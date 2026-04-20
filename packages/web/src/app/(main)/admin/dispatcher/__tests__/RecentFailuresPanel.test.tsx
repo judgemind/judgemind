@@ -43,7 +43,9 @@ describe('RecentFailuresPanel', () => {
       expect(glyph.className).not.toMatch(/bg-amber/);
     });
 
-    it('renders amber ↺ for daemon_restart_abandoned', () => {
+    it('renders gray ↺ for daemon_restart_abandoned', () => {
+      // Issue #2953 recoloured the infra-preempt chip from amber to
+      // gray (bg-muted) — infra churn is neutral, not a warning.
       render(
         <RecentFailuresPanel
           failures={[makeFailure({ category: 'daemon_restart_abandoned' })]}
@@ -52,13 +54,14 @@ describe('RecentFailuresPanel', () => {
       );
       const glyph = screen.getByTestId('failure-glyph-infra_preempted');
       expect(glyph.textContent).toBe('\u21BA');
-      expect(glyph.className).toContain('bg-amber');
+      expect(glyph.className).toContain('bg-muted');
+      expect(glyph.className).not.toMatch(/bg-amber/);
       expect(glyph.className).not.toMatch(/bg-red/);
       // aria-label is a neutral descriptor, not "failed".
       expect(glyph.getAttribute('aria-label')).toBe('infra preempted');
     });
 
-    it('renders amber ↺ for paused_by_killswitch', () => {
+    it('renders gray ↺ for paused_by_killswitch', () => {
       render(
         <RecentFailuresPanel
           failures={[makeFailure({ category: 'paused_by_killswitch' })]}
@@ -67,7 +70,8 @@ describe('RecentFailuresPanel', () => {
       );
       const glyph = screen.getByTestId('failure-glyph-infra_preempted');
       expect(glyph.textContent).toBe('\u21BA');
-      expect(glyph.className).toContain('bg-amber');
+      expect(glyph.className).toContain('bg-muted');
+      expect(glyph.className).not.toMatch(/bg-amber/);
     });
 
     it('keeps infra-preempted rows IN the table (operator wants the signal)', () => {

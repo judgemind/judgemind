@@ -330,6 +330,14 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
   // for failure terminals. Always nullable — succeeded / needs_review
   // rows don't populate it, nor do historical rows from before
   // migration 33.
+  // #2953: also select the four milestone columns
+  // (``merged_at`` / ``verified_at`` / ``verify_skip_reason`` /
+  // ``retroed_at``) so the admin cockpit can render a single glyph
+  // whose color encodes pipeline completeness — green ✓ for fully
+  // verified+retroed shipments, amber ✓ for shipped but bookkeeping-
+  // incomplete, red ✗ for non-merged failures, gray ↺ for infra
+  // preempts. See ``packages/web/src/app/(main)/admin/dispatcher/
+  // ui-primitives.tsx`` for the color-mapping logic.
   const { rows } = await pool.query<Row>(
     `SELECT a.agent_id,
             a.issue_number,
@@ -339,6 +347,10 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
             a.ended_at,
             a.pr_number,
             a.failure_summary,
+            a.merged_at,
+            a.verified_at,
+            a.verify_skip_reason,
+            a.retroed_at,
             po.total_tokens,
             po.total_cost_usd
        FROM dispatcher.agents a
@@ -591,6 +603,18 @@ function recentCompletionsToGraphQL(
       // completed panel. Null for succeeded / needs_review / historical
       // rows — the UI falls back to the default status-label tooltip.
       failureSummary,
+      // #2953: milestone columns. Each one is null when the milestone
+      // hasn't happened (or can't happen — skip reason case for
+      // ``verifiedAt``). The UI uses the combined presence of these
+      // fields to pick the outcome glyph color — see
+      // ``packages/web/src/app/(main)/admin/dispatcher/ui-primitives.tsx``.
+      mergedAt: row.merged_at ?? null,
+      verifiedAt: row.verified_at ?? null,
+      verifySkipReason:
+        typeof row.verify_skip_reason === 'string' && row.verify_skip_reason
+          ? row.verify_skip_reason
+          : null,
+      retroedAt: row.retroed_at ?? null,
     };
   });
 }

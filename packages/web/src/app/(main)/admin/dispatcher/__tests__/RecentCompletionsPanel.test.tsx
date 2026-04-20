@@ -23,6 +23,13 @@ function completion(overrides: Partial<RecentCompletion>): RecentCompletion {
     totalTokens: null,
     totalCostUsd: null,
     failureSummary: null,
+    // Issue #2953 — milestone columns. Default to a "fully-complete"
+    // success row so the existing green-✓ assertions hold; individual
+    // test cases override as needed.
+    mergedAt: '2026-04-18T11:50:00Z',
+    verifiedAt: '2026-04-18T11:53:00Z',
+    verifySkipReason: null,
+    retroedAt: '2026-04-18T11:55:00Z',
     ...overrides,
   };
 }
@@ -127,6 +134,10 @@ describe('RecentCompletionsPanel', () => {
   // OutcomePill's `title` attribute, so operators can triage failures
   // without opening the agent detail page.
   it('#2900: wires failure_summary into the OutcomePill tooltip for failure rows', () => {
+    // A `crashed` row with no merge signal — failureSummary becomes the
+    // tooltip (pre-#2953 status-only path). Post-#2953 a merged row
+    // whose verify failed shows a combined "<summary> — <milestones>"
+    // tooltip; see the milestone-completeness suite for that case.
     const summary =
       'ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns';
     const items = [
@@ -136,6 +147,10 @@ describe('RecentCompletionsPanel', () => {
         status: 'crashed',
         prNumber: null,
         failureSummary: summary,
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
       }),
     ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
@@ -144,7 +159,21 @@ describe('RecentCompletionsPanel', () => {
   });
 
   it('#2900: leaves the default status-label tooltip for succeeded rows (no summary)', () => {
-    const items = [completion({ agentId: 'agent-ok', failureSummary: null })];
+    // Issue #2953: pre-merge `succeeded` rows with NO mergedAt signal
+    // (pre-migration-35 data where the backfill failed for some
+    // reason, or a future code path) still use the pre-#2953 status-
+    // label tooltip. The milestone-completeness path only kicks in
+    // when mergedAt is populated.
+    const items = [
+      completion({
+        agentId: 'agent-ok',
+        failureSummary: null,
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
+      }),
+    ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
     const pill = screen.getByTestId('outcome-pill-succeeded');
     // Default tooltip is the human status label ("succeeded").
@@ -161,6 +190,10 @@ describe('RecentCompletionsPanel', () => {
         status: 'crashed',
         prNumber: null,
         failureSummary: summary,
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
       }),
     ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
@@ -170,8 +203,9 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.queryByText(summary)).not.toBeInTheDocument();
   });
 
-  // --- #2947 — infra-preempted override at the panel level.
-  it('#2947: renders ↺ amber for rows with the "dispatcher restarted" summary', () => {
+  // --- #2947 — infra-preempted override at the panel level
+  //     (#2953 recoloured the chip from amber → gray).
+  it('#2947 / #2953: renders ↺ gray for rows with the "dispatcher restarted" summary', () => {
     const items = [
       completion({
         agentId: 'agent-infra-restart',
@@ -179,6 +213,11 @@ describe('RecentCompletionsPanel', () => {
         status: 'failed',
         prNumber: null,
         failureSummary: 'dispatcher restarted',
+        // Infra-preempted rows have no merge/verify/retro signal.
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
       }),
     ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
@@ -190,7 +229,7 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.queryByTestId('outcome-pill-failed')).not.toBeInTheDocument();
   });
 
-  it('#2947: renders ↺ amber for rows with the "manually stopped" summary', () => {
+  it('#2947 / #2953: renders ↺ gray for rows with the "manually stopped" summary', () => {
     const items = [
       completion({
         agentId: 'agent-infra-killswitch',
@@ -198,23 +237,34 @@ describe('RecentCompletionsPanel', () => {
         status: 'failed',
         prNumber: null,
         failureSummary: 'manually stopped',
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
       }),
     ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
     const pill = screen.getByTestId('outcome-pill-infra_preempted');
     expect(pill.textContent).toBe('\u21BA');
-    expect(pill.className).toContain('bg-amber');
+    // Issue #2953: gray (bg-muted), not amber.
+    expect(pill.className).toContain('bg-muted');
+    expect(pill.className).not.toMatch(/bg-amber/);
   });
 
   it('#2947: leaves the tooltip unchanged — the visual glyph + color is the fix', () => {
     // Per the issue body: "Tooltip text is unchanged — the visual
     // glyph + color is the fix." Operators still get the exact
-    // canonical string on hover.
+    // canonical string on hover. (#2953 recoloured but kept the
+    // tooltip behaviour.)
     const items = [
       completion({
         agentId: 'agent-tooltip',
         status: 'failed',
         failureSummary: 'dispatcher restarted',
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
       }),
     ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);

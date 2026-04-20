@@ -260,6 +260,33 @@ export const dispatcherTypeDefs = `#graphql
     migration 33. Rendered as a tooltip on the outcome glyph in the
     admin cockpit's \`Recently completed\` panel. Issue #2900."""
     failureSummary: String
+    """Timestamp the PR squash-merge was observed by the daemon. One-way
+    latch — written at merge time, never cleared. Paired with the
+    \`status='succeeded'\` flip that happens in the same write, so
+    \`mergedAt != null\` is the canonical "shipped" signal (use it in
+    preference to \`status\` for "did this PR make it"). NULL on rows
+    that never merged (push_and_pr failed, CI red after retries, etc.)
+    and on pre-migration-35 historical rows. Issue #2953."""
+    mergedAt: DateTime
+    """Timestamp the verify phase completed with verdict=VERIFIED. NULL
+    when verify was intentionally skipped (see \`verifySkipReason\`),
+    when verify crashed mid-phase, or for pre-migration-35 rows. A
+    merged row with NULL \`verifiedAt\` AND NULL \`verifySkipReason\`
+    renders as amber ✓ in the admin cockpit — "shipped but post-merge
+    bookkeeping incomplete". Issue #2953."""
+    verifiedAt: DateTime
+    """Non-null when verify was intentionally skipped. Today the only
+    written value is \`"self_deploy"\` (dispatcher-self-PR touches
+    \`scripts/dispatcher/\`). Admin cockpit treats a merged row with
+    a non-null skip reason as fully-shipped (green ✓) — skipping is
+    not a regression signal. Issue #2953."""
+    verifySkipReason: String
+    """Timestamp the retro phase completed (reached PHASE_RETRO_DONE).
+    NULL when retro crashed, when the worktree was already gone at
+    retro time (fast-path to cleanup_done), or for pre-migration-35
+    rows. Rendered as the third tick in the milestone-breakdown
+    tooltip. Issue #2953."""
+    retroedAt: DateTime
   }
 
   """One key/value entry from \`dispatcher.config\` (#2805 §1.6)."""
