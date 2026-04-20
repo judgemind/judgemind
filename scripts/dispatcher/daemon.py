@@ -429,6 +429,19 @@ BASELINE_FETCH_TIMEOUT_SECONDS = 120
 #: finish in milliseconds.
 GH_AUTH_SETUP_GIT_TIMEOUT_SECONDS = 10
 
+#: Hard wall-clock timeout on the daemon-side ``git push`` subprocess
+#: calls (post-summary push in ``_advance_awaiting_summary`` and the
+#: fix-ci retry push in ``_advance_awaiting_ci``). 120s was too tight:
+#: the pre-push hook runs each touched package's full test suite,
+#: which for multi-package changes (e.g. scraper-framework + nlp-
+#: pipeline) regularly exceeds 3 minutes before the actual git push
+#: even starts. Two confirmed overnight failures on 2026-04-19 lost
+#: ralph's entire output when the 120s ceiling tripped mid-hook (issue
+#: #2882). 600s (10 min) is a comfortable ceiling for the slowest
+#: realistic package test run + git push + network, while still
+#: preventing a genuinely-stuck process from burning indefinitely.
+GIT_PUSH_TIMEOUT_SECONDS = 600
+
 #: Per-issue cooldown — skip an issue from candidate selection if its
 #: most recent ``dispatcher.agents`` row (any status) was created
 #: within this many seconds. Prevents a systemically-broken issue from
@@ -6123,9 +6136,28 @@ class DispatcherDaemon:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=GIT_PUSH_TIMEOUT_SECONDS,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            self._log.exception(
+                "daemon.git_push_timeout",
+                extra={
+                    "event": "git_push_timeout",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
+                    "detail": str(exc),
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="failed",
+                phase="push_and_pr",
+                exit_code=None,
+                issue_number=issue_number,
+            )
+            return
         except Exception as exc:
             self._log.exception(
                 "daemon.git_push_failed",
@@ -7154,9 +7186,24 @@ class DispatcherDaemon:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=GIT_PUSH_TIMEOUT_SECONDS,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            self._log.exception(
+                "daemon.fix_ci_git_push_timeout",
+                extra={
+                    "event": "fix_ci_git_push_timeout",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
+                    "detail": str(exc),
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
         except Exception:
             self._log.exception(
                 "daemon.fix_ci_git_push_failed",
