@@ -33,6 +33,7 @@ jobs:
       schema: ${{ steps.changes.outputs.schema }}
       hooks: ${{ steps.changes.outputs.hooks }}
       githooks: ${{ steps.changes.outputs.githooks }}
+      dispatcher-integration: ${{ steps.changes.outputs.dispatcher-integration }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -121,6 +122,22 @@ jobs:
             githooks:
               - '.githooks/**'
               - 'scripts/tests/test_pre_push.sh'
+              - '.github/workflows/ci.yml'
+            # Integration tests for the dispatcher claim path (#2895).
+            # Fires whenever any code the integration suite exercises
+            # changes — the helper, the daemon's _atomic_claim, any
+            # migration that touches the dispatcher schema, or the
+            # docker-compose stanza + pytest test file themselves.
+            #
+            # ``.github/workflows/ci.yml`` is included because editing
+            # the dispatcher-integration-tests job body without one of
+            # the other paths matching would otherwise make the job
+            # SKIP on its own PR (the #2410/#2505/#2893 footgun caught
+            # by scripts/check-ci-job-skipped.sh).
+            dispatcher-integration:
+              - 'scripts/dispatcher/**'
+              - 'packages/api/migrations/*_dispatcher-*.sql'
+              - 'docker-compose.yml'
               - '.github/workflows/ci.yml'
       - name: Check if any coverage-producing package changed
         id: any-testable
@@ -466,6 +483,50 @@ jobs:
           files: packages/api/coverage/lcov.info
           flags: api
           fail_ci_if_error: false
+
+  # Dispatcher claim-path integration tests (#2895). Runs the pytest
+  # suite in scripts/dispatcher/tests/test_task_claim_integration.py
+  # against a real Postgres 16 so column-type contract drift between
+  # the helper / daemon and the dispatcher schema is caught on the PR,
+  # not in production. The #2892 regression (UUID column-type mismatch)
+  # was the motivating incident.
+  #
+  # The services: block spins up postgres:16-alpine on localhost:5432
+  # (the image mirrors dev RDS's major version and the local
+  # docker-compose dispatcher-test-postgres service). INTEGRATION_
+  # DATABASE_URL points the suite at that service; the suite's
+  # session-scoped fixture applies every ``*_dispatcher-*.sql``
+  # migration under packages/api/migrations/ to build a clean schema.
+  dispatcher-integration-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.dispatcher-integration == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: localdev
+          POSTGRES_DB: dispatcher_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dispatcher_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      INTEGRATION_DATABASE_URL: postgresql://postgres:localdev@localhost:5432/dispatcher_test
+      PYTHONPATH: scripts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install pytest "psycopg[binary]>=3.1,<4" -e packages/judgemind-config
+      - name: Run dispatcher integration tests
+        run: pytest scripts/dispatcher/tests/test_task_claim_integration.py -v --tb=short
 
   web-tests:
     needs: detect-changes
