@@ -229,20 +229,34 @@ PHASE_STDERR_PREVIEW_MAX_CHARS = 2000
 #: '<agent_id>'`` returns the pair.
 PHASE_FAILURE_LOG_MAX_CHARS = 10000
 
-#: Per-phase ``--max-turns`` values. Matches the frontmatter on each
-#: ``.claude/skills/task-v2-*/SKILL.md`` file. Sonnet-backed ralph gets
-#: the long tail; plan and summary stay tight. Post-PR phases added
-#: in Phase 3B (#2787) — fix-ci is a targeted patch so 100 turns is
-#: generous; verify is read-mostly so 50 turns fits. Retro added in
-#: Phase 3E (#2798) — a read-only review producing zero-to-many issue
-#: bodies; 30 turns matches the retro skill's frontmatter.
+#: Per-phase ``--max-turns`` values. Issue #2885 bumped every phase by
+#: 10× on the operator directive "stop being parsimonious on these
+#: limits; cost is not the constraint, success is." Two overnight
+#: failure modes forced the bump:
+#:
+#: 1. Plan agents hit ``error_max_turns`` at 51/50 on complex scraper
+#:    issues (#2564, #2565), burning ~$3 of opus with zero output then
+#:    retrying — legitimate exploration on a large codebase just
+#:    doesn't fit in 50 turns.
+#: 2. Ralph's old 500 cap was adequate for typical work but left no
+#:    slack for genuinely hard problems where the worker-reviewer loop
+#:    runs long; on Max-plan billing the extra turns are effectively
+#:    free and a successful ralph iteration beats a failed retry at
+#:    any turn count.
+#:
+#: Original values (#2787 Phase 3B + #2798 Phase 3E) were calibrated
+#: conservatively against observed medians; the new values are 10×
+#: headroom above that calibration. Post-PR phases (fix-ci, verify)
+#: and retro also bumped 10× for consistency; none of them had been
+#: hitting the old cap but the parsimony was left over from when
+#: every turn mattered.
 PHASE_MAX_TURNS = {
-    "plan": 50,
-    "ralph": 500,
-    "summary": 30,
-    "fix-ci": 100,
-    "verify": 50,
-    "retro": 30,
+    "plan": 500,
+    "ralph": 5000,
+    "summary": 300,
+    "fix-ci": 1000,
+    "verify": 500,
+    "retro": 300,
 }
 
 #: Per-phase ``--model`` values. Matches ``dispatcher.config.model_by_phase``
@@ -544,15 +558,32 @@ STUCK_TIMEOUT_SECONDS = 30 * 60
 #: (JSONB object merged into this default at read time — see
 #: :meth:`_stuck_timeout_for_phase`).
 STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
+    # Issue #2885 bumped every LLM-bearing phase by 10× after an
+    # overnight race: agent ``821e96ee`` ran ralph 5834s and finished
+    # normally, but the supervisor flagged it stuck at 5419s (old 90
+    # min threshold) and fired a retry. Ralph exited cleanly 415s
+    # later, but the retry had already started, producing
+    # ``phase_output_missing`` and a failed agent despite ralph
+    # actually succeeding. Operator directive: "stop being
+    # parsimonious on these limits. Cost is not the constraint;
+    # success is." The new values are effectively "never trip the
+    # timer on a phase that's still running normally" — a truly
+    # stuck agent (subprocess hung, daemon crashed mid-phase) will
+    # still trip eventually. Non-LLM phases (``claiming``,
+    # ``awaiting_ci``, ``awaiting_deploy``, terminal sweeps) keep
+    # their original tight windows because their upper bounds are
+    # set by external systems (gh API, GitHub Actions, ECS rolling
+    # deploy) not by our subprocess runtime.
     "claiming": 5 * 60,  # 5 min — claim is a single gh + psycopg call
-    "planning": 30 * 60,  # 30 min — plan is read-only LLM, typical 2-9 min
-    "plan": 30 * 60,  # alias for phase_transitions "plan" row
-    "ralph": 90 * 60,  # 90 min — ralph iterates, see #2513 107 min outlier
-    "summary": 30 * 60,  # 30 min — summary is single-pass LLM, typical 1-3 min
+    "planning": 9000,  # 2.5 hr (was 30 min) — plan is read-only LLM, issue #2885
+    "plan": 9000,  # alias for phase_transitions "plan" row — issue #2885
+    "ralph": 54000,  # 15 hr (was 90 min) — ralph iterates, issue #2885
+    "summary": 6000,  # 100 min (was 30 min) — summary single-pass LLM, issue #2885
     "awaiting_ci": 120 * 60,  # 2 hr — CI + any flaky retry headroom
     "awaiting_deploy": 45 * 60,  # 45 min — dev deploy rolling wait
-    "fix_ci": 30 * 60,  # 30 min — single /task-v2-fix-ci run
-    "retro": 20 * 60,  # 20 min — single /task-v2-retro run
+    "fix_ci": 18000,  # 5 hr (was 30 min) — single /task-v2-fix-ci, issue #2885
+    "verify": 3000,  # 50 min (was unset, fell back to 30 min global) — issue #2885
+    "retro": 3000,  # 50 min (was 20 min) — single /task-v2-retro, issue #2885
     "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
     "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
 }

@@ -312,7 +312,7 @@ class TestPerPhaseStuckTimeout:
         assert d._check_stuck_agents() == 0
 
     def test_plan_below_threshold_not_flagged(self, tmp_path: Path) -> None:
-        """A 90-second plan is not stuck (threshold is 30 min)."""
+        """A 90-second plan is not stuck (threshold is 2.5 hr, #2885)."""
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
             [("agent-1", 42, "plan", 90.0)],
@@ -323,10 +323,10 @@ class TestPerPhaseStuckTimeout:
         assert d._check_stuck_agents() == 0
 
     def test_ralph_over_threshold_flagged(self, tmp_path: Path) -> None:
-        """A 100-minute ralph IS stuck (threshold is 90 min)."""
+        """A 16-hour ralph IS stuck (threshold is 15 hr / 54000s, #2885)."""
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 6000.0)],  # 100 min
+            [("agent-1", 42, "ralph", 57600.0)],  # 16 hr
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
@@ -337,7 +337,7 @@ class TestPerPhaseStuckTimeout:
         detected = handler.events("failure_detected")
         assert detected
         # Structured log includes the per-phase threshold for ops debug.
-        assert getattr(detected[0], "threshold_seconds", None) == 90 * 60
+        assert getattr(detected[0], "threshold_seconds", None) == 54000
 
     def test_config_override_wins_over_default(self, tmp_path: Path) -> None:
         """Operator override in ``stuck_timeout_s_by_phase`` takes precedence."""
@@ -369,13 +369,121 @@ class TestPerPhaseStuckTimeout:
         assert d._check_stuck_agents() == 1
 
     def test_stuck_timeout_for_phase_table_values(self) -> None:
-        """Module-level defaults match the documented spec (#2872)."""
-        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["ralph"] == 90 * 60
-        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["plan"] == 30 * 60
+        """Module-level defaults match the documented spec (#2872 + #2885 10× bump)."""
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["ralph"] == 54000  # 15 hr
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["plan"] == 9000  # 2.5 hr
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["summary"] == 6000
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["verify"] == 3000
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["retro"] == 3000
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["fix_ci"] == 18000
+        # Non-LLM phases keep original tight windows — external-system-bound.
         assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["claiming"] == 5 * 60
         # Restart-recovery "terminal" phases have a tight window so a
         # daemon that crashes mid-reclaim is picked up quickly.
         assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["daemon_restart_abandoned"] == 60
+
+
+# --------------------------------------------------------------------------
+# Issue #2885 — 10× stuck_timeout + max_turns bump.
+# --------------------------------------------------------------------------
+
+
+class TestIssue2885TenTimesBump:
+    """Regressions for the #2885 10× bump.
+
+    Overnight 2026-04-20 observed two distinct failure modes:
+
+    1. Ralph race. Agent ``821e96ee`` on #2565 ran ralph 5834s. The
+       supervisor flagged it stuck at 5419s (old 90 min threshold, 19s
+       of slack), fired a retry. Ralph exited cleanly 415s later but
+       the retry had already taken over — ``phase_output_missing`` +
+       failed agent despite ralph actually succeeding.
+    2. Plan ``error_max_turns``. Plan agents hit 51/50 turns on complex
+       scraper issues (#2564, #2565), burning ~$3 of opus with zero
+       output. Two agents tripped this within 5 min 24s on 2026-04-20.
+
+    Operator directive: "stop being parsimonious on these limits.
+    Cost is not the constraint; success is." Every LLM-bearing phase
+    gets a 10× headroom bump so a normally-progressing subprocess
+    never races against the supervisor's stuck-declaration.
+    """
+
+    def test_max_turns_all_bumped_to_ten_times(self) -> None:
+        """Every phase in PHASE_MAX_TURNS is at least 10× the original calibration."""
+        # Original values from #2787 Phase 3B + #2798 Phase 3E.
+        original = {
+            "plan": 50,
+            "ralph": 500,
+            "summary": 30,
+            "fix-ci": 100,
+            "verify": 50,
+            "retro": 30,
+        }
+        for phase, old in original.items():
+            assert phase in daemon.PHASE_MAX_TURNS, (
+                f"phase {phase!r} missing from PHASE_MAX_TURNS"
+            )
+            assert daemon.PHASE_MAX_TURNS[phase] >= old * 10, (
+                f"phase {phase!r} max_turns not 10×-bumped: got "
+                f"{daemon.PHASE_MAX_TURNS[phase]}, expected >= {old * 10}"
+            )
+
+    def test_max_turns_exact_issue_values(self) -> None:
+        """Exact values called out in #2885."""
+        assert daemon.PHASE_MAX_TURNS["plan"] == 500
+        assert daemon.PHASE_MAX_TURNS["ralph"] == 5000
+        assert daemon.PHASE_MAX_TURNS["summary"] == 300
+        assert daemon.PHASE_MAX_TURNS["verify"] == 500
+        assert daemon.PHASE_MAX_TURNS["retro"] == 300
+        # fix-ci's old value was 100 (not 50 as misremembered in the
+        # issue body); 10× is 1000.
+        assert daemon.PHASE_MAX_TURNS["fix-ci"] == 1000
+
+    def test_stuck_timeout_llm_phases_match_issue_targets(self) -> None:
+        """Every LLM-bearing phase matches the explicit target values in #2885.
+
+        The issue calls out exact target values rather than a blanket
+        10× formula (because the pre-#2885 ralph threshold of 5400s
+        was already under the rest of the module defaults — the table
+        was inconsistent). These values are what #2885 explicitly
+        requested; treating them as the authoritative spec here
+        guards against "fix the parsimony, lose the parsimony, fix
+        again" drift.
+        """
+        issue_targets = {
+            "planning": 9000,
+            "plan": 9000,
+            "ralph": 54000,
+            "summary": 6000,
+            "verify": 3000,
+            "fix_ci": 18000,
+            "retro": 3000,
+        }
+        for phase, target in issue_targets.items():
+            assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE[phase] == target, (
+                f"phase {phase!r} stuck_timeout not at issue #2885 target: "
+                f"got {daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE[phase]}, "
+                f"expected {target}"
+            )
+
+    def test_ralph_race_regression(self, tmp_path: Path) -> None:
+        """Agent ``821e96ee`` at 5419s would NOT be flagged under the new threshold.
+
+        Concrete reproduction of the overnight race. Pre-#2885 ralph
+        threshold was 5400s, so 5419s tripped the supervisor even
+        though the subprocess was 15s from clean exit. The new 54000s
+        threshold gives ~15 hr of headroom — enough that a
+        normally-progressing ralph can NEVER race against the timer.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [("agent-821e96ee", 2565, "ralph", 5419.0)],
+        ]
+        conn.cursor_instance.fetch_queue = [
+            None,  # stuck_timeout_s_by_phase override — unset
+        ]
+        # Pre-fix: 1. Post-fix: 0.
+        assert d._check_stuck_agents() == 0
 
 
 # --------------------------------------------------------------------------
