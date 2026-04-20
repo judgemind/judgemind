@@ -628,16 +628,22 @@ class TestConsumeDiagnosis:
         conn: _FakeConnection,
         recommendation: dict[str, Any] | None,
         retry_marker_count: int = 0,
+        agent_kind: str = "task",
     ) -> None:
         """Seed the fetch queue in the order the consumer issues reads.
 
         Order for the common retry path:
           1. read_recommendation → (rec,)
-          2. create_retry_marker COUNT → (retry_marker_count,)
-          3. _backoff_seconds → ("[60,300,900]",)
+          2. _lookup_agent_kind in _create_retry_marker → (kind,)  (#2903)
+          3. create_retry_marker COUNT → (retry_marker_count,)
+          4. _backoff_seconds → ("[60,300,900]",)
+
+        ``agent_kind`` defaults to ``"task"`` (daemon-owned) so the
+        existing tests continue exercising the retry-marker path.
         """
         conn.cursor_instance.fetch_queue = [
             (recommendation,) if recommendation is not None else None,
+            (agent_kind,),
             (retry_marker_count,),
             ("[60,300,900]",),
         ]

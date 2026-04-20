@@ -186,8 +186,10 @@ class TestRecoverAbandonedAgents:
         ]
         # _write_failure → _mark_agent_terminal → _create_retry_marker
         # reads nothing via fetchone in the write path except
-        # _create_retry_marker's COUNT query + backoff_seconds config.
+        # _create_retry_marker's _lookup_agent_kind (#2903) +
+        # COUNT query + backoff_seconds config.
         conn.cursor_instance.fetch_queue = [
+            ("task",),  # _lookup_agent_kind (#2903) — daemon-owned row
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff schedule
         ]
@@ -303,8 +305,10 @@ class TestPerPhaseStuckTimeout:
     def test_ralph_below_threshold_not_flagged(self, tmp_path: Path) -> None:
         """A 2.5-minute ralph is not stuck (threshold is 90 min)."""
         d, conn, _handler = _make_daemon(tmp_path)
+        # SELECT returns (agent_id, issue_number, phase, elapsed, kind).
+        # Issue #2903 added the ``kind`` column.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 150.0)],  # 2.5 min elapsed
+            [("agent-1", 42, "ralph", 150.0, "task")],  # 2.5 min elapsed
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
@@ -315,7 +319,7 @@ class TestPerPhaseStuckTimeout:
         """A 90-second plan is not stuck (threshold is 2.5 hr, #2885)."""
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "plan", 90.0)],
+            [("agent-1", 42, "plan", 90.0, "task")],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
@@ -326,10 +330,11 @@ class TestPerPhaseStuckTimeout:
         """A 16-hour ralph IS stuck (threshold is 15 hr / 54000s, #2885)."""
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 57600.0)],  # 16 hr
+            [("agent-1", 42, "ralph", 57600.0, "task")],  # 16 hr
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            ("task",),  # _lookup_agent_kind in _create_retry_marker (#2903)
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff
         ]
@@ -345,10 +350,11 @@ class TestPerPhaseStuckTimeout:
         # Elapsed 400s — under the default 5min claiming threshold, but
         # operator set claiming override to 300s. Should fire.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "claiming", 400.0)],
+            [("agent-1", 42, "claiming", 400.0, "task")],
         ]
         conn.cursor_instance.fetch_queue = [
             ('{"claiming": 300}',),  # operator override
+            ("task",),  # _lookup_agent_kind (#2903)
             (0,),
             ("[60,300,900]",),
         ]
@@ -359,10 +365,11 @@ class TestPerPhaseStuckTimeout:
         d, conn, _handler = _make_daemon(tmp_path)
         # Novel phase, elapsed 31 min — over the 30 min default fallback.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "novel_phase", 31 * 60.0)],
+            [("agent-1", 42, "novel_phase", 31 * 60.0, "task")],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # no override
+            ("task",),  # _lookup_agent_kind (#2903)
             (0,),
             ("[60,300,900]",),
         ]
@@ -477,7 +484,7 @@ class TestIssue2885TenTimesBump:
         """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-821e96ee", 2565, "ralph", 5419.0)],
+            [("agent-821e96ee", 2565, "ralph", 5419.0, "task")],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
