@@ -3916,6 +3916,12 @@ class DispatcherDaemon:
 
         Returns a dict shaped like the ``/task-v2-plan`` SKILL.md input
         contract. Raises :class:`RuntimeError` on subprocess failure.
+
+        The returned dict includes ``issue_updated_at`` — the ISO-8601
+        ``updatedAt`` timestamp from GitHub. :meth:`_try_reuse_prior_plan`
+        uses this to detect whether the issue body was edited after the
+        prior plan ran and therefore whether the cached plan is still
+        valid (#2937).
         """
         cmd = [
             "gh",
@@ -3925,7 +3931,7 @@ class DispatcherDaemon:
             "--repo",
             self._cfg.github_repo,
             "--json",
-            "number,title,body,labels,comments",
+            "number,title,body,labels,comments,updatedAt",
         ]
         try:
             result = subprocess.run(
@@ -3987,6 +3993,9 @@ class DispatcherDaemon:
             "issue_labels": labels,
             "blocked_by": blocked_by,
             "parent_issue": parent_issue,
+            # ISO-8601 string — used by _try_reuse_prior_plan to detect
+            # post-plan issue edits that invalidate the cached plan (#2937).
+            "issue_updated_at": payload.get("updatedAt", ""),
         }
 
     @staticmethod
@@ -5992,6 +6001,131 @@ class DispatcherDaemon:
         )
         return True
 
+    # ------------------------------------------------------------------ #
+    # Plan-reuse helpers (issue #2937)                                    #
+    # ------------------------------------------------------------------ #
+
+    def _try_reuse_prior_plan(
+        self,
+        issue_number: int,
+        issue_updated_at: str,
+    ) -> tuple[dict[str, Any], str] | None:
+        """Return ``(plan_output, prior_ts_str)`` if a reusable prior plan exists.
+
+        Queries ``dispatcher.phase_outputs`` for the most recent
+        successful plan output from an agent that was terminated by an
+        infra-preemption event (``daemon_restart_abandoned`` or
+        ``paused_by_killswitch``).  Returns ``None`` when:
+
+        * No qualifying row exists.
+        * The prior plan's ``output_json.go`` is not ``True`` (plan
+          blocked or no-op — the new agent must re-evaluate).
+        * The issue was updated after the prior plan ran (body edit
+          may have changed scope; re-plan is required).
+
+        The infra-preemption filter (``a.status IN ('failed', 'crashed')``
+        AND ``a.phase = ANY(%s)`` matching
+        :data:`_INFRA_PREEMPTION_CATEGORIES`) scopes reuse to dead agents
+        that were killed by infrastructure churn, not to same-agent
+        budgeted-retry successors (those never write a terminal row before
+        retrying) and not to ``plan_blocked`` predecessors (their ``go``
+        guard catches them even if they somehow slipped through the phase
+        filter).
+
+        Returns a ``(output_json, prior_ts_str)`` tuple on hit so the
+        caller can include ``prior_plan_output_ts`` in the
+        ``daemon.plan_reused`` observability event (AC #4, issue #2937).
+        """
+        assert self._conn is not None, "connect() must run before plan-reuse query"
+
+        infra_phases = list(_INFRA_PREEMPTION_CATEGORIES)
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT po.output_json, po.ts "
+                    "FROM dispatcher.phase_outputs po "
+                    "JOIN dispatcher.agents a ON a.agent_id = po.agent_id "
+                    "WHERE a.issue_number = %s "
+                    "  AND po.phase = 'plan' "
+                    "  AND a.status IN ('failed', 'crashed') "
+                    "  AND a.phase = ANY(%s) "
+                    "ORDER BY po.ts DESC LIMIT 1",
+                    (issue_number, infra_phases),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.plan_reuse_query_failed",
+                extra={
+                    "event": "plan_reuse_query_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        if row is None:
+            return None
+
+        raw_output_json, prior_ts = row[0], row[1]
+
+        # Parse output_json — may arrive as a string (psycopg2 behaviour
+        # on JSONB columns without the extras codec registered) or as a
+        # dict (psycopg3 default).
+        if isinstance(raw_output_json, str):
+            try:
+                prior_output: dict[str, Any] = json.loads(raw_output_json)
+            except json.JSONDecodeError:
+                return None
+        elif isinstance(raw_output_json, dict):
+            prior_output = raw_output_json
+        else:
+            return None
+
+        # Only reuse plans that said "go ahead".  A plan that returned
+        # go=false must be re-evaluated — the issue may have since been
+        # unblocked or the scope decision may have changed.
+        if not prior_output.get("go"):
+            return None
+
+        # Invalidate if the issue body was updated after the plan ran.
+        # ``issue_updated_at`` and ``prior_ts`` are both ISO-8601 strings;
+        # simple lexicographic comparison is correct for the UTC subset
+        # that GitHub and PostgreSQL both emit (YYYY-MM-DDTHH:MM:SSZ form).
+        prior_ts_str = (
+            prior_ts.isoformat()
+            if hasattr(prior_ts, "isoformat")
+            else str(prior_ts or "")
+        )
+        if issue_updated_at and prior_ts is not None:
+            if issue_updated_at > prior_ts_str:
+                return None
+
+        return prior_output, prior_ts_str
+
+    def _materialize_plan_output(
+        self,
+        worktree: Path,
+        plan_output: dict[str, Any],
+    ) -> None:
+        """Write a reused plan to ``{worktree}/tmp/dispatcher-output/plan.json``.
+
+        Mirrors the artifact that the real plan subprocess produces so
+        any downstream code that reads the file directly (e.g. scripts,
+        admin tooling) sees an identical structure regardless of whether
+        the plan was freshly generated or reused from a prior agent's
+        run (#2937).
+        """
+        output_dir = worktree / "tmp" / "dispatcher-output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "plan.json"
+        output_path.write_text(json.dumps(plan_output, indent=2, default=str))
+
     def _run_plan_phase(self, agent_id: str, issue_number: int, worktree: Path) -> bool:
         """Run ``/task-v2-plan``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "planning")
@@ -6017,6 +6151,39 @@ class DispatcherDaemon:
                 issue_number=issue_number,
             )
             return False
+
+        # ── Plan-reuse short-circuit (#2937) ──────────────────────────────
+        # Before spawning the expensive Opus plan subprocess, check whether
+        # a prior agent ran plan successfully on this same issue and was
+        # terminated by an infra-preemption event (daemon restart,
+        # killswitch cap flip).  If the issue hasn't been edited since that
+        # prior plan and the prior plan said go=True, reuse it directly —
+        # no subprocess spawn, no Opus cost.
+        issue_updated_at: str = bundle.get("issue_updated_at", "")
+        reuse_result = self._try_reuse_prior_plan(issue_number, issue_updated_at)
+        if reuse_result is not None:
+            reused, prior_ts_str = reuse_result
+            self._persist_phase_output(
+                agent_id,
+                "plan",
+                reused,
+                log_text="<reused from prior plan>",
+                usage=None,
+            )
+            self._materialize_plan_output(worktree, reused)
+            self._log.info(
+                "daemon.plan_reused",
+                extra={
+                    "event": "plan_reused",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "prior_plan_output_ts": prior_ts_str,
+                },
+            )
+            self._agent_plan_output = reused
+            return True
+        # ── end plan-reuse ─────────────────────────────────────────────────
 
         plan_input = {
             "agent_id": agent_id,
