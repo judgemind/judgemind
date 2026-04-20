@@ -340,16 +340,16 @@ class TestEvaluateCircuitBreaker:
         # fetchall — but _FakeCursor uses fetchall_queue separately.
         conn.cursor_instance.fetchall_queue.append(
             [
-                ("failed",),
-                ("failed",),
-                ("failed",),
-                ("plan_blocked",),
-                ("needs_review",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
+                ("failed", None),
+                ("failed", None),
+                ("failed", None),
+                ("plan_blocked", None),
+                ("needs_review", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
             ]
         )
         # ``current_cap = self._cb_config_int("concurrency_cap", -1)``
@@ -390,16 +390,16 @@ class TestEvaluateCircuitBreaker:
         self._stub_config_reads(conn)
         conn.cursor_instance.fetchall_queue.append(
             [
-                ("failed",),
-                ("failed",),
-                ("failed",),
-                ("failed",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
+                ("failed", None),
+                ("failed", None),
+                ("failed", None),
+                ("failed", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
             ]
         )
 
@@ -419,7 +419,7 @@ class TestEvaluateCircuitBreaker:
         """Regression: all 10 recent successes → circuit stays closed."""
         d, conn, handler = _make_daemon(tmp_path)
         self._stub_config_reads(conn)
-        conn.cursor_instance.fetchall_queue.append([("succeeded",)] * 10)
+        conn.cursor_instance.fetchall_queue.append([("succeeded", None)] * 10)
 
         tripped = d._evaluate_circuit_breaker("agent-x")
 
@@ -479,7 +479,7 @@ class TestIdempotence:
             (0,),  # current_cap already 0 → was_already_open=True
         ]
         conn.cursor_instance.fetchall_queue.append(
-            [("failed",)] * 5 + [("succeeded",)] * 5
+            [("failed", None)] * 5 + [("succeeded", None)] * 5
         )
 
         telegram_calls: list[Any] = []
@@ -646,16 +646,16 @@ class TestAcceptanceCriteria:
         # 25 min window has 10 terminals: 5 bad + 5 good.
         conn.cursor_instance.fetchall_queue.append(
             [
-                ("failed",),
-                ("crashed",),
-                ("failed",),
-                ("plan_blocked",),
-                ("needs_review",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
-                ("succeeded",),
+                ("failed", None),
+                ("crashed", None),
+                ("failed", None),
+                ("plan_blocked", None),
+                ("needs_review", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
+                ("succeeded", None),
             ]
         )
 
@@ -716,7 +716,7 @@ class TestAcceptanceCriteria:
             (5,),
         ]
         conn.cursor_instance.fetchall_queue.append(
-            [("failed",)] * 4 + [("succeeded",)] * 6
+            [("failed", None)] * 4 + [("succeeded", None)] * 6
         )
 
         tripped = d._evaluate_circuit_breaker("agent-y")
@@ -926,6 +926,12 @@ class TestCircuitBreakerQueryShape:
         assert "kind = 'task'" not in sql, (
             f"scan SQL should not carry a kind filter post-#2927: {sql!r}"
         )
+        # #2942: the query now includes a correlated subquery that pulls
+        # the latest failure category for each outcome row.
+        assert "dispatcher.failures" in sql, (
+            f"scan SQL should include correlated subquery against "
+            f"dispatcher.failures post-#2942: {sql!r}"
+        )
 
     def test_five_crashed_rows_trip_breaker(self, tmp_path: Path) -> None:
         """Regression: 5 ``crashed`` rows in the window trip the breaker.
@@ -936,13 +942,212 @@ class TestCircuitBreakerQueryShape:
         """
         d, conn, handler = _make_daemon(tmp_path)
         self._stub_config_reads(conn)
-        conn.cursor_instance.fetchall_queue.append([("crashed",)] * 5)
+        conn.cursor_instance.fetchall_queue.append([("crashed", None)] * 5)
         # ``current_cap`` read after the scan / threshold check.
         conn.cursor_instance.fetch_queue.append((1,))
 
         tripped = d._evaluate_circuit_breaker("daemon-task-agent")
 
         assert tripped is True
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+            and "concurrency_cap" in e[0]
+            and e[1] == ("circuit_breaker",)
+        ]
+        assert len(cap_updates) == 1
+        opened = handler.events("circuit_breaker_opened")
+        assert len(opened) == 1
+        assert opened[0].bad_count == 5  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------
+# Infra-preemption filter — issue #2942.
+# The circuit breaker must skip daemon_restart_abandoned and
+# paused_by_killswitch outcomes when counting bad terminals so a
+# stretch of dispatcher redeploys does not falsely trip the breaker.
+# --------------------------------------------------------------------------
+
+
+class TestInfraPreemptionFilter:
+    """#2942: infra-preempted outcomes are filtered before the bad-count check."""
+
+    def _stub_config_reads(
+        self,
+        conn: _FakeConnection,
+        *,
+        enabled: Any = True,
+        window_minutes: Any = 30,
+        window_size: Any = 10,
+        threshold: Any = 5,
+    ) -> None:
+        """Queue up the four config SELECTs in order."""
+        conn.cursor_instance.fetch_queue.extend(
+            [
+                (enabled,),
+                (window_minutes,),
+                (window_size,),
+                (threshold,),
+            ]
+        )
+
+    def test_breaker_skips_infra_preempted_outcomes(self, tmp_path: Path) -> None:
+        """AC1: 4 daemon_restart_abandoned + 2 subprocess_crash — only 2 count.
+
+        threshold=5, bad_count after filter=2 → breaker does NOT flip.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn, threshold=5)
+        # 4 infra rows (daemon_restart_abandoned) + 2 genuine (subprocess_crash).
+        conn.cursor_instance.fetchall_queue.append(
+            [
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+            ]
+        )
+
+        tripped = d._evaluate_circuit_breaker("agent-infra")
+
+        assert tripped is False, (
+            "infra-preempted outcomes must not count toward the bad-outcome budget"
+        )
+        # No cap flip.
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0] and "concurrency_cap" in e[0]
+        ]
+        assert cap_updates == [], "cap_flip must not fire when only 2 genuine bad rows"
+        assert handler.events("circuit_breaker_opened") == []
+
+    def test_breaker_skips_paused_by_killswitch_outcomes(self, tmp_path: Path) -> None:
+        """AC1: paused_by_killswitch is symmetric to daemon_restart_abandoned.
+
+        4 killswitch + 2 subprocess_crash; threshold=5 → only 2 genuine
+        rows after filter; breaker stays closed.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn, threshold=5)
+        conn.cursor_instance.fetchall_queue.append(
+            [
+                ("failed", daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH),
+                ("failed", daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH),
+                ("failed", daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH),
+                ("failed", daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+            ]
+        )
+
+        tripped = d._evaluate_circuit_breaker("agent-killswitch")
+
+        assert tripped is False, (
+            "paused_by_killswitch outcomes must not count toward the bad-outcome budget"
+        )
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0] and "concurrency_cap" in e[0]
+        ]
+        assert cap_updates == []
+        assert handler.events("circuit_breaker_opened") == []
+
+    def test_breaker_eval_logs_skipped_infra_count_when_not_tripping(
+        self, tmp_path: Path
+    ) -> None:
+        """AC3: skipped_infra_count observability — INFO event emitted when not tripping.
+
+        3 infra + 1 genuine; bad_count=1 < threshold=5 → no flip, but
+        circuit_breaker_eval_skipped_infra is logged with skipped_infra_count=3.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn, threshold=5)
+        conn.cursor_instance.fetchall_queue.append(
+            [
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("failed", daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+            ]
+        )
+
+        tripped = d._evaluate_circuit_breaker("agent-obs")
+
+        assert tripped is False
+        skipped_events = handler.events("circuit_breaker_eval_skipped_infra")
+        assert len(skipped_events) == 1, (
+            "expected circuit_breaker_eval_skipped_infra event when infra rows skipped"
+        )
+        ev = skipped_events[0]
+        assert ev.skipped_infra_count == 3  # type: ignore[attr-defined]
+        assert ev.window_total == 4  # type: ignore[attr-defined]
+        assert ev.bad_count == 1  # type: ignore[attr-defined]
+        assert ev.threshold == 5  # type: ignore[attr-defined]
+
+    def test_breaker_opened_log_includes_skipped_infra_count(
+        self, tmp_path: Path
+    ) -> None:
+        """AC3: circuit_breaker_opened extras carry skipped_infra_count + window_total.
+
+        2 infra + 5 genuine (threshold=5) → breaker trips. The opened
+        log event must include skipped_infra_count=2 and window_total=7.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn, threshold=5)
+        conn.cursor_instance.fetchall_queue.append(
+            [
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("failed", None),
+                ("failed", None),
+                ("crashed", None),
+            ]
+        )
+        # current_cap read after threshold met.
+        conn.cursor_instance.fetch_queue.append((1,))
+
+        tripped = d._evaluate_circuit_breaker("agent-obs2")
+
+        assert tripped is True
+        opened = handler.events("circuit_breaker_opened")
+        assert len(opened) == 1
+        ev = opened[0]
+        assert ev.bad_count == 5  # type: ignore[attr-defined]
+        assert ev.skipped_infra_count == 2  # type: ignore[attr-defined]
+        assert ev.window_total == 7  # type: ignore[attr-defined]
+
+    def test_breaker_still_trips_on_pure_genuine_streak(self, tmp_path: Path) -> None:
+        """AC2: regression guard — genuine failure streak still trips the breaker.
+
+        5 subprocess_crash rows with no infra category → all 5 count;
+        bad_count=5 == threshold=5 → breaker opens.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn, threshold=5)
+        conn.cursor_instance.fetchall_queue.append(
+            [
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("crashed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("failed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+                ("failed", daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH),
+            ]
+        )
+        # current_cap read after threshold met.
+        conn.cursor_instance.fetch_queue.append((1,))
+
+        tripped = d._evaluate_circuit_breaker("agent-genuine")
+
+        assert tripped is True, (
+            "a genuine failure streak must still trip the breaker after the infra filter"
+        )
         cap_updates = [
             e
             for e in conn.cursor_instance.executed
