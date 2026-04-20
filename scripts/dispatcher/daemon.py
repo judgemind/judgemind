@@ -4481,16 +4481,39 @@ class DispatcherDaemon:
             "plan_blocked",
             "needs_review",
         )
+        # Issue #2913: clear ``failure_summary`` on correct-outcome
+        # terminals so a row that previously held a crash message from
+        # an earlier iteration (crashed → retry_reset → succeeded) does
+        # not render its old tooltip on the ✓ glyph in the admin
+        # cockpit. Atomic with the status transition — no second
+        # round-trip, no window where the admin page can read a
+        # ``succeeded`` row with a stale ``failure_summary``. Failure
+        # terminals (``failed`` / ``crashed`` / ``plan_blocked``) leave
+        # the column alone here; the follow-up ``_write_failure_summary``
+        # block below (issue #2900) populates it with the templated
+        # one-liner for those statuses.
+        clear_failure_summary = status in ("succeeded", "needs_review")
         try:
             with self._conn.cursor() as cur:
                 if terminal:
-                    cur.execute(
-                        "UPDATE dispatcher.agents "
-                        "SET status = %s, phase = %s, ended_at = now(), "
-                        "    exit_code = %s, pr_number = COALESCE(%s, pr_number) "
-                        "WHERE agent_id = %s",
-                        (status, phase, exit_code, pr_number, agent_id),
-                    )
+                    if clear_failure_summary:
+                        cur.execute(
+                            "UPDATE dispatcher.agents "
+                            "SET status = %s, phase = %s, ended_at = now(), "
+                            "    exit_code = %s, "
+                            "    pr_number = COALESCE(%s, pr_number), "
+                            "    failure_summary = NULL "
+                            "WHERE agent_id = %s",
+                            (status, phase, exit_code, pr_number, agent_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE dispatcher.agents "
+                            "SET status = %s, phase = %s, ended_at = now(), "
+                            "    exit_code = %s, pr_number = COALESCE(%s, pr_number) "
+                            "WHERE agent_id = %s",
+                            (status, phase, exit_code, pr_number, agent_id),
+                        )
                 else:
                     cur.execute(
                         "UPDATE dispatcher.agents "
