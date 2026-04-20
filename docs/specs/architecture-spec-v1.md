@@ -2,25 +2,31 @@ JUDGEMIND
 
 Architecture Specification v1.0
 
-March 2026
+Last updated: April 2026
 
-Companion to: Judgemind Product Specification v1.0
+Companion to: Judgemind Product Specification
 
 AI-implemented • Human-reviewed • Open source
+
+---
+
+This document is split into two parts. **§1–§2** cover principles and system overview. **§3 Today** describes what is implemented and running in production. **§4 Direction** describes what is planned but not yet built. A component belongs in exactly one of those sections. When a feature is partially built, name the shipped part in Today and the unbuilt part in Direction — no "partially implemented" hedge prose.
 
 # 1. Architecture Principles
 
 The following principles govern all architectural decisions in Judgemind. They are listed in priority order; when principles conflict, higher-ranked principles prevail.
 
-API-first. The web application is a client of the API, not the other way around. Every capability exposed in the UI is available programmatically. The public REST API and the internal GraphQL API share the same data access layer.
+**API-first.** The web application is a client of the API, not the other way around. Every capability exposed in the UI is available programmatically. The public REST API and the internal GraphQL API share the same data access layer.
 
-Cost-aware by default. Judgemind is self-funded and free to users. Every component must be designed with cost ceilings in mind. Prefer fixed-cost infrastructure over usage-based pricing where possible. Never assume unlimited budget.
+**Cost-aware by default.** Judgemind is self-funded and free to users. Every component must be designed with cost ceilings in mind. Prefer fixed-cost infrastructure over usage-based pricing where possible. Never assume unlimited budget.
 
-Data capture is irreversible priority. Tentative rulings and other ephemeral court data disappear permanently if not captured. The ingestion pipeline is the single most critical system. Downtime in the web UI is tolerable; downtime in scraping is data loss.
+**Data capture is irreversible priority.** Tentative rulings and other ephemeral court data disappear permanently if not captured. The ingestion pipeline is the single most critical system. Downtime in the web UI is tolerable; downtime in scraping is data loss.
 
-Transparency over polish. Every AI output is labeled. Every analytic shows its sample size. Every data gap is disclosed. Trust is the product.
+**Transparency over polish.** Every AI output is labeled. Every analytic shows its sample size. Every data gap is disclosed. Trust is the product.
 
-Open source. The codebase is open source. Architecture should favor open-source and commodity components where practical, but managed AWS services are the primary deployment target. If a proprietary service is clearly the best tool for a job, use it. Self-hosted deployment is not a design constraint.
+**Open source.** The codebase is open source. Architecture should favor open-source and commodity components where practical, but managed AWS services are the primary deployment target. If a proprietary service is clearly the best tool for a job, use it. Self-hosted deployment is not a design constraint.
+
+**No unreachable affordances.** Buttons, endpoints, config flags, and schema fields only land in `main` when they've been exercised end-to-end. Half-built behind a feature flag is fine; half-built and reachable by users is a bug.
 
 # 2. System Overview
 
@@ -28,23 +34,22 @@ Judgemind consists of five major subsystems connected by event-driven messaging.
 
 ## 2.1 Event-Driven Architecture
 
-The five subsystems communicate through an event bus implemented with Redis Streams. Redis is already in the stack for caching and rate limiting (see Section 2.2), so using Redis Streams for messaging avoids adding another service. The event volume (thousands of documents per day, not millions) is well within Redis Streams’ capabilities.
+The subsystems communicate through an event bus implemented with Redis Streams. Redis is already in the stack for caching and rate limiting, so using Redis Streams for messaging avoids adding another service. The event volume (thousands of documents per day, not millions) is well within Redis Streams' capabilities.
 
 ### 2.1.1 Event Flow
 
 Data flows through the system in a pipeline pattern. Each stage produces events consumed by the next stage, with the event bus decoupling producers from consumers so each can scale and fail independently.
 
-document.captured: Emitted by a scraper when it captures a new or updated document. Payload includes raw content, content hash, source URL, court/county/state metadata, and capture timestamp. Consumed by the ingestion worker, which handles transcription, enrichment, and indexing inline.
+- **document.captured**: Emitted by a scraper when it captures a new or updated document. Payload includes raw content, content hash, source URL, court/county/state metadata, and capture timestamp. Consumed by the ingestion worker, which handles transcription, enrichment, and indexing inline.
+- **scraper.health**: Emitted by each scraper after every run with operational metrics (success/failure, response time, records captured). Consumed by CloudWatch metric filters for alerting on scraper failures.
 
-scraper.health: Emitted by each scraper after every run with operational metrics (success/failure, response time, records captured). Consumed by CloudWatch metric filters for alerting on scraper failures.
-
-Note: The ingestion worker processes documents inline (transcription → enrichment → DB write → OpenSearch index) rather than through separate event-driven stages. This is simpler and sufficient at current scale. The event bus handles producer-consumer decoupling between scrapers and the ingestion worker, but downstream processing is synchronous within the worker. A planned validation step (§3.5.3) will add LLM-based quality checks between enrichment and DB write.
+The ingestion worker processes documents inline (transcription → enrichment → DB write → OpenSearch index) rather than through separate event-driven stages. This is simpler and sufficient at current scale. The event bus handles producer-consumer decoupling between scrapers and the ingestion worker; downstream processing is synchronous within the worker.
 
 ### 2.1.2 Consumer Groups & Failure Handling
 
 Redis Streams consumer groups ensure that each event is processed exactly once by each consuming service, even if the consumer crashes and restarts. Events are acknowledged after successful processing; unacknowledged events are automatically retried. A dead-letter mechanism catches events that fail processing repeatedly so they can be investigated without blocking the pipeline.
 
-The pipeline is designed to be resumable. If any stage goes down (the NLP pipeline has an outage, Elasticsearch is temporarily unavailable), events accumulate in the stream and are processed when the consumer comes back. This is particularly important for the ingestion layer: scrapers should never be blocked by a downstream processing delay, because the court data they are capturing may be ephemeral.
+The pipeline is designed to be resumable. If any consumer goes down, events accumulate in the stream and are processed when the consumer comes back. This is particularly important for the ingestion layer: scrapers should never be blocked by a downstream processing delay, because the court data they are capturing may be ephemeral.
 
 ### 2.1.3 Event Schema
 
@@ -54,242 +59,143 @@ All events share a common envelope: event type, event ID (UUID), timestamp, prod
 
 Court data has an excellent property for caching: once captured, it almost never changes. A tentative ruling captured yesterday will have the same text today. A docket entry from last month is identical. This means cache invalidation — normally the hard part of caching — is straightforward. The caching layer uses the same Redis instance as the event bus and rate limiter.
 
-### 2.2.1 What Gets Cached
+**What gets cached today:**
 
-Pre-computed AI outputs (highest value): Document summaries, entity extraction results, and classification outputs are generated during ingestion (Tier 1) and cached permanently. When a user views a document summary, the system serves the cached result rather than making a live AI API call. This eliminates the most expensive per-request cost.
+- **Judge analytics aggregations:** Grant/deny rates, motion-specific statistics, and other analytics computed from ruling data. Invalidated when new rulings for that judge are indexed.
+- **Search results:** OpenSearch query results for common searches, with short TTLs (5–15 minutes) to smooth traffic spikes.
+- **Judge and attorney profiles:** Profile pages with biographical data, case history, and analytics. Cached with event-driven invalidation.
 
-Judge analytics aggregations: Grant/deny rates, motion-specific statistics, and other analytics are computed from the underlying ruling data and cached. Cache is invalidated and recomputed when new rulings for that judge are indexed (triggered by the document.indexed event). Since new rulings arrive at most daily, this is infrequent.
+**Invalidation.** Event-driven. When a document is indexed, the system invalidates caches depending on that document: the relevant judge's analytics, attorney profile, case detail, and any affected search results. Because court data arrives in daily batches rather than continuous streams, invalidation volume is low and stale windows are short.
 
-Search results: Elasticsearch query results for common searches are cached with short TTLs (5–15 minutes). This smooths traffic spikes without serving stale data. The GraphQL layer can serve entire resolved queries from cache when the underlying data has not changed.
+# 3. Today — Implemented and Running
 
-Judge and attorney profiles: Profile pages with biographical data, case history, and analytics are among the most frequently accessed pages and change infrequently. Cached with event-driven invalidation.
+This section describes what currently exists in production. Anything not described here is either out of scope or described in §4 Direction.
 
-### 2.2.2 Invalidation
+## 3.1 Data Ingestion
 
-Cache invalidation is event-driven. When a document.indexed event fires, the system invalidates cached data that depends on the new document: the relevant judge’s analytics cache, attorney profile caches, case detail caches, and any search result caches that might be affected. Because court data changes infrequently (new data arrives in daily batches, not continuous streams), the invalidation volume is low and the window of stale data is short.
+The ingestion layer is the most operationally critical component of Judgemind. It captures court data before it disappears — particularly tentative rulings that may only be available for days.
 
-For user-facing AI features (Tier 2 and 3), results are cached per-document: if a user requests a case assessment for a case that another user already assessed, the cached result is served. This is safe because the AI output is grounded in the same source documents regardless of who requests it.
+### 3.1.1 Scraper Framework
 
-# 3. Data Ingestion Layer
+Scrapers are organized in a four-level hierarchy reflecting how court systems are actually structured. Each scraper is a self-contained module with the following contract:
 
-The ingestion layer is the most operationally critical component of Judgemind. It is responsible for capturing court data before it disappears, particularly tentative rulings that may only be available for days.
+- **Configuration:** Target URL(s), polling frequency, authentication requirements (if any), rate limits, and time-of-day restrictions (some courts deploy CAPTCHAs during business hours only).
+- **Execution:** Fetch data, parse response (HTML, PDF, or DOCX), extract structured fields, compute content hash.
+- **Field extraction completeness:** A scraper is not considered complete until it correctly extracts 100% of the structured fields present in the source data obtained during development. Required fields: judge name, motion type, case title, hearing date, outcome, and parties. If a field is present in the source, the scraper must extract it — do not ship scrapers that leave extractable fields empty and rely on post-hoc backfills. Regression tests against real fixtures must cover every extracted field. "Unknown" or "Not classified" values are acceptable only when the source data genuinely does not contain the information.
+- **Output:** Emit standardized ingestion events to the message queue. Events include raw content, parsed content, content hash, source metadata, and capture timestamp. Scrapers populate as many structured fields as possible (judge name, case number, hearing date, etc.) from the court website's own structured data. Any fields the scraper cannot populate are filled downstream by the LLM enrichment pipeline (§3.3.2).
+- **Error handling:** Retry with exponential backoff. Alert on repeated failures. Log all errors with enough context for debugging.
+- **Health reporting:** Each scraper reports its last successful run, last failure, and current status to a central registry.
 
-## 3.1 Scraper Framework
+**Lessons baked into the framework:**
 
-Scrapers are organized in a four-level hierarchy reflecting how court systems are actually structured:
+- **Assume nothing about data consistency.** Different clerks enter data differently within the same court. Holiday schedules create unexpected entries. Typo corrections appear as updates. The scraper treats every assumption about format as provisional.
+- **Version tracking with content hashing.** Every captured document or ruling gets a SHA-256 content hash. When a scraper sees matching content, it skips the document. Differing hashes trigger an upsert.
+- **Multiple tentatives per case.** A single case may have multiple tentative rulings corresponding to different motions or hearings. The data model associates each tentative with its specific motion/hearing, not just the case.
+- **Time-of-day awareness.** Some courts deploy anti-scraping measures (CAPTCHAs, rate limits) only during business hours. Scrapers support scheduling windows.
+- **Court website performance.** Some court websites are slow or unreliable. Scrapers have generous timeouts, handle partial responses, and avoid hammering struggling servers.
+- **Leverage shared CMS platforms.** Many counties use the same court management software (Tyler Technologies Odyssey is common). One scraper template parameterized per county can cover many courts.
 
-Each scraper is a self-contained module with the following contract:
+### 3.1.2 Document Processing Pipeline
 
-Configuration: Target URL(s), polling frequency, authentication requirements (if any), rate limits, and time-of-day restrictions (some courts deploy CAPTCHAs during business hours only).
+Court documents arrive in three formats (HTML, PDF, DOCX), each requiring a different processing path. All documents pass through the AI/ML pipeline (§3.3) after text extraction.
 
-Execution: Fetch data, parse response (HTML, PDF, or DOCX), extract structured fields, compute content hash.
-
-Field extraction completeness: A scraper is not considered complete until it correctly extracts 100% of the structured fields present in the source data obtained during development. Required fields: judge name, motion type, case title, hearing date, outcome, and parties. If a field is present in the source, the scraper must extract it — do not ship scrapers that leave extractable fields empty and rely on post-hoc backfills. Regression tests against real fixtures must cover every extracted field. "Unknown" or "Not classified" values are acceptable only when the source data genuinely does not contain the information.
-
-Output: Emit standardized ingestion events to the message queue. Events include raw content, parsed content, content hash, source metadata, and capture timestamp. Scrapers populate as many structured fields as possible (judge name, case number, hearing date, etc.) from the court website's own structured data. Any fields the scraper cannot populate are filled downstream by the LLM extraction pipeline (see Section 5.2).
-
-Error handling: Retry with exponential backoff. Alert on repeated failures. Log all errors with enough context for debugging (URL, response status, partial content).
-
-Health reporting: Each scraper reports its last successful run, last failure, and current status to a central registry.
-
-### 3.1.1 Lessons from Prior Implementation
-
-The following design decisions are informed by hard-won experience building the original state court scraping infrastructure in 2016:
-
-Assume nothing about data consistency. Different clerks enter data differently within the same court. Holiday schedules create unexpected entries. Typo corrections appear as updates. The scraper must treat every assumption about format as provisional and handle deviations gracefully.
-
-Version tracking with content hashing. Every captured document or ruling gets a SHA-256 content hash. When a scraper sees content with a matching hash, it skips the document. When the hash differs, the new version is stored via upsert.
-
-Multiple tentatives per case. A single case may have multiple tentative rulings corresponding to different motions or hearings. The data model must associate each tentative with its specific motion/hearing, not just the case.
-
-Time-of-day awareness. Some courts deploy anti-scraping measures (CAPTCHAs, rate limits) only during business hours. Scrapers must support scheduling windows. Example: Orange County historically deployed CAPTCHAs from 9 AM–5 PM Pacific only.
-
-Court website performance. Some court websites are slow or unreliable. Scrapers must have generous timeouts, handle partial responses, and avoid hammering already-struggling servers. Be a good citizen: respect robots.txt, use reasonable request intervals.
-
-Leverage shared CMS platforms. Many counties use the same court management software (Tyler Technologies Odyssey is common). When we identify a shared CMS, we can write one scraper template and parameterize it per county, dramatically reducing per-court development effort.
-
-## 3.2 Document Processing Pipeline
-
-Court documents arrive in three formats, each requiring a different processing path:
-
-All documents, regardless of source format, pass through the NLP pipeline (Section 5) after text extraction for entity extraction, classification, and embedding generation.
-
-## 3.3 Tentative Ruling Capture
+### 3.1.3 Tentative Ruling Capture
 
 Tentative rulings are the highest-priority data type. The capture pipeline has dedicated monitoring and alerting separate from general scraping.
 
-Polling frequency: Daily for most courts. Hourly for high-volume courts that update frequently (configurable per endpoint). More frequent polling adds cost and load without proportional value for most courts.
+- **Polling frequency:** Daily for most courts. Hourly for high-volume courts that update frequently (configurable per endpoint).
+- **Archival:** Every captured tentative ruling is immediately archived to object storage (immutable). The system never overwrites a previously captured version.
+- **Deduplication:** Content hashing (SHA-256) distinguishes new captures from duplicates. When a hash matches, the document is skipped. When it differs, the new version is stored (upsert semantics update mutable fields while preserving immutable ones).
+- **Failure alerting:** If a tentative ruling scraper fails for more than 24 hours, an alert fires. Tentative ruling capture failures are treated as high-severity incidents because the data may be permanently lost.
 
-Archival: Every captured tentative ruling is immediately archived to object storage (immutable). The system never overwrites a previously captured version.
+### 3.1.4 External Data Integration
 
-Deduplication: Content hashing (SHA-256) distinguishes new captures from duplicates. When a hash matches, the document is skipped. When it differs, the new version is stored (upsert semantics update mutable fields while preserving immutable ones). LLM-based diff classification (substantive vs cosmetic) is not yet implemented.
+Judgemind integrates with existing open legal data sources to avoid duplicating effort:
 
-Failure alerting: If a tentative ruling scraper fails for more than 24 hours, an alert fires. Tentative ruling capture failures are treated as high-severity incidents because the data may be permanently lost.
+- **CourtListener (Free Law Project):** Federal opinions and some state appellate data. Implemented as a scraper (`packages/scraper-framework/src/courts/federal/courtlistener.py`) that ingests via their API, with regression tests against recorded responses.
 
-## 3.4 External Data Integration
-
-Judgemind integrates with existing open legal data sources to avoid duplicating effort and to provide federal court coverage:
-
-CourtListener (Free Law Project): Federal opinions, some state appellate data. Implemented as a scraper (`packages/scraper-framework/src/courts/federal/courtlistener.py`) that ingests via their API.
-
-## 3.5 Scraper Development & Quality Assurance
+### 3.1.5 Scraper Development & Quality Assurance
 
 Building a reliable scraper requires iteration. Court websites are messy, inconsistent, and full of edge cases that only surface over time.
 
-### 3.5.1 Development Process
+**Development process.** AI agents (via `/task`) write scrapers against real court websites. Each scraper ships with regression tests against archived fixture pages. The `/ralph` review loop (worker + reviewers) iterates until the code passes review and CI. Once merged, the scraper runs on its EventBridge schedule and the ingestion worker processes captured documents.
 
-AI agents (via `/task`) write scrapers against real court websites. Each scraper ships with regression tests against archived fixture pages. The `/ralph` review loop (worker + reviewers) iterates until the code passes review and CI. Once merged, the scraper runs on its EventBridge schedule and the ingestion worker processes captured documents.
+**Quality assurance mechanisms:**
 
-### 3.5.2 Current Quality Assurance
+- **Regression tests.** Every scraper has tests against real fixtures covering typical pages, edge cases, and known formatting variations.
+- **Hourly data quality checks.** GitHub Actions workflow runs `scripts/data-quality-check.py` to detect ingest rate drops, scraper staleness, field completeness regressions, and orphaned documents. Persists per-county metrics to the `data_quality_metrics` DB table and sends P1 alerts via Telegram.
+- **Periodic spot checks.** The `/spotcheck` skill samples rulings across counties, runs DB queries for known issue patterns, takes screenshots for visual inspection, and files issues for findings.
+- **Field completeness auditing.** `scripts/audit_field_completeness.py` reports per-county gaps in required fields.
 
-Today, scraped data flows directly to the production database without a validation gate. Quality is ensured through:
-- **Regression tests:** Every scraper has tests against real fixtures covering typical pages, edge cases, and known formatting variations.
-- **Hourly data quality checks:** GitHub Actions workflow runs `scripts/data-quality-check.py` to detect ingest rate drops, scraper staleness, field completeness regressions, and orphaned documents. Auto-creates issues on regressions.
-- **Periodic spot checks:** The `/spotcheck` skill samples rulings across counties, runs DB queries for known issue patterns, takes screenshots for visual inspection, and files issues for findings.
-- **Field completeness auditing:** `scripts/audit_field_completeness.py` reports per-county gaps in required fields (judge name, motion type, case title, hearing date, outcome, parties).
+These mechanisms catch scraper *failures* well (crashes, staleness, missing fields). They are weaker at catching scrapers that *succeed but return wrong data* — e.g., text assigned to the wrong case, ruling content from one entry overwriting another. That class of silent data corruption motivates the validation agent in §4.1.
 
-These mechanisms catch scraper *failures* well (crashes, staleness, missing fields). They are weaker at catching scrapers that *succeed but return wrong data* — e.g., text assigned to the wrong case (#1716), ruling content from one entry overwriting another. This class of silent data corruption motivates the validation agent described below.
+**Scraper health model.** Operational status is tracked via `scraper_runs` records (success/failure, response time, records captured). Output quality is tracked via hourly data quality checks. CloudWatch alarms fire if no successful scraper run occurs within 24 hours. The admin data quality dashboard shows per-county health tiles (green/yellow/red) based on ruling count, field completeness, and scraper freshness.
 
-### 3.5.3 Validation Agent (Planned)
+## 3.2 Data Store
 
-A lightweight LLM-based validation step that reviews every ingested document before it reaches the production database. The goal is to catch data quality issues that regression tests and volume-based monitoring miss — particularly cases where the scraper runs successfully but produces incorrect output.
+Judgemind uses three complementary storage systems, each optimized for a specific access pattern.
 
-**How it works:**
+### 3.2.1 PostgreSQL — Structured Data
 
-The ingestion worker, after transcription and enrichment, passes each document's extracted fields through a validation LLM call before writing to the database. The validator checks:
+PostgreSQL is the primary database for all structured, relational data. The data model centers on six primary entities — courts, judges, cases, attorneys, parties, and rulings — with supporting tables for documents and alerts.
 
-- **Internal consistency:** Does the ruling text plausibly match the assigned case number and case title? Is a 6-page ruling assigned to a case that also has a one-line "See #1 Above" entry? (This would have caught #1716.)
-- **Field plausibility:** Is the judge name actually a name (not a court division header)? Is the hearing date in a reasonable range? Is the motion type a recognized legal motion?
-- **Cross-document consistency:** Within a multi-case PDF, are all entries accounted for? Do entry counts match expected patterns for this court?
-- **Court-specific learned rules:** Expected volume ranges per department, typical case number formats, known formatting patterns. These rules accumulate over time as edge cases are discovered.
+**Entity resolution.** Court data is entered by humans with no enforced consistency. The same judge may appear as "Johnson, Robert M.", "Robert Johnson", "Hon. R.M. Johnson", or "Judge Johnson" across different courts, clerks, and document types. The schema supports canonical records with aliases (`judges`/`judge_aliases`, `attorneys`/`attorney_aliases`). Entity resolution is handled by the enrichment tier: normalized name matching links rulings to canonical judge records.
 
-**Validation outcomes:**
+**Schema namespaces** make data tier explicit:
 
-| Result | Action |
-|---|---|
-| **Pass** | Write to production database normally |
-| **Flag** | Write to production but tag for async review; create a review item in the admin dashboard |
-| **Fail** | Do not write to production; log the failure with full context; create a high-priority review item |
+- **`derived.*`** (courts, judges, cases, attorneys, parties, documents, rulings, court_directory_snapshots, and `*_aliases`): rebuildable from the S3 archive by re-running ingestion (`scripts/rebuild_db.py`). Cacheable, disposable state.
+- **`public.*`** (users, refresh_tokens, alert_subscriptions, alert_events): authoritative accumulated state. Not derivable from S3.
+- **`staging.*`** (captures, ruled_items): transient pipeline buffers between ingestion stages.
+- **`telemetry.*`** (scraper_runs, validation_results, data_quality_metrics): accumulated observability data. Not derivable from S3.
 
-There is no manual approval gate — at hundreds of documents per day, all validation is automated. Flagged items are reviewed asynchronously and feed back into scraper improvements.
+### 3.2.2 OpenSearch — Full-Text Search
 
-**Cost:** Uses a cheap model (Haiku-class or Flash Lite). The validation prompt is short (extracted fields + ruling text excerpt, not full text). At ~1,000 documents/day, the incremental LLM cost should be modest relative to existing enrichment costs.
+OpenSearch (AWS-managed) indexes ruling text for full-text search with relevance ranking. It powers the ruling search page with faceted filtering (court, county, judge, hearing date range, case number prefix, motion type, outcome).
 
-**Implementation approach:** Add validation as a step in the ingestion worker between enrichment and database write. No separate service or staging schema needed — the worker already has all the context. Validation results are logged to a `validation_results` table for monitoring and the admin dashboard.
+Populated by the ingestion worker when it writes rulings to PostgreSQL. PostgreSQL is the source of truth; OpenSearch is a derived read-optimized view.
 
-### 3.5.4 Scraper Health Model
-
-The scraper health model tracks operational status via `scraper_runs` records (success/failure, response time, records captured) and output quality via hourly data quality checks. CloudWatch alarms fire if no successful scraper run occurs within 24 hours. The admin data quality dashboard shows per-county health tiles (green/yellow/red) based on ruling count, field completeness, and scraper freshness. Once the validation agent is implemented, validation pass/flag/fail rates will be added to the health model.
-
-# 4. Data Store
-
-Judgemind uses four complementary storage systems, each optimized for a specific access pattern.
-
-## 4.1 PostgreSQL — Structured Data
-
-PostgreSQL is the primary database for all structured, relational data. It stores the core entities and their relationships.
-
-### 4.1.1 Core Entity Model
-
-The data model centers on six primary entities. The entity-relationship design must accommodate the messiness of court data, particularly around identity resolution (see Section 4.1.2).
-
-### 4.1.2 Entity Resolution
-
-Court data is entered by humans with no enforced consistency. The same judge may appear as "Johnson, Robert M.", "Robert Johnson", "Hon. R.M. Johnson", or "Judge Johnson" across different courts, clerks, and document types.
-
-The schema supports canonical records with aliases (`judges`/`judge_aliases`, `attorneys`/`attorney_aliases`). Currently, entity resolution is handled by the enrichment tier — normalized name matching links rulings to canonical judge records. Fuzzy matching and embedding-based resolution are not yet implemented.
-
-## 4.2 OpenSearch — Full-Text Search
-
-OpenSearch (AWS-managed) indexes ruling text for full-text search with relevance ranking. It powers the ruling search page with faceted filtering.
-
-Faceted search: Aggregations for filtering by court, county, judge, hearing date range, case number prefix, motion type, and outcome.
-
-Sync: OpenSearch is populated by the ingestion worker when it writes rulings to PostgreSQL. PostgreSQL is the source of truth; OpenSearch is a derived read-optimized view.
-
-## 4.3 Qdrant — Vector Search (Not Yet Active)
-
-Qdrant is included in the docker-compose stack and declared as a dependency, but embedding generation is not yet implemented. No embeddings are being produced or stored. When semantic search or RAG features are built, Qdrant will store document embeddings for similarity search with metadata filtering.
-
-## 4.4 Object Storage — Documents & Archival
+### 3.2.3 Object Storage — Documents & Archival
 
 AWS S3 stores all original documents and archival copies (MinIO in docker-compose for local development).
 
-### 4.4.1 Archive-First Principle
+**Archive-first principle.** The S3 archive is the authoritative source of truth for all captured data. The PostgreSQL database is a derived, rebuildable index — every fact in the database traces back to an archived source file in S3. Three implications:
 
-The S3 archive is the authoritative source of truth for all captured data. The PostgreSQL database is a derived, rebuildable index — every fact in the database must trace back to an archived source file in S3.
+1. **Archive before process.** Every external data source (court websites, court directories) archives raw fetched content to S3 before any extraction or transformation. If a downstream processing step fails, the raw content is preserved and can be reprocessed.
+2. **The database is rebuildable.** All extraction (LLM, regex, HTML parsing) can be re-run on archived content. `scripts/rebuild_db.py` discovers courts from S3 key prefixes, seeds the database, fetches court directory rosters, then processes every archived document through the full ingestion pipeline. The result is a complete database rebuilt from S3 alone.
+3. **Immutable archival.** Original captured documents are never modified or deleted. Object versioning is enabled as an additional safety net.
 
-This principle has three implications:
+**Content-addressed key scheme.** S3 keys for captured documents include a SHA-256 hash of the content. This makes writes idempotent (the same content maps to the same key, so duplicate uploads are no-ops), gives deduplication by construction, and makes the local cache (`S3_CACHE_DIR`) cache-friendly — cached files are valid forever with no invalidation. The archiver implementation is in `packages/scraper-framework/src/framework/storage.py`.
 
-1. **Archive before process.** Every external data source (court websites, court directories, and eventually third-party sources like Ballotpedia and state bar associations) archives raw fetched content to S3 before any extraction or transformation. If a downstream processing step fails, the raw content is preserved and can be reprocessed.
+**S3 key prefixes** in the `judgemind-document-archive-{env}` bucket:
 
-2. **The database is rebuildable.** All extraction (LLM, regex, HTML parsing) can be re-run on archived content. `scripts/rebuild_db.py` demonstrates this: it discovers courts from S3 key prefixes, seeds the database, fetches court directory rosters, then processes every archived document through the full ingestion pipeline (transcription, enrichment, DB write). The result is a complete database rebuilt from S3 alone.
+| Prefix pattern | Purpose | Key scheme |
+|---|---|---|
+| `{state}/{county}/{court}/raw/{content_hash}.{ext}` | Captured tentative rulings and court documents | Content-addressed |
+| `directories/{court_id}/{timestamp}.{ext}` | Department-to-judge directory snapshots | Timestamped |
+| `llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_key}.json` | Cached LLM extraction results | Content-addressed (prompt + document) |
+| `data-quality/{YYYY-MM-DD}/{HH}.json` | Hourly data quality check snapshots | Timestamped |
 
-3. **Immutable archival.** Original captured documents are never modified or deleted. Object versioning is enabled as an additional safety net. This is critical for tentative rulings, which are ephemeral — if the raw content is lost, it cannot be recaptured.
+Directory snapshots use timestamped (not content-addressed) keys because the same directory page changes over time and we want to preserve history. LLM cache stores extraction results keyed by prompt template hash and document content hash — changing the prompt invalidates the cache (new results are computed); unchanged prompts reuse cached results. The cache is shared across local and ECS environments via S3.
 
-### 4.4.2 Content-Addressed Key Scheme
+**Storage tiers.** Hot storage for documents less than 90 days old or frequently accessed. Cold/archive storage for older documents. Lifecycle policies automate transitions.
 
-S3 keys for captured documents use content-addressed paths: the key includes a SHA-256 hash of the document content. This design has several advantages:
+## 3.3 AI/ML Layer
 
-- **Idempotent writes.** The same content always maps to the same key. A scraper that captures the same ruling twice produces the same key, so the second PutObject is a no-op. No orphaned duplicates, no wasted storage.
-- **Deduplication by construction.** When a content hash matches an existing key, the archiver skips the upload entirely (verified via HeadObject), saving bandwidth and S3 PUT costs.
-- **Cache-friendly.** Content-addressed keys never go stale — the content at a given key is immutable by definition. The local S3 cache (`S3_CACHE_DIR`) exploits this: cached files are valid forever with no invalidation logic needed.
+The AI layer handles all natural language processing at ingestion time. User-facing generative features (RAG, summarization) are not yet built — see §4.2.
 
-The archiver implementation is in `packages/scraper-framework/src/framework/storage.py`. The `build_s3_key` function constructs the key from document metadata and content hash.
+### 3.3.1 Processing Tiers
 
-### 4.4.3 S3 Key Prefixes
+Judgemind uses three processing tiers with different cost, quality, and volume characteristics. The guiding principle is: start simple, measure, then optimize. Do not prematurely invest in GPU infrastructure before understanding actual usage patterns.
 
-All S3 objects live in the `judgemind-document-archive-{env}` bucket. Key prefixes organize content by source type and purpose:
+**Tier 1 — per-document ingestion.** Runs on every document at capture time (transcription, enrichment). Uses small/cheap models. All outputs are cached so they never need to be recomputed. Currently ~$47/month on Claude Haiku at ~1,000 documents/day ingestion volume.
 
-| Prefix pattern | Purpose | Key scheme | Example |
-|---|---|---|---|
-| `{state}/{county}/{court}/raw/{content_hash}.{ext}` | Captured tentative rulings and court documents | Content-addressed (SHA-256 hash) | `ca/orange/orange_county_superior_court/raw/a1b2c3d4...f0.pdf` |
-| `directories/{court_id}/{timestamp}.{ext}` | Department-to-judge directory snapshots | Timestamped (`YYYYMMDDTHHMMSSz`) | `directories/ca_orange_oc_superior/20260315T080000Z.html` |
-| `llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_key}.json` | Cached LLM extraction results | Content-addressed (prompt hash + content hash) | `llm-cache/google-gemini-2.0-flash/prompt-ab12.../5f3e...json` |
-| `data-quality/{YYYY-MM-DD}/{HH}.json` | Hourly data quality check snapshots | Timestamped (date + hour) | `data-quality/2026-03-15/08.json` |
+**Tier 2 — per-user interactive.** Reserved for future user-facing AI features. Hosted commercial APIs on a per-call basis. Rate limiting prevents runaway costs. No Tier 2 features are live today.
 
-**Ruling archives** use the content-addressed scheme described above. The scraper captures raw content, computes the SHA-256 hash, and archives to `{state}/{county}/{court}/raw/{hash}.{ext}`. The `rebuild_db.py` script discovers courts by parsing these prefixes — the S3 key structure itself encodes the court hierarchy.
+**Tier 3 — per-query generative.** Reserved for future RAG-grounded generation. Hosted commercial APIs. Not live today.
 
-**Directory snapshots** archive raw HTML (or PDF for Santa Barbara and San Francisco) from court websites that map department numbers to judge names. These are timestamped rather than content-addressed because the same department page may change over time and we want to preserve the history. Fetched by `scripts/fetch_rosters.py` and the per-court directory scrapers in `packages/scraper-framework/src/framework/court_directory.py`.
-
-**LLM cache** stores extraction results keyed by both the prompt template hash and the document content hash. This means changing the prompt invalidates the cache (new results are computed), while unchanged prompts reuse cached results. The cache is shared across local and ECS environments via S3.
-
-**Data quality snapshots** store the output of the hourly `scripts/data-quality-check.py` run. These enable trend analysis — the `scripts/dq_trend_storage.py` module reads historical snapshots to detect regressions over time.
-
-### 4.4.4 Data Sources Not Yet Archive-First
-
-The following data sources are integrated but do not yet archive raw content to S3 before processing:
-
-- **Ballotpedia** (`packages/scraper-framework/src/courts/ca/ballotpedia.py`): fetches judge biographical data but does not archive raw HTML to S3. A future `external/ballotpedia/{content_hash}.html` prefix is planned.
-- **State bar associations**: not yet integrated. When added, raw responses should be archived under `external/{source}/{content_hash}.html`.
-
-The planned `external/{source}/{content_hash}.html` prefix will follow the same content-addressed scheme as ruling archives, ensuring idempotent archival for third-party data sources.
-
-### 4.4.5 Storage Tiers
-
-Tiered storage: Hot storage for documents less than 90 days old or frequently accessed. Cold/archive storage for older documents. Lifecycle policies automate transitions.
-
-# 5. AI/ML Layer
-
-The AI layer handles all natural language processing, from ingestion-time entity extraction to user-facing generative features. It is designed around three processing tiers with different cost, quality, and volume characteristics.
-
-## 5.1 Processing Tiers
-
-### 5.1.1 Cost Management Strategy
-
-The guiding principle is: start simple, measure, then optimize. Do not prematurely invest in GPU infrastructure before understanding actual usage patterns.
-
-Phase 1 (Months 1–6): All hosted APIs. Use small/cheap models for Tier 1 (Haiku-class). Monitor per-document ingestion cost carefully. Cache all Tier 1 outputs so they never need to be recomputed.
-
-Phase 2 (Months 6–12): If Tier 1 costs exceed ~$3,000/month (indicating ~10,000+ documents/day), evaluate self-hosted GPU. A single A100 instance at ~$1,500/month running Llama or Mistral can handle Tier 1 at any realistic volume.
-
-Ongoing: Tier 2 and Tier 3 remain on hosted commercial APIs indefinitely. Their per-call costs scale with users, not data volume, and quality requirements justify premium models. Rate limiting on AI features prevents runaway costs.
-
-## 5.2 Ingestion Pipeline
+### 3.3.2 Three-Stage Ingestion Pipeline
 
 The ingestion pipeline converts raw captured content into structured ruling records. It has three stages, each with a clear responsibility. **No stage should do the work of another stage** — scrapers capture, transcription converts format, enrichment populates fields.
-
-### 5.2.1 Three-Stage Pipeline
 
 | Stage | Responsibility | Inputs | Outputs |
 |---|---|---|---|
@@ -297,143 +203,69 @@ The ingestion pipeline converts raw captured content into structured ruling reco
 | **Transcription** | Convert raw content to clean text, split multi-case documents, mark cross-page continuations | Raw PDF bytes or HTML | Ruling text per case, case boundaries, continuation markers |
 | **Enrichment** | Extract structured fields from text | Ruling text + scraper metadata | case_number, case_title, hearing_date, motion_type, outcome, parties, case_type |
 
-**Capture** is format-agnostic. The scraper's job is to reliably fetch and archive raw content, plus extract whatever metadata the website's *own structure* provides (e.g., a judge name in link text, a department in a URL parameter). Scrapers do NOT parse PDF content or extract fields from unstructured text — that's enrichment's job.
+**Capture** is format-agnostic. The scraper reliably fetches and archives raw content plus extracts whatever metadata the website's *own structure* provides (e.g., a judge name in link text, a department in a URL parameter). Scrapers do NOT parse PDF content or extract fields from unstructured text — that's enrichment's job.
 
 **Transcription** varies by content format:
+
 - **HTML documents** (e.g., LA County): text is extracted directly from HTML markup. No LLM needed — BeautifulSoup parsing is sufficient. Case splitting uses HTML structure (dividers, headings).
-- **Tabular PDF documents** (e.g., OC): pages are rendered as images and sent to a multimodal LLM (one page per call). The prompt describes the visual structure of the page — column positions relative to ruled lines, column widths, row separators — so the LLM reads the table like a human would. The LLM returns structured JSON per table row with `entry_number`, `case_info`, and `ruling_text` fields. A post-processing join step merges rows across pages: a new case is detected when a row has both a valid integer entry number AND case identification (case number or adversarial case name) in the case_info column. Rows without both signals are merged as continuations of the previous case.
+- **Tabular PDF documents** (e.g., OC): pages are rendered as images and sent to a multimodal LLM (one page per call). The prompt describes the visual structure of the page — column positions relative to ruled lines, column widths, row separators — so the LLM reads the table like a human would. The LLM returns structured JSON per table row; a post-processing join step merges rows across pages based on whether a row has both a valid integer entry number AND case identification.
 - **Text-based PDF documents** (e.g., Riverside): pdfplumber/pymupdf text extraction is reliable (no column layout issues), so extracted text is sent to the LLM rather than page images. The LLM's job is splitting numbered entries and extracting ruling text per case.
 
-The transcription LLM prompt describes **visual structure, not text heuristics**. For tabular PDFs, it describes column positions relative to vertical ruled lines and row separators. For text-based PDFs, it describes the numbered entry format. The prompt never references specific case number formats, date patterns, or other fragile text patterns — those vary by court division and break when formats change. See `docs/scraper-lessons.md` §LLM Extraction for the full approach and lessons learned.
-
-Each county's prompt is validated through an iterative eval loop before production integration: build an eval script against test fixtures, iterate the prompt until 100% lenient case count accuracy, then integrate. The rollout plan (#1467) is: OC → Riverside → SB → LA → SF/SC/Ventura.
-
-The transcription LLM does NOT extract case numbers, titles, outcomes, or other structured fields. That is enrichment's job.
+The transcription LLM prompt describes **visual structure, not text heuristics**. Each county's prompt is validated through an iterative eval loop before production integration: build an eval script against test fixtures, iterate the prompt until 100% lenient case count accuracy, then integrate. The transcription LLM does NOT extract case numbers, titles, outcomes, or other structured fields — that is enrichment's job.
 
 **Enrichment** applies a two-tier extraction strategy to each ruling's text:
 
-**Tier 1 — Scraper-provided fields (highest priority).** Values the scraper extracted from website structure (not from document content). These are authoritative — e.g., a judge name from link text, a department from a URL parameter. Used as-is, never overwritten by later tiers.
+- **Tier 1 — Scraper-provided fields (highest priority).** Values the scraper extracted from website structure (not from document content). Authoritative — used as-is, never overwritten by later tiers.
+- **Tier 2 — LLM extraction.** For fields not provided by the scraper. Two paths: per-field LLM extraction (`packages/scraper-framework/src/framework/llm_extractor.py`) for transcription-level fields on counties with custom configs, and universal LLM enrichment (`packages/scraper-framework/src/framework/llm_enrichment.py`) which extracts motion_type, outcome, case_title, and parties from ruling text in a single, taxonomy-constrained, stateless LLM call.
 
-**Tier 2 — LLM extraction.** For fields not provided by the scraper, the ingestion worker uses LLM-based extraction. Two LLM extraction paths cover different field sets:
+**Regex utilities** in `packages/scraper-framework/src/ingestion/extract.py` cover fields not handled by LLM enrichment: case number extraction, hearing date extraction, judge name extraction, and case type inference from case number prefixes. These are lightweight fallbacks that supplement LLM extraction.
 
-- **Per-field LLM extraction** (`packages/scraper-framework/src/framework/llm_extractor.py`): configurable per-county extraction using structured prompts. Handles transcription-level fields (ruling_text, case_number, etc.) for counties with custom extraction configs.
-- **LLM enrichment** (`packages/scraper-framework/src/framework/llm_enrichment.py`): universal enrichment module that extracts motion_type, outcome, case_title, and parties from ruling text in a single LLM call. Taxonomy-constrained and stateless. This replaced per-county regex extraction patterns in #2178.
+**Implementation details:**
 
-Key implementation details:
-- **Provider-agnostic adapter** (`packages/scraper-framework/src/ingestion/llm_providers.py`): supports Anthropic and Google GenAI via `LLM_PROVIDER` and `LLM_MODEL` environment variables. Default: Claude Haiku (defined centrally in `packages/judgemind-config/src/judgemind_config/models.py`, overridable via `HAIKU_MODEL` env var).
-- **Connection reuse:** the worker creates a single LLM client at startup and reuses it across all documents in the session, amortizing connection overhead.
-- **Rate-limit retry:** each provider adapter retries once on rate-limit errors (HTTP 429 / ResourceExhausted) with a 1-second backoff.
-- **Cost:** approximately $47/month on Anthropic Haiku at current ingestion volume (~1,000 documents/day).
+- **Provider-agnostic adapter** (`packages/scraper-framework/src/ingestion/llm_providers.py`): supports Anthropic and Google GenAI via `LLM_PROVIDER` and `LLM_MODEL` environment variables. Default: Claude Haiku (centrally defined in `packages/judgemind-config/src/judgemind_config/models.py`, overridable via `HAIKU_MODEL`).
+- **Connection reuse:** the worker creates a single LLM client at startup and reuses it across all documents.
+- **Rate-limit retry:** each provider adapter retries once on 429 / ResourceExhausted with a 1-second backoff.
+- **Enrichment logging:** the worker tracks which tier populated each field in an `extraction_methods` dict (`"scraper"`, `"llm"`, `"llm_enrichment"`, `"regex"`) and logs a summary for every document. Enables monitoring of extraction quality per court.
 
-**Regex utilities.** A small set of regex-based extraction functions remain in `packages/scraper-framework/src/ingestion/extract.py` for fields not covered by LLM enrichment: case number extraction, hearing date extraction, judge name extraction, and case type inference from case number prefixes, scraper IDs, or motion types. These are lightweight fallbacks that supplement LLM extraction. Normalization functions for outcome and motion_type values are also in this module.
+**Reingestion.** Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`. Operates on **existing database records only** — it queries `documents` to find S3 keys to reprocess. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>`, which discovers documents directly from S3 keys.
 
-### 5.2.2 Enrichment Logging
+## 3.4 Application Layer
 
-The worker tracks which tier populated each field in an `extraction_methods` dict (values: `"scraper"`, `"llm"`, `"llm_enrichment"`, `"regex"`) and logs a summary for every document. This enables monitoring of extraction quality and identifying courts where scrapers should be improved to reduce LLM dependency.
+### 3.4.1 Dual API — GraphQL + Minimal REST
 
-### 5.2.3 Reingestion
+Judgemind exposes two API surfaces, both backed by the same data access layer.
 
-Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`. This script queries the `documents` table to find existing records, reads their archived content from S3, reconstructs ingestion events, and pushes them through the same extraction pipeline. This is used to backfill fields for documents that were ingested before LLM extraction was available, or after extraction logic improvements.
+**GraphQL API (internal, frontend).** The Next.js frontend communicates exclusively with GraphQL. Legal data is deeply relational — a single case involves a judge, multiple attorneys, parties, docket entries, documents, rulings, and motions — and GraphQL's nested query structure maps naturally to it. A case detail page that would require 5–7 REST calls can be served in one GraphQL query.
 
-**Important:** `reingest_from_s3.py` operates on **existing database records only**. If you run it for a county with no records in the `documents` table, it will process 0 documents silently. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>` instead — it discovers documents directly from S3 keys and does not require pre-existing database records.
-
-### 5.2.4 Additional Tier 1 Capabilities
-
-- **Summarization:** Partially implemented. Gated behind `ENABLE_RULING_SUMMARIZATION` env var. Uses Claude Haiku to generate one-paragraph summaries at ingestion time (`packages/scraper-framework/src/ingestion/ruling_summarizer.py`).
-- **Embedding generation:** Not yet implemented. Qdrant dependency declared but no embeddings are being produced.
-- **Version classification:** Not yet implemented. No LLM-based diffing for content hash mismatches.
-
-## 5.3 RAG Pipeline (Not Yet Implemented)
-
-User-facing generative AI features (document summarization, case assessment, etc.) will use retrieval-augmented generation grounded in actual court documents. This requires embedding generation (§5.2.4) to be implemented first. The pipeline design: retrieve relevant documents from Qdrant via semantic similarity → assemble context with source attribution → generate with citation requirements → verify citations against source material.
-
-# 6. Application Layer
-
-## 6.1 API Architecture — Dual API Pattern
-
-Judgemind exposes two API surfaces, both backed by the same data access layer. This ensures consistency while optimizing each API for its audience.
-
-### 6.1.1 GraphQL API (Internal, Frontend)
-
-The Next.js frontend communicates exclusively with the GraphQL API. GraphQL is the right fit for Judgemind’s data model because:
-
-Different views need different data slices. A case detail page, a judge profile page, and a search results page all query the same underlying entities but need different fields and relationships. GraphQL lets the frontend request exactly what it needs in one round trip.
-
-Legal data is deeply relational. A single case involves a judge, multiple attorneys, multiple parties, docket entries, documents, rulings, and motions. GraphQL’s nested query structure maps naturally to this.
-
-Performance: Eliminates the "chatty API" problem. A case detail page that would require 5–7 REST calls can be served in a single GraphQL query. This directly supports the requirement for a fast, responsive UI.
-
-### 6.1.2 REST API
-
-Currently minimal — two endpoints for document access:
+**REST API (minimal).** Two endpoints today, both for document access:
 - `/rest/document-download` — download original PDF/HTML from S3
 - `/rest/document-content` — retrieve document text content with charset handling
 
-A comprehensive public REST API (resource endpoints, OpenAPI docs, versioning, webhooks) is a future consideration if third-party integration demand materializes. For now, GraphQL serves all needs.
+Both APIs sit on a shared data access layer handling queries, caching, authorization, and business logic. This guarantees that a case retrieved via GraphQL and via REST is identical and subject to the same access controls.
 
-### 6.1.3 Shared Data Access Layer
+### 3.4.2 Web Application — Next.js
 
-Both APIs sit on top of a shared data access layer that handles database queries, caching, authorization, and business logic. This ensures that a case retrieved via GraphQL and the same case retrieved via REST are always identical and subject to the same access controls.
+Next.js provides server-side rendering for SEO and fast initial page loads, with client-side navigation for responsive navigation after first load. SSR matters because court data pages (judge profiles, case summaries, ruling text) should be indexable by search engines — particularly important for an open-source project that benefits from organic discovery.
 
-## 6.2 Web Application — Next.js
+### 3.4.3 Authentication & Authorization
 
-The web application is built with Next.js, providing server-side rendering for SEO and fast initial page loads, with client-side navigation for a responsive single-page application experience after first load.
+JWT-based authentication with refresh tokens. Two login methods: email/password (with email verification) and Google OAuth. Rate limiting on login attempts. Authorization is a simple admin flag on user records — no role-based access control beyond that.
 
-### 6.2.1 Why Next.js
+### 3.4.4 Cost Protection & Rate Limiting
 
-SEO: Court data pages (judge profiles, case summaries, ruling text) should be indexable by search engines. Server-side rendering ensures search engines see full content. This is particularly important for an open-source project that benefits from organic discovery.
+Judgemind is free, but the hosted instance is self-funded. Cost protection is built into every layer with variable cost exposure.
 
-Performance: Server-side rendering means users see content on first paint without waiting for client-side JavaScript to fetch data. Combined with GraphQL, this produces a fast, responsive experience.
+**API rate limiting.** Generous for normal use, aggressive against abuse. Per-user limits (baseline request budget for authenticated users; unauthenticated access heavily restricted for expensive endpoints), per-API-key limits, and anti-scraping patterns (sequential enumeration, high-volume document downloads, systematic crawling are detected and throttled). The irony of an open-source scraping platform blocking scrapers is acknowledged — anyone who wants bulk access can self-host.
 
-Developer experience: Next.js is the most widely adopted React framework with a large ecosystem. This matters for an open-source project that needs community contributors.
+**AI feature cost caps** (applied when AI features ship). Per-user daily AI budget, global AI spend ceiling with automatic per-user budget reduction if approached, tiered degradation to cheaper models under cost pressure rather than hard cutoffs, and abuse detection for non-human consumption patterns.
 
-## 6.3 Authentication & Authorization
+**Admin controls.** Platform administrators can adjust per-user and global rate limits without a code deploy (configuration-driven), throttle or suspend specific users generating disproportionate cost, temporarily disable specific AI features platform-wide, and view a real-time cost dashboard.
 
-JWT-based authentication with refresh tokens. Two login methods: email/password (with email verification) and Google OAuth. Rate limiting on login attempts. No role-based access control beyond a simple admin flag on user records.
+## 3.5 Infrastructure & Operations
 
-## 6.5 Cost Protection & Rate Limiting
+### 3.5.1 Hosted Instance
 
-Judgemind is free, but the hosted instance is self-funded. The platform must protect against both intentional abuse and unintentional cost spikes without degrading the experience for normal users. Cost protection is built into every layer that has variable cost exposure.
-
-### 6.5.1 API Rate Limiting
-
-Rate limits apply to both the GraphQL and REST APIs. Limits are generous for normal use and aggressive against abuse.
-
-Per-user limits: Authenticated users get a baseline request budget (e.g., 1,000 API calls/hour for search and data retrieval). Unauthenticated access is heavily restricted or disabled for expensive endpoints.
-
-Per-API-key limits: Third-party API keys have configurable rate limits. Default limits are generous for research and integration use. Keys that consistently hit limits can request increases (manual review).
-
-Anti-scraping: Patterns consistent with bulk scraping (sequential enumeration, high-volume document downloads, systematic crawling) are detected and throttled. The irony of an open-source scraping platform blocking scrapers is acknowledged, but the hosted instance has finite resources. Anyone who wants bulk access can self-host.
-
-### 6.5.2 AI Feature Cost Caps
-
-AI-powered features (Tiers 2 and 3) are the most expensive per-request operations. They require dedicated cost controls:
-
-Per-user daily AI budget: Each user gets a daily allocation of AI-powered operations (e.g., 20 document summaries, 5 case assessments, 2 motion drafts per day). Limits are set based on actual cost per operation and total AI budget. Users who hit their daily cap see a clear message explaining the limit and when it resets.
-
-Global AI spend ceiling: A platform-wide daily and monthly ceiling on total AI API spend. If the ceiling is approached, the system automatically reduces per-user AI budgets or temporarily queues non-urgent AI requests. This prevents a sudden influx of users from creating an unbounded cost spike.
-
-Tiered degradation: If cost pressure requires it, the system can downgrade AI operations to cheaper models (e.g., Haiku instead of Sonnet for summarization) rather than disabling features entirely. This is preferable to hard cutoffs from the user’s perspective.
-
-Abuse detection: Automated detection of patterns that suggest non-human or abusive use of AI features (e.g., rapid-fire summarization of hundreds of documents, which suggests automated consumption rather than a human researcher). Flagged accounts are throttled pending review.
-
-### 6.5.3 Admin Controls
-
-Platform administrators have the ability to:
-
-Adjust per-user and global rate limits and AI budgets without a code deploy (configuration-driven).
-
-Throttle or suspend specific users or API keys that are generating disproportionate cost.
-
-Temporarily disable specific AI features platform-wide if costs spike unexpectedly (emergency lever).
-
-View a real-time cost dashboard showing per-user, per-feature, and per-model spend with projections based on current usage trajectory.
-
-# 7. Infrastructure & Deployment
-
-## 7.1 Hosted Instance
-
-The primary Judgemind instance runs on AWS (us-west-2) using ECS Fargate for all compute. Fargate was chosen over EC2 or Kubernetes because it provides per-second billing with zero cluster management overhead — no nodes to patch, no autoscaler to tune, no idle capacity to pay for. At current scale this is significantly cheaper than maintaining a Kubernetes cluster.
+The primary Judgemind instance runs on AWS (us-west-2) using ECS Fargate for all compute. Fargate was chosen over EC2 or Kubernetes because it provides per-second billing with zero cluster management overhead.
 
 **Compute services (ECS Fargate):**
 
@@ -450,28 +282,24 @@ The primary Judgemind instance runs on AWS (us-west-2) using ECS Fargate for all
 
 All infrastructure is managed via Terraform (`infra/terraform/`).
 
-## 7.1.1 Domain Naming Convention
-
-All Judgemind services follow a consistent domain naming pattern. Production services use bare subdomains under `judgemind.org`. Non-production environments prefix the environment name to the service subdomain.
+**Domain naming convention.** Production services use bare subdomains under `judgemind.org`. Non-production environments prefix the environment name.
 
 | Service | Production | Dev |
 |---------|-----------|-----|
 | Web app | `judgemind.org` | `dev.judgemind.org` |
 | API     | `api.judgemind.org` | `dev.api.judgemind.org` |
 
-The pattern is `{env}.{service}.judgemind.org` for non-production and `{service}.judgemind.org` for production (web app uses the bare domain). This keeps the environment as a prefix, avoiding DNS conflicts where a parent subdomain's CNAME (e.g. `dev.` pointing to Vercel) would affect child subdomains (e.g. CAA record inheritance).
+The pattern is `{env}.{service}.judgemind.org` for non-production and `{service}.judgemind.org` for production. This keeps the environment as a prefix, avoiding DNS conflicts where a parent subdomain's CNAME (e.g. `dev.` pointing to Vercel) would affect child subdomains (e.g. CAA record inheritance).
 
-## 7.2 Local Development
+### 3.5.2 Local Development
 
-`docker-compose.yml` provides the full dependency stack for local development: PostgreSQL 16, Redis 7, OpenSearch 2.12, Qdrant, and MinIO (S3-compatible). Self-hosted production deployment is not a design goal.
+`docker-compose.yml` provides the full dependency stack for local development: PostgreSQL 16, Redis 7, OpenSearch 2.12, and MinIO (S3-compatible). Self-hosted production deployment is not a design goal.
 
-## 7.3 Monitoring & Observability
+### 3.5.3 Monitoring & Observability
 
 Monitoring uses CloudWatch for infrastructure metrics and alarms, GitHub Actions for automated data quality checks, and PostgreSQL for metrics storage. No Prometheus or Grafana — CloudWatch is the natural fit for ECS Fargate, and GitHub Actions workflows provide higher-level checks that integrate directly with the issue tracker.
 
-### 7.3.1 CloudWatch Alarms
-
-CloudWatch metric filters extract key signals from ECS task logs and ALB metrics:
+**CloudWatch alarms.** Metric filters extract key signals from ECS task logs and ALB metrics:
 
 | Alarm | Trigger | Severity |
 |---|---|---|
@@ -484,106 +312,109 @@ CloudWatch metric filters extract key signals from ECS task logs and ALB metrics
 
 Alarms publish to SNS topics (`judgemind-scraper-alerts-{env}`) which deliver to email.
 
-### 7.3.2 Automated Data Quality Checks
+**Automated data quality checks.** Two GitHub Actions workflows run hourly:
 
-Two GitHub Actions workflows run hourly and provide application-level monitoring:
+- **Data quality check** (`.github/workflows/data-quality-check.yml`, every hour at :15): runs `scripts/data-quality-check.py` on dev via ECS. Checks ingest rate drops, scraper staleness, zero rulings, field completeness regressions, orphaned documents. Persists per-county metrics to the `data_quality_metrics` DB table for dashboard display. Sends Telegram notifications for P1 alerts only.
+- **Site quality check** (`.github/workflows/site-quality-check.yml`, every hour at :30): validates `dev.judgemind.org` pages load with expected content and API GraphQL endpoint responds with expected shapes. Auto-creates/closes `site-quality-failure` issues.
 
-**Data quality check** (`.github/workflows/data-quality-check.yml`, every hour at :15):
-- Runs `scripts/data-quality-check.py` on dev via ECS
-- Checks ingest rate drops, scraper staleness, zero rulings, field completeness regressions, orphaned documents
-- Persists per-county metrics to the `data_quality_metrics` DB table for dashboard display
-- Sends Telegram notification only for P1 alerts (persistent, unresolvable conditions)
-- All alert details visible on `/admin/data-quality` dashboard (no GitHub issues filed)
+**Data quality dashboard.** An admin dashboard at `/admin/data-quality` shows per-county health status: county health tiles (green/yellow/red based on ruling count, field completeness, scraper freshness), 7-day time-series of key metrics, and drill-down with full metric history.
 
-**Site quality check** (`.github/workflows/site-quality-check.yml`, every hour at :30):
-- Validates `dev.judgemind.org` pages load with expected content
-- Validates API GraphQL endpoint responds with expected shapes
-- Auto-creates/closes `site-quality-failure` issues
+**ECS Container Insights** is enabled on all ECS clusters, providing automatic CPU, memory, network, and task health metrics.
 
-### 7.3.3 Data Quality Dashboard
+**Log retention.** Dev: 14 days. Production: 30 days. All ECS tasks write structured logs to CloudWatch log groups (`/ecs/judgemind-{service}-{env}`).
 
-An admin dashboard at `/admin/data-quality` shows per-county health status:
-- **OverviewGrid**: county health tiles (green/yellow/red) based on ruling count, field completeness, and scraper freshness
-- **MetricsChart**: 7-day time-series of key metrics from `data_quality_metrics` table
-- **CountyDetail**: drill-down with full metric history
+### 3.5.4 Testing Strategy
 
-Health thresholds: green (rulings > 0, completeness ≥ 90%, scraper < 6h old), yellow (completeness 70–90% or scraper 6–24h old), red (scraper > 24h or completeness < 70%).
+Testing a system that depends on live, external court websites presents a unique challenge. Court websites change without notice, and scraper correctness can only be verified against real court data. Judgemind's testing strategy uses the archived court pages it captures during normal operation as a regression test corpus.
 
-### 7.3.4 ECS Container Insights
+**Scraper testing.** Since the ingestion pipeline archives every page it captures, these archived pages form a natural regression test corpus. Three layers:
 
-Container Insights is enabled on all ECS clusters, providing automatic CPU, memory, network, and task health metrics without custom instrumentation.
+- **Baseline snapshot corpus.** For each court, a representative sample of archived pages (50–100 pages covering typical rulings, edge cases, holidays, multi-tentative cases, and clerk formatting variations). Each snapshot is paired with its "golden" extraction output.
+- **Regression testing on scraper changes.** When a scraper is modified, it runs against the full snapshot corpus for its court. Output is compared to golden. Discrepancies are reviewed: correct handling of a previously failing case → update golden; break on a previously passing case → reject or revise the change.
+- **Edge case fixtures.** Particularly tricky pages are tagged as permanent fixtures: multiple tentatives per case, holiday schedules, typo corrections, unusual clerk formatting, CAPTCHAs, pages from site redesigns.
 
-### 7.3.5 Log Retention
+**Application testing.** Unit tests for the data access layer, entity resolution, rate limiting, and auth. Integration tests that push a captured document through the ingestion pipeline and verify the final database state. GraphQL schema testing and TypeScript type checking (`tsc --noEmit`).
 
-Dev: 14 days. Production: 30 days. All ECS tasks write structured logs to CloudWatch log groups (`/ecs/judgemind-{service}-{env}`).
+**CI/CD.** GitHub Actions runs the full test suite on every pull request. Scraper regression tests run when scraper code is modified. The test suite must pass before merge.
 
-## 7.4 Testing Strategy
+### 3.5.5 Backup & Disaster Recovery
 
-Testing a system that depends on live, external court websites presents a unique challenge. The court websites change without notice, and scraper correctness can only be verified against real court data. Judgemind’s testing strategy uses the archived court pages it captures during normal operation as a regression test corpus.
+Judgemind has an unusual backup requirement: most of its data is public court records that could theoretically be re-scraped, but tentative rulings and other ephemeral data cannot be re-acquired once the court takes them down. Losing the tentative ruling archive means losing data that is irreplaceable.
 
-### 7.4.1 Scraper Testing
+**Document archive (critical).** The S3 document bucket is the most critical data to protect. Object versioning protects against accidental deletion or overwrite. Cross-region replication to a second region — if the primary region suffers a catastrophic failure, the archive survives. This is the one area where the cost of redundancy is justified regardless of budget pressure.
 
-Since the ingestion pipeline already archives every page it captures (raw HTML, PDFs, and DOCX files in object storage), these archived pages form a natural regression test corpus. The testing approach works in three layers:
+**PostgreSQL (mixed).** Daily snapshots with PITR, 30 days daily / 12 months weekly retention, regular restoration tests. Impact varies by namespace: loss of `public.*` is user-facing; loss of `derived.*` is a cost event (re-running ingestion); loss of `telemetry.*` is a monitoring gap. For `derived.*` drift or corruption, the preferred remediation is a county-scoped rebuild (`scripts/rebuild_db.py --county <name>`) rather than surgical mutation — rebuild exercises the real ingestion and enrichment pipeline, so it simultaneously validates any upstream fix and backfills existing rows.
 
-Baseline snapshot corpus: For each court, maintain a representative sample of archived pages (50–100 pages covering typical rulings, edge cases, holidays, multi-tentative cases, and clerk formatting variations). This sample is curated during the burn-in phase as interesting edge cases are discovered. Each snapshot is paired with the expected extraction output (the “golden” output that was validated during burn-in).
+**OpenSearch (rebuildable).** OpenSearch indices are derived from PostgreSQL and the document archive. They can be fully rebuilt from source. AWS-managed OpenSearch has automated snapshots.
 
-Regression testing on scraper changes: When a scraper is modified (to handle a new edge case, adapt to a site redesign, or fix a bug), the modified scraper runs against the full snapshot corpus for that court. Its output is compared to the golden output. Any discrepancies are reviewed: if the scraper correctly handles a previously failing case, the golden output is updated. If it breaks a previously passing case, the change is rejected or revised.
+# 4. Direction — Planned, Not Yet Built
 
-Edge case fixtures: Particularly interesting or tricky pages are tagged as permanent test fixtures. These include: pages with multiple tentative rulings for the same case, holiday schedule entries, typo corrections (paired with the original to test version deduplication), unusual clerk formatting, CAPTCHAs or access-denied pages (to test error handling), and pages from court website redesigns (to test detection of structural changes).
+This section describes work that is planned or aspirational. Nothing here is implemented, running, or exercised by users today. When any of these ships and is verified end-to-end in a deployed environment, move it to §3.
 
-### 7.4.2 Application Testing
+## 4.1 Validation Agent
 
-Standard application testing applies to the API and web layers:
+A lightweight LLM-based validation step between enrichment and database write. The goal is to catch data quality issues that regression tests and volume-based monitoring miss — particularly scrapers that run successfully but produce incorrect output (e.g., text assigned to the wrong case; ruling content from one entry overwriting another).
 
-Unit tests: Data access layer, entity resolution logic, rate limiting, and authentication. These are conventional and can use standard mocking.
+**Design.** The ingestion worker, after transcription and enrichment, would pass each document's extracted fields through a validation LLM call before writing to the database. The validator checks internal consistency (does the ruling text plausibly match the assigned case number and title?), field plausibility (is the judge name actually a name, not a court division header? Is the motion type a recognized legal motion?), cross-document consistency within multi-case PDFs (are all entries accounted for? Do entry counts match expected patterns for this court?), and court-specific learned rules (expected volume ranges per department, typical case number formats).
 
-Integration tests: End-to-end tests that push a captured document through the ingestion pipeline (transcription, enrichment, indexing) and verify the final state in the database.
+**Outcomes.** Pass → write to production normally. Flag → write to production but tag for async review in the admin dashboard. Fail → do not write; log the failure with full context; create a high-priority review item. No manual approval gate — at hundreds of documents per day, all validation is automated. Flagged items are reviewed asynchronously and feed back into scraper improvements.
 
-API tests: The GraphQL API is tested against its schema. TypeScript type checking (`tsc --noEmit`) ensures type safety across the API and frontend.
+**Cost target.** A cheap model (Haiku-class or Flash Lite), short prompt (extracted fields + ruling text excerpt, not full text). At ~1,000 documents/day, incremental LLM cost should be modest relative to existing enrichment costs.
 
-CI/CD: GitHub Actions runs the full test suite on every pull request. Scraper regression tests run as part of CI when scraper code is modified. The test suite must pass before merge.
+**Implementation approach.** Add validation as a step in the ingestion worker between enrichment and database write. No separate service or staging schema needed — the worker already has all the context. Validation results logged to a `validation_results` table (already exists in the `telemetry.*` namespace) for monitoring and the admin dashboard.
 
-## 7.5 Backup & Disaster Recovery
+## 4.2 Vector Search and Semantic Retrieval
 
-Judgemind has an unusual backup requirement: most of its data is public court records that could theoretically be re-scraped, but tentative rulings and other ephemeral data cannot be re-acquired once the court takes them down. Losing the tentative ruling archive means losing data that is irreplaceable. The backup strategy reflects this asymmetry.
+User-facing AI features (semantic search, RAG-grounded document summarization, case assessment) require a semantic retrieval layer that does not exist today.
 
-### 7.5.1 Document Archive (Critical)
+**Components planned:**
 
-The S3-compatible object store containing original captured documents (especially tentative rulings) is the most critical data to protect:
+- **Embedding generation.** A Tier 1 enrichment step that generates vector embeddings for each document and ruling. Cached permanently (embeddings never change for a fixed document).
+- **Vector store (Qdrant).** Stores document embeddings for similarity search with metadata filtering. Qdrant is already in `docker-compose.yml` from earlier aspirational work, but nothing in production writes to or reads from it — it is not deployed in AWS. When semantic search ships, Qdrant (or whichever vector DB is chosen at that point) will be deployed and populated by the ingestion worker.
+- **RAG pipeline.** The pipeline design: retrieve relevant documents via semantic similarity → assemble context with source attribution → generate with citation requirements → verify citations against source material. This is a prerequisite for user-facing generative AI features (document summarization, case assessment, etc.).
+- **Embedding-based entity resolution.** Current entity resolution (§3.2.1) uses normalized name matching only. Embedding-based resolution would improve judge/attorney disambiguation across formatting variants.
 
-Object versioning: Enabled on the document bucket. Protects against accidental deletion or overwrite.
+**Sequencing.** Embedding generation must ship first. Vector store deployment and RAG pipeline follow.
 
-Cross-region replication: The document archive is replicated to a second region. If the primary region suffers a catastrophic failure, the archive survives. This is the one area where the cost of redundancy is justified regardless of budget pressure.
+## 4.3 Ingestion Enhancements
 
-Versioning: The archive bucket has versioning enabled to protect against accidental deletion or overwrite. Object lock (WORM) is not currently enabled.
+### 4.3.1 Version Classification
 
-### 7.5.2 PostgreSQL (Mixed — Important)
+LLM-based classification of content-hash mismatches as substantive (content changed meaningfully) vs cosmetic (whitespace, typo fix). Would let the admin dashboard surface only substantive changes and avoid noise from minor reformatting.
 
-PostgreSQL contains both derived and authoritative data. The schema namespaces make the distinction explicit:
+### 4.3.2 Ruling Summarization
 
-- **`derived.*`** (courts, judges, cases, attorneys, parties, documents, rulings, court_directory_snapshots, and `*_aliases`): rebuildable from the S3 archive by re-running ingestion (`scripts/rebuild_db.py`). These tables are cacheable, disposable state. When they drift or become corrupted, the preferred remediation is a county-scoped rebuild rather than surgical mutation. Rebuild exercises the real ingestion and enrichment pipeline, so it simultaneously validates any upstream fix and backfills existing rows — a surgical delete/patch script only touches existing rows and leaves inbound data exposed to the same root cause. Surgical one-offs are also prone to their own bugs (wrong filter, missed edge case, partial mutation) and can easily create more damage than they repair.
-- **`public.*`** (users, refresh_tokens, alert_subscriptions, alert_events): authoritative accumulated state. Not derivable from S3. Requires standard backup protection.
-- **`staging.*`** (captures, ruled_items): transient pipeline buffers between ingestion stages. Disposable but not "rebuildable" in the archive sense — drain through the pipeline rather than rebuild from source.
-- **`telemetry.*`** (scraper_runs, validation_results, data_quality_metrics): accumulated observability data. Not derivable from S3. Low-stakes — loss impairs monitoring but not product.
+One-paragraph summaries generated at ingestion time using Claude Haiku. The code exists (`packages/scraper-framework/src/ingestion/ruling_summarizer.py`) and is gated behind `ENABLE_RULING_SUMMARIZATION`, currently off in production pending cost and quality evaluation before rollout. Summaries would be cached in `rulings.summary`.
 
-Backup practices: daily snapshots with PITR, 30 days daily / 12 months weekly retention, regular restoration tests. The backup covers all namespaces; loss of `public.*` is user-facing, loss of `derived.*` is a cost event (re-running ingestion), loss of `telemetry.*` is a monitoring gap.
+### 4.3.3 Archive-First for External Data Sources
 
-### 7.5.3 OpenSearch & Qdrant (Rebuildable)
+Two data sources are currently integrated but do not archive raw content to S3 before processing:
 
-Both OpenSearch indices and Qdrant vector collections are derived from PostgreSQL and the document archive. They can be fully rebuilt from source if lost, though rebuilding takes time. AWS-managed OpenSearch has automated snapshots. Neither requires the same level of protection as the document archive or PostgreSQL, since they are derived data stores.
+- **Ballotpedia** (`packages/scraper-framework/src/courts/ca/ballotpedia.py`): fetches judge biographical data. A future `external/ballotpedia/{content_hash}.html` prefix is planned.
+- **State bar associations**: not yet integrated. When added, raw responses should be archived under `external/{source}/{content_hash}.html`.
 
-# 8. Security & Trust
+The planned `external/{source}/{content_hash}.html` prefix will follow the same content-addressed scheme as ruling archives.
+
+## 4.4 Public REST API
+
+The current REST surface is minimal (two document-access endpoints — see §3.4.1). A comprehensive public REST API (resource endpoints, OpenAPI docs, versioning, webhooks) is a future consideration if third-party integration demand materializes. For now, GraphQL serves all needs.
+
+## 4.5 Predictive Models
+
+Motion-outcome prediction based on case features, judge, and precedent. Deferred until 18+ months of clean data accumulation. The prediction system will require its own architecture review when the time comes.
+
+# 5. Security & Trust
+
+Cross-cutting; applies to the Today implementation and any Direction work that ships.
 
 Judgemind handles public court data, but user accounts require standard security practices. Secrets are stored in AWS Secrets Manager. All traffic is TLS-terminated. JWT tokens have short expiry with refresh token rotation.
 
-# 9. Technology Stack Summary
+# 6. Open Questions
 
-# 10. Open Questions & Decisions Deferred
+**Tier 1 self-hosting threshold.** The crossover point where self-hosted GPU becomes cheaper than hosted API calls depends on actual document volume and per-document token counts. Currently using Google GenAI (Flash Lite) for transcription and Claude Haiku for enrichment — both cheap enough that self-hosting is not justified at current scale. Phase 2 evaluation: if Tier 1 costs exceed ~$3,000/month (indicating ~10,000+ documents/day), consider a single A100 instance (~$1,500/month) running Llama or Mistral.
 
-Tier 1 self-hosting threshold. The crossover point where self-hosted GPU becomes cheaper than hosted API calls depends on actual document volume and per-document token counts. Currently using Google GenAI (Flash Lite) for transcription and Claude Haiku for enrichment — both are cheap enough that self-hosting is not justified at current scale.
+**When to ship semantic search.** Depends on whether full-text search (OpenSearch) proves sufficient for user needs or whether users demand semantic/RAG features strongly enough to justify the embedding generation + vector DB cost and complexity.
 
-Embedding generation and semantic search. When to build this depends on whether full-text search (OpenSearch) is sufficient for user needs or whether semantic/RAG features are demanded.
+**Predictive model architecture.** Deferred until 18+ months of data accumulation. Architecture review happens when the time comes.
 
-Predictive model architecture. Deferred until 18+ months of data accumulation. The prediction system will require its own architecture review when the time comes.
-
-End of Document
+End of document.
