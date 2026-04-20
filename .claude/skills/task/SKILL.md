@@ -165,16 +165,24 @@ Once MCP writes are unblocked (follow-up issue referenced from `docs/agent/gh-to
 Run the helper (stays in the foreground — use `timeout: 1200000` since the ECS-Exec code path takes 2-4 s per call):
 
 ```
-scripts/dispatcher/task_claim.py claim \
+python3 {worktree}/scripts/dispatcher/task_claim.py claim \
     --issue <N> \
-    --agent-id <agent-id> \
     --worktree-path {worktree}
 ```
 
-The `<agent-id>` must be the id derived from the worktree directory name (e.g. `agent-a56f2e57`). Exit codes:
+The helper **generates a fresh UUID for you** and writes it to `{worktree}/.task-agent-id` (the "sidecar") so the later `terminal` call can recover it without the caller threading state through the rest of the /task flow. The JSON emitted on stdout includes the UUID:
+
+```
+{"status": "claimed", "issue_number": 2866, "agent_id": "aabbccdd-eeff-..."}
+```
+
+**Do NOT pass `--agent-id` with the short worktree suffix** (e.g. `agent-a56f2e57`). The DB column is `uuid` — non-UUID values fail the INSERT with `invalid input syntax for type uuid`. Issue #2892 was the bug. The helper's own `uuid4()` is the right shape; let it do the work.
+
+Exit codes:
 
 - **`0`** — claim row inserted successfully. Continue to Part B.
 - **`2`** — **claim lost to a prior owner.** The helper printed a JSON payload on stdout with `owner_kind` (either `task` for the Fargate daemon or `task-skill` for another /task subagent) and `owner_agent_id`. Do **not** proceed — another worker owns this issue right now. Print the payload and stop. The operator will see the message and either wait for the other agent or cancel it.
+- **`3`** — **configuration error.** The caller handed the helper something the DB rejected at the column-type level (e.g. a non-UUID explicit `--agent-id`). This is a bug in the /task skill or an override the operator supplied by hand. Surface the stderr and stop — retrying with the same args will fail again.
 - **`1`** — unexpected error (DB down, dev-db-query.sh missing, auth problem). Surface the stderr message and stop.
 
 The helper uses `DATABASE_URL` when set (Fargate /task paths) and falls back to `scripts/dev-db-query.sh --rw` (laptop /task paths). Both shells write the same `kind='task-skill'` + `status='running'` row.
@@ -192,13 +200,15 @@ Idempotent — `gh` ignores the request if the label is already present.
 **MANDATORY teardown on terminal.** On any terminal state (PR merged, verification passed, blocker, investigation closed), run:
 
 ```
-scripts/dispatcher/task_claim.py terminal \
-    --agent-id <agent-id> \
+python3 {worktree}/scripts/dispatcher/task_claim.py terminal \
+    --worktree-path {worktree} \
     --status <succeeded|failed> \
     [--pr-number <N>]
 
 gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
 ```
+
+The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim`), so you don't need to remember or pass it. If the sidecar is missing you can still pass `--agent-id <uuid>` explicitly — but in the normal /task flow, `--worktree-path` is all you need.
 
 Terminal status values:
 - `succeeded` — PR merged + deploy verified + evidence comment posted (normal success path).
@@ -309,10 +319,10 @@ Skip this for Terraform-only or docs-only tasks.
 - **For ingestion/extraction pipeline tasks** (scraper changes, LLM prompt changes, enrichment logic): use the local dev stack to iterate. The local DB + S3 cache enables fast iteration without deploying to dev. Run `scripts/rebuild_db.sh --skip-reset` to re-process documents through the pipeline and verify data correctness against source documents. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify that extracted fields match the source document, not just that fields are populated.
 - If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Before stopping, **release the claim interlock** (issue #2866) so the issue isn't permanently hidden from future agents:
   ```
-  scripts/dispatcher/task_claim.py terminal --agent-id <agent-id> --status failed
+  python3 {worktree}/scripts/dispatcher/task_claim.py terminal --worktree-path {worktree} --status failed
   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
   ```
-  Then stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
+  The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim` in Step 2a). Then stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
 
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
@@ -491,15 +501,15 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 **Record terminal status in the `dispatcher.agents` ledger (issue #2866).** The claim row inserted in Step 2a must be closed out so the next /task or daemon claim on this issue can acquire the partial-UNIQUE-INDEX slot. Run this *before* A.8 deploy-watch so the slot releases promptly even if deploy verification drags:
 
 ```
-scripts/dispatcher/task_claim.py terminal \
-    --agent-id <agent-id> \
+python3 {worktree}/scripts/dispatcher/task_claim.py terminal \
+    --worktree-path {worktree} \
     --status succeeded \
     --pr-number <PR-N>
 
 gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
 ```
 
-Best-effort — both commands exit 0 on no-op (row already terminal, label already absent). A failure here is logged but does not block A.8.
+The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim` in Step 2a). Best-effort — both commands exit 0 on no-op (row already terminal, label already absent). A failure here is logged but does not block A.8.
 
 #### A.8 — Verify deployment and post evidence (MANDATORY)
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
@@ -688,14 +698,14 @@ gh issue close <N> --repo judgemind/judgemind --reason completed
 **Record terminal status in the `dispatcher.agents` ledger (issue #2866).** The claim row inserted in Step 2a must be released so a future investigation or follow-up /task on this issue can acquire the partial-UNIQUE-INDEX slot:
 
 ```
-scripts/dispatcher/task_claim.py terminal \
-    --agent-id <agent-id> \
+python3 {worktree}/scripts/dispatcher/task_claim.py terminal \
+    --worktree-path {worktree} \
     --status succeeded
 
 gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
 ```
 
-Best-effort — both commands exit 0 on no-op (row already terminal, label already absent).
+The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim` in Step 2a). Best-effort — both commands exit 0 on no-op (row already terminal, label already absent).
 
 #### B.3 — Unblock dependent issues
 

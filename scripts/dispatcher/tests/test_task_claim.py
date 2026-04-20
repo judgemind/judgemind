@@ -59,6 +59,13 @@ import psycopg  # noqa: E402  — re-import after stub install
 
 from dispatcher import task_claim  # noqa: E402  — sys.path mutation above
 
+# A valid UUID to use as the ``agent_id`` in tests that don't care
+# about the specific value — matches the ``str(uuid.uuid4())`` shape
+# ``dispatcher.agents.agent_id`` expects (issue #2892 — bare hex
+# strings like ``"abc"`` or ``"agent-a56f2e57"`` fail the real DB
+# column's ``InvalidTextRepresentation`` check).
+_VALID_AGENT_ID = "aabbccdd-eeff-0011-2233-445566778899"
+
 
 # --------------------------------------------------------------------------
 # Shared fakes — mirror the _FakeCursor / _FakeConnection pattern from
@@ -310,6 +317,358 @@ class TestClaimViaDbQuerySh:
                 issue_title=None,
             )
 
+    def test_invalid_uuid_error_raises_configuration_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test for issue #2892.
+
+        The old classifier treated ``InvalidTextRepresentation`` (caller
+        bug — non-UUID agent_id) as a generic RuntimeError, which the
+        /task skill was supposed to treat as "stop" but in practice
+        silently swallowed. Surface it as a distinct
+        :class:`ClaimConfigurationError` so ``do_claim`` can emit exit
+        code 3.
+        """
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 1
+            r.stdout = ""
+            # Exact error text reproduced from running the helper
+            # against dev RDS with agent_id='agent-a5d7e546':
+            r.stderr = (
+                "Database error: invalid input syntax for type uuid: "
+                '"agent-a5d7e546"\n'
+                "LINE 1: ...ssue_title, worktree_path, phase, status) "
+                "VALUES ('agent-a5d...\n"
+            )
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        with pytest.raises(task_claim.ClaimConfigurationError):
+            task_claim._claim_via_db_query_sh(
+                issue_number=2866,
+                agent_id="agent-a5d7e546",
+                worktree_path="/tmp/wt",
+                issue_title=None,
+            )
+
+    def test_json_parser_strips_ecs_exec_trailer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test for issue #2892.
+
+        ``aws ecs execute-command`` wraps command output with a session
+        preamble and a ``Cannot perform start session: EOF`` trailer.
+        The old parser's fallback used ``stdout[stdout.find("{"):]``
+        which leaves the trailer in the slice, so ``json.loads`` fails
+        and the whole claim comes back as a generic RuntimeError.
+        Use :meth:`json.JSONDecoder.raw_decode` to read exactly one
+        JSON value and ignore the trailer.
+        """
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = (
+                "\n"
+                "The Session Manager plugin was installed successfully. "
+                "Use the AWS CLI to start a session.\n"
+                "\n"
+                "\n"
+                "Starting session with SessionId: "
+                "ecs-execute-command-abc123\n"
+                '{"rowcount": 1}\n'
+                "Cannot perform start session: EOF\n"
+            )
+            r.stderr = "Running query on dev database via ECS Exec...\n"
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = task_claim._run_sql_via_db_query_sh("INSERT INTO x VALUES (1)")
+        assert result == {"rowcount": 1}
+
+    def test_json_parser_handles_select_list_payload_with_trailer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same as above but for SELECT-shape payloads (a JSON array).
+
+        The owner-lookup code path reads a list of row dicts; it hits
+        the same ECS Exec trailer and must parse just the array.
+        """
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = (
+                "Starting session with SessionId: ecs-abc\n"
+                '[{"owner_agent_id": "daemon-uuid", "owner_kind": "task"}]\n'
+                "Cannot perform start session: EOF\n"
+            )
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = task_claim._run_sql_via_db_query_sh("SELECT 1")
+        assert isinstance(result, list)
+        assert result[0]["owner_agent_id"] == "daemon-uuid"
+
+
+class TestExtractFirstJsonValue:
+    """Direct tests for the raw-decode helper — fast path + trailing-noise."""
+
+    def test_pure_json_object(self) -> None:
+        assert task_claim._extract_first_json_value('{"rowcount": 1}') == {
+            "rowcount": 1
+        }
+
+    def test_pure_json_array(self) -> None:
+        assert task_claim._extract_first_json_value("[1, 2, 3]") == [1, 2, 3]
+
+    def test_strips_ecs_exec_trailer(self) -> None:
+        payload = (
+            "Starting session with SessionId: ecs-xyz\n"
+            '{"rowcount": 1}\n'
+            "Cannot perform start session: EOF\n"
+        )
+        assert task_claim._extract_first_json_value(payload) == {"rowcount": 1}
+
+    def test_raw_decode_prefers_outer_object_over_inner_string_literal(
+        self,
+    ) -> None:
+        """Ensure the raw_decode scan prefers the outer wrapping object.
+
+        If someone embeds a ``{`` inside a string literal earlier in the
+        payload, we want the outer object — not the start of a string
+        value. ``raw_decode`` is naturally greedy-forward so the first
+        successful raw_decode at the first ``[``/``{`` wins, which is
+        exactly what we want.
+        """
+        payload = '{"outer": {"inner": 1}}'
+        assert task_claim._extract_first_json_value(payload) == {"outer": {"inner": 1}}
+
+    def test_no_json_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="non-JSON stdout"):
+            task_claim._extract_first_json_value("no json here at all")
+
+
+class TestIsUuid:
+    """Regression tests for the UUID validator added in #2892."""
+
+    def test_accepts_canonical_uuid(self) -> None:
+        assert task_claim._is_uuid("aabbccdd-eeff-0011-2233-445566778899")
+
+    def test_rejects_short_hex(self) -> None:
+        # This is the exact bug shape from #2892 — worktree basenames
+        # are ``agent-<8 hex chars>`` which is NOT a UUID.
+        assert not task_claim._is_uuid("agent-a56f2e57")
+
+    def test_rejects_bare_hex(self) -> None:
+        assert not task_claim._is_uuid("abc")
+
+    def test_rejects_empty(self) -> None:
+        assert not task_claim._is_uuid("")
+
+    def test_accepts_uuid_without_hyphens(self) -> None:
+        # ``uuid.UUID`` accepts no-hyphen form too; we don't care as
+        # long as Postgres's UUID type would accept it.
+        assert task_claim._is_uuid("aabbccddeeff00112233445566778899")
+
+
+class TestAgentIdSidecar:
+    """The claim→terminal handshake via ``<worktree>/.task-agent-id``."""
+
+    def test_write_then_read_round_trips(self, tmp_path: Path) -> None:
+        task_claim._write_agent_id_sidecar(str(tmp_path), _VALID_AGENT_ID)
+        recovered = task_claim._read_agent_id_sidecar(str(tmp_path))
+        assert recovered == _VALID_AGENT_ID
+
+    def test_read_returns_none_when_missing(self, tmp_path: Path) -> None:
+        # tmp_path exists but no sidecar written yet.
+        assert task_claim._read_agent_id_sidecar(str(tmp_path)) is None
+
+    def test_read_rejects_non_uuid_contents(self, tmp_path: Path) -> None:
+        """A sidecar with non-UUID contents is treated as missing.
+
+        Defends against ancient sidecars that predate the UUID fix
+        (e.g. containing ``agent-a56f2e57``) — don't propagate the bad
+        value into an INSERT that would fail again.
+        """
+        (tmp_path / task_claim.AGENT_ID_SIDECAR_NAME).write_text(
+            "agent-a56f2e57\n", encoding="utf-8"
+        )
+        assert task_claim._read_agent_id_sidecar(str(tmp_path)) is None
+
+    def test_write_creates_parent_dir(self, tmp_path: Path) -> None:
+        # Nested non-existent path — write should create it.
+        nested = tmp_path / "nested"
+        task_claim._write_agent_id_sidecar(str(nested), _VALID_AGENT_ID)
+        assert (nested / task_claim.AGENT_ID_SIDECAR_NAME).exists()
+
+
+class TestDoClaimUuidGeneration:
+    """``do_claim`` generates a UUID when ``agent_id`` is None — #2892."""
+
+    def test_none_agent_id_generates_uuid_and_writes_sidecar(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """Pass ``agent_id=None``; verify a UUID was generated, passed
+        to the DB path, emitted in the JSON response, and persisted to
+        the sidecar."""
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        captured_agent_ids: list[str] = []
+
+        def fake_claim(
+            database_url: str,
+            issue_number: int,
+            agent_id: str,
+            worktree_path: str,
+            issue_title: str | None,
+        ) -> None:
+            captured_agent_ids.append(agent_id)
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
+        rc = task_claim.do_claim(2866, None, str(tmp_path), None)
+        assert rc == 0
+        assert len(captured_agent_ids) == 1
+        generated = captured_agent_ids[0]
+        assert task_claim._is_uuid(generated)
+
+        # Sidecar round-trips.
+        sidecar = tmp_path / task_claim.AGENT_ID_SIDECAR_NAME
+        assert sidecar.exists()
+        assert sidecar.read_text(encoding="utf-8").strip() == generated
+
+        # JSON response carries the agent_id.
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["agent_id"] == generated
+
+    def test_non_uuid_agent_id_returns_three(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Regression test: ``agent-a5d7e546`` (the exact shape #2892
+        documents in SKILL.md) must fail fast at the validator, not
+        round-trip to the DB."""
+        rc = task_claim.do_claim(2892, "agent-a5d7e546", "/tmp/wt", None)
+        assert rc == 3
+        err = capsys.readouterr().err
+        assert "agent-a5d7e546" in err
+        assert "UUID" in err
+
+    def test_configuration_error_from_db_returns_three(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """If the DB returns InvalidTextRepresentation despite client-
+        side UUID validation (edge case — e.g. caller passed a valid
+        UUID but the psycopg path tripped something else), surface as
+        exit 3 not exit 1."""
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+
+        def raise_cfg(*_a: Any, **_k: Any) -> None:
+            raise task_claim.ClaimConfigurationError("invalid input syntax")
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", raise_cfg)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
+        assert rc == 3
+        err = capsys.readouterr().err
+        assert "configuration error" in err.lower()
+
+
+class TestDoTerminalSidecarRecovery:
+    """``do_terminal`` recovers ``agent_id`` from the sidecar — #2892."""
+
+    def test_sidecar_recovery_round_trip(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Write a sidecar, then call ``do_terminal`` with only a
+        worktree path — it should recover the agent_id and pass it to
+        the terminal DB path."""
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        task_claim._write_agent_id_sidecar(str(tmp_path), _VALID_AGENT_ID)
+
+        captured: list[str] = []
+
+        def fake_terminal(
+            database_url: str,
+            agent_id: str,
+            status: str,
+            pr_number: int | None,
+        ) -> int:
+            captured.append(agent_id)
+            return 1
+
+        monkeypatch.setattr(task_claim, "_terminal_via_psycopg", fake_terminal)
+        rc = task_claim.do_terminal(None, "succeeded", None, str(tmp_path))
+        assert rc == 0
+        assert captured == [_VALID_AGENT_ID]
+
+    def test_missing_sidecar_and_no_agent_id_returns_three(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        # tmp_path has no sidecar.
+        rc = task_claim.do_terminal(None, "succeeded", None, str(tmp_path))
+        assert rc == 3
+        err = capsys.readouterr().err
+        assert "sidecar" in err.lower()
+
+    def test_neither_agent_id_nor_worktree_returns_three(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = task_claim.do_terminal(None, "succeeded", None, None)
+        assert rc == 3
+        err = capsys.readouterr().err
+        assert "either --agent-id or --worktree-path" in err
+
+    def test_explicit_agent_id_wins_over_sidecar(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """If the caller passes ``--agent-id`` explicitly, use that and
+        ignore the sidecar. Sidecar is a fallback, not an override."""
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        task_claim._write_agent_id_sidecar(str(tmp_path), _VALID_AGENT_ID)
+
+        # Different UUID for the explicit arg.
+        other_uuid = "00112233-4455-6677-8899-aabbccddeeff"
+        captured: list[str] = []
+
+        def fake_terminal(
+            database_url: str,
+            agent_id: str,
+            status: str,
+            pr_number: int | None,
+        ) -> int:
+            captured.append(agent_id)
+            return 1
+
+        monkeypatch.setattr(task_claim, "_terminal_via_psycopg", fake_terminal)
+        rc = task_claim.do_terminal(other_uuid, "succeeded", None, str(tmp_path))
+        assert rc == 0
+        assert captured == [other_uuid]
+
+    def test_invalid_explicit_agent_id_returns_three(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = task_claim.do_terminal("not-a-uuid", "succeeded", None, None)
+        assert rc == 3
+        err = capsys.readouterr().err
+        assert "UUID" in err
+
 
 # --------------------------------------------------------------------------
 # _terminal_via_psycopg — psycopg terminal UPDATE
@@ -371,12 +730,16 @@ class TestDoClaim:
             called.append({"args": args, "kwargs": kwargs})
 
         monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
-        rc = task_claim.do_claim(2866, "abc", "/tmp/wt", None)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
         assert rc == 0
         assert len(called) == 1
         captured = capsys.readouterr()
         payload = json.loads(captured.out.strip())
-        assert payload == {"status": "claimed", "issue_number": 2866}
+        # Payload now includes ``agent_id`` so the terminal call can
+        # recover it if the sidecar somehow fails to write.
+        assert payload["status"] == "claimed"
+        assert payload["issue_number"] == 2866
+        assert payload["agent_id"] == _VALID_AGENT_ID
 
     def test_claim_lost_returns_two_and_emits_owner_json(
         self,
@@ -400,7 +763,7 @@ class TestDoClaim:
         monkeypatch.setattr(task_claim, "_claim_via_psycopg", raise_claim_lost)
         monkeypatch.setattr(task_claim, "_lookup_owner_via_psycopg", fake_lookup)
 
-        rc = task_claim.do_claim(2866, "abc", "/tmp/wt", None)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
         assert rc == 2
         out = capsys.readouterr()
         payload = json.loads(out.out.strip())
@@ -431,7 +794,7 @@ class TestDoClaim:
             task_claim, "_lookup_owner_via_psycopg", lambda *_a, **_k: None
         )
 
-        rc = task_claim.do_claim(2866, "abc", "/tmp/wt", None)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
         assert rc == 2
         payload = json.loads(capsys.readouterr().out.strip())
         assert payload["issue_number"] == 2866
@@ -448,7 +811,7 @@ class TestDoClaim:
             raise RuntimeError("boom")
 
         monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
-        rc = task_claim.do_claim(2866, "abc", "/tmp/wt", None)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
         assert rc == 1
         err = capsys.readouterr().err
         assert "boom" in err
@@ -464,7 +827,7 @@ class TestDoClaim:
             called.append((args, kwargs))
 
         monkeypatch.setattr(task_claim, "_claim_via_db_query_sh", fake_claim_sh)
-        rc = task_claim.do_claim(2866, "abc", "/tmp/wt", None)
+        rc = task_claim.do_claim(2866, _VALID_AGENT_ID, "/tmp/wt", None)
         assert rc == 0
         assert len(called) == 1
 
@@ -486,7 +849,7 @@ class TestDoTerminal:
             "_terminal_via_psycopg",
             lambda *_a, **_k: 1,
         )
-        rc = task_claim.do_terminal("abc", "succeeded", 42)
+        rc = task_claim.do_terminal(_VALID_AGENT_ID, "succeeded", 42, None)
         assert rc == 0
         payload = json.loads(capsys.readouterr().out.strip())
         assert payload["status"] == "terminal_recorded"
@@ -504,7 +867,7 @@ class TestDoTerminal:
             "_terminal_via_psycopg",
             lambda *_a, **_k: 0,
         )
-        rc = task_claim.do_terminal("missing", "failed", None)
+        rc = task_claim.do_terminal(_VALID_AGENT_ID, "failed", None, None)
         assert rc == 0
         err = capsys.readouterr().err
         assert "matched 0 rows" in err
@@ -520,7 +883,7 @@ class TestDoTerminal:
             raise RuntimeError("db down")
 
         monkeypatch.setattr(task_claim, "_terminal_via_psycopg", fake_terminal)
-        rc = task_claim.do_terminal("abc", "succeeded", None)
+        rc = task_claim.do_terminal(_VALID_AGENT_ID, "succeeded", None, None)
         assert rc == 1
         err = capsys.readouterr().err
         assert "db down" in err
@@ -561,10 +924,15 @@ class TestMain:
     def test_terminal_subcommand_dispatches_to_do_terminal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        captured: list[tuple[str, str, int | None]] = []
+        captured: list[tuple[str, str, int | None, str | None]] = []
 
-        def fake_do_terminal(agent_id: str, status: str, pr_number: int | None) -> int:
-            captured.append((agent_id, status, pr_number))
+        def fake_do_terminal(
+            agent_id: str,
+            status: str,
+            pr_number: int | None,
+            worktree_path: str | None,
+        ) -> int:
+            captured.append((agent_id, status, pr_number, worktree_path))
             return 0
 
         monkeypatch.setattr(task_claim, "do_terminal", fake_do_terminal)
@@ -572,7 +940,7 @@ class TestMain:
             [
                 "terminal",
                 "--agent-id",
-                "abc",
+                _VALID_AGENT_ID,
                 "--status",
                 "succeeded",
                 "--pr-number",
@@ -580,7 +948,40 @@ class TestMain:
             ]
         )
         assert rc == 0
-        assert captured == [("abc", "succeeded", 42)]
+        assert captured == [(_VALID_AGENT_ID, "succeeded", 42, None)]
+
+    def test_terminal_with_worktree_path_threads_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--worktree-path`` on ``terminal`` threads through to do_terminal.
+
+        Guards the sidecar-recovery code path — the /task skill's
+        terminal call passes ``--worktree-path`` (not ``--agent-id``)
+        after the ``claim`` wrote the sidecar.
+        """
+        captured: list[tuple[Any, ...]] = []
+
+        def fake_do_terminal(
+            agent_id: Any,
+            status: str,
+            pr_number: int | None,
+            worktree_path: str | None,
+        ) -> int:
+            captured.append((agent_id, status, pr_number, worktree_path))
+            return 0
+
+        monkeypatch.setattr(task_claim, "do_terminal", fake_do_terminal)
+        rc = task_claim.main(
+            [
+                "terminal",
+                "--worktree-path",
+                "/tmp/wt",
+                "--status",
+                "succeeded",
+            ]
+        )
+        assert rc == 0
+        assert captured == [(None, "succeeded", None, "/tmp/wt")]
 
     def test_terminal_rejects_invalid_status(
         self, capsys: pytest.CaptureFixture[str]
@@ -590,7 +991,7 @@ class TestMain:
                 [
                     "terminal",
                     "--agent-id",
-                    "abc",
+                    _VALID_AGENT_ID,
                     "--status",
                     "crashed",  # not in VALID_TERMINAL_STATUSES
                 ]
