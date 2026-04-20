@@ -255,26 +255,33 @@ describe('DispatcherDashboard', () => {
     }
   });
 
-  it('invokes dispatcherControl with "pause" when the Pause button is clicked', () => {
+  it('invokes dispatcherControl with "stop" when the Stop button is clicked (#2884 graceful)', () => {
     mockQueryResult.data = makeActiveState();
     mockQueryResult.loading = false;
     render(<DispatcherDashboard />);
-    const pauseButton = screen.getByRole('button', { name: /Pause/i });
-    fireEvent.click(pauseButton);
+    // #2884: Stop is graceful — no confirm modal, fires immediately.
+    // This is the whole point of the simplification: stopping dev
+    // work should not be friction-heavy.
+    const stopButton = screen.getByRole('button', { name: /^stop$/i });
+    fireEvent.click(stopButton);
     expect(mockMutationFn).toHaveBeenCalledTimes(1);
     expect(mockMutationFn).toHaveBeenCalledWith(
       expect.objectContaining({
-        variables: { command: 'pause', payload: {} },
+        variables: { command: 'stop', payload: {} },
       }),
     );
+    // #2884: no X-MFA-Token header — the MFA re-auth placeholder was
+    // removed. Admin session auth is the only gate.
+    const call = mockMutationFn.mock.calls[0][0];
+    expect(call.context).toBeUndefined();
   });
 
-  it('requires confirmation for destructive commands', () => {
+  it('requires confirmation for Force Stop (immediate abort, destructive)', () => {
     mockQueryResult.data = makeActiveState();
     mockQueryResult.loading = false;
     render(<DispatcherDashboard />);
-    const drainButton = screen.getByRole('button', { name: /Stop \(drain\)/i });
-    fireEvent.click(drainButton);
+    const forceStopButton = screen.getByRole('button', { name: /force stop/i });
+    fireEvent.click(forceStopButton);
     // Mutation NOT yet invoked — waiting on confirm modal.
     expect(mockMutationFn).not.toHaveBeenCalled();
     // Confirm dialog should have appeared.
@@ -282,12 +289,30 @@ describe('DispatcherDashboard', () => {
     fireEvent.click(confirmButton);
     expect(mockMutationFn).toHaveBeenCalledWith(
       expect.objectContaining({
-        variables: { command: 'drain', payload: {} },
-        context: expect.objectContaining({
-          headers: expect.objectContaining({ 'X-MFA-Token': expect.any(String) }),
-        }),
+        variables: { command: 'force_stop', payload: {} },
       }),
     );
+    // #2884: no X-MFA-Token header — even for the destructive
+    // variant. Admin session auth is sufficient; the confirm modal
+    // provides the "are you sure" friction.
+    const call = mockMutationFn.mock.calls[0][0];
+    expect(call.context).toBeUndefined();
+  });
+
+  it('renders exactly three control buttons (#2884): Start, Stop, Force Stop', () => {
+    mockQueryResult.data = makeActiveState();
+    mockQueryResult.loading = false;
+    render(<DispatcherDashboard />);
+    const controls = screen.getByTestId('dispatcher-controls');
+    const buttons = controls.querySelectorAll('button');
+    expect(buttons.length).toBe(3);
+    expect(buttons[0]).toHaveTextContent(/^start$/i);
+    expect(buttons[1]).toHaveTextContent(/^stop$/i);
+    expect(buttons[2]).toHaveTextContent(/^force stop$/i);
+    // Pause/Resume/Drain must be gone.
+    expect(screen.queryByRole('button', { name: /^pause$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^resume$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /stop \(drain\)/i })).toBeNull();
   });
 
   it('renders an error banner when the query errors', () => {

@@ -7,7 +7,6 @@ import { useAuth } from '@/providers/AuthProvider';
 import { ErrorBanner } from '@/components/ErrorBanner';
 import { PAGE_TITLE } from '@/lib/typography';
 import {
-  DESTRUCTIVE_COMMANDS,
   DISPATCHER_CONTROL_MUTATION,
   DISPATCHER_SET_CONFIG_MUTATION,
   DISPATCHER_STATE_QUERY,
@@ -130,17 +129,11 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     async (command: DispatcherCommand, payload: Record<string, unknown> = {}) => {
       setCommandError(null);
       try {
+        // #2884: the X-MFA-Token placeholder was removed — admin
+        // session auth is the only gate. No per-command context
+        // headers needed.
         await dispatcherControl({
           variables: { command, payload },
-          // Destructive commands require a non-empty X-MFA-Token header per
-          // the Phase 1 placeholder in `dispatcher/auth.ts`. We always send
-          // it so the destructive flow succeeds; a follow-up wires the real
-          // MFA challenge flow (#2761). Non-destructive paths omit the
-          // header to avoid any confusion if/when the backend starts
-          // distinguishing admin-with-MFA from admin.
-          context: DESTRUCTIVE_COMMANDS.has(command)
-            ? { headers: { 'X-MFA-Token': 'phase1-placeholder' } }
-            : undefined,
         });
         // Kick an immediate refetch so the page doesn't wait up to 2s for
         // the next poll to reflect the newly-written command row.
@@ -156,7 +149,13 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   const handleControlClick = useCallback(
     (command: DispatcherCommand) => {
       setCommandError(null);
-      if (DESTRUCTIVE_COMMANDS.has(command)) {
+      // #2884: `force_stop` is the only control command that confirms
+      // via modal — it aborts in-flight work. `stop` is graceful
+      // (in-flight agent finishes its current phase) and `start` is
+      // safe, so both fire without a confirmation prompt. The whole
+      // point of the simplification is that stopping dev work should
+      // NOT be friction-heavy for the operator.
+      if (command === 'force_stop') {
         setPendingCommand(command);
         return;
       }
@@ -166,10 +165,10 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   );
 
   /**
-   * Internal helper that actually calls `dispatcherSetConfig` with the
-   * MFA placeholder header + JSON-encoded value. Not exposed directly to
-   * `ConfigPanel` — see `handleConfigEdit` below, which interposes the
-   * "lower cap" confirm dialog.
+   * Internal helper that actually calls `dispatcherSetConfig` with a
+   * JSON-encoded value. Not exposed directly to `ConfigPanel` — see
+   * `handleConfigEdit` below, which interposes the "lower cap"
+   * confirm dialog. #2884: the MFA placeholder header was removed.
    */
   const commitConfigEdit = useCallback(
     async (key: string, value: string): Promise<void> => {
@@ -178,9 +177,6 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
       try {
         await dispatcherSetConfig({
           variables: { key, value },
-          context: {
-            headers: { 'X-MFA-Token': 'phase1-placeholder' },
-          },
         });
         await refetch();
       } catch (err) {
@@ -216,11 +212,14 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   }, []);
 
   const handleAgentAction = useCallback(
-    (command: 'retry' | 'force_kill', agentId: string) => {
+    (command: 'retry' | 'force_stop', agentId: string) => {
       setCommandError(null);
-      if (DESTRUCTIVE_COMMANDS.has(command)) {
+      // Per-agent `force_stop` (formerly `force_kill`) still confirms —
+      // it crashes a running agent without a clean exit. `retry` is
+      // safe and fires immediately.
+      if (command === 'force_stop') {
         const confirmed = window.confirm(
-          `Force-kill agent ${agentId.slice(0, 8)}? This cannot be undone.`,
+          `Force-stop agent ${agentId.slice(0, 8)}? This cannot be undone.`,
         );
         if (!confirmed) return;
       }

@@ -15,7 +15,7 @@
 import type { Pool } from 'pg';
 import { GraphQLError, GraphQLScalarType, Kind } from 'graphql';
 import type { AuthUser } from '../../auth';
-import { DESTRUCTIVE_COMMANDS, requireDispatcherAdmin } from './auth';
+import { requireDispatcherAdmin } from './auth';
 import { extractPriority, parseBlockedBy, priorityRank } from './parse-labels';
 
 /**
@@ -38,7 +38,6 @@ interface SnapshotIssueRecord {
 interface DispatcherContext {
   pool: Pool;
   user: AuthUser | null;
-  mfaToken: string | null;
 }
 
 type Row = Record<string, unknown>;
@@ -707,22 +706,15 @@ export const dispatcherResolvers = {
         command,
         payload,
       }: { command: string; payload?: Record<string, unknown> | null },
-      { pool, user, mfaToken }: DispatcherContext,
+      { pool, user }: DispatcherContext,
     ) => {
       const admin = requireDispatcherAdmin(user);
 
-      // Destructive commands require a fresh re-auth token per §17 Risk 6.
-      // TODO(#2730 follow-up): Phase 1 placeholder — accept any non-empty
-      // X-MFA-Token header. Sub-task E or a follow-up wires the real MFA
-      // challenge flow (short-lived token issued by a dedicated
-      // challenge-verify mutation).
-      if (DESTRUCTIVE_COMMANDS.has(command)) {
-        if (!mfaToken || mfaToken.trim().length === 0) {
-          throw new GraphQLError('MFA re-auth required for destructive commands', {
-            extensions: { code: 'MFA_REQUIRED' },
-          });
-        }
-      }
+      // #2884: the MFA re-auth placeholder was removed — admin session
+      // auth is sufficient, and the "destructive vs not" gate added pure
+      // friction with zero real safety (any non-empty X-MFA-Token
+      // header was accepted). Audit trail lives in
+      // `dispatcher.commands.issued_by`.
 
       const effectivePayload = payload ?? {};
       const { row, created } = await insertCommandIdempotent(
@@ -737,17 +729,13 @@ export const dispatcherResolvers = {
     dispatcherSetConfig: async (
       _: unknown,
       { key, value }: { key: string; value: string },
-      { pool, user, mfaToken }: DispatcherContext,
+      { pool, user }: DispatcherContext,
     ) => {
       const admin = requireDispatcherAdmin(user);
 
-      // Config edits materially change daemon behaviour — require the
-      // same MFA placeholder gate as destructive commands (§17 Risk 6).
-      if (!mfaToken || mfaToken.trim().length === 0) {
-        throw new GraphQLError('MFA re-auth required for config updates', {
-          extensions: { code: 'MFA_REQUIRED' },
-        });
-      }
+      // #2884: MFA re-auth placeholder removed (see dispatcherControl
+      // above). Config edits still go through `requireDispatcherAdmin`
+      // and `validateConfigValue`.
 
       let parsed: unknown;
       try {

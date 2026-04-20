@@ -12,6 +12,11 @@
  * is the response shape: this gate returns a generic NOT_FOUND so the
  * dispatcher schema is not enumerable by non-admins, whereas data-quality
  * returns an explicit FORBIDDEN.
+ *
+ * #2884: the placeholder MFA re-auth gate (`DESTRUCTIVE_COMMANDS` +
+ * `X-MFA-Token`) was removed — it accepted any non-empty header string
+ * and added pure friction with zero real safety. Admin session auth is
+ * sufficient; audit trail lives in `dispatcher.commands.issued_by`.
  */
 
 import { GraphQLError } from 'graphql';
@@ -43,11 +48,3 @@ export function requireDispatcherAdmin(user: AuthUser | null): AuthUser {
   }
   return user;
 }
-
-/**
- * Destructive commands that require a fresh re-auth (MFA) step before
- * execution per §17 Risk 6. In Phase 1 the check is a placeholder — any
- * non-empty `X-MFA-Token` header is accepted. Sub-task E or a follow-up
- * will wire the real MFA challenge flow (see TODO in resolvers.ts).
- */
-export const DESTRUCTIVE_COMMANDS = new Set(['stop', 'drain', 'force_kill']);

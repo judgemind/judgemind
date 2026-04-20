@@ -2,9 +2,11 @@
  * Tests for the dispatcher admin dashboard (#2805).
  *
  * Focus areas:
- *   - Destructive control mutations always inject `X-MFA-Token` in the
- *     Apollo `context.headers` (#2805 §1.1 / #2803 Option A).
- *   - Config-edit mutations always inject `X-MFA-Token`.
+ *   - #2884: the three-button control surface — Start, Stop, Force
+ *     Stop. Stop is graceful (no confirm modal, fires immediately);
+ *     Force Stop pops the ConfirmDialog.
+ *   - #2884: control and config-edit mutations do NOT inject any
+ *     `X-MFA-Token` header — the MFA re-auth placeholder was removed.
  *   - Lowering `concurrency_cap` pops the ConfirmDialog before committing.
  *   - Raising `concurrency_cap` commits immediately without dialog.
  *   - State-flow two-column layout (#2823): Active → Queue-ready (left),
@@ -107,7 +109,7 @@ function renderDashboard() {
   return render(<DispatcherDashboard />);
 }
 
-describe('DispatcherDashboard — MFA header plumbing', () => {
+describe('DispatcherDashboard — #2884 simplified command surface', () => {
   beforeEach(() => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
@@ -115,20 +117,33 @@ describe('DispatcherDashboard — MFA header plumbing', () => {
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
-  it('non-destructive commands (Pause) do NOT send X-MFA-Token', async () => {
+  it('Start fires immediately and does NOT send any context headers', async () => {
     renderDashboard();
-    fireEvent.click(screen.getByRole('button', { name: /^pause$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^start$/i }));
     await waitFor(() => {
       expect(mockControlMutate).toHaveBeenCalled();
     });
     const call = mockControlMutate.mock.calls[0][0];
-    expect(call.variables).toEqual({ command: 'pause', payload: {} });
+    expect(call.variables).toEqual({ command: 'start', payload: {} });
+    // #2884: no X-MFA-Token header — the MFA re-auth placeholder was removed.
     expect(call.context).toBeUndefined();
   });
 
-  it('destructive Stop requires confirm + sends X-MFA-Token on confirm', async () => {
+  it('Stop is graceful — fires immediately without a confirm modal (#2884)', async () => {
     renderDashboard();
-    fireEvent.click(screen.getByRole('button', { name: /force-stop/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+    await waitFor(() => {
+      expect(mockControlMutate).toHaveBeenCalled();
+    });
+    const call = mockControlMutate.mock.calls[0][0];
+    expect(call.variables).toEqual({ command: 'stop', payload: {} });
+    // No confirm dialog and no X-MFA-Token header.
+    expect(call.context).toBeUndefined();
+  });
+
+  it('Force Stop requires confirm and fires without X-MFA-Token (#2884)', async () => {
+    renderDashboard();
+    fireEvent.click(screen.getByRole('button', { name: /force stop/i }));
     // ConfirmDialog appears — the mutation has NOT fired yet.
     expect(mockControlMutate).not.toHaveBeenCalled();
     const confirm = await screen.findByTestId('confirm-dialog-confirm');
@@ -137,21 +152,25 @@ describe('DispatcherDashboard — MFA header plumbing', () => {
       expect(mockControlMutate).toHaveBeenCalled();
     });
     const call = mockControlMutate.mock.calls[0][0];
-    expect(call.variables.command).toBe('stop');
-    expect(call.context?.headers).toEqual({ 'X-MFA-Token': 'phase1-placeholder' });
+    expect(call.variables.command).toBe('force_stop');
+    expect(call.context).toBeUndefined();
   });
 
-  it('destructive Drain (stop drain) sends X-MFA-Token on confirm', async () => {
+  it('Pause/Resume/Drain buttons no longer exist (#2884 removed)', () => {
     renderDashboard();
-    fireEvent.click(screen.getByRole('button', { name: /stop \(drain\)/i }));
-    const confirm = await screen.findByTestId('confirm-dialog-confirm');
-    fireEvent.click(confirm);
-    await waitFor(() => {
-      expect(mockControlMutate).toHaveBeenCalled();
-    });
-    const call = mockControlMutate.mock.calls[0][0];
-    expect(call.variables.command).toBe('drain');
-    expect(call.context?.headers).toEqual({ 'X-MFA-Token': 'phase1-placeholder' });
+    expect(screen.queryByRole('button', { name: /^pause$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^resume$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /stop \(drain\)/i })).toBeNull();
+  });
+
+  it('dispatcher-controls has exactly three buttons: Start, Stop, Force Stop (#2884 AC2)', () => {
+    renderDashboard();
+    const controls = screen.getByTestId('dispatcher-controls');
+    const buttons = controls.querySelectorAll('button');
+    expect(buttons.length).toBe(3);
+    expect(buttons[0].textContent).toMatch(/^start$/i);
+    expect(buttons[1].textContent).toMatch(/^stop$/i);
+    expect(buttons[2].textContent).toMatch(/^force stop$/i);
   });
 });
 
@@ -163,7 +182,7 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
   });
 
-  it('raising concurrency_cap commits immediately with MFA header', async () => {
+  it('raising concurrency_cap commits immediately without any context headers (#2884)', async () => {
     renderDashboard();
     const capButton = screen.getByTestId('config-value-concurrency_cap');
     fireEvent.click(capButton);
@@ -175,10 +194,11 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     });
     const call = mockSetConfigMutate.mock.calls[0][0];
     expect(call.variables).toEqual({ key: 'concurrency_cap', value: '4' });
-    expect(call.context?.headers).toEqual({ 'X-MFA-Token': 'phase1-placeholder' });
+    // #2884: no X-MFA-Token header — admin session auth is the gate.
+    expect(call.context).toBeUndefined();
   });
 
-  it('lowering concurrency_cap pops confirm dialog before committing', async () => {
+  it('lowering concurrency_cap pops confirm dialog before committing (no MFA header)', async () => {
     renderDashboard();
     const capButton = screen.getByTestId('config-value-concurrency_cap');
     fireEvent.click(capButton);
@@ -197,7 +217,8 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     });
     const call = mockSetConfigMutate.mock.calls[0][0];
     expect(call.variables).toEqual({ key: 'concurrency_cap', value: '1' });
-    expect(call.context?.headers).toEqual({ 'X-MFA-Token': 'phase1-placeholder' });
+    // #2884: no X-MFA-Token header.
+    expect(call.context).toBeUndefined();
   });
 
   it('Escape cancels an in-progress cap edit without firing the mutation', async () => {
@@ -212,7 +233,7 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     expect(mockSetConfigMutate).not.toHaveBeenCalled();
   });
 
-  it('backoff edit commits with MFA header + preserves higher attempts in array', async () => {
+  it('backoff edit commits without MFA header + preserves higher attempts in array (#2884)', async () => {
     renderDashboard();
     const backoffButton = screen.getByTestId('config-value-backoff_seconds');
     fireEvent.click(backoffButton);
@@ -226,7 +247,8 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     expect(call.variables.key).toBe('backoff_seconds');
     // First slot updated; subsequent retry delays preserved.
     expect(JSON.parse(call.variables.value)).toEqual([120, 300, 900]);
-    expect(call.context?.headers).toEqual({ 'X-MFA-Token': 'phase1-placeholder' });
+    // #2884: no X-MFA-Token header.
+    expect(call.context).toBeUndefined();
   });
 });
 

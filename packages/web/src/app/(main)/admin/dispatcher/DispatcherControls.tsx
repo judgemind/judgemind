@@ -10,21 +10,23 @@ interface DispatcherControlsProps {
 }
 
 /**
- * Five control buttons matching spec §11: Start · Pause · Resume ·
- * Stop (drain) · Force-stop.
+ * Three control buttons — Start, Stop, Force Stop — matching the
+ * simplified command taxonomy from #2884. Replaces the prior
+ * Start / Pause / Resume / Stop (drain) / Force-stop cluster:
+ *
+ *   - **Start** — set `concurrency_cap` back to 1 (resume claiming).
+ *   - **Stop** — graceful: block new spawns, let any in-flight agent
+ *     finish its current phase. Previously spelled "Stop (drain)".
+ *     No confirmation modal — stopping dev work is not destructive,
+ *     and the operator needs an immediate stop button (not a friction
+ *     path) when something goes sideways.
+ *   - **Force Stop** — immediate: block new spawns AND abort any
+ *     in-flight agent at the next phase boundary. Confirms via
+ *     `ConfirmDialog` because it kills work in progress.
  *
  * Rendered as a flat inline cluster — no card wrapper, no explanatory
- * paragraph — per #2805 §1.1. Same size/variant/enabled rules as the
- * previous implementation so behaviour is unchanged.
- *
- * The implementation-trivia footnote ("commands written to
- * dispatcher.commands") is intentionally removed — the operator has
- * internalized it and the page is about visibility, not tutorials.
- *
- * Daemon-side command handlers are tracked in #2801 — until that lands
- * some click handlers write a `dispatcher.commands` row but produce no
- * observable daemon behaviour change. This UI ships the correct writes
- * today.
+ * paragraph. The MFA re-auth gate was also removed (#2884) — admin
+ * session auth is sufficient.
  */
 export function DispatcherControls({
   currentRun,
@@ -49,36 +51,18 @@ export function DispatcherControls({
         variant="outline"
         size="sm"
         disabled={disabled || !daemonActive}
-        onClick={() => onControlClick('pause')}
+        onClick={() => onControlClick('stop')}
       >
-        Pause
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={disabled}
-        onClick={() => onControlClick('resume')}
-      >
-        Resume
-      </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={disabled || !daemonActive}
-        onClick={() => onControlClick('drain')}
-      >
-        Stop (drain)
+        Stop
       </Button>
       <Button
         type="button"
         variant="destructive"
         size="sm"
         disabled={disabled || !daemonActive}
-        onClick={() => onControlClick('stop')}
+        onClick={() => onControlClick('force_stop')}
       >
-        Force-stop
+        Force Stop
       </Button>
     </div>
   );

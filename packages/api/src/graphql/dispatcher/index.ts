@@ -20,4 +20,4 @@ export {
   runRowToGraphQL,
   transitionRowToGraphQL,
 } from './resolvers';
-export { requireDispatcherAdmin, notFound, DESTRUCTIVE_COMMANDS } from './auth';
+export { requireDispatcherAdmin, notFound } from './auth';

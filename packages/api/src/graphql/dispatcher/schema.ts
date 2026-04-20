@@ -24,30 +24,38 @@ export const dispatcherTypeDefs = `#graphql
   scalar JSON
 
   # ---------------------------------------------------------------------------
-  # Enum — admin control commands
+  # Enum — admin control commands (#2884 simplified taxonomy)
   # ---------------------------------------------------------------------------
 
   """Control commands the admin page can issue to the daemon.
   Consumed via \`dispatcher.commands\` row insert.
 
-  Destructive commands (\`stop\`, \`drain\`, \`force_kill\`) require fresh
-  re-auth (MFA-style) per §17 Risk 6 — see \`dispatcherControl\`.
+  Four commands: three global daemon-state transitions
+  (\`start\` / \`stop\` / \`force_stop\`) and one per-agent action
+  (\`retry\`). Previously the surface included \`pause\`, \`resume\`,
+  \`drain\`, and a separate \`force_kill\` — all removed per #2884.
+  Stopping development work is not destructive, so no MFA gate.
   """
   enum DispatcherCommand {
-    """Resume scheduler + supervisor ticks after a pause/stop."""
+    """Resume claiming; sets \`concurrency_cap\` from 0 back to 1."""
     start
-    """Block new spawns; let in-flight agents finish (destructive)."""
+    """Graceful stop: blocks new spawns and lets any in-flight agent
+    finish its current phase pipeline. Sets \`concurrency_cap\` to 0
+    without engaging the killswitch — the in-flight worker keeps
+    running. Replaces the former \`drain\` command (same SQL, clearer
+    semantic boundary vs. \`force_stop\`)."""
     stop
-    """Block new spawns with aggressive timeout on in-flight agents (destructive)."""
-    drain
-    """Suspend both scheduler and supervisor until \`resume\`."""
-    pause
-    """Resume after \`pause\`."""
-    resume
-    """Queue a manual retry for a specific agent (payload.agentId required)."""
+    """Immediate stop. Sets \`concurrency_cap\` to 0 AND engages the
+    killswitch so the in-flight worker aborts at the next phase
+    boundary via \`_check_killswitch_and_abort\`.
+
+    When \`payload.agentId\` is supplied, scope narrows to that single
+    agent: kill its subprocess (SIGKILL if the pid is local) and mark
+    it \`status='crashed'\` without changing the global
+    \`concurrency_cap\`. Replaces the former \`force_kill\` command."""
+    force_stop
+    """Queue a manual retry for a specific agent. \`payload.agentId\` required."""
     retry
-    """Kill a specific agent's subprocess without waiting (destructive; payload.agentId required)."""
-    force_kill
   }
 
   # ---------------------------------------------------------------------------
@@ -310,25 +318,26 @@ export const dispatcherTypeDefs = `#graphql
     written in the last 10 seconds and is still unconsumed, return that row
     and set \`created=false\` instead of inserting a duplicate.
 
-    Destructive commands (\`stop\`, \`drain\`, \`force_kill\`) require fresh
-    re-auth per §17 Risk 6. In Phase 1 this is enforced via the
-    \`X-MFA-Token\` HTTP header — any non-empty value is accepted as a
-    placeholder. Sub-task E or a follow-up wires the real MFA prompt.
+    #2884: the MFA re-auth placeholder was removed. Admin session auth
+    is sufficient; audit trail lives in \`dispatcher.commands.issued_by\`.
 
     Admin-only; non-admins receive "not found".
     """
     dispatcherControl(
       command: DispatcherCommand!
-      """Command-specific JSON payload. For \`retry\` / \`force_kill\` this must
-      include \`agentId\`. For others, \`{}\` is fine."""
+      """Command-specific JSON payload. For \`retry\` this must include
+      \`agentId\`. For \`force_stop\`, \`agentId\` is optional — when
+      present the command is scoped to that agent; when absent it is a
+      global immediate stop. For \`start\` and \`stop\`, \`{}\` is fine."""
       payload: JSON
     ): DispatcherCommandResult!
 
     """Update a single \`dispatcher.config\` entry (#2805 §1.6). Writes the
     new value as JSONB, stamps \`updated_at\`, and records the admin's email
-    in \`updated_by\` for audit. Like \`dispatcherControl\`, this requires a
-    non-empty \`X-MFA-Token\` header — config edits can materially change
-    daemon behaviour (e.g. lowering \`concurrency_cap\` mid-flight).
+    in \`updated_by\` for audit.
+
+    #2884: the MFA re-auth placeholder was removed — admin session auth
+    is the gate.
 
     Admin-only; non-admins receive "not found".
     """

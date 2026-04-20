@@ -19,7 +19,7 @@ interface ConfigPanelProps {
    * or surface the error via `errorMessage`.
    */
   onCommitEdit: (key: string, value: string) => Promise<void>;
-  /** Transient error surfaced by the parent (e.g. MFA_REQUIRED). */
+  /** Transient error surfaced by the parent (e.g. validation failure). */
   errorMessage?: string | null;
   /** Transient busy indicator for the last-edited key. */
   busyKey?: string | null;

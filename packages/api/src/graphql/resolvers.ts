@@ -19,12 +19,6 @@ interface Context {
   reply: FastifyReply;
   cookieHeader: string;
   opensearch: Client;
-  /**
-   * `X-MFA-Token` header value, propagated per request. Consumed by the
-   * dispatcher admin surface for destructive-command re-auth. Null when
-   * the header is absent.
-   */
-  mfaToken: string | null;
 }
 
 type Row = Record<string, unknown>;

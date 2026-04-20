@@ -210,29 +210,21 @@ export interface DispatcherStateData {
   dispatcherState: DispatcherState;
 }
 
-/** Control commands accepted by `dispatcherControl`.
+/** Control commands accepted by `dispatcherControl` (#2884 simplified).
  *
- * Mirrors the `DispatcherCommand` enum in the API schema. The subset marked
- * "destructive" in the server's `DESTRUCTIVE_COMMANDS` set triggers a
- * confirmation modal in the UI before invoking the mutation.
+ * Mirrors the `DispatcherCommand` enum in the API schema. Three global
+ * commands (`start` / `stop` / `force_stop`) plus one per-agent command
+ * (`retry`). The former `pause`, `resume`, `drain`, and `force_kill`
+ * commands were removed — `stop` now carries the former `drain`
+ * semantic (graceful) and `force_stop` replaces both the former `stop`
+ * (immediate) and the per-agent `force_kill` (when `payload.agentId`
+ * is supplied).
+ *
+ * `force_stop` is the only command the admin page confirms via modal
+ * (immediate abort is destructive). `stop` is graceful — in-flight
+ * agents finish their current phase — so no confirmation is needed.
  */
-export type DispatcherCommand =
-  | 'start'
-  | 'stop'
-  | 'drain'
-  | 'pause'
-  | 'resume'
-  | 'retry'
-  | 'force_kill';
-
-/** Commands that mutate in-flight agent state. Matches the server-side
- * `DESTRUCTIVE_COMMANDS` set in `packages/api/src/graphql/dispatcher/auth.ts`.
- * The admin page always raises a confirmation modal for these. */
-export const DESTRUCTIVE_COMMANDS: ReadonlySet<DispatcherCommand> = new Set([
-  'stop',
-  'drain',
-  'force_kill',
-]);
+export type DispatcherCommand = 'start' | 'stop' | 'force_stop' | 'retry';
 
 export interface DispatcherCommandResult {
   commandId: string;

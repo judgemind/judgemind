@@ -350,7 +350,7 @@ No subscriptions. Admin page uses Apollo `pollInterval: 2000` (2s). Dispatcher e
 **UI sections:**
 
 - **Header:** daemon status pill (running / paused / stopped / unhealthy), uptime, version SHA.
-- **Controls:** Start, Stop (drain), Force-stop, Pause, Resume buttons. Each posts a confirmation modal (stop/kill are destructive).
+- **Controls (#2884 simplified):** three buttons — **Start**, **Stop**, **Force Stop**. `start` flips `concurrency_cap` back to 1; `stop` is graceful (blocks new spawns, lets any in-flight agent finish its current phase pipeline); `force_stop` is immediate (sets `_pause_requested` so the in-flight worker aborts at the next phase boundary). Only `force_stop` posts a confirmation modal — the whole point of the simplification is that stopping dev work must not be friction-heavy for the operator. The former Pause / Resume / Stop (drain) / Force-stop cluster and the MFA re-auth gate were removed per #2884.
 - **Active agents table:** agent_id (short), issue #, phase, elapsed, worktree (link to CloudWatch logs), actions (retry, kill).
 - **Queue:** upcoming `agent/ready` issues, blocked-by count.
 - **Recent failures (last 24h):** grouped by category, with count and most recent example.
@@ -506,7 +506,7 @@ Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/di
 
 5. **GitHub Actions runner queue depth.** If CI is backed up (common on busy days), PRs pile up waiting for checks. Daemon merges based on check rollup; if checks don't start for 20min, "recently merged" signal (for idle-mode `/audit`) fires incorrectly. **Mitigation:** treat `pending` as neutral, not green; only count SUCCESS for idle triggers.
 
-6. **Admin page auth compromise.** Controls include force-kill and drain. Anyone with admin access can stop the daemon. **Mitigation:** require fresh re-auth (MFA-style) for destructive actions. Audit log in `dispatcher.commands.issued_by`.
+6. **Admin page auth compromise.** Controls include force-stop (global and per-agent). Anyone with admin access can stop the daemon. **Original mitigation (superseded by #2884):** require fresh re-auth (MFA-style) for destructive actions. **Current mitigation:** admin role on the session is the only gate. The prior placeholder MFA check accepted any non-empty `X-MFA-Token` header — zero real safety, pure friction — and during a 2026-04-20 incident it actively prevented the operator from stopping a runaway pipeline for ~2 hours. Since admin-session auth is already required for any dispatcher control, adding a per-request friction layer without a real second factor was net-negative. Audit log in `dispatcher.commands.issued_by` remains the trail of record. If a real MFA second factor is ever implemented, apply it to login (every admin action) rather than per-control-button (which is the friction pattern that failed in 2026-04-20).
 
 7. **Schema evolution.** Adding a new phase name requires a migration. **Mitigation:** `dispatcher.phase_transitions.phase` is a free-form string, not an enum. Validation is daemon-side, not DB-side.
 
