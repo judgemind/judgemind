@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { IssueLink, OutcomePill, PriorityBadge, PRLink } from '../ui-primitives';
+import {
+  INFRA_PREEMPTED_CATEGORIES,
+  INFRA_PREEMPTED_GLYPH,
+  INFRA_PREEMPTED_SUMMARIES,
+  IssueLink,
+  OutcomePill,
+  PriorityBadge,
+  PRLink,
+} from '../ui-primitives';
 
 describe('IssueLink', () => {
   it('renders an anchor to the github issue that opens in a new tab', () => {
@@ -222,6 +230,107 @@ describe('OutcomePill', () => {
       expect(pill.getAttribute('title')).toBe(
         "future terminal we haven't seen yet",
       );
+    });
+  });
+
+  // #2947: two `dispatcher.failures.category` values represent
+  // infra preemption rather than real failure — `daemon_restart_abandoned`
+  // (dispatcher cycled mid-agent; retry on next tick) and
+  // `paused_by_killswitch` (operator hit the global kill switch). The
+  // daemon writes exactly two canonical `failure_summary` strings for
+  // these — "dispatcher restarted" and "manually stopped" — and the pill
+  // re-skins to amber ↺ to signal "will auto-resume, not an action item".
+  describe('infra-preempted override (#2947)', () => {
+    it('renders ↺ in amber for "dispatcher restarted" (daemon_restart_abandoned)', () => {
+      render(
+        <OutcomePill status="failed" failureSummary="dispatcher restarted" />,
+      );
+      const pill = screen.getByTestId('outcome-pill-infra_preempted');
+      expect(pill.textContent).toBe(INFRA_PREEMPTED_GLYPH);
+      expect(pill.textContent).toBe('\u21BA');
+      expect(pill.className).toContain('bg-amber');
+      expect(pill.className).not.toMatch(/bg-red/);
+      // aria-label is a neutral descriptor; operator-friendly.
+      expect(pill.getAttribute('aria-label')).toBe('infra preempted');
+      expect(pill.getAttribute('title')).toBe('dispatcher restarted');
+    });
+
+    it('renders ↺ in amber for "manually stopped" (paused_by_killswitch)', () => {
+      render(
+        <OutcomePill status="failed" failureSummary="manually stopped" />,
+      );
+      const pill = screen.getByTestId('outcome-pill-infra_preempted');
+      expect(pill.textContent).toBe('\u21BA');
+      expect(pill.className).toContain('bg-amber');
+      expect(pill.className).not.toMatch(/bg-red/);
+      expect(pill.getAttribute('title')).toBe('manually stopped');
+    });
+
+    it('trims whitespace before matching (defensive against upstream drift)', () => {
+      render(
+        <OutcomePill
+          status="failed"
+          failureSummary="  manually stopped  "
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-infra_preempted');
+      expect(pill.textContent).toBe('\u21BA');
+      expect(pill.getAttribute('title')).toBe('manually stopped');
+    });
+
+    it('falls back to red ✗ for a non-infra failureSummary', () => {
+      render(
+        <OutcomePill
+          status="failed"
+          failureSummary="subprocess crashed (turn limit)"
+        />,
+      );
+      // Regular failed path — red ✗, not amber ↺.
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.textContent).toBe('\u2717');
+      expect(pill.className).toContain('bg-red');
+    });
+
+    it('does not apply the override when failureSummary is null', () => {
+      render(<OutcomePill status="failed" failureSummary={null} />);
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.textContent).toBe('\u2717');
+      expect(pill.className).toContain('bg-red');
+    });
+
+    it('overrides crashed → ↺ too, because the category can land on either status', () => {
+      // If a future code path writes `status='crashed'` for an
+      // infra-preempted row (today the daemon uses `failed`, but we
+      // intentionally don't couple to that), the pill should still
+      // re-skin to ↺ amber rather than keep the `⚠ crashed` look.
+      render(
+        <OutcomePill status="crashed" failureSummary="dispatcher restarted" />,
+      );
+      const pill = screen.getByTestId('outcome-pill-infra_preempted');
+      expect(pill.textContent).toBe('\u21BA');
+      expect(pill.className).toContain('bg-amber');
+    });
+
+    it('exports exactly the two canonical summary strings', () => {
+      // Guard rail: the set must stay in lockstep with the daemon's
+      // `_NO_TAIL_CATEGORY_SUMMARIES` (see
+      // `scripts/dispatcher/daemon.py`). Extending this set requires
+      // coordinating with the daemon; shrinking it causes silent
+      // regressions on admin-page rows.
+      expect(INFRA_PREEMPTED_SUMMARIES.size).toBe(2);
+      expect(INFRA_PREEMPTED_SUMMARIES.has('dispatcher restarted')).toBe(true);
+      expect(INFRA_PREEMPTED_SUMMARIES.has('manually stopped')).toBe(true);
+    });
+
+    it('exports exactly the two canonical category strings', () => {
+      // Same guard rail for `dispatcher.failures.category` values,
+      // used by `RecentFailuresPanel` which keys off category
+      // directly.
+      expect(INFRA_PREEMPTED_CATEGORIES.size).toBe(2);
+      expect(INFRA_PREEMPTED_CATEGORIES.has('daemon_restart_abandoned')).toBe(
+        true,
+      );
+      expect(INFRA_PREEMPTED_CATEGORIES.has('paused_by_killswitch')).toBe(true);
     });
   });
 });

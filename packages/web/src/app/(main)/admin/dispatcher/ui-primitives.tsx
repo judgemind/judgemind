@@ -90,7 +90,8 @@ export function PriorityBadge({ priority }: { priority: string | null }) {
 
 // ---------------------------------------------------------------------------
 // Outcome glyph pill — succeeded (✓ green), failed (✗ red), crashed (⚠ amber),
-// plan_blocked (⊘ neutral — #2857), needs_review (◐ yellow — #2856).
+// plan_blocked (⊘ neutral — #2857), needs_review (◐ yellow — #2856),
+// infra-preempted (↺ amber — #2947).
 //
 // Colour assignment intentionally keeps red reserved for genuine failure
 // and amber reserved for the crash-category anomaly. `plan_blocked`
@@ -108,7 +109,64 @@ export function PriorityBadge({ priority }: { priority: string | null }) {
 // separate "review my draft PR" from "something crashed, diagnose
 // this". The glyph ◐ (half-circle) is the semantic anchor: ralph
 // did half the work, you do the other half (review + merge).
+//
+// `infra_preempted` is a *derived* sub-category of `failed` for the two
+// infra-preemption categories in ``scripts/dispatcher/daemon.py``'s
+// ``_INFRA_PREEMPTION_CATEGORIES`` frozenset —
+// ``daemon_restart_abandoned`` and ``paused_by_killswitch``. These
+// agents didn't fail in any code/runtime sense; the dispatcher itself
+// interrupted them (restart recovery, or operator hit the killswitch)
+// and they will resume on the next tick. Rendering them as red ✗
+// misleads operators into treating them as actionable — which is the
+// opposite of the truth. They earn ↺ (counterclockwise arrow) in amber
+// to signal "will auto-resume; not an operator action item".
+//
+// Detection is pattern-based on `failureSummary`. The daemon writes
+// exactly two canonical strings for these categories —
+// ``"dispatcher restarted"`` (daemon_restart_abandoned) and
+// ``"manually stopped"`` (paused_by_killswitch) — from
+// ``_NO_TAIL_CATEGORY_SUMMARIES`` (issues #2924 / #2935). The resolver
+// surfaces these verbatim through ``failureSummary``. Pattern-matching
+// on this closed set is robust because the daemon has no other code
+// path that can produce these exact strings for a failed row. If the
+// daemon ever changes the strings, the pill falls back to the plain
+// red ✗ — a soft regression, not a crash.
 // ---------------------------------------------------------------------------
+
+/**
+ * Canonical failure-summary strings produced by the dispatcher daemon
+ * for rows whose `dispatcher.failures.category` is in
+ * ``_INFRA_PREEMPTION_CATEGORIES``. Mirrors
+ * ``_NO_TAIL_CATEGORY_SUMMARIES`` in ``scripts/dispatcher/daemon.py``.
+ *
+ * Export for re-use by panels that render their own glyph (e.g. the
+ * Recent failures roll-up, which keys off `category` directly and
+ * doesn't go through `OutcomePill`). Issue #2947.
+ */
+export const INFRA_PREEMPTED_SUMMARIES: ReadonlySet<string> = new Set([
+  'dispatcher restarted',
+  'manually stopped',
+]);
+
+/**
+ * Canonical `dispatcher.failures.category` values that are
+ * infra-preempted (will auto-resume; not operator action items).
+ * Mirrors ``_INFRA_PREEMPTION_CATEGORIES`` in
+ * ``scripts/dispatcher/daemon.py``. Used by panels (e.g.
+ * ``RecentFailuresPanel``) that key off `category` directly rather
+ * than matching on `failureSummary`. Issue #2947.
+ */
+export const INFRA_PREEMPTED_CATEGORIES: ReadonlySet<string> = new Set([
+  'daemon_restart_abandoned',
+  'paused_by_killswitch',
+]);
+
+/** Shared amber chip class for the ↺ infra-preempted glyph. Issue #2947. */
+export const INFRA_PREEMPTED_CHIP_CLASSES =
+  'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200';
+
+/** Shared ↺ glyph (U+21BA, ANTICLOCKWISE OPEN CIRCLE ARROW). Issue #2947. */
+export const INFRA_PREEMPTED_GLYPH = '\u21BA';
 
 type OutcomeStatus =
   | 'succeeded'
@@ -176,19 +234,44 @@ export function OutcomePill({
    * We deliberately do NOT render an always-visible second line — the
    * "Recently completed" panel's density-first design (#2818) is the
    * constraint. Tooltip-only.
+   *
+   * Issue #2947: when the summary exactly matches one of
+   * ``INFRA_PREEMPTED_SUMMARIES``, the pill re-skins to amber ↺
+   * (infra-preempted) instead of red ✗ / amber ⚠ — the agent was
+   * preempted by the dispatcher, not an operator action item.
    */
   failureSummary?: string | null;
 }) {
   const info = OUTCOME_STYLES[status as OutcomeStatus];
+  const trimmedSummary =
+    failureSummary && failureSummary.trim() ? failureSummary.trim() : null;
+  // #2947: infra-preemption override. Daemon writes a short canonical
+  // string (``"dispatcher restarted"`` / ``"manually stopped"``) for
+  // the two `_INFRA_PREEMPTION_CATEGORIES` — those rows should render
+  // ↺ amber regardless of the stored `status` (today always `failed`
+  // for these, but we don't want to couple to that invariant).
+  // Pattern-matching on the closed set in ``INFRA_PREEMPTED_SUMMARIES``
+  // avoids plumbing a new `category` field through the GraphQL type
+  // for what is effectively a display override; any drift in the
+  // daemon's canonical strings just collapses back to the default red
+  // ✗ (a soft regression, not a crash).
+  if (trimmedSummary !== null && INFRA_PREEMPTED_SUMMARIES.has(trimmedSummary)) {
+    return (
+      <span
+        aria-label="infra preempted"
+        title={trimmedSummary}
+        className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${INFRA_PREEMPTED_CHIP_CLASSES}`}
+        data-testid="outcome-pill-infra_preempted"
+      >
+        {INFRA_PREEMPTED_GLYPH}
+      </span>
+    );
+  }
   if (!info) {
     return (
       <span
         className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-muted text-[10px] text-muted-foreground"
-        title={
-          failureSummary && failureSummary.trim()
-            ? failureSummary.trim()
-            : undefined
-        }
+        title={trimmedSummary ?? undefined}
       >
         ?
       </span>
@@ -200,8 +283,7 @@ export function OutcomePill({
   // summary text mid-row. Sighted operators get the full narrative on
   // hover; assistive-tech users hear "failed" / "crashed" and can
   // navigate to the agent detail page from there.
-  const tooltip =
-    failureSummary && failureSummary.trim() ? failureSummary.trim() : info.label;
+  const tooltip = trimmedSummary ?? info.label;
   return (
     <span
       aria-label={info.label}
