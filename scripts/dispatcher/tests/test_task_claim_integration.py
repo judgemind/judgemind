@@ -214,6 +214,7 @@ def _psycopg_connect(database_url: str) -> Any:
     real_psycopg = _capture_real_psycopg()["psycopg"]
     return real_psycopg.connect(database_url, connect_timeout=10)
 
+
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
@@ -258,6 +259,7 @@ def _discover_dispatcher_migrations() -> list[Path]:
         entries.append((number, entry))
     entries.sort(key=lambda pair: pair[0])
     return [path for _, path in entries]
+
 
 #: Test issue numbers — pick values that don't collide with real repo
 #: issues (above 999_000) so if someone accidentally points the test
@@ -360,9 +362,7 @@ def clean_agents(_schema_loaded: None, integration_db_url: str) -> None:
 
 
 @pytest.fixture
-def database_url_env(
-    monkeypatch: pytest.MonkeyPatch, integration_db_url: str
-) -> str:
+def database_url_env(monkeypatch: pytest.MonkeyPatch, integration_db_url: str) -> str:
     """Set ``DATABASE_URL`` so ``task_claim`` uses its psycopg path.
 
     ``task_claim`` picks psycopg vs. ``dev-db-query.sh`` by checking
@@ -757,9 +757,7 @@ class TestDaemonAtomicClaimIntegration:
             # non-UniqueViolation exception as ``claim_failed`` and
             # returns False — the caller (``_claim_and_orchestrate_one``)
             # then moves on to the next candidate.
-            assert (
-                d._atomic_claim(issue, "agent-a5d7e546", str(tmp_path)) is False
-            )
+            assert d._atomic_claim(issue, "agent-a5d7e546", str(tmp_path)) is False
             # No row was inserted.
             assert _fetch_agent_row(database_url_env, issue) is None
         finally:
