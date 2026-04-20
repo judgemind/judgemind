@@ -10906,10 +10906,24 @@ class DispatcherDaemon:
                 # construction and the breaker query reverts to its
                 # pre-#2866 shape. The ``a.kind = 'task'`` JOIN added
                 # by #2921 is no longer needed.
+                #
+                # #2942: correlate each terminal_outcomes row with the
+                # most-recent dispatcher.failures.category for the same
+                # agent_id so infra-preempted outcomes
+                # (daemon_restart_abandoned, paused_by_killswitch) can
+                # be filtered out before the bad-outcome count. The
+                # correlated subquery mirrors _build_failure_summary's
+                # "freshest failure row per agent" semantics. agent_id
+                # may be NULL on synthetic test rows; the subquery
+                # simply returns NULL → treated as non-infra.
                 cur.execute(
-                    "SELECT status FROM dispatcher.terminal_outcomes "
-                    "WHERE ended_at > now() - make_interval(mins => %s) "
-                    "ORDER BY ended_at DESC "
+                    "SELECT t.status, "
+                    "       (SELECT f.category FROM dispatcher.failures f "
+                    "        WHERE f.agent_id = t.agent_id "
+                    "        ORDER BY f.ts DESC LIMIT 1) AS latest_category "
+                    "FROM dispatcher.terminal_outcomes t "
+                    "WHERE t.ended_at > now() - make_interval(mins => %s) "
+                    "ORDER BY t.ended_at DESC "
                     "LIMIT %s",
                     (window_minutes, window_size),
                 )
@@ -10930,9 +10944,37 @@ class DispatcherDaemon:
                 pass
             return False
 
-        statuses = [str(r[0]) for r in rows if r and r[0] is not None]
+        # #2942: strip infra-preempted rows before counting bad outcomes.
+        # Infra preemption (daemon restart, operator killswitch) is not
+        # an agent-driven failure; a streak of redeploys must not trip
+        # the breaker. Reuse the module-level frozenset — same set as
+        # _process_retry_markers uses for free-retry classification.
+        raw_pairs = [(str(r[0]), r[1]) for r in rows if r and r[0] is not None]
+        filtered = [
+            (s, c) for s, c in raw_pairs if c not in _INFRA_PREEMPTION_CATEGORIES
+        ]
+        skipped_infra_count = len(raw_pairs) - len(filtered)
+        statuses = [s for s, _c in filtered]
         bad_count = sum(1 for s in statuses if self._is_bad_outcome(s))
+        window_total = len(raw_pairs)
+
         if bad_count < threshold:
+            # Emit an INFO event when infra rows were filtered so post-
+            # incident CloudWatch queries can confirm the filter worked
+            # even when the breaker did not trip.
+            if skipped_infra_count > 0:
+                self._log.info(
+                    "daemon.circuit_breaker_eval_skipped_infra",
+                    extra={
+                        "event": "circuit_breaker_eval_skipped_infra",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "skipped_infra_count": skipped_infra_count,
+                        "window_total": window_total,
+                        "bad_count": bad_count,
+                        "threshold": threshold,
+                    },
+                )
             return False
 
         # Threshold met. Flip ``concurrency_cap`` to 0 and stamp
@@ -11019,6 +11061,8 @@ class DispatcherDaemon:
                 "previous_cap": current_cap,
                 "was_already_open": was_already_open,
                 "recent_statuses": statuses,
+                "skipped_infra_count": skipped_infra_count,
+                "window_total": window_total,
             },
         )
 
