@@ -431,16 +431,14 @@ class TestListAdvanceableAgents:
         assert rows == []
         assert conn.rollbacks >= 1
 
-    def test_select_filters_on_kind_task(self, tmp_path: Path) -> None:
-        """Regression for #2908.
+    def test_select_has_no_kind_filter(self, tmp_path: Path) -> None:
+        """Post-#2927 regression: ``_list_advanceable_agents`` has no kind filter.
 
-        ``_list_advanceable_agents`` drives the daemon's Phase 3B/3E
-        advance loop (CI watch, deploy watch, retro, cleanup). It should
-        only advance ``kind='task'`` rows — task-skill rows never reach
-        ``awaiting_ci``/``awaiting_deploy``/``retro_*`` in practice
-        (their lifecycle ends with the operator's /task pipeline), but
-        filtering defensively documents the scope and prevents a future
-        phase-label collision from starving the advance loop.
+        The /task skill stopped writing to ``dispatcher.agents``
+        (label-only coordination), so every row the advance loop
+        sees is daemon-owned by construction. The #2908
+        ``kind='task'`` carve-out was reverted — the SELECT is back
+        to its pre-#2866 shape.
         """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [[]]
@@ -454,10 +452,9 @@ class TestListAdvanceableAgents:
         assert selects, "expected _list_advanceable_agents to issue the SELECT"
         sql, _params = selects[0]
         assert "status = 'running'" in sql
-        assert "kind = 'task'" in sql, (
-            "_list_advanceable_agents must filter kind='task' so the "
-            "advance loop is scoped to daemon-owned agents (see #2908). "
-            "Actual SQL: " + sql
+        assert "kind = 'task'" not in sql, (
+            "_list_advanceable_agents should not carry a kind filter "
+            "post-#2927 — every row is daemon-owned. Actual SQL: " + sql
         )
 
 

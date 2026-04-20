@@ -50,7 +50,6 @@ type Row = Record<string, unknown>;
 function agentRowToGraphQL(row: Row): Record<string, unknown> {
   return {
     id: row.agent_id,
-    kind: row.kind,
     issueNumber: row.issue_number,
     // Issue title captured at claim time (#2820). Pre-migration-28 rows
     // have NULL which the UI renders as a fallback to `#<number>`.

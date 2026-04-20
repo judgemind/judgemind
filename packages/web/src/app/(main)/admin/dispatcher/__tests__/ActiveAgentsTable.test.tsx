@@ -14,7 +14,6 @@ import { ActiveAgentsTable } from '../ActiveAgentsTable';
 function makeAgent(overrides: Partial<DispatcherAgent> = {}): DispatcherAgent {
   return {
     id: 'aabbccdd-eeff-0011-2233-445566778899',
-    kind: 'task',
     issueNumber: 2899,
     issueTitle: 'feat(web): unify dispatcher admin tables',
     priority: 'p2',

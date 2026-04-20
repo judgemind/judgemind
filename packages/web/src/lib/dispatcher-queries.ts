@@ -26,7 +26,6 @@ export const DISPATCHER_STATE_QUERY = gql`
       }
       activeAgents {
         id
-        kind
         issueNumber
         issueTitle
         priority
@@ -132,7 +131,6 @@ export interface DispatcherRun {
 
 export interface DispatcherAgent {
   id: string;
-  kind: string;
   issueNumber: number;
   /** Issue title captured at claim time from the queue-snapshot
    * enrichment (#2820). Null for pre-migration-28 rows or when the

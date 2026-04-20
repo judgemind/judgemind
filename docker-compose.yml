@@ -64,38 +64,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # Dedicated Postgres for dispatcher integration tests (#2895).
-  #
-  # Separate from the main `postgres` service because:
-  #
-  # - Integration tests DROP + CREATE SCHEMA dispatcher between runs to
-  #   guarantee a clean slate. Doing that against the primary dev DB
-  #   would nuke local dispatcher state an operator may care about.
-  # - The image (`postgres:16-alpine`) mirrors dev RDS's engine major
-  #   version (16) and the CI job's `services:` image, so the integration
-  #   suite validates against the same Postgres we run in production.
-  # - Uses port 5433 on the host to avoid colliding with the main
-  #   `postgres` service on 5432 when both are running.
-  #
-  # Tests read ``INTEGRATION_DATABASE_URL`` from the environment and
-  # skip themselves when unset, so the service is opt-in:
-  #   docker compose up -d dispatcher-test-postgres
-  #   export INTEGRATION_DATABASE_URL=postgresql://postgres:localdev@localhost:5433/dispatcher_test
-  #   pytest scripts/dispatcher/tests/test_task_claim_integration.py -v
-  dispatcher-test-postgres:
-    image: postgres:16-alpine
-    ports:
-      - "5433:5432"
-    environment:
-      POSTGRES_DB: dispatcher_test
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: localdev
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d dispatcher_test"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   # MinIO provides S3-compatible object storage locally
   minio:
     image: minio/minio:latest

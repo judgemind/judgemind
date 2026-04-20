@@ -185,11 +185,10 @@ class TestRecoverAbandonedAgents:
             [("agent-abandoned", 2807, "ralph")],
         ]
         # _write_failure → _mark_agent_terminal → _create_retry_marker
-        # reads nothing via fetchone in the write path except
-        # _create_retry_marker's _lookup_agent_kind (#2903) +
-        # COUNT query + backoff_seconds config.
+        # reads nothing via fetchone in the write path except the
+        # retry-marker COUNT query + backoff_seconds config. Post-#2927
+        # the #2903 _lookup_agent_kind fetch is gone.
         conn.cursor_instance.fetch_queue = [
-            ("task",),  # _lookup_agent_kind (#2903) — daemon-owned row
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff schedule
         ]
@@ -284,16 +283,14 @@ class TestRecoverAbandonedAgents:
         assert d.recover_abandoned_agents() == 0
         assert conn.rollbacks >= 1
 
-    def test_select_filters_on_kind_task(self, tmp_path: Path) -> None:
-        """Regression for #2908.
+    def test_select_has_no_kind_filter(self, tmp_path: Path) -> None:
+        """Post-#2927 regression: ``recover_abandoned_agents`` has no kind filter.
 
-        ``recover_abandoned_agents`` is a daemon-supervisor decision —
-        it reclaims ``status='running'`` agents from PRIOR daemon runs
-        and enqueues retry markers. ``kind='task-skill'`` rows are
-        operator-owned laptop subagents, not daemon-reclaimable; if the
-        daemon "reclaimed" one it would create a phantom retry of work
-        that is still running in a separate OS process on the operator's
-        laptop. The SELECT must filter ``kind='task'``.
+        The /task skill stopped writing to ``dispatcher.agents``
+        (label-only coordination), so every ``status='running'`` row
+        from a prior run is daemon-owned by construction. The #2908
+        ``kind='task'`` carve-out was reverted — the SELECT is back
+        to its pre-#2866 shape.
         """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [[]]
@@ -308,10 +305,9 @@ class TestRecoverAbandonedAgents:
         assert selects, "expected recover_abandoned_agents to issue the SELECT"
         sql, _params = selects[0]
         assert "status = 'running'" in sql
-        assert "kind = 'task'" in sql, (
-            "recover_abandoned_agents must filter kind='task' so laptop "
-            "/task subagents are not reclaimed at daemon boot (see #2908). "
-            "Actual SQL: " + sql
+        assert "kind = 'task'" not in sql, (
+            "recover_abandoned_agents should not carry a kind filter "
+            "post-#2927 — every row is daemon-owned. Actual SQL: " + sql
         )
 
 
@@ -335,10 +331,10 @@ class TestPerPhaseStuckTimeout:
     def test_ralph_below_threshold_not_flagged(self, tmp_path: Path) -> None:
         """A 2.5-minute ralph is not stuck (threshold is 90 min)."""
         d, conn, _handler = _make_daemon(tmp_path)
-        # SELECT returns (agent_id, issue_number, phase, elapsed, kind).
-        # Issue #2903 added the ``kind`` column.
+        # SELECT returns (agent_id, issue_number, phase, elapsed).
+        # Post-#2927 the #2903 ``kind`` column was dropped.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 150.0, "task")],  # 2.5 min elapsed
+            [("agent-1", 42, "ralph", 150.0)],  # 2.5 min elapsed
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
@@ -349,7 +345,7 @@ class TestPerPhaseStuckTimeout:
         """A 90-second plan is not stuck (threshold is 2.5 hr, #2885)."""
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "plan", 90.0, "task")],
+            [("agent-1", 42, "plan", 90.0)],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
@@ -360,11 +356,10 @@ class TestPerPhaseStuckTimeout:
         """A 16-hour ralph IS stuck (threshold is 15 hr / 54000s, #2885)."""
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 57600.0, "task")],  # 16 hr
+            [("agent-1", 42, "ralph", 57600.0)],  # 16 hr
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
-            ("task",),  # _lookup_agent_kind in _create_retry_marker (#2903)
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff
         ]
@@ -380,12 +375,11 @@ class TestPerPhaseStuckTimeout:
         # Elapsed 400s — under the default 5min claiming threshold, but
         # operator set claiming override to 300s. Should fire.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "claiming", 400.0, "task")],
+            [("agent-1", 42, "claiming", 400.0)],
         ]
         conn.cursor_instance.fetch_queue = [
             ('{"claiming": 300}',),  # operator override
-            ("task",),  # _lookup_agent_kind (#2903)
-            (0,),
+            (0,),  # prior marker count
             ("[60,300,900]",),
         ]
         assert d._check_stuck_agents() == 1
@@ -395,12 +389,11 @@ class TestPerPhaseStuckTimeout:
         d, conn, _handler = _make_daemon(tmp_path)
         # Novel phase, elapsed 31 min — over the 30 min default fallback.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "novel_phase", 31 * 60.0, "task")],
+            [("agent-1", 42, "novel_phase", 31 * 60.0)],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # no override
-            ("task",),  # _lookup_agent_kind (#2903)
-            (0,),
+            (0,),  # prior marker count
             ("[60,300,900]",),
         ]
         assert d._check_stuck_agents() == 1
