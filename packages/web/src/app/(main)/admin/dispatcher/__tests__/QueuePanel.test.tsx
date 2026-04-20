@@ -94,4 +94,73 @@ describe('QueuePanel', () => {
     expect(titleEl.className).toMatch(/break-words/);
     expect(titleEl.className).not.toMatch(/\btruncate\b/);
   });
+
+  // --- #2886 — panel header renders `{shown} / {total}` so the operator
+  //             can see queue depth even when the displayed list is capped
+  //             server-side at 10.
+  it('#2886: ready panel header renders `{shown} / {total}` when total provided', () => {
+    const items = [
+      item({ issueNumber: 2801, title: 'first' }),
+      item({ issueNumber: 2802, title: 'second' }),
+    ];
+    render(
+      <QueuePanel
+        queueReady={items}
+        queueBlocked={[]}
+        queueReadyTotal={82}
+        queueBlockedTotal={0}
+        nowMs={now}
+      />,
+    );
+    expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('2 / 82');
+    // Legacy "N shown" label must NOT render on the ready panel when a
+    // total is supplied — the whole point of #2886 is to replace that
+    // ambiguous label.
+    expect(screen.getByTestId('queue-ready-count')).not.toHaveTextContent(/shown/);
+  });
+
+  it('#2886: blocked panel header renders `{shown} / {total}` when total provided', () => {
+    const blocked = [
+      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
+    ];
+    render(
+      <QueuePanel
+        queueReady={[]}
+        queueBlocked={blocked}
+        queueBlockedTotal={15}
+        nowMs={now}
+      />,
+    );
+    expect(screen.getByTestId('queue-blocked-count')).toHaveTextContent('1 / 15');
+  });
+
+  it('#2886: header renders `0 / N` when the list is empty but total > 0 (AC3)', () => {
+    // AC3 — blocked panel with nothing visible but total non-zero. In
+    // practice this shouldn't happen for the ready panel (cap-10 with
+    // total>0 always yields at least 1 shown), but the blocked-panel
+    // empty-with-total-nonzero case is explicitly called out in the
+    // issue. The component MUST still render `0 / N`, never "0 shown".
+    render(
+      <QueuePanel
+        queueReady={[]}
+        queueBlocked={[]}
+        queueReadyTotal={82}
+        queueBlockedTotal={5}
+        nowMs={now}
+      />,
+    );
+    expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 82');
+    expect(screen.getByTestId('queue-blocked-count')).toHaveTextContent('0 / 5');
+  });
+
+  it('#2886: falls back to `{shown} shown` when total prop is omitted (back-compat)', () => {
+    // Existing callers that haven't wired up `queueDepth` / `blockedDepth`
+    // must keep working. Dropping the denominator entirely when we don't
+    // have a total is strictly safer than guessing — total === shown
+    // would be a lie when the tail is capped.
+    const items = [item({ issueNumber: 2801, title: 'first' })];
+    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('1 shown');
+    expect(screen.getByTestId('queue-blocked-count')).toHaveTextContent('0 shown');
+  });
 });

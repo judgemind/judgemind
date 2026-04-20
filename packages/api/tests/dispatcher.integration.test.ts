@@ -336,6 +336,34 @@ describe('dispatcherState — admin', () => {
     // the inserted run in cleanup tears down the snapshot rows too.
   });
 
+  it('blockedDepth reflects the latest row in dispatcher.blocked_snapshots (#2886)', async () => {
+    // Mirror the queueDepth test — seed two blocked snapshots and
+    // confirm the resolver returns the latest-by-observed_at value.
+    // The admin-cockpit queue panels pair this with the capped list so
+    // the header renders `{shown} / {total}` (issue #2886).
+    const runId = await insertRun();
+    await pool.query(
+      `INSERT INTO dispatcher.blocked_snapshots (observed_at, blocked_depth, issue_numbers, run_id)
+       VALUES (now() - interval '2 minutes', 2, ARRAY[501,502]::int[], $1)`,
+      [runId],
+    );
+    await pool.query(
+      `INSERT INTO dispatcher.blocked_snapshots (observed_at, blocked_depth, issue_numbers, run_id)
+       VALUES (now() - interval '10 seconds', 15, ARRAY[601,602,603,604,605,606,607,608,609,610,611,612,613,614,615]::int[], $1)`,
+      [runId],
+    );
+
+    const body = await gql(
+      `{ dispatcherState { blockedDepth } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    expect(state.blockedDepth).toBe(15);
+    // Snapshots cascade-delete with the run row in cleanup.
+  });
+
   it('surfaces recent failures within sinceHours window', async () => {
     const agentId = await insertAgent({ issueNumber: 999002, status: 'failed' });
     await insertFailure({
