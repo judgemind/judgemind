@@ -10434,11 +10434,29 @@ class DispatcherDaemon:
 
         try:
             with self._conn.cursor() as cur:
+                # Issue #2921: filter to ``kind='task'`` daemon-owned
+                # rows only. The supervisor's stuck_timeout sweep
+                # writes ``status='crashed'`` terminal outcomes for
+                # ``kind='task-skill'`` rows (operator-spawned /task
+                # subagents whose phase never advances past
+                # ``claiming`` because the skill doesn't write
+                # ``phase_transitions``). Those are operator-side
+                # lifecycle events — they have no predictive power
+                # for daemon pipeline health and must not trip the
+                # breaker. Sibling fixes in #2903 (retry-markers
+                # skipped for task-skill rows) and #2908
+                # (``_has_active_agent`` + boot recovery filtered to
+                # ``kind='task'``) addressed the same
+                # kind-conflation pattern elsewhere in the daemon.
                 cur.execute(
-                    "SELECT status FROM dispatcher.terminal_outcomes "
-                    "WHERE ended_at > now() - make_interval(mins => %s) "
-                    "ORDER BY ended_at DESC "
-                    "LIMIT %s",
+                    "SELECT o.status "
+                    "  FROM dispatcher.terminal_outcomes o "
+                    "  JOIN dispatcher.agents a "
+                    "    ON a.agent_id = o.agent_id "
+                    " WHERE o.ended_at > now() - make_interval(mins => %s) "
+                    "   AND a.kind = 'task' "
+                    " ORDER BY o.ended_at DESC "
+                    " LIMIT %s",
                     (window_minutes, window_size),
                 )
                 rows = cur.fetchall()

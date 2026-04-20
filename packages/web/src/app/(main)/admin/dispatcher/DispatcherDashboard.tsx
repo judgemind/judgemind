@@ -320,7 +320,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
             Circuit breaker open — dispatcher auto-paused (#2860).
           </div>
           <div className="mt-1">
-            A streak of bad terminal outcomes tripped the overnight-safety rail.
+            A streak of bad terminal outcomes tripped the circuit breaker.
             <code className="mx-1 font-mono">concurrency_cap</code>
             is held at 0. Review recent completions and failures below, then
             raise cap back to ≥1 in the config strip once the underlying

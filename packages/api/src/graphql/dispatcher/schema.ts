@@ -311,7 +311,7 @@ export const dispatcherTypeDefs = `#graphql
     config: [DispatcherConfigEntry!]!
     """\`dispatcher.config.value\` for \`spawn_frozen_until\` (§10), or null if not set."""
     spawnFrozenUntil: DateTime
-    """True when the overnight-safety circuit breaker is open
+    """True when the circuit breaker is open
     (\`dispatcher.config.cap_flipped_by\` == \`"circuit_breaker"\`).
     Surfaces the open state in the admin cockpit so the operator sees
     "Circuit open: N recent agents bad, cap held at 0" instead of a

@@ -857,3 +857,152 @@ class TestTelegramMessage:
             statuses=[],
         )
         assert "(none)" in body
+
+
+# --------------------------------------------------------------------------
+# Issue #2921: the candidate SELECT must JOIN dispatcher.agents and
+# filter ``kind='task'`` so the supervisor's stuck_timeout sweeps on
+# ``kind='task-skill'`` rows (operator-spawned /task subagents whose
+# phase never advances past ``claiming``) do not trip the breaker.
+#
+# Before the fix: 5 task-skill stuck_timeout sweeps in 30 min → breaker
+# opens, cap=0, daemon paused, running pipeline killed by the
+# killswitch. Observed 2026-04-20 16:48:26 UTC with
+# ``recent_statuses=['crashed','crashed','crashed','crashed','crashed']``
+# all sourced from task-skill rows.
+#
+# The DB-level filter is the canonical gate: ``_FakeCursor`` in these
+# tests doesn't enforce the JOIN semantics (it returns whatever rows
+# the test queued), so we assert the filter by inspecting the executed
+# SQL string. An integration test against a real Postgres would
+# additionally exercise the JOIN semantics end-to-end; those live in
+# the dispatcher-integration-tests job and are out of scope here.
+# --------------------------------------------------------------------------
+
+
+class TestCircuitBreakerKindFilter:
+    """Issue #2921 — SELECT must filter to ``kind='task'`` rows."""
+
+    def _stub_config_reads(
+        self,
+        conn: _FakeConnection,
+        *,
+        enabled: Any = True,
+        window_minutes: Any = 30,
+        window_size: Any = 10,
+        threshold: Any = 5,
+    ) -> None:
+        conn.cursor_instance.fetch_queue.extend(
+            [
+                (enabled,),
+                (window_minutes,),
+                (window_size,),
+                (threshold,),
+            ]
+        )
+
+    def test_scan_query_joins_dispatcher_agents_on_kind_task(
+        self, tmp_path: Path
+    ) -> None:
+        """The candidate SELECT must JOIN ``dispatcher.agents`` and filter ``kind='task'``.
+
+        Regression for #2921: the pre-fix query read from
+        ``dispatcher.terminal_outcomes`` alone, with no ``kind``
+        filter. That let supervisor stuck_timeout sweeps on
+        ``kind='task-skill'`` rows count toward the breaker. The
+        post-fix query joins against ``dispatcher.agents`` on
+        ``agent_id`` and filters ``a.kind = 'task'`` so only
+        daemon-owned outcomes influence the breaker.
+        """
+        d, conn, _h = _make_daemon(tmp_path)
+        self._stub_config_reads(conn)
+        # Empty scan result — we only care about the SQL string here.
+        conn.cursor_instance.fetchall_queue.append([])
+
+        d._evaluate_circuit_breaker("agent-x")
+
+        scans = [
+            e
+            for e in conn.cursor_instance.executed
+            if "dispatcher.terminal_outcomes" in e[0]
+        ]
+        assert len(scans) == 1, (
+            f"expected exactly one scan SELECT, got {len(scans)}: {scans!r}"
+        )
+        sql = scans[0][0]
+        # The JOIN on dispatcher.agents is the structural filter.
+        assert "JOIN dispatcher.agents" in sql, (
+            f"scan SQL missing JOIN on dispatcher.agents: {sql!r}"
+        )
+        # And the kind='task' predicate is the filter itself.
+        assert "a.kind = 'task'" in sql, (
+            f"scan SQL missing kind='task' predicate: {sql!r}"
+        )
+
+    def test_five_task_skill_crashed_rows_do_not_trip_breaker(
+        self, tmp_path: Path
+    ) -> None:
+        """AC: 5 ``kind='task-skill'`` crashed rows in 30 min → breaker stays closed.
+
+        The DB-level JOIN filter excludes task-skill rows before they
+        reach Python, so the scan's ``fetchall`` returns zero rows
+        when the only terminal outcomes in the window are task-skill
+        stuck_timeout sweeps. With zero bad rows observed, the
+        breaker cannot trip regardless of threshold. This mirrors
+        the 2026-04-20 16:48:26 UTC incident's real-world shape
+        (``recent_statuses=['crashed','crashed','crashed','crashed','crashed']``
+        all from task-skill rows) — with the fix the scan returns
+        ``[]`` and the breaker stays closed.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn)
+        # Post-fix the JOIN excludes task-skill rows at the DB layer,
+        # so the scan sees an empty window for this workload.
+        conn.cursor_instance.fetchall_queue.append([])
+
+        tripped = d._evaluate_circuit_breaker("daemon-task-agent")
+
+        assert tripped is False, (
+            "breaker tripped on an empty scan result — the kind='task' "
+            "filter is the only thing keeping task-skill stuck_timeouts "
+            "from polluting the breaker signal"
+        )
+        # No cap flip UPDATE fired.
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0] and "concurrency_cap" in e[0]
+        ]
+        assert cap_updates == []
+        assert handler.events("circuit_breaker_opened") == []
+
+    def test_five_task_crashed_rows_still_trip_breaker(self, tmp_path: Path) -> None:
+        """Regression: 5 genuine ``kind='task'`` crashed rows still trip.
+
+        Mirror of the AC scenario but with daemon-owned crashed
+        rows — the breaker must still fire as before. The fake
+        cursor represents the post-JOIN result set (task-kind rows
+        only), so the five ``crashed`` entries here stand for five
+        daemon-pipeline crashes that survived the kind filter. The
+        breaker must open and flip cap.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn)
+        conn.cursor_instance.fetchall_queue.append([("crashed",)] * 5)
+        # ``current_cap`` read after the scan / threshold check.
+        conn.cursor_instance.fetch_queue.append((1,))
+
+        tripped = d._evaluate_circuit_breaker("daemon-task-agent")
+
+        assert tripped is True
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+            and "concurrency_cap" in e[0]
+            and e[1] == ("circuit_breaker",)
+        ]
+        assert len(cap_updates) == 1
+        opened = handler.events("circuit_breaker_opened")
+        assert len(opened) == 1
+        assert opened[0].bad_count == 5  # type: ignore[attr-defined]
