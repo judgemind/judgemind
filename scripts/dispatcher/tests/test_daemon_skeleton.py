@@ -208,16 +208,19 @@ class TestSchedulerTick:
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 3
         assert summary["concurrency_cap"] == 0
-        # Three commits on the first tick:
+        # Four commits on the first tick:
         #   1. config read (command consumption is now its own transaction
         #      managed by _consume_commands, which is stubbed here),
-        #   2. queue_snapshots INSERT (Phase 2 addition, #2768),
-        #   3. blocked_snapshots INSERT (#2820) — always runs on the
+        #   2. infra-preemption retry-marker SELECT (#2949 pre-scan drain
+        #      runs in its own transaction; the fake cursor returns an
+        #      empty fetchall so no markers are processed here),
+        #   3. queue_snapshots INSERT (Phase 2 addition, #2768),
+        #   4. blocked_snapshots INSERT (#2820) — always runs on the
         #      first tick so the admin page has a populated blocked
         #      panel immediately after daemon boot.
         # Each scan is isolated in its own transaction. Phase 3A gate stays
         # closed at ``concurrency_cap=0`` so no additional reads/commits.
-        assert fake_conn.commits == 3
+        assert fake_conn.commits == 4
         # Tick counter incremented.
         assert d._scheduler_ticks == 1
 

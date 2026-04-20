@@ -1593,10 +1593,21 @@ class DispatcherDaemon:
                ``_pause_requested`` killswitch event for the worker thread
                to observe between phases (#2847).
             3. Fire the Phase 2 spawn-safety guard (log-only warning).
-            4. Scan the GitHub ``agent/ready`` queue and write a row to
+            4. Drain due retry markers whose reason is in
+               :data:`_INFRA_PREEMPTION_CATEGORIES` via
+               :meth:`_process_retry_markers(only_infra_preemption=True)`
+               (#2949). Those markers re-add ``agent/ready`` to the
+               interrupted issue, so running this step before the queue
+               scan below lands the issue in the same tick's snapshot —
+               it would otherwise wait for the next scheduler tick and
+               lose its slot to fresh claims of equal priority. Budgeted
+               retries (``subprocess_crash``, ``stuck_timeout``,
+               ``gh_rate_exhausted``, ``operator_retry``) stay on the
+               supervisor-tick drain.
+            5. Scan the GitHub ``agent/ready`` queue and write a row to
                ``dispatcher.queue_snapshots``; run the blocked-list scan
                on its slower cadence.
-            5. If the gate allows, spawn the orchestration worker thread
+            6. If the gate allows, spawn the orchestration worker thread
                (#2847). The spawn is non-blocking — the worker runs on a
                dedicated thread with its own psycopg connection so this
                tick returns promptly, preserving the 30s cadence even
@@ -1626,6 +1637,10 @@ class DispatcherDaemon:
               still alive at end-of-tick (#2847).
             * ``pause_requested``: 1 iff the killswitch event is set
               at end-of-tick (#2847).
+            * ``retry_markers_prioritized``: int, count of
+              infra-preemption retry markers drained before the queue
+              scan this tick (#2949). Non-zero means an interrupted
+              agent was reclaimed ahead of any fresh queue claim.
         """
         assert self._conn is not None, "connect() must run before ticks"
 
@@ -1760,6 +1775,51 @@ class DispatcherDaemon:
                 },
             )
 
+        # Issue #2949 — process infra-preemption retry markers BEFORE
+        # scanning the ``agent/ready`` queue. When a daemon restart
+        # abandons an in-flight agent, PR #2944's terminal-and-reclaim
+        # path marks the old row ``failed`` and re-adds ``agent/ready``
+        # to the issue. Draining those markers here means the queue
+        # scan below picks them up on the SAME tick; draining only in
+        # the supervisor tick (120s cadence) would let up to four
+        # scheduler ticks claim fresh work ahead of the interrupted
+        # issue, which burns operator time on agents that paid the
+        # plan cost already. Budgeted retries (``subprocess_crash``,
+        # ``stuck_timeout``, ``gh_rate_exhausted``, ``operator_retry``)
+        # are left for the supervisor drain — their reset path hands
+        # off through ``_resume_retrying_agent`` so claim ordering is
+        # unaffected by their processing cadence.
+        #
+        # Exceptions here are caught + logged but not re-raised — the
+        # scheduler tick must survive any marker-scan failure so the
+        # downstream queue scan + claim gate still fire this tick.
+        retry_markers_prioritized = 0
+        try:
+            retry_markers_prioritized = self._process_retry_markers(
+                only_infra_preemption=True
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.retry_prioritized_pass_failed",
+                extra={
+                    "event": "retry_prioritized_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
+        if retry_markers_prioritized > 0:
+            # Distinct event from ``retry_processed`` /
+            # ``retry_terminal_and_reclaim`` so a CloudWatch Insights
+            # filter can confirm the #2949 ordering kicked in on the
+            # post-restart tick without scanning every retry event.
+            self._log.info(
+                "daemon.retry_prioritized_over_fresh_claim",
+                extra={
+                    "event": "retry_prioritized_over_fresh_claim",
+                    "run_id": self._run_id,
+                    "markers_processed": retry_markers_prioritized,
+                },
+            )
+
         # 3. Scan the ``agent/ready`` queue and persist a snapshot.
         #
         # Failures here (rate limit, network, auth) log + return -1 but
@@ -1853,6 +1913,10 @@ class DispatcherDaemon:
                 # holds regardless of worker state.
                 "orchestration_thread_alive": orchestration_thread_alive,
                 "pause_requested": pause_requested,
+                # #2949: count of infra-preemption retry markers drained
+                # before the queue scan this tick. Non-zero means an
+                # interrupted agent was reclaimed ahead of fresh work.
+                "retry_markers_prioritized": retry_markers_prioritized,
             },
         )
         return {
@@ -1864,6 +1928,9 @@ class DispatcherDaemon:
             # #2847 observability fields for tests and CloudWatch.
             "orchestration_thread_alive": 1 if orchestration_thread_alive else 0,
             "pause_requested": 1 if pause_requested else 0,
+            # #2949 observability — count of infra-preemption retry
+            # markers drained before the queue scan.
+            "retry_markers_prioritized": retry_markers_prioritized,
         }
 
     # ── command consumption (#2801) ────────────────────────────────────
@@ -10284,11 +10351,14 @@ class DispatcherDaemon:
         )
         return False
 
-    def _process_retry_markers(self) -> int:
+    def _process_retry_markers(self, *, only_infra_preemption: bool = False) -> int:
         """Drain due retry markers, reset each agent, resolve the marker.
 
-        Called from the supervisor tick. For each unresolved marker
-        whose ``retry_after_ts`` has elapsed:
+        Called from the supervisor tick (full drain, default) and from
+        the scheduler tick with ``only_infra_preemption=True`` so
+        infra-preemption retries resume before fresh queue claims on
+        the same tick (issue #2949). For each unresolved marker whose
+        ``retry_after_ts`` has elapsed:
 
         1. Best-effort drop the existing worktree (see
            :meth:`_drop_worktree_best_effort`).
@@ -10339,20 +10409,54 @@ class DispatcherDaemon:
         ``retry_counted`` boolean so CloudWatch queries can separate
         budgeted retries (``retry_counted=true``) from free infra
         preemption retries (``retry_counted=false``).
+
+        **Scheduler-tick pre-scan drain (issue #2949).** When
+        ``only_infra_preemption=True`` the SELECT is narrowed to rows
+        whose ``reason`` is in :data:`_INFRA_PREEMPTION_CATEGORIES`.
+        Budgeted retries (``subprocess_crash``, ``stuck_timeout``,
+        ``gh_rate_exhausted``, ``operator_retry``) are left for the
+        supervisor-tick drain later in the cycle. Rationale:
+        infra-preemption markers re-add ``agent/ready`` to the issue
+        via the terminal-and-reclaim path; processing them before the
+        queue scan ensures the interrupted issue lands in this tick's
+        snapshot and is picked over any fresh claim of equal priority.
+        Budgeted retries reset the existing row to
+        ``status='retrying' phase='claiming'`` and are handled by
+        :meth:`_resume_retrying_agent` on the orchestration worker
+        thread, so their processing cadence does not affect claim
+        ordering and can remain on the supervisor tick.
         """
         assert self._conn is not None, "connect() must run before marker drain"
 
         try:
             with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT m.marker_id, m.agent_id, m.reason, m.attempt, "
-                    "       a.worktree_path, a.issue_number "
-                    "FROM dispatcher.retry_markers m "
-                    "JOIN dispatcher.agents a ON a.agent_id = m.agent_id "
-                    "WHERE m.resolved_at IS NULL "
-                    "  AND m.retry_after_ts <= now() "
-                    "ORDER BY m.retry_after_ts ASC",
-                )
+                if only_infra_preemption:
+                    # Issue #2949 — scheduler-tick pre-scan drain.
+                    # Narrow to infra-preemption rows so the supervisor
+                    # tick still owns the steady-state budgeted retry
+                    # drain. ``reason = ANY(%s)`` uses a bind parameter
+                    # so psycopg handles the list-to-array conversion.
+                    cur.execute(
+                        "SELECT m.marker_id, m.agent_id, m.reason, m.attempt, "
+                        "       a.worktree_path, a.issue_number "
+                        "FROM dispatcher.retry_markers m "
+                        "JOIN dispatcher.agents a ON a.agent_id = m.agent_id "
+                        "WHERE m.resolved_at IS NULL "
+                        "  AND m.retry_after_ts <= now() "
+                        "  AND m.reason = ANY(%s) "
+                        "ORDER BY m.retry_after_ts ASC",
+                        (list(_INFRA_PREEMPTION_CATEGORIES),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT m.marker_id, m.agent_id, m.reason, m.attempt, "
+                        "       a.worktree_path, a.issue_number "
+                        "FROM dispatcher.retry_markers m "
+                        "JOIN dispatcher.agents a ON a.agent_id = m.agent_id "
+                        "WHERE m.resolved_at IS NULL "
+                        "  AND m.retry_after_ts <= now() "
+                        "ORDER BY m.retry_after_ts ASC",
+                    )
                 due = cur.fetchall()
             self._conn.commit()
         except Exception:
