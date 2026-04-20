@@ -334,6 +334,52 @@ class TestHasActiveAgent:
         assert d._has_active_agent() is True
         assert conn.rollbacks >= 1
 
+    def test_query_filters_on_kind_task(self, tmp_path: Path) -> None:
+        """Regression for #2908.
+
+        The scheduler concurrency gate must only consider daemon-owned
+        (``kind='task'``) agents. A laptop ``/task`` subagent's
+        ``kind='task-skill'`` row at ``status='running'`` is operator-
+        owned and has no bearing on the daemon's subprocess-slot
+        accounting — counting it starves the daemon's scheduler.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [None]
+        d._has_active_agent()
+
+        selects = [
+            e
+            for e in conn.cursor_instance.executed
+            if "SELECT 1 FROM dispatcher.agents" in e[0]
+        ]
+        assert selects, "expected _has_active_agent to issue the SELECT"
+        sql, _params = selects[0]
+        assert "status = 'running'" in sql
+        assert "kind = 'task'" in sql, (
+            "_has_active_agent must filter kind='task' so task-skill rows "
+            "do not starve the scheduler (see #2908). Actual SQL: " + sql
+        )
+
+    def test_task_skill_row_is_not_counted_as_active(self, tmp_path: Path) -> None:
+        """End-to-end behavior: with a live ``kind='task-skill'`` row as
+        the only ``status='running'`` row in the database, the scheduler
+        gate must treat the slot as FREE.
+
+        We simulate this by seeding the fake cursor's ``fetch_queue``
+        with ``None`` — i.e. the kind-filtered SELECT returns zero rows.
+        This only holds if the SQL actually includes the ``kind='task'``
+        predicate; without it, the pre-fix query would return a row and
+        the fake would have to be primed with ``(1,)`` instead.
+        The assertion on the SQL text in
+        ``test_query_filters_on_kind_task`` is the structural guarantee;
+        this test documents the behavioral contract alongside.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        # After the kind filter, a lone task-skill row produces zero
+        # matches.
+        conn.cursor_instance.fetch_queue = [None]
+        assert d._has_active_agent() is False
+
 
 # --------------------------------------------------------------------------
 # _latest_queue_snapshot_issues

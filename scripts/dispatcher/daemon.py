@@ -2592,17 +2592,32 @@ class DispatcherDaemon:
     # ``{worktree}/tmp/claude-p-<phase>.log``.
 
     def _has_active_agent(self) -> bool:
-        """Return True when an agent row is already ``running`` for this run.
+        """Return True when a daemon-owned agent row is already ``running``.
 
         Phase 3 concurrency cap is 1 per daemon: no new claim while any
         existing agent is still in flight. Uses the
-        ``idx_dispatcher_agents_running`` partial index.
+        ``idx_dispatcher_agents_running`` partial index; the extra
+        ``kind = 'task'`` predicate is a cheap post-filter on top.
+
+        The ``kind = 'task'`` filter is the key scope discipline (#2908):
+        the scheduler gate must only count daemon-owned agents. A laptop
+        /task subagent writes a ``kind='task-skill'`` row at
+        ``status='running'`` (see ``scripts/dispatcher/task_claim.py``);
+        that row represents a separate OS process on the operator's
+        machine and has no bearing on the daemon's subprocess-slot
+        budget. Counting task-skill rows here caused the daemon to go
+        idle with a full queue whenever any subagent was running.
+        Interlock paths (``_lookup_active_owner_kind``,
+        ``_atomic_claim`` UniqueViolation handling) legitimately need to
+        see task-skill rows and MUST NOT use this filter.
         """
         assert self._conn is not None, "connect() must run before checking"
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM dispatcher.agents WHERE status = 'running' LIMIT 1",
+                    "SELECT 1 FROM dispatcher.agents "
+                    "WHERE status = 'running' AND kind = 'task' "
+                    "LIMIT 1",
                 )
                 row = cur.fetchone()
             self._conn.commit()
@@ -3402,10 +3417,19 @@ class DispatcherDaemon:
         candidates: list[tuple[str, int | None, str | None]] = []
         try:
             with self._conn.cursor() as cur:
+                # ``kind = 'task'`` filter (#2908): only reclaim
+                # daemon-owned agents from prior runs. Laptop /task
+                # subagents (``kind='task-skill'``) write their own
+                # ``dispatcher.agents`` row but their subprocess lives
+                # on the operator's machine — the daemon cannot reclaim
+                # or retry them, and enqueuing a restart-abandoned retry
+                # marker would phantom-dispatch work that is still
+                # running elsewhere.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase "
                     "FROM dispatcher.agents "
                     "WHERE status = 'running' "
+                    "  AND kind = 'task' "
                     "  AND (parent_run_id IS NULL "
                     "       OR parent_run_id <> %s)",
                     (self._run_id,),
@@ -6818,14 +6842,23 @@ class DispatcherDaemon:
         agents: list[dict[str, Any]] = []
         try:
             with self._conn.cursor() as cur:
+                # ``kind = 'task'`` filter (#2908): the advance loop is
+                # scoped to daemon-owned agents. Laptop /task subagents
+                # (``kind='task-skill'``) never reach
+                # ``awaiting_ci``/``awaiting_deploy``/``retro_*`` in
+                # practice, but filtering defensively documents the
+                # scope and prevents a future phase-label collision
+                # from silently driving the advance loop against rows
+                # the daemon does not own.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status "
                     "FROM dispatcher.agents "
-                    "WHERE (status = 'running' "
-                    "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
-                    "   OR (status = 'succeeded' "
-                    "       AND phase IN ('done', 'retro_done', 'retro_failed')) "
+                    "WHERE kind = 'task' "
+                    "  AND ((status = 'running' "
+                    "        AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
+                    "    OR (status = 'succeeded' "
+                    "        AND phase IN ('done', 'retro_done', 'retro_failed'))) "
                     "ORDER BY started_at ASC",
                 )
                 for row in cur.fetchall():
