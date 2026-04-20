@@ -4146,10 +4146,35 @@ class DispatcherDaemon:
     #: Human-readable summaries for the no-tail categories. Keyed by
     #: category; the value is the complete ``failure_summary`` string
     #: (no phase/status/category parens — those would repeat the same
-    #: word). Issue #2924.
+    #: word). Issue #2924; strings rephrased for operator-readability in
+    #: issue #2935 (``"paused by killswitch"`` → ``"manually stopped"``;
+    #: ``"daemon restart abandoned"`` → ``"dispatcher restarted"``). The
+    #: stored ``dispatcher.failures.category`` values are unchanged —
+    #: only the surfaced display string here.
     _NO_TAIL_CATEGORY_SUMMARIES = {
-        "paused_by_killswitch": "paused by killswitch",
-        "daemon_restart_abandoned": "daemon restart abandoned",
+        "paused_by_killswitch": "manually stopped",
+        "daemon_restart_abandoned": "dispatcher restarted",
+    }
+
+    #: Display-name map consulted by :meth:`_build_failure_summary` at
+    #: the parenthesized-category slot of the templated output. Keyed by
+    #: the stored ``dispatcher.failures.category`` value (which is a
+    #: machine-readable token used for retry classification, log
+    #: filtering, and CloudWatch Insights queries); the value is the
+    #: operator-friendly phrasing rendered in the admin cockpit tooltip.
+    #: Unknown categories fall through to the stored string verbatim via
+    #: ``_CATEGORY_DISPLAY_NAMES.get(category, category)``.
+    #:
+    #: Issue #2935 — rename is display-only; stored values stay put so
+    #: logs, Insights queries, retry classifiers, and existing tests
+    #: aren't broken.
+    _CATEGORY_DISPLAY_NAMES = {
+        "subprocess_turn_limit": "turn limit reached",
+        "subprocess_crash": "subprocess crashed",
+        "subprocess_auth_fail": "auth failed",
+        "ci_red_after_retries": "CI failed after retries",
+        "gh_rate_exhausted": "GitHub rate limit",
+        "stuck_timeout": "timed out",
     }
 
     @staticmethod
@@ -4396,9 +4421,14 @@ class DispatcherDaemon:
 
         # Compose. Category is parenthesized; detail trails a colon so
         # a scanner can pattern-match on either end of the string.
+        # Issue #2935: map the stored (machine-readable) category through
+        # ``_CATEGORY_DISPLAY_NAMES`` so the tooltip reads in English.
+        # The stored value in ``dispatcher.failures.category`` stays
+        # unchanged — this rewrite is render-time only.
         parts: list[str] = [verb_phrase]
         if category:
-            parts[-1] = f"{parts[-1]} ({category})"
+            display_category = self._CATEGORY_DISPLAY_NAMES.get(category, category)
+            parts[-1] = f"{parts[-1]} ({display_category})"
         if detail:
             summary = f"{parts[-1]}: {detail}"
         else:

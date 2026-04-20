@@ -166,9 +166,14 @@ class TestBuildFailureSummary:
             exit_code=124,
         )
         assert summary is not None
-        # Shape: "ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns"
+        # Shape (issue #2935): "ralph crashed at ralph-reviewer iteration
+        # 3 (turn limit reached): reviewer exceeded max turns". The
+        # stored category ``subprocess_turn_limit`` is mapped through
+        # ``_CATEGORY_DISPLAY_NAMES`` to the operator-friendly phrasing.
         assert "ralph crashed at ralph-reviewer iteration 3" in summary
-        assert "(subprocess_turn_limit)" in summary
+        assert "(turn limit reached)" in summary
+        # The jargon token must NOT appear — it was rewritten at render time.
+        assert "subprocess_turn_limit" not in summary
         assert "reviewer exceeded max turns" in summary
         assert len(summary) <= 240
 
@@ -219,8 +224,8 @@ class TestBuildFailureSummary:
         """``ci_red_after_retries`` is a distinct category; the
         phase-group ``push_and_pr`` is the verb phrase source.
 
-        Matches issue example:
-          "push_and_pr failed (ci_red_after_retries): pre-push test regression in packages/scraper-framework/tests/"
+        Matches issue example (post-#2935 display phrasing):
+          "push_and_pr failed (CI failed after retries): pre-push test regression in packages/scraper-framework/tests/"
         """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [
@@ -242,7 +247,9 @@ class TestBuildFailureSummary:
         )
         assert summary is not None
         assert "push_and_pr" in summary
-        assert "ci_red_after_retries" in summary
+        # Issue #2935: stored category renders through display-name map.
+        assert "(CI failed after retries)" in summary
+        assert "ci_red_after_retries" not in summary
         # Detail text surfaces.
         assert "pre-push" in summary
 
@@ -322,7 +329,11 @@ class TestBuildFailureSummary:
         ``de44c316-...`` (issue #2564): the admin tooltip rendered the
         raw ``claude -p`` JSON result envelope because ``phase_outputs
         .log_text`` contained the stdout success blob (the agent was
-        paused mid-run, not crashed)."""
+        paused mid-run, not crashed).
+
+        Issue #2935: display string was rephrased from ``"paused by
+        killswitch"`` to ``"manually stopped"``. The stored category
+        value is unchanged — only the surfaced summary."""
         d, conn, _handler = _make_daemon(tmp_path)
         # Feed a log_text that contains the raw JSON envelope — the
         # exact shape observed in the #2564 tooltip. If the fix regresses
@@ -341,13 +352,13 @@ class TestBuildFailureSummary:
             phase="paused_by_killswitch",
             exit_code=0,
         )
-        assert summary == "paused by killswitch"
+        # Issue #2935: operator-friendly phrasing.
+        assert summary == "manually stopped"
         # Belt-and-suspenders — no JSON in the output.
         assert "{" not in summary
         assert "result" not in summary
-        # No phase echo — the word "paused_by_killswitch" must not appear
-        # twice or show up parenthesized as a category.
-        assert summary.count("killswitch") == 1
+        # The jargon word must not leak through the short-circuit.
+        assert "killswitch" not in summary
 
     def test_daemon_restart_abandoned_skips_tail(self, tmp_path: Path) -> None:
         """``category='daemon_restart_abandoned'`` same as killswitch:
@@ -356,7 +367,11 @@ class TestBuildFailureSummary:
         Regression for the ``7c28b8e1-...`` pattern (issue #2899) — the
         tooltip read ``"daemon_restart_abandoned crashed at
         daemon_restart_abandoned (daemon_restart_abandoned)"`` because
-        every template slot resolved to the same word."""
+        every template slot resolved to the same word.
+
+        Issue #2935: display string was rephrased from ``"daemon
+        restart abandoned"`` to ``"dispatcher restarted"``. The stored
+        category value is unchanged — only the surfaced summary."""
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [
             ("daemon_restart_abandoned", {}),
@@ -368,12 +383,12 @@ class TestBuildFailureSummary:
             phase="daemon_restart_abandoned",
             exit_code=None,
         )
-        assert summary == "daemon restart abandoned"
+        # Issue #2935: operator-friendly phrasing.
+        assert summary == "dispatcher restarted"
         assert "{" not in summary
-        # Phase word appears exactly once — no tautological repetition.
-        # (Count the underscored form since the summary uses the
-        # humanized spaced form.)
+        # The jargon phrase must not leak through the short-circuit.
         assert "daemon_restart_abandoned" not in summary
+        assert "abandoned" not in summary
 
     def test_subprocess_turn_limit_tail_skips_json_envelope(
         self, tmp_path: Path
@@ -494,6 +509,149 @@ class TestBuildFailureSummary:
 
 
 # --------------------------------------------------------------------------
+# Issue #2935 — operator-friendly category display names.
+#
+# ``dispatcher.failures.category`` stays machine-readable (used by retry
+# classifiers, CloudWatch Insights queries, tests). But the admin cockpit
+# tooltip renders the templated ``_build_failure_summary`` output, and
+# the parenthesized category slot previously leaked the raw token. The
+# ``_CATEGORY_DISPLAY_NAMES`` map is consulted at render-time so the
+# tooltip reads in English without changing the stored value.
+#
+# These tests verify one mapping per templated category + the
+# unknown-category fallback + map contents for the renamed short-circuit
+# no-tail categories from issue #2935.
+# --------------------------------------------------------------------------
+
+
+class TestCategoryDisplayNames:
+    """Issue #2935 — display-name map for templated categories.
+
+    Map shape (keyed by stored category):
+
+        subprocess_turn_limit   → "turn limit reached"
+        subprocess_crash        → "subprocess crashed"
+        subprocess_auth_fail    → "auth failed"
+        ci_red_after_retries    → "CI failed after retries"
+        gh_rate_exhausted       → "GitHub rate limit"
+        stuck_timeout           → "timed out"
+        any other (unknown)     → category string verbatim (fallback)
+    """
+
+    def _build_for_category(
+        self,
+        tmp_path: Path,
+        category: str,
+        *,
+        detail: str | None = "some detail",
+    ) -> str:
+        """Helper — synthesize a templated failure row for ``category``
+        and return the rendered ``failure_summary``."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        details = {"detail": detail} if detail else {}
+        conn.cursor_instance.fetch_queue = [
+            (category, details),
+            (None,),  # no phase_outputs log_text
+        ]
+        summary = d._build_failure_summary(
+            agent_id=f"agent-cat-{category}",
+            status="failed",
+            phase="push_and_pr",
+            exit_code=1,
+        )
+        assert summary is not None
+        return summary
+
+    def test_subprocess_turn_limit_renders_as_turn_limit_reached(
+        self, tmp_path: Path
+    ) -> None:
+        summary = self._build_for_category(tmp_path, "subprocess_turn_limit")
+        assert "(turn limit reached)" in summary
+        # The stored token must not leak into the user-facing string.
+        assert "subprocess_turn_limit" not in summary
+
+    def test_subprocess_crash_renders_as_subprocess_crashed(
+        self, tmp_path: Path
+    ) -> None:
+        summary = self._build_for_category(tmp_path, "subprocess_crash")
+        assert "(subprocess crashed)" in summary
+        assert "subprocess_crash" not in summary
+
+    def test_subprocess_auth_fail_renders_as_auth_failed(self, tmp_path: Path) -> None:
+        summary = self._build_for_category(tmp_path, "subprocess_auth_fail")
+        assert "(auth failed)" in summary
+        assert "subprocess_auth_fail" not in summary
+
+    def test_ci_red_after_retries_renders_as_ci_failed_after_retries(
+        self, tmp_path: Path
+    ) -> None:
+        summary = self._build_for_category(tmp_path, "ci_red_after_retries")
+        assert "(CI failed after retries)" in summary
+        assert "ci_red_after_retries" not in summary
+
+    def test_gh_rate_exhausted_renders_as_github_rate_limit(
+        self, tmp_path: Path
+    ) -> None:
+        summary = self._build_for_category(tmp_path, "gh_rate_exhausted")
+        assert "(GitHub rate limit)" in summary
+        assert "gh_rate_exhausted" not in summary
+
+    def test_stuck_timeout_renders_as_timed_out(self, tmp_path: Path) -> None:
+        summary = self._build_for_category(tmp_path, "stuck_timeout")
+        assert "(timed out)" in summary
+        assert "stuck_timeout" not in summary
+
+    def test_unknown_category_falls_through_verbatim(self, tmp_path: Path) -> None:
+        """Anything not in ``_CATEGORY_DISPLAY_NAMES`` falls through
+        unchanged — future categories won't silently disappear from the
+        tooltip while the map catches up.
+
+        AC verify line: "unit test with category='some_future_category' →
+        parens contain 'some_future_category' verbatim".
+        """
+        summary = self._build_for_category(tmp_path, "some_future_category")
+        # Fallback: the raw token IS what appears in the tooltip.
+        assert "(some_future_category)" in summary
+
+    # The renamed short-circuits live outside ``_CATEGORY_DISPLAY_NAMES``
+    # — they're keyed in ``_NO_TAIL_CATEGORY_SUMMARIES`` because they
+    # skip the template entirely. These two tests lock the post-#2935
+    # map contents so a rename typo in either dict surfaces in CI.
+
+    def test_no_tail_summaries_contains_manually_stopped(self) -> None:
+        """``paused_by_killswitch`` → ``"manually stopped"``. Guards
+        against accidentally reverting to the old ``"paused by
+        killswitch"`` phrasing."""
+        assert (
+            daemon.DispatcherDaemon._NO_TAIL_CATEGORY_SUMMARIES["paused_by_killswitch"]
+            == "manually stopped"
+        )
+
+    def test_no_tail_summaries_contains_dispatcher_restarted(self) -> None:
+        """``daemon_restart_abandoned`` → ``"dispatcher restarted"``.
+        Guards against accidentally reverting to the old ``"daemon
+        restart abandoned"`` phrasing."""
+        assert (
+            daemon.DispatcherDaemon._NO_TAIL_CATEGORY_SUMMARIES[
+                "daemon_restart_abandoned"
+            ]
+            == "dispatcher restarted"
+        )
+
+    def test_category_display_names_map_contents(self) -> None:
+        """Lock the full ``_CATEGORY_DISPLAY_NAMES`` map contents so a
+        typo or accidental deletion on any row surfaces immediately."""
+        assert daemon.DispatcherDaemon._CATEGORY_DISPLAY_NAMES == {
+            "subprocess_turn_limit": "turn limit reached",
+            "subprocess_crash": "subprocess crashed",
+            "subprocess_auth_fail": "auth failed",
+            "ci_red_after_retries": "CI failed after retries",
+            "gh_rate_exhausted": "GitHub rate limit",
+            "stuck_timeout": "timed out",
+        }
+
+
+# --------------------------------------------------------------------------
 # _extract_stderr_tail — JSON-envelope filter
 # --------------------------------------------------------------------------
 
@@ -588,7 +746,10 @@ class TestMarkAgentTerminalWritesFailureSummary:
         assert params[1] == "agent-failed"
         summary_text = params[0]
         assert isinstance(summary_text, str)
-        assert "subprocess_turn_limit" in summary_text
+        # Issue #2935: the stored category ``subprocess_turn_limit`` is
+        # rendered through ``_CATEGORY_DISPLAY_NAMES`` at the tooltip slot.
+        assert "turn limit reached" in summary_text
+        assert "subprocess_turn_limit" not in summary_text
         assert len(summary_text) <= 240
 
     def test_crashed_terminal_writes_failure_summary(self, tmp_path: Path) -> None:
@@ -612,7 +773,11 @@ class TestMarkAgentTerminalWritesFailureSummary:
             if "UPDATE dispatcher.agents" in e[0] and "failure_summary" in e[0]
         ]
         assert summary_updates
-        assert "stuck_timeout" in summary_updates[0][1][0]
+        # Issue #2935: the stored category ``stuck_timeout`` renders
+        # through ``_CATEGORY_DISPLAY_NAMES`` as ``"timed out"``.
+        summary_written = summary_updates[0][1][0]
+        assert "timed out" in summary_written
+        assert "stuck_timeout" not in summary_written
 
     def test_plan_blocked_terminal_writes_failure_summary(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
