@@ -279,6 +279,94 @@ describe('recentCompletionsToGraphQL', () => {
     );
   });
 
+  // #2913 — defense-in-depth: even if a pre-#2913 ``succeeded`` row is
+  // still carrying a stale ``failure_summary`` in the DB (e.g. the 3
+  // confused rows observed on dev: agents for #2921, #2916, #2899 that
+  // went crashed → retry_reset → succeeded before the daemon-side
+  // clear shipped), the resolver MUST NOT expose it on the GraphQL
+  // surface. The admin cockpit renders the ✓ glyph with the default
+  // status-label tooltip instead. Primary fix is the daemon-side clear;
+  // this is the belt-and-suspenders so the UX never regresses.
+  it('drops ``failureSummary`` on succeeded rows even if the DB still has one (#2913)', () => {
+    const rows = [
+      {
+        agent_id: 'uuid-recovered',
+        issue_number: 2908,
+        issue_title: 'Recovered via retry_reset',
+        status: 'succeeded',
+        ended_at: '2026-04-20T12:00:00Z',
+        pr_number: 2912,
+        failure_summary:
+          'daemon_restart_abandoned crashed at daemon_restart_abandoned (daemon_restart_abandoned)',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].status).toBe('succeeded');
+    expect(result[0].failureSummary).toBeNull();
+  });
+
+  it('drops ``failureSummary`` on needs_review rows even if the DB still has one (#2913)', () => {
+    // ``needs_review`` is a correct-outcome terminal — the draft PR IS
+    // the signal, not a failure string. Same gate as ``succeeded``.
+    const rows = [
+      {
+        agent_id: 'uuid-nr',
+        issue_number: 2856,
+        issue_title: 'Draft PR opened',
+        status: 'needs_review',
+        ended_at: '2026-04-20T14:00:00Z',
+        pr_number: 9001,
+        failure_summary: 'stale summary from an earlier iteration',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].status).toBe('needs_review');
+    expect(result[0].failureSummary).toBeNull();
+  });
+
+  it('keeps ``failureSummary`` on failed / crashed / plan_blocked rows (#2913 gate allows failure statuses)', () => {
+    // Positive case: the resolver-side gate must only drop the summary
+    // for correct-outcome terminals. Failure terminals still surface
+    // the tooltip.
+    const rows = [
+      {
+        agent_id: 'uuid-failed',
+        issue_number: 101,
+        status: 'failed',
+        ended_at: '2026-04-20T10:00:00Z',
+        pr_number: null,
+        failure_summary: 'ralph failed at ralph-reviewer iteration 3',
+      },
+      {
+        agent_id: 'uuid-crashed',
+        issue_number: 102,
+        status: 'crashed',
+        ended_at: '2026-04-20T10:01:00Z',
+        pr_number: null,
+        failure_summary: 'ralph crashed (stuck_timeout): no log tail',
+      },
+      {
+        agent_id: 'uuid-pb',
+        issue_number: 103,
+        status: 'plan_blocked',
+        ended_at: '2026-04-20T10:02:00Z',
+        pr_number: null,
+        failure_summary:
+          'plan phase returned go=false (plan_go_false): scope is ambiguous',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].failureSummary).toBe(
+      'ralph failed at ralph-reviewer iteration 3',
+    );
+    expect(result[1].failureSummary).toBe(
+      'ralph crashed (stuck_timeout): no log tail',
+    );
+    expect(result[2].failureSummary).toBe(
+      'plan phase returned go=false (plan_go_false): scope is ambiguous',
+    );
+  });
+
   it('emits priority=null for pre-migration-33 rows (#2899)', () => {
     // Rows whose claim predates migration 34 (the one #2899 adds) have
     // ``priority`` = NULL from pg; the UI renders an em-dash placeholder.

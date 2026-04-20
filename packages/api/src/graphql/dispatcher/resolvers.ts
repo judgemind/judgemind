@@ -448,6 +448,22 @@ function queueItemFromSnapshot(
   };
 }
 
+/**
+ * Statuses whose rows are allowed to expose a ``failureSummary`` on the
+ * GraphQL surface. Defense-in-depth (#2913): the daemon clears the
+ * column on correct-outcome terminals (``succeeded`` / ``needs_review``)
+ * in the same UPDATE as the status transition, but this resolver-side
+ * gate guarantees the admin cockpit never renders a stale tooltip on a
+ * ✓ row even if a pre-fix row sneaks through or a future code path
+ * forgets the clear. Matches the daemon's ``_FAILURE_SUMMARY_STATUSES``
+ * allowlist.
+ */
+const FAILURE_SUMMARY_STATUSES = new Set<string>([
+  'failed',
+  'crashed',
+  'plan_blocked',
+]);
+
 function recentCompletionsToGraphQL(
   rows: readonly Row[],
 ): Array<Record<string, unknown>> {
@@ -464,10 +480,21 @@ function recentCompletionsToGraphQL(
     // built-in status label). Trimming matches the daemon's write-time
     // convention and handles the edge case where a migration-era empty
     // string sneaks through.
-    const failureSummary =
+    //
+    // #2913: defense-in-depth — only expose the summary for failure
+    // statuses (``failed`` / ``crashed`` / ``plan_blocked``). Belt-and-
+    // suspenders with the daemon's clear-on-success-terminal write: if
+    // a ``succeeded`` / ``needs_review`` row arrives with a populated
+    // ``failure_summary`` (pre-#2913 data, or a future code path that
+    // forgets to clear), the UI still renders a clean tooltip.
+    const statusStr = typeof row.status === 'string' ? row.status : '';
+    const rawSummary =
       typeof row.failure_summary === 'string' && row.failure_summary.trim()
         ? row.failure_summary.trim()
         : null;
+    const failureSummary = FAILURE_SUMMARY_STATUSES.has(statusStr)
+      ? rawSummary
+      : null;
     return {
       agentId: row.agent_id,
       issueNumber: number,
