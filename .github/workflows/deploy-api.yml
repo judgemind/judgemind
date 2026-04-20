@@ -87,7 +87,7 @@ jobs:
 
   deploy-dev:
     name: Deploy to Dev
-    needs: build-and-push
+    needs: [build-and-push, run-migrations]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
@@ -146,7 +146,7 @@ jobs:
 
   run-migrations:
     name: Run Database Migrations (Dev)
-    needs: [build-and-push, deploy-dev]
+    needs: build-and-push
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 

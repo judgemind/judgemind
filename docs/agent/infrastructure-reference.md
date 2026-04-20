@@ -259,6 +259,29 @@ SELECT phase,
 
 Both queries filter `cost_usd IS NOT NULL` (or sort NULLS LAST) so pre-migration-31 rows don't corrupt the averages or take up slots in the top-10 view.
 
+## Deploy Pipeline Invariants
+
+### Migrations always run before code (#2915)
+
+The API deploy pipeline (`.github/workflows/deploy-api.yml`) enforces a strict ordering: **dev database migrations complete before the new API image is rolled onto the `judgemind-api-dev` service.** The job graph is:
+
+```
+build-and-push
+  ├─> run-migrations     (needs: build-and-push)                  <-- apply first
+  └─> deploy-dev         (needs: [build-and-push, run-migrations]) <-- then ship code
+post-deploy-health-check (needs: [deploy-dev, run-migrations])
+```
+
+This closes the race window observed in PR #2907 where a new resolver shipped onto dev before its backing migration applied, leaving `/admin/dispatcher` briefly serving `UndefinedColumn` errors. The enforcement is the `needs:` dependency on `deploy-dev` — if migrations fail, the deploy is cancelled and the old image keeps serving traffic.
+
+**Scope.** This covers forward-compatible migrations (add nullable column, add table, add index) — the overwhelming majority of Judgemind schema changes. Migrations-first plus rolling deploy is safe for those regardless of whether the old or new code is running when the new column appears.
+
+**Out of scope (backward-incompatible migrations).** Renames, drops, and type changes are still unsafe under a single-phase rolling deploy and require an explicit two-phase cadence (ship tolerant code → migrate → ship code that uses the new shape). Not enforced by this workflow — plan those PRs manually.
+
+**Other deploy workflows.**
+- `deploy-dispatcher.yml` — no migration step. The dispatcher image does not run `scripts/seed-and-migrate.mjs`; the API image owns schema. Nothing to enforce here.
+- `deploy-scraper.yml`, `deploy-production.yml` — no migration step. Same reason.
+
 ## ECS Script Execution
 
 > **Important:** The dev database is in a private VPC and is not reachable from localhost. Do not attempt to connect to it locally using `scripts/with-secret.sh` with `DATABASE_URL` — the connection will fail. All data scripts must run inside the VPC via `ecs-run-task.sh`.
