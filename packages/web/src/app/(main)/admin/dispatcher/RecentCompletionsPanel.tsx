@@ -7,10 +7,10 @@ import { IssueLink, OutcomePill, PriorityBadge, PRLink } from './ui-primitives';
 interface RecentCompletionsPanelProps {
   completions: readonly RecentCompletion[];
   /**
-   * Override for deterministic tests. Currently unused after #2818 stripped
-   * the "N min ago" column — kept in the prop signature so callers
-   * (`DispatcherDashboard`) don't need a refactor if we re-introduce a
-   * time-based cell later.
+   * Override for deterministic tests. Used by the relative-time cell
+   * (#2932) to render "Nm ago" / "Nh ago" / "N days ago" against a
+   * fixed `now` in tests. Production callers omit this prop and the
+   * row falls back to `Date.now()` at render time.
    */
   nowMs?: number;
 }
@@ -40,9 +40,16 @@ interface RecentCompletionsPanelProps {
  * when `prNumber` is null — empty space is less noisy than italic copy.
  * The title cell wraps onto a second line rather than ellipsis-truncating
  * so the full text is always readable without hover.
+ *
+ * #2932 re-adds a relative-time cell **after** the cost footnote, with
+ * better formatting than the original ("5m ago" / "4h ago" / "11 days
+ * ago" / "2 months ago"). Native `title` attribute exposes the full
+ * datetime in Pacific time on hover. Operator gets at-a-glance "when
+ * did this happen" without clicking into the agent detail page.
  */
 export function RecentCompletionsPanel({
   completions,
+  nowMs,
 }: RecentCompletionsPanelProps) {
   return (
     <section aria-labelledby="recent-completions-heading">
@@ -61,6 +68,7 @@ export function RecentCompletionsPanel({
             <RecentCompletionRow
               key={completion.agentId}
               completion={completion}
+              nowMs={nowMs}
             />
           ))}
         </ul>
@@ -69,11 +77,28 @@ export function RecentCompletionsPanel({
   );
 }
 
-function RecentCompletionRow({ completion }: { completion: RecentCompletion }) {
+function RecentCompletionRow({
+  completion,
+  nowMs,
+}: {
+  completion: RecentCompletion;
+  nowMs?: number;
+}) {
   const costFootnote = formatCostFootnote(
     completion.totalCostUsd,
     completion.totalTokens,
   );
+  // Resolve `now` at render. Tests pass a fixed `nowMs` to make the
+  // relative-time cell deterministic; production callers omit the
+  // prop so we fall back to `Date.now()`.
+  const effectiveNowMs = nowMs ?? Date.now();
+  const endedMs = Date.parse(completion.endedAt);
+  const relativeTime = Number.isFinite(endedMs)
+    ? formatRelativeTime(endedMs, effectiveNowMs)
+    : null;
+  const pacificTitle = Number.isFinite(endedMs)
+    ? formatPacificDatetime(endedMs)
+    : '';
   return (
     <li className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50">
       <span className="flex-shrink-0 pt-0.5">
@@ -117,6 +142,22 @@ function RecentCompletionRow({ completion }: { completion: RecentCompletion }) {
           </span>
         )}
       </span>
+      {/* #2932 — abbreviated relative-time cell ("5m ago" / "4h ago" /
+          "11 days ago"). Native `title` attribute shows the full datetime
+          in Pacific time on hover, matching the OutcomePill / IssueLink
+          tooltip pattern. Narrow fixed-width cell — abbreviated values
+          are short (≤ ~11 chars).
+          Positioned AFTER the title+cost span so a tall/wrapping title
+          does not push the timestamp off the row. */}
+      {relativeTime !== null && (
+        <span
+          className="flex-shrink-0 pt-0.5 text-xs text-muted-foreground tabular-nums"
+          data-testid="completion-row-relative-time"
+          title={pacificTitle}
+        >
+          {relativeTime}
+        </span>
+      )}
     </li>
   );
 }
@@ -163,7 +204,96 @@ function formatTokenCount(tokens: number): string {
   return `${tokens} tok`;
 }
 
+/** Render an abbreviated, age-scaled "N ago" string from two epoch-ms
+ * values (#2932). Designed for the Recently Completed panel where the
+ * operator wants at-a-glance freshness, not precise duration.
+ *
+ * Ranges (per the issue body):
+ * - `< 60 seconds`: `Just now`
+ *   (`0m ago` reads as "zero minutes", which is confusing — the spec
+ *   allows either phrasing and "Just now" is the clearer one.)
+ * - `< 60 minutes`: `Nm ago` (e.g. `5m ago`, `47m ago`)
+ * - `1–23 hours`: `Nh ago`
+ * - `1 day`: `1 day ago` (singular, no "s")
+ * - `2–29 days`: `N days ago`
+ * - `30–364 days`: `N months ago` (30-day months, singular for N=1)
+ * - `≥ 365 days`: `N years ago` (365-day years, singular for N=1)
+ *
+ * Future timestamps (clock skew, test fixtures) collapse to `Just now`
+ * rather than rendering a nonsensical negative-minutes string.
+ */
+function formatRelativeTime(timestampMs: number, nowMs: number): string {
+  const diffMs = nowMs - timestampMs;
+  // Future or < 1 second → "Just now" (graceful clock-skew handling).
+  if (diffMs < 1000) return 'Just now';
+
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 60) return 'Just now';
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+
+  const days = Math.floor(hours / 24);
+  if (days === 1) return '1 day ago';
+  if (days < 30) return `${days} days ago`;
+
+  // ≥ 30 days — month/year bucketing using fixed 30-day months and
+  // 365-day years. Operators use this for freshness scanning, not
+  // calendar precision; the hover tooltip carries the exact datetime.
+  if (days < 365) {
+    const months = Math.floor(days / 30);
+    return months === 1 ? '1 month ago' : `${months} months ago`;
+  }
+  const years = Math.floor(days / 365);
+  return years === 1 ? '1 year ago' : `${years} years ago`;
+}
+
+/** Format an epoch-ms timestamp as a Pacific-time datetime string
+ * (#2932) like `2026-04-20 15:36:39 PDT`. Used as the native `title`
+ * attribute on the relative-time cell so operators get the exact time
+ * on hover.
+ *
+ * Vanilla `Intl.DateTimeFormat` is used (no dayjs / moment / date-fns
+ * — the web package has none of those and this component is the only
+ * caller). `formatToParts` lets us assemble the YYYY-MM-DD HH:MM:SS
+ * format the spec calls for without relying on a locale that happens
+ * to produce the right shape.
+ */
+function formatPacificDatetime(timestampMs: number): string {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZoneName: 'short',
+  });
+  const parts = formatter.formatToParts(new Date(timestampMs));
+  const lookup: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') lookup[part.type] = part.value;
+  }
+  // `hour12: false` can emit "24" for midnight on some engines —
+  // normalize to "00" so the assembled string is unambiguous.
+  const hour = lookup.hour === '24' ? '00' : (lookup.hour ?? '00');
+  return (
+    `${lookup.year}-${lookup.month}-${lookup.day} ` +
+    `${hour}:${lookup.minute}:${lookup.second} ${lookup.timeZoneName}`
+  );
+}
+
 // Exported for unit testing; the helpers stay co-located with the
 // component because they are presentation-only and not reused elsewhere.
 // See ``__tests__/RecentCompletionsPanel.test.tsx``.
-export { formatCostFootnote, formatTokenCount };
+export {
+  formatCostFootnote,
+  formatTokenCount,
+  formatRelativeTime,
+  formatPacificDatetime,
+};
