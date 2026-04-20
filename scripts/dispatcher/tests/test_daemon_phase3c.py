@@ -231,18 +231,23 @@ class TestCheckStuckAgents:
 
         # Seeded row: one stale ralph agent. Elapsed 55000s > 54000s
         # (ralph default threshold bumped 10× in #2885). #2872 — the
-        # SELECT returns (agent_id, issue_number, phase, elapsed_seconds)
+        # SELECT returns (agent_id, issue_number, phase, elapsed_seconds, kind)
         # and the Python-side comparison applies the per-phase threshold.
+        # Issue #2903: ``kind`` is now included so the retry-marker skip
+        # for task-skill rows is visible at the call site.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 55000.0)],
+            [("agent-1", 42, "ralph", 55000.0, "task")],
         ]
         # Order inside _check_stuck_agents + _create_retry_marker:
         # (1) stuck_timeout_s_by_phase override read (returns None → fall
         # through to module defaults),
-        # (2) COUNT prior markers in _create_retry_marker,
-        # (3) read backoff_seconds config.
+        # (2) _lookup_agent_kind in _create_retry_marker (issue #2903
+        # defensive guard) — returns the row's kind,
+        # (3) COUNT prior markers in _create_retry_marker,
+        # (4) read backoff_seconds config.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            ("task",),  # _lookup_agent_kind — daemon-owned row
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff schedule
         ]
@@ -290,6 +295,118 @@ class TestCheckStuckAgents:
         assert marker_params[1] == daemon.FAILURE_CATEGORY_STUCK_TIMEOUT
         assert marker_params[2] == 1  # first attempt
 
+    def test_task_skill_row_flagged_but_no_retry_marker(self, tmp_path: Path) -> None:
+        """Issue #2903: task-skill rows get the failure + crash flip but NO retry marker.
+
+        The daemon does not own the operator's /task subagent
+        subprocess, so creating a retry marker would cause the daemon
+        to re-dispatch the same issue while the subagent is still
+        running — producing duplicate PRs or a push collision.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        # Task-skill row stuck in ``claiming`` past the 5-minute
+        # default threshold. 600s > 300s.
+        conn.cursor_instance.fetchall_queue = [
+            [("agent-task-skill-1", 99, "claiming", 600.0, "task-skill")],
+        ]
+        # Only ONE fetch queued: the stuck_timeout override lookup.
+        # _create_retry_marker is not called for task-skill rows, so
+        # neither the _lookup_agent_kind query nor the COUNT/backoff
+        # queries fire.
+        conn.cursor_instance.fetch_queue = [
+            None,  # stuck_timeout_s_by_phase override — unset
+        ]
+
+        flagged = d._check_stuck_agents()
+        assert flagged == 1
+
+        # Failure row still inserted — issue #2903 explicitly scopes
+        # the failure row and the crashed flip as acceptable.
+        failure_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.failures" in e[0]
+        ]
+        assert len(failure_inserts) == 1
+        assert failure_inserts[0][1][0] == "agent-task-skill-1"
+
+        # Crashed flip still happens.
+        crashed_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "crashed" in e[1]
+        ]
+        assert crashed_updates
+
+        # The critical assertion: NO retry marker inserted.
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        assert marker_inserts == []
+
+        # Explicit skip event is logged so operators can trace the
+        # decision in CloudWatch.
+        skipped_events = handler.events("retry_marker_skipped_task_skill")
+        assert len(skipped_events) == 1
+        assert skipped_events[0].agent_id == "agent-task-skill-1"
+        assert skipped_events[0].reason == daemon.FAILURE_CATEGORY_STUCK_TIMEOUT
+
+        # Structured failure_detected event still fires (includes kind).
+        detected = handler.events("failure_detected")
+        assert len(detected) == 1
+        assert getattr(detected[0], "kind", None) == "task-skill"
+
+    def test_mixed_kinds_only_task_kind_gets_retry_marker(self, tmp_path: Path) -> None:
+        """Issue #2903: with mixed kinds in one sweep, only kind='task' gets retry.
+
+        Regression guard against the #2866 interlock collision
+        scenario where two task-skill rows and one daemon-owned row
+        are all stuck in the same sweep. The daemon-owned row should
+        still be recovered (retry marker created), but the two
+        task-skill rows must not.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        conn.cursor_instance.fetchall_queue = [
+            [
+                ("agent-task-1", 1, "claiming", 600.0, "task-skill"),
+                ("agent-daemon-1", 2, "ralph", 55000.0, "task"),
+                ("agent-task-2", 3, "claiming", 700.0, "task-skill"),
+            ],
+        ]
+        # Queue: (1) stuck_timeout override,
+        # then the daemon-owned agent goes through _create_retry_marker:
+        # (2) _lookup_agent_kind, (3) prior count, (4) backoff.
+        # The two task-skill rows skip the retry path entirely, so no
+        # additional queue entries are needed for them.
+        conn.cursor_instance.fetch_queue = [
+            None,  # stuck_timeout_s_by_phase
+            ("task",),  # _lookup_agent_kind for agent-daemon-1
+            (0,),  # prior marker count
+            ("[60,300,900]",),  # backoff
+        ]
+
+        assert d._check_stuck_agents() == 3
+
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        # Exactly one retry marker — for agent-daemon-1 only.
+        assert len(marker_inserts) == 1
+        assert marker_inserts[0][1][0] == "agent-daemon-1"
+
+        # Two skip events (one per task-skill row) from the call-site guard.
+        skipped_events = handler.events("retry_marker_skipped_task_skill")
+        skipped_agents = {e.agent_id for e in skipped_events}
+        assert skipped_agents == {"agent-task-1", "agent-task-2"}
+
     def test_no_stuck_agents_returns_zero(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [[]]
@@ -313,16 +430,19 @@ class TestCheckStuckAgents:
         # ralph 10× from 90min to 15hr.)
         conn.cursor_instance.fetchall_queue = [
             [
-                ("agent-1", 1, "ralph", 55000.0),
-                ("agent-2", 2, "claiming", 600.0),
+                ("agent-1", 1, "ralph", 55000.0, "task"),
+                ("agent-2", 2, "claiming", 600.0, "task"),
             ],
         ]
         # Queue: (1) stuck_timeout_s_by_phase override (unset),
-        # then for each agent (1) prior count (2) backoff config.
+        # then for each agent (1) _lookup_agent_kind (2) prior count
+        # (3) backoff config.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase — unset
+            ("task",),  # _lookup_agent_kind for agent-1
             (0,),
             ("[60,300,900]",),
+            ("task",),  # _lookup_agent_kind for agent-2
             (0,),
             ("[60,300,900]",),
         ]
@@ -465,8 +585,10 @@ class TestGhRateSkipActive:
 class TestCreateRetryMarker:
     def test_first_attempt_inserts_marker(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        # Order: (1) COUNT prior markers, (2) read backoff_seconds.
+        # Order (issue #2903 adds the kind lookup):
+        # (1) _lookup_agent_kind, (2) COUNT prior markers, (3) backoff.
         conn.cursor_instance.fetch_queue = [
+            ("task",),  # _lookup_agent_kind — daemon-owned
             (0,),  # prior count = 0
             ("[60,300,900]",),  # backoff read
         ]
@@ -492,6 +614,7 @@ class TestCreateRetryMarker:
     def test_third_attempt_still_inserts(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [
+            ("task",),  # _lookup_agent_kind (#2903)
             (2,),  # prior attempts 1 and 2 already exist
             ("[60,300,900]",),
         ]
@@ -510,8 +633,9 @@ class TestCreateRetryMarker:
 
     def test_fourth_attempt_blocked_and_agent_failed(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        # Cap reached — only the prior-count read runs; no backoff read.
+        # Cap reached — kind lookup + prior-count read; no backoff read.
         conn.cursor_instance.fetch_queue = [
+            ("task",),  # _lookup_agent_kind (#2903)
             (3,),
         ]
         attempt = d._create_retry_marker(
@@ -561,11 +685,69 @@ class TestCreateRetryMarker:
         assert attempt is None
         assert handler.events("retry_marker_skipped")
 
+    def test_task_skill_kind_blocks_retry_marker(self, tmp_path: Path) -> None:
+        """Issue #2903: _create_retry_marker must bail when kind='task-skill'.
+
+        Defensive in-function guard that protects every call site —
+        even if a future caller forgets to check kind itself, the
+        daemon cannot enqueue a retry marker for an operator's /task
+        subagent row. The guard runs before the AUTO_RETRY_CATEGORIES
+        check in practice only for legitimate retry categories; here
+        we exercise a tier-1 category so we know the kind check is
+        what blocked the write.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("task-skill",),  # _lookup_agent_kind returns task-skill
+        ]
+        attempt = d._create_retry_marker(
+            agent_id="a-task-skill-1",
+            reason=daemon.FAILURE_CATEGORY_STUCK_TIMEOUT,
+        )
+        assert attempt is None
+        # No retry marker row written.
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        assert marker_inserts == []
+        # Structured skip log for CloudWatch visibility.
+        skipped = handler.events("retry_marker_skipped_task_skill")
+        assert len(skipped) == 1
+        assert skipped[0].agent_id == "a-task-skill-1"
+        assert skipped[0].reason == daemon.FAILURE_CATEGORY_STUCK_TIMEOUT
+
+    def test_db_error_on_kind_lookup_fails_open(self, tmp_path: Path) -> None:
+        """Issue #2903: DB error during _lookup_agent_kind falls through to retry path.
+
+        A broken DB lookup must NOT silently suppress retries for
+        daemon-owned rows — the downstream retry INSERT will hit the
+        same DB error a moment later if the DB is really unavailable,
+        but a transient kind-lookup blip should not cause a missed
+        retry.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        # _lookup_agent_kind: no row for agent_id (fetchone returns
+        # None) — helper returns None, create_retry_marker proceeds.
+        # Then the usual COUNT + backoff reads.
+        conn.cursor_instance.fetch_queue = [
+            None,  # _lookup_agent_kind → None (missing row)
+            (0,),  # prior count
+            ("[60,300,900]",),  # backoff
+        ]
+        attempt = d._create_retry_marker(
+            agent_id="unknown",
+            reason=daemon.FAILURE_CATEGORY_STUCK_TIMEOUT,
+        )
+        assert attempt == 1  # retry proceeded normally
+
     def test_malformed_backoff_config_falls_back_to_default(
         self, tmp_path: Path
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [
+            ("task",),  # _lookup_agent_kind (#2903)
             (0,),  # prior count
             ("not valid json",),  # bad backoff config → falls back
         ]
@@ -791,6 +973,7 @@ class TestHandleSubprocessFailure:
     def test_crash_writes_failure_and_enqueues_retry(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [
+            ("task",),  # _lookup_agent_kind (#2903)
             (0,),  # prior count
             ("[60,300,900]",),  # backoff
         ]
