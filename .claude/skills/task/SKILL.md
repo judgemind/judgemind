@@ -172,6 +172,8 @@ python3 {worktree}/scripts/dispatcher/task_claim.py claim \
     --worktree-path {worktree}
 ```
 
+**`--issue-title` is optional — auto-fetched when omitted (issue #2923).** If you omit `--issue-title` (or pass an empty string), the helper shells out to `gh issue view <N> --repo judgemind/judgemind --json title -q .title` and uses the returned value. An ad-hoc operator invocation without `--issue-title` will now land a row with a populated title instead of the "(title unavailable)" cosmetic bug. Passing `--issue-title` in the normal /task flow is still preferred (saves one `gh` round-trip, ~1-2 s), but no longer a correctness requirement — if the fetch fails (gh unavailable, rate-limit, network blip), the claim still succeeds with NULL title and a single warning log line.
+
 The helper **generates a fresh UUID for you** and writes it to `{worktree}/.task-agent-id` (the "sidecar") so the later `terminal` call can recover it without the caller threading state through the rest of the /task flow. The JSON emitted on stdout includes the UUID:
 
 ```

@@ -119,6 +119,19 @@ VALID_TERMINAL_STATUSES = frozenset({"succeeded", "failed"})
 #: for a slow rollover.
 DEV_DB_QUERY_TIMEOUT_SECONDS = 60
 
+#: Subprocess timeout for the ``gh issue view`` shell-out that populates
+#: ``issue_title`` when the caller omits ``--issue-title``. A slow GitHub
+#: API response shouldn't block the claim for longer than this; if the
+#: call times out we fall back to NULL title (cosmetic, not a
+#: correctness gate — see issue #2923).
+GH_ISSUE_VIEW_TIMEOUT_SECONDS = 15
+
+#: GitHub repository slug used for the ``gh issue view`` fallback fetch.
+#: Matches the hard-coded value in SKILL.md's claim invocation and in
+#: ``scripts/check-issue-author.sh`` — the /task skill is repository-
+#: specific, so we do not plumb this through the CLI.
+GH_REPO_SLUG = "judgemind/judgemind"
+
 #: Relative path to the dev-db-query wrapper, resolved from the repo root.
 DEV_DB_QUERY_SCRIPT = Path("scripts/dev-db-query.sh")
 
@@ -249,6 +262,86 @@ def _dev_db_query_path() -> Path:
     here = Path(__file__).resolve()
     repo_root = _resolve_repo_root(here)
     return repo_root / DEV_DB_QUERY_SCRIPT
+
+
+def _fetch_issue_title_via_gh(issue_number: int) -> str | None:
+    """Fetch the issue title via ``gh issue view`` as a fallback.
+
+    When the caller omits ``--issue-title`` (or passes an empty string),
+    the helper shells out to
+    ``gh issue view <N> --repo judgemind/judgemind --json title -q .title``
+    so the ``dispatcher.agents.issue_title`` column isn't left NULL —
+    which renders as "(title unavailable)" on the admin cockpit. See
+    issue #2923.
+
+    The fetch is best-effort: any failure (``gh`` not on PATH, network
+    blip, rate-limit, non-existent issue, timeout) logs a warning to
+    stderr and returns ``None`` so the claim proceeds with a NULL
+    title. The title is cosmetic, not a correctness gate — never block
+    the claim on this fetch.
+
+    Returns the title string on success, or ``None`` on any failure.
+    """
+    cmd = [
+        "gh",
+        "issue",
+        "view",
+        str(int(issue_number)),
+        "--repo",
+        GH_REPO_SLUG,
+        "--json",
+        "title",
+        "-q",
+        ".title",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=GH_ISSUE_VIEW_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        sys.stderr.write(
+            "task_claim: gh CLI not on PATH; cannot auto-fetch issue title "
+            f"for #{issue_number}. Claim will proceed with NULL title. "
+            "Pass --issue-title explicitly to populate it (issue #2923).\n"
+        )
+        return None
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"task_claim: gh issue view timed out after "
+            f"{GH_ISSUE_VIEW_TIMEOUT_SECONDS}s fetching title for "
+            f"#{issue_number}; claim will proceed with NULL title "
+            "(issue #2923).\n"
+        )
+        return None
+    except OSError as exc:
+        sys.stderr.write(
+            f"task_claim: gh issue view failed for #{issue_number}: {exc}; "
+            "claim will proceed with NULL title (issue #2923).\n"
+        )
+        return None
+
+    if result.returncode != 0:
+        stderr_snippet = (result.stderr or "").strip()[:200]
+        sys.stderr.write(
+            f"task_claim: gh issue view exit={result.returncode} "
+            f"fetching title for #{issue_number}: {stderr_snippet}; "
+            "claim will proceed with NULL title (issue #2923).\n"
+        )
+        return None
+
+    title = (result.stdout or "").strip()
+    if not title:
+        sys.stderr.write(
+            f"task_claim: gh issue view returned empty title for "
+            f"#{issue_number}; claim will proceed with NULL title "
+            "(issue #2923).\n"
+        )
+        return None
+    return title
 
 
 def _run_sql_via_db_query_sh(sql: str) -> dict[str, Any]:
@@ -694,6 +787,15 @@ def do_claim(
             "``str(uuid.uuid4())`` — match that shape. See #2892.\n"
         )
         return 3
+
+    # Fallback-fetch the issue title when the caller omitted it. See
+    # issue #2923: every caller that forgets to pass ``--issue-title``
+    # leaves a NULL-title row that renders as "(title unavailable)" on
+    # the admin cockpit. CLI arg takes precedence — we only fetch when
+    # the caller passed None or an empty/whitespace-only string. Fetch
+    # failure is non-fatal; the claim proceeds with NULL title.
+    if issue_title is None or not issue_title.strip():
+        issue_title = _fetch_issue_title_via_gh(issue_number)
 
     database_url = os.environ.get("DATABASE_URL", "").strip()
     use_psycopg = bool(database_url)
