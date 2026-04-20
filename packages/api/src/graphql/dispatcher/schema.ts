@@ -94,22 +94,27 @@ export const dispatcherTypeDefs = `#graphql
     issueNumber: Int
   }
 
-  """One /task (or audit/spotcheck) agent invocation."""
+  """One /task (or audit/spotcheck) agent invocation.
+
+  Post-#2927 every row is daemon-owned — the /task skill no longer
+  writes to \`dispatcher.agents\` (label-only coordination). The
+  underlying \`kind\` column is preserved in the DB for backward
+  compatibility with historical rows but is not exposed on the
+  GraphQL surface.
+  """
   type DispatcherAgent {
     id: ID!
-    kind: String!
     issueNumber: Int!
-    """Issue title captured at claim time. Populated by the daemon
-    (\`_atomic_claim\`) + /task skill (\`task_claim.py claim --issue-title ...\`)
-    from the queue-snapshot enrichment, issue #2820. Null when the issue
-    is not in the snapshot or the row predates migration 28 — the admin
-    cockpit falls back to \`#<number>\`. Exposed on the active-agents
-    query so the unified table can render title alongside issue+priority
-    without a separate GitHub round-trip. Issue #2899."""
+    """Issue title captured at claim time by the daemon's
+    \`_atomic_claim\` from the queue-snapshot enrichment, issue #2820.
+    Null when the issue is not in the snapshot or the row predates
+    migration 28 — the admin cockpit falls back to \`#<number>\`.
+    Exposed on the active-agents query so the unified table can render
+    title alongside issue+priority without a separate GitHub
+    round-trip. Issue #2899."""
     issueTitle: String
     """Priority label captured at claim time — one of p0 | p1 | p2 | p3 | null.
-    Written by both the daemon's \`_atomic_claim\` and the /task skill's
-    \`task_claim.py claim --issue-priority ...\`. Reflects "priority when
+    Written by the daemon's \`_atomic_claim\`. Reflects "priority when
     spawned"; does NOT retroactively update when the issue is relabeled
     on GitHub after the claim. Pre-migration-33 rows return null —
     the admin cockpit renders those as an em-dash placeholder.

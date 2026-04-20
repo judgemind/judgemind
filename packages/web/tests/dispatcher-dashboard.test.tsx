@@ -112,7 +112,6 @@ function makeActiveState() {
       activeAgents: [
         {
           id: 'agent-aca547d3-long-id',
-          kind: 'task',
           issueNumber: 2731,
           worktreePath: '.claude/worktrees/agent-aca547d3',
           phase: 'ralph-worker (2)',

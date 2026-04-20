@@ -154,73 +154,41 @@ Once MCP writes are unblocked (follow-up issue referenced from `docs/agent/gh-to
 - Format: `#<N> — <short title>` (drop any `[AREA]` prefix tag from the issue title)
 - Run: `/rename #<N> — <short title>`
 
-## Step 2a — Record claim in `dispatcher.agents` ledger (MANDATORY)
+## Step 2a — Mark the issue `status/in-progress` (MANDATORY)
 
-**Why:** This is the shared claim interlock between `/task` subagents and the Fargate dispatcher daemon. Without it, a /task subagent you spawn on a `agent/ready` issue can race with the daemon's next queue scan — both will independently run the full plan → ralph → summary → PR pipeline on the same issue and produce duplicate PRs. Observed 2026-04-19 with #2856 (issue #2866). The daemon writes to `dispatcher.agents` via `_atomic_claim`; `/task` must do the same write so the partial UNIQUE INDEX on `(issue_number) WHERE status IN ('running', 'retrying')` catches the collision atomically in either direction.
+**Why:** This is the sole claim interlock between `/task` subagents and the Fargate dispatcher daemon. A /task subagent you spawn on an `agent/ready` issue can race with the daemon's next queue scan — both would independently run the full plan → ralph → summary → PR pipeline on the same issue and produce duplicate PRs. The daemon's queue-scan filter drops any issue carrying `status/in-progress`, so flipping that label before stripping `agent/ready` is all the coordination the /task skill needs.
 
-**Two-part interlock — both halves run here:**
+Issue #2927 simplified this from a two-halves DB-row + label interlock (#2866) to this label-only flow. The former `scripts/dispatcher/task_claim.py claim` / `terminal` helper is now a deprecated no-op stub — **you do not run it**. If you encounter an older transcript or guide that still invokes it, the stub exits 0 without touching the DB, so historical CLAUDE.md copies keep working without crashing.
 
-### Part A — DB row (atomic race detection)
+### The add-then-remove ordering (race-defense)
 
-Run the helper (stays in the foreground — use `timeout: 1200000` since the ECS-Exec code path takes 2-4 s per call). **Pass the issue title** you already fetched from GitHub in Step 1 (the `title` field from `mcp__github__get_issue` / `mcp__github__list_issues`) — without it, the `dispatcher.agents` row is inserted with `issue_title=NULL` and the admin cockpit's Recently Completed panel renders the row as "(title unavailable)" (issue #2898). **Also pass the priority** derived from the issue's `priority/pN` label (`--issue-priority p0|p1|p2|p3`) — without it, the admin cockpit's Active-agents and Recently-completed panels render the priority badge as an em-dash instead of the actual p0/p1/p2/p3 chip (issue #2899). Omit `--issue-priority` only when the issue carries no priority label at all. The daemon's own `_atomic_claim` caller (`scripts/dispatcher/daemon.py`) already supplies both; `/task` must match that behavior.
+**Add `status/in-progress` BEFORE removing `agent/ready`.** GitHub label propagation is ~100ms. A racing daemon tick that observes your labels between the remove and the add could see `agent/ready=present, status/in-progress=absent` and try to claim. Doing the add first closes that window: the daemon's queue-scan filter drops any issue carrying `status/in-progress`, and the daemon's own pre-claim label recheck inside `_atomic_claim` re-reads the label set at claim time so a race in the other direction is caught atomically too.
 
-```
-python3 {worktree}/scripts/dispatcher/task_claim.py claim \
-    --issue <N> \
-    --issue-title "<issue-title>" \
-    --issue-priority <p0|p1|p2|p3> \
-    --worktree-path {worktree}
-```
+The tiny residual race — both the operator's add and the daemon's scan complete within the same ~100ms of each other — is accepted (issue #2927). Worst case: one operator PR + one daemon PR on the same issue, a human notices and closes one.
 
-**`--issue-title` is optional — auto-fetched when omitted (issue #2923).** If you omit `--issue-title` (or pass an empty string), the helper shells out to `gh issue view <N> --repo judgemind/judgemind --json title -q .title` and uses the returned value. An ad-hoc operator invocation without `--issue-title` will now land a row with a populated title instead of the "(title unavailable)" cosmetic bug. Passing `--issue-title` in the normal /task flow is still preferred (saves one `gh` round-trip, ~1-2 s), but no longer a correctness requirement — if the fetch fails (gh unavailable, rate-limit, network blip), the claim still succeeds with NULL title and a single warning log line.
-
-The helper **generates a fresh UUID for you** and writes it to `{worktree}/.task-agent-id` (the "sidecar") so the later `terminal` call can recover it without the caller threading state through the rest of the /task flow. The JSON emitted on stdout includes the UUID:
-
-```
-{"status": "claimed", "issue_number": 2866, "agent_id": "aabbccdd-eeff-..."}
-```
-
-**Do NOT pass `--agent-id` with the short worktree suffix** (e.g. `agent-a56f2e57`). The DB column is `uuid` — non-UUID values fail the INSERT with `invalid input syntax for type uuid`. Issue #2892 was the bug. The helper's own `uuid4()` is the right shape; let it do the work.
-
-Exit codes:
-
-- **`0`** — claim row inserted successfully. Continue to Part B.
-- **`2`** — **claim lost to a prior owner.** The helper printed a JSON payload on stdout with `owner_kind` (either `task` for the Fargate daemon or `task-skill` for another /task subagent) and `owner_agent_id`. Do **not** proceed — another worker owns this issue right now. Print the payload and stop. The operator will see the message and either wait for the other agent or cancel it.
-- **`3`** — **configuration error.** The caller handed the helper something the DB rejected at the column-type level (e.g. a non-UUID explicit `--agent-id`). This is a bug in the /task skill or an override the operator supplied by hand. Surface the stderr and stop — retrying with the same args will fail again.
-- **`1`** — unexpected error (DB down, dev-db-query.sh missing, auth problem). Surface the stderr message and stop.
-
-The helper uses `DATABASE_URL` when set (Fargate /task paths) and falls back to `scripts/dev-db-query.sh --rw` (laptop /task paths). Both shells write the same `kind='task-skill'` + `status='running'` row.
-
-### Part B — `status/in-progress` label (human-visible signal)
-
-Add the label so the operator sees the issue is being worked on AND the daemon's queue scan filter excludes it (belt-and-suspenders with Part A):
+Run the two edits as separate tool calls, in this order:
 
 ```
 gh issue edit <N> --repo judgemind/judgemind --add-label status/in-progress
+gh issue edit <N> --repo judgemind/judgemind --remove-label agent/ready
 ```
 
-Idempotent — `gh` ignores the request if the label is already present.
+Both calls are idempotent (`gh` ignores a label that is already present / already absent). The `agent/ready` remove is optional in the narrow case where the operator manually spawned you on an issue that never carried the label (e.g. a rerun of a previous /task session on an issue already closed + reopened) — but running it is harmless.
 
-**MANDATORY teardown on terminal.** On any terminal state (PR merged, verification passed, blocker, investigation closed), run:
+Exit codes:
+
+- **`0`** on each edit — continue to Step 3.
+- Any non-zero — a GitHub API failure. Retry once; if it fails again, stop and report the error. The operator can re-issue the command manually or wait for rate limits to recover.
+
+### MANDATORY teardown on terminal
+
+On any terminal state (PR merged, verification passed, blocker, investigation closed, STUCK exit), remove the label:
 
 ```
-python3 {worktree}/scripts/dispatcher/task_claim.py terminal \
-    --worktree-path {worktree} \
-    --status <succeeded|failed> \
-    [--pr-number <N>]
-
 gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
 ```
 
-The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim`), so you don't need to remember or pass it. If the sidecar is missing you can still pass `--agent-id <uuid>` explicitly — but in the normal /task flow, `--worktree-path` is all you need.
-
-Terminal status values:
-- `succeeded` — PR merged + deploy verified + evidence comment posted (normal success path).
-- `failed` — ralph STUCK, verification failed, task abandoned, or any other terminal non-success state.
-
-Both calls are idempotent and best-effort (exit 0 on rowcount=0 or label-already-absent).
-
-The teardown lives in the Path A/B per-step recipe below (A.8 step 4, B.2 step 3, and the STUCK-exit paths). Do not skip it — leaving the row at `status='running'` blocks the next /task or daemon claim on the same issue until the daemon's supervisor stuck-timeout sweep flips it to `crashed` (30 min), and the label keeps the issue hidden from the queue scan forever.
+No DB write. The label remove is idempotent — `gh` exits 0 if the label is already absent (for example, the daemon already swept it off during its own parallel teardown). The teardown appears in the Path A/B per-step recipes below (A.7, B.2, and the STUCK-exit path inside A.2). Do not skip it — leaving the label in place keeps the issue hidden from the daemon's queue scan forever.
 
 ---
 ---
@@ -321,12 +289,11 @@ Skip this for Terraform-only or docs-only tasks.
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
 - **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see `docs/agent/code-standards.md` §Pre-PR Checks) and review your own diff before continuing.
 - **For ingestion/extraction pipeline tasks** (scraper changes, LLM prompt changes, enrichment logic): use the local dev stack to iterate. The local DB + S3 cache enables fast iteration without deploying to dev. Run `scripts/rebuild_db.sh --skip-reset` to re-process documents through the pipeline and verify data correctness against source documents. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify that extracted fields match the source document, not just that fields are populated.
-- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Before stopping, **release the claim interlock** (issue #2866) so the issue isn't permanently hidden from future agents:
+- If `/ralph` exits with a blocker (STUCK or max iterations), the issue has already been commented on and blocked (via `scripts/block-issue.sh` or `status/blocked` label). Before stopping, **release the label interlock** so the issue isn't permanently hidden from future agents:
   ```
-  python3 {worktree}/scripts/dispatcher/task_claim.py terminal --worktree-path {worktree} --status failed
   gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
   ```
-  The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim` in Step 2a). Then stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
+  Idempotent — exits 0 if the label is already absent. Then stop — the worktree will be cleaned up automatically by Claude Code (if spawned with `isolation: "worktree"`) or by the dispatcher.
 
 **POST-RALPH CHECKPOINT — Do not skip this.** After `/ralph` returns:
 1. Read `{worktree}/tmp/ralph/ralph-done.txt` to confirm ralph completed with SHIP status.
@@ -502,18 +469,13 @@ gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 
 **Dependent issues will be unblocked automatically** by the `unblock-issues` workflow when the PR merges. No manual unblocking needed.
 
-**Record terminal status in the `dispatcher.agents` ledger (issue #2866).** The claim row inserted in Step 2a must be closed out so the next /task or daemon claim on this issue can acquire the partial-UNIQUE-INDEX slot. Run this *before* A.8 deploy-watch so the slot releases promptly even if deploy verification drags:
+**Release the label interlock (label-only flow, #2927).** Remove the `status/in-progress` label so the daemon can see the issue as terminal and (on future reopens) pick it up again. Run this *before* A.8 deploy-watch so the signal releases promptly even if deploy verification drags:
 
 ```
-python3 {worktree}/scripts/dispatcher/task_claim.py terminal \
-    --worktree-path {worktree} \
-    --status succeeded \
-    --pr-number <PR-N>
-
 gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
 ```
 
-The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim` in Step 2a). Best-effort — both commands exit 0 on no-op (row already terminal, label already absent). A failure here is logged but does not block A.8.
+Idempotent — exits 0 if the label is already absent. A failure here is logged but does not block A.8.
 
 #### A.8 — Verify deployment and post evidence (MANDATORY)
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
@@ -699,17 +661,13 @@ gh issue close <N> --repo judgemind/judgemind --reason completed
 
 **Close with a standard summary comment.** Only leave an investigation issue open if it genuinely requires human judgment that cannot be captured in a follow-up issue.
 
-**Record terminal status in the `dispatcher.agents` ledger (issue #2866).** The claim row inserted in Step 2a must be released so a future investigation or follow-up /task on this issue can acquire the partial-UNIQUE-INDEX slot:
+**Release the label interlock (label-only flow, #2927).** Remove the `status/in-progress` label so the daemon can see the issue as terminal:
 
 ```
-python3 {worktree}/scripts/dispatcher/task_claim.py terminal \
-    --worktree-path {worktree} \
-    --status succeeded
-
 gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
 ```
 
-The helper reads the agent's UUID from `{worktree}/.task-agent-id` (written by `claim` in Step 2a). Best-effort — both commands exit 0 on no-op (row already terminal, label already absent).
+Idempotent — exits 0 if the label is already absent.
 
 #### B.3 — Unblock dependent issues
 

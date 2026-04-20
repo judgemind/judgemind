@@ -2336,11 +2336,12 @@ class DispatcherDaemon:
         # issue that still has ``agent/ready`` attached (e.g. mid-
         # transition) should not inflate the queue depth because the
         # daemon would never spawn on it. ``status/in-progress`` is the
-        # /task-skill↔daemon interlock signal (#2866) — an issue a
-        # ``/task`` subagent has just claimed carries it (and also has
-        # a row in ``dispatcher.agents`` — the DB write is atomic; the
-        # label is human-visible + queue-scan-visible) so the daemon
-        # should never pick it up as a candidate.
+        # /task-skill↔daemon interlock signal — after #2927 the /task
+        # subagent uses label-only coordination (add
+        # ``status/in-progress`` BEFORE removing ``agent/ready``), so
+        # the label here is the sole race-defense primitive. The
+        # daemon's pre-claim recheck in ``_atomic_claim`` re-reads the
+        # label set at claim time to close the ~100ms propagation race.
         filtered: list[dict[str, Any]] = []
         for issue in issues:
             if not isinstance(issue, dict):
@@ -2621,32 +2622,24 @@ class DispatcherDaemon:
     # ``{worktree}/tmp/claude-p-<phase>.log``.
 
     def _has_active_agent(self) -> bool:
-        """Return True when a daemon-owned agent row is already ``running``.
+        """Return True when an agent row is already ``running`` for this run.
 
         Phase 3 concurrency cap is 1 per daemon: no new claim while any
         existing agent is still in flight. Uses the
-        ``idx_dispatcher_agents_running`` partial index; the extra
-        ``kind = 'task'`` predicate is a cheap post-filter on top.
+        ``idx_dispatcher_agents_running`` partial index.
 
-        The ``kind = 'task'`` filter is the key scope discipline (#2908):
-        the scheduler gate must only count daemon-owned agents. A laptop
-        /task subagent writes a ``kind='task-skill'`` row at
-        ``status='running'`` (see ``scripts/dispatcher/task_claim.py``);
-        that row represents a separate OS process on the operator's
-        machine and has no bearing on the daemon's subprocess-slot
-        budget. Counting task-skill rows here caused the daemon to go
-        idle with a full queue whenever any subagent was running.
-        Interlock paths (``_lookup_active_owner_kind``,
-        ``_atomic_claim`` UniqueViolation handling) legitimately need to
-        see task-skill rows and MUST NOT use this filter.
+        After #2927 the /task skill no longer writes to
+        ``dispatcher.agents`` (label-only coordination), so every
+        ``status='running'`` row here is daemon-owned by construction
+        — no ``kind`` filter needed. Historical ``kind='task-skill'``
+        rows the /task skill wrote pre-#2927 were cleaned up at
+        deploy time (see #2927 cleanup commit).
         """
         assert self._conn is not None, "connect() must run before checking"
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM dispatcher.agents "
-                    "WHERE status = 'running' AND kind = 'task' "
-                    "LIMIT 1",
+                    "SELECT 1 FROM dispatcher.agents WHERE status = 'running' LIMIT 1",
                 )
                 row = cur.fetchone()
             self._conn.commit()
@@ -3135,13 +3128,19 @@ class DispatcherDaemon:
                 )
             self._conn.commit()
         except psycopg.errors.UniqueViolation:
-            # Another daemon OR a /task subagent claimed this issue
-            # first. Roll back and return False so the caller skips to
-            # the next candidate. Look up the existing row's ``kind`` so
-            # the log distinguishes a daemon↔daemon race (``claim_lost``)
-            # from a /task-skill collision (#2866 —
-            # ``already_claimed_by_task``). Owner lookup is best-effort;
-            # failure to read it just falls back to the generic log.
+            # Another daemon claimed this issue first. Roll back and
+            # return False so the caller skips to the next candidate.
+            # Look up the existing row's ``kind`` so the log
+            # distinguishes a daemon↔daemon race (``claim_lost``) from
+            # a historical task-skill collision
+            # (``already_claimed_by_task``). After #2927 the /task
+            # skill no longer writes ``kind='task-skill'`` rows, so
+            # the task-skill branch only fires if a pre-#2927
+            # historical row is still active in ``dispatcher.agents``
+            # — preserved as belt-and-suspenders for deploy-window
+            # races and log-archaeology clarity.
+            # Owner lookup is best-effort; failure to read it just
+            # falls back to the generic log.
             try:
                 self._conn.rollback()
             except Exception:  # pragma: no cover
@@ -3187,12 +3186,14 @@ class DispatcherDaemon:
             return False
 
         # Atomic DB claim succeeded. Add the ``status/in-progress``
-        # label (#2866) so operators + the queue-scan filter see the
-        # issue is being worked on. The label is the human-visible half
-        # of the interlock; the DB row is the atomic half. Label-write
-        # failure is logged but does NOT roll back the DB claim —
-        # ``_mark_agent_terminal`` will still remove the label on
-        # completion even if the add failed (idempotent).
+        # label so operators see the issue is being worked on AND so
+        # the /task subagent (which uses label-only coordination
+        # post-#2927) observes a claimed issue and bails out. For the
+        # daemon the label is still only the human-visible signal —
+        # the DB row is the atomic primitive for daemon↔daemon races.
+        # Label-write failure is logged but does NOT roll back the DB
+        # claim — ``_mark_agent_terminal`` will still remove the label
+        # on completion even if the add failed (idempotent).
         self._gh_issue_add_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
 
         self._log.info(
@@ -3205,40 +3206,6 @@ class DispatcherDaemon:
             },
         )
         return True
-
-    def _lookup_agent_kind(self, agent_id: str) -> str | None:
-        """Return the ``kind`` for a ``dispatcher.agents`` row, or None.
-
-        Used by :meth:`_create_retry_marker` (issue #2903) as a
-        defensive guard so no caller can accidentally enqueue a retry
-        marker for a /task-skill-owned row (which would cause the
-        daemon to re-dispatch an issue while the operator's subagent
-        is still working it). Best-effort — returns None on DB error
-        or missing row so the caller can fall through to its normal
-        path (fail-open — a DB outage should not silently suppress
-        legitimate retries for daemon-owned rows).
-        """
-        assert self._conn is not None, "connect() must run before reading"
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT kind FROM dispatcher.agents WHERE agent_id = %s",
-                    (agent_id,),
-                )
-                row = cur.fetchone()
-            self._conn.commit()
-        except Exception:
-            try:
-                self._conn.rollback()
-            except Exception:  # pragma: no cover
-                pass
-            return None
-        if row is None:
-            return None
-        kind = row[0]
-        if not isinstance(kind, str):
-            return None
-        return kind
 
     def _lookup_active_owner_kind(self, issue_number: int) -> str | None:
         """Return the ``kind`` of the current active row for an issue, or None.
@@ -3515,19 +3482,14 @@ class DispatcherDaemon:
         candidates: list[tuple[str, int | None, str | None]] = []
         try:
             with self._conn.cursor() as cur:
-                # ``kind = 'task'`` filter (#2908): only reclaim
-                # daemon-owned agents from prior runs. Laptop /task
-                # subagents (``kind='task-skill'``) write their own
-                # ``dispatcher.agents`` row but their subprocess lives
-                # on the operator's machine — the daemon cannot reclaim
-                # or retry them, and enqueuing a restart-abandoned retry
-                # marker would phantom-dispatch work that is still
-                # running elsewhere.
+                # #2927: /task subagents no longer write to
+                # ``dispatcher.agents`` (label-only coordination), so
+                # every ``status='running'`` row found here is
+                # daemon-owned. No ``kind`` filter needed.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase "
                     "FROM dispatcher.agents "
                     "WHERE status = 'running' "
-                    "  AND kind = 'task' "
                     "  AND (parent_run_id IS NULL "
                     "       OR parent_run_id <> %s)",
                     (self._run_id,),
@@ -7031,23 +6993,18 @@ class DispatcherDaemon:
         agents: list[dict[str, Any]] = []
         try:
             with self._conn.cursor() as cur:
-                # ``kind = 'task'`` filter (#2908): the advance loop is
-                # scoped to daemon-owned agents. Laptop /task subagents
-                # (``kind='task-skill'``) never reach
-                # ``awaiting_ci``/``awaiting_deploy``/``retro_*`` in
-                # practice, but filtering defensively documents the
-                # scope and prevents a future phase-label collision
-                # from silently driving the advance loop against rows
-                # the daemon does not own.
+                # #2927: /task subagents no longer write to
+                # ``dispatcher.agents``, so every row here is
+                # daemon-owned by construction — no ``kind`` filter
+                # needed.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status "
                     "FROM dispatcher.agents "
-                    "WHERE kind = 'task' "
-                    "  AND ((status = 'running' "
-                    "        AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
-                    "    OR (status = 'succeeded' "
-                    "        AND phase IN ('done', 'retro_done', 'retro_failed'))) "
+                    "WHERE (status = 'running' "
+                    "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
+                    "   OR (status = 'succeeded' "
+                    "       AND phase IN ('done', 'retro_done', 'retro_failed')) "
                     "ORDER BY started_at ASC",
                 )
                 for row in cur.fetchall():
@@ -9360,19 +9317,12 @@ class DispatcherDaemon:
         config overrides.
 
         Each flagged agent gets a ``dispatcher.failures`` row with
-        ``category='stuck_timeout'`` and is flipped to
-        ``status='crashed'``. For daemon-owned rows (``kind='task'``)
-        the sweep also enqueues a retry marker so
-        :meth:`_process_retry_markers` can reset the agent with a
-        fresh worktree. **Task-skill rows (``kind='task-skill'``) are
-        explicitly excluded from retry-marker creation** (issue #2903)
-        because the daemon does not own the subprocess for those rows —
-        creating a retry marker would cause the daemon to re-dispatch
-        the same issue while the operator's /task subagent is still
-        running, duplicating work and risking a push collision. The
-        ``_create_retry_marker`` call also double-checks this via a DB
-        lookup on ``dispatcher.agents.kind`` so any future call site
-        inherits the guard.
+        ``category='stuck_timeout'``, is flipped to ``status='crashed'``,
+        and enqueues a retry marker so
+        :meth:`_process_retry_markers` can reset it with a fresh
+        worktree. After #2927 every running row is daemon-owned
+        (label-only /task coordination), so no kind-filter is needed
+        — the #2903 task-skill guard has been removed.
 
         Returns the number of stuck agents flagged this tick (for
         logging). Exceptions are caught per-agent + logged; one bad
@@ -9385,19 +9335,15 @@ class DispatcherDaemon:
         # so we can consult both the live config override and the
         # module-level defaults without expressing them as SQL.
         #
-        # Fields: agent_id, issue_number, phase, elapsed_seconds, kind.
-        # ``kind`` is included so the retry-marker skip for
-        # ``task-skill`` rows (issue #2903) is visible at the call
-        # site without a second DB roundtrip.
-        candidates: list[tuple[str, int | None, str | None, float, str | None]] = []
+        # Fields: agent_id, issue_number, phase, elapsed_seconds.
+        candidates: list[tuple[str, int | None, str | None, float]] = []
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "SELECT a.agent_id, a.issue_number, a.phase, "
                     "       EXTRACT(EPOCH FROM ("
                     "           now() - COALESCE(pt.last_ts, a.started_at)"
-                    "       )) AS elapsed_seconds, "
-                    "       a.kind "
+                    "       )) AS elapsed_seconds "
                     "FROM dispatcher.agents a "
                     "LEFT JOIN LATERAL ("
                     "    SELECT MAX(ts) AS last_ts "
@@ -9414,7 +9360,6 @@ class DispatcherDaemon:
                             int(row[1]) if row[1] is not None else None,
                             str(row[2]) if row[2] is not None else None,
                             float(row[3]) if row[3] is not None else 0.0,
-                            str(row[4]) if row[4] is not None else None,
                         )
                     )
             self._conn.commit()
@@ -9438,7 +9383,7 @@ class DispatcherDaemon:
         overrides = self._read_stuck_timeout_overrides()
 
         flagged = 0
-        for agent_id, issue_number, phase, elapsed_seconds, kind in candidates:
+        for agent_id, issue_number, phase, elapsed_seconds in candidates:
             threshold = self._stuck_timeout_for_phase(phase, overrides=overrides)
             if elapsed_seconds < threshold:
                 continue
@@ -9452,7 +9397,6 @@ class DispatcherDaemon:
                         "threshold_seconds": threshold,
                         "last_known_phase": phase,
                         "issue_number": issue_number,
-                        "kind": kind,
                     },
                 )
                 self._mark_agent_terminal(
@@ -9472,44 +9416,15 @@ class DispatcherDaemon:
                         "phase": phase,
                         "stuck_seconds": int(elapsed_seconds),
                         "threshold_seconds": threshold,
-                        "kind": kind,
                     },
                 )
-                # Issue #2903: skip retry-marker creation for
-                # task-skill rows. The daemon does not own the
-                # operator's /task subagent subprocess, so a retry
-                # marker would re-dispatch the same issue while the
-                # subagent is still working and produce a duplicate
-                # PR or a push collision. The failure row + crashed
-                # status flip above are fine — they are daemon-side
-                # observability only. ``_create_retry_marker`` also
-                # re-checks kind defensively, so adding new call
-                # sites does not reintroduce this bug.
-                if kind == TASK_SKILL_KIND:
-                    self._log.info(
-                        "daemon.retry_marker_skipped_task_skill",
-                        extra={
-                            "event": "retry_marker_skipped_task_skill",
-                            "run_id": self._run_id,
-                            "agent_id": agent_id,
-                            "issue_number": issue_number,
-                            "reason": FAILURE_CATEGORY_STUCK_TIMEOUT,
-                            "phase": phase,
-                            "detail": (
-                                "task-skill rows are not owned by the "
-                                "daemon — skipping retry to avoid "
-                                "re-dispatching the same issue"
-                            ),
-                        },
-                    )
-                else:
-                    # Enqueue the tier-1 retry marker. The processor
-                    # picks it up on the next supervisor tick once
-                    # the backoff window elapses.
-                    self._create_retry_marker(
-                        agent_id=agent_id,
-                        reason=FAILURE_CATEGORY_STUCK_TIMEOUT,
-                    )
+                # Enqueue the tier-1 retry marker. The processor picks
+                # it up on the next supervisor tick once the backoff
+                # window elapses.
+                self._create_retry_marker(
+                    agent_id=agent_id,
+                    reason=FAILURE_CATEGORY_STUCK_TIMEOUT,
+                )
                 flagged += 1
             except Exception:
                 # Per-agent failure must not stall the whole scan.
@@ -9725,18 +9640,9 @@ class DispatcherDaemon:
         (e.g. ``subprocess_auth_fail``) is a caller bug; the method
         logs + returns None without writing.
 
-        **Task-skill rows are skipped unconditionally.** Issue #2903.
-        When an operator's /task subagent row (``kind='task-skill'``)
-        is flagged by the supervisor, diagnoser, or subprocess-failure
-        handler, creating a retry marker would cause the daemon to
-        re-dispatch the same issue while the subagent is still
-        running its own pipeline — duplicating work and risking a
-        push collision on the worktree branch. The daemon never owns
-        a task-skill subprocess, so there is no legitimate retry path
-        for one. Callers (``_check_stuck_agents``, etc.) already
-        filter on kind for visibility; this in-function lookup is the
-        defensive belt-and-suspenders guard that protects any future
-        call site from reintroducing the bug.
+        After #2927 every ``dispatcher.agents`` row is daemon-owned
+        (label-only /task coordination replaced the DB-row interlock),
+        so the #2903 task-skill defensive guard was removed.
         """
         assert self._conn is not None, "connect() must run before marker insert"
 
@@ -9752,30 +9658,6 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "reason": reason,
                     "detail": "not a tier-1 auto-retry category",
-                },
-            )
-            return None
-
-        # Issue #2903 defensive guard: never create a retry marker for
-        # a task-skill row, regardless of caller. A DB lookup failure
-        # falls through fail-open (treat as daemon-owned) so an
-        # unavailable DB doesn't silently suppress legitimate retries
-        # — the existing retry INSERT path will surface the same DB
-        # error a moment later if it's really down.
-        agent_kind = self._lookup_agent_kind(agent_id)
-        if agent_kind == TASK_SKILL_KIND:
-            self._log.info(
-                "daemon.retry_marker_skipped_task_skill",
-                extra={
-                    "event": "retry_marker_skipped_task_skill",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "reason": reason,
-                    "detail": (
-                        "task-skill rows are not owned by the daemon — "
-                        "skipping retry to avoid re-dispatching the same "
-                        "issue while the subagent is still running"
-                    ),
                 },
             )
             return None
@@ -10515,29 +10397,17 @@ class DispatcherDaemon:
 
         try:
             with self._conn.cursor() as cur:
-                # Issue #2921: filter to ``kind='task'`` daemon-owned
-                # rows only. The supervisor's stuck_timeout sweep
-                # writes ``status='crashed'`` terminal outcomes for
-                # ``kind='task-skill'`` rows (operator-spawned /task
-                # subagents whose phase never advances past
-                # ``claiming`` because the skill doesn't write
-                # ``phase_transitions``). Those are operator-side
-                # lifecycle events — they have no predictive power
-                # for daemon pipeline health and must not trip the
-                # breaker. Sibling fixes in #2903 (retry-markers
-                # skipped for task-skill rows) and #2908
-                # (``_has_active_agent`` + boot recovery filtered to
-                # ``kind='task'``) addressed the same
-                # kind-conflation pattern elsewhere in the daemon.
+                # #2927: /task subagents no longer write to
+                # ``dispatcher.agents`` (label-only coordination), so
+                # every ``terminal_outcomes`` row is daemon-owned by
+                # construction and the breaker query reverts to its
+                # pre-#2866 shape. The ``a.kind = 'task'`` JOIN added
+                # by #2921 is no longer needed.
                 cur.execute(
-                    "SELECT o.status "
-                    "  FROM dispatcher.terminal_outcomes o "
-                    "  JOIN dispatcher.agents a "
-                    "    ON a.agent_id = o.agent_id "
-                    " WHERE o.ended_at > now() - make_interval(mins => %s) "
-                    "   AND a.kind = 'task' "
-                    " ORDER BY o.ended_at DESC "
-                    " LIMIT %s",
+                    "SELECT status FROM dispatcher.terminal_outcomes "
+                    "WHERE ended_at > now() - make_interval(mins => %s) "
+                    "ORDER BY ended_at DESC "
+                    "LIMIT %s",
                     (window_minutes, window_size),
                 )
                 rows = cur.fetchall()

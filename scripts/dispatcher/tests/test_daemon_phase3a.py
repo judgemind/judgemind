@@ -380,14 +380,15 @@ class TestHasActiveAgent:
         assert d._has_active_agent() is True
         assert conn.rollbacks >= 1
 
-    def test_query_filters_on_kind_task(self, tmp_path: Path) -> None:
-        """Regression for #2908.
+    def test_query_has_no_kind_filter(self, tmp_path: Path) -> None:
+        """Post-#2927 regression: ``_has_active_agent`` has no kind filter.
 
-        The scheduler concurrency gate must only consider daemon-owned
-        (``kind='task'``) agents. A laptop ``/task`` subagent's
-        ``kind='task-skill'`` row at ``status='running'`` is operator-
-        owned and has no bearing on the daemon's subprocess-slot
-        accounting — counting it starves the daemon's scheduler.
+        The /task skill stopped writing to ``dispatcher.agents``
+        (label-only coordination), so every ``status='running'`` row
+        is daemon-owned by construction. The #2908 ``kind='task'``
+        carve-out was reverted — the SELECT is back to its pre-#2866
+        shape. This test locks in that shape so the carve-out can't
+        silently come back.
         """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [None]
@@ -401,30 +402,10 @@ class TestHasActiveAgent:
         assert selects, "expected _has_active_agent to issue the SELECT"
         sql, _params = selects[0]
         assert "status = 'running'" in sql
-        assert "kind = 'task'" in sql, (
-            "_has_active_agent must filter kind='task' so task-skill rows "
-            "do not starve the scheduler (see #2908). Actual SQL: " + sql
+        assert "kind = 'task'" not in sql, (
+            "_has_active_agent should not carry a kind filter post-#2927 — "
+            "every row is daemon-owned. Actual SQL: " + sql
         )
-
-    def test_task_skill_row_is_not_counted_as_active(self, tmp_path: Path) -> None:
-        """End-to-end behavior: with a live ``kind='task-skill'`` row as
-        the only ``status='running'`` row in the database, the scheduler
-        gate must treat the slot as FREE.
-
-        We simulate this by seeding the fake cursor's ``fetch_queue``
-        with ``None`` — i.e. the kind-filtered SELECT returns zero rows.
-        This only holds if the SQL actually includes the ``kind='task'``
-        predicate; without it, the pre-fix query would return a row and
-        the fake would have to be primed with ``(1,)`` instead.
-        The assertion on the SQL text in
-        ``test_query_filters_on_kind_task`` is the structural guarantee;
-        this test documents the behavioral contract alongside.
-        """
-        d, conn, _handler = _make_daemon(tmp_path)
-        # After the kind filter, a lone task-skill row produces zero
-        # matches.
-        conn.cursor_instance.fetch_queue = [None]
-        assert d._has_active_agent() is False
 
 
 # --------------------------------------------------------------------------
@@ -3095,8 +3076,10 @@ class TestNeedsReviewOrchestration:
 
 
 # --------------------------------------------------------------------------
-# #2866 — claim interlock: ``status/in-progress`` label lifecycle +
-# daemon queue-scan filter + task-skill collision detection.
+# Claim interlock: ``status/in-progress`` label lifecycle + daemon
+# queue-scan filter. Post-#2927 the /task skill uses label-only
+# coordination (no DB row), but the daemon still writes the label
+# on claim so the UI + queue-scan filter observe in-progress state.
 # --------------------------------------------------------------------------
 
 
