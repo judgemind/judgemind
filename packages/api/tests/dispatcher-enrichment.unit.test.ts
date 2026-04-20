@@ -192,8 +192,88 @@ describe('recentCompletionsToGraphQL', () => {
         prNumber: 2824,
         totalTokens: 12345,
         totalCostUsd: 0.042,
+        // #2900: succeeded rows stay NULL on failure_summary — the
+        // column only populates on failure terminals.
+        failureSummary: null,
       },
     ]);
+  });
+
+  // #2900: failure_summary passthrough + trimming/empty handling.
+  it('passes ``failure_summary`` through for failure rows', () => {
+    const rows = [
+      {
+        agent_id: 'uuid-fail',
+        issue_number: 2900,
+        issue_title: 'Test failure summary',
+        status: 'failed',
+        ended_at: '2026-04-20T10:00:00Z',
+        pr_number: null,
+        failure_summary:
+          'ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].failureSummary).toBe(
+      'ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns',
+    );
+  });
+
+  it('emits ``failureSummary=null`` for NULL / empty values (pre-migration-33 rows)', () => {
+    const rows = [
+      // Historical row — column didn't exist at write-time.
+      {
+        agent_id: 'uuid-old',
+        issue_number: 999,
+        issue_title: 'Old row',
+        status: 'failed',
+        ended_at: '2026-03-01T00:00:00Z',
+        pr_number: null,
+        failure_summary: null,
+      },
+      // Edge: empty string sneaks through.
+      {
+        agent_id: 'uuid-empty',
+        issue_number: 998,
+        issue_title: 'Empty summary',
+        status: 'failed',
+        ended_at: '2026-03-01T00:00:00Z',
+        pr_number: null,
+        failure_summary: '',
+      },
+      // Whitespace-only also collapses to null.
+      {
+        agent_id: 'uuid-ws',
+        issue_number: 997,
+        issue_title: 'Whitespace summary',
+        status: 'failed',
+        ended_at: '2026-03-01T00:00:00Z',
+        pr_number: null,
+        failure_summary: '   ',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].failureSummary).toBeNull();
+    expect(result[1].failureSummary).toBeNull();
+    expect(result[2].failureSummary).toBeNull();
+  });
+
+  it('trims surrounding whitespace on ``failure_summary``', () => {
+    const rows = [
+      {
+        agent_id: 'uuid-wsp',
+        issue_number: 111,
+        issue_title: 'Padded',
+        status: 'crashed',
+        ended_at: '2026-04-20T10:00:00Z',
+        pr_number: null,
+        failure_summary: '  ralph crashed (stuck_timeout): no log tail  ',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].failureSummary).toBe(
+      'ralph crashed (stuck_timeout): no log tail',
+    );
   });
 
   it('emits totalTokens=null and totalCostUsd=null for pre-migration-31 rows', () => {

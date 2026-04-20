@@ -225,6 +225,15 @@ export const dispatcherTypeDefs = `#graphql
     WARNING: list-price estimate, NOT Max plan-adjusted. See
     \`DispatcherAgent.totalCostUsd\`."""
     totalCostUsd: Float
+    """Short "what happened" string for failure terminals (\`failed\`,
+    \`crashed\`, \`plan_blocked\`). Populated at terminal-time by the
+    daemon from \`failures.category\` + \`phase\` + stderr tail, then
+    optionally upgraded by \`/diagnose-failure\` to a richer LLM-
+    authored sentence. Capped at 240 chars. NULL for \`succeeded\` /
+    \`needs_review\` rows and for historical rows that pre-date
+    migration 33. Rendered as a tooltip on the outcome glyph in the
+    admin cockpit's \`Recently completed\` panel. Issue #2900."""
+    failureSummary: String
   }
 
   """One key/value entry from \`dispatcher.config\` (#2805 §1.6)."""

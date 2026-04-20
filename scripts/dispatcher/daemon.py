@@ -3962,6 +3962,235 @@ class DispatcherDaemon:
             except Exception:  # pragma: no cover
                 pass
 
+    # ── failure_summary builder (issue #2900) ──────────────────────────
+
+    #: Statuses that get a ``dispatcher.agents.failure_summary``
+    #: populated at terminal-time. Genuine failures + the plan-blocked
+    #: correct-outcome terminal (operators still want "why did plan
+    #: decline") qualify; ``succeeded`` and ``needs_review`` do not —
+    #: the draft PR IS the signal for needs_review and success needs
+    #: no narrative.
+    _FAILURE_SUMMARY_STATUSES = frozenset({"failed", "crashed", "plan_blocked"})
+
+    #: Hard cap matching the admin cockpit tooltip's visual budget and
+    #: the Postgres column comment in migration 33. Enforced at
+    #: write-time; anything longer is truncated with an ellipsis.
+    _FAILURE_SUMMARY_MAX_CHARS = 240
+
+    @staticmethod
+    def _humanize_phase(phase: str) -> str:
+        """Turn ``"ralph-reviewer (3)"`` into ``"ralph-reviewer iteration 3"``.
+
+        Other shapes pass through unchanged — ``"plan"`` stays ``"plan"``,
+        ``"push_and_pr"`` stays ``"push_and_pr"``, ``"ralph (1)"``
+        becomes ``"ralph iteration 1"``. The iteration suffix is the
+        ralph loop's attempt counter; surfacing it inline makes the
+        tooltip self-describing without the operator having to know the
+        phase-naming convention.
+        """
+        import re  # noqa: PLC0415 — lazy; only fires on terminal path
+
+        m = re.match(r"^(.*)\s*\((\d+)\)\s*$", phase or "")
+        if m:
+            prefix = m.group(1).strip()
+            n = m.group(2)
+            return f"{prefix} iteration {n}" if prefix else f"iteration {n}"
+        return phase or "unknown"
+
+    @staticmethod
+    def _extract_stderr_tail(log_text: str | None) -> str:
+        """Pull the last non-empty line out of a ``phase_outputs.log_text``.
+
+        ``log_text`` is the composed stdout+stderr blob from
+        :meth:`_compose_phase_log` — begins with ``=== stderr ===`` when
+        both streams had content. We search from the end for the first
+        non-blank, non-separator line. Empty string when the log has no
+        usable tail.
+        """
+        if not log_text:
+            return ""
+        lines = [line.strip() for line in log_text.splitlines()]
+        for line in reversed(lines):
+            if not line:
+                continue
+            if line.startswith("===") and line.endswith("==="):
+                continue
+            return line
+        return ""
+
+    @staticmethod
+    def _extract_details_message(details: Any) -> str:
+        """Pull a short human message out of a ``failures.details`` JSONB.
+
+        The ``details`` column is per-category schema — different keys
+        for ``stuck_timeout`` (``stuck_seconds``), ``plan_go_false``
+        (``block_reason``), ``ci_red_after_retries`` (``detail``), etc.
+        Try the most-often-present keys in priority order; fall back to
+        an empty string so the caller can still emit a summary using
+        just phase + category.
+        """
+        if not isinstance(details, dict):
+            return ""
+        for key in (
+            "stderr_tail",
+            "block_reason",
+            "detail",
+            "reason",
+            "message",
+            "error",
+        ):
+            value = details.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _build_failure_summary(
+        self,
+        *,
+        agent_id: str,
+        status: str,
+        phase: str,
+        exit_code: int | None,
+    ) -> str | None:
+        """Build the templated one-liner for ``agents.failure_summary``.
+
+        Issue #2900. Reads the latest ``dispatcher.failures`` row
+        (category + details) and the latest ``dispatcher.phase_outputs``
+        ``log_text`` (last stderr line) for the agent, then composes:
+
+            "{phase-group} {verb} at {phase-humanized} ({category}): {detail}"
+
+        For ``plan_blocked`` the verb phrase becomes
+        ``"plan phase returned go=false"`` to match the issue's example
+        list and keep the correct-outcome terminal visually distinct
+        from a genuine crash.
+
+        Returns ``None`` for:
+
+        - Statuses outside :attr:`_FAILURE_SUMMARY_STATUSES` (succeeded,
+          needs_review, running) — caller skips the column write.
+        - Any DB error during the SELECTs — caller writes NULL to the
+          column, matching the "best-effort" contract. The column is a
+          nice-to-have; never blocking the terminal path.
+
+        Truncates to :attr:`_FAILURE_SUMMARY_MAX_CHARS` with a single
+        trailing ellipsis so the admin tooltip stays visually bounded.
+        """
+        if status not in self._FAILURE_SUMMARY_STATUSES:
+            return None
+        if self._conn is None:
+            return None
+
+        category: str | None = None
+        details: Any = None
+        log_text: str | None = None
+        try:
+            with self._conn.cursor() as cur:
+                # Latest failure row for this agent. ``ts DESC LIMIT 1``
+                # — a multi-retry agent may have several failure rows,
+                # the freshest one is the one that caused the current
+                # terminal transition.
+                cur.execute(
+                    "SELECT category, details "
+                    "FROM dispatcher.failures "
+                    "WHERE agent_id = %s "
+                    "ORDER BY ts DESC "
+                    "LIMIT 1",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    category = row[0]
+                    details = row[1]
+
+                # Latest phase_outputs log_text — the composed
+                # stdout+stderr blob from the most-recent phase (which
+                # is typically the failing one).
+                cur.execute(
+                    "SELECT log_text "
+                    "FROM dispatcher.phase_outputs "
+                    "WHERE agent_id = %s "
+                    "ORDER BY ts DESC "
+                    "LIMIT 1",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    log_text = row[0]
+            self._conn.commit()
+        except Exception:
+            self._log.warning(
+                "daemon.failure_summary_read_failed",
+                extra={
+                    "event": "failure_summary_read_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+            return None
+
+        phase_humanized = self._humanize_phase(phase)
+        # Phase-group = first token before a dash or space. ``ralph-reviewer``
+        # → ``ralph``; ``push_and_pr`` → ``push_and_pr`` (no dash).
+        phase_group = (phase or "unknown").split("-", 1)[0].split(" ", 1)[0]
+
+        # Detail message: prefer the failure-row details dict (has
+        # category-specific rich data), fall back to the stderr tail
+        # from phase_outputs (raw subprocess output), fall back to the
+        # exit_code.
+        detail = self._extract_details_message(details)
+        if not detail:
+            detail = self._extract_stderr_tail(log_text)
+        if not detail and exit_code is not None:
+            detail = f"exit_code={exit_code}"
+
+        # Verb phrase — ``plan_blocked`` is its own thing per the issue
+        # examples; other failure statuses are "crashed" / "failed".
+        if status == "plan_blocked":
+            verb_phrase = "plan phase returned go=false"
+        elif status == "crashed":
+            verb_phrase = f"{phase_group} crashed at {phase_humanized}"
+        else:  # status == "failed"
+            verb_phrase = f"{phase_group} failed at {phase_humanized}"
+
+        # Compose. Category is parenthesized; detail trails a colon so
+        # a scanner can pattern-match on either end of the string.
+        parts: list[str] = [verb_phrase]
+        if category:
+            parts[-1] = f"{parts[-1]} ({category})"
+        if detail:
+            summary = f"{parts[-1]}: {detail}"
+        else:
+            summary = parts[-1]
+
+        # Truncate to the column's visual budget. Leave room for the
+        # trailing ellipsis so we don't cut a UTF-8 sequence in half.
+        cap = self._FAILURE_SUMMARY_MAX_CHARS
+        if len(summary) > cap:
+            summary = summary[: cap - 1].rstrip() + "\u2026"
+        return summary
+
+    def _write_failure_summary(self, agent_id: str, summary: str) -> None:
+        """UPDATE ``dispatcher.agents.failure_summary`` for one agent.
+
+        Issue #2900. Called by :meth:`_mark_agent_terminal` on genuine-
+        failure terminals and by the ``/diagnose-failure`` upgrade path
+        (written to the same column with richer LLM-authored prose).
+        Best-effort — a write failure logs + rolls back but must not
+        propagate; the terminal status was already committed.
+        """
+        assert self._conn is not None, "connect() must run before update"
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE dispatcher.agents SET failure_summary = %s WHERE agent_id = %s",
+                (summary, agent_id),
+            )
+        self._conn.commit()
+
     def _mark_agent_terminal(
         self,
         agent_id: str,
@@ -4071,6 +4300,38 @@ class DispatcherDaemon:
                         "status": status,
                     },
                 )
+
+            # Issue #2900: write a templated one-liner to
+            # ``dispatcher.agents.failure_summary`` for genuine-failure
+            # + plan_blocked terminals so the admin cockpit can surface
+            # "what happened" on hover over the outcome glyph without a
+            # cross-table join. Best-effort — a failure here cannot roll
+            # back the terminal-status update above. The builder returns
+            # None for non-failure statuses (succeeded, needs_review);
+            # we skip the UPDATE entirely in that case.
+            try:
+                summary = self._build_failure_summary(
+                    agent_id=agent_id,
+                    status=status,
+                    phase=phase,
+                    exit_code=exit_code,
+                )
+                if summary:
+                    self._write_failure_summary(agent_id, summary)
+            except Exception:
+                self._log.exception(
+                    "daemon.failure_summary_write_failed",
+                    extra={
+                        "event": "failure_summary_write_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "status": status,
+                    },
+                )
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
             # Overnight-safety circuit breaker (#2860): append the outcome
             # to ``dispatcher.terminal_outcomes`` and evaluate the

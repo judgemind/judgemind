@@ -77,7 +77,14 @@ function RecentCompletionRow({ completion }: { completion: RecentCompletion }) {
   return (
     <li className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50">
       <span className="flex-shrink-0 pt-0.5">
-        <OutcomePill status={completion.status} />
+        {/* #2900: pass failureSummary through as hover tooltip for
+            failure terminals. Null on succeeded / needs_review /
+            pre-#2900 rows, in which case the pill falls back to its
+            built-in status-label tooltip (prior behaviour). */}
+        <OutcomePill
+          status={completion.status}
+          failureSummary={completion.failureSummary}
+        />
       </span>
       <span className="flex-shrink-0 pt-0.5">
         <IssueLink number={completion.issueNumber} />

@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 32 migrations.
+-- Generated from 33 migrations.
 
 
 
@@ -327,7 +327,8 @@ CREATE TABLE dispatcher.agents (
     pid integer,
     runner_override jsonb,
     model_override jsonb,
-    issue_title text
+    issue_title text,
+    failure_summary text
 );
 
 
@@ -341,6 +342,9 @@ COMMENT ON COLUMN dispatcher.agents.model_override IS 'Per-agent override of dis
 
 
 COMMENT ON COLUMN dispatcher.agents.issue_title IS 'Issue title captured at claim time from the queue-snapshot enrichment. Lets the /admin/dispatcher recent-completions panel render a title without re-fetching from GitHub after the agent has completed and the issue may have left the active queue. Nullable — historical rows pre-dating issue #2820 have NULL and are not backfilled.';
+
+
+COMMENT ON COLUMN dispatcher.agents.failure_summary IS 'One-line "what happened" string for failed / crashed / plan_blocked terminals. Populated by _mark_agent_terminal at terminal-time from failures.category + phase + exit_code + stderr tail (<=240 chars), then optionally upgraded by /diagnose-failure to the first 1-3 sentences of recommendation.reasoning. NULL for succeeded / needs_review rows and historical pre-#2900 rows. Rendered as a tooltip on the outcome glyph in the /admin/dispatcher Recently completed panel. Issue #2900.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (

@@ -11,11 +11,11 @@ Diagnoser for the dispatcher v2 tier-2/3 failure flow (`docs/specs/dispatcher-v2
 
 **Prerequisites:** The daemon has already (a) written a `dispatcher.diagnoses` row with `status='pending'` and a serialized context bundle, (b) spawned this skill with the `diagnosis_id` as the argument.
 
-**Goal:** Update `dispatcher.diagnoses.recommendation` (JSONB) with `{action, reasoning, hint?, new_scope?}` and set `status='completed'`, `completed_at=now()`. The daemon's next supervisor tick consumes the recommendation.
+**Goal:** Update `dispatcher.diagnoses.recommendation` (JSONB) with `{action, reasoning, hint?, new_scope?}` and set `status='completed'`, `completed_at=now()`. Additionally, UPDATE `dispatcher.agents.failure_summary` with the first 1-3 sentences of the recommendation's `reasoning` (truncated to 240 chars) so the admin cockpit's "Recently completed" panel shows an LLM-authored summary on hover instead of the daemon's terminal-time template (issue #2900). The daemon's next supervisor tick consumes the recommendation.
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation. This subprocess is already a dispatcher-spawned background task.
 
-**IMPORTANT — No side effects on GitHub or the filesystem.** This skill does NOT comment on issues, edit labels, close issues, edit PRs, or modify the worktree. The daemon owns all of those operations — the skill's only write is the UPDATE on `dispatcher.diagnoses`. The skill MAY read from GitHub (`gh issue view`, `gh pr view`, `gh run view --log-failed`) and from local files in the failed agent's worktree when the context bundle references them.
+**IMPORTANT — No side effects on GitHub or the filesystem.** This skill does NOT comment on issues, edit labels, close issues, edit PRs, or modify the worktree. The daemon owns all of those operations — the skill's only writes are the UPDATE on `dispatcher.diagnoses` and the UPDATE on `dispatcher.agents.failure_summary`. The skill MAY read from GitHub (`gh issue view`, `gh pr view`, `gh run view --log-failed`) and from local files in the failed agent's worktree when the context bundle references them.
 
 **IMPORTANT — 5-minute wall-clock budget.** The daemon kills this subprocess after 5 minutes. Aim for the simplest viable recommendation within that budget; default to `escalate` when genuinely uncertain — a human can always re-classify. Do not chase rabbit holes.
 
@@ -52,7 +52,7 @@ You may also shell out with `scripts/dev-db-query.sh` for quick SELECTs. Either 
 
 The `context` JSONB contains (schema stable — the daemon serializes this):
 
-- `agent_id` (str) — the failing agent's UUID.
+- `agent_id` (str) — the failing agent's UUID. **Required for the `failure_summary` upgrade write (#2900).**
 - `failure_id` (int) — `dispatcher.failures.failure_id` for the triggering failure.
 - `failure_category` (str) — one of `subprocess_turn_limit`, `stuck_timeout`, `gh_rate_exhausted`, `subprocess_crash`, `ci_red_after_retries`, or any other §8 category the daemon has routed here.
 - `tier` (int) — `2` or `3`.
@@ -72,21 +72,43 @@ The `context` JSONB contains (schema stable — the daemon serializes this):
 
 ## Output contract
 
-Update the `dispatcher.diagnoses` row. Use a second tiny helper:
+Update the `dispatcher.diagnoses` row AND upgrade `dispatcher.agents.failure_summary` (issue #2900) in a single transaction. Use a second tiny helper:
 
 ```bash
-python3 {worktree}/tmp/dispatcher-diagnoser/write_recommendation.py <diagnosis_id> <recommendation_json_file>
+python3 {worktree}/tmp/dispatcher-diagnoser/write_recommendation.py <diagnosis_id> <agent_id> <recommendation_json_file>
 ```
 
 where the helper runs:
 
 ```python
-import json, os, sys
+import json, os, re, sys
 import psycopg
 
 diagnosis_id = int(sys.argv[1])
-with open(sys.argv[2], "r", encoding="utf-8") as f:
+agent_id = sys.argv[2]  # UUID string from context.agent_id
+with open(sys.argv[3], "r", encoding="utf-8") as f:
     recommendation = json.load(f)
+
+# Issue #2900: upgrade dispatcher.agents.failure_summary with the first
+# 1-3 sentences of recommendation.reasoning, truncated to 240 chars.
+# The daemon wrote a templated fallback at terminal-time; this upgrade
+# replaces it with LLM-authored prose for tier-2/3 failures where we
+# already paid for the analysis. Best-effort — a write failure here
+# must not block the diagnosis row write.
+def _summary_from_reasoning(reasoning: str, cap: int = 240) -> str:
+    text = (reasoning or "").strip()
+    if not text:
+        return ""
+    # Take the first 1-3 sentences. Split on sentence terminators (.!?)
+    # followed by whitespace or end-of-string. Rejoin up to 3.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    head = " ".join(sentences[:3]).strip()
+    if len(head) > cap:
+        head = head[: cap - 1].rstrip() + "\u2026"
+    return head
+
+summary = _summary_from_reasoning(recommendation.get("reasoning", ""))
+
 with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
     with conn.cursor() as cur:
         cur.execute(
@@ -97,6 +119,12 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
             "WHERE diagnosis_id = %s",
             (json.dumps(recommendation), diagnosis_id),
         )
+        if summary:
+            cur.execute(
+                "UPDATE dispatcher.agents "
+                "SET failure_summary = %s WHERE agent_id = %s",
+                (summary, agent_id),
+            )
     conn.commit()
 ```
 
@@ -114,7 +142,7 @@ The recommendation JSON has this shape:
 Field rules:
 
 - `action` (required) — exactly one of the five strings above.
-- `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. This gets surfaced in operator dashboards and the §8 weekly report.
+- `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. This gets surfaced in operator dashboards and the §8 weekly report. The first 1-3 sentences are also written to `dispatcher.agents.failure_summary` (issue #2900) so the admin cockpit can show an LLM-authored tooltip on hover over the outcome glyph — keep the opening sentences self-contained ("what happened + why this action"), not mid-argument.
 - `hint` (conditional) — required when `action='retry_with_hint'`; the daemon posts it verbatim as an issue comment before enqueueing the retry marker. Ignored for other actions.
 - `new_scope` (conditional) — required when `action='reissue'`; the daemon replaces the issue body with this string. Should be a full, well-formed issue body with acceptance criteria — not a diff.
 
@@ -172,7 +200,7 @@ The context bundle should usually be enough. Shell out sparingly:
 
 3. **Decide.** Walk the decision tree above. Do not fetch anything you don't need — context bundle first, GitHub reads only when a specific question remains.
 
-4. **Write recommendation.** Serialize the recommendation dict to `{worktree}/tmp/dispatcher-diagnoser/recommendation.json`, then run the writer helper with the `diagnosis_id` and the JSON file path.
+4. **Write recommendation.** Serialize the recommendation dict to `{worktree}/tmp/dispatcher-diagnoser/recommendation.json`, then run the writer helper with the `diagnosis_id`, the `agent_id` (from `context.agent_id`), and the JSON file path. The helper writes both the diagnosis row AND the `dispatcher.agents.failure_summary` upgrade in one transaction — issue #2900.
 
 5. **Exit 0.** Done. The daemon picks up the recommendation on the next supervisor tick.
 
