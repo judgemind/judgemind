@@ -720,6 +720,196 @@ class TestProcessRetryMarkers:
         ]
         assert resets
 
+    # ------------------------------------------------------------------
+    # Issue #2936 — infra-preemption retries don't count toward attempt
+    # budget. Paired tests: one infra-preemption reason preserves the
+    # prior attempt; one budgeted reason increments as before. Both
+    # assert the ``retry_counted`` field on the ``retry_processed``
+    # log event for CloudWatch observability.
+    # ------------------------------------------------------------------
+
+    def test_daemon_restart_preserves_prior_attempt(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """An agent at attempt=2 preempted by daemon restart stays at attempt=2.
+
+        The marker's reason is ``daemon_restart_abandoned`` — classified
+        as infra preemption — so ``_process_retry_markers`` must reset
+        the agent without incrementing ``retries_used``. The
+        ``daemon.retry_processed`` log event records
+        ``retry_counted=false``.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [
+                (
+                    1,  # marker_id
+                    "agent-preempted-1",
+                    daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+                    2,  # attempt (per-reason marker counter)
+                    str(tmp_path / "worktrees" / "agent-preempted-1"),
+                    42,  # issue_number
+                ),
+            ],
+        ]
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        # The reset UPDATE must NOT include the retries_used++
+        # clause — the agent's prior attempt count is preserved.
+        incremented = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert incremented == [], (
+            "daemon_restart_abandoned retry must not increment retries_used"
+        )
+
+        # A reset UPDATE did run — status='retrying', phase='claiming',
+        # and retries_used absent from the SET clause.
+        preserved_resets = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+            and "phase = 'claiming'" in e[0]
+            and "retries_used" not in e[0]
+        ]
+        assert preserved_resets, (
+            "infra-preemption retry should still reset agent to retrying/claiming"
+        )
+
+        # retry_processed event with retry_counted=false.
+        events = handler.events("retry_processed")
+        assert len(events) == 1
+        assert events[0].retry_counted is False
+        assert events[0].reason == daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
+        assert events[0].attempt == 2
+
+    def test_killswitch_preserves_prior_attempt(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Killswitch-preempted agent at attempt=2 stays at attempt=2.
+
+        Parallel to the daemon-restart case. Uses
+        :data:`FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH` (added in this
+        PR) as the marker reason — any future killswitch retry path
+        that tags itself with this constant gets the correct
+        preservation semantics.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [
+                (
+                    2,  # marker_id
+                    "agent-killswitched-1",
+                    daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH,
+                    2,  # attempt
+                    str(tmp_path / "worktrees" / "agent-killswitched-1"),
+                    43,
+                ),
+            ],
+        ]
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        incremented = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert incremented == [], (
+            "paused_by_killswitch retry must not increment retries_used"
+        )
+
+        events = handler.events("retry_processed")
+        assert len(events) == 1
+        assert events[0].retry_counted is False
+        assert events[0].reason == daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
+
+    def test_subprocess_crash_increments_attempt_at_2(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """A budgeted retry at attempt=2 increments retries_used so the agent resumes at attempt=3.
+
+        Parallel to ``test_daemon_restart_preserves_prior_attempt``
+        for the opposite case — budgeted reasons still consume the
+        retry budget. The ``daemon.retry_processed`` log event records
+        ``retry_counted=true``.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [
+                (
+                    3,  # marker_id
+                    "agent-crashed-1",
+                    daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH,
+                    2,  # attempt
+                    str(tmp_path / "worktrees" / "agent-crashed-1"),
+                    44,
+                ),
+            ],
+        ]
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        # Reset UPDATE includes retries_used++ for budgeted reasons.
+        incremented = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert len(incremented) == 1, (
+            "subprocess_crash retry must increment retries_used"
+        )
+
+        events = handler.events("retry_processed")
+        assert len(events) == 1
+        assert events[0].retry_counted is True
+        assert events[0].reason == daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH
+        assert events[0].attempt == 2
+
+    def test_infra_preemption_categories_contents(self) -> None:
+        """Regression guard — the preemption set contains exactly the two infra categories.
+
+        Adding a new category must be a conscious decision; tripping
+        this assert forces a review of whether the new category is
+        truly infrastructure preemption or an agent-driven failure.
+        """
+        assert daemon._INFRA_PREEMPTION_CATEGORIES == frozenset(
+            {
+                daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+                daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH,
+            }
+        )
+
+    def test_killswitch_failure_category_string_matches_phase(self) -> None:
+        """``FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH`` == ``KILLSWITCH_TERMINAL_PHASE``.
+
+        The issue body explicitly directs us to reuse the phase
+        string value for the new failure-category constant so a
+        future killswitch retry path can write the same string to
+        both ``phase`` (via _mark_agent_terminal) and
+        ``retry_markers.reason`` (via _create_retry_marker) and have
+        the preemption classifier recognize it without an extra
+        mapping step.
+        """
+        assert (
+            daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
+            == daemon.KILLSWITCH_TERMINAL_PHASE
+            == "paused_by_killswitch"
+        )
+
 
 # --------------------------------------------------------------------------
 # _drop_worktree_best_effort
