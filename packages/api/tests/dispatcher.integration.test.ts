@@ -10,7 +10,8 @@
  *   - dispatcherControl: writes a row visible in the next dispatcherState call.
  *   - dispatcherControl: idempotency — repeating the same command inside
  *     the idempotency window returns the existing row (created=false).
- *   - dispatcherControl: destructive commands require X-MFA-Token header.
+ *   - dispatcherControl: admin role is the only gate (#2884 removed the
+ *     MFA re-auth placeholder — admin session auth is sufficient).
  *
  * DATA ISOLATION: this file uses `dispatcher` in the test-counties registry.
  * It writes only to `public.users` (emails prefixed with the run timestamp)
@@ -245,7 +246,7 @@ describe('dispatcher — auth gate', () => {
 
   it('non-admin: dispatcherControl returns "not found"', async () => {
     const body = await gql(
-      `mutation { dispatcherControl(command: pause) { commandId } }`,
+      `mutation { dispatcherControl(command: start) { commandId } }`,
       undefined,
       userToken,
     );
@@ -422,13 +423,13 @@ describe('dispatcherAgent — admin', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dispatcherControl — write path, idempotency, MFA
+// dispatcherControl — write path, idempotency, #2884 no-MFA regression
 // ---------------------------------------------------------------------------
 
 describe('dispatcherControl — admin', () => {
-  it('PAUSE writes a row in dispatcher.commands and returns it', async () => {
+  it('start writes a row in dispatcher.commands and returns it', async () => {
     const body = await gql(
-      `mutation { dispatcherControl(command: pause) {
+      `mutation { dispatcherControl(command: start) {
          commandId command issuedBy payload created
        } }`,
       undefined,
@@ -436,7 +437,7 @@ describe('dispatcherControl — admin', () => {
     );
     expect(body.errors).toBeUndefined();
     const result = body.data?.dispatcherControl as Record<string, unknown>;
-    expect(result.command).toBe('pause');
+    expect(result.command).toBe('start');
     expect(result.issuedBy).toBe(`${MARKER}-admin@test.com`);
     expect(result.created).toBe(true);
 
@@ -446,7 +447,7 @@ describe('dispatcherControl — admin', () => {
       [result.commandId],
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0].command).toBe('pause');
+    expect(rows[0].command).toBe('start');
     expect(rows[0].issued_by).toBe(`${MARKER}-admin@test.com`);
   });
 
@@ -458,7 +459,7 @@ describe('dispatcherControl — admin', () => {
 
     // Issue #1
     const first = await gql(
-      `mutation($p: JSON) { dispatcherControl(command: pause, payload: $p) { commandId created } }`,
+      `mutation($p: JSON) { dispatcherControl(command: start, payload: $p) { commandId created } }`,
       { p: markerPayload },
       adminToken,
     );
@@ -468,7 +469,7 @@ describe('dispatcherControl — admin', () => {
 
     // Issue #2 — identical command, identical issuer, identical payload.
     const second = await gql(
-      `mutation($p: JSON) { dispatcherControl(command: pause, payload: $p) { commandId created } }`,
+      `mutation($p: JSON) { dispatcherControl(command: start, payload: $p) { commandId created } }`,
       { p: markerPayload },
       adminToken,
     );
@@ -494,26 +495,44 @@ describe('dispatcherControl — admin', () => {
     expect(payload.reason).toBe('flake');
   });
 
-  it('destructive command (stop) without X-MFA-Token returns MFA_REQUIRED', async () => {
-    const body = await gql(
-      `mutation { dispatcherControl(command: stop) { commandId } }`,
-      undefined,
-      adminToken,
-    );
-    expect(body.errors).toBeDefined();
-    expect(body.errors![0].extensions?.code).toBe('MFA_REQUIRED');
-  });
-
-  it('destructive command (stop) with non-empty X-MFA-Token succeeds', async () => {
+  it('stop command succeeds without any MFA header (#2884 removed the gate)', async () => {
+    // Regression guard: the placeholder X-MFA-Token gate was removed;
+    // admin session auth is sufficient. Stopping dev work is not
+    // destructive — the operator needs an immediate stop button.
     const body = await gql(
       `mutation { dispatcherControl(command: stop) { commandId command created } }`,
       undefined,
       adminToken,
-      { 'x-mfa-token': 'placeholder-token-accepted-in-phase-1' },
     );
     expect(body.errors).toBeUndefined();
     const result = body.data?.dispatcherControl as Record<string, unknown>;
     expect(result.command).toBe('stop');
+  });
+
+  it('force_stop command succeeds without any MFA header (#2884)', async () => {
+    const body = await gql(
+      `mutation { dispatcherControl(command: force_stop) { commandId command created } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const result = body.data?.dispatcherControl as Record<string, unknown>;
+    expect(result.command).toBe('force_stop');
+  });
+
+  it('dispatcherSetConfig succeeds without any MFA header (#2884)', async () => {
+    // Same rationale as the control mutations — admin session auth is
+    // the gate; the placeholder MFA header was removed.
+    const body = await gql(
+      `mutation($k: String!, $v: String!) {
+         dispatcherSetConfig(key: $k, value: $v) { key value updatedBy }
+       }`,
+      { k: 'concurrency_cap', v: '1' },
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const result = body.data?.dispatcherSetConfig as Record<string, unknown>;
+    expect(result.key).toBe('concurrency_cap');
   });
 
   it('state reflects a newly-issued command on the next read', async () => {
@@ -521,7 +540,7 @@ describe('dispatcherControl — admin', () => {
     // dispatcher.commands, which this test verifies directly (admin surface
     // doesn't expose the commands queue in dispatcherState for Phase 1).
     const issue = await gql(
-      `mutation { dispatcherControl(command: resume) { commandId } }`,
+      `mutation { dispatcherControl(command: start) { commandId } }`,
       undefined,
       adminToken,
     );
@@ -531,6 +550,6 @@ describe('dispatcherControl — admin', () => {
       [commandId],
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0].command).toBe('resume');
+    expect(rows[0].command).toBe('start');
   });
 });

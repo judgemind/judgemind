@@ -174,13 +174,23 @@ DEFAULT_AWS_REGION = "us-west-2"
 PHASE_2_REQUIRED_CONCURRENCY_CAP = 0
 
 #: Killswitch terminal phase name (#2847). When the scheduler observes
-#: ``concurrency_cap=0`` mid-orchestration, the worker thread aborts at
-#: the next phase boundary and ``_mark_agent_terminal`` is called with
+#: ``concurrency_cap=0`` mid-orchestration and the killswitch engages
+#: (not a #2884 graceful ``stop``), the worker thread aborts at the
+#: next phase boundary and ``_mark_agent_terminal`` is called with
 #: ``status='failed'`` + this phase name. The dedicated phase value
 #: distinguishes operator killswitches from real failures in retro /
 #: admin-page views and stops them from being mis-classified as
 #: tier-1/2/3 failures by the diagnoser.
 KILLSWITCH_TERMINAL_PHASE = "paused_by_killswitch"
+
+#: #2884 terminal phase name for explicit operator ``force_stop``
+#: commands. Distinct from ``paused_by_killswitch`` (which covers
+#: cap=0 observed for any reason, including a direct config edit) so
+#: the admin cockpit / retro can tell "operator fired the emergency
+#: kill button" apart from "cap observed as 0 for some other reason".
+#: Used by :meth:`DispatcherDaemon._check_killswitch_and_abort` when
+#: :attr:`DispatcherDaemon._force_stop_requested` is set.
+FORCE_STOP_TERMINAL_PHASE = "force_stopped"
 
 #: Maximum time :meth:`DispatcherDaemon.run_forever` waits for the
 #: orchestration worker thread to exit during shutdown (#2847). If the
@@ -554,6 +564,7 @@ STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     "fix_ci": 30 * 60,  # 30 min — single /task-v2-fix-ci run
     "retro": 20 * 60,  # 20 min — single /task-v2-retro run
     "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
+    "force_stopped": 60,  # 1 min — #2884 operator force_stop terminal phase
     "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
 }
 
@@ -1052,10 +1063,11 @@ class CommandError(RuntimeError):
     """A command handler received an invalid or inapplicable payload.
 
     Raised by ``_handle_*`` methods when the command cannot be applied
-    (e.g. ``retry`` issued for an already-running agent, ``force_kill``
-    missing an ``agentId``). The caller catches this, rolls back, and
-    records a ``dispatcher.failures`` row so the command is left
-    unconsumed for visibility rather than silently discarded.
+    (e.g. ``retry`` issued for an already-running agent, a per-agent
+    ``force_stop`` naming an unknown ``agentId``). The caller catches
+    this, rolls back, and records a ``dispatcher.failures`` row so the
+    command is left unconsumed for visibility rather than silently
+    discarded.
     """
 
 
@@ -1214,6 +1226,30 @@ class DispatcherDaemon:
         self._orchestration_thread: threading.Thread | None = None
         self._orchestration_thread_lock = threading.Lock()
         self._pause_requested = threading.Event()
+        # #2884 command-taxonomy flags. In-memory only — a daemon
+        # restart loses them, which is acceptable: on restart the
+        # in-flight worker thread doesn't exist yet, so there's
+        # nothing to abort-vs-let-finish. Both flags read by
+        # ``scheduler_tick`` (to decide whether cap=0 engages the
+        # killswitch) and by ``_check_killswitch_and_abort`` (to
+        # pick the terminal phase name — ``paused_by_killswitch`` vs
+        # ``force_stopped``).
+        #
+        # ``_graceful_stop_requested`` — set by the ``stop`` handler.
+        # Tells ``scheduler_tick`` to NOT auto-set ``_pause_requested``
+        # when it observes cap==0. The in-flight worker keeps running
+        # through its current phase pipeline; new spawns are still
+        # blocked (cap=0). Cleared by the ``start`` handler and by the
+        # ``force_stop`` handler.
+        #
+        # ``_force_stop_requested`` — set by the ``force_stop``
+        # handler (global variant — no ``agentId`` in payload). Tells
+        # ``_check_killswitch_and_abort`` to mark the aborting agent
+        # with ``phase='force_stopped'`` instead of the default
+        # ``phase='paused_by_killswitch'``. Cleared by the ``start``
+        # handler.
+        self._graceful_stop_requested: bool = False
+        self._force_stop_requested: bool = False
         # Observation record: the most recent ``concurrency_cap`` value
         # read by scheduler_tick and when (monotonic seconds since
         # boot). Used by tests and by the ``daemon.scheduler_tick``
@@ -1435,27 +1471,54 @@ class DispatcherDaemon:
                 concurrency_cap = int(row[0]) if row[0] is not None else None
         self._conn.commit()
 
-        # Killswitch observation (#2847). Update the observation state
-        # and the ``_pause_requested`` event so the orchestration worker
-        # thread (if one is running) can abort at the next phase
-        # boundary within ≤60s of an operator cap=0 commit. Cap==0
-        # (killswitch) SETS the event; any positive cap value CLEARS it
-        # so a cap=0 → cap=1 flip lets a fresh orchestration proceed
+        # Killswitch observation (#2847, amended #2884). Update the
+        # observation state and the ``_pause_requested`` event so the
+        # orchestration worker thread (if one is running) can abort at
+        # the next phase boundary within ≤60s of an operator cap=0
+        # commit.
+        #
+        # #2884 amendment: when the operator issued a graceful ``stop``
+        # command (``_graceful_stop_requested`` flag set), cap==0 is
+        # observed but ``_pause_requested`` is NOT set — the in-flight
+        # worker is allowed to finish its current phase pipeline.
+        # ``force_stop`` (or any other path that sets cap=0 — e.g. a
+        # direct config edit, the circuit breaker) continues to engage
+        # the killswitch as before.
+        #
+        # Any positive cap value CLEARS ``_pause_requested`` (and the
+        # #2884 graceful-stop / force-stop flags as belt-and-braces) so
+        # a cap=0 → cap=1 flip lets a fresh orchestration proceed
         # normally on the next tick.
         self._last_cap_observed = concurrency_cap
         self._last_cap_observed_monotonic = time.monotonic()
         if concurrency_cap == 0:
-            if not self._pause_requested.is_set():
+            if self._graceful_stop_requested:
+                # Graceful stop: observe cap=0, do NOT engage the
+                # killswitch. Log a distinct event so CloudWatch can
+                # distinguish "operator asked for graceful stop" from
+                # "cap=0 engaged killswitch". Idempotent on repeated
+                # ticks — this is informational, not state.
                 self._log.info(
-                    "daemon.killswitch_engaged",
+                    "daemon.graceful_stop_in_progress",
                     extra={
-                        "event": "killswitch_engaged",
+                        "event": "graceful_stop_in_progress",
                         "run_id": self._run_id,
                         "observed_concurrency_cap": concurrency_cap,
                         "orchestration_in_flight": self._orchestration_thread_alive(),
                     },
                 )
-            self._pause_requested.set()
+            else:
+                if not self._pause_requested.is_set():
+                    self._log.info(
+                        "daemon.killswitch_engaged",
+                        extra={
+                            "event": "killswitch_engaged",
+                            "run_id": self._run_id,
+                            "observed_concurrency_cap": concurrency_cap,
+                            "orchestration_in_flight": self._orchestration_thread_alive(),
+                        },
+                    )
+                self._pause_requested.set()
         else:
             if self._pause_requested.is_set():
                 self._log.info(
@@ -1467,6 +1530,14 @@ class DispatcherDaemon:
                     },
                 )
             self._pause_requested.clear()
+            # #2884: positive cap also clears the stop-intent flags so
+            # a stale ``stop`` / ``force_stop`` from a prior cycle
+            # doesn't leak into the next one. The ``start`` handler
+            # already clears these, but an operator who sets cap back
+            # to ≥1 via a direct config edit (bypassing the ``start``
+            # command) must also get a clean slate.
+            self._graceful_stop_requested = False
+            self._force_stop_requested = False
 
         # Overnight-safety circuit breaker auto-close (#2860). When the
         # breaker previously opened it set ``cap_flipped_by='circuit_breaker'``
@@ -1638,14 +1709,14 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before ticks"
 
+        # #2884 simplified taxonomy: three global commands + retry.
+        # Removed: drain, pause/resume, force_kill (per-agent variant
+        # now lives as force_stop with an agentId payload).
         _HANDLERS = {
             "start": self._handle_start,
             "stop": self._handle_stop,
-            "drain": self._handle_drain,
-            "pause": self._handle_pause,
-            "resume": self._handle_resume,
+            "force_stop": self._handle_force_stop,
             "retry": self._handle_retry,
-            "force_kill": self._handle_force_kill,
         }
 
         try:
@@ -1744,12 +1815,20 @@ class DispatcherDaemon:
 
         Only applies when the current value is 0 (the killswitch state);
         if the cap is already > 0 this is a safe no-op (rowcount == 0).
+        Also clears the in-memory ``_graceful_stop_requested`` and
+        ``_force_stop_requested`` flags so a prior ``stop`` / ``force_stop``
+        does not leak into the new cycle (#2884).
         """
         cur.execute(
             "UPDATE dispatcher.config "
             "SET value = '1', updated_at = now(), updated_by = 'daemon' "
             "WHERE key = 'concurrency_cap' AND value::int = 0",
         )
+        # Clear #2884 stop-intent flags. scheduler_tick will also clear
+        # _pause_requested on the next cap>0 observation via the
+        # existing #2847 machinery — doing it here is belt-and-braces.
+        self._graceful_stop_requested = False
+        self._force_stop_requested = False
         self._log.info(
             "daemon.command_start_applied",
             extra={
@@ -1760,7 +1839,28 @@ class DispatcherDaemon:
         )
 
     def _handle_stop(self, cur: Any, payload: dict[str, Any]) -> None:
-        """Handle ``stop`` command — set ``concurrency_cap`` to 0 (killswitch)."""
+        """Handle ``stop`` command — graceful stop (#2884).
+
+        Sets ``concurrency_cap`` to 0 so no new agents spawn, and marks
+        the in-memory ``_graceful_stop_requested`` flag so the next
+        ``scheduler_tick`` does NOT engage the killswitch
+        (``_pause_requested``) on its cap=0 observation. Any in-flight
+        orchestration worker thread therefore keeps running through
+        its current phase pipeline and completes normally — graceful
+        stop = block new work but don't yank the rug from under
+        existing work.
+
+        Replaces the former ``drain`` command (same SQL, clearer
+        semantic boundary vs. ``force_stop``). Replaces the former
+        ``stop`` command (which mapped to the immediate-abort
+        semantic — that role now belongs to ``force_stop``).
+        """
+        # Set the flag BEFORE the UPDATE so there is no brief window
+        # where scheduler_tick could observe cap=0 without seeing the
+        # graceful-stop intent. Worst case: an extra scheduler_tick
+        # observes cap=0 with the flag already set, which is harmless.
+        self._graceful_stop_requested = True
+        self._force_stop_requested = False
         cur.execute(
             "UPDATE dispatcher.config "
             "SET value = '0', updated_at = now(), updated_by = 'daemon' "
@@ -1772,58 +1872,105 @@ class DispatcherDaemon:
                 "event": "command_stop_applied",
                 "run_id": self._run_id,
                 "rows_updated": cur.rowcount,
+                "mode": "graceful",
             },
         )
 
-    def _handle_drain(self, cur: Any, payload: dict[str, Any]) -> None:
-        """Handle ``drain`` command — same SQL as stop, distinct audit intent."""
+    def _handle_force_stop(self, cur: Any, payload: dict[str, Any]) -> None:
+        """Handle ``force_stop`` command (#2884).
+
+        Unified command with two behaviours, selected by payload:
+
+        - **Global (no ``agentId``)** — set ``concurrency_cap`` to 0
+          AND immediately set ``_pause_requested`` so the worker
+          thread aborts at the next phase boundary via
+          ``_check_killswitch_and_abort``. Also set
+          ``_force_stop_requested = True`` so the terminal phase is
+          marked ``force_stopped`` (distinct from the generic
+          ``paused_by_killswitch`` used when cap=0 is observed by
+          any other means, e.g. a direct config edit).
+
+        - **Per-agent (``payload['agentId']`` present)** — kill just
+          that agent: update its ``status`` to ``crashed``, set
+          ``ended_at`` to now(), and SIGKILL the pid if it is local.
+          Does NOT touch ``concurrency_cap`` or any global flag —
+          other in-flight agents and new claims are unaffected.
+          Replaces the former ``force_kill`` command.
+        """
+        agent_id = payload.get("agentId")
+
+        if agent_id:
+            # Per-agent force_stop — narrow scope, no global effects.
+            cur.execute(
+                "SELECT pid FROM dispatcher.agents WHERE agent_id = %s",
+                (agent_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise CommandError(
+                    f"force_stop: agent {agent_id!r} not found in dispatcher.agents"
+                )
+            pid = int(row[0]) if row[0] is not None else None
+
+            cur.execute(
+                "UPDATE dispatcher.agents "
+                "SET status = 'crashed', ended_at = now() "
+                "WHERE agent_id = %s",
+                (agent_id,),
+            )
+
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    self._log.info(
+                        "daemon.force_stop_signal_sent",
+                        extra={
+                            "event": "force_stop_signal_sent",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "pid": pid,
+                        },
+                    )
+                except ProcessLookupError:
+                    # Process already gone — not an error.
+                    pass
+                except PermissionError:
+                    # Foreign host pid — not an error either.
+                    pass
+
+            self._log.info(
+                "daemon.command_force_stop_agent_applied",
+                extra={
+                    "event": "command_force_stop_agent_applied",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pid": pid,
+                },
+            )
+            return
+
+        # Global force_stop — cap=0 + engage killswitch immediately.
+        # Clear the graceful flag so a pending graceful stop doesn't
+        # override the force-stop intent.
+        self._graceful_stop_requested = False
+        self._force_stop_requested = True
         cur.execute(
             "UPDATE dispatcher.config "
             "SET value = '0', updated_at = now(), updated_by = 'daemon' "
             "WHERE key = 'concurrency_cap'",
         )
+        # Engage the killswitch immediately — don't wait for the next
+        # scheduler_tick to observe cap=0. The orchestration worker
+        # checks this event before each phase and aborts; see
+        # :meth:`_check_killswitch_and_abort`.
+        self._pause_requested.set()
         self._log.info(
-            "daemon.command_drain_applied",
+            "daemon.command_force_stop_applied",
             extra={
-                "event": "command_drain_applied",
+                "event": "command_force_stop_applied",
                 "run_id": self._run_id,
                 "rows_updated": cur.rowcount,
-            },
-        )
-
-    def _handle_pause(self, cur: Any, payload: dict[str, Any]) -> None:
-        """Handle ``pause`` command — UPSERT ``paused=true`` in config.
-
-        Does not change ``concurrency_cap``; the claim gate checks both
-        ``paused`` and ``concurrency_cap > 0``.
-        """
-        cur.execute(
-            "INSERT INTO dispatcher.config (key, value, updated_at, updated_by) "
-            "VALUES ('paused', 'true', now(), 'daemon') "
-            "ON CONFLICT (key) DO UPDATE "
-            "    SET value = 'true', updated_at = now(), updated_by = 'daemon'",
-        )
-        self._log.info(
-            "daemon.command_pause_applied",
-            extra={
-                "event": "command_pause_applied",
-                "run_id": self._run_id,
-            },
-        )
-
-    def _handle_resume(self, cur: Any, payload: dict[str, Any]) -> None:
-        """Handle ``resume`` command — UPSERT ``paused=false`` in config."""
-        cur.execute(
-            "INSERT INTO dispatcher.config (key, value, updated_at, updated_by) "
-            "VALUES ('paused', 'false', now(), 'daemon') "
-            "ON CONFLICT (key) DO UPDATE "
-            "    SET value = 'false', updated_at = now(), updated_by = 'daemon'",
-        )
-        self._log.info(
-            "daemon.command_resume_applied",
-            extra={
-                "event": "command_resume_applied",
-                "run_id": self._run_id,
+                "mode": "global",
             },
         )
 
@@ -1875,66 +2022,6 @@ class DispatcherDaemon:
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "attempt": retries_used + 1,
-            },
-        )
-
-    def _handle_force_kill(self, cur: Any, payload: dict[str, Any]) -> None:
-        """Handle ``force_kill`` command — crash a running agent immediately.
-
-        Requires ``payload['agentId']``. Updates the agent row to
-        ``status='crashed'``, sets ``ended_at = now()``. If the agent's
-        ``pid`` is known and ``os.kill(pid, SIGKILL)`` succeeds on this
-        host, the process is killed; a dead or foreign-host pid is not
-        an error.
-        """
-        agent_id = payload.get("agentId")
-        if not agent_id:
-            raise CommandError("force_kill command missing required payload.agentId")
-
-        cur.execute(
-            "SELECT pid FROM dispatcher.agents WHERE agent_id = %s",
-            (agent_id,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise CommandError(
-                f"force_kill: agent {agent_id!r} not found in dispatcher.agents"
-            )
-        pid = int(row[0]) if row[0] is not None else None
-
-        cur.execute(
-            "UPDATE dispatcher.agents "
-            "SET status = 'crashed', ended_at = now() "
-            "WHERE agent_id = %s",
-            (agent_id,),
-        )
-
-        if pid is not None:
-            try:
-                os.kill(pid, signal.SIGKILL)
-                self._log.info(
-                    "daemon.force_kill_signal_sent",
-                    extra={
-                        "event": "force_kill_signal_sent",
-                        "run_id": self._run_id,
-                        "agent_id": agent_id,
-                        "pid": pid,
-                    },
-                )
-            except ProcessLookupError:
-                # Process already gone — not an error.
-                pass
-            except PermissionError:
-                # Foreign host pid — not an error either.
-                pass
-
-        self._log.info(
-            "daemon.command_force_kill_applied",
-            extra={
-                "event": "command_force_kill_applied",
-                "run_id": self._run_id,
-                "agent_id": agent_id,
-                "pid": pid,
             },
         )
 
@@ -4399,6 +4486,17 @@ class DispatcherDaemon:
         if not self._pause_requested.is_set():
             return False
 
+        # #2884: pick the terminal phase name based on how the
+        # killswitch was engaged. An explicit ``force_stop`` command
+        # marks the agent ``phase='force_stopped'`` so the admin
+        # cockpit / retro can distinguish it from a generic cap=0
+        # observation (config edit, circuit breaker, etc.) which
+        # marks the agent ``phase='paused_by_killswitch'``.
+        terminal_phase = (
+            FORCE_STOP_TERMINAL_PHASE
+            if self._force_stop_requested
+            else KILLSWITCH_TERMINAL_PHASE
+        )
         self._log.info(
             "daemon.orchestration_paused",
             extra={
@@ -4406,6 +4504,7 @@ class DispatcherDaemon:
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "after_phase": after_phase,
+                "terminal_phase": terminal_phase,
                 "detail": (
                     "concurrency_cap observed as 0 mid-pipeline; aborting "
                     "before next phase to honor operator killswitch"
@@ -4415,7 +4514,7 @@ class DispatcherDaemon:
         self._mark_agent_terminal(
             agent_id,
             status="failed",
-            phase=KILLSWITCH_TERMINAL_PHASE,
+            phase=terminal_phase,
             exit_code=None,
             issue_number=issue_number,
         )

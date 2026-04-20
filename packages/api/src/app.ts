@@ -95,17 +95,9 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
           const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
           const cookieHeader =
             typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
-          // X-MFA-Token propagates the admin re-auth challenge token for
-          // destructive dispatcherControl commands (§17 Risk 6). Phase 1
-          // placeholder — any non-empty value is accepted; sub-task E wires
-          // the real MFA challenge flow.
-          const mfaTokenHeader = req.headers['x-mfa-token'];
-          const mfaToken =
-            typeof mfaTokenHeader === 'string'
-              ? mfaTokenHeader
-              : Array.isArray(mfaTokenHeader)
-                ? mfaTokenHeader[0]
-                : null;
+          // #2884: X-MFA-Token parsing removed with the MFA re-auth gate.
+          // Admin surfaces rely on `user.role === 'admin'` alone; audit
+          // trail lives in `dispatcher.commands.issued_by`.
           return {
             pool,
             loaders: createLoaders(pool),
@@ -114,7 +106,6 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
             reply,
             cookieHeader,
             opensearch,
-            mfaToken,
           };
         },
       });

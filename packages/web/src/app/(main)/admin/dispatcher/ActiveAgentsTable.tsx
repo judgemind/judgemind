@@ -9,7 +9,7 @@ import { IssueLink } from './ui-primitives';
 interface ActiveAgentsTableProps {
   agents: readonly DispatcherAgent[];
   disabled?: boolean;
-  onAgentAction: (command: 'retry' | 'force_kill', agentId: string) => void;
+  onAgentAction: (command: 'retry' | 'force_stop', agentId: string) => void;
   /** Override for deterministic tests. */
   nowMs?: number;
 }
@@ -60,7 +60,7 @@ function ActiveAgentRow({
 }: {
   agent: DispatcherAgent;
   disabled?: boolean;
-  onAction: (command: 'retry' | 'force_kill', agentId: string) => void;
+  onAction: (command: 'retry' | 'force_stop', agentId: string) => void;
   nowMs?: number;
 }) {
   const logsHref = worktreeLogsUrl(agent.worktreePath);
@@ -116,7 +116,7 @@ function ActiveAgentRow({
           variant="destructive"
           size="xs"
           disabled={disabled}
-          onClick={() => onAction('force_kill', agent.id)}
+          onClick={() => onAction('force_stop', agent.id)}
         >
           Kill
         </Button>
