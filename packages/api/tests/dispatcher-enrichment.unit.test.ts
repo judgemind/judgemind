@@ -23,6 +23,7 @@ import {
   phaseCostRowsToGraphQL,
   queueItemFromSnapshot,
   recentCompletionsToGraphQL,
+  sortAndSliceQueueBlocked,
   sortAndSliceQueueReady,
   sumPhaseCost,
   type SnapshotIssueRecord,
@@ -734,6 +735,256 @@ describe('sortAndSliceQueueReady', () => {
 
     expect(result).toHaveLength(2);
     expect(result.map((r) => r.number)).toEqual([1, 2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sortAndSliceQueueBlocked (issue #2930 — mirror of #2843 for the
+// admin cockpit's Queue: Blocked panel). Uses the same
+// `(priorityRank ASC, createdAt ASC)` comparator as the ready queue
+// so the operator reads both panels with the same mental model.
+// ---------------------------------------------------------------------------
+
+describe('sortAndSliceQueueBlocked', () => {
+  /** Small helper — build a SnapshotIssueRecord with sensible defaults. */
+  function issue(
+    number: number,
+    labels: string[],
+    createdAt: string,
+    body?: string,
+  ): SnapshotIssueRecord {
+    const rec: SnapshotIssueRecord = {
+      number,
+      title: `Issue ${number}`,
+      labels,
+      createdAt,
+    };
+    if (body !== undefined) rec.body = body;
+    return rec;
+  }
+
+  it('sorts blocked issues by priority first (p1 before p2 before p3)', () => {
+    // Storage order is what the daemon writes to
+    // dispatcher.blocked_snapshots — unsorted w.r.t. priority. Before
+    // #2930 this came out as createdAt DESC, so the p1 at the bottom
+    // was buried beneath newer p2/p3 rows.
+    const p3 = issue(
+      100,
+      ['priority/p3', 'status/blocked'],
+      '2026-04-19T00:00:00Z',
+      'Blocked by #1',
+    );
+    const p2 = issue(
+      101,
+      ['priority/p2', 'status/blocked'],
+      '2026-04-18T00:00:00Z',
+      'Blocked by #2',
+    );
+    const p1 = issue(
+      102,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-10T00:00:00Z',
+      'Blocked by #3',
+    );
+
+    const result = sortAndSliceQueueBlocked([p3, p2, p1], 10);
+
+    expect(result.map((r) => r.number)).toEqual([102, 101, 100]);
+  });
+
+  it('breaks ties within a priority bucket by createdAt ASC (longest-blocked surfaces)', () => {
+    // Three p1-blocked issues — operator wants the longest-blocked
+    // (oldest createdAt) first so investigation-aging is visible.
+    const newer = issue(
+      200,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-19T12:00:00Z',
+    );
+    const middle = issue(
+      201,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-18T12:00:00Z',
+    );
+    const older = issue(
+      202,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-17T12:00:00Z',
+    );
+
+    const result = sortAndSliceQueueBlocked([newer, middle, older], 10);
+
+    expect(result.map((r) => r.number)).toEqual([202, 201, 200]);
+  });
+
+  it('respects both keys: priority first, then createdAt ASC', () => {
+    const p0 = issue(1, ['priority/p0', 'status/blocked'], '2026-04-19T00:00:00Z');
+    const p1Old = issue(2, ['priority/p1', 'status/blocked'], '2026-01-01T00:00:00Z');
+    const p1New = issue(3, ['priority/p1', 'status/blocked'], '2026-04-19T00:00:00Z');
+    const p2 = issue(4, ['priority/p2', 'status/blocked'], '2025-12-01T00:00:00Z');
+
+    const result = sortAndSliceQueueBlocked([p2, p1New, p0, p1Old], 10);
+
+    expect(result.map((r) => r.number)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('sorts unlabelled blocked issues last among open rows', () => {
+    const unlabelled = issue(
+      900,
+      ['status/blocked'],
+      '2026-01-01T00:00:00Z',
+    );
+    const p3 = issue(
+      901,
+      ['priority/p3', 'status/blocked'],
+      '2026-04-19T00:00:00Z',
+    );
+    const p0 = issue(
+      902,
+      ['priority/p0', 'status/blocked'],
+      '2026-04-19T00:00:00Z',
+    );
+
+    const result = sortAndSliceQueueBlocked([unlabelled, p0, p3], 10);
+
+    expect(result.map((r) => r.number)).toEqual([902, 901, 900]);
+  });
+
+  it('slices to `limit` after sorting, not before', () => {
+    // If a naive slice(0, limit) ran before the sort, the p1 at the
+    // end of the input would drop off even though it should lead the
+    // blocked panel.
+    const input: SnapshotIssueRecord[] = [];
+    for (let i = 0; i < 15; i += 1) {
+      input.push(
+        issue(
+          2000 + i,
+          ['priority/p3', 'status/blocked'],
+          `2026-04-${String(19 - i).padStart(2, '0')}T00:00:00Z`,
+        ),
+      );
+    }
+    const p1 = issue(
+      1,
+      ['priority/p1', 'status/blocked'],
+      '2025-01-01T00:00:00Z',
+    );
+    input.push(p1); // past the slice boundary
+
+    const result = sortAndSliceQueueBlocked(input, 10);
+
+    expect(result).toHaveLength(10);
+    expect(result[0].number).toBe(1);
+  });
+
+  it('returns an empty array for an empty input', () => {
+    expect(sortAndSliceQueueBlocked([], 10)).toEqual([]);
+  });
+
+  it('does not mutate the input array', () => {
+    const input: SnapshotIssueRecord[] = [
+      issue(1, ['priority/p2', 'status/blocked'], '2026-04-19T00:00:00Z'),
+      issue(2, ['priority/p0', 'status/blocked'], '2026-04-18T00:00:00Z'),
+    ];
+    const inputCopy = input.slice();
+
+    sortAndSliceQueueBlocked(input, 10);
+
+    expect(input).toEqual(inputCopy);
+    expect(input[0].number).toBe(1);
+  });
+
+  it('handles missing / empty createdAt by sorting them last within their bucket', () => {
+    const withTs = issue(
+      1,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-19T00:00:00Z',
+    );
+    const withoutTs = issue(2, ['priority/p1', 'status/blocked'], '');
+
+    const result = sortAndSliceQueueBlocked([withoutTs, withTs], 10);
+
+    expect(result.map((r) => r.number)).toEqual([1, 2]);
+  });
+
+  it('preserves the snapshot body so parseBlockedBy can read it downstream', () => {
+    // Unlike the ready queue, the blocked-queue snapshot carries
+    // ``body`` (daemon writes it on blocked-scan only). The sort
+    // helper must not strip or mutate it — queueItemFromSnapshot
+    // parses it for the inline blocker list in the admin cockpit.
+    const p1 = issue(
+      10,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-19T00:00:00Z',
+      'Blocked by #5\nBlocked by #6',
+    );
+    const p2 = issue(
+      11,
+      ['priority/p2', 'status/blocked'],
+      '2026-04-18T00:00:00Z',
+      'Blocked by #7',
+    );
+
+    const result = sortAndSliceQueueBlocked([p2, p1], 10);
+
+    expect(result.map((r) => r.number)).toEqual([10, 11]);
+    expect(result[0].body).toBe('Blocked by #5\nBlocked by #6');
+    expect(result[1].body).toBe('Blocked by #7');
+  });
+
+  it('surfaces a lone p1 ahead of newer p2/p3 blockers (#2930 ergonomics)', () => {
+    // Real-world shape of the blocked queue: a couple of urgent
+    // blockers buried under a pile of lower-priority ones. Before
+    // #2930 the operator had to scan the whole list; after #2930
+    // the p1s lead.
+    const newerLower: SnapshotIssueRecord[] = [];
+    // 18 p2s (enough to fill rows 2-10 without bleeding into p3) plus
+    // a handful of p3s to stress the tie-break. Every row's createdAt
+    // is strictly newer than the lone p1 below, so createdAt-DESC
+    // (the pre-#2930 order) would bury the p1 at the tail of the list.
+    for (let i = 0; i < 18; i += 1) {
+      const day = String(20 - (i % 20)).padStart(2, '0');
+      const createdAt = `2026-05-${day}T12:00:00Z`;
+      newerLower.push(
+        issue(
+          3000 + i,
+          ['priority/p2', 'status/blocked'],
+          createdAt,
+          'Blocked by #1',
+        ),
+      );
+    }
+    for (let i = 0; i < 4; i += 1) {
+      const day = String(20 - (i % 20)).padStart(2, '0');
+      const createdAt = `2026-05-${day}T12:00:00Z`;
+      newerLower.push(
+        issue(
+          4000 + i,
+          ['priority/p3', 'status/blocked'],
+          createdAt,
+          'Blocked by #1',
+        ),
+      );
+    }
+    const p1 = issue(
+      2600,
+      ['priority/p1', 'status/blocked'],
+      '2026-03-01T00:00:00Z',
+      'Blocked by #1',
+    );
+    // Storage order — createdAt DESC would keep p1 at the very end.
+    const storedOrder = [...newerLower, p1];
+
+    const result = sortAndSliceQueueBlocked(storedOrder, 10);
+
+    expect(result).toHaveLength(10);
+    expect(result[0].number).toBe(2600);
+    expect(priorityRank(result[0].labels)).toBe(1);
+    // Rows 2-10 must all be p2 (p2 beats p3 in the tie-break, and we
+    // seeded 18 p2s — enough to fill the remaining nine slots without
+    // spilling into p3).
+    for (let i = 1; i < result.length; i += 1) {
+      expect(result[i].labels).toContain('priority/p2');
+    }
   });
 });
 

@@ -399,19 +399,7 @@ function sortAndSliceQueueReady(
   limit: number,
 ): SnapshotIssueRecord[] {
   const copy = issues.slice();
-  copy.sort((a, b) => {
-    const ra = priorityRank(a.labels);
-    const rb = priorityRank(b.labels);
-    if (ra !== rb) return ra - rb;
-    // Secondary key: createdAt ASC. Empty/missing createdAt sorts last
-    // within its priority bucket (same convention as the daemon).
-    const ca = a.createdAt || '';
-    const cb = b.createdAt || '';
-    if (ca === cb) return 0;
-    if (ca === '') return 1;
-    if (cb === '') return -1;
-    return ca < cb ? -1 : 1;
-  });
+  copy.sort(comparePriorityThenCreatedAtAsc);
   return copy.slice(0, limit);
 }
 
@@ -426,12 +414,64 @@ async function queryQueueBlocked(
   limit: number,
 ): Promise<Array<Record<string, unknown>>> {
   const issues = await queryLatestBlockedSnapshotIssuesJson(pool);
-  const result = issues.map((issue) =>
+  if (issues.length === 0) return [];
+  return sortAndSliceQueueBlocked(issues, limit).map((issue) =>
     queueItemFromSnapshot(issue, /* includeBlockedBy */ true),
   );
-  // Sort newest first per spec.
-  result.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-  return result.slice(0, limit);
+}
+
+/**
+ * Sort the enriched blocked-queue `issues` snapshot by
+ * `(priorityRank, createdAt ASC)` and return the first `limit`
+ * entries. Shares the comparator with {@link sortAndSliceQueueReady}
+ * so both admin-cockpit queue panels render in the same operator-
+ * friendly order (issue #2930, sibling of #2843).
+ *
+ * Before #2930, the blocked panel sorted by `createdAt DESC` — which
+ * meant a p1 blocker filed last week sat below a p3 blocker filed
+ * today, exactly the ergonomics problem that #2843 fixed for
+ * agent-ready. Using the same `(priorityRank ASC, createdAt ASC)`
+ * key lets the operator scan both panels with the same mental model:
+ * urgent work at the top, longest-waiting within each priority tier.
+ *
+ * Uses a copied array + stable-by-construction comparator — we do
+ * not mutate the input.
+ */
+function sortAndSliceQueueBlocked(
+  issues: readonly SnapshotIssueRecord[],
+  limit: number,
+): SnapshotIssueRecord[] {
+  const copy = issues.slice();
+  copy.sort(comparePriorityThenCreatedAtAsc);
+  return copy.slice(0, limit);
+}
+
+/**
+ * Shared comparator for the admin-cockpit queue panels. Primary key
+ * is `priorityRank(labels)` ascending (p0 < p1 < p2 < p3 < unlabelled);
+ * secondary key is `createdAt` ASC (older-first within a priority
+ * bucket). Empty / missing `createdAt` sorts last within its bucket
+ * — same convention as the Python daemon's ``_priority_rank`` path
+ * in ``scripts/dispatcher/daemon.py``.
+ *
+ * Extracted so the two sort-and-slice helpers (`sortAndSliceQueueReady`
+ * and `sortAndSliceQueueBlocked`) stay byte-for-byte identical in the
+ * ordering they produce. Changing the daemon's pick order means
+ * changing this one function (issue #2930).
+ */
+function comparePriorityThenCreatedAtAsc(
+  a: SnapshotIssueRecord,
+  b: SnapshotIssueRecord,
+): number {
+  const ra = priorityRank(a.labels);
+  const rb = priorityRank(b.labels);
+  if (ra !== rb) return ra - rb;
+  const ca = a.createdAt || '';
+  const cb = b.createdAt || '';
+  if (ca === cb) return 0;
+  if (ca === '') return 1;
+  if (cb === '') return -1;
+  return ca < cb ? -1 : 1;
 }
 
 function queueItemFromSnapshot(
@@ -1131,6 +1171,7 @@ export {
   queueItemFromSnapshot,
   recentCompletionsToGraphQL,
   runRowToGraphQL,
+  sortAndSliceQueueBlocked,
   sortAndSliceQueueReady,
   sumPhaseCost,
   transitionRowToGraphQL,
