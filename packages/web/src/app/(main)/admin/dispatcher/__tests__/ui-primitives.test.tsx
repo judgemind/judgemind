@@ -143,4 +143,85 @@ describe('OutcomePill', () => {
     render(<OutcomePill status="bogus" />);
     expect(screen.getByText('?')).toBeInTheDocument();
   });
+
+  // #2900: failureSummary prop drives the hover tooltip for failure
+  // terminals so operators can triage without opening the agent detail
+  // page. Null / undefined / whitespace falls back to the built-in
+  // status-label tooltip to preserve the existing UX for succeeded /
+  // needs_review / pre-migration-33 rows.
+  describe('failureSummary prop (#2900)', () => {
+    it('uses failureSummary as the title tooltip when present', () => {
+      const summary =
+        'ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns';
+      render(<OutcomePill status="crashed" failureSummary={summary} />);
+      const pill = screen.getByTestId('outcome-pill-crashed');
+      expect(pill.getAttribute('title')).toBe(summary);
+      // aria-label stays on the short status string so screen readers
+      // announce "crashed" without reading the full summary mid-row.
+      expect(pill.getAttribute('aria-label')).toBe('crashed');
+    });
+
+    it('falls back to the status label when failureSummary is null', () => {
+      render(<OutcomePill status="failed" failureSummary={null} />);
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.getAttribute('title')).toBe('failed');
+    });
+
+    it('falls back to the status label when failureSummary is undefined', () => {
+      render(<OutcomePill status="failed" />);
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.getAttribute('title')).toBe('failed');
+    });
+
+    it('falls back to the status label when failureSummary is an empty string', () => {
+      render(<OutcomePill status="failed" failureSummary="" />);
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.getAttribute('title')).toBe('failed');
+    });
+
+    it('falls back to the status label when failureSummary is whitespace-only', () => {
+      render(<OutcomePill status="failed" failureSummary="   " />);
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.getAttribute('title')).toBe('failed');
+    });
+
+    it('trims surrounding whitespace in the rendered tooltip', () => {
+      render(
+        <OutcomePill
+          status="failed"
+          failureSummary="  plan phase returned go=false: scope is ambiguous  "
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.getAttribute('title')).toBe(
+        'plan phase returned go=false: scope is ambiguous',
+      );
+    });
+
+    it('respects the plan_blocked failure-summary path', () => {
+      // plan_blocked is a correct-outcome terminal but still gets a
+      // failure_summary (the block_reason). Verify the pill shows the
+      // summary on hover without losing its neutral chip styling.
+      const summary = 'plan phase returned go=false: acceptance criteria missing';
+      render(
+        <OutcomePill status="plan_blocked" failureSummary={summary} />,
+      );
+      const pill = screen.getByTestId('outcome-pill-plan_blocked');
+      expect(pill.getAttribute('title')).toBe(summary);
+      expect(pill.className).toContain('bg-muted');
+    });
+
+    it('applies the tooltip to the unknown-status fallback chip', () => {
+      render(
+        <OutcomePill
+          status="something-new"
+          failureSummary="future terminal we haven't seen yet"
+        />,
+      );
+      const pill = screen.getByText('?');
+      expect(pill.getAttribute('title')).toBe(
+        "future terminal we haven't seen yet",
+      );
+    });
+  });
 });

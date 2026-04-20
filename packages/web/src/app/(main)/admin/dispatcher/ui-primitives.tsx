@@ -159,19 +159,53 @@ const OUTCOME_STYLES: Record<
   },
 };
 
-export function OutcomePill({ status }: { status: string }) {
+export function OutcomePill({
+  status,
+  failureSummary,
+}: {
+  status: string;
+  /**
+   * Optional one-line "what happened" string. When present (failure
+   * terminals: `failed` / `crashed` / `plan_blocked`), overrides the
+   * default status-label tooltip so operators can scan the cause on
+   * hover without opening the agent detail page. Null / undefined
+   * falls back to the default status label — preserves the existing
+   * UX for `succeeded` / `needs_review` rows and historical rows from
+   * before migration 33. Issue #2900.
+   *
+   * We deliberately do NOT render an always-visible second line — the
+   * "Recently completed" panel's density-first design (#2818) is the
+   * constraint. Tooltip-only.
+   */
+  failureSummary?: string | null;
+}) {
   const info = OUTCOME_STYLES[status as OutcomeStatus];
   if (!info) {
     return (
-      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-muted text-[10px] text-muted-foreground">
+      <span
+        className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-muted text-[10px] text-muted-foreground"
+        title={
+          failureSummary && failureSummary.trim()
+            ? failureSummary.trim()
+            : undefined
+        }
+      >
         ?
       </span>
     );
   }
+  // #2900: prefer the failure_summary for the hover tooltip when
+  // present. The aria-label stays on the short status label so screen
+  // readers announce the category without reading the (possibly long)
+  // summary text mid-row. Sighted operators get the full narrative on
+  // hover; assistive-tech users hear "failed" / "crashed" and can
+  // navigate to the agent detail page from there.
+  const tooltip =
+    failureSummary && failureSummary.trim() ? failureSummary.trim() : info.label;
   return (
     <span
       aria-label={info.label}
-      title={info.label}
+      title={tooltip}
       className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${info.className}`}
       data-testid={`outcome-pill-${status}`}
     >

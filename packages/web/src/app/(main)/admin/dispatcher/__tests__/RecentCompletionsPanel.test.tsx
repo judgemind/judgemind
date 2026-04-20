@@ -19,6 +19,7 @@ function completion(overrides: Partial<RecentCompletion>): RecentCompletion {
     prNumber: 2811,
     totalTokens: null,
     totalCostUsd: null,
+    failureSummary: null,
     ...overrides,
   };
 }
@@ -101,6 +102,56 @@ describe('RecentCompletionsPanel', () => {
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
     // No footnote rendered — distinguishes "no data" from "$0.00".
     expect(screen.queryByTestId('completion-row-cost')).not.toBeInTheDocument();
+  });
+
+  // --- #2900 — failure_summary tooltip on the outcome glyph.
+  //
+  // The panel keeps its density-first layout (#2818) — no always-
+  // visible second line. The summary surfaces on hover via the
+  // OutcomePill's `title` attribute, so operators can triage failures
+  // without opening the agent detail page.
+  it('#2900: wires failure_summary into the OutcomePill tooltip for failure rows', () => {
+    const summary =
+      'ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns';
+    const items = [
+      completion({
+        agentId: 'agent-fail',
+        issueNumber: 2900,
+        status: 'crashed',
+        prNumber: null,
+        failureSummary: summary,
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const pill = screen.getByTestId('outcome-pill-crashed');
+    expect(pill.getAttribute('title')).toBe(summary);
+  });
+
+  it('#2900: leaves the default status-label tooltip for succeeded rows (no summary)', () => {
+    const items = [completion({ agentId: 'agent-ok', failureSummary: null })];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const pill = screen.getByTestId('outcome-pill-succeeded');
+    // Default tooltip is the human status label ("succeeded").
+    expect(pill.getAttribute('title')).toBe('succeeded');
+  });
+
+  it('#2900: does NOT render the summary as a second visible line on the row', () => {
+    const summary =
+      'ralph crashed at ralph-reviewer iteration 3 (subprocess_turn_limit): reviewer exceeded max turns';
+    const items = [
+      completion({
+        agentId: 'agent-hidden',
+        issueNumber: 2900,
+        status: 'crashed',
+        prNumber: null,
+        failureSummary: summary,
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    // The summary must not appear as visible text on the row — the
+    // density-first constraint (#2818) is that the panel keeps its
+    // one-line-per-row layout. The tooltip is the *only* surface.
+    expect(screen.queryByText(summary)).not.toBeInTheDocument();
   });
 
   it('#2869: renders only the available half when the other metering field is null', () => {

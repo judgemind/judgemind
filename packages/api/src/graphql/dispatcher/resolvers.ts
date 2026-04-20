@@ -287,6 +287,11 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
   // predate migration 31 have NULL metering columns, so SUM returns
   // NULL (not 0), which the UI renders as "no cost data" rather than a
   // misleading "$0.00".
+  // #2900: select `a.failure_summary` so the admin cockpit can render
+  // a one-line "what happened" tooltip on hover over the outcome glyph
+  // for failure terminals. Always nullable — succeeded / needs_review
+  // rows don't populate it, nor do historical rows from before
+  // migration 33.
   const { rows } = await pool.query<Row>(
     `SELECT a.agent_id,
             a.issue_number,
@@ -294,6 +299,7 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
             a.status,
             a.ended_at,
             a.pr_number,
+            a.failure_summary,
             po.total_tokens,
             po.total_cost_usd
        FROM dispatcher.agents a
@@ -442,6 +448,16 @@ function recentCompletionsToGraphQL(
       typeof row.issue_title === 'string' && row.issue_title.length > 0
         ? row.issue_title
         : null;
+    // #2900: failure_summary is TEXT nullable — any non-string or empty
+    // value collapses to null so the UI renders the outcome glyph
+    // exactly as it did pre-#2900 (no tooltip layering over the
+    // built-in status label). Trimming matches the daemon's write-time
+    // convention and handles the edge case where a migration-era empty
+    // string sneaks through.
+    const failureSummary =
+      typeof row.failure_summary === 'string' && row.failure_summary.trim()
+        ? row.failure_summary.trim()
+        : null;
     return {
       agentId: row.agent_id,
       issueNumber: number,
@@ -459,6 +475,11 @@ function recentCompletionsToGraphQL(
       // null so the UI renders "no data" instead of "$0.00".
       totalTokens: coerceNullableNumber(row.total_tokens),
       totalCostUsd: coerceNullableNumber(row.total_cost_usd),
+      // #2900: one-line "what happened" string for failure terminals,
+      // rendered as a tooltip in the admin cockpit's Recently
+      // completed panel. Null for succeeded / needs_review / historical
+      // rows — the UI falls back to the default status-label tooltip.
+      failureSummary,
     };
   });
 }

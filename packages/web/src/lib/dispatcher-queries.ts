@@ -72,6 +72,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         prNumber
         totalTokens
         totalCostUsd
+        failureSummary
       }
       config {
         key
@@ -176,6 +177,16 @@ export interface RecentCompletion {
    *
    * WARNING: list-price estimate, NOT Max plan-adjusted. */
   totalCostUsd: number | null;
+  /** One-line "what happened" string for failure terminals (`failed`,
+   * `crashed`, `plan_blocked`). Populated at terminal-time by the
+   * daemon from `failures.category` + `phase` + stderr tail, then
+   * optionally upgraded by `/diagnose-failure`. Capped at 240 chars.
+   *
+   * Null for `succeeded` / `needs_review` rows and for historical rows
+   * that pre-date migration 33. Rendered as a tooltip on the outcome
+   * glyph in the `Recently completed` panel — no always-visible second
+   * line. Issue #2900. */
+  failureSummary: string | null;
 }
 
 export interface DispatcherConfigEntry {
