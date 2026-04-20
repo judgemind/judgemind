@@ -1064,7 +1064,9 @@ class TestDropWorktreeBestEffort:
             return r
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        assert d._drop_worktree_best_effort("/some/path") is True
+        worktree_dir = tmp_path / "my_worktree"
+        worktree_dir.mkdir()
+        assert d._drop_worktree_best_effort(str(worktree_dir)) is True
 
     def test_empty_path_returns_false(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -1089,7 +1091,9 @@ class TestDropWorktreeBestEffort:
             return r
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        assert d._drop_worktree_best_effort("/some/path") is True
+        worktree_dir = tmp_path / "my_worktree"
+        worktree_dir.mkdir()
+        assert d._drop_worktree_best_effort(str(worktree_dir)) is True
 
     def test_git_failure_returns_false(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -1103,7 +1107,9 @@ class TestDropWorktreeBestEffort:
             return r
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        assert d._drop_worktree_best_effort("/some/path") is False
+        worktree_dir = tmp_path / "my_worktree"
+        worktree_dir.mkdir()
+        assert d._drop_worktree_best_effort(str(worktree_dir)) is False
 
 
 # --------------------------------------------------------------------------
@@ -1624,7 +1630,9 @@ class TestDropWorktreeBestEffortGitParent:
         monkeypatch.setattr(subprocess, "run", fake_run)
 
         # No cleanup_worktree.sh at the repo_root — forces git fallback.
-        assert d._drop_worktree_best_effort("/some/worktree") is True
+        worktree_dir = tmp_path / "my_worktree"
+        worktree_dir.mkdir()
+        assert d._drop_worktree_best_effort(str(worktree_dir)) is True
 
         # Only one call (the fallback), anchored to the baseline via -C.
         git_remove = [c for c in captured if "worktree" in c and "remove" in c]
@@ -1663,7 +1671,9 @@ class TestDropWorktreeBestEffortGitParent:
             return r
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        assert d._drop_worktree_best_effort("/some/worktree") is True
+        worktree_dir = tmp_path / "my_worktree"
+        worktree_dir.mkdir()
+        assert d._drop_worktree_best_effort(str(worktree_dir)) is True
 
         git_remove = [c for c in captured if "worktree" in c and "remove" in c]
         assert git_remove
