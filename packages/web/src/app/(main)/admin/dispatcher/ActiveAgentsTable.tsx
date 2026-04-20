@@ -3,8 +3,9 @@
 import { Button } from '@/components/ui/button';
 import { SECTION_HEADING } from '@/lib/typography';
 import type { DispatcherAgent } from '@/lib/dispatcher-queries';
+import { tooltipText } from '@/lib/dispatcher-phase-flow';
 import { formatUptime, shortAgentId, worktreeLogsUrl } from './format-helpers';
-import { IssueLink } from './ui-primitives';
+import { IssueLink, PriorityBadge } from './ui-primitives';
 
 interface ActiveAgentsTableProps {
   agents: readonly DispatcherAgent[];
@@ -65,6 +66,9 @@ function ActiveAgentRow({
 }) {
   const logsHref = worktreeLogsUrl(agent.worktreePath);
   const elapsed = formatUptime(agent.startedAt, nowMs);
+  // Build the phase tooltip from the shared canonical constant so
+  // future phase additions propagate automatically (#2899).
+  const phaseTooltip = tooltipText(agent.phase);
   return (
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm hover:bg-muted/50">
       <span
@@ -73,10 +77,30 @@ function ActiveAgentRow({
       >
         {shortAgentId(agent.id)}
       </span>
+      {/* Unified (issue, priority, title) prefix — matches QueuePanel
+          and RecentCompletionsPanel (#2899). */}
       <span className="flex-shrink-0">
         <IssueLink number={agent.issueNumber} />
       </span>
-      <span className="min-w-0 flex-1 font-mono text-xs text-muted-foreground">
+      <span className="flex-shrink-0">
+        <PriorityBadge priority={agent.priority} />
+      </span>
+      <span
+        className="min-w-0 flex-1 truncate text-foreground"
+        data-testid="active-agent-title"
+        title={agent.issueTitle ?? undefined}
+      >
+        {agent.issueTitle ?? (
+          <span className="italic text-muted-foreground">
+            (title unavailable)
+          </span>
+        )}
+      </span>
+      <span
+        className="flex-shrink-0 cursor-help rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
+        data-testid={`active-agent-phase-${agent.id}`}
+        title={phaseTooltip}
+      >
         {agent.phase}
       </span>
       <span className="w-16 flex-shrink-0 text-right font-mono text-xs text-muted-foreground">

@@ -99,6 +99,22 @@ export const dispatcherTypeDefs = `#graphql
     id: ID!
     kind: String!
     issueNumber: Int!
+    """Issue title captured at claim time. Populated by the daemon
+    (\`_atomic_claim\`) + /task skill (\`task_claim.py claim --issue-title ...\`)
+    from the queue-snapshot enrichment, issue #2820. Null when the issue
+    is not in the snapshot or the row predates migration 28 — the admin
+    cockpit falls back to \`#<number>\`. Exposed on the active-agents
+    query so the unified table can render title alongside issue+priority
+    without a separate GitHub round-trip. Issue #2899."""
+    issueTitle: String
+    """Priority label captured at claim time — one of p0 | p1 | p2 | p3 | null.
+    Written by both the daemon's \`_atomic_claim\` and the /task skill's
+    \`task_claim.py claim --issue-priority ...\`. Reflects "priority when
+    spawned"; does NOT retroactively update when the issue is relabeled
+    on GitHub after the claim. Pre-migration-33 rows return null —
+    the admin cockpit renders those as an em-dash placeholder.
+    Issue #2899."""
+    priority: String
     worktreePath: String!
     phase: String!
     """One of running | succeeded | failed | retrying | crashed | plan_blocked | needs_review.
@@ -204,6 +220,11 @@ export const dispatcherTypeDefs = `#graphql
     agentId: ID!
     """Issue the agent was working on."""
     issueNumber: Int!
+    """Priority label captured at claim time — one of p0 | p1 | p2 | p3 | null.
+    Same semantics as \`DispatcherAgent.priority\`: reflects "priority
+    when spawned". Pre-migration-33 rows return null (em-dash in the
+    admin cockpit). Issue #2899."""
+    priority: String
     """Issue title (fetched live from GitHub; null if the lookup failed)."""
     issueTitle: String
     """One of succeeded | failed | crashed | plan_blocked | needs_review.

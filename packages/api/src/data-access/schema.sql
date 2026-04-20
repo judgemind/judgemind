@@ -328,7 +328,8 @@ CREATE TABLE dispatcher.agents (
     runner_override jsonb,
     model_override jsonb,
     issue_title text,
-    failure_summary text
+    failure_summary text,
+    priority text
 );
 
 
@@ -345,6 +346,9 @@ COMMENT ON COLUMN dispatcher.agents.issue_title IS 'Issue title captured at clai
 
 
 COMMENT ON COLUMN dispatcher.agents.failure_summary IS 'One-line "what happened" string for failed / crashed / plan_blocked terminals. Populated by _mark_agent_terminal at terminal-time from failures.category + phase + exit_code + stderr tail (<=240 chars), then optionally upgraded by /diagnose-failure to the first 1-3 sentences of recommendation.reasoning. NULL for succeeded / needs_review rows and historical pre-#2900 rows. Rendered as a tooltip on the outcome glyph in the /admin/dispatcher Recently completed panel. Issue #2900.';
+
+
+COMMENT ON COLUMN dispatcher.agents.priority IS 'Priority label captured at claim time (p0|p1|p2|p3|NULL). Written by both DispatcherDaemon._atomic_claim and scripts/dispatcher/task_claim.py. Reflects "priority when spawned"; does not retroactively update when the issue is relabeled on GitHub. Issue #2899.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (

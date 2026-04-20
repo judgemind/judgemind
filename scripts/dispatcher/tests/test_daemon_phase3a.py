@@ -220,6 +220,52 @@ class TestPriorityRank:
 
 
 # --------------------------------------------------------------------------
+# _extract_priority (issue #2899)
+# --------------------------------------------------------------------------
+
+
+class TestExtractPriority:
+    """``_extract_priority`` maps label lists to the stored priority value.
+
+    Mirrors :class:`TestPriorityRank` but returns the string value
+    (``'p0'`` | ... | None) instead of a numeric sort rank. Used at
+    claim time to populate ``dispatcher.agents.priority``.
+    """
+
+    def test_p0_returns_p0(self) -> None:
+        assert daemon._extract_priority(["priority/p0"]) == "p0"
+
+    def test_p1_returns_p1(self) -> None:
+        assert daemon._extract_priority(["priority/p1"]) == "p1"
+
+    def test_p2_returns_p2(self) -> None:
+        assert daemon._extract_priority(["priority/p2"]) == "p2"
+
+    def test_p3_returns_p3(self) -> None:
+        assert daemon._extract_priority(["priority/p3"]) == "p3"
+
+    def test_no_priority_label_returns_none(self) -> None:
+        assert daemon._extract_priority(["area/devops", "type/bug"]) is None
+
+    def test_empty_labels_returns_none(self) -> None:
+        assert daemon._extract_priority([]) is None
+
+    def test_non_list_returns_none(self) -> None:
+        assert daemon._extract_priority(None) is None
+        assert daemon._extract_priority("priority/p0") is None
+        assert daemon._extract_priority({"priority/p0": 1}) is None
+
+    def test_multiple_priority_labels_picks_most_urgent(self) -> None:
+        """Matches ``_priority_rank`` — p0 wins over p2, p1 over p3, etc."""
+        assert daemon._extract_priority(["priority/p2", "priority/p0"]) == "p0"
+        assert daemon._extract_priority(["priority/p3", "priority/p1"]) == "p1"
+
+    def test_non_string_entries_are_ignored(self) -> None:
+        """Defensive: malformed JSONB rows cannot crash the claim path."""
+        assert daemon._extract_priority([{"name": "priority/p0"}, 42, None]) is None
+
+
+# --------------------------------------------------------------------------
 # Gate in scheduler_tick: orchestration only runs when cap>0 and no agent
 # --------------------------------------------------------------------------
 
@@ -694,8 +740,43 @@ class TestAtomicClaim:
             if "INSERT INTO dispatcher.agents" in e[0]
         ]
         assert len(inserts) == 1
+        # #2899 — priority column is now part of every INSERT.
+        insert_sql = inserts[0][0]
+        assert "priority" in insert_sql
         assert conn.commits == 1
         assert handler.events("claim_succeeded") != []
+
+    def test_priority_parameter_is_passed_to_insert(self, tmp_path: Path) -> None:
+        """Issue #2899 — the daemon pipes the priority through to the
+        INSERT so the admin cockpit can render the priority badge in
+        the active-agents and recently-completed panels.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        ok = d._atomic_claim(42, "agent-uuid", "/path", priority="p0")
+        assert ok is True
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.agents" in e[0]
+        ]
+        # Last bound parameter is the priority value.
+        _sql, params = inserts[0]
+        assert params[-1] == "p0"
+
+    def test_priority_default_none_passes_null(self, tmp_path: Path) -> None:
+        """Priority is optional; omitting it stores NULL (pre-migration-33
+        fallback behaviour).
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        ok = d._atomic_claim(42, "agent-uuid", "/path")
+        assert ok is True
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.agents" in e[0]
+        ]
+        _sql, params = inserts[0]
+        assert params[-1] is None
 
     def test_unique_violation_returns_false(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)

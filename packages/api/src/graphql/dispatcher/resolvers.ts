@@ -52,6 +52,15 @@ function agentRowToGraphQL(row: Row): Record<string, unknown> {
     id: row.agent_id,
     kind: row.kind,
     issueNumber: row.issue_number,
+    // Issue title captured at claim time (#2820). Pre-migration-28 rows
+    // have NULL which the UI renders as a fallback to `#<number>`.
+    issueTitle:
+      typeof row.issue_title === 'string' && row.issue_title.length > 0
+        ? row.issue_title
+        : null,
+    // Priority was added in migration 33 (#2899). Pre-migration rows
+    // return null from pg, which the UI renders as an em-dash.
+    priority: typeof row.priority === 'string' ? row.priority : null,
     worktreePath: row.worktree_path,
     phase: row.phase,
     status: row.status,
@@ -296,6 +305,7 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
     `SELECT a.agent_id,
             a.issue_number,
             a.issue_title,
+            a.priority,
             a.status,
             a.ended_at,
             a.pr_number,
@@ -461,6 +471,11 @@ function recentCompletionsToGraphQL(
     return {
       agentId: row.agent_id,
       issueNumber: number,
+      // Priority pulled from ``dispatcher.agents.priority`` (populated
+      // by the daemon at claim time from the queue-snapshot labels;
+      // issue #2899). Pre-migration-33 rows return null, which the UI
+      // renders as an em-dash placeholder.
+      priority: typeof row.priority === 'string' ? row.priority : null,
       // Pulled from ``dispatcher.agents.issue_title`` (populated by the
       // daemon at claim time from the queue-snapshot enrichment; issue
       // #2820). Agents that claimed before migration 28 will have

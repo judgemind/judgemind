@@ -28,6 +28,8 @@ export const DISPATCHER_STATE_QUERY = gql`
         id
         kind
         issueNumber
+        issueTitle
+        priority
         worktreePath
         phase
         status
@@ -67,6 +69,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         agentId
         issueNumber
         issueTitle
+        priority
         status
         endedAt
         prNumber
@@ -131,6 +134,19 @@ export interface DispatcherAgent {
   id: string;
   kind: string;
   issueNumber: number;
+  /** Issue title captured at claim time from the queue-snapshot
+   * enrichment (#2820). Null for pre-migration-28 rows or when the
+   * issue was not in the snapshot at claim time — the UI renders
+   * `#<number>` alone in that case. Exposed here so the active-agents
+   * table can render a shared `(issue, priority, title)` prefix
+   * matching the queue and recent-completions panels (#2899). */
+  issueTitle: string | null;
+  /** Priority label captured at claim time — `p0` | `p1` | `p2` | `p3`
+   * | null. Null for pre-migration-33 rows or issues with no
+   * `priority/pN` label at claim time; the UI renders an em-dash
+   * placeholder. Reflects "priority when spawned", not "priority now".
+   * Issue #2899. */
+  priority: string | null;
   worktreePath: string;
   phase: string;
   status: string;
@@ -164,6 +180,10 @@ export interface RecentCompletion {
   agentId: string;
   issueNumber: number;
   issueTitle: string | null;
+  /** Priority label captured at claim time — `p0` | `p1` | `p2` | `p3`
+   * | null. Same semantics as `DispatcherAgent.priority`; pre-migration-33
+   * rows return null (em-dash in the UI). Issue #2899. */
+  priority: string | null;
   /** One of `succeeded | failed | crashed`. */
   status: string;
   endedAt: string;
