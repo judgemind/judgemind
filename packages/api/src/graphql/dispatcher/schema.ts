@@ -297,6 +297,15 @@ export const dispatcherTypeDefs = `#graphql
     tick (Phase 2+). Returns 0 before the daemon has booted or when every
     recent scan has failed — the admin page treats that as "queue unknown / 0"."""
     queueDepth: Int!
+    """Count of open \`status/blocked\` issues. Sourced from the most recent row
+    in \`dispatcher.blocked_snapshots\`, written by the daemon on a slower
+    cadence (every N scheduler ticks — blocked list changes slowly). Returns 0
+    before the daemon has booted or when no blocked scan has landed — the admin
+    page treats that as "0 blocked / unknown" just like \`queueDepth\`. Exposed
+    alongside the capped \`queueBlocked\` list so the admin page header can
+    render \`{shown} / {total}\` without losing the tail beyond the server-side
+    cap of 10 (issue #2886)."""
+    blockedDepth: Int!
     """Top 10 ready-for-pickup issues (#2805 §1.3). Sourced from the most
     recent \`dispatcher.queue_snapshots\` row, joined with a GitHub API
     lookup for title/labels. Empty list when the queue is empty OR when

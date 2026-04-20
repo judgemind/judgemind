@@ -81,6 +81,7 @@ const BASE_STATE = {
   activeAgents: [],
   recentFailures: [],
   queueDepth: 0,
+  blockedDepth: 0,
   queueReady: [],
   queueBlocked: [],
   recentCompletions: [],

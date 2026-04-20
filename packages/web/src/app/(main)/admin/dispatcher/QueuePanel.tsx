@@ -10,6 +10,21 @@ interface QueuePanelProps {
   /** Open issues labelled `status/blocked`. */
   queueBlocked: readonly QueueItem[];
   /**
+   * Total count of agent-ready issues observed by the daemon's most
+   * recent queue scan (from `DispatcherState.queueDepth`). Rendered in
+   * the Queue: Agent-ready panel header as `{items.length} / {total}`
+   * so the operator can see queue depth even when the displayed list
+   * is capped server-side at 10 (issue #2886). Optional so existing
+   * test fixtures keep working — omit to hide the denominator.
+   */
+  queueReadyTotal?: number;
+  /**
+   * Total count of open `status/blocked` issues observed by the daemon's
+   * most recent blocked scan (from `DispatcherState.blockedDepth`).
+   * Same semantics as `queueReadyTotal`. Issue #2886.
+   */
+  queueBlockedTotal?: number;
+  /**
    * Override for deterministic tests. Currently unused after #2818 stripped
    * the "filed N d ago" column — kept in the prop signature so existing
    * callers (`DispatcherDashboard`, the test suite) don't need to refactor
@@ -44,27 +59,60 @@ interface QueuePanelProps {
  * `QueuePanel` component is retained for backwards compatibility with the
  * existing test suite but is no longer used by the dashboard itself.
  */
-export function QueuePanel({ queueReady, queueBlocked }: QueuePanelProps) {
+export function QueuePanel({
+  queueReady,
+  queueBlocked,
+  queueReadyTotal,
+  queueBlockedTotal,
+}: QueuePanelProps) {
   return (
     <div
       className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2"
       data-testid="queue-panels"
     >
-      <QueueReadyPanel items={queueReady} />
-      <QueueBlockedPanel items={queueBlocked} />
+      <QueueReadyPanel items={queueReady} total={queueReadyTotal} />
+      <QueueBlockedPanel items={queueBlocked} total={queueBlockedTotal} />
     </div>
   );
 }
 
-export function QueueReadyPanel({ items }: { items: readonly QueueItem[] }) {
+/**
+ * Format the panel-header count badge. When `total` is provided we
+ * render `{shown} / {total}` so the operator can see queue depth even
+ * when the list is capped server-side at 10 (#2886). When it's omitted
+ * we fall back to the pre-#2886 `{shown} shown` string so existing
+ * tests and any caller that hasn't wired up `DispatcherState.queueDepth`
+ * / `blockedDepth` still work.
+ *
+ * Edge case: when `total` is a number but `shown === 0`, render `0 / N`
+ * (never "0 shown") — empty-panel UX stays obvious while still
+ * communicating the denominator. This is the AC3 case in issue #2886
+ * (blocked panel with tail truncation but all 10 visible items
+ * cleared).
+ */
+function formatCountLabel(shown: number, total: number | undefined): string {
+  if (typeof total === 'number') return `${shown} / ${total}`;
+  return `${shown} shown`;
+}
+
+export function QueueReadyPanel({
+  items,
+  total,
+}: {
+  items: readonly QueueItem[];
+  total?: number;
+}) {
   return (
     <section aria-labelledby="queue-ready-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
         <h2 id="queue-ready-heading" className={SECTION_HEADING}>
           Queue: Agent-ready
         </h2>
-        <span className="font-mono text-xs text-muted-foreground">
-          {items.length} shown
+        <span
+          className="font-mono text-xs text-muted-foreground"
+          data-testid="queue-ready-count"
+        >
+          {formatCountLabel(items.length, total)}
         </span>
       </div>
       {items.length === 0 ? (
@@ -82,15 +130,24 @@ export function QueueReadyPanel({ items }: { items: readonly QueueItem[] }) {
   );
 }
 
-export function QueueBlockedPanel({ items }: { items: readonly QueueItem[] }) {
+export function QueueBlockedPanel({
+  items,
+  total,
+}: {
+  items: readonly QueueItem[];
+  total?: number;
+}) {
   return (
     <section aria-labelledby="queue-blocked-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
         <h2 id="queue-blocked-heading" className={SECTION_HEADING}>
           Queue: Blocked
         </h2>
-        <span className="font-mono text-xs text-muted-foreground">
-          {items.length} shown
+        <span
+          className="font-mono text-xs text-muted-foreground"
+          data-testid="queue-blocked-count"
+        >
+          {formatCountLabel(items.length, total)}
         </span>
       </div>
       {items.length === 0 ? (

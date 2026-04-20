@@ -358,7 +358,10 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
                 disabled={controlLoading}
                 onAgentAction={handleAgentAction}
               />
-              <QueueReadyPanel items={state?.queueReady ?? []} />
+              <QueueReadyPanel
+                items={state?.queueReady ?? []}
+                total={state?.queueDepth}
+              />
             </div>
 
             {/*
@@ -371,7 +374,10 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
               <RecentCompletionsPanel
                 completions={state?.recentCompletions ?? []}
               />
-              <QueueBlockedPanel items={state?.queueBlocked ?? []} />
+              <QueueBlockedPanel
+                items={state?.queueBlocked ?? []}
+                total={state?.blockedDepth}
+              />
             </div>
           </div>
 

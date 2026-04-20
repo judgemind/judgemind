@@ -48,6 +48,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         issueNumber
       }
       queueDepth
+      blockedDepth
       queueReady {
         issueNumber
         title
@@ -220,6 +221,13 @@ export interface DispatcherState {
   activeAgents: DispatcherAgent[];
   recentFailures: DispatcherFailure[];
   queueDepth: number;
+  /** Total count of open `status/blocked` issues on the most recent
+   * daemon blocked-scan tick. Paired with `queueBlocked` (capped at 10
+   * server-side) so the admin-cockpit panel header can render
+   * `{shown} / {total}` without losing the tail (issue #2886). Returns
+   * 0 before any blocked scan has landed — same fall-back-to-0 contract
+   * as `queueDepth`. */
+  blockedDepth: number;
   queueReady: QueueItem[];
   queueBlocked: QueueItem[];
   recentCompletions: RecentCompletion[];

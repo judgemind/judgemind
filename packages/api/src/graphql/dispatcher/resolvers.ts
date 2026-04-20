@@ -214,6 +214,36 @@ async function queryQueueDepth(pool: Pool): Promise<number> {
   return typeof raw === 'number' ? raw : Number(raw);
 }
 
+/**
+ * Total count of open `status/blocked` issues observed on the most
+ * recent daemon blocked-scan tick (issue #2886). Sourced from
+ * `dispatcher.blocked_snapshots.blocked_depth`, populated by the daemon
+ * in `_scan_blocked_and_snapshot` on a slower cadence than the 30s
+ * queue scan (blocked list changes slowly).
+ *
+ * Mirrors `queryQueueDepth` exactly — same fall-back-to-0 contract so
+ * the `blockedDepth: Int!` GraphQL field is always safe to render. A 0
+ * return means "no blocked scan has landed yet" (fresh deploy, daemon
+ * down, or the blocked-scan cadence gate held the scan this tick) —
+ * same operator-visible UX as an actually-zero queue.
+ *
+ * The admin cockpit pairs this with the capped `queueBlocked` list so
+ * the panel header can render `{items.length} / {blockedDepth}` —
+ * otherwise the operator sees "0 shown" and has no in-page signal that
+ * the list is truncated server-side at 10.
+ */
+async function queryBlockedDepth(pool: Pool): Promise<number> {
+  const { rows } = await pool.query<{ blocked_depth: number | string }>(
+    `SELECT blocked_depth
+       FROM dispatcher.blocked_snapshots
+       ORDER BY observed_at DESC
+       LIMIT 1`,
+  );
+  if (rows.length === 0) return 0;
+  const raw = rows[0].blocked_depth;
+  return typeof raw === 'number' ? raw : Number(raw);
+}
+
 async function queryLatestQueueSnapshotIssuesJson(
   pool: Pool,
 ): Promise<SnapshotIssueRecord[]> {
@@ -887,6 +917,11 @@ export const dispatcherResolvers = {
     queueDepth: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
       requireDispatcherAdmin(user);
       return queryQueueDepth(pool);
+    },
+
+    blockedDepth: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
+      requireDispatcherAdmin(user);
+      return queryBlockedDepth(pool);
     },
 
     queueReady: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
