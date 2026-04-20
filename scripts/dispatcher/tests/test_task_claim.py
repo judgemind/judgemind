@@ -1129,3 +1129,287 @@ class TestMain:
                     "crashed",  # not in VALID_TERMINAL_STATUSES
                 ]
             )
+
+
+# --------------------------------------------------------------------------
+# Issue-title auto-fetch — #2923
+# --------------------------------------------------------------------------
+
+
+class TestFetchIssueTitleViaGh:
+    """Unit tests for ``_fetch_issue_title_via_gh`` in isolation."""
+
+    def test_happy_path_returns_stripped_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "  Real Title  \n"
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        title = task_claim._fetch_issue_title_via_gh(2923)
+        assert title == "Real Title"
+        # Command shape matches the SKILL.md documentation.
+        assert captured[0][0] == "gh"
+        assert captured[0][1:4] == ["issue", "view", "2923"]
+        assert "--repo" in captured[0]
+        assert task_claim.GH_REPO_SLUG in captured[0]
+        assert "--json" in captured[0]
+        assert "title" in captured[0]
+        assert "-q" in captured[0]
+        assert ".title" in captured[0]
+
+    def test_non_zero_exit_returns_none_and_logs_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def fake_run(_cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 1
+            r.stdout = ""
+            r.stderr = "GraphQL: Could not resolve to an Issue\n"
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        title = task_claim._fetch_issue_title_via_gh(999999)
+        assert title is None
+        err = capsys.readouterr().err
+        assert "gh issue view" in err.lower()
+        assert "999999" in err
+
+    def test_gh_not_on_path_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def fake_run(_cmd: list[str], **_kwargs: Any) -> Any:
+            raise FileNotFoundError("gh")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        title = task_claim._fetch_issue_title_via_gh(2923)
+        assert title is None
+        err = capsys.readouterr().err
+        assert "gh CLI not on PATH" in err
+
+    def test_timeout_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def fake_run(_cmd: list[str], **_kwargs: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=15)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        title = task_claim._fetch_issue_title_via_gh(2923)
+        assert title is None
+        err = capsys.readouterr().err
+        assert "timed out" in err.lower()
+
+    def test_empty_stdout_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A zero-exit with empty stdout still means we don't have a title.
+
+        Falls through to NULL so the admin page renders the same
+        "(title unavailable)" as before — but with a warning log that
+        makes it easy to diagnose if it ever happens in practice.
+        """
+
+        def fake_run(_cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "\n"
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        title = task_claim._fetch_issue_title_via_gh(2923)
+        assert title is None
+        err = capsys.readouterr().err
+        assert "empty title" in err.lower()
+
+
+class TestDoClaimIssueTitleFallback:
+    """``do_claim`` auto-fetches issue_title when the caller omits it — #2923.
+
+    Covers the three AC scenarios from the issue body:
+
+    * ``--issue-title ""`` + ``gh`` returns ``Real Title`` → row stored
+      with ``Real Title``.
+    * ``--issue-title "explicit"`` → row stored with ``explicit``
+      regardless of what ``gh`` would return.
+    * ``--issue-title`` omitted + ``gh`` exits non-zero → row stored with
+      NULL, warning logged, no exception.
+    """
+
+    def test_empty_string_title_triggers_gh_fetch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        captured_titles: list[str | None] = []
+
+        def fake_claim(
+            _database_url: str,
+            _issue_number: int,
+            _agent_id: str,
+            _worktree_path: str,
+            issue_title: str | None,
+            _issue_priority: str | None = None,
+        ) -> None:
+            captured_titles.append(issue_title)
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
+
+        def fake_fetch(_issue_number: int) -> str | None:
+            return "Real Title"
+
+        monkeypatch.setattr(task_claim, "_fetch_issue_title_via_gh", fake_fetch)
+
+        rc = task_claim.do_claim(2923, _VALID_AGENT_ID, str(tmp_path), "", None)
+        assert rc == 0
+        assert captured_titles == ["Real Title"]
+
+    def test_whitespace_only_title_triggers_gh_fetch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A whitespace-only ``--issue-title "   "`` should be treated
+        the same as empty — otherwise the admin page still renders
+        a blank chip.
+        """
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        captured_titles: list[str | None] = []
+
+        def fake_claim(
+            _database_url: str,
+            _issue_number: int,
+            _agent_id: str,
+            _worktree_path: str,
+            issue_title: str | None,
+            _issue_priority: str | None = None,
+        ) -> None:
+            captured_titles.append(issue_title)
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
+        monkeypatch.setattr(
+            task_claim, "_fetch_issue_title_via_gh", lambda _n: "Fetched Title"
+        )
+
+        rc = task_claim.do_claim(2923, _VALID_AGENT_ID, str(tmp_path), "   ", None)
+        assert rc == 0
+        assert captured_titles == ["Fetched Title"]
+
+    def test_none_title_triggers_gh_fetch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        captured_titles: list[str | None] = []
+        fetch_calls: list[int] = []
+
+        def fake_claim(
+            _database_url: str,
+            _issue_number: int,
+            _agent_id: str,
+            _worktree_path: str,
+            issue_title: str | None,
+            _issue_priority: str | None = None,
+        ) -> None:
+            captured_titles.append(issue_title)
+
+        def fake_fetch(issue_number: int) -> str | None:
+            fetch_calls.append(issue_number)
+            return "Auto-fetched"
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
+        monkeypatch.setattr(task_claim, "_fetch_issue_title_via_gh", fake_fetch)
+
+        rc = task_claim.do_claim(2923, _VALID_AGENT_ID, str(tmp_path), None, None)
+        assert rc == 0
+        assert captured_titles == ["Auto-fetched"]
+        assert fetch_calls == [2923]
+
+    def test_explicit_title_wins_over_gh_fetch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """CLI arg takes precedence — the fetch must NOT run.
+
+        A caller that passes ``--issue-title "explicit"`` gets exactly
+        ``"explicit"`` stored, even if the fetch would return something
+        else. The fetch is a fallback, not an override.
+        """
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        captured_titles: list[str | None] = []
+
+        def fake_claim(
+            _database_url: str,
+            _issue_number: int,
+            _agent_id: str,
+            _worktree_path: str,
+            issue_title: str | None,
+            _issue_priority: str | None = None,
+        ) -> None:
+            captured_titles.append(issue_title)
+
+        def fake_fetch(_issue_number: int) -> str | None:
+            raise AssertionError(
+                "_fetch_issue_title_via_gh must not run when the caller "
+                "passed an explicit non-empty --issue-title"
+            )
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
+        monkeypatch.setattr(task_claim, "_fetch_issue_title_via_gh", fake_fetch)
+
+        rc = task_claim.do_claim(2923, _VALID_AGENT_ID, str(tmp_path), "explicit", None)
+        assert rc == 0
+        assert captured_titles == ["explicit"]
+
+    def test_gh_fetch_failure_falls_back_to_null(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """When ``gh`` fails, the claim still succeeds with NULL title.
+
+        The helper logs a warning (covered by ``TestFetchIssueTitleViaGh``
+        above) and returns None; ``do_claim`` forwards that None to the
+        DB path so the row lands with ``issue_title IS NULL``. No
+        exception bubbles up — the claim is never blocked on the fetch.
+        """
+        monkeypatch.setenv("DATABASE_URL", "postgres://fake")
+        captured_titles: list[str | None] = []
+
+        def fake_claim(
+            _database_url: str,
+            _issue_number: int,
+            _agent_id: str,
+            _worktree_path: str,
+            issue_title: str | None,
+            _issue_priority: str | None = None,
+        ) -> None:
+            captured_titles.append(issue_title)
+
+        monkeypatch.setattr(task_claim, "_claim_via_psycopg", fake_claim)
+        # Simulate the fetch returning None (gh exit non-zero, timeout,
+        # gh not on PATH — any failure path).
+        monkeypatch.setattr(task_claim, "_fetch_issue_title_via_gh", lambda _n: None)
+
+        rc = task_claim.do_claim(2923, _VALID_AGENT_ID, str(tmp_path), None, None)
+        # Claim still succeeds (exit 0) with NULL title.
+        assert rc == 0
+        assert captured_titles == [None]
