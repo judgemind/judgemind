@@ -345,7 +345,7 @@ describe('DispatcherDashboard — #2860 circuit-breaker banner', () => {
     expect(banner).toBeInTheDocument();
     expect(banner.textContent).toMatch(/Circuit breaker open/i);
     expect(banner.textContent).toMatch(/concurrency_cap/);
-    // Red by design — overnight-safety rail is a loud signal.
+    // Red by design — the circuit breaker is a loud signal.
     expect(banner.className).toMatch(/bg-red/);
     expect(banner.getAttribute('role')).toBe('alert');
   });

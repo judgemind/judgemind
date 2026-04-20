@@ -174,8 +174,8 @@ async function querySpawnFrozenUntil(pool: Pool): Promise<string | null> {
  * Read ``dispatcher.config.cap_flipped_by`` — the diagnostic trail for
  * the last `concurrency_cap` flip. Returns the raw string (e.g.
  * `"circuit_breaker"`) or null when the row is unset or contains JSON
- * `null`. Used by the admin cockpit to render the overnight-safety
- * circuit breaker's open banner (#2860).
+ * `null`. Used by the admin cockpit to render the circuit breaker's
+ * open banner (#2860).
  */
 async function queryCapFlippedBy(pool: Pool): Promise<string | null> {
   const { rows } = await pool.query<{ value: unknown }>(
@@ -858,10 +858,9 @@ export const dispatcherResolvers = {
     },
 
     /**
-     * True when the overnight-safety circuit breaker is open
-     * (#2860). Derived from `cap_flipped_by === 'circuit_breaker'` so
-     * the admin cockpit can show a banner without parsing the raw
-     * config value client-side.
+     * True when the circuit breaker is open (#2860). Derived from
+     * `cap_flipped_by === 'circuit_breaker'` so the admin cockpit can
+     * show a banner without parsing the raw config value client-side.
      */
     circuitBreakerOpen: (parent: Record<string, unknown>) => {
       return parent.__capFlippedBy === 'circuit_breaker';
