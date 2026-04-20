@@ -19,9 +19,9 @@ interface RecentCompletionsPanelProps {
  * The "Recently completed" panel (#2805 §1.5). Newest terminal-state
  * agents (succeeded / failed / crashed / plan_blocked / needs_review) in
  * the operator's recent history. Each row links to the issue and, when
- * available, the PR. The two correct-outcome triage terminals render
- * with their own chips to keep them visually separated from genuine
- * failures:
+ * available, the PR. The correct-outcome and infra-preempted terminals
+ * render with their own chips to keep them visually separated from
+ * genuine failures:
  *
  * - `plan_blocked` (#2857) — neutral muted chip (⊘). Operator-
  *   informational; no action expected unless the issue needs reshaping.
@@ -30,6 +30,11 @@ interface RecentCompletionsPanelProps {
  *   summary flagged unmet AC. The yellow is distinct from amber
  *   (`crashed`) so the operator can scan the panel and separate
  *   "review my draft PR" from "something crashed, diagnose this".
+ * - *infra-preempted* (#2947) — amber chip (↺). A `failed` row whose
+ *   `failureSummary` matches one of the canonical infra-preemption
+ *   strings (``"dispatcher restarted"`` / ``"manually stopped"``).
+ *   The dispatcher itself interrupted the agent; it will auto-resume
+ *   on the next tick. NOT an operator action item.
  *
  * Borderless. Lives in the right column below Active agents.
  *

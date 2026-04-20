@@ -170,6 +170,58 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.queryByText(summary)).not.toBeInTheDocument();
   });
 
+  // --- #2947 — infra-preempted override at the panel level.
+  it('#2947: renders ↺ amber for rows with the "dispatcher restarted" summary', () => {
+    const items = [
+      completion({
+        agentId: 'agent-infra-restart',
+        issueNumber: 2947,
+        status: 'failed',
+        prNumber: null,
+        failureSummary: 'dispatcher restarted',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    // The pill re-skinned to the infra-preempted testid; a red ✗
+    // `outcome-pill-failed` must NOT appear on this row.
+    expect(
+      screen.getByTestId('outcome-pill-infra_preempted'),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('outcome-pill-failed')).not.toBeInTheDocument();
+  });
+
+  it('#2947: renders ↺ amber for rows with the "manually stopped" summary', () => {
+    const items = [
+      completion({
+        agentId: 'agent-infra-killswitch',
+        issueNumber: 2947,
+        status: 'failed',
+        prNumber: null,
+        failureSummary: 'manually stopped',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const pill = screen.getByTestId('outcome-pill-infra_preempted');
+    expect(pill.textContent).toBe('\u21BA');
+    expect(pill.className).toContain('bg-amber');
+  });
+
+  it('#2947: leaves the tooltip unchanged — the visual glyph + color is the fix', () => {
+    // Per the issue body: "Tooltip text is unchanged — the visual
+    // glyph + color is the fix." Operators still get the exact
+    // canonical string on hover.
+    const items = [
+      completion({
+        agentId: 'agent-tooltip',
+        status: 'failed',
+        failureSummary: 'dispatcher restarted',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const pill = screen.getByTestId('outcome-pill-infra_preempted');
+    expect(pill.getAttribute('title')).toBe('dispatcher restarted');
+  });
+
   // --- #2932 — relative-time cell (re-introduced post-#2818 density pass).
   it('#2932: places the relative-time cell AFTER the cost footnote in DOM order', () => {
     const items = [

@@ -3,7 +3,12 @@
 import { SECTION_HEADING } from '@/lib/typography';
 import type { DispatcherFailure } from '@/lib/dispatcher-queries';
 import { formatRelativeTime, groupFailuresByCategory } from './format-helpers';
-import { IssueLink } from './ui-primitives';
+import {
+  INFRA_PREEMPTED_CATEGORIES,
+  INFRA_PREEMPTED_CHIP_CLASSES,
+  INFRA_PREEMPTED_GLYPH,
+  IssueLink,
+} from './ui-primitives';
 
 interface RecentFailuresPanelProps {
   failures: readonly DispatcherFailure[];
@@ -11,10 +16,29 @@ interface RecentFailuresPanelProps {
   nowMs?: number;
 }
 
+// #2947: red-✗ chip for non-infra-preempted failure categories. Shares
+// the visual grammar with `OutcomePill`'s `failed` chip so the two
+// panels read as a single outcome vocabulary. Infra-preempted rows
+// (``daemon_restart_abandoned`` / ``paused_by_killswitch``) render the
+// amber ↺ glyph instead (see ``INFRA_PREEMPTED_*`` imports above) —
+// per operator direction, these rows DO still appear in the Recent
+// failures roll-up (useful signal about dispatcher churn) but the
+// different glyph+color makes it obvious at a glance that they aren't
+// real operator action items.
+const FAILURE_GLYPH = '\u2717';
+const FAILURE_CHIP_CLASSES =
+  'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300';
+
 /**
  * Recent failures panel (#2805 §1.7) — same data, borderless. Category
  * renders as a muted pill; most-recent timestamp is a relative string
  * with the raw ISO on hover.
+ *
+ * #2947: adds a leading glyph column that keys off `category`. Infra-
+ * preempted categories (``daemon_restart_abandoned`` /
+ * ``paused_by_killswitch``) render ↺ amber; every other failure
+ * category renders ✗ red. Matches the outcome-pill vocabulary in
+ * ``RecentCompletionsPanel`` so the two panels read together.
  */
 export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProps) {
   const groups = groupFailuresByCategory(failures);
@@ -34,6 +58,10 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+              <th scope="col" className="py-2 font-medium">
+                {/* Glyph column — visually narrow, no header text. */}
+                <span className="sr-only">Severity</span>
+              </th>
               <th scope="col" className="py-2 font-medium">Category</th>
               <th scope="col" className="py-2 font-medium">Count</th>
               <th scope="col" className="py-2 font-medium">Most recent</th>
@@ -41,32 +69,53 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
             </tr>
           </thead>
           <tbody>
-            {groups.map((group) => (
-              <tr
-                key={group.category}
-                className="border-t border-border hover:bg-muted/50"
-              >
-                <td className="py-2">
-                  <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
-                    {group.category}
-                  </span>
-                </td>
-                <td className="py-2 font-mono text-foreground">{group.count}</td>
-                <td
-                  className="py-2 text-xs text-muted-foreground"
-                  title={group.mostRecent.ts}
+            {groups.map((group) => {
+              const infra = INFRA_PREEMPTED_CATEGORIES.has(group.category);
+              const glyph = infra ? INFRA_PREEMPTED_GLYPH : FAILURE_GLYPH;
+              const chipClasses = infra
+                ? INFRA_PREEMPTED_CHIP_CLASSES
+                : FAILURE_CHIP_CLASSES;
+              const label = infra ? 'infra preempted' : 'failed';
+              const testId = infra
+                ? 'failure-glyph-infra_preempted'
+                : 'failure-glyph-failed';
+              return (
+                <tr
+                  key={group.category}
+                  className="border-t border-border hover:bg-muted/50"
                 >
-                  {formatRelativeTime(group.mostRecent.ts, nowMs)}
-                </td>
-                <td className="py-2">
-                  {group.mostRecent.issueNumber !== null ? (
-                    <IssueLink number={group.mostRecent.issueNumber} />
-                  ) : (
-                    <span className="text-muted-foreground">&mdash;</span>
-                  )}
-                </td>
-              </tr>
-            ))}
+                  <td className="py-2 pr-2">
+                    <span
+                      aria-label={label}
+                      title={label}
+                      className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${chipClasses}`}
+                      data-testid={testId}
+                    >
+                      {glyph}
+                    </span>
+                  </td>
+                  <td className="py-2">
+                    <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+                      {group.category}
+                    </span>
+                  </td>
+                  <td className="py-2 font-mono text-foreground">{group.count}</td>
+                  <td
+                    className="py-2 text-xs text-muted-foreground"
+                    title={group.mostRecent.ts}
+                  >
+                    {formatRelativeTime(group.mostRecent.ts, nowMs)}
+                  </td>
+                  <td className="py-2">
+                    {group.mostRecent.issueNumber !== null ? (
+                      <IssueLink number={group.mostRecent.issueNumber} />
+                    ) : (
+                      <span className="text-muted-foreground">&mdash;</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
