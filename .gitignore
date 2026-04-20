@@ -73,3 +73,8 @@ worktrees/
 
 # Agent lock files (per-worktree, ephemeral)
 .agent-lock
+
+# Task-claim agent_id sidecar (per-worktree, written by
+# scripts/dispatcher/task_claim.py, read by the terminal call —
+# ephemeral handshake between claim and terminal, never committed).
+.task-agent-id
