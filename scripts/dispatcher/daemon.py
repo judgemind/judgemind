@@ -219,6 +219,14 @@ CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60
 #: ``dispatcher.phase_outputs.log_text``.
 PHASE_STDERR_TAIL_MAX_CHARS = 2000
 
+#: Character cap on the ``stderr_tail`` field attached to structured-log
+#: events that fire on the **rare error path** — e.g. ``git_push_failed``.
+#: Larger than :data:`PHASE_STDERR_TAIL_MAX_CHARS` because these events
+#: are emitted at most once per failure and the extra context is worth
+#: the CloudWatch log-volume cost when the failure is unusual (network
+#: hiccup, pre-push hook output, transient auth errors). Issue #2902.
+STRUCTURED_LOG_STDERR_MAX = 4000
+
 #: Character cap on the ``stderr_preview`` field attached to
 #: ``daemon.phase_output_missing`` and retro-failure structured events.
 #: Previously 200; raised to 2000 (#2821) for the same rationale as
@@ -676,18 +684,32 @@ FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL = "subprocess_auth_fail"
 #: fixes "the CI-fixing skill couldn't fix CI three times in a row".
 FAILURE_CATEGORY_CI_RED_AFTER_RETRIES = "ci_red_after_retries"
 
+#: Git-push failure categories for the ``push_and_pr`` phase (issue #2902).
+#: ``push_failed`` is the generic catch-all; the two sub-kinds are
+#: classifier-derived from stderr content via ``_classify_push_failure``.
+#: All three are tier-1 auto-retry — a transient network or pre-push hook
+#: failure on the first attempt is commonly self-healing.
+FAILURE_CATEGORY_PUSH_FAILED = "push_failed"
+FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED = "pre_push_hook_rejected"
+FAILURE_CATEGORY_GIT_PUSH_NETWORK = "git_push_network"
+
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
 #: ``subprocess_auth_fail`` (halt — no retry) are intentionally
 #: excluded; 3D's diagnoser owns the escalation path for both.
 #: ``stuck_timeout``, ``gh_rate_exhausted``, and ``subprocess_crash``
-#: are the three that retry mechanically.
+#: are the three that retry mechanically. The three push-failure
+#: sub-kinds (#2902) are also tier-1 — transient network and pre-push
+#: hook failures are self-healing on a fresh retry.
 AUTO_RETRY_CATEGORIES = frozenset(
     {
         FAILURE_CATEGORY_STUCK_TIMEOUT,
         FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
         FAILURE_CATEGORY_SUBPROCESS_CRASH,
         FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+        FAILURE_CATEGORY_PUSH_FAILED,
+        FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED,
+        FAILURE_CATEGORY_GIT_PUSH_NETWORK,
     }
 )
 
@@ -737,6 +759,61 @@ _SUBPROCESS_STDERR_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"401\s+Unauthorized", FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL),
     (r"Reached max turns", FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT),
 )
+
+
+def _stderr_tail(stderr: str | bytes | None) -> str:
+    """Return the trailing :data:`STRUCTURED_LOG_STDERR_MAX` chars of *stderr*.
+
+    Handles ``bytes`` input (subprocess ``capture_output=True`` with
+    ``text=False``), ``None``, and empty strings uniformly. No ellipsis
+    marker is added — callers embed the tail verbatim in structured-log
+    ``extra`` dicts where the truncation point is understood by convention.
+
+    .. note::
+        This helper is for **structured-log event fields** (rare, error-path
+        only).  The per-phase ``stderr_tail`` fields in the normal subprocess
+        flow use the named cap constants
+        (:data:`PHASE_STDERR_TAIL_MAX_CHARS`, etc.) directly — do **not**
+        replace those with this helper.
+
+    Issue #2902.
+    """
+    if stderr is None:
+        return ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    stderr = stderr.strip()
+    if len(stderr) <= STRUCTURED_LOG_STDERR_MAX:
+        return stderr
+    return stderr[-STRUCTURED_LOG_STDERR_MAX:]
+
+
+def _classify_push_failure(stderr: str) -> str:
+    """Classify a ``git push`` non-zero exit by inspecting stderr.
+
+    Returns one of the ``FAILURE_CATEGORY_PUSH_*`` constants:
+
+    * ``pre_push_hook_rejected`` — ``pre-push:`` hook output in stderr
+      (e.g. ``.githooks/pre-push`` reporting a lint or test failure).
+    * ``git_push_network`` — network-layer error: DNS, connection refused,
+      or a 4xx/5xx from the remote (GitHub outage, auth).
+    * ``push_failed`` — catch-all for any other non-zero exit.
+
+    Modelled on :meth:`DispatcherDaemon._classify_subprocess_failure`.
+    Issue #2902.
+    """
+    import re  # noqa: PLC0415 — lazy import; called only on error path
+
+    tail = stderr or ""
+    if re.search(r"pre-push:", tail, re.IGNORECASE):
+        return FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED
+    if re.search(
+        r"could not resolve host|connection refused|The requested URL returned error",
+        tail,
+        re.IGNORECASE,
+    ):
+        return FAILURE_CATEGORY_GIT_PUSH_NETWORK
+    return FAILURE_CATEGORY_PUSH_FAILED
 
 
 # --------------------------------------------------------------------------
@@ -3106,7 +3183,7 @@ class DispatcherDaemon:
                 "run_id": self._run_id,
                 "issue_number": issue_number,
                 "exit_code": result.returncode,
-                "detail": (result.stdout or result.stderr or "").strip()[:200],
+                "detail": _stderr_tail(result.stdout or result.stderr),
             },
         )
         return False
@@ -3404,7 +3481,7 @@ class DispatcherDaemon:
                 "event": "gh_setup_git_failed",
                 "run_id": self._run_id,
                 "exit_code": result.returncode,
-                "detail": (result.stderr or result.stdout or "").strip()[:200],
+                "detail": _stderr_tail(result.stderr or result.stdout),
             },
         )
 
@@ -3693,7 +3770,7 @@ class DispatcherDaemon:
             ) from exc
 
         if result.returncode != 0:
-            stderr_preview = (result.stderr or "").strip()[:200]
+            stderr_preview = _stderr_tail(result.stderr)
             raise RuntimeError(f"git clone exit={result.returncode}: {stderr_preview}")
 
         self._log.info(
@@ -3734,7 +3811,7 @@ class DispatcherDaemon:
             ) from exc
 
         if result.returncode != 0:
-            stderr_preview = (result.stderr or "").strip()[:200]
+            stderr_preview = _stderr_tail(result.stderr)
             raise RuntimeError(f"git fetch exit={result.returncode}: {stderr_preview}")
 
     def _create_worktree(self, agent_id: str) -> Path:
@@ -3817,7 +3894,7 @@ class DispatcherDaemon:
             raise RuntimeError("git worktree add timed out after 60s") from exc
 
         if result.returncode != 0:
-            stderr_preview = (result.stderr or "").strip()[:200]
+            stderr_preview = _stderr_tail(result.stderr)
             raise RuntimeError(
                 f"git worktree add exit={result.returncode}: {stderr_preview}"
             )
@@ -3864,7 +3941,7 @@ class DispatcherDaemon:
             raise RuntimeError("gh issue view timed out after 30s") from exc
 
         if result.returncode != 0:
-            stderr_preview = (result.stderr or "").strip()[:200]
+            stderr_preview = _stderr_tail(result.stderr)
             raise RuntimeError(
                 f"gh issue view exit={result.returncode}: {stderr_preview}"
             )
@@ -4177,6 +4254,10 @@ class DispatcherDaemon:
         "ci_red_after_retries": "CI failed after retries",
         "gh_rate_exhausted": "GitHub rate limit",
         "stuck_timeout": "timed out",
+        # Push-failure sub-kinds (#2902).
+        "push_failed": "git push failed",
+        "pre_push_hook_rejected": "pre-push hook rejected",
+        "git_push_network": "git push network error",
     }
 
     @staticmethod
@@ -5337,7 +5418,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_preview": (result.stderr or "").strip()[:200],
+                    "stderr_preview": _stderr_tail(result.stderr),
                 },
             )
             return None
@@ -5493,7 +5574,7 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_preview": (result.stderr or "").strip()[:200],
+                    "stderr_preview": _stderr_tail(result.stderr),
                 },
             )
             return False
@@ -5560,7 +5641,7 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_preview": (result.stderr or "").strip()[:200],
+                    "stderr_preview": _stderr_tail(result.stderr),
                 },
             )
             return False
@@ -5775,7 +5856,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_preview": (result.stderr or "").strip()[:200],
+                    "stderr_preview": _stderr_tail(result.stderr),
                 },
             )
             return None
@@ -5894,7 +5975,7 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_preview": (result.stderr or "").strip()[:200],
+                    "stderr_preview": _stderr_tail(result.stderr),
                 },
             )
             return False
@@ -6742,7 +6823,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": add_result.returncode,
-                    "stderr_tail": (add_result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(add_result.stderr),
                 },
             )
             self._mark_agent_terminal(
@@ -6801,7 +6882,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": commit_result.returncode,
-                    "stderr_tail": (commit_result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(commit_result.stderr),
                 },
             )
             self._mark_agent_terminal(
@@ -6833,6 +6914,7 @@ class DispatcherDaemon:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            tail = _stderr_tail(getattr(exc, "stderr", None))
             self._log.exception(
                 "daemon.git_push_timeout",
                 extra={
@@ -6840,8 +6922,27 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
+                    "stderr_tail": tail,
                     "detail": str(exc),
                 },
+            )
+            self._write_failure(
+                agent_id=agent_id,
+                category=FAILURE_CATEGORY_GIT_PUSH_NETWORK,
+                detected_by="scheduler",
+                details={
+                    "phase": "push_and_pr",
+                    "branch": branch,
+                    "stderr_tail": tail,
+                    "exit_code": None,
+                    "reason": "timeout",
+                },
+            )
+            self._persist_phase_output(
+                agent_id,
+                phase="push_and_pr",
+                output_json={"event": "git_push_timeout", "branch": branch},
+                log_text=tail,
             )
             self._mark_agent_terminal(
                 agent_id,
@@ -6861,6 +6962,23 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
+            self._write_failure(
+                agent_id=agent_id,
+                category=FAILURE_CATEGORY_PUSH_FAILED,
+                detected_by="scheduler",
+                details={
+                    "phase": "push_and_pr",
+                    "branch": branch,
+                    "stderr_tail": str(exc),
+                    "exit_code": None,
+                },
+            )
+            self._persist_phase_output(
+                agent_id,
+                phase="push_and_pr",
+                output_json={"event": "git_push_failed", "branch": branch},
+                log_text=str(exc),
+            )
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -6870,6 +6988,8 @@ class DispatcherDaemon:
             )
             return
         if push_result.returncode != 0:
+            tail = _stderr_tail(push_result.stderr)
+            category = _classify_push_failure(tail)
             self._log.warning(
                 "daemon.git_push_failed",
                 extra={
@@ -6877,8 +6997,31 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": push_result.returncode,
-                    "stderr_tail": (push_result.stderr or "")[:200],
+                    "stderr_tail": tail,
+                    "category": category,
+                    "branch": branch,
                 },
+            )
+            self._write_failure(
+                agent_id=agent_id,
+                category=category,
+                detected_by="scheduler",
+                details={
+                    "phase": "push_and_pr",
+                    "branch": branch,
+                    "stderr_tail": tail,
+                    "exit_code": push_result.returncode,
+                },
+            )
+            self._persist_phase_output(
+                agent_id,
+                phase="push_and_pr",
+                output_json={
+                    "event": "git_push_failed",
+                    "exit_code": push_result.returncode,
+                    "branch": branch,
+                },
+                log_text=(push_result.stderr or ""),
             )
             self._mark_agent_terminal(
                 agent_id,
@@ -6946,7 +7089,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": pr_result.returncode,
-                    "stderr_tail": (pr_result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(pr_result.stderr),
                 },
             )
             self._mark_agent_terminal(
@@ -7338,7 +7481,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "pr_number": pr_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
             return None
@@ -7492,7 +7635,7 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "pr_number": pr_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
             return
@@ -7810,7 +7953,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": add_result.returncode,
-                    "stderr_tail": (add_result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(add_result.stderr),
                 },
             )
             self._mark_agent_terminal(
@@ -7862,7 +8005,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": commit_result.returncode,
-                    "stderr_tail": (commit_result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(commit_result.stderr),
                 },
             )
             self._mark_agent_terminal(
@@ -7922,7 +8065,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": push_result.returncode,
-                    "stderr_tail": (push_result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(push_result.stderr),
                 },
             )
             self._mark_agent_terminal(
@@ -8089,7 +8232,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "merge_sha": merge_sha,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
             return []
@@ -8433,7 +8576,7 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
             return
@@ -9008,7 +9151,7 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                     "title": title,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "")[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
             return None
@@ -9145,8 +9288,8 @@ class DispatcherDaemon:
                 "agent_id": agent_id,
                 "worktree_path": worktree_path,
                 "exit_code": result.returncode,
-                "stderr_tail": (result.stderr or "").strip()[:200],
-                "stdout_tail": (result.stdout or "").strip()[:200],
+                "stderr_tail": _stderr_tail(result.stderr),
+                "stdout_tail": _stderr_tail(result.stdout),
             },
         )
 
@@ -9611,7 +9754,7 @@ class DispatcherDaemon:
                     "event": "gh_rate_probe_failed",
                     "run_id": self._run_id,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
             return None
@@ -9901,7 +10044,7 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                         "worktree_path": worktree_path,
                         "exit_code": result.returncode,
-                        "stderr_tail": (result.stderr or "").strip()[:200],
+                        "stderr_tail": _stderr_tail(result.stderr),
                     },
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
@@ -9958,7 +10101,7 @@ class DispatcherDaemon:
                 "run_id": self._run_id,
                 "worktree_path": worktree_path,
                 "exit_code": result.returncode,
-                "stderr_tail": (result.stderr or "").strip()[:200],
+                "stderr_tail": _stderr_tail(result.stderr),
             },
         )
         return False
@@ -11648,7 +11791,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
 
@@ -11693,7 +11836,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
 
@@ -11742,7 +11885,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
 
@@ -11794,7 +11937,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
 
@@ -11841,7 +11984,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "issue_number": issue_number,
                     "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "").strip()[:200],
+                    "stderr_tail": _stderr_tail(result.stderr),
                 },
             )
 

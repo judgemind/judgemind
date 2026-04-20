@@ -640,7 +640,8 @@ class TestCategoryDisplayNames:
 
     def test_category_display_names_map_contents(self) -> None:
         """Lock the full ``_CATEGORY_DISPLAY_NAMES`` map contents so a
-        typo or accidental deletion on any row surfaces immediately."""
+        typo or accidental deletion on any row surfaces immediately.
+        Issue #2902 added three push-failure sub-kinds."""
         assert daemon.DispatcherDaemon._CATEGORY_DISPLAY_NAMES == {
             "subprocess_turn_limit": "turn limit reached",
             "subprocess_crash": "subprocess crashed",
@@ -648,7 +649,29 @@ class TestCategoryDisplayNames:
             "ci_red_after_retries": "CI failed after retries",
             "gh_rate_exhausted": "GitHub rate limit",
             "stuck_timeout": "timed out",
+            # Push-failure sub-kinds (#2902).
+            "push_failed": "git push failed",
+            "pre_push_hook_rejected": "pre-push hook rejected",
+            "git_push_network": "git push network error",
         }
+
+    def test_push_failed_renders_as_git_push_failed(self, tmp_path: Path) -> None:
+        """``push_failed`` → ``"git push failed"``. Issue #2902."""
+        summary = self._build_for_category(tmp_path, "push_failed")
+        assert "(git push failed)" in summary
+        assert "push_failed" not in summary
+
+    def test_pre_push_hook_rejected_renders_humanized(self, tmp_path: Path) -> None:
+        """``pre_push_hook_rejected`` → ``"pre-push hook rejected"``. Issue #2902."""
+        summary = self._build_for_category(tmp_path, "pre_push_hook_rejected")
+        assert "(pre-push hook rejected)" in summary
+        assert "pre_push_hook_rejected" not in summary
+
+    def test_git_push_network_renders_humanized(self, tmp_path: Path) -> None:
+        """``git_push_network`` → ``"git push network error"``. Issue #2902."""
+        summary = self._build_for_category(tmp_path, "git_push_network")
+        assert "(git push network error)" in summary
+        assert "git_push_network" not in summary
 
 
 # --------------------------------------------------------------------------
