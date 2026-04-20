@@ -431,6 +431,35 @@ class TestListAdvanceableAgents:
         assert rows == []
         assert conn.rollbacks >= 1
 
+    def test_select_filters_on_kind_task(self, tmp_path: Path) -> None:
+        """Regression for #2908.
+
+        ``_list_advanceable_agents`` drives the daemon's Phase 3B/3E
+        advance loop (CI watch, deploy watch, retro, cleanup). It should
+        only advance ``kind='task'`` rows — task-skill rows never reach
+        ``awaiting_ci``/``awaiting_deploy``/``retro_*`` in practice
+        (their lifecycle ends with the operator's /task pipeline), but
+        filtering defensively documents the scope and prevents a future
+        phase-label collision from starving the advance loop.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [[]]
+        d._list_advanceable_agents()
+
+        selects = [
+            e
+            for e in conn.cursor_instance.executed
+            if "SELECT agent_id" in e[0] and "dispatcher.agents" in e[0]
+        ]
+        assert selects, "expected _list_advanceable_agents to issue the SELECT"
+        sql, _params = selects[0]
+        assert "status = 'running'" in sql
+        assert "kind = 'task'" in sql, (
+            "_list_advanceable_agents must filter kind='task' so the "
+            "advance loop is scoped to daemon-owned agents (see #2908). "
+            "Actual SQL: " + sql
+        )
+
 
 # --------------------------------------------------------------------------
 # _advance_running_agents — dispatch + crash isolation

@@ -282,6 +282,36 @@ class TestRecoverAbandonedAgents:
         assert d.recover_abandoned_agents() == 0
         assert conn.rollbacks >= 1
 
+    def test_select_filters_on_kind_task(self, tmp_path: Path) -> None:
+        """Regression for #2908.
+
+        ``recover_abandoned_agents`` is a daemon-supervisor decision —
+        it reclaims ``status='running'`` agents from PRIOR daemon runs
+        and enqueues retry markers. ``kind='task-skill'`` rows are
+        operator-owned laptop subagents, not daemon-reclaimable; if the
+        daemon "reclaimed" one it would create a phantom retry of work
+        that is still running in a separate OS process on the operator's
+        laptop. The SELECT must filter ``kind='task'``.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [[]]
+        d.recover_abandoned_agents()
+
+        selects = [
+            e
+            for e in conn.cursor_instance.executed
+            if "SELECT agent_id, issue_number, phase" in e[0]
+            and "dispatcher.agents" in e[0]
+        ]
+        assert selects, "expected recover_abandoned_agents to issue the SELECT"
+        sql, _params = selects[0]
+        assert "status = 'running'" in sql
+        assert "kind = 'task'" in sql, (
+            "recover_abandoned_agents must filter kind='task' so laptop "
+            "/task subagents are not reclaimed at daemon boot (see #2908). "
+            "Actual SQL: " + sql
+        )
+
 
 # --------------------------------------------------------------------------
 # Bug B — per-phase stuck_timeout thresholds
