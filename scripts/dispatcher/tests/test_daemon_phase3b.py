@@ -644,6 +644,12 @@ class TestAwaitingCiGreen:
             if cmd[:3] == ["gh", "pr", "merge"]:
                 r.stdout = ""
                 return r
+            # Issue #2953: ``_write_merged_at`` releases the
+            # ``status/in-progress`` label on successful merge
+            # (matches ``_mark_agent_terminal`` teardown path).
+            if cmd[:3] == ["gh", "issue", "edit"] and "--remove-label" in cmd:
+                r.stdout = ""
+                return r
             raise AssertionError(f"unexpected subprocess call: {cmd}")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1246,15 +1252,25 @@ class TestAwaitingDeploySuccess:
         comment_cmds = [c for c in call_log if c[:3] == ["gh", "issue", "comment"]]
         assert comment_cmds
         assert "--body-file" in comment_cmds[0]
-        # Agent marked succeeded.
-        succeeded_updates = [
+        # Issue #2953: ``status='succeeded'`` was written at merge time
+        # by ``_write_merged_at``; the verify-complete path NO longer
+        # re-writes status. It writes ``verified_at = now()`` (milestone
+        # column) and advances ``phase`` to ``done``.
+        verified_at_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "verified_at" in e[0]
+        ]
+        assert verified_at_updates
+        phase_done_updates = [
             e
             for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.agents" in e[0]
+            and "SET phase" in e[0]
             and e[1] is not None
-            and "succeeded" in e[1]
+            and "done" in e[1]
         ]
-        assert succeeded_updates
+        assert phase_done_updates
         # agent_completed event.
         completed = handler.events("agent_completed")
         assert completed
@@ -1354,15 +1370,25 @@ class TestAwaitingDeployNoDeployRun:
 
         polls = handler.events("deploy_poll")
         assert polls and polls[0].deploy_state == "none"
-        # Verify still ran and agent marked succeeded.
-        succeeded_updates = [
+        # Issue #2953: verify writes ``verified_at`` + advances phase
+        # to ``done``; status flip to ``succeeded`` happens at merge
+        # (not called directly in this test path). Here we assert the
+        # verified-at milestone was stamped and phase advanced.
+        verified_at_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "verified_at" in e[0]
+        ]
+        assert verified_at_updates
+        phase_done_updates = [
             e
             for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.agents" in e[0]
+            and "SET phase" in e[0]
             and e[1] is not None
-            and "succeeded" in e[1]
+            and "done" in e[1]
         ]
-        assert succeeded_updates
+        assert phase_done_updates
 
 
 # --------------------------------------------------------------------------

@@ -202,6 +202,12 @@ describe('recentCompletionsToGraphQL', () => {
         // #2900: succeeded rows stay NULL on failure_summary — the
         // column only populates on failure terminals.
         failureSummary: null,
+        // #2953: milestone columns default to null when the input row
+        // omits them (pre-migration-35 historical case).
+        mergedAt: null,
+        verifiedAt: null,
+        verifySkipReason: null,
+        retroedAt: null,
       },
     ]);
   });
@@ -397,6 +403,106 @@ describe('recentCompletionsToGraphQL', () => {
     const result = recentCompletionsToGraphQL(rows);
     expect(result[0].priority).toBeNull();
     expect(result[1].priority).toBeNull();
+  });
+
+  // #2953 — milestone-column passthrough: the resolver must surface
+  // merged_at / verified_at / verify_skip_reason / retroed_at verbatim
+  // so the admin cockpit can render a single glyph whose colour
+  // encodes pipeline completeness.
+  it('#2953: passes all four milestone columns through verbatim', () => {
+    const rows = [
+      {
+        agent_id: 'uuid-fully-shipped',
+        issue_number: 2953,
+        issue_title: 'Fully-shipped row',
+        status: 'succeeded',
+        ended_at: '2026-04-20T22:50:00Z',
+        pr_number: 3000,
+        merged_at: '2026-04-20T22:35:00Z',
+        verified_at: '2026-04-20T22:41:00Z',
+        verify_skip_reason: null,
+        retroed_at: '2026-04-20T22:50:00Z',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].mergedAt).toBe('2026-04-20T22:35:00Z');
+    expect(result[0].verifiedAt).toBe('2026-04-20T22:41:00Z');
+    expect(result[0].verifySkipReason).toBeNull();
+    expect(result[0].retroedAt).toBe('2026-04-20T22:50:00Z');
+  });
+
+  it('#2953: surfaces verifySkipReason on a self-deploy row', () => {
+    const rows = [
+      {
+        agent_id: 'uuid-self-deploy',
+        issue_number: 2953,
+        issue_title: 'Dispatcher self-PR',
+        status: 'succeeded',
+        ended_at: '2026-04-20T22:48:00Z',
+        pr_number: 3001,
+        merged_at: '2026-04-20T22:35:00Z',
+        verified_at: null,
+        verify_skip_reason: 'self_deploy',
+        retroed_at: '2026-04-20T22:48:00Z',
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].verifySkipReason).toBe('self_deploy');
+    expect(result[0].verifiedAt).toBeNull();
+  });
+
+  it('#2953: emits all milestone columns null for pre-migration-35 rows', () => {
+    // A historical row whose agent ran before migration 35 has NULL
+    // in the four new columns (backfill only sets merged_at for
+    // rows with pr_number + status='succeeded'; rows without a PR
+    // stay untouched).
+    const rows = [
+      {
+        agent_id: 'uuid-pre35',
+        issue_number: 100,
+        issue_title: 'Pre-migration row',
+        status: 'succeeded',
+        ended_at: '2026-01-01T00:00:00Z',
+        pr_number: null,
+        // columns missing entirely — defensive against pg result shape drift
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].mergedAt).toBeNull();
+    expect(result[0].verifiedAt).toBeNull();
+    expect(result[0].verifySkipReason).toBeNull();
+    expect(result[0].retroedAt).toBeNull();
+  });
+
+  it('#2953: verifySkipReason ignores empty / non-string values', () => {
+    // Defense-in-depth: empty strings or non-string jsonb drift
+    // must collapse to null so the UI's milestone-completeness
+    // logic doesn't treat an empty string as "skipped".
+    const rows = [
+      {
+        agent_id: 'uuid-empty',
+        issue_number: 100,
+        issue_title: 'Empty skip reason',
+        status: 'succeeded',
+        ended_at: '2026-04-20T00:00:00Z',
+        pr_number: 500,
+        merged_at: '2026-04-20T00:00:00Z',
+        verify_skip_reason: '',
+      },
+      {
+        agent_id: 'uuid-nonstring',
+        issue_number: 101,
+        issue_title: 'Non-string skip reason',
+        status: 'succeeded',
+        ended_at: '2026-04-20T00:00:00Z',
+        pr_number: 501,
+        merged_at: '2026-04-20T00:00:00Z',
+        verify_skip_reason: 42,
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].verifySkipReason).toBeNull();
+    expect(result[1].verifySkipReason).toBeNull();
   });
 
   it('emits totalTokens=null and totalCostUsd=null for pre-migration-31 rows', () => {

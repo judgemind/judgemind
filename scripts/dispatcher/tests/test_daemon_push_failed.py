@@ -272,7 +272,15 @@ class TestGitPushFailedWritesFailureRow:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        run_side_effects = [add_ok, commit_ok, push_fail]
+        # Issue #2953: ``_push_and_open_pr`` now runs ``git show
+        # --name-only HEAD`` between commit and push to detect
+        # dispatcher-self-PRs. The fourth entry below answers that
+        # call with an empty file list (no self-deploy detected) so
+        # the test's push-failed path is unaffected.
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        run_side_effects = [add_ok, commit_ok, git_show_empty, push_fail]
         with patch("subprocess.run", side_effect=run_side_effects):
             d._push_and_open_pr(
                 agent_id=agent_id,
@@ -331,7 +339,15 @@ class TestGitPushFailedWritesFailureRow:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        with patch("subprocess.run", side_effect=[add_ok, commit_ok, push_fail]):
+        # Issue #2953: inject a no-op ``git show --name-only HEAD``
+        # between commit and push for the self-deploy detection step.
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        with patch(
+            "subprocess.run",
+            side_effect=[add_ok, commit_ok, git_show_empty, push_fail],
+        ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=99, worktree=worktree)
 
         failure_inserts = [
@@ -382,7 +398,15 @@ class TestGitPushFailedWritesPhaseOutputRow:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        with patch("subprocess.run", side_effect=[add_ok, commit_ok, push_fail]):
+        # Issue #2953: inject a no-op ``git show --name-only HEAD``
+        # between commit and push for the self-deploy detection step.
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        with patch(
+            "subprocess.run",
+            side_effect=[add_ok, commit_ok, git_show_empty, push_fail],
+        ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=7, worktree=worktree)
 
         # Find the INSERT into dispatcher.phase_outputs for push_and_pr.

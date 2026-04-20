@@ -618,6 +618,30 @@ TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
     {"succeeded", "failed", "crashed", "plan_blocked", "needs_review"}
 )
 
+# --------------------------------------------------------------------------
+# Milestone columns on ``dispatcher.agents`` — split the single
+# ``status='succeeded'`` terminal write into four independently-stamped
+# milestones so the admin cockpit can distinguish "shipped" from
+# "verified" from "retro completed" (issue #2953, migration 35).
+# --------------------------------------------------------------------------
+
+#: Verify-skip reason written to ``dispatcher.agents.verify_skip_reason``
+#: when a dispatcher-self-PR (touches ``scripts/dispatcher/``) is
+#: detected in push_and_pr. Verify cannot meaningfully run against a
+#: process that is about to be replaced by its own deploy, so the
+#: verify phase no-ops and the admin cockpit renders the row as
+#: shipped-without-verify (not as an incomplete-verify warning).
+#: Issue #2953.
+VERIFY_SKIP_REASON_SELF_DEPLOY = "self_deploy"
+
+#: Path prefixes whose presence in a PR's file list triggers
+#: ``verify_skip_reason=self_deploy``. Today: dispatcher source only.
+#: Future candidates (``docs/`` → ``docs_only``, ``.github/workflows/``
+#: → ``ci_cd_only``) are not yet written — the migration column allows
+#: them but the daemon code path doesn't emit them until a follow-up
+#: issue lands.
+_SELF_DEPLOY_PATH_PREFIXES: tuple[str, ...] = ("scripts/dispatcher/",)
+
 #: Failure category written when the daemon restart-recovery sweep
 #: reclaims a ``status='running'`` agent left behind by the previous
 #: daemon run. Tier-1 mechanical retry category — the agent gets a
@@ -4273,6 +4297,299 @@ class DispatcherDaemon:
             except Exception:  # pragma: no cover
                 pass
 
+    # ── milestone column writers (issue #2953, migration 35) ───────────
+    #
+    # Each helper stamps one of the four milestone columns on
+    # ``dispatcher.agents``. All are best-effort — a DB error logs,
+    # rolls back, and returns without re-raising, matching the
+    # ``_update_agent_phase`` / ``_write_failure_summary`` pattern so a
+    # transient DB hiccup cannot unwind the caller's control flow (the
+    # daemon is already past the decision point the milestone records).
+
+    def _write_merged_at(
+        self,
+        agent_id: str,
+        *,
+        pr_number: int | None = None,
+        issue_number: int | None = None,
+    ) -> None:
+        """Stamp ``merged_at = now()`` + flip ``status='succeeded'`` on merge.
+
+        Issue #2953. Called by ``_merge_pr_and_advance`` at the moment
+        the ``gh pr merge`` call returns successfully — not at end of
+        retro. One-way latch: status becomes ``succeeded`` the instant
+        the PR ships, so a container kill between merge and retro no
+        longer renders as a red ✗.
+
+        Mirrors the terminal-time side-effects of ``_mark_agent_terminal``
+        for the ``succeeded`` branch (``ended_at``, ``failure_summary``
+        cleanup, diagnosis outcome write-back, terminal-outcome circuit
+        breaker feed) in one UPDATE so the admin row transitions atomically.
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'succeeded', "
+                    "    merged_at = now(), "
+                    "    ended_at = COALESCE(ended_at, now()), "
+                    "    exit_code = COALESCE(exit_code, 0), "
+                    "    pr_number = COALESCE(%s, pr_number), "
+                    "    failure_summary = NULL "
+                    "WHERE agent_id = %s",
+                    (pr_number, agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.write_merged_at_failed",
+                extra={
+                    "event": "write_merged_at_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+            return
+
+        # Mirror the best-effort side-effects that ``_mark_agent_terminal``
+        # runs for terminal statuses so the merge-time flip lands the
+        # same downstream signals (diagnosis outcome write-back,
+        # terminal-outcome circuit-breaker feed, issue-label teardown,
+        # circuit-breaker evaluation). Each one is independently
+        # wrapped — a failure here cannot roll back the status flip
+        # above (which was already committed).
+        try:
+            self._write_diagnosis_outcome_for_agent(agent_id, "succeeded")
+        except Exception:
+            self._log.exception(
+                "daemon.diagnosis_outcome_write_failed",
+                extra={
+                    "event": "diagnosis_outcome_write_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "status": "succeeded",
+                    "origin": "merged_at",
+                },
+            )
+        try:
+            self._write_terminal_outcome(agent_id, "succeeded")
+        except Exception:
+            self._log.exception(
+                "daemon.terminal_outcome_write_failed",
+                extra={
+                    "event": "terminal_outcome_write_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "status": "succeeded",
+                    "origin": "merged_at",
+                },
+            )
+        try:
+            self._evaluate_circuit_breaker(agent_id)
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_evaluate_failed",
+                extra={
+                    "event": "circuit_breaker_evaluate_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "origin": "merged_at",
+                },
+            )
+        if issue_number is not None:
+            # Release ``status/in-progress`` label — the agent logically
+            # succeeded the moment the PR shipped. Best-effort; matches
+            # the ``_mark_agent_terminal`` teardown path (#2866).
+            self._gh_issue_remove_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
+
+    def _write_verified_at(self, agent_id: str) -> None:
+        """Stamp ``verified_at = now()`` when the verify phase succeeds.
+
+        Issue #2953. Does NOT touch ``status`` — ``merged_at`` already
+        flipped it to ``succeeded`` at merge. The admin cockpit reads
+        both columns and renders the pill color from their combined
+        presence.
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents SET verified_at = now() "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.write_verified_at_failed",
+                extra={
+                    "event": "write_verified_at_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+
+    def _write_verify_skip_reason(self, agent_id: str, reason: str) -> None:
+        """Stamp ``verify_skip_reason`` pre-push when verify is skipped.
+
+        Issue #2953. Written by ``_push_and_open_pr`` before the push
+        when the PR touches ``scripts/dispatcher/`` (self-deploy case).
+        The verify phase later reads this column and no-ops if it's
+        non-null, so the admin cockpit can distinguish "shipped + verify
+        does not apply" from "shipped + verify failed to run".
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents SET verify_skip_reason = %s "
+                    "WHERE agent_id = %s",
+                    (reason, agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.write_verify_skip_reason_failed",
+                extra={
+                    "event": "write_verify_skip_reason_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "reason": reason,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+
+    def _read_verify_skip_reason(self, agent_id: str) -> str | None:
+        """Return the current ``verify_skip_reason`` for an agent, or None."""
+        assert self._conn is not None, "connect() must run before read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT verify_skip_reason FROM dispatcher.agents "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.read_verify_skip_reason_failed",
+                extra={
+                    "event": "read_verify_skip_reason_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+            return None
+        if row is None:
+            return None
+        value = row[0]
+        return str(value) if isinstance(value, str) and value else None
+
+    def _write_retroed_at(self, agent_id: str) -> None:
+        """Stamp ``retroed_at = now()`` when retro reaches PHASE_RETRO_DONE.
+
+        Issue #2953. Does NOT touch ``status`` or ``phase`` — those are
+        handled by the existing ``_update_agent_phase(PHASE_RETRO_DONE)``
+        call. Best-effort; a DB error here cannot unwind the retro work.
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents SET retroed_at = now() "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.write_retroed_at_failed",
+                extra={
+                    "event": "write_retroed_at_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+
+    @staticmethod
+    def _detect_verify_skip_reason(
+        touched_paths: list[str],
+    ) -> str | None:
+        """Return a ``verify_skip_reason`` for a PR's touched file list, or None.
+
+        Issue #2953 dispatcher-self-PR detection. Called in
+        ``_push_and_open_pr`` after ``git commit`` and before ``git
+        push``. Any file whose path starts with a prefix in
+        :data:`_SELF_DEPLOY_PATH_PREFIXES` triggers
+        :data:`VERIFY_SKIP_REASON_SELF_DEPLOY`.
+
+        The check is "any file matches" — a PR that touches both
+        dispatcher source AND something else still skips verify,
+        because the daemon deploy will land mid-verify regardless of
+        what else the PR did. Pure-functional for testability.
+        """
+        for path in touched_paths:
+            for prefix in _SELF_DEPLOY_PATH_PREFIXES:
+                if path.startswith(prefix):
+                    return VERIFY_SKIP_REASON_SELF_DEPLOY
+        return None
+
+    def _list_committed_files_at_head(self, worktree: Path) -> list[str]:
+        """Return the file list of the most recent commit on ``worktree``.
+
+        Issue #2953. Uses ``git show --name-only --pretty=format:``
+        which emits one path per line after the commit's empty-message
+        preamble. Returns an empty list on subprocess failure — the
+        caller treats that as "no skip reason detectable" and verify
+        runs normally. Swallowing the error is safe because the
+        admin-cockpit UX gracefully handles a verify that ran and
+        wrote ``verified_at`` (the normal path).
+        """
+        cmd = [
+            "git",
+            "-C",
+            str(worktree),
+            "show",
+            "--name-only",
+            "--pretty=format:",
+            "HEAD",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return []
+        if result.returncode != 0:
+            return []
+        return [line for line in (result.stdout or "").splitlines() if line.strip()]
+
     # ── failure_summary builder (issue #2900) ──────────────────────────
 
     #: Statuses that get a ``dispatcher.agents.failure_summary``
@@ -7128,6 +7445,46 @@ class DispatcherDaemon:
             )
             return
 
+        # Issue #2953: dispatcher-self-PR detection. If the just-made
+        # commit touches any file under ``scripts/dispatcher/``, stamp
+        # ``verify_skip_reason='self_deploy'`` NOW — before the push —
+        # so the downstream verify phase reads the signal and no-ops.
+        # Rationale: the daemon that would run verify post-merge is
+        # about to be replaced by the deploy of this very PR, and
+        # verifying against a soon-dead container produces false-failure
+        # noise during the drain window. Inspecting HEAD's file list
+        # is a pure read against the local worktree — no network, no
+        # DB beyond the single UPDATE.
+        try:
+            touched_paths = self._list_committed_files_at_head(worktree)
+            skip_reason = self._detect_verify_skip_reason(touched_paths)
+            if skip_reason:
+                self._write_verify_skip_reason(agent_id, skip_reason)
+                self._log.info(
+                    "daemon.verify_skip_reason_written",
+                    extra={
+                        "event": "verify_skip_reason_written",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "skip_reason": skip_reason,
+                        "touched_paths": touched_paths[:20],
+                    },
+                )
+        except Exception:
+            # Non-critical path — a failure to detect skip reason
+            # just means verify runs normally. The worst case is
+            # false-failure noise on the admin page during a self-
+            # deploy window, which was the pre-#2953 status quo.
+            self._log.exception(
+                "daemon.verify_skip_detection_failed",
+                extra={
+                    "event": "verify_skip_detection_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+
         # git push -u origin <branch>
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         branch = f"agent/{short_id}"
@@ -7467,6 +7824,17 @@ class DispatcherDaemon:
                 # ``dispatcher.agents``, so every row here is
                 # daemon-owned by construction — no ``kind`` filter
                 # needed.
+                # Issue #2953: post-merge rows now carry
+                # ``status='succeeded'`` from merge-detection onward
+                # (instead of only after retro). The filter picks up
+                # both pre-merge ``status='running'`` agents (awaiting_ci,
+                # awaiting_deploy) AND post-merge ``status='succeeded'``
+                # agents that still need verify / retro / cleanup
+                # (awaiting_deploy, done, retro_done, retro_failed).
+                # The awaiting_deploy phase appears in both branches
+                # because the transition merge→awaiting_deploy flips
+                # status without changing phase — the next tick sees
+                # the succeeded branch.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status "
@@ -7474,7 +7842,8 @@ class DispatcherDaemon:
                     "WHERE (status = 'running' "
                     "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
                     "   OR (status = 'succeeded' "
-                    "       AND phase IN ('done', 'retro_done', 'retro_failed')) "
+                    "       AND phase IN ('awaiting_deploy', 'done', "
+                    "                     'retro_done', 'retro_failed')) "
                     "ORDER BY started_at ASC",
                 )
                 for row in cur.fetchall():
@@ -7533,6 +7902,13 @@ class DispatcherDaemon:
                 if phase == "awaiting_ci":
                     self._advance_awaiting_ci(agent)
                 elif phase == "awaiting_deploy":
+                    # Issue #2953: post-merge rows have flipped to
+                    # ``status='succeeded'`` at merge time; pre-merge
+                    # rows (merge path not yet reached) are still
+                    # ``status='running'``. Both need the deploy
+                    # handler — status differentiates only the "is the
+                    # crash recoverable" policy in the exception
+                    # handler below.
                     self._advance_awaiting_deploy(agent)
                 elif phase == "done" and status == "succeeded":
                     # Phase 3E (#2798): post-success retro phase.
@@ -7575,11 +7951,26 @@ class DispatcherDaemon:
                 )
                 if status == "succeeded":
                     # Mark the post-success phase failed without
-                    # touching the success status. retro phase failure
-                    # → flip to retro_failed so cleanup still runs;
-                    # cleanup phase failure → flip to cleanup_blocked
-                    # so an operator can investigate.
-                    if phase == "done":
+                    # touching the success status. The agent logically
+                    # succeeded at merge time (#2953) — subsequent
+                    # deploy-watch / verify / retro / cleanup are
+                    # bookkeeping that can leave milestone columns
+                    # NULL without retroactively changing the success
+                    # status:
+                    #   awaiting_deploy  → deploy-watch/verify exception
+                    #                      advances straight to
+                    #                      PHASE_RETRO_FAILED so retro
+                    #                      runs bookkeeping anyway.
+                    #                      ``verified_at`` stays NULL
+                    #                      — admin shows amber ✓.
+                    #   done             → retro exception → retro_failed
+                    #                      so cleanup still runs.
+                    #   retro_done /
+                    #   retro_failed     → cleanup exception →
+                    #                      cleanup_blocked.
+                    if phase == "awaiting_deploy":
+                        self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+                    elif phase == "done":
                         self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
                     elif phase in (PHASE_RETRO_DONE, PHASE_RETRO_FAILED):
                         self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
@@ -7882,6 +8273,24 @@ class DispatcherDaemon:
             if refreshed is not None:
                 merge_sha = self._extract_merge_sha(refreshed)
 
+        # Issue #2953: flip ``status='succeeded'`` + stamp ``merged_at``
+        # the moment the PR squash-merge lands — not at end of retro.
+        # The row now reads "shipped" durably even if the container
+        # dies mid-verify / mid-retro. ``phase`` advances to
+        # ``awaiting_deploy`` so the scheduler's next tick picks it up
+        # and drives the remaining post-merge bookkeeping. Order
+        # matters: stamp milestone + flip status FIRST, then advance
+        # phase — a crash between the two writes leaves a
+        # ``status='succeeded' AND phase='awaiting_ci'`` row (still
+        # recoverable by the next tick's advanceable-agents scan
+        # because the expanded filter picks up
+        # ``status='succeeded' AND phase IN (...)``).
+        issue_number = agent.get("issue_number")
+        self._write_merged_at(
+            agent_id,
+            pr_number=pr_number,
+            issue_number=int(issue_number) if issue_number is not None else None,
+        )
         self._update_agent_phase(agent_id, "awaiting_deploy")
         self._log.info(
             "daemon.pr_merged",
@@ -8526,11 +8935,57 @@ class DispatcherDaemon:
         merge_sha: str,
         deploy_runs: list[dict[str, Any]],
     ) -> None:
-        """Spawn ``/task-v2-verify``, post evidence comment, mark succeeded."""
+        """Spawn ``/task-v2-verify``, post evidence comment, advance to done.
+
+        Issue #2953: ``status='succeeded'`` was already written at merge
+        time by ``_write_merged_at`` — this method no longer flips the
+        status. Its remaining responsibilities are (a) short-circuit
+        when ``verify_skip_reason`` is set (dispatcher-self-PR case),
+        (b) run the verify subprocess, (c) stamp ``verified_at`` on
+        VERIFIED/SKIPPED verdict, and (d) advance ``phase`` to ``done``
+        so the retro phase picks it up on the next tick.
+
+        A FAILED verdict flips status back to ``failed`` via
+        ``_mark_agent_terminal`` — verify failing post-merge is a real
+        problem (the deployed code didn't behave as expected) and the
+        admin cockpit should surface it in red even though the PR
+        technically shipped. The row still has ``merged_at`` populated
+        so the milestone breakdown tooltip can show "merged X · verify
+        failed" on operator hover.
+        """
         agent_id = agent["agent_id"]
         issue_number = agent["issue_number"]
         pr_number = agent["pr_number"]
         worktree = Path(agent["worktree_path"])
+
+        # Issue #2953: short-circuit when this PR was detected as a
+        # dispatcher-self-PR during push_and_pr. The daemon process
+        # running verify here is about to be replaced by its own
+        # deploy, so verifying against a soon-dead container adds
+        # noise (false-failure race during the drain window) without
+        # validating anything. Advance straight to ``done`` — the
+        # retro phase still runs (bookkeeping fits in the drain
+        # window) and the admin row renders as shipped-without-verify
+        # (green ✓) per the skip-reason semantic.
+        skip_reason = self._read_verify_skip_reason(agent_id)
+        if skip_reason:
+            self._log.info(
+                "daemon.verify_skipped",
+                extra={
+                    "event": "verify_skipped",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "skip_reason": skip_reason,
+                },
+            )
+            # Advance phase so retro picks it up. Do NOT stamp
+            # ``verified_at`` — the skip reason is the canonical
+            # signal; a stamped timestamp would conflate "verify ran
+            # and passed" with "verify intentionally did not run".
+            self._update_agent_phase(agent_id, "done")
+            return
 
         # Fetch the issue bundle for acceptance criteria. Best-effort —
         # the verify skill tolerates an empty AC list with a failure row.
@@ -8637,15 +9092,23 @@ class DispatcherDaemon:
                     "failure_reason": verify_output.get("failure_reason"),
                 },
             )
+            # Issue #2953: verify failed post-merge is a genuine
+            # regression signal — the deployed code didn't behave as
+            # expected. Flip status back to ``failed`` so the admin
+            # cockpit renders red. ``merged_at`` stays populated so the
+            # tooltip can read "merged X · verify failed" instead of
+            # hiding the shipment entirely.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="done", exit_code=exit_code
             )
             return
 
-        # VERIFIED or SKIPPED — either is a success for the daemon.
-        self._mark_agent_terminal(
-            agent_id, status="succeeded", phase="done", exit_code=0
-        )
+        # VERIFIED or SKIPPED — stamp ``verified_at`` and advance phase
+        # so the retro phase picks up the row next tick. ``status`` is
+        # already ``succeeded`` from merge-time; no re-flip needed
+        # (issue #2953).
+        self._write_verified_at(agent_id)
+        self._update_agent_phase(agent_id, "done")
         self._log.info(
             "daemon.agent_completed",
             extra={
@@ -8996,6 +9459,13 @@ class DispatcherDaemon:
             if new_issue is not None:
                 filed += 1
 
+        # Issue #2953: stamp ``retroed_at`` BEFORE advancing phase so a
+        # crash between the two writes leaves the milestone column set
+        # — the admin cockpit can render the "retro completed" signal
+        # even if the phase advance failed. Paired reads of
+        # ``phase=retro_done`` and ``retroed_at IS NOT NULL`` are both
+        # authoritative (post this fix).
+        self._write_retroed_at(agent_id)
         self._update_agent_phase(agent_id, PHASE_RETRO_DONE)
         self._log.info(
             "daemon.retro_done",

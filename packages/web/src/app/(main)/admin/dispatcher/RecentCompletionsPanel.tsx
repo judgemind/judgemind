@@ -110,10 +110,16 @@ function RecentCompletionRow({
         {/* #2900: pass failureSummary through as hover tooltip for
             failure terminals. Null on succeeded / needs_review /
             pre-#2900 rows, in which case the pill falls back to its
-            built-in status-label tooltip (prior behaviour). */}
+            built-in status-label tooltip (prior behaviour).
+            #2953: pass the four milestone columns through so the pill
+            can render green vs. amber vs. red+milestone-breakdown. */}
         <OutcomePill
           status={completion.status}
           failureSummary={completion.failureSummary}
+          mergedAt={completion.mergedAt}
+          verifiedAt={completion.verifiedAt}
+          verifySkipReason={completion.verifySkipReason}
+          retroedAt={completion.retroedAt}
         />
       </span>
       {/* Unified (issue, priority, [pr,] title) prefix — matches

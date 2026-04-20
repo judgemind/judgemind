@@ -89,48 +89,47 @@ export function PriorityBadge({ priority }: { priority: string | null }) {
 }
 
 // ---------------------------------------------------------------------------
-// Outcome glyph pill — succeeded (✓ green), failed (✗ red), crashed (⚠ amber),
-// plan_blocked (⊘ neutral — #2857), needs_review (◐ yellow — #2856),
-// infra-preempted (↺ amber — #2947).
+// Outcome glyph pill — the single visual summary of an agent's terminal
+// state. One glyph per row; colour encodes pipeline completeness.
 //
-// Colour assignment intentionally keeps red reserved for genuine failure
-// and amber reserved for the crash-category anomaly. `plan_blocked`
-// ("plan correctly declined to proceed") is operator-informational, so
-// it uses the neutral muted surface — the same treatment `priority/p2`
-// gets above — per BRAND.md §"Minimal accent use". A dashboard full of
-// plan_blocked chips must not look like a house on fire.
+// Colour vocabulary (issue #2953):
+// * green  ✓ — shipped + post-merge bookkeeping complete (merged +
+//              verified OR verify-skipped-with-reason + retroed)
+// * amber  ✓ — shipped but post-merge bookkeeping incomplete (merged
+//              but missing verifiedAt AND no skip reason, OR missing
+//              retroedAt). Operator signal: "this PR landed, but
+//              verify/retro didn't finish — investigate why before
+//              trusting the shipment."
+// * red    ✗ — genuine failure (didn't merge).
+// * gray   ↺ — infra-preempted (dispatcher restart / killswitch). Not
+//              an operator action item; will auto-resume. Issue #2953
+//              changes the colour from amber (#2947) to gray to sit
+//              the glyph on the neutral palette — infra churn is not
+//              a warning, it's routine resumption.
+// * yellow ◐ — needs_review (#2856): ralph produced reviewer-approved
+//              SHIP code but summary flagged unmet AC; daemon opened a
+//              draft PR for operator triage.
+// * neutral⊘ — plan_blocked (#2857): plan correctly declined to
+//              proceed. Operator-informational, not alarming.
+// * fallback? — unknown status.
 //
-// `needs_review` is the one correct-outcome terminal that DOES need
-// operator action (ralph produced reviewer-approved SHIP code but
-// summary flagged unmet AC; the daemon opened a draft PR that sits
-// for operator triage). It earns yellow — adjacent to amber on the
-// colour wheel but visually distinct from crashed's amber so the
-// operator can scan the "Recently completed" panel and quickly
-// separate "review my draft PR" from "something crashed, diagnose
-// this". The glyph ◐ (half-circle) is the semantic anchor: ralph
-// did half the work, you do the other half (review + merge).
+// Tooltip:
+// For a merged row, the tooltip renders a milestone breakdown —
+// `merged 22:35 · verified 22:41 · retro 22:50` or
+// `merged 22:35 · verify skipped (self-deploy) · retro 22:48` or
+// `merged 22:35 · verified — · retro — (container restarted before retry)` —
+// so the operator can at-a-glance see where the pipeline stopped.
+// Non-merged rows keep the pre-#2953 tooltip behaviour (failureSummary
+// or status-label fallback).
 //
-// `infra_preempted` is a *derived* sub-category of `failed` for the two
-// infra-preemption categories in ``scripts/dispatcher/daemon.py``'s
-// ``_INFRA_PREEMPTION_CATEGORIES`` frozenset —
-// ``daemon_restart_abandoned`` and ``paused_by_killswitch``. These
-// agents didn't fail in any code/runtime sense; the dispatcher itself
-// interrupted them (restart recovery, or operator hit the killswitch)
-// and they will resume on the next tick. Rendering them as red ✗
-// misleads operators into treating them as actionable — which is the
-// opposite of the truth. They earn ↺ (counterclockwise arrow) in amber
-// to signal "will auto-resume; not an operator action item".
-//
-// Detection is pattern-based on `failureSummary`. The daemon writes
-// exactly two canonical strings for these categories —
-// ``"dispatcher restarted"`` (daemon_restart_abandoned) and
-// ``"manually stopped"`` (paused_by_killswitch) — from
-// ``_NO_TAIL_CATEGORY_SUMMARIES`` (issues #2924 / #2935). The resolver
-// surfaces these verbatim through ``failureSummary``. Pattern-matching
-// on this closed set is robust because the daemon has no other code
-// path that can produce these exact strings for a failed row. If the
-// daemon ever changes the strings, the pill falls back to the plain
-// red ✗ — a soft regression, not a crash.
+// `infra_preempted` is detected from `failureSummary` matching one of
+// the canonical strings produced by the daemon's
+// `_NO_TAIL_CATEGORY_SUMMARIES` map — `"dispatcher restarted"` (from
+// `daemon_restart_abandoned`) and `"manually stopped"` (from
+// `paused_by_killswitch`). This avoids plumbing a new `category`
+// field through GraphQL for what is effectively a display override;
+// any drift in the daemon strings just collapses back to the default
+// chip (soft regression, not a crash).
 // ---------------------------------------------------------------------------
 
 /**
@@ -161,9 +160,18 @@ export const INFRA_PREEMPTED_CATEGORIES: ReadonlySet<string> = new Set([
   'paused_by_killswitch',
 ]);
 
-/** Shared amber chip class for the ↺ infra-preempted glyph. Issue #2947. */
+/** Shared gray chip class for the ↺ infra-preempted glyph.
+ *
+ * Issue #2953: recoloured from amber (#2947) to gray. An infra-
+ * preempt is not a warning — it's a neutral resumption event
+ * (dispatcher restarted, operator hit killswitch, etc.). Amber
+ * inappropriately visually groups it with the amber ✓ "shipped but
+ * bookkeeping incomplete" state introduced by this issue; gray keeps
+ * the two clearly distinct. Uses `bg-muted` / `text-muted-foreground`
+ * so the chip inherits the shadcn neutral palette — same treatment as
+ * `plan_blocked` (⊘), with no accent weight. */
 export const INFRA_PREEMPTED_CHIP_CLASSES =
-  'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200';
+  'bg-muted text-muted-foreground';
 
 /** Shared ↺ glyph (U+21BA, ANTICLOCKWISE OPEN CIRCLE ARROW). Issue #2947. */
 export const INFRA_PREEMPTED_GLYPH = '\u21BA';
@@ -174,6 +182,18 @@ type OutcomeStatus =
   | 'crashed'
   | 'plan_blocked'
   | 'needs_review';
+
+/** Amber ✓ chip — shipped but post-merge bookkeeping incomplete.
+ *
+ * Issue #2953. Written when a row is ``status='succeeded'`` with a
+ * ``mergedAt`` timestamp (so it genuinely shipped) but either
+ * ``verifiedAt`` is missing with no skip reason, or ``retroedAt``
+ * is missing. The amber colour is distinct from the green ✓
+ * (``bg-green-100``), yellow ◐ (``bg-yellow-100``), and gray ↺
+ * (``bg-muted``) so the operator can scan the panel and separate
+ * the four "shipped" sub-states at a glance. */
+const INCOMPLETE_SUCCESS_CLASSES =
+  'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200';
 
 const OUTCOME_STYLES: Record<
   OutcomeStatus,
@@ -217,9 +237,93 @@ const OUTCOME_STYLES: Record<
   },
 };
 
+/** Format a milestone timestamp for the tooltip. Returns `HH:MM` in
+ * the viewer's local time (no date — the panel already scopes to
+ * recently-completed rows, full datetime is on the relative-time
+ * hover). Returns an em-dash for null / undefined / unparseable
+ * inputs so the tooltip format is stable. Issue #2953. */
+function formatMilestoneTime(ts: string | null | undefined): string {
+  if (!ts) return '\u2014';
+  const parsed = Date.parse(ts);
+  if (!Number.isFinite(parsed)) return '\u2014';
+  const d = new Date(parsed);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+/** Render the milestone-breakdown tooltip for a row. Issue #2953.
+ *
+ * Format:
+ *   `merged HH:MM · verified HH:MM · retro HH:MM`
+ *   `merged HH:MM · verify skipped (<reason>) · retro HH:MM`
+ *   `merged HH:MM · verified — · retro — (post-merge bookkeeping incomplete)`
+ *
+ * Rendered inside the native `title` attribute — plain text, no HTML.
+ * Reuses the same em-dash placeholder the milestone-time formatter
+ * produces so the tooltip shape is stable regardless of which
+ * milestones landed. */
+export function formatMilestoneTooltip(args: {
+  mergedAt: string | null;
+  verifiedAt: string | null;
+  verifySkipReason: string | null;
+  retroedAt: string | null;
+}): string {
+  const parts: string[] = [];
+  parts.push(`merged ${formatMilestoneTime(args.mergedAt)}`);
+  if (args.verifySkipReason) {
+    // Render the skip reason with underscores → spaces so
+    // ``self_deploy`` reads as ``self-deploy``. Keep the parens so
+    // the tooltip is scannable.
+    const pretty = args.verifySkipReason.replace(/_/g, '-');
+    parts.push(`verify skipped (${pretty})`);
+  } else {
+    parts.push(`verified ${formatMilestoneTime(args.verifiedAt)}`);
+  }
+  parts.push(`retro ${formatMilestoneTime(args.retroedAt)}`);
+
+  // If the row merged but any post-merge milestone is missing with no
+  // skip reason, append a short trailing hint so the operator can
+  // spot the incomplete-bookkeeping case at a glance.
+  const incomplete =
+    !!args.mergedAt &&
+    ((!args.verifiedAt && !args.verifySkipReason) || !args.retroedAt);
+  if (incomplete) {
+    parts.push('post-merge bookkeeping incomplete');
+  }
+  return parts.join(' \u00B7 ');
+}
+
+/** Return the pipeline-completeness category for a row. Issue #2953.
+ *
+ * - ``fully_complete`` — merged + (verified OR skipped with reason) +
+ *   retroed.
+ * - ``shipped_incomplete`` — merged, but verify and/or retro bookkeeping
+ *   did not complete (no skip reason to explain verify, or retro is
+ *   missing).
+ * - ``not_merged`` — no ``mergedAt`` signal; the base ``status`` drives
+ *   the glyph (failed / crashed / plan_blocked / needs_review).
+ *
+ * Pure-functional for testability. */
+export function classifyPipelineCompleteness(args: {
+  mergedAt: string | null;
+  verifiedAt: string | null;
+  verifySkipReason: string | null;
+  retroedAt: string | null;
+}): 'fully_complete' | 'shipped_incomplete' | 'not_merged' {
+  if (!args.mergedAt) return 'not_merged';
+  const verifyDone = !!args.verifiedAt || !!args.verifySkipReason;
+  const retroDone = !!args.retroedAt;
+  return verifyDone && retroDone ? 'fully_complete' : 'shipped_incomplete';
+}
+
 export function OutcomePill({
   status,
   failureSummary,
+  mergedAt = null,
+  verifiedAt = null,
+  verifySkipReason = null,
+  retroedAt = null,
 }: {
   status: string;
   /**
@@ -227,34 +331,45 @@ export function OutcomePill({
    * terminals: `failed` / `crashed` / `plan_blocked`), overrides the
    * default status-label tooltip so operators can scan the cause on
    * hover without opening the agent detail page. Null / undefined
-   * falls back to the default status label — preserves the existing
-   * UX for `succeeded` / `needs_review` rows and historical rows from
-   * before migration 33. Issue #2900.
-   *
-   * We deliberately do NOT render an always-visible second line — the
-   * "Recently completed" panel's density-first design (#2818) is the
-   * constraint. Tooltip-only.
+   * falls back to the default status label. Issue #2900.
    *
    * Issue #2947: when the summary exactly matches one of
-   * ``INFRA_PREEMPTED_SUMMARIES``, the pill re-skins to amber ↺
-   * (infra-preempted) instead of red ✗ / amber ⚠ — the agent was
-   * preempted by the dispatcher, not an operator action item.
+   * ``INFRA_PREEMPTED_SUMMARIES``, the pill re-skins to ↺ gray
+   * (infra-preempted) instead of red ✗ / amber ⚠. Issue #2953 moves
+   * the infra-preempt colour from amber → gray — see
+   * ``INFRA_PREEMPTED_CHIP_CLASSES``.
    */
   failureSummary?: string | null;
+  /** Issue #2953 — PR-merge timestamp. When present the pill uses the
+   * milestone-completeness rules (green ✓ vs. amber ✓) instead of the
+   * base status mapping. When null the pill falls back to the pre-
+   * #2953 status-only path. */
+  mergedAt?: string | null;
+  /** Issue #2953 — verify phase timestamp. */
+  verifiedAt?: string | null;
+  /** Issue #2953 — ``dispatcher.agents.verify_skip_reason``. Non-null
+   * means verify was intentionally skipped (today: ``self_deploy``).
+   * A merged row with a skip reason counts as fully-verified for the
+   * glyph colour — the skip was intentional, not a regression. */
+  verifySkipReason?: string | null;
+  /** Issue #2953 — retro phase timestamp. */
+  retroedAt?: string | null;
 }) {
   const info = OUTCOME_STYLES[status as OutcomeStatus];
   const trimmedSummary =
     failureSummary && failureSummary.trim() ? failureSummary.trim() : null;
-  // #2947: infra-preemption override. Daemon writes a short canonical
-  // string (``"dispatcher restarted"`` / ``"manually stopped"``) for
-  // the two `_INFRA_PREEMPTION_CATEGORIES` — those rows should render
-  // ↺ amber regardless of the stored `status` (today always `failed`
-  // for these, but we don't want to couple to that invariant).
-  // Pattern-matching on the closed set in ``INFRA_PREEMPTED_SUMMARIES``
-  // avoids plumbing a new `category` field through the GraphQL type
-  // for what is effectively a display override; any drift in the
-  // daemon's canonical strings just collapses back to the default red
-  // ✗ (a soft regression, not a crash).
+
+  // #2947 / #2953: infra-preemption override. Daemon writes a short
+  // canonical string (``"dispatcher restarted"`` / ``"manually
+  // stopped"``) for the two `_INFRA_PREEMPTION_CATEGORIES` — those
+  // rows render ↺ gray (was amber in #2947; #2953 recoloured to gray
+  // to keep infra churn on the neutral palette, distinct from the
+  // amber ✓ "shipped but bookkeeping incomplete" chip introduced by
+  // #2953). Pattern-matching on the closed set in
+  // ``INFRA_PREEMPTED_SUMMARIES`` avoids plumbing a new `category`
+  // field through GraphQL; any drift in the daemon strings just
+  // collapses back to the default red ✗ (soft regression, not a
+  // crash).
   if (trimmedSummary !== null && INFRA_PREEMPTED_SUMMARIES.has(trimmedSummary)) {
     return (
       <span
@@ -267,6 +382,81 @@ export function OutcomePill({
       </span>
     );
   }
+
+  // #2953: milestone-completeness path. When the row has a
+  // ``mergedAt`` stamp, it genuinely shipped — the glyph is always ✓,
+  // and the colour encodes whether the post-merge bookkeeping (verify
+  // + retro) completed. The milestone-breakdown tooltip replaces the
+  // status-label / failure-summary tooltips for merged rows so the
+  // operator can scan "where did this land in the pipeline" on hover
+  // without opening the agent detail page.
+  //
+  // Only applied when ``status`` resolves to 'succeeded' OR the row
+  // has a mergedAt (defensive — a row flipped back to 'failed' after
+  // a post-merge verify failure stays in the failure path, but we
+  // still want the tooltip to surface that it did merge).
+  if (mergedAt) {
+    const completeness = classifyPipelineCompleteness({
+      mergedAt,
+      verifiedAt,
+      verifySkipReason,
+      retroedAt,
+    });
+    const milestoneTooltip = formatMilestoneTooltip({
+      mergedAt,
+      verifiedAt,
+      verifySkipReason,
+      retroedAt,
+    });
+
+    // Genuine post-merge failure (verify FAILED → status flipped to
+    // 'failed' by _run_verify_and_complete). We keep the red ✗ glyph
+    // but the tooltip surfaces the milestone breakdown so the
+    // operator sees that the PR *did* ship before verify rejected it.
+    if (status === 'failed' || status === 'crashed') {
+      const failureInfo = info ?? OUTCOME_STYLES.failed;
+      const combinedTooltip = trimmedSummary
+        ? `${trimmedSummary} — ${milestoneTooltip}`
+        : milestoneTooltip;
+      return (
+        <span
+          aria-label={failureInfo.label}
+          title={combinedTooltip}
+          className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${failureInfo.className}`}
+          data-testid={`outcome-pill-${status}`}
+        >
+          {failureInfo.glyph}
+        </span>
+      );
+    }
+
+    // The succeeded / merged branch — green ✓ when fully complete,
+    // amber ✓ when shipped but bookkeeping incomplete.
+    const className =
+      completeness === 'fully_complete'
+        ? OUTCOME_STYLES.succeeded.className
+        : INCOMPLETE_SUCCESS_CLASSES;
+    const label =
+      completeness === 'fully_complete'
+        ? 'succeeded'
+        : 'shipped, post-merge bookkeeping incomplete';
+    const testId =
+      completeness === 'fully_complete'
+        ? 'outcome-pill-succeeded'
+        : 'outcome-pill-succeeded-incomplete';
+    return (
+      <span
+        aria-label={label}
+        title={milestoneTooltip}
+        className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${className}`}
+        data-testid={testId}
+      >
+        {OUTCOME_STYLES.succeeded.glyph}
+      </span>
+    );
+  }
+
+  // No mergedAt — fall back to the pre-#2953 status-only path.
   if (!info) {
     return (
       <span

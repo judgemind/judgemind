@@ -329,7 +329,11 @@ CREATE TABLE dispatcher.agents (
     model_override jsonb,
     issue_title text,
     failure_summary text,
-    priority text
+    priority text,
+    merged_at timestamp with time zone,
+    verified_at timestamp with time zone,
+    verify_skip_reason text,
+    retroed_at timestamp with time zone
 );
 
 
@@ -349,6 +353,18 @@ COMMENT ON COLUMN dispatcher.agents.failure_summary IS 'One-line "what happened"
 
 
 COMMENT ON COLUMN dispatcher.agents.priority IS 'Priority label captured at claim time (p0|p1|p2|p3|NULL). Written by both DispatcherDaemon._atomic_claim and scripts/dispatcher/task_claim.py. Reflects "priority when spawned"; does not retroactively update when the issue is relabeled on GitHub. Issue #2899.';
+
+
+COMMENT ON COLUMN dispatcher.agents.merged_at IS 'Timestamp the PR squash-merge was observed by the daemon (``_merge_pr_and_advance``). One-way latch: written once, never cleared. Paired with the ``status=''succeeded''`` write at the same merge point. NULL for rows that never merged (push_and_pr failed, CI red after retries, etc.) and for pre-migration-35 rows without a recoverable merge signal. Issue #2953.';
+
+
+COMMENT ON COLUMN dispatcher.agents.verified_at IS 'Timestamp the verify phase completed with verdict=VERIFIED. NULL when verify was intentionally skipped (see ``verify_skip_reason``), when verify crashed mid-phase, or for pre-migration-35 rows. A merged row with NULL ``verified_at`` AND NULL ``verify_skip_reason`` renders as amber ✓ in the admin cockpit — "shipped but post-merge bookkeeping incomplete". Issue #2953.';
+
+
+COMMENT ON COLUMN dispatcher.agents.verify_skip_reason IS 'Non-null when verify is intentionally skipped — the row is "shipped + verify-does-not-apply" rather than "shipped + verify failed to run". Today the only written value is ''self_deploy'' (dispatcher-self-PR touches ``scripts/dispatcher/`` and the new daemon deploy will land mid-verify, making verify against the soon-to-be-replaced process useless). Planned future values: ''docs_only'' (``docs/`` / ``*.md`` only), ''ci_cd_only'' (``.github/workflows/`` only). No CHECK constraint — the set is daemon-code owned. Issue #2953.';
+
+
+COMMENT ON COLUMN dispatcher.agents.retroed_at IS 'Timestamp the retro phase reached PHASE_RETRO_DONE. NULL when retro crashed, when the worktree was already gone at retro time (fast-path to cleanup_done), or for pre-migration-35 rows. A merged row with ``verified_at`` set but ``retroed_at`` NULL renders as amber ✓ — "shipped + verified but retro bookkeeping did not complete". Issue #2953.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (

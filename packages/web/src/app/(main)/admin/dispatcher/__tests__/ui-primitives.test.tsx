@@ -239,29 +239,37 @@ describe('OutcomePill', () => {
   // `paused_by_killswitch` (operator hit the global kill switch). The
   // daemon writes exactly two canonical `failure_summary` strings for
   // these — "dispatcher restarted" and "manually stopped" — and the pill
-  // re-skins to amber ↺ to signal "will auto-resume, not an action item".
-  describe('infra-preempted override (#2947)', () => {
-    it('renders ↺ in amber for "dispatcher restarted" (daemon_restart_abandoned)', () => {
+  // re-skins to ↺ to signal "will auto-resume, not an action item".
+  // #2953: the ↺ chip colour moved from amber → gray (bg-muted) so the
+  // infra-preempt glyph sits on the neutral palette, distinct from the
+  // amber ✓ "shipped but bookkeeping incomplete" chip this issue
+  // introduces.
+  describe('infra-preempted override (#2947, gray-recoloured by #2953)', () => {
+    it('renders ↺ in gray for "dispatcher restarted" (daemon_restart_abandoned)', () => {
       render(
         <OutcomePill status="failed" failureSummary="dispatcher restarted" />,
       );
       const pill = screen.getByTestId('outcome-pill-infra_preempted');
       expect(pill.textContent).toBe(INFRA_PREEMPTED_GLYPH);
       expect(pill.textContent).toBe('\u21BA');
-      expect(pill.className).toContain('bg-amber');
+      // Issue #2953: gray (bg-muted), not amber — infra churn is
+      // neutral, not a warning.
+      expect(pill.className).toContain('bg-muted');
+      expect(pill.className).not.toMatch(/bg-amber/);
       expect(pill.className).not.toMatch(/bg-red/);
       // aria-label is a neutral descriptor; operator-friendly.
       expect(pill.getAttribute('aria-label')).toBe('infra preempted');
       expect(pill.getAttribute('title')).toBe('dispatcher restarted');
     });
 
-    it('renders ↺ in amber for "manually stopped" (paused_by_killswitch)', () => {
+    it('renders ↺ in gray for "manually stopped" (paused_by_killswitch)', () => {
       render(
         <OutcomePill status="failed" failureSummary="manually stopped" />,
       );
       const pill = screen.getByTestId('outcome-pill-infra_preempted');
       expect(pill.textContent).toBe('\u21BA');
-      expect(pill.className).toContain('bg-amber');
+      expect(pill.className).toContain('bg-muted');
+      expect(pill.className).not.toMatch(/bg-amber/);
       expect(pill.className).not.toMatch(/bg-red/);
       expect(pill.getAttribute('title')).toBe('manually stopped');
     });
@@ -285,7 +293,7 @@ describe('OutcomePill', () => {
           failureSummary="subprocess crashed (turn limit)"
         />,
       );
-      // Regular failed path — red ✗, not amber ↺.
+      // Regular failed path — red ✗, not gray ↺.
       const pill = screen.getByTestId('outcome-pill-failed');
       expect(pill.textContent).toBe('\u2717');
       expect(pill.className).toContain('bg-red');
@@ -302,13 +310,14 @@ describe('OutcomePill', () => {
       // If a future code path writes `status='crashed'` for an
       // infra-preempted row (today the daemon uses `failed`, but we
       // intentionally don't couple to that), the pill should still
-      // re-skin to ↺ amber rather than keep the `⚠ crashed` look.
+      // re-skin to ↺ gray rather than keep the `⚠ crashed` look.
       render(
         <OutcomePill status="crashed" failureSummary="dispatcher restarted" />,
       );
       const pill = screen.getByTestId('outcome-pill-infra_preempted');
       expect(pill.textContent).toBe('\u21BA');
-      expect(pill.className).toContain('bg-amber');
+      expect(pill.className).toContain('bg-muted');
+      expect(pill.className).not.toMatch(/bg-amber/);
     });
 
     it('exports exactly the two canonical summary strings', () => {
@@ -331,6 +340,181 @@ describe('OutcomePill', () => {
         true,
       );
       expect(INFRA_PREEMPTED_CATEGORIES.has('paused_by_killswitch')).toBe(true);
+    });
+  });
+
+  // #2953: milestone-completeness glyph + colour logic. A merged row
+  // renders ✓ whose colour depends on whether post-merge bookkeeping
+  // (verify + retro) completed:
+  // - green ✓   — fully complete
+  // - amber ✓   — shipped but bookkeeping incomplete
+  // - red ✗     — verify flipped status back to 'failed' post-merge
+  // - gray ↺    — infra-preempted (see infra-preempted suite above)
+  describe('milestone-completeness (#2953)', () => {
+    it('renders green ✓ when merged + verified + retroed', () => {
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-20T22:35:00Z"
+          verifiedAt="2026-04-20T22:41:00Z"
+          retroedAt="2026-04-20T22:50:00Z"
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded');
+      expect(pill.textContent).toBe('\u2713');
+      expect(pill.className).toContain('bg-green');
+      expect(pill.className).not.toMatch(/bg-amber/);
+    });
+
+    it('renders green ✓ when verify-skipped-with-reason + retroed', () => {
+      // Dispatcher-self-PR case — verifySkipReason is the canonical
+      // signal; verifiedAt is null (the verify phase didn't run).
+      // The glyph should still be green.
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-20T22:35:00Z"
+          verifiedAt={null}
+          verifySkipReason="self_deploy"
+          retroedAt="2026-04-20T22:48:00Z"
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded');
+      expect(pill.textContent).toBe('\u2713');
+      expect(pill.className).toContain('bg-green');
+    });
+
+    it('renders amber ✓ when merged but retroed is missing', () => {
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-20T22:35:00Z"
+          verifiedAt="2026-04-20T22:41:00Z"
+          retroedAt={null}
+        />,
+      );
+      // Data-testid differs so tests can distinguish the two success
+      // variants without relying on class-string matching.
+      const pill = screen.getByTestId('outcome-pill-succeeded-incomplete');
+      expect(pill.textContent).toBe('\u2713');
+      expect(pill.className).toContain('bg-amber');
+      expect(pill.className).not.toMatch(/bg-green/);
+    });
+
+    it('renders amber ✓ when merged but verifiedAt is missing with no skip reason', () => {
+      // Historical (pre-migration-35) succeeded row has mergedAt set
+      // from the backfill but verifiedAt NULL and no skip reason —
+      // we genuinely don't know whether verify ran, so the amber ✓
+      // ("incomplete bookkeeping") is the honest signal.
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-19T10:00:00Z"
+          verifiedAt={null}
+          retroedAt={null}
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded-incomplete');
+      expect(pill.textContent).toBe('\u2713');
+      expect(pill.className).toContain('bg-amber');
+    });
+
+    it('renders red ✗ for a post-merge verify failure', () => {
+      // verify returned FAILED → daemon flipped status back to 'failed'
+      // (real regression signal — the deployed code didn't behave as
+      // expected). mergedAt stays set so the tooltip can still show
+      // the shipment, but the glyph colour is red.
+      render(
+        <OutcomePill
+          status="failed"
+          mergedAt="2026-04-20T22:35:00Z"
+          verifiedAt={null}
+          retroedAt={null}
+          failureSummary="verify FAILED: API returned 500"
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.textContent).toBe('\u2717');
+      expect(pill.className).toContain('bg-red');
+    });
+
+    it('falls back to the pre-#2953 status-only path when mergedAt is null', () => {
+      // A row that never merged (push_and_pr failed, CI red after
+      // retries) has mergedAt null — the milestone-completeness
+      // branch does not apply. The pill renders red ✗ with the
+      // standard failure tooltip.
+      render(
+        <OutcomePill
+          status="failed"
+          mergedAt={null}
+          failureSummary="git push failed"
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-failed');
+      expect(pill.textContent).toBe('\u2717');
+      expect(pill.className).toContain('bg-red');
+      expect(pill.getAttribute('title')).toBe('git push failed');
+    });
+
+    it('milestone-breakdown tooltip shows merged / verified / retro times', () => {
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-20T22:35:00Z"
+          verifiedAt="2026-04-20T22:41:00Z"
+          retroedAt="2026-04-20T22:50:00Z"
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded');
+      const tooltip = pill.getAttribute('title') ?? '';
+      expect(tooltip).toMatch(/merged \d{2}:\d{2}/);
+      expect(tooltip).toMatch(/verified \d{2}:\d{2}/);
+      expect(tooltip).toMatch(/retro \d{2}:\d{2}/);
+      expect(tooltip).toContain('\u00B7'); // middle-dot separator
+    });
+
+    it('tooltip shows skip reason when verifySkipReason is set', () => {
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-20T22:35:00Z"
+          verifiedAt={null}
+          verifySkipReason="self_deploy"
+          retroedAt="2026-04-20T22:48:00Z"
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded');
+      const tooltip = pill.getAttribute('title') ?? '';
+      expect(tooltip).toContain('verify skipped (self-deploy)');
+    });
+
+    it('tooltip flags post-merge bookkeeping incompleteness', () => {
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-19T10:00:00Z"
+          verifiedAt={null}
+          retroedAt={null}
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded-incomplete');
+      const tooltip = pill.getAttribute('title') ?? '';
+      expect(tooltip).toContain('post-merge bookkeeping incomplete');
+    });
+
+    it('tooltip em-dashes missing milestones in the fully-incomplete case', () => {
+      render(
+        <OutcomePill
+          status="succeeded"
+          mergedAt="2026-04-19T10:00:00Z"
+          verifiedAt={null}
+          retroedAt={null}
+        />,
+      );
+      const pill = screen.getByTestId('outcome-pill-succeeded-incomplete');
+      const tooltip = pill.getAttribute('title') ?? '';
+      expect(tooltip).toContain('verified \u2014');
+      expect(tooltip).toContain('retro \u2014');
     });
   });
 });

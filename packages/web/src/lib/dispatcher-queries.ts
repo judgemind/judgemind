@@ -77,6 +77,10 @@ export const DISPATCHER_STATE_QUERY = gql`
         totalTokens
         totalCostUsd
         failureSummary
+        mergedAt
+        verifiedAt
+        verifySkipReason
+        retroedAt
       }
       config {
         key
@@ -220,6 +224,27 @@ export interface RecentCompletion {
    * glyph in the `Recently completed` panel — no always-visible second
    * line. Issue #2900. */
   failureSummary: string | null;
+  /** Timestamp the PR squash-merge was observed by the daemon. Paired
+   * with the `status='succeeded'` flip at merge time — `mergedAt != null`
+   * is the canonical "shipped" signal. Null on rows that never merged
+   * (push failed, CI red after retries, etc.) and on pre-migration-35
+   * historical rows. Issue #2953. */
+  mergedAt: string | null;
+  /** Timestamp the verify phase completed with verdict=VERIFIED. Null
+   * when verify was intentionally skipped (see `verifySkipReason`),
+   * when verify crashed mid-phase, or for pre-migration-35 rows.
+   * Issue #2953. */
+  verifiedAt: string | null;
+  /** Non-null when verify was intentionally skipped. Today the only
+   * written value is `"self_deploy"` (dispatcher-self-PR touches
+   * `scripts/dispatcher/`). A merged row with a non-null skip reason
+   * counts as fully-shipped (green ✓) — skipping is not a regression.
+   * Issue #2953. */
+  verifySkipReason: string | null;
+  /** Timestamp the retro phase completed (reached PHASE_RETRO_DONE).
+   * Null when retro crashed, when the worktree was already gone at
+   * retro time, or for pre-migration-35 rows. Issue #2953. */
+  retroedAt: string | null;
 }
 
 export interface DispatcherConfigEntry {
