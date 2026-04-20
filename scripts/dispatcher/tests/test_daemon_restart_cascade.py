@@ -840,3 +840,260 @@ class TestAutoRetryCategoriesIncludesRestartAbandoned:
             daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
             in daemon.AUTO_RETRY_CATEGORIES
         )
+
+
+# --------------------------------------------------------------------------
+# Issue #2925 — terminal-and-reclaim for infra-preemption retry markers
+# --------------------------------------------------------------------------
+
+
+class TestProcessRetryMarkersInfraPreemption:
+    """Infra-preemption markers take the terminal-and-reclaim path.
+
+    Before #2925, ``_process_retry_markers`` reset infra-preemption markers
+    to ``status='retrying' phase='claiming'`` — leaving a zombie row in
+    ``dispatcher.agents`` with ``ended_at=NULL`` that blocked the partial
+    UNIQUE INDEX and prevented fresh claims. The fix instead marks the old
+    row terminal (``status='failed'``, ``phase=reason``, ``ended_at=now()``)
+    and adds ``agent/ready`` back to the issue so the scheduler re-discovers
+    it.
+    """
+
+    def _make_infra_marker_row(
+        self,
+        tmp_path: Path,
+        reason: str,
+        issue_number: int = 42,
+    ) -> tuple[Any, _FakeConnection, _CapturingLogHandler]:
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [
+                (
+                    1,  # marker_id
+                    "agent-infra-preempted",
+                    reason,
+                    1,  # attempt
+                    str(tmp_path / "worktrees" / "agent-infra"),  # worktree_path
+                    issue_number,
+                ),
+            ],
+        ]
+        return d, conn, handler
+
+    def test_restart_abandoned_terminates_old_and_unblocks_claim(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``daemon_restart_abandoned`` marks the row failed + adds agent/ready.
+
+        Verifies:
+        - ``_mark_agent_terminal`` called with ``status='failed'``,
+          ``phase='daemon_restart_abandoned'``, ``issue_number=42``.
+        - ``agent/ready`` label added via ``_gh_issue_add_labels``.
+        - Marker resolved via ``UPDATE dispatcher.retry_markers SET resolved_at``.
+        - No ``status='retrying'`` UPDATE emitted.
+        - No ``phase_transitions ('retry_reset')`` INSERT emitted.
+        - ``daemon.retry_terminal_and_reclaim`` log event emitted.
+        """
+        d, conn, handler = self._make_infra_marker_row(
+            tmp_path, daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        gh_calls: list[tuple[int, list[str]]] = []
+
+        def fake_gh_add(issue_num: int, labels: list[str]) -> None:
+            gh_calls.append((issue_num, labels))
+
+        monkeypatch.setattr(d, "_gh_issue_add_labels", fake_gh_add)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        # agent/ready added.
+        assert gh_calls == [(42, ["agent/ready"])], (
+            f"expected [(42, ['agent/ready'])], got {gh_calls}"
+        )
+
+        # No retrying-reset UPDATE.
+        retrying_resets = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+        ]
+        assert retrying_resets == [], (
+            f"infra-preemption path must not emit retrying reset; got {retrying_resets}"
+        )
+
+        # No retry_reset phase_transition.
+        retry_reset_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.phase_transitions" in e[0]
+            and e[1] is not None
+            and "retry_reset" in str(e[1])
+        ]
+        assert retry_reset_inserts == [], (
+            f"infra-preemption path must not insert retry_reset transition; got {retry_reset_inserts}"
+        )
+
+        # Marker resolved.
+        resolves = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.retry_markers" in e[0]
+            and "resolved_at" in e[0]
+        ]
+        assert resolves, "retry marker must be resolved"
+
+        # Terminal-and-reclaim log event emitted.
+        reclaim_events = handler.events("retry_terminal_and_reclaim")
+        assert len(reclaim_events) == 1
+        assert getattr(reclaim_events[0], "reason", None) == (
+            daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
+        )
+
+        # No retry_processed event (that's for the budgeted path).
+        assert handler.events("retry_processed") == []
+
+    def test_paused_by_killswitch_takes_same_terminal_path(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``paused_by_killswitch`` follows the same terminal-and-reclaim flow."""
+        d, conn, handler = self._make_infra_marker_row(
+            tmp_path, daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        gh_calls: list[tuple[int, list[str]]] = []
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: gh_calls.append((n, l)))
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        assert gh_calls == [(42, ["agent/ready"])]
+
+        retrying_resets = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+        ]
+        assert retrying_resets == []
+
+        reclaim_events = handler.events("retry_terminal_and_reclaim")
+        assert len(reclaim_events) == 1
+        assert getattr(reclaim_events[0], "reason", None) == (
+            daemon.FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH
+        )
+
+    def test_mark_agent_terminal_called_with_correct_args(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``_mark_agent_terminal`` receives status='failed', phase=reason, issue_number.
+
+        Integration-style: verify the _mark_agent_terminal call shape
+        mirrors the ``recover_abandoned_agents`` precedent (line 3660).
+        """
+        d, conn, handler = self._make_infra_marker_row(
+            tmp_path,
+            daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+            issue_number=2925,
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: None)
+
+        terminal_calls: list[dict[str, Any]] = []
+
+        original_mark = d._mark_agent_terminal
+
+        def capturing_mark(
+            agent_id: str,
+            status: str,
+            phase: str,
+            exit_code: int | None = None,
+            pr_number: int | None = None,
+            issue_number: int | None = None,
+        ) -> None:
+            terminal_calls.append(
+                {
+                    "agent_id": agent_id,
+                    "status": status,
+                    "phase": phase,
+                    "exit_code": exit_code,
+                    "issue_number": issue_number,
+                }
+            )
+            original_mark(
+                agent_id,
+                status=status,
+                phase=phase,
+                exit_code=exit_code,
+                issue_number=issue_number,
+            )
+
+        monkeypatch.setattr(d, "_mark_agent_terminal", capturing_mark)
+
+        d._process_retry_markers()
+
+        assert len(terminal_calls) == 1
+        call = terminal_calls[0]
+        assert call["status"] == "failed"
+        assert call["phase"] == daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED
+        assert call["exit_code"] is None
+        assert call["issue_number"] == 2925
+
+
+# --------------------------------------------------------------------------
+# Issue #2925 — _drop_worktree_best_effort missing path guard
+# --------------------------------------------------------------------------
+
+
+class TestDropWorktreeBestEffortMissingPath:
+    """When the worktree path doesn't exist, no subprocess fires.
+
+    Before #2925, ``_drop_worktree_best_effort`` always tried
+    ``cleanup_worktree.sh`` and/or ``git worktree remove`` even when the
+    path was already gone — emitting the noisy ``worktree_remove_nonzero``
+    WARNING on every daemon restart. The fix returns True immediately
+    when ``Path(worktree_path).exists()`` is False and logs a lighter
+    ``worktree_already_gone`` INFO event.
+    """
+
+    def test_missing_path_logs_already_gone_no_subprocess(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        d, _conn, handler = _make_daemon(tmp_path)
+
+        subprocess_calls: list[Any] = []
+
+        def fake_run(cmd: Any, **_kwargs: Any) -> Any:
+            subprocess_calls.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Stub Path.exists to return False for any path.
+        monkeypatch.setattr(
+            "dispatcher.daemon.Path",
+            lambda p: type("_FakePath", (), {"exists": lambda self: False})(),
+        )
+
+        result = d._drop_worktree_best_effort("/nonexistent/worktree/agent-abc")
+
+        assert result is True, "should return True (path already gone = success)"
+        assert subprocess_calls == [], (
+            f"no subprocess should fire when path is missing; got {subprocess_calls}"
+        )
+
+        events = handler.events("worktree_already_gone")
+        assert len(events) == 1
+        assert getattr(events[0], "worktree_path", None) == (
+            "/nonexistent/worktree/agent-abc"
+        )
+        # INFO level, not WARNING.
+        assert events[0].levelno == logging.INFO, (
+            f"expected INFO, got {logging.getLevelName(events[0].levelno)}"
+        )
