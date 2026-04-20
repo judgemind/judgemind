@@ -184,7 +184,8 @@ class TestPhase3EPhaseConstants:
 
     def test_retro_phase_in_max_turns(self) -> None:
         assert "retro" in daemon.PHASE_MAX_TURNS
-        assert daemon.PHASE_MAX_TURNS["retro"] == 30
+        # 10× bumped in #2885 (was 30).
+        assert daemon.PHASE_MAX_TURNS["retro"] == 300
 
     def test_retro_phase_in_models(self) -> None:
         assert "retro" in daemon.PHASE_MODELS

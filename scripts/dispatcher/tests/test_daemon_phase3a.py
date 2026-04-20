@@ -1099,7 +1099,7 @@ class TestSpawnPhaseSubprocess:
         assert "--cwd" not in captured["cmd"]
         assert captured["cwd"] == str(tmp_path)
         assert "--max-turns" in captured["cmd"]
-        assert "50" in captured["cmd"]  # plan
+        assert "500" in captured["cmd"]  # plan — 10× bumped in #2885
         assert "--model" in captured["cmd"]
         assert "opus" in captured["cmd"]
         assert captured["timeout"] == 180 * 60
@@ -1107,9 +1107,10 @@ class TestSpawnPhaseSubprocess:
         log_path = tmp_path / "tmp" / "claude-p-plan.log"
         assert log_path.exists()
 
-    def test_ralph_uses_sonnet_and_500_turns(
+    def test_ralph_uses_sonnet_and_5000_turns(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """Ralph's max_turns was 10× bumped to 5000 in #2885."""
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
@@ -1121,12 +1122,13 @@ class TestSpawnPhaseSubprocess:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
-        assert "500" in captured["cmd"]
+        assert "5000" in captured["cmd"]
         assert "sonnet" in captured["cmd"]
 
-    def test_summary_uses_haiku_and_30_turns(
+    def test_summary_uses_haiku_and_300_turns(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """Summary's max_turns was 10× bumped to 300 in #2885."""
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
@@ -1138,7 +1140,7 @@ class TestSpawnPhaseSubprocess:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         d._spawn_phase_subprocess("summary", tmp_path, "agent-uuid")
-        assert "30" in captured["cmd"]
+        assert "300" in captured["cmd"]
         assert "haiku" in captured["cmd"]
 
 
