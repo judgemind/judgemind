@@ -4,6 +4,8 @@ import {
   RecentCompletionsPanel,
   formatCostFootnote,
   formatTokenCount,
+  formatRelativeTime,
+  formatPacificDatetime,
 } from '../RecentCompletionsPanel';
 import type { RecentCompletion } from '@/lib/dispatcher-queries';
 
@@ -59,7 +61,9 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.queryByTestId('pr-link-null')).not.toBeInTheDocument();
   });
 
-  it('#2818: does not render a "N min ago" completion-time column', () => {
+  // #2932 re-introduces the relative-time cell that #2818 stripped,
+  // with a better abbreviated format and a Pacific-time hover tooltip.
+  it('#2932: renders the abbreviated relative-time cell (5m ago) after the cost footnote', () => {
     const items = [
       completion({
         endedAt: '2026-04-18T11:55:00Z', // 5 min ago from the fixed `now`
@@ -67,7 +71,8 @@ describe('RecentCompletionsPanel', () => {
       }),
     ];
     render(<RecentCompletionsPanel completions={items} nowMs={now} />);
-    expect(screen.queryByText(/\bago\b/i)).not.toBeInTheDocument();
+    const cell = screen.getByTestId('completion-row-relative-time');
+    expect(cell.textContent).toBe('5m ago');
   });
 
   it('#2818: still shows the "(title unavailable)" placeholder when issueTitle is null', () => {
@@ -165,6 +170,58 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.queryByText(summary)).not.toBeInTheDocument();
   });
 
+  // --- #2932 — relative-time cell (re-introduced post-#2818 density pass).
+  it('#2932: places the relative-time cell AFTER the cost footnote in DOM order', () => {
+    const items = [
+      completion({
+        agentId: 'agent-order',
+        endedAt: '2026-04-18T11:55:00Z', // 5m ago
+        totalCostUsd: 0.42,
+        totalTokens: 12000,
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const cost = screen.getByTestId('completion-row-cost');
+    const timestamp = screen.getByTestId('completion-row-relative-time');
+    // `compareDocumentPosition`: 0x04 = DOCUMENT_POSITION_FOLLOWING.
+    expect(
+      cost.compareDocumentPosition(timestamp) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('#2932: sets the native `title` attribute on the cell to a Pacific-time datetime', () => {
+    const items = [
+      completion({
+        agentId: 'agent-pacific',
+        endedAt: '2026-04-18T11:55:00Z',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const cell = screen.getByTestId('completion-row-relative-time');
+    const title = cell.getAttribute('title');
+    expect(title).not.toBeNull();
+    // Format: "YYYY-MM-DD HH:MM:SS PDT" or "PST" — Pacific time always
+    // abbreviates to one of these two. April is PDT.
+    expect(title).toMatch(
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T$/,
+    );
+    expect(title).toContain('PDT');
+  });
+
+  it('#2932: falls back to Date.now() when nowMs prop is omitted', () => {
+    // Render without `nowMs`. The cell still renders (with some age
+    // computed against real wall-clock time). We only assert the cell
+    // is present and has the expected testid — the exact text depends
+    // on wall-clock time at test runtime so we don't pin it.
+    const items = [completion({ agentId: 'agent-realtime' })];
+    render(<RecentCompletionsPanel completions={items} />);
+    const cell = screen.getByTestId('completion-row-relative-time');
+    expect(cell).toBeInTheDocument();
+    // Must have a non-empty title attribute (Pacific datetime).
+    expect(cell.getAttribute('title')).toMatch(/P[DS]T$/);
+  });
+
   it('#2869: renders only the available half when the other metering field is null', () => {
     const costOnly = [
       completion({
@@ -232,5 +289,125 @@ describe('formatTokenCount (#2869)', () => {
   it('renders raw count for < 1k so "0k" does not imply zero cost', () => {
     expect(formatTokenCount(500)).toBe('500 tok');
     expect(formatTokenCount(0)).toBe('0 tok');
+  });
+});
+
+describe('formatRelativeTime (#2932)', () => {
+  // Anchor "now" at a fixed instant so the age math is deterministic.
+  const nowMs = Date.parse('2026-04-20T12:00:00Z');
+
+  function at(isoOffset: string): number {
+    return Date.parse(isoOffset);
+  }
+
+  it('renders "Just now" for < 60 seconds (30s case)', () => {
+    const thirtySecondsAgo = nowMs - 30 * 1000;
+    expect(formatRelativeTime(thirtySecondsAgo, nowMs)).toBe('Just now');
+  });
+
+  it('renders "5m ago" for 5 minutes', () => {
+    const fiveMinutesAgo = nowMs - 5 * 60 * 1000;
+    expect(formatRelativeTime(fiveMinutesAgo, nowMs)).toBe('5m ago');
+  });
+
+  it('renders "47m ago" for 47 minutes (edge of the hour bucket)', () => {
+    const fortySevenMinutesAgo = nowMs - 47 * 60 * 1000;
+    expect(formatRelativeTime(fortySevenMinutesAgo, nowMs)).toBe('47m ago');
+  });
+
+  it('renders "1h ago" for exactly 1 hour', () => {
+    const oneHourAgo = nowMs - 60 * 60 * 1000;
+    expect(formatRelativeTime(oneHourAgo, nowMs)).toBe('1h ago');
+  });
+
+  it('renders "23h ago" for 23 hours (edge of the day bucket)', () => {
+    const twentyThreeHoursAgo = nowMs - 23 * 60 * 60 * 1000;
+    expect(formatRelativeTime(twentyThreeHoursAgo, nowMs)).toBe('23h ago');
+  });
+
+  it('renders "1 day ago" (SINGULAR) for exactly 1 day', () => {
+    const oneDayAgo = nowMs - 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(oneDayAgo, nowMs)).toBe('1 day ago');
+  });
+
+  it('renders "2 days ago" for 2 days', () => {
+    const twoDaysAgo = nowMs - 2 * 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(twoDaysAgo, nowMs)).toBe('2 days ago');
+  });
+
+  it('renders "11 days ago" for 11 days', () => {
+    const elevenDaysAgo = nowMs - 11 * 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(elevenDaysAgo, nowMs)).toBe('11 days ago');
+  });
+
+  it('renders "1 month ago" for 40 days (≥ 30-day bucket, singular)', () => {
+    const fortyDaysAgo = nowMs - 40 * 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(fortyDaysAgo, nowMs)).toBe('1 month ago');
+  });
+
+  it('renders "3 months ago" for 100 days', () => {
+    const hundredDaysAgo = nowMs - 100 * 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(hundredDaysAgo, nowMs)).toBe('3 months ago');
+  });
+
+  it('renders "1 year ago" for 400 days (singular)', () => {
+    const fourHundredDaysAgo = nowMs - 400 * 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(fourHundredDaysAgo, nowMs)).toBe('1 year ago');
+  });
+
+  it('renders "N years ago" for multi-year ages', () => {
+    const threeYearsAgo = nowMs - 3 * 365 * 24 * 60 * 60 * 1000;
+    expect(formatRelativeTime(threeYearsAgo, nowMs)).toBe('3 years ago');
+  });
+
+  it('renders "Just now" for future timestamps (clock skew)', () => {
+    const fiveSecondsInTheFuture = nowMs + 5 * 1000;
+    expect(formatRelativeTime(fiveSecondsInTheFuture, nowMs)).toBe('Just now');
+  });
+
+  it('boundary: 59 seconds → "Just now", 60 seconds → "1m ago"', () => {
+    expect(formatRelativeTime(nowMs - 59 * 1000, nowMs)).toBe('Just now');
+    expect(formatRelativeTime(nowMs - 60 * 1000, nowMs)).toBe('1m ago');
+  });
+
+  it('boundary: 59 minutes → "59m ago", 60 minutes → "1h ago"', () => {
+    expect(formatRelativeTime(nowMs - 59 * 60 * 1000, nowMs)).toBe('59m ago');
+    expect(formatRelativeTime(nowMs - 60 * 60 * 1000, nowMs)).toBe('1h ago');
+  });
+
+  it('boundary: 29 days → "29 days ago", 30 days → "1 month ago"', () => {
+    expect(formatRelativeTime(nowMs - 29 * 24 * 60 * 60 * 1000, nowMs)).toBe(
+      '29 days ago',
+    );
+    expect(formatRelativeTime(nowMs - 30 * 24 * 60 * 60 * 1000, nowMs)).toBe(
+      '1 month ago',
+    );
+  });
+
+  // Keep this cheap — `at` is only used when the test needs an
+  // absolute ISO-8601 date rather than an offset.
+  it('works with ISO-parsed endedAt values (smoke test)', () => {
+    expect(formatRelativeTime(at('2026-04-20T11:55:00Z'), nowMs)).toBe('5m ago');
+  });
+});
+
+describe('formatPacificDatetime (#2932)', () => {
+  it('formats an April UTC timestamp as PDT (daylight time)', () => {
+    // 2026-04-20T22:36:39Z is 15:36:39 in Pacific Daylight Time (UTC-7).
+    const ms = Date.parse('2026-04-20T22:36:39Z');
+    expect(formatPacificDatetime(ms)).toBe('2026-04-20 15:36:39 PDT');
+  });
+
+  it('formats a January UTC timestamp as PST (standard time)', () => {
+    // 2026-01-15T18:00:00Z is 10:00:00 in Pacific Standard Time (UTC-8).
+    const ms = Date.parse('2026-01-15T18:00:00Z');
+    expect(formatPacificDatetime(ms)).toBe('2026-01-15 10:00:00 PST');
+  });
+
+  it('emits a consistent YYYY-MM-DD HH:MM:SS ZZZ shape', () => {
+    const ms = Date.parse('2026-04-20T22:36:39Z');
+    expect(formatPacificDatetime(ms)).toMatch(
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T$/,
+    );
   });
 });
