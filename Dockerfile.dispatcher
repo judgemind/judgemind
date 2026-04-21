@@ -329,9 +329,9 @@ ENV GIT_SHA=${GIT_SHA}
 # subagents) inherits the identity via ``/etc/gitconfig`` without
 # needing per-user setup. Values are cosmetic — GitHub attributes
 # the merged commit to the PR author via the squash-merge flow, not
-# this identity.
+# this identity. ``noreply@`` by convention is non-deliverable.
 # ---------------------------------------------------------------------------
-RUN git config --system user.email "dispatcher@judgemind.org" \
+RUN git config --system user.email "noreply@judgemind.org" \
     && git config --system user.name "Judgemind Dispatcher"
 
 # ---------------------------------------------------------------------------
