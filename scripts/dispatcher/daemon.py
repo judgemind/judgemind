@@ -6658,6 +6658,153 @@ class DispatcherDaemon:
         output_path = output_dir / "plan.json"
         output_path.write_text(json.dumps(plan_output, indent=2, default=str))
 
+    def _fetch_prior_attempts(self, issue_number: int) -> list[dict[str, Any]]:
+        """Return up to 3 prior non-infra-preempted failed agents for *issue_number*.
+
+        Queries ``dispatcher.agents`` LEFT JOIN ``dispatcher.phase_outputs``
+        (twice — once for the ``ralph`` phase log, once for the
+        ``push_and_pr`` phase log) and returns rows for agents whose terminal
+        phase is NOT in :data:`_INFRA_PREEMPTION_CATEGORIES` (i.e. real
+        budgeted retries: ``subprocess_crash``, ``stuck_timeout``,
+        ``gh_rate_exhausted``, ``operator_retry``).
+
+        Returns an empty list on any DB error (fail-open — the spawn
+        continues without prior context).
+
+        Each returned dict has keys:
+
+        * ``failure_summary`` — ``a.failure_summary`` (may be ``None``).
+        * ``ralph_log_text``  — ``po.log_text`` for the ralph phase (may be ``None``).
+        * ``push_log_text``   — ``pp.log_text`` for the push_and_pr phase (may be ``None``).
+        * ``started_at``      — ``a.started_at`` as a string (ISO-8601).
+        """
+        assert self._conn is not None, "connect() must run before prior-attempts query"
+
+        non_infra_phases = list(_INFRA_PREEMPTION_CATEGORIES)
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT "
+                    "  a.failure_summary, "
+                    "  po.log_text, "
+                    "  pp.log_text, "
+                    "  a.started_at "
+                    "FROM dispatcher.agents a "
+                    "LEFT JOIN dispatcher.phase_outputs po "
+                    "  ON po.agent_id = a.agent_id AND po.phase = 'ralph' "
+                    "LEFT JOIN dispatcher.phase_outputs pp "
+                    "  ON pp.agent_id = a.agent_id AND pp.phase = 'push_and_pr' "
+                    "WHERE a.issue_number = %s "
+                    "  AND a.status IN ('failed', 'crashed') "
+                    "  AND a.phase NOT IN %s "
+                    "ORDER BY a.started_at DESC "
+                    "LIMIT 3",
+                    (issue_number, tuple(non_infra_phases)),
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.prior_attempts_query_failed",
+                extra={
+                    "event": "prior_attempts_query_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return []
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            failure_summary, ralph_log, push_log, started_at = row
+            started_at_str = (
+                started_at.isoformat()
+                if hasattr(started_at, "isoformat")
+                else str(started_at or "")
+            )
+            results.append(
+                {
+                    "failure_summary": failure_summary,
+                    "ralph_log_text": ralph_log,
+                    "push_log_text": push_log,
+                    "started_at": started_at_str,
+                }
+            )
+        return results
+
+    def _materialize_prior_attempts(self, worktree: Path, issue_number: int) -> int:
+        """Write ``prior_attempts.md`` to the worktree and return the attempt count.
+
+        Fetches up to 3 prior non-infra-preempted failures via
+        :meth:`_fetch_prior_attempts` and formats them into a markdown file at
+        ``{worktree}/tmp/dispatcher-output/prior_attempts.md`` so the ralph
+        skill can surface them to fresh workers.
+
+        **When the count is 0 the file is NOT written** — the first-attempt
+        path must not receive a stale or empty ``prior_attempts.md`` that could
+        confuse the worker.
+
+        The markdown shape for each attempt::
+
+            ## Prior attempt N (started <ISO-ts>)
+
+            **Category:** <failure_summary or "unknown">
+
+            **Pre-push failure tail:**
+
+            <last ~2000 chars of push_and_pr log, or "(none)">
+
+            **Ralph iteration narrative:**
+
+            <## Iteration feedback section extracted from ralph log, or "(none)">
+
+        Returns the number of attempts written (0 if none).
+        """
+        attempts = self._fetch_prior_attempts(issue_number)
+        if not attempts:
+            return 0
+
+        sections: list[str] = []
+        for i, attempt in enumerate(attempts, start=1):
+            failure_summary = attempt.get("failure_summary") or "unknown"
+            started_at = attempt.get("started_at") or "unknown"
+
+            # Push-and-pr log tail (~2000 chars).
+            push_log = attempt.get("push_log_text") or ""
+            if push_log:
+                push_tail = push_log[-2000:] if len(push_log) > 2000 else push_log
+            else:
+                push_tail = "(none)"
+
+            # Extract the ## Iteration feedback section from the ralph log.
+            ralph_log = attempt.get("ralph_log_text") or ""
+            ralph_narrative = "(none)"
+            if ralph_log:
+                marker = "## Iteration feedback"
+                idx = ralph_log.find(marker)
+                if idx != -1:
+                    ralph_narrative = ralph_log[idx:]
+
+            section = (
+                f"## Prior attempt {i} (started {started_at})\n\n"
+                f"**Category:** {failure_summary}\n\n"
+                f"**Pre-push failure tail:**\n\n"
+                f"{push_tail}\n\n"
+                f"**Ralph iteration narrative:**\n\n"
+                f"{ralph_narrative}"
+            )
+            sections.append(section)
+
+        content = "\n\n---\n\n".join(sections)
+        output_dir = worktree / "tmp" / "dispatcher-output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "prior_attempts.md").write_text(content, encoding="utf-8")
+        return len(attempts)
+
     def _run_plan_phase(self, agent_id: str, issue_number: int, worktree: Path) -> bool:
         """Run ``/task-v2-plan``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "planning")
@@ -6816,6 +6963,24 @@ class DispatcherDaemon:
     ) -> bool:
         """Run ``/task-v2-ralph``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "ralph")
+
+        # ── Prior-attempt context (#2984) ──────────────────────────────────
+        # Before seeding the ralph input bundle, materialize prior failed
+        # attempts (non-infra-preempted) into prior_attempts.md so the
+        # /task-v2-ralph skill can surface them to fresh workers.  The call
+        # is a no-op (returns 0, writes no file) on first-attempt spawns.
+        prior_attempts_count = self._materialize_prior_attempts(worktree, issue_number)
+        self._log.info(
+            "daemon.ralph_spawn",
+            extra={
+                "event": "ralph_spawn",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "prior_attempts_count": prior_attempts_count,
+            },
+        )
+        # ── end prior-attempt context ──────────────────────────────────────
 
         plan_output = self._agent_plan_output or {}
         ralph_input = {

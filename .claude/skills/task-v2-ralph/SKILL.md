@@ -138,7 +138,18 @@ Before Step 1, verify the `Task` tool is callable. The check is implementation-d
 }
 ```
 
-**If `Task` is available**, continue to Step 1.
+**If `Task` is available**, continue to Step 0.5.
+
+---
+
+## Step 0.5 — Load prior-attempt context (if present)
+
+Before seeding the ralph state directory, check whether the daemon has left a prior-attempts file at `{worktree}/tmp/dispatcher-output/prior_attempts.md`.
+
+- **If the file exists**: read it. Its content will be included in `task.md` under a `## Prior attempts` section (see Step 1) so the inner `/ralph` worker has explicit failure context from previous runs.
+- **If the file does not exist** (first-attempt case): skip this step. Do NOT create the file, do NOT include a `## Prior attempts` section in `task.md`. The worker receives no prior-attempt context — this is the correct zero-cost path for new issues.
+
+Store the file content (or empty string) for use in Step 1.
 
 ---
 
@@ -183,7 +194,13 @@ Create `{worktree}/tmp/ralph/` if it does not exist. Write:
   ## Scope boundary
 
   <any items from plan.scope_check with in_scope=false — so worker does NOT touch them>
+
+  ## Prior attempts (optional — omit this section if no prior_attempts.md exists)
+
+  <verbatim content of {worktree}/tmp/dispatcher-output/prior_attempts.md if present>
   ```
+
+  Include the `## Prior attempts` section only when `{worktree}/tmp/dispatcher-output/prior_attempts.md` exists (i.e. when Step 0.5 found the file). When the file is absent, omit the section entirely — the worker should not see an empty or placeholder section.
 
 - `feedback.md` — `No prior feedback. This is the first iteration.`
 
@@ -296,6 +313,14 @@ Capture `changed_files` from `git -C {worktree} diff --name-only origin/main...H
 Compose `summary` as 1-3 sentences describing what was implemented. Pull from the worker's final status report or the Claude reviewer's SHIP justification.
 
 ## Step 4 — Write output JSON and exit
+
+**Before writing the JSON**, run the iteration-feedback helper to capture any multi-iteration feedback into the result field:
+
+```
+python3 {worktree}/scripts/dispatcher/iteration_feedback.py {worktree}/tmp/ralph/feedback.md
+```
+
+Capture stdout. If the output is non-empty it is the `## Iteration feedback` section (starting with `---\n## Iteration feedback (from feedback.md)\n\n...`). Append this verbatim to the `summary` field or to a separate `iteration_feedback` key in the output JSON — either way the daemon's `_read_full_phase_log` captures the full terminal text (stdout + structured logs) into `phase_outputs.log_text`, so downstream retry spawns can query that column for the iteration narrative.
 
 Use the Write tool to emit `{worktree}/tmp/dispatcher-output/ralph.json` with the fields above. Exit 0.
 
