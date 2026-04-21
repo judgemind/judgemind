@@ -46,6 +46,8 @@ htmlcov/
 coverage.xml
 lcov.info
 .pytest_cache/
+.testmondata
+.testmondata-journal
 
 # Docker
 docker-compose.override.yml
