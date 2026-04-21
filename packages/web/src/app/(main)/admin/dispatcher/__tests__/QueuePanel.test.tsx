@@ -163,4 +163,36 @@ describe('QueuePanel', () => {
     expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('1 shown');
     expect(screen.getByTestId('queue-blocked-count')).toHaveTextContent('0 shown');
   });
+
+  // --- #2967 — Magic Move `view-transition-name` on ready-panel rows.
+  //             The blocked-panel rows intentionally do NOT get a name
+  //             because they are not part of the Queue → Active flow
+  //             and would collide with the Active outer on transitions
+  //             between ready and blocked labels.
+  it('#2967: ready panel rows carry view-transition-name: issue-<N>', () => {
+    const items = [
+      item({ issueNumber: 2801, title: 'first' }),
+      item({ issueNumber: 2802, title: 'second' }),
+    ];
+    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    const row1 = screen.getByTestId('queue-row-2801');
+    const row2 = screen.getByTestId('queue-row-2802');
+    expect((row1 as HTMLElement).style.viewTransitionName).toBe('issue-2801');
+    expect((row2 as HTMLElement).style.viewTransitionName).toBe('issue-2802');
+  });
+
+  it('#2967: blocked panel rows do NOT carry a view-transition-name', () => {
+    const blocked = [
+      item({ issueNumber: 2500, title: 'blocked issue' }),
+    ];
+    render(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
+    // Blocked rows are intentionally not animated — they don't show up
+    // in the Queue → Active → Completed flow, and giving them the same
+    // `issue-<N>` name as a ready row of the same issue number would
+    // cause a DOM collision the next time an issue flips between the
+    // two label states. We assert via the absence of any
+    // `queue-row-<N>` test id — the animated-row testid is only set on
+    // ready rows.
+    expect(screen.queryByTestId('queue-row-2500')).toBeNull();
+  });
 });

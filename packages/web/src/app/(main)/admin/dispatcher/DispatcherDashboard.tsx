@@ -1,10 +1,11 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { notFound } from 'next/navigation';
 import { useMutation, useQuery } from '@apollo/client';
 import { useAuth } from '@/providers/AuthProvider';
 import { ErrorBanner } from '@/components/ErrorBanner';
+import { useViewTransitionUpdate } from '@/hooks/useViewTransition';
 import { PAGE_TITLE } from '@/lib/typography';
 import {
   DISPATCHER_CONTROL_MUTATION,
@@ -117,6 +118,35 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
       fetchPolicy: 'cache-and-network',
     },
   );
+
+  // Magic Move wiring (#2967). Apollo's `useQuery` pushes poll results
+  // straight into `data`, but Magic Move needs the DOM mutation to happen
+  // *inside* a `document.startViewTransition` callback so the browser
+  // can snapshot the old frame, run the React render, then animate each
+  // `view-transition-name` from its old position to its new one. We
+  // mirror `data` into a local `renderedData` state and flip it through
+  // the view-transition wrapper; the panel components render from the
+  // mirror, so every poll update (and every imperative `refetch()`)
+  // flows through the animation path without changing Apollo's cache
+  // behaviour. On first paint we initialise synchronously — the very
+  // first frame would have no "old" snapshot to animate from anyway.
+  const [renderedData, setRenderedData] = useState<DispatcherStateData | undefined>(
+    data,
+  );
+  const startViewTransitionUpdate = useViewTransitionUpdate();
+  const lastAppliedDataRef = useRef<DispatcherStateData | undefined>(data);
+  useEffect(() => {
+    if (data === undefined) return;
+    if (data === lastAppliedDataRef.current) return;
+    const hasPrior = lastAppliedDataRef.current !== undefined;
+    lastAppliedDataRef.current = data;
+    if (!hasPrior) {
+      // First successful fetch — no prior frame to transition from.
+      setRenderedData(data);
+      return;
+    }
+    startViewTransitionUpdate(() => setRenderedData(data));
+  }, [data, startViewTransitionUpdate]);
 
   const [dispatcherControl, { loading: controlLoading }] =
     useMutation<DispatcherControlData>(DISPATCHER_CONTROL_MUTATION);
@@ -236,7 +266,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   const handleConfigEdit = useCallback(
     async (key: string, value: string): Promise<void> => {
       if (key === 'concurrency_cap') {
-        const entries = data?.dispatcherState?.config ?? [];
+        const entries = renderedData?.dispatcherState?.config ?? [];
         const current = entries.find((e) => e.key === 'concurrency_cap');
         const currentValue = current ? parsePositiveInt(current.value) : null;
         const nextValue = parsePositiveInt(value);
@@ -255,7 +285,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
       }
       await commitConfigEdit(key, value);
     },
-    [commitConfigEdit, data],
+    [commitConfigEdit, renderedData],
   );
 
   // Loading states — show the skeleton while either auth or the first
@@ -264,7 +294,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     return <SkeletonShell />;
   }
 
-  const state = data?.dispatcherState;
+  const state = renderedData?.dispatcherState;
 
   // GraphQL errors — hard-fail only when we have no cached state to show.
   // Apollo's polling contract is that `data` and `error` can both be
@@ -279,7 +309,13 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     return <ErrorBanner message="Failed to load dispatcher state." onRetry={() => void refetch()} />;
   }
 
-  const showInitialLoad = loading && !state;
+  // `showInitialLoad` was historically `loading && !state`. After the
+  // Magic Move mirror (#2967) it also needs to cover the one-render
+  // gap between Apollo populating `data` and the useEffect flipping
+  // `renderedData`: if we render before the effect commits, `state`
+  // would be undefined even though data is ready. `data && !state`
+  // catches that frame and keeps the skeleton up.
+  const showInitialLoad = (loading && !state) || (data !== undefined && !state);
 
   return (
     <div>

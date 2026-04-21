@@ -513,3 +513,36 @@ describe('formatPacificDatetime (#2932)', () => {
     );
   });
 });
+
+describe('RecentCompletionsPanel — Magic Move view-transition names (#2967)', () => {
+  it('tags each row with view-transition-name: agent-<agentId>', () => {
+    // Use real-shaped UUIDs rather than the fixture's `agent-1` so the
+    // resulting name isn't the visually confusing `agent-agent-1`. The
+    // production data model stores bare UUIDs without an `agent-`
+    // prefix; the `agent-` *prefix* is the view-transition-name prefix,
+    // not part of the id.
+    const items = [
+      completion({
+        agentId: 'aabbccdd-eeff-0011-2233-445566778899',
+        issueNumber: 2967,
+      }),
+      completion({
+        agentId: '11223344-5566-7788-99aa-bbccddeeff00',
+        issueNumber: 2900,
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const row1 = screen.getByTestId(
+      'completion-row-aabbccdd-eeff-0011-2233-445566778899',
+    );
+    const row2 = screen.getByTestId(
+      'completion-row-11223344-5566-7788-99aa-bbccddeeff00',
+    );
+    expect((row1 as HTMLElement).style.viewTransitionName).toBe(
+      'agent-aabbccdd-eeff-0011-2233-445566778899',
+    );
+    expect((row2 as HTMLElement).style.viewTransitionName).toBe(
+      'agent-11223344-5566-7788-99aa-bbccddeeff00',
+    );
+  });
+});

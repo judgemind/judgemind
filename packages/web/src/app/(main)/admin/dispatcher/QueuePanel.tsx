@@ -1,5 +1,6 @@
 'use client';
 
+import type { CSSProperties } from 'react';
 import { SECTION_HEADING } from '@/lib/typography';
 import type { QueueItem } from '@/lib/dispatcher-queries';
 import { IssueLink, PriorityBadge } from './ui-primitives';
@@ -122,7 +123,11 @@ export function QueueReadyPanel({
       ) : (
         <ul className="divide-y divide-border">
           {items.map((item) => (
-            <QueueRow key={item.issueNumber} item={item} />
+            <QueueRow
+              key={item.issueNumber}
+              item={item}
+              animated
+            />
           ))}
         </ul>
       )}
@@ -165,9 +170,35 @@ export function QueueBlockedPanel({
   );
 }
 
-function QueueRow({ item }: { item: QueueItem }) {
+function QueueRow({
+  item,
+  animated = false,
+}: {
+  item: QueueItem;
+  /**
+   * When true, apply a stable ``view-transition-name`` keyed on the
+   * issue number so the row can Magic Move between the Agent-ready
+   * queue and the Active agents panel (#2967). Only the ready panel
+   * passes `animated`; the Blocked panel is a stable sidebar that is
+   * not part of the Queue → Active → Completed flow.
+   */
+  animated?: boolean;
+}) {
+  // CSS's `view-transition-name` property isn't in the standard React
+  // `CSSProperties` type yet (the project pins `@types/react` 18), so
+  // we splice it in via a narrow cast rather than widening the global
+  // `CSSProperties` declaration. The browser and jsdom both accept the
+  // kebab-case key on the `style` attribute; React happily camelCases
+  // it at runtime.
+  const rowStyle = animated
+    ? ({ viewTransitionName: `issue-${item.issueNumber}` } as CSSProperties)
+    : undefined;
   return (
-    <li className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50">
+    <li
+      className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50"
+      style={rowStyle}
+      data-testid={animated ? `queue-row-${item.issueNumber}` : undefined}
+    >
       <div className="flex-shrink-0 pt-0.5">
         <IssueLink number={item.issueNumber} />
       </div>

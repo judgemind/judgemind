@@ -103,3 +103,44 @@ describe('ActiveAgentsTable — empty state', () => {
     expect(screen.getByText('No active agents.')).toBeInTheDocument();
   });
 });
+
+describe('ActiveAgentsTable — Magic Move view-transition names (#2967)', () => {
+  it('renders outer <li> with view-transition-name: issue-<N>', () => {
+    const agent = makeAgent({ id: 'agent-42', issueNumber: 2967 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const outer = screen.getByTestId(`active-agent-row-${agent.id}`);
+    // React camel-cases `viewTransitionName`; jsdom exposes it on the
+    // `style` property. Assert the exact value so a future rename of
+    // the prefix fails loudly.
+    expect((outer as HTMLElement).style.viewTransitionName).toBe(
+      `issue-${agent.issueNumber}`,
+    );
+  });
+
+  it('renders inner wrapper with view-transition-name: agent-<id>', () => {
+    const agent = makeAgent({ id: 'agent-42', issueNumber: 2967 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const inner = screen.getByTestId(`active-agent-inner-${agent.id}`);
+    expect((inner as HTMLElement).style.viewTransitionName).toBe(
+      `agent-${agent.id}`,
+    );
+  });
+
+  it('nests the agent wrapper inside the issue wrapper (enables the failure-retry split)', () => {
+    const agent = makeAgent({ id: 'agent-42', issueNumber: 2967 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const outer = screen.getByTestId(`active-agent-row-${agent.id}`);
+    const inner = screen.getByTestId(`active-agent-inner-${agent.id}`);
+    // The inner `agent-X` wrapper must be a DOM descendant of the outer
+    // `issue-N` <li>. That nesting is what lets the same frame animate
+    // the inner card into Completed while the outer shell flies back
+    // to the Queue on a failure-with-retry (see tmp/magic-move-proto).
+    expect(outer.contains(inner)).toBe(true);
+  });
+});
