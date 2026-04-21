@@ -7,18 +7,32 @@
 # anything — the image just has to boot, tick, heartbeat, and exit cleanly
 # on SIGTERM.
 #
-# Base image choice — `node:20-slim`:
-# - Spike 0.1 (docs/investigations/dispatcher-v2-spike-0.1.md) validated
-#   this exact base for `claude -p` on Fargate.
-# - Python is installed on top via apt. The dispatcher is Python 3.12; the
-#   Claude Code CLI is a Node binary published as
-#   `@anthropic-ai/claude-code`. Running both from one image avoids a
-#   second-language multi-stage build.
+# Base image choice — `python:3.12-slim`:
+# - The dispatcher is Python 3.12. More importantly, every ralph subagent
+#   that spawns inside this container runs pre-push checks that invoke
+#   `pytest` against per-package venvs — and those venvs are built against
+#   the codebase's canonical 3.12 interpreter (see #2491's
+#   `scripts/install-package-venv.sh`). Packages in this repo use PEP 695
+#   generic syntax (e.g. `def retry_sync[T](...)` at
+#   `packages/scraper-framework/src/framework/retry.py:13`), which fails
+#   to parse on 3.11 — meaning a 3.11-based dispatcher would see every
+#   ralph pre-push that touches scraper-framework fail at
+#   pytest-collection time with a SyntaxError, not a real test result
+#   (#2968).
+# - The Claude Code CLI is a Node binary published as
+#   `@anthropic-ai/claude-code`. Node 20+ is installed on top via the
+#   NodeSource apt repository so both languages coexist in one image —
+#   avoids a second-language multi-stage build.
 # - We do NOT layer this on top of `packages/scraper-framework/Dockerfile`
-#   (which is `python:3.12-slim`) because the scraper image carries
+#   (which is also `python:3.12-slim`) because the scraper image carries
 #   Playwright + Chromium — ~400 MB of browser binaries the daemon has no
-#   use for. Starting from `node:20-slim` keeps the image under ~600 MB
-#   even after pip installs.
+#   use for.
+# - Historical note: Phase 1 originally used `node:20-slim` (validated by
+#   spike 0.1 at docs/investigations/dispatcher-v2-spike-0.1.md). That
+#   was fine when the daemon ran nothing but itself. Once Phase 2+ ralph
+#   subagents started running pytest in-container, the 3.11 default of
+#   Debian bookworm became a hard blocker — the swap to `python:3.12-slim`
+#   is the direct fix.
 #
 # $HOME policy:
 # - The base image lands at `/root`; we override to `/home/dispatcher` so
@@ -40,22 +54,28 @@
 #         judgemind-dispatcher-local \
 #         --tick-scheduler-seconds 5 --tick-supervisor-seconds 10
 
-FROM node:20-slim
+FROM python:3.12-slim
 
 # ---------------------------------------------------------------------------
-# System deps: Python 3 (Debian bookworm ships Python 3.11, which is fine
-# — the daemon only uses 3.11-compatible features: `datetime.UTC` landed
-# in 3.11, no 3.12-only syntax is used. See `pyproject.toml` /
-# `.python-version` in the repo for local dev on 3.12; the Fargate image
-# pinning 3.11 means we can keep the single `node:20-slim` base without
-# needing to install Python from source or pull in deadsnakes).
+# System deps: we install on top of the official Python 3.12 slim base
+# (Debian bookworm + `python` / `python3` / `pip` already wired up —
+# `python --version` → `Python 3.12.x`). Python 3.12 is required because
+# packages in this repo use PEP 695 generic syntax (e.g.
+# `def retry_sync[T](...)` at
+# `packages/scraper-framework/src/framework/retry.py:13`), which fails to
+# parse on 3.11. A 3.11-based dispatcher blocked every pytest-gated ralph
+# pre-push that touched scraper-framework — see #2968 for the incident.
 #
-# Also installed: git + gh CLI (needed by future /task-v2-* phases —
-# spike 0.7 wired these into the spike image and confirmed
-# `gh auth setup-git` + `git push` work with the scoped PAT secret),
-# plus ca-certificates and curl for the claude-code install and any
-# outbound HTTPS (GitHub API, Anthropic API, ECR, Telegram, Secrets
-# Manager).
+# Node 20+ is installed below (separate RUN) via the NodeSource apt
+# repository — the `@anthropic-ai/claude-code` CLI is a Node binary and
+# requires Node 20+.
+#
+# git + gh CLI are needed by future /task-v2-* phases (spike 0.7 wired
+# these into the spike image and confirmed `gh auth setup-git` +
+# `git push` work with the scoped PAT secret). ca-certificates, curl,
+# and gnupg cover the claude-code install path, the NodeSource + GitHub
+# CLI keyring installs, and any outbound HTTPS (GitHub API, Anthropic
+# API, ECR, Telegram, Secrets Manager).
 # ---------------------------------------------------------------------------
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -63,9 +83,23 @@ RUN apt-get update \
         curl \
         gnupg \
         git \
-        python3 \
-        python3-venv \
-        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Node.js 20 via NodeSource
+#
+# The official python:3.12-slim base doesn't ship Node. Debian bookworm's
+# default apt `nodejs` package is 18.x, which is below the
+# `@anthropic-ai/claude-code` Node 20+ floor. NodeSource publishes
+# first-party apt repositories pinned to a specific major version; the
+# one-liner install script below adds the node_20.x repo and installs
+# the matching nodejs package (npm is bundled).
+#
+# See https://github.com/nodesource/distributions for the canonical
+# install script (MIT-licensed, maintained by the Node.js foundation).
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the GitHub CLI from the official apt repository. The
@@ -82,12 +116,6 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
-
-# Make `python` resolve to the installed system python3 so
-# `python -m scripts.dispatcher.daemon` in the CMD below always picks
-# the interpreter we installed (node:20-slim has no `python` alias
-# out-of-the-box).
-RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # ---------------------------------------------------------------------------
 # Python dependencies
@@ -108,14 +136,12 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # new layer only for a pip install step means future Phase 2+ changes bust
 # only the COPY layers below, not the Python install.
 # ---------------------------------------------------------------------------
-# Newer pip enforces PEP 668 "externally-managed-environment" on Debian's
-# system Python. We install at the system level (there is only one
-# Python process in the container and it is the daemon itself), so
-# opt out of the marker explicitly — same pattern used by the public
-# `claude-code` Dockerfile and the python:3.12-slim base of our scraper
-# image (which doesn't enforce it because its Python comes from the
-# official `python` image, not Debian's system packages).
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
+# The official `python:3.12-slim` base uses its own interpreter (not
+# Debian's system Python), so pip does NOT enforce the PEP 668
+# "externally-managed-environment" marker here. We can `pip install`
+# directly into the base interpreter without `--break-system-packages`
+# or an explicit venv (there is only one Python process in the container
+# and it is the daemon itself).
 RUN pip install --no-cache-dir \
     "psycopg[binary]>=3.1,<4" \
     "boto3>=1.34,<2"
@@ -210,10 +236,10 @@ ENV GIT_SHA=${GIT_SHA}
 # `command` override just follow through as argv. Tick-scheduler and
 # tick-supervisor default to the spec's 30s / 120s.
 #
-# NOTE: `node:20-slim` inherits a `docker-entrypoint.sh` that wraps
-# every CMD with `exec node`; ours runs Python, not Node, so we reset
-# ENTRYPOINT explicitly. Without this, `docker run <img> --help` would
-# route the `--help` to node and print Node's help text.
+# NOTE: the `python:3.12-slim` base image has no inherited entrypoint
+# (its default CMD is an interactive `python3` REPL). Setting ENTRYPOINT
+# explicitly makes `docker run <img> --flag` route the flag to the
+# daemon's argv instead of python's.
 # ---------------------------------------------------------------------------
 ENTRYPOINT ["python", "-m", "scripts.dispatcher.daemon"]
 CMD []
