@@ -25,7 +25,12 @@ export function applyMigrations(): void {
   try {
     execSync('npx node-pg-migrate up --no-timestamp', {
       cwd: apiDir,
-      env: { ...process.env, DATABASE_URL: dbUrl },
+      // NODE_TLS_REJECT_UNAUTHORIZED=0 bypasses SSL cert verification for the
+      // migration child process only. This is intentional for test setup — CI
+      // uses a plain localhost postgres (no SSL), and dev RDS uses a self-signed
+      // cert chain that pg now rejects by default after a pg-connection-string
+      // upgrade. Production code is unaffected.
+      env: { ...process.env, DATABASE_URL: dbUrl, NODE_TLS_REJECT_UNAUTHORIZED: '0' },
       stdio: 'pipe',
     });
   } catch (err: unknown) {

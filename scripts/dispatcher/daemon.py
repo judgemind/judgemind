@@ -3150,13 +3150,10 @@ class DispatcherDaemon:
     def _issue_in_cooldown(self, issue_number: int) -> bool:
         """True if this issue's most recent ``dispatcher.agents`` row is fresh.
 
-        Freshness window is :data:`FAILED_AGENT_COOLDOWN_SECONDS`. All
-        statuses count (not just ``failed``/``crashed``) so a recent
-        ``running`` / ``succeeded`` agent also prevents immediate
-        re-claim — though in practice ``running`` is already caught by
-        :meth:`_issue_already_attempted` (partial UNIQUE INDEX), this
-        extra belt keeps the predicate simple + single-source-of-truth:
-        "did we touch this issue recently? skip".
+        Delegates to ``dispatcher.issue_cooldown_remaining_seconds`` (SQL
+        function, migration 37).  Returns ``True`` when the function returns a
+        positive integer (cooldown still running), ``False`` when it returns
+        ``0`` (elapsed) or ``NULL`` (never attempted).
 
         Returns True (fail-closed — treat as in cooldown) on DB error
         to avoid the failure-loop amplification the cooldown exists to
@@ -3166,10 +3163,7 @@ class DispatcherDaemon:
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM dispatcher.agents "
-                    "WHERE issue_number = %s "
-                    "  AND started_at > now() - make_interval(secs => %s) "
-                    "LIMIT 1",
+                    "SELECT dispatcher.issue_cooldown_remaining_seconds(%s, %s) > 0",
                     (issue_number, FAILED_AGENT_COOLDOWN_SECONDS),
                 )
                 row = cur.fetchone()
@@ -3190,25 +3184,29 @@ class DispatcherDaemon:
             # Fail closed — treat as in cooldown on a DB hiccup so we
             # don't amplify a failure loop on top of a DB problem.
             return True
-        return row is not None
+        # row[0] is True (in cooldown), False (elapsed), or None (NULL > 0
+        # evaluates to NULL in SQL, which fetchone returns as Python None).
+        # NULL means never attempted → not in cooldown.
+        return bool(row[0]) if row and row[0] is not None else False
 
     def _issue_already_attempted(self, issue_number: int) -> bool:
         """True if ``dispatcher.agents`` has any active/succeeded row for this issue.
 
+        Delegates to ``dispatcher.issue_has_active_agent`` (SQL function,
+        migration 37).  The function mirrors :data:`ACTIVE_AGENT_STATUSES`
+        (``running``, ``retrying``, ``succeeded``, ``needs_review``).
+
         The partial UNIQUE INDEX (migration 25) enforces uniqueness on
-        ``running`` and ``retrying``. The extra ``succeeded`` check
-        here is so a successful prior run (not yet cleaned up) doesn't
+        ``running`` and ``retrying``. The extra ``succeeded`` / ``needs_review``
+        check is so a successful prior run (not yet cleaned up) doesn't
         get double-processed before the PR merges.
         """
         assert self._conn is not None, "connect() must run before reading"
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM dispatcher.agents "
-                    "WHERE issue_number = %s "
-                    "  AND status = ANY(%s) "
-                    "LIMIT 1",
-                    (issue_number, list(ACTIVE_AGENT_STATUSES)),
+                    "SELECT dispatcher.issue_has_active_agent(%s)",
+                    (issue_number,),
                 )
                 row = cur.fetchone()
             self._conn.commit()
@@ -3228,7 +3226,7 @@ class DispatcherDaemon:
             # Fail closed — pretend the issue is already attempted so
             # we don't double-claim on a DB hiccup.
             return True
-        return row is not None
+        return bool(row[0]) if row else False
 
     def _issue_author_trusted(self, issue_number: int) -> bool:
         """Run ``scripts/check-issue-author.sh`` and return True iff exit 0.

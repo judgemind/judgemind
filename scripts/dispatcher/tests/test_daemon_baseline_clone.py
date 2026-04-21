@@ -705,13 +705,14 @@ class TestCooldownSkip:
         self, tmp_path: Path
     ) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(1,)]
+        # New SQL: SELECT dispatcher.issue_cooldown_remaining_seconds(%s, %s) > 0
+        # Returns (True,) when there is remaining cooldown.
+        conn.cursor_instance.fetch_queue = [(True,)]
         assert d._issue_in_cooldown(42) is True
-        # Confirm the SQL fires against dispatcher.agents with a
-        # started_at interval bound.
+        # Confirm the SQL delegates to the SQL function (migration 37).
         executed = conn.cursor_instance.executed
         assert any(
-            "dispatcher.agents" in sql and "started_at" in sql and "secs => %s" in sql
+            "dispatcher.issue_cooldown_remaining_seconds" in sql
             for sql, _params in executed
         )
         # And the parameters include the issue number + cooldown seconds.
@@ -721,7 +722,8 @@ class TestCooldownSkip:
 
     def test_cooldown_db_query_returns_false_when_no_row(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [None]
+        # New SQL returns NULL (→ Python None) when no prior row exists.
+        conn.cursor_instance.fetch_queue = [(None,)]
         assert d._issue_in_cooldown(42) is False
 
     def test_cooldown_fail_closed_on_db_error(self, tmp_path: Path) -> None:

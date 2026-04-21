@@ -584,3 +584,139 @@ describe('dispatcherControl — admin', () => {
     expect(rows[0].command).toBe('start');
   });
 });
+
+// ---------------------------------------------------------------------------
+// queueReady — predicate SQL functions contract test (#3001)
+//
+// Seed: queue snapshot with issues A=1001, B=1002, C=1003.
+//   - B has a running agent row → active, should be filtered out.
+//   - C has a failed agent row started 10 minutes ago → cooldown remaining.
+//   - A has no agent row → null cooldown, should appear normally.
+//
+// Asserts:
+//   - queueReady contains 1001 and 1003; does NOT contain 1002.
+//   - 1003's cooldownSecondsRemaining is > 0 and <= 3600.
+//   - 1001's cooldownSecondsRemaining is null.
+//   - activeAgents contains 1002.
+//   - Drift guard: direct SQL call to dispatcher.issue_has_active_agent(1002)
+//     returns true, confirming the SQL function matches the filter behaviour.
+//     If someone removes 'running' from the active-status list in the SQL,
+//     the GraphQL filter AND this assertion both fail — catching drift.
+// ---------------------------------------------------------------------------
+
+describe('queueReady — SQL predicate functions contract (#3001)', () => {
+  let snapshotRunId: string;
+  const ISSUE_A = 1001;
+  const ISSUE_B = 1002;
+  const ISSUE_C = 1003;
+  const insertedAgentIds3001: string[] = [];
+
+  beforeAll(async () => {
+    // Insert a run for the snapshot.
+    const { rows: runRows } = await pool.query<{ run_id: string }>(
+      `INSERT INTO dispatcher.runs (version_sha, host, pid)
+       VALUES ('deadbeef', $1, 1234)
+       RETURNING run_id`,
+      [`${MARKER}-host-3001`],
+    );
+    snapshotRunId = runRows[0].run_id;
+    insertedRunIds.push(snapshotRunId);
+
+    // Insert queue snapshot with issues A, B, C.
+    const issuesJson = JSON.stringify([
+      { number: ISSUE_A, title: 'Issue A (never attempted)', labels: ['priority/p2', 'agent/ready'], createdAt: '2026-04-01T00:00:00Z' },
+      { number: ISSUE_B, title: 'Issue B (running agent)', labels: ['priority/p2', 'agent/ready'], createdAt: '2026-04-01T00:00:00Z' },
+      { number: ISSUE_C, title: 'Issue C (failed, in cooldown)', labels: ['priority/p2', 'agent/ready'], createdAt: '2026-04-01T00:00:00Z' },
+    ]);
+    await pool.query(
+      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, issues_json, run_id)
+       VALUES (now(), 3, ARRAY[$1, $2, $3]::int[], $4::jsonb, $5)`,
+      [ISSUE_A, ISSUE_B, ISSUE_C, issuesJson, snapshotRunId],
+    );
+
+    // Insert running agent for issue B (active).
+    const { rows: agentBRows } = await pool.query<{ agent_id: string }>(
+      `INSERT INTO dispatcher.agents (issue_number, worktree_path, phase, status, started_at)
+       VALUES ($1, $2, 'ralph', 'running', now() - interval '5 minutes')
+       RETURNING agent_id`,
+      [ISSUE_B, `/tmp/${MARKER}/agent-3001-b`],
+    );
+    insertedAgentIds3001.push(agentBRows[0].agent_id);
+    insertedAgentIds.push(agentBRows[0].agent_id);
+
+    // Insert failed agent for issue C (recent failure → cooldown).
+    const { rows: agentCRows } = await pool.query<{ agent_id: string }>(
+      `INSERT INTO dispatcher.agents (issue_number, worktree_path, phase, status, started_at, ended_at)
+       VALUES ($1, $2, 'push_and_pr', 'failed', now() - interval '10 minutes', now() - interval '5 minutes')
+       RETURNING agent_id`,
+      [ISSUE_C, `/tmp/${MARKER}/agent-3001-c`],
+    );
+    insertedAgentIds3001.push(agentCRows[0].agent_id);
+    insertedAgentIds.push(agentCRows[0].agent_id);
+  }, 30_000);
+
+  it('queueReady contains A and C but not B (active agent filtered)', async () => {
+    const body = await gql(
+      `{
+        dispatcherState {
+          queueReady {
+            issueNumber
+            cooldownSecondsRemaining
+          }
+          activeAgents {
+            issueNumber
+          }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    const queueReady = state.queueReady as Array<{ issueNumber: number; cooldownSecondsRemaining: number | null }>;
+    const activeAgents = state.activeAgents as Array<{ issueNumber: number }>;
+
+    const readyNumbers = queueReady.map((i) => i.issueNumber);
+
+    // B has a running agent — must be filtered from queueReady.
+    expect(readyNumbers).not.toContain(ISSUE_B);
+
+    // A and C must appear in queueReady.
+    expect(readyNumbers).toContain(ISSUE_A);
+    expect(readyNumbers).toContain(ISSUE_C);
+
+    // C started 10 minutes ago; cooldown window is 3600s, so ~3000s remaining.
+    const itemC = queueReady.find((i) => i.issueNumber === ISSUE_C);
+    expect(itemC).toBeDefined();
+    expect(itemC!.cooldownSecondsRemaining).toBeGreaterThan(0);
+    expect(itemC!.cooldownSecondsRemaining).toBeLessThanOrEqual(3600);
+
+    // A has no prior agent row — cooldown must be null.
+    const itemA = queueReady.find((i) => i.issueNumber === ISSUE_A);
+    expect(itemA).toBeDefined();
+    expect(itemA!.cooldownSecondsRemaining).toBeNull();
+
+    // B must appear in activeAgents.
+    const activeNumbers = activeAgents.map((a) => a.issueNumber);
+    expect(activeNumbers).toContain(ISSUE_B);
+  });
+
+  it('drift guard: dispatcher.issue_has_active_agent(B) returns true (SQL matches filter)', async () => {
+    // Direct SQL call to the function — if someone removes 'running' from
+    // the active-status list in the SQL function, this assertion AND the
+    // GraphQL filter both fail, catching the drift immediately.
+    const { rows } = await pool.query<{ result: boolean }>(
+      `SELECT dispatcher.issue_has_active_agent($1) AS result`,
+      [ISSUE_B],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].result).toBe(true);
+
+    // A has no agent row — function must return false.
+    const { rows: rowsA } = await pool.query<{ result: boolean }>(
+      `SELECT dispatcher.issue_has_active_agent($1) AS result`,
+      [ISSUE_A],
+    );
+    expect(rowsA[0].result).toBe(false);
+  });
+});
