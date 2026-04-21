@@ -19,6 +19,19 @@ import { requireDispatcherAdmin } from './auth';
 import { extractPriority, parseBlockedBy, priorityRank } from './parse-labels';
 
 /**
+ * Cooldown window in seconds — mirrors `FAILED_AGENT_COOLDOWN_SECONDS` in
+ * `scripts/dispatcher/daemon.py:493`. Both the daemon and this resolver read
+ * the same env var so ops can override in both containers simultaneously via
+ * `FAILED_AGENT_COOLDOWN_SECONDS`.
+ *
+ * Authoritative twin: scripts/dispatcher/daemon.py:493
+ */
+const FAILED_AGENT_COOLDOWN_SECONDS = parseInt(
+  process.env.FAILED_AGENT_COOLDOWN_SECONDS ?? '3600',
+  10,
+);
+
+/**
  * Shape of a single entry in the enrichment JSON the daemon writes
  * into ``dispatcher.queue_snapshots.issues_json`` /
  * ``dispatcher.blocked_snapshots.issues_json`` (issue #2820). Must
@@ -455,6 +468,13 @@ function configRowToGraphQL(row: Row): Record<string, unknown> {
  * ``github.ts`` and the removed ``GITHUB_TOKEN`` secret from the API
  * task-def).
  *
+ * Batch-queries ``dispatcher.issue_has_active_agent`` and
+ * ``dispatcher.issue_cooldown_remaining_seconds`` for all issues in
+ * the snapshot via a single lateral unnest (issue #3001). Active-agent
+ * issues are filtered out before sort+slice so the admin cockpit never
+ * shows an issue that is already being worked on. Cooldown is annotated
+ * on the remaining items.
+ *
  * Graceful degradation: when the snapshot is empty (fresh deploy
  * before the first daemon scan, or the daemon is down), the admin
  * page renders an empty queue — which is the correct UX, because we
@@ -466,8 +486,38 @@ async function queryQueueReady(
 ): Promise<Array<Record<string, unknown>>> {
   const issues = await queryLatestQueueSnapshotIssuesJson(pool);
   if (issues.length === 0) return [];
-  return sortAndSliceQueueReady(issues, limit).map((issue) =>
-    queueItemFromSnapshot(issue, /* includeBlockedBy */ false),
+
+  // Batch-query active + cooldown for every issue number in the snapshot.
+  const issueNumbers = issues.map((i) => i.number);
+  const { rows: predicateRows } = await pool.query<{
+    issue_number: number;
+    active: boolean;
+    cooldown: number | null;
+  }>(
+    `SELECT
+       issue_number,
+       dispatcher.issue_has_active_agent(issue_number) AS active,
+       dispatcher.issue_cooldown_remaining_seconds(issue_number, $1) AS cooldown
+     FROM unnest($2::int[]) AS issue_number`,
+    [FAILED_AGENT_COOLDOWN_SECONDS, issueNumbers],
+  );
+  // Build lookup maps from the batch query results.
+  const activeMap = new Map<number, boolean>();
+  const cooldownMap = new Map<number, number | null>();
+  for (const row of predicateRows) {
+    activeMap.set(row.issue_number, row.active);
+    cooldownMap.set(row.issue_number, row.cooldown);
+  }
+
+  // Filter out issues that have an active agent.
+  const eligible = issues.filter((i) => !activeMap.get(i.number));
+
+  return sortAndSliceQueueReady(eligible, limit).map((issue) =>
+    queueItemFromSnapshot(
+      issue,
+      /* includeBlockedBy */ false,
+      cooldownMap.get(issue.number) ?? null,
+    ),
   );
 }
 
@@ -572,6 +622,7 @@ function comparePriorityThenCreatedAtAsc(
 function queueItemFromSnapshot(
   issue: SnapshotIssueRecord,
   includeBlockedBy: boolean,
+  cooldownSecondsRemaining: number | null = null,
 ): Record<string, unknown> {
   return {
     issueNumber: issue.number,
@@ -580,6 +631,7 @@ function queueItemFromSnapshot(
     labels: issue.labels,
     createdAt: issue.createdAt,
     blockedBy: includeBlockedBy ? parseBlockedBy(issue.body) : [],
+    cooldownSecondsRemaining,
   };
 }
 

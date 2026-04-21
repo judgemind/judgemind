@@ -170,6 +170,19 @@ export function QueueBlockedPanel({
   );
 }
 
+/**
+ * Format a cooldown duration into a short human-readable string for the
+ * operator. Rough buckets — second-precision is unnecessary on the admin
+ * panel; the operator needs to know whether to wait seconds, minutes, etc.
+ *
+ * Examples: formatCooldown(3) → '3s', formatCooldown(42) → '42s',
+ *           formatCooldown(300) → '5m', formatCooldown(3540) → '59m'
+ */
+export function formatCooldown(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m`;
+}
+
 function QueueRow({
   item,
   animated = false,
@@ -193,6 +206,11 @@ function QueueRow({
   const rowStyle = animated
     ? ({ viewTransitionName: `issue-${item.issueNumber}` } as CSSProperties)
     : undefined;
+  const cooldown =
+    typeof item.cooldownSecondsRemaining === 'number' &&
+    item.cooldownSecondsRemaining > 0
+      ? item.cooldownSecondsRemaining
+      : null;
   return (
     <li
       className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50"
@@ -205,6 +223,15 @@ function QueueRow({
       <div className="flex-shrink-0 pt-0.5">
         <PriorityBadge priority={item.priority} />
       </div>
+      {cooldown !== null && (
+        <span
+          className="flex-shrink-0 pt-0.5 font-mono text-xs text-muted-foreground"
+          data-testid={`cooldown-badge-${item.issueNumber}`}
+          title={`${cooldown}s cooldown remaining`}
+        >
+          {formatCooldown(cooldown)} cooldown
+        </span>
+      )}
       <div className="min-w-0 flex-1">
         <span
           className="block break-words text-foreground"

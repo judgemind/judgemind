@@ -10,7 +10,7 @@
     "start": "node dist/index.js",
     "lint": "eslint src/ tests/ --no-error-on-unmatched-pattern",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests",
+    "test": "node scripts/run-tests.mjs",
     "test:unit": "vitest run --passWithNoTests .unit.test",
     "test:integration": "vitest run --passWithNoTests .integration.test",
     "test:watch": "vitest",

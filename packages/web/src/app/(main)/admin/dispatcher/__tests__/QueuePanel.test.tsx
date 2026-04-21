@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { QueuePanel } from '../QueuePanel';
+import { formatCooldown } from '../QueuePanel';
 import type { QueueItem } from '@/lib/dispatcher-queries';
 
 const now = Date.parse('2026-04-18T12:00:00Z');
@@ -13,6 +14,7 @@ function item(overrides: Partial<QueueItem>): QueueItem {
     labels: ['priority/p1', 'agent/ready'],
     createdAt: '2026-04-18T11:00:00Z',
     blockedBy: [],
+    cooldownSecondsRemaining: null,
     ...overrides,
   };
 }
@@ -194,5 +196,48 @@ describe('QueuePanel', () => {
     // `queue-row-<N>` test id — the animated-row testid is only set on
     // ready rows.
     expect(screen.queryByTestId('queue-row-2500')).toBeNull();
+  });
+
+  // --- #3001 — cooldown badge on queue-ready rows.
+  it('#3001: renders cooldown badge when cooldownSecondsRemaining > 0', () => {
+    const items = [
+      item({ issueNumber: 3001, title: 'cooled down issue', cooldownSecondsRemaining: 1800 }),
+    ];
+    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    const badge = screen.getByTestId('cooldown-badge-3001');
+    expect(badge).toBeInTheDocument();
+    // 1800s → 30m
+    expect(badge).toHaveTextContent('30m cooldown');
+  });
+
+  it('#3001: does NOT render cooldown badge when cooldownSecondsRemaining is null', () => {
+    const items = [
+      item({ issueNumber: 3002, title: 'fresh issue', cooldownSecondsRemaining: null }),
+    ];
+    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    expect(screen.queryByTestId('cooldown-badge-3002')).toBeNull();
+  });
+
+  it('#3001: does NOT render cooldown badge when cooldownSecondsRemaining is 0', () => {
+    const items = [
+      item({ issueNumber: 3003, title: 'expired cooldown', cooldownSecondsRemaining: 0 }),
+    ];
+    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    expect(screen.queryByTestId('cooldown-badge-3003')).toBeNull();
+  });
+});
+
+describe('formatCooldown', () => {
+  it('formats seconds less than 60 as Xs', () => {
+    expect(formatCooldown(3)).toBe('3s');
+    expect(formatCooldown(42)).toBe('42s');
+    expect(formatCooldown(59)).toBe('59s');
+  });
+
+  it('formats seconds >= 60 as Nm (floor division)', () => {
+    expect(formatCooldown(60)).toBe('1m');
+    expect(formatCooldown(300)).toBe('5m');
+    expect(formatCooldown(3540)).toBe('59m');
+    expect(formatCooldown(3600)).toBe('60m');
   });
 });

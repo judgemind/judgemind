@@ -147,6 +147,7 @@ describe('queueItemFromSnapshot', () => {
       labels: ['priority/p2', 'agent/ready', 'area/api'],
       createdAt: '2026-04-18T12:00:00Z',
       blockedBy: [],
+      cooldownSecondsRemaining: null,
     });
   });
 

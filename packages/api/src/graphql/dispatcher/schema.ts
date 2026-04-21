@@ -230,6 +230,11 @@ export const dispatcherTypeDefs = `#graphql
     """Issue numbers this issue is blocked by (from the 'Blocked by #N' lines
     in the body). Empty for queueReady items."""
     blockedBy: [Int!]!
+    """Seconds left before this issue is eligible for the scheduler to pick up
+    again after a recent failure. Null when no prior \`dispatcher.agents\` row
+    exists or when cooldown has elapsed (0 = expired, positive = still cooling,
+    null = never attempted). Issue #3001."""
+    cooldownSecondsRemaining: Int
   }
 
   """One row in the 'Recently completed' panel (#2805 §1.5). Derived from

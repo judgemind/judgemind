@@ -569,13 +569,23 @@ class TestLatestQueueSnapshot:
 class TestIssueAlreadyAttempted:
     def test_no_row_returns_false(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [None]
+        # SQL function returns (False,) when no active agent row exists.
+        conn.cursor_instance.fetch_queue = [(False,)]
         assert d._issue_already_attempted(42) is False
 
     def test_running_row_returns_true(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(1,)]
+        # SQL function returns (True,) when an active agent row exists.
+        conn.cursor_instance.fetch_queue = [(True,)]
         assert d._issue_already_attempted(42) is True
+        # Confirm the SQL delegates to the SQL function (migration 37).
+        select_calls = [
+            e
+            for e in conn.cursor_instance.executed
+            if "dispatcher.issue_has_active_agent" in e[0]
+        ]
+        assert select_calls
+        assert select_calls[0][1][0] == 42
 
     def test_db_error_returns_true_fail_closed(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
@@ -594,29 +604,26 @@ class TestIssueAlreadyAttempted:
         labelled ``agent/ready`` (the issue body still describes
         requested work), so the next scheduler tick would otherwise
         re-pick it and race two agent branches against the open draft.
-        ``ACTIVE_AGENT_STATUSES`` includes ``needs_review`` for
-        exactly this reason — the picker treats the prior row as
-        "issue has an in-flight artifact" until the operator merges,
-        closes, or edits.
+        The SQL function ``dispatcher.issue_has_active_agent`` (migration 37)
+        includes ``needs_review`` in its active-status list for exactly
+        this reason — the picker treats the prior row as "issue has an
+        in-flight artifact" until the operator merges, closes, or edits.
         """
         d, conn, _handler = _make_daemon(tmp_path)
-        # Return a non-None row as if a needs_review agent row exists.
-        conn.cursor_instance.fetch_queue = [(1,)]
+        # Return (True,) as if the SQL function found a needs_review row.
+        conn.cursor_instance.fetch_queue = [(True,)]
         assert d._issue_already_attempted(42) is True
-        # Confirm the SELECT would have matched needs_review — the
-        # query binds ACTIVE_AGENT_STATUSES as the ANY() parameter.
+        # Confirm the SELECT delegates to the SQL function (migration 37).
         select_calls = [
             e
             for e in conn.cursor_instance.executed
-            if "SELECT 1 FROM dispatcher.agents" in e[0]
+            if "dispatcher.issue_has_active_agent" in e[0]
         ]
         assert select_calls
-        # ACTIVE_AGENT_STATUSES is passed as the second param of the
-        # bind tuple: (issue_number, list(ACTIVE_AGENT_STATUSES)).
+        # The function receives (issue_number,) as its sole parameter.
         params = select_calls[0][1]
         assert params is not None
-        # params is (issue_number, [statuses...]).
-        assert "needs_review" in params[1]
+        assert params[0] == 42
 
 
 # --------------------------------------------------------------------------

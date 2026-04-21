@@ -57,6 +57,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         labels
         createdAt
         blockedBy
+        cooldownSecondsRemaining
       }
       queueBlocked {
         issueNumber
@@ -191,6 +192,11 @@ export interface QueueItem {
   labels: string[];
   createdAt: string;
   blockedBy: number[];
+  /** Seconds left in the post-failure cooldown window. Null when no prior
+   * attempt exists (never attempted) or when cooldown has elapsed.
+   * Positive when the issue is still cooling down after a recent failure.
+   * Issue #3001. */
+  cooldownSecondsRemaining: number | null;
 }
 
 export interface RecentCompletion {
