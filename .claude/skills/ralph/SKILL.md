@@ -72,6 +72,7 @@ Write `task.md` with:
 - Which packages are involved and where their venvs/node_modules are
 - Any relevant context from `docs/specs/`
 - A `## Testable` line with `yes` or `no` (see §"Change-type-aware behavior"). `/task-v2-ralph` always writes this line; the legacy `/task` caller may omit it (ralph treats missing as `yes`).
+- A `## Prior attempts (optional)` section if `{worktree}/tmp/dispatcher-output/prior_attempts.md` exists — verbatim content of that file. Omit the section entirely when the file is absent (first-attempt case).
 
 Write `feedback.md` with: `No prior feedback. This is the first iteration.`
 
@@ -122,6 +123,8 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > - `{worktree}/tmp/ralph/task.md`
 > - `{worktree}/tmp/ralph/feedback.md`
 >
+> **If `task.md` contains a `## Prior attempts` section**, read it carefully. It lists failures from previous ralph runs for this same issue — including the failure category, push-time stderr tail, and ralph iteration narrative. Address the listed failures directly rather than re-discovering them. The absence of a `## Prior attempts` section means this is the first attempt.
+>
 > Then implement the task using TDD:
 > 1. Read the task and feedback files.
 > 2. Examine existing code and test patterns in the relevant packages.
@@ -165,6 +168,8 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > Read these files for your task and any prior feedback:
 > - `{worktree}/tmp/ralph/task.md`
 > - `{worktree}/tmp/ralph/feedback.md`
+>
+> **If `task.md` contains a `## Prior attempts` section**, read it carefully. It lists failures from previous ralph runs for this same issue — including the failure category, push-time stderr tail, and ralph iteration narrative. Address the listed failures directly rather than re-discovering them. The absence of a `## Prior attempts` section means this is the first attempt.
 >
 > Then implement the task directly:
 > 1. Read the task and feedback files. Focus on the "## Plan (from /task-v2-plan)" section's "What will change" subsection — this is the concrete list of edits to make.
@@ -299,6 +304,8 @@ The Claude reviewer prompt applies to both branches:
 > You are reviewing a code change in a ralph loop (iteration N of max 5). Your job is to evaluate whether the implementation is ready to ship or needs revision. You are a fresh pair of eyes — you did not write this code.
 >
 > **First, read `{worktree}/tmp/ralph/task.md` and check for `## Testable`.** The line will be `yes`, `no`, or absent. If `no`, this is a **non-testable** change (docs, db_migration, dx_tooling, no_deployed_component); apply the non-testable rules below. Otherwise, apply the testable rules.
+>
+> **Also check `task.md` for a `## Prior attempts` section.** If present, it lists failures from previous ralph runs for this same issue. When reviewing, verify that the current implementation addresses those prior failure causes — flagging the same issue as REVISE that a prior attempt already fixed is a loop deadlock. The absence of a `## Prior attempts` section means this is the first attempt.
 >
 > **Both Gemini reviews either ran (testable) or were skipped (non-testable) before you.** Read their feedback files before starting your own review:
 > - `{worktree}/tmp/ralph/gemini-feedback.md` (Gemini standard review — may say "Skipped: non-testable change type")
