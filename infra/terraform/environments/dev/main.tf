@@ -229,6 +229,16 @@ module "dispatcher_daemon" {
   # singleton and overlapping instances would double-spawn agents.
   desired_count = 1
 
+  # Memory sized for ralph's in-container pre-push gate (#2962).
+  # The spec §14 default (2 GiB) covers the daemon itself but not the
+  # per-agent ralph subprocess that runs `pytest packages/<pkg>/tests/`
+  # over the full 7200-test scraper-framework suite — pytest was
+  # SIGKILL'd by the kernel OOM reaper on #2568 after loading ~3% of
+  # tests. Bump to 8 GiB (Fargate 1 vCPU max; larger requires bumping
+  # CPU too) to give the pre-push gate headroom. Cost delta is minimal
+  # (~$0.04/hr extra for a singleton dev dispatcher).
+  task_memory = 8192
+
   # Secret ARNs — populated incrementally as their owning issues land.
   # #2700 wires `github_token_secret_arn` (this ARN is the scoped PAT from
   # spike 0.7, provisioned in Secrets Manager by the operator and pinned
