@@ -173,6 +173,12 @@ Then commit the updated `schema.sql` alongside the migration. `schema.sql` is au
 
 The same check runs in CI as the `schema-drift-check` job. The pre-push hook runs it whenever a `packages/api/migrations/*.sql` file is in the push (requires Docker + a running daemon; emits a WARNING and skips if Docker is unavailable), so migration-vs-schema drift is caught locally before the ~10 minute CI round trip. See #2702.
 
+### Hygiene-check CI steps
+
+When wiring a `scripts/check-no-*.sh`, `scripts/check-forbidden-*.sh`, or `scripts/check-deprecated-*.sh` guard into `.github/workflows/ci.yml`, **do not quote the forbidden string in the step's `name:` field** — the quoted pattern itself will trip the guard on the next CI run (see #2541/#2542 for the specific incident). Name the step after what the check *does* instead of what it *forbids* (e.g., name it after the replacement tool or the category of misuse, not the literal string).
+
+The peer guard tests under `scripts/tests/test_check_*.sh` include a self-match assertion (see `scripts/tests/_guard_self_match_helpers.sh`) that catches this at test time. When adding a new string-forbidding guard, add an `assert_no_self_match_on_ci_step_name` call to its test.
+
 ### Subagent responsibilities
 
 Subagents MUST install dependencies, run ALL lint/format/test commands for every package touched, fix failures before committing, and only push after all local checks pass.
