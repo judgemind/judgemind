@@ -243,17 +243,17 @@ There is **no undo step**. The commit stays on the branch. The daemon's `push_an
 The pre-push hook reads its ref range from stdin, with one line per ref in the form `<local_ref> <local_sha> <remote_ref> <remote_sha>`. Run it against the committed SHAs captured in 2.5a:
 
 - Write `refs/heads/<branch> <local_sha> refs/heads/<branch> <base_sha>` to `{worktree}/tmp/ralph/prepush_stdin.txt`.
-- `bash {worktree}/.githooks/pre-push origin https://github.com/judgemind/judgemind.git < {worktree}/tmp/ralph/prepush_stdin.txt 2> {worktree}/tmp/ralph/prepush_stderr.txt`
+- `bash {worktree}/.githooks/pre-push origin https://github.com/judgemind/judgemind.git < {worktree}/tmp/ralph/prepush_stdin.txt &> {worktree}/tmp/ralph/prepush-failure.txt`
 - Capture the exit code.
 
 ### 2.5c — Handle the hook result
 
 - **Exit 0 (hook passed):** the local pre-push gate is green. Ralph's commit stays in place; continue to Step 3 with the existing SHIP verdict.
 
-- **Exit non-zero (hook failed):** treat the captured stderr as new reviewer feedback and iterate:
-  1. Read `{worktree}/tmp/ralph/prepush_stderr.txt`. Append it to `{worktree}/tmp/ralph/feedback.md` under a new heading `## Pre-push hook failure (local gate — Step 2.5)`, preserving the full stderr so the next worker iteration has exact error messages (ruff lines, pytest tracebacks, markdown-link failures, schema-drift diffs).
+- **Exit non-zero (hook failed):** treat the captured output as new reviewer feedback and iterate:
+  1. Read `{worktree}/tmp/ralph/prepush-failure.txt`. Append it to `{worktree}/tmp/ralph/feedback.md` under a new heading `## Pre-push hook failure (local gate — Step 2.5)`, preserving the full output so the next worker iteration has exact error messages (ruff lines, pytest tracebacks, markdown-link failures, schema-drift diffs).
   2. Bump `iteration.txt` by one.
-  3. **If the new iteration count exceeds `max_iterations`**, stop iterating. Emit `verdict=BLOCKED` with `block_reason="pre-push hook failed on iteration N; max_iterations reached — see {worktree}/tmp/ralph/prepush_stderr.txt"`. Continue to Step 3 (Step 3 maps BLOCKED correctly). The ralph commit stays on the branch; the daemon does not advance past `push_and_pr` on BLOCKED so the commit does not reach main.
+  3. **If the new iteration count exceeds `max_iterations`**, stop iterating. Emit `verdict=BLOCKED` with `block_reason="pre-push hook failed on iteration N; max_iterations reached — see {worktree}/tmp/ralph/prepush-failure.txt"`. Continue to Step 3 (Step 3 maps BLOCKED correctly). The ralph commit stays on the branch; the daemon does not advance past `push_and_pr` on BLOCKED so the commit does not reach main.
   4. **Otherwise**, re-invoke `/ralph` via the Task tool (same call as Step 2). The inner loop re-runs the worker with the new feedback, converges again, and writes a new `ralph-done.txt`. After `/ralph` returns, **collapse the new worker's changes into ralph's existing commit via amend**:
      - `git -C {worktree} add -A`
      - `git -C {worktree} commit --amend --no-edit`
