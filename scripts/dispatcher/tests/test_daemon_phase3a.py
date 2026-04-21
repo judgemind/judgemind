@@ -1512,15 +1512,27 @@ class TestHappyPathOrchestration:
             f"got: {[e[1] for e in conn.cursor_instance.executed if 'UPDATE dispatcher.agents' in e[0]]}"
         )
 
-        # git commands: worktree add, add -A, commit, push. All use
+        # git commands: worktree add, commit --amend, push. All use
         # ``git -C <repo-or-worktree> <verb>`` shape, so just check the
         # verb appears anywhere in each command.
+        #
+        # Issue #2971: the happy-path sequence no longer runs ``git add
+        # -A``. Ralph's Step 2.5 committed its work with the placeholder
+        # message; the daemon's commit step is ``git commit --amend -F
+        # <file>`` which rewrites the message without touching the index.
         git_cmds = [c for c in call_log if c and c[0] == "git"]
         flat = [" ".join(c) for c in git_cmds]
         assert any("worktree add" in s for s in flat)
-        assert any("add -A" in s for s in flat)
-        assert any(" commit" in s for s in flat)
+        assert any("commit --amend" in s for s in flat), (
+            f"Expected ``git commit --amend`` after #2971; got: {flat}"
+        )
         assert any(" push " in s for s in flat)
+        # Guard: no stray ``git add -A`` call (would be a regression
+        # toward the pre-#2971 flow that swallowed ralph's diff on an
+        # incomplete undo).
+        assert not any("add -A" in s for s in flat), (
+            f"Unexpected ``git add -A`` call after #2971; got: {flat}"
+        )
 
 
 # --------------------------------------------------------------------------

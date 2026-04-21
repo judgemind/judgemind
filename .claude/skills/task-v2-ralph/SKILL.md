@@ -1,5 +1,5 @@
 ---
-description: Ralph phase for the per-phase /task-v2 pipeline. Iterative worker + reviewer loop, returns SHIP verdict plus uncommitted implementation diff in the worktree. Long-tail phase (~45-90 min internally).
+description: Ralph phase for the per-phase /task-v2 pipeline. Iterative worker + reviewer loop, returns SHIP verdict plus a committed implementation diff on the worktree branch. Long-tail phase (~45-90 min internally).
 argument-hint: "<agent-id>"
 maxTurns: 500
 model: sonnet
@@ -33,7 +33,7 @@ This is the harness-limitation path surfaced by the Phase 1 gate smoke test (iss
 
 **Prerequisites:** The dispatcher daemon has already (a) installed dependencies per `dependencies_to_install` from the plan output, (b) written the input bundle to `{worktree}/tmp/dispatcher-input/ralph.json`.
 
-**Goal:** Produce committed-ready code in the worktree's working tree (staged or unstaged — daemon stages + commits + pushes), plus `{worktree}/tmp/dispatcher-output/ralph.json` with a SHIP/BLOCKED verdict.
+**Goal:** Produce a committed implementation diff on the worktree branch (ralph commits directly — see Step 2.5), plus `{worktree}/tmp/dispatcher-output/ralph.json` with a SHIP/BLOCKED verdict.
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, any Task tool call, or any other operation. `/task-v2-ralph` is already a dispatcher-spawned background subprocess — further backgrounding causes completion notifications to surface in the wrong context and loses results.
 
@@ -110,9 +110,9 @@ Always exit 0. BLOCKED is not a subprocess error — the daemon reads verdict fr
 
 `ralph_done_path` and `review_log_path` are non-null whenever the ralph loop ran (every SHIP path). They are `null` only when Step 0's Task-tool availability check fails and the skill exits BLOCKED without spawning a worker.
 
-On SHIP: the worktree working tree contains the implementation diff (or is clean, if the change was trivially a no-op — unusual), AND the local `.githooks/pre-push` hook passed on the current branch (Step 2.5). It may be staged or unstaged. The daemon stages + commits + pushes in the `summary` and `push_and_pr` phases.
+On SHIP: ralph has committed the implementation diff to the worktree branch with the placeholder message `"WIP: ralph output"` (see Step 2.5), AND the local `.githooks/pre-push` hook passed against that commit. The daemon's `summary` phase reads the diff via `git diff origin/main...HEAD`; the daemon's `push_and_pr` phase amends ralph's commit with summary's conventional-commits message (`git commit --amend -F <file>`) and pushes. Issue #2971.
 
-On BLOCKED: the working tree may contain partial work. The daemon decides whether to retry (fresh worktree) or diagnose (`§8` Tier 2/3 flow).
+On BLOCKED: the working tree may contain partial work (committed or uncommitted). The daemon decides whether to retry (fresh worktree) or diagnose (`§8` Tier 2/3 flow).
 
 ---
 
@@ -218,46 +218,59 @@ Spawn the `/ralph` skill as a Task-tool subagent (so its own internal worker+rev
 
 Wait synchronously for the subagent to complete. Do not time out from the outer skill — the dispatcher owns the subprocess-wide timeout.
 
-## Step 2.5 — Local pre-push gate (MANDATORY before SHIP)
+## Step 2.5 — Commit ralph's work and run local pre-push gate (MANDATORY before SHIP)
 
-**Ralph is not done until `.githooks/pre-push` passes locally.** This step is the final convergence criterion — a local pre-flight that shifts the pre-push feedback earlier so the `push_and_pr` phase does not reject ralph's output after the daemon commits. The daemon's `git push` still runs the same hook authoritatively; this step just catches it in-session rather than after subprocess exit.
+**Ralph is not done until (a) ralph's work is committed to the worktree branch, AND (b) `.githooks/pre-push` passes against that commit.**
 
-**Skip condition.** If Step 2 read `ralph-done.txt` as `BLOCKED` or `REVISE` (i.e. the inner `/ralph` did not reach SHIP), skip this step entirely and continue to Step 3 with the existing verdict. The pre-push gate only runs on the SHIP path.
+The commit is the load-bearing change from issue #2971. Ralph commits directly with a placeholder message (`"WIP: ralph output"`); the daemon's `push_and_pr` phase later amends that commit with summary's conventional-commits message via `git commit --amend -F <file>`. Committing in place eliminates the pre-#2971 "stage + throwaway commit + hook + reset --soft + reset HEAD" juggling, which had a latent failure mode: an incomplete undo silently swallowed ralph's diff and produced `git_commit_failed exit_code=1 stderr_tail=""` on the daemon side (observed 2026-04-21 02:59 UTC on agent `cc6c5a07`, issue #2565).
 
-### 2.5a — Run the hook
+**Skip condition.** If Step 2 read `ralph-done.txt` as `BLOCKED` or `REVISE` (i.e. the inner `/ralph` did not reach SHIP), skip this step entirely and continue to Step 3 with the existing verdict. The commit + pre-push gate only runs on the SHIP path.
 
-The pre-push hook reads its ref range from stdin, with one line per ref in the form `<local_ref> <local_sha> <remote_ref> <remote_sha>`. On the SHIP path, ralph's inner loop has produced an uncommitted diff in the worktree — there are no new commits to push yet. To exercise the full hook against the would-be push, stage the current diff into a throwaway commit, run the hook, then reset back to uncommitted state:
+### 2.5a — Commit ralph's work with the placeholder message
 
 1. Capture the current branch name: `git -C {worktree} rev-parse --abbrev-ref HEAD`. Store as `<branch>`.
 2. Capture the current `HEAD` SHA (the pre-push "remote_sha" baseline — the commit the daemon will push against): `git -C {worktree} rev-parse HEAD`. Store as `<base_sha>`.
-3. Stage and commit everything in the working tree to a throwaway commit so the hook sees the would-be-pushed contents:
+3. Stage and commit everything in the working tree with the placeholder message. Write the placeholder message to a file first (no heredocs / quoted `;` — see CLAUDE.md Critical Rules):
+   - Write `WIP: ralph output` to `{worktree}/tmp/ralph/prepush_commit_msg.txt`.
    - `git -C {worktree} add -A`
-   - `git -C {worktree} commit -m "pre-push gate snapshot"` (use `-F {worktree}/tmp/ralph/prepush_commit_msg.txt` to avoid quoted-string-and-`;` violations if needed)
+   - `git -C {worktree} commit -F {worktree}/tmp/ralph/prepush_commit_msg.txt`
 4. Capture the new commit SHA as `<local_sha>`: `git -C {worktree} rev-parse HEAD`.
-5. Run the hook with the stdin ref line written to a file first (no heredocs — see CLAUDE.md Critical Rules). Write `refs/heads/<branch> <local_sha> refs/heads/<branch> <base_sha>` to `{worktree}/tmp/ralph/prepush_stdin.txt`, then:
-   - `bash {worktree}/.githooks/pre-push origin https://github.com/judgemind/judgemind.git < {worktree}/tmp/ralph/prepush_stdin.txt 2> {worktree}/tmp/ralph/prepush_stderr.txt`
-   - Capture the exit code.
-6. **Always undo the throwaway commit** so the daemon's `summary` + `push_and_pr` phases see the original uncommitted diff:
-   - `git -C {worktree} reset --soft <base_sha>` (un-commits but keeps the staged diff)
-   - `git -C {worktree} reset HEAD` (un-stages so the working tree matches ralph's original output)
 
-The `reset --soft` + `reset HEAD` pair is deliberate: it returns the worktree to the exact state ralph left it in (unstaged diff), regardless of whether the hook passed or failed.
+There is **no undo step**. The commit stays on the branch. The daemon's `push_and_pr` phase amends it in place (`git commit --amend -F <summary-message-file>`) — see `scripts/dispatcher/daemon.py::_push_and_open_pr` and issue #2971.
 
-### 2.5b — Handle the result
+### 2.5b — Run the pre-push hook against the committed state
 
-- **Exit 0 (hook passed):** the local pre-push gate is green. Continue to Step 3 with the existing SHIP verdict.
+The pre-push hook reads its ref range from stdin, with one line per ref in the form `<local_ref> <local_sha> <remote_ref> <remote_sha>`. Run it against the committed SHAs captured in 2.5a:
+
+- Write `refs/heads/<branch> <local_sha> refs/heads/<branch> <base_sha>` to `{worktree}/tmp/ralph/prepush_stdin.txt`.
+- `bash {worktree}/.githooks/pre-push origin https://github.com/judgemind/judgemind.git < {worktree}/tmp/ralph/prepush_stdin.txt 2> {worktree}/tmp/ralph/prepush_stderr.txt`
+- Capture the exit code.
+
+### 2.5c — Handle the hook result
+
+- **Exit 0 (hook passed):** the local pre-push gate is green. Ralph's commit stays in place; continue to Step 3 with the existing SHIP verdict.
 
 - **Exit non-zero (hook failed):** treat the captured stderr as new reviewer feedback and iterate:
   1. Read `{worktree}/tmp/ralph/prepush_stderr.txt`. Append it to `{worktree}/tmp/ralph/feedback.md` under a new heading `## Pre-push hook failure (local gate — Step 2.5)`, preserving the full stderr so the next worker iteration has exact error messages (ruff lines, pytest tracebacks, markdown-link failures, schema-drift diffs).
   2. Bump `iteration.txt` by one.
-  3. **If the new iteration count exceeds `max_iterations`**, stop iterating. Emit `verdict=BLOCKED` with `block_reason="pre-push hook failed on iteration N; max_iterations reached — see {worktree}/tmp/ralph/prepush_stderr.txt"`. Continue to Step 3 (Step 3 maps BLOCKED correctly).
-  4. **Otherwise**, re-invoke `/ralph` via the Task tool (same call as Step 2). The inner loop re-runs the worker with the new feedback, converges again, and writes a new `ralph-done.txt`. After `/ralph` returns, loop back to Step 2.5a — run the hook again. Repeat until the hook passes or `max_iterations` is exhausted.
+  3. **If the new iteration count exceeds `max_iterations`**, stop iterating. Emit `verdict=BLOCKED` with `block_reason="pre-push hook failed on iteration N; max_iterations reached — see {worktree}/tmp/ralph/prepush_stderr.txt"`. Continue to Step 3 (Step 3 maps BLOCKED correctly). The ralph commit stays on the branch; the daemon does not advance past `push_and_pr` on BLOCKED so the commit does not reach main.
+  4. **Otherwise**, re-invoke `/ralph` via the Task tool (same call as Step 2). The inner loop re-runs the worker with the new feedback, converges again, and writes a new `ralph-done.txt`. After `/ralph` returns, **collapse the new worker's changes into ralph's existing commit via amend**:
+     - `git -C {worktree} add -A`
+     - `git -C {worktree} commit --amend --no-edit`
+  
+     The `--no-edit` keeps the placeholder message intact (the daemon will rewrite it later). The `-a` is absorbed by the explicit `add -A` + `--amend`. The net effect is a single commit on the branch reflecting the latest iteration's work, ready for the next pre-push hook run. Then loop back to 2.5b — run the hook again. Repeat until the hook passes or `max_iterations` is exhausted.
 
 This is intentionally identical to how the Claude reviewer's REVISE feedback is iterated on — the pre-push hook is just another reviewer whose verdict must be SHIP before the outer skill emits SHIP. A pre-push failure is not a dispatcher escalation; it is a signal that ralph's inner checks missed something the push-time hook catches (cross-package hygiene, schema drift, markdown links, CI-job-skipped footgun, dispatcher-image deps). The failure modes cited in issue #2962 (`push_and_pr failed (pre-push hook rejected): FAILED: tests for scraper-framework`, `FAILED: npm run lint for api`, schema drift) all converge by re-running the worker with the concrete stderr.
 
-### 2.5c — No-op guardrail
+### 2.5d — No-op guardrail
 
-If `git -C {worktree} status --porcelain` returns empty (no diff to commit), skip Steps 2.5a and 2.5b entirely — there is nothing to pre-push-check. This happens on trivially no-op changes and on BLOCKED paths. Log "pre-push gate skipped — working tree clean" and continue to Step 3.
+If the inner `/ralph` produced no diff (e.g. trivially-no-op change, or a non-testable path that converged without touching any file), `git -C {worktree} status --porcelain` returns empty at the top of 2.5a. In that case:
+
+- Skip the commit step in 2.5a (there is nothing to commit; `git commit` would fail with "nothing to commit, working tree clean").
+- Skip 2.5b (no commit to push-check).
+- Log "pre-push gate skipped — working tree clean; no commit created" and continue to Step 3 with the existing SHIP verdict.
+
+A truly no-op SHIP is unusual; the daemon handles this case by emitting a no-op PR or escalating depending on the change type.
 
 ## Step 3 — Parse ralph output
 
@@ -278,7 +291,7 @@ If Step 2.5 overrode the verdict to BLOCKED (pre-push hook failed and max_iterat
 
 Count iterations from `{worktree}/tmp/ralph/iteration.txt`. Include the Step 2.5 re-invocations — each pre-push retry counts as an iteration because each one re-ran `/ralph` with new feedback.
 
-Capture `changed_files` from `git -C {worktree} diff --name-only HEAD`. Do NOT commit — daemon owns that. (Step 2.5's throwaway commit has already been reset, so this yields ralph's original uncommitted diff.)
+Capture `changed_files` from `git -C {worktree} diff --name-only origin/main...HEAD` — compares the committed state (ralph's commit) to origin/main. On the no-op guardrail path (2.5d) the range is empty and `changed_files` is `[]`.
 
 Compose `summary` as 1-3 sentences describing what was implemented. Pull from the worker's final status report or the Claude reviewer's SHIP justification.
 
@@ -302,19 +315,19 @@ For non-testable change types, the budget is tighter: worker runs without TDD an
 
 The Task-tool availability check (Step 0) is cheap: a single tool-registry probe, no subprocess.
 
-The Step 2.5 pre-push gate is cheap on the green path — the hook takes ~5-30s wall clock for a typical single-package diff (ruff + pytest + format). On the red path it re-invokes `/ralph`, which spends another iteration's worth of tokens; the re-invocation is bounded by `max_iterations` (same budget as the inner loop), so the worst case adds one iteration's tokens, not unbounded retry cost.
+The Step 2.5 commit + pre-push gate is cheap on the green path — the commit is a single `git add -A && git commit -F` (sub-second), and the hook takes ~5-30s wall clock for a typical single-package diff (ruff + pytest + format). On the red path it re-invokes `/ralph`, which spends another iteration's worth of tokens; the re-invocation is bounded by `max_iterations` (same budget as the inner loop), so the worst case adds one iteration's tokens, not unbounded retry cost.
 
 ## What this skill does NOT do
 
 - **Does not install dependencies.** Daemon already did that in the `setup` phase.
-- **Does not commit, push, or open a PR.** Daemon owns git + GitHub. (Step 2.5's throwaway commit is local-only and always reset before Step 3.)
+- **Does not push or open a PR.** Daemon owns remote git + GitHub. Ralph's local commit stays in the worktree until the daemon's `push_and_pr` phase amends + pushes it.
 - **Does not post issue comments.** `/task-v2-summary` owns the pre-PR comment.
 - **Does not watch CI or merge.** Daemon's `ci_watch` and `merge` phases handle that; if CI fails, the daemon spawns `/task-v2-fix-ci`.
 - **Does not run deploy verification.** `/task-v2-verify` owns that post-deploy.
 
 ## Worked example — testable change, 1-iteration SHIP
 
-Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: yes`), Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5 runs `.githooks/pre-push` against the staged diff — the hook's per-package ruff, pytest, and diff-coverage checks pass (the inner worker already ran them per-package in iteration 1). Step 3 parses `ralph-done.txt` = `SHIP`, emits output.
+Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: yes`), Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5a commits the diff with message `"WIP: ralph output"`. Step 2.5b runs `.githooks/pre-push` against the committed state — the hook's per-package ruff, pytest, and diff-coverage checks pass (the inner worker already ran them per-package in iteration 1). Step 3 parses `ralph-done.txt` = `SHIP`, captures `changed_files` via `git diff --name-only origin/main...HEAD`, emits output. The ralph commit stays in place; the daemon's `push_and_pr` phase amends it with summary's conventional-commits message.
 
 Output `ralph.json`:
 
@@ -337,7 +350,7 @@ Output `ralph.json`:
 
 ## Worked example — non-testable change (docs), 1-iteration SHIP
 
-Input `plan.json` has `change_type=docs`. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: no`), Step 2 invokes `/ralph`. The worker reads `## Testable: no`, skips TDD, implements the plan's "What will change" section (e.g. edits `docs/agent/unattended-patterns.md`), runs `scripts/check-markdown-links.sh` on any touched markdown files, and writes `COMPLETE`. Only the Claude reviewer runs — verifies acceptance criteria against the diff, confirms no stale references remain, writes `SHIP` to `review-result.txt`. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5 runs `.githooks/pre-push` against the staged diff — the hook re-runs `check-markdown-links.sh`, which passes. Step 3 emits SHIP.
+Input `plan.json` has `change_type=docs`. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: no`), Step 2 invokes `/ralph`. The worker reads `## Testable: no`, skips TDD, implements the plan's "What will change" section (e.g. edits `docs/agent/unattended-patterns.md`), runs `scripts/check-markdown-links.sh` on any touched markdown files, and writes `COMPLETE`. Only the Claude reviewer runs — verifies acceptance criteria against the diff, confirms no stale references remain, writes `SHIP` to `review-result.txt`. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5a commits with placeholder message. Step 2.5b runs `.githooks/pre-push` against the committed state — the hook re-runs `check-markdown-links.sh`, which passes. Step 3 emits SHIP.
 
 Output `ralph.json`:
 
@@ -361,7 +374,7 @@ Notice `iterations_used=1` (not 0) and `changed_files` is non-empty — the #284
 
 ## Worked example — pre-push gate catches a cross-package hygiene failure (Step 2.5 re-iteration)
 
-Input `plan.json` has `change_type=api` — an API change that also touches a docs file. Step 2's inner `/ralph` loop converges on iteration 2 with SHIP (worker ran ruff + pytest + diff-coverage per-package, Claude reviewer approved). Step 2.5 stages the diff and runs `.githooks/pre-push`, which executes `scripts/check-markdown-links.sh` across the whole push — a markdown pointer in the touched docs file is broken. Exit non-zero, stderr captures the broken-link line. Step 2.5b appends the stderr to `feedback.md`, bumps `iteration.txt` to 3, and re-invokes `/ralph`. The new worker reads the feedback, fixes the markdown link, re-runs the worker's internal pre-PR checks, and reviewers SHIP again. Step 2.5 re-runs the hook — this time it passes. Step 3 emits SHIP with `iterations_used=3`.
+Input `plan.json` has `change_type=api` — an API change that also touches a docs file. Step 2's inner `/ralph` loop converges on iteration 2 with SHIP (worker ran ruff + pytest + diff-coverage per-package, Claude reviewer approved). Step 2.5a commits with placeholder. Step 2.5b runs `.githooks/pre-push`, which executes `scripts/check-markdown-links.sh` across the whole push — a markdown pointer in the touched docs file is broken. Exit non-zero, stderr captures the broken-link line. Step 2.5c appends the stderr to `feedback.md`, bumps `iteration.txt` to 3, and re-invokes `/ralph`. The new worker reads the feedback, fixes the markdown link, re-runs the worker's internal pre-PR checks, and reviewers SHIP again. Back in 2.5c step 4, the new changes are folded into the existing commit via `git add -A && git commit --amend --no-edit`, and control returns to 2.5b. The hook runs again — this time it passes. Step 3 emits SHIP with `iterations_used=3`. The branch still has exactly one commit (the amended ralph commit); the daemon's `push_and_pr` phase will amend it one more time to replace the placeholder message with summary's conventional-commits text.
 
 This is the failure mode cited in issue #2962 (push-time hygiene rejections like `FAILED: scripts/check-markdown-links.sh`, `FAILED: tests for scraper-framework` across packages the inner loop didn't spot-check, schema drift, CI-job-skipped footgun). Moving the check into Step 2.5 converts an expensive across-subprocess retry (daemon re-spawns the whole ralph phase in a fresh worktree) into a cheap in-session iteration.
 
@@ -404,9 +417,9 @@ Elapsed time: under a second. The operator re-runs the smoke test via `claude -p
 
 ## Reminders
 
-- No `$()`, no heredocs, no `python -c`. See `CLAUDE.md` Critical Rules. Step 2.5's stdin-ref line goes through a temp file, not a heredoc.
+- No `$()`, no heredocs, no `python -c`. See `CLAUDE.md` Critical Rules. Step 2.5's stdin-ref line and the commit message both go through temp files, not heredocs.
 - All temp files go in `{worktree}/tmp/`, never `/tmp/`.
 - Reviewers run synchronously via Task-tool subagents — no `run_in_background`.
-- Pre-PR checks (ruff, pytest, lint/typecheck/build for testable types; markdown-link check, ruff on any touched `.py` scripts for non-testable types) run INSIDE ralph's worker or final verification step. **Step 2.5 then runs the full `.githooks/pre-push` hook as a final in-session gate before SHIP** — it catches the cross-package hygiene checks (markdown-links, schema-drift, ci-job-skipped, dispatcher-image-deps, filename-separator collisions) that the per-package worker checks don't cover. The daemon's `git push` still runs the same hook authoritatively; Step 2.5 just shifts the failure detection earlier so a fix iterates in-session instead of triggering a whole-phase retry. Issue #2962.
-- Step 2.5's throwaway commit is always reset (both `--soft` and `reset HEAD`) before Step 3, regardless of whether the hook passed or failed. The daemon's `summary` + `push_and_pr` phases expect ralph's original uncommitted diff.
+- Pre-PR checks (ruff, pytest, lint/typecheck/build for testable types; markdown-link check, ruff on any touched `.py` scripts for non-testable types) run INSIDE ralph's worker or final verification step. **Step 2.5 then commits ralph's work and runs the full `.githooks/pre-push` hook as a final in-session gate before SHIP** — it catches the cross-package hygiene checks (markdown-links, schema-drift, ci-job-skipped, dispatcher-image-deps, filename-separator collisions) that the per-package worker checks don't cover. The daemon's `git push` still runs the same hook authoritatively; Step 2.5 just shifts the failure detection earlier so a fix iterates in-session instead of triggering a whole-phase retry. Issues #2962, #2971.
+- Step 2.5 commits in place with the placeholder message `"WIP: ralph output"` and **does not undo the commit**. The daemon's `push_and_pr` phase amends it with summary's conventional-commits message (`git commit --amend -F <file>`) — never pattern-match or parse the placeholder elsewhere; it is purely a stopgap label that the daemon rewrites.
 - `/ralph` writes status updates to `{repo_root}/tmp/agent-status/<agent-id>.txt` per its convention. `/task-v2-ralph` may read this file for monitoring but should not write to it — the dispatcher daemon owns agent status via `dispatcher.phase_transitions` rows.
