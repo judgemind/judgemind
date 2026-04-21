@@ -80,6 +80,44 @@ CREATE TYPE public.validation_status AS ENUM (
 );
 
 
+-- Name: issue_cooldown_remaining_seconds(integer, integer); Type: FUNCTION; Schema: dispatcher; Owner: -
+
+CREATE FUNCTION dispatcher.issue_cooldown_remaining_seconds(p_issue_number integer, p_cooldown_seconds integer) RETURNS integer
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT GREATEST(0,
+        p_cooldown_seconds - EXTRACT(EPOCH FROM (now() - MAX(started_at)))::integer
+    )
+      FROM dispatcher.agents
+     WHERE issue_number = p_issue_number
+    HAVING MAX(started_at) IS NOT NULL;
+$$;
+
+
+-- Name: FUNCTION issue_cooldown_remaining_seconds(p_issue_number integer, p_cooldown_seconds integer); Type: COMMENT; Schema: dispatcher; Owner: -
+
+COMMENT ON FUNCTION dispatcher.issue_cooldown_remaining_seconds(p_issue_number integer, p_cooldown_seconds integer) IS 'Returns the seconds remaining in the cooldown window keyed on MAX(started_at) for any prior agent row for this issue. NULL when there is no prior row (never attempted). 0 when cooldown has elapsed (GREATEST keeps it non-negative). Issue #3001.';
+
+
+-- Name: issue_has_active_agent(integer); Type: FUNCTION; Schema: dispatcher; Owner: -
+
+CREATE FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1
+          FROM dispatcher.agents
+         WHERE issue_number = p_issue_number
+           AND status IN ('running', 'retrying', 'succeeded', 'needs_review')
+    );
+$$;
+
+
+-- Name: FUNCTION issue_has_active_agent(p_issue_number integer); Type: COMMENT; Schema: dispatcher; Owner: -
+
+COMMENT ON FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) IS 'Returns TRUE when dispatcher.agents has any row for this issue with status IN (''running'', ''retrying'', ''succeeded'', ''needs_review''). Mirrors ACTIVE_AGENT_STATUSES in scripts/dispatcher/daemon.py:354. Issue #3001.';
+
+
 CREATE FUNCTION public.update_updated_at() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
