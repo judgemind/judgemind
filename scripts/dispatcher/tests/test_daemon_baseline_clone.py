@@ -451,6 +451,211 @@ class TestCreateWorktreeBaselineMode:
 
 
 # --------------------------------------------------------------------------
+# _install_fargate_preflight_hook — swap the narrowed hook into the worktree
+# on each _create_worktree in Fargate mode (issue #2982)
+# --------------------------------------------------------------------------
+
+
+class TestInstallFargatePreflightHook:
+    """The Fargate container ships a narrowed preflight hook at
+    ``$DISPATCHER_FARGATE_HOOKS_DIR``. After ``git worktree add`` runs, the
+    worktree's tracked ``.claude/hooks/preflight-bash.sh`` is overwritten
+    with the narrowed copy AND marked ``skip-worktree`` so the divergence
+    does not show up in ``git status`` / pre-push / PR diffs. Laptop
+    sessions skip the swap — the operator-local hook stays in place."""
+
+    def _prepare_stage_dir(self, stage_dir: Path) -> tuple[Path, Path]:
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        hook = stage_dir / "preflight-bash.sh"
+        helper = stage_dir / "preflight_cross_worktree.py"
+        hook.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        helper.write_text("# stub helper\n", encoding="utf-8")
+        hook.chmod(0o755)
+        helper.chmod(0o644)
+        return hook, helper
+
+    def test_swaps_hook_and_marks_skip_worktree_in_fargate_mode(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        baseline = tmp_path / "repo"
+        (baseline / ".git").mkdir(parents=True)
+        stage_dir = tmp_path / "fargate-hooks"
+        stage_hook, stage_helper = self._prepare_stage_dir(stage_dir)
+        monkeypatch.setenv("DISPATCHER_FARGATE_HOOKS_DIR", str(stage_dir))
+        d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+
+        # Simulate the ``git worktree add`` by materializing a worktree
+        # dir with a pre-existing (operator-local) hook that we expect to
+        # be overwritten.
+        worktree_path = baseline.parent / "worktrees" / "agent-aabbccdd"
+        hooks_dir = worktree_path / ".claude" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        operator_hook = hooks_dir / "preflight-bash.sh"
+        operator_hook.write_text(
+            "#!/usr/bin/env bash\n# operator-local full ruleset\nexit 99\n",
+            encoding="utf-8",
+        )
+        operator_hook.chmod(0o755)
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd)
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Exercise directly — _create_worktree() calls this helper when
+        # baseline_repo_root is set, but we test the helper unit directly
+        # so the test doesn't have to simulate the full `git worktree add`
+        # subprocess protocol.
+        d._install_fargate_preflight_hook(worktree_path, "agent-aabbccdd")
+
+        # Hook file was overwritten with the staged copy.
+        assert operator_hook.read_text(encoding="utf-8") == (
+            stage_hook.read_text(encoding="utf-8")
+        )
+        # Executable bit preserved.
+        assert operator_hook.stat().st_mode & 0o111
+        # Helper file was also copied.
+        assert (hooks_dir / "preflight_cross_worktree.py").read_text(
+            encoding="utf-8"
+        ) == stage_helper.read_text(encoding="utf-8")
+        # Both files marked skip-worktree so the divergence stays out of
+        # git status / pre-push / PR diffs.
+        skip_worktree_calls = [
+            c for c in captured if "update-index" in c and "--skip-worktree" in c
+        ]
+        assert len(skip_worktree_calls) == 2
+        skipped_paths = {c[-1] for c in skip_worktree_calls}
+        assert ".claude/hooks/preflight-bash.sh" in skipped_paths
+        assert ".claude/hooks/preflight_cross_worktree.py" in skipped_paths
+        # Success event emitted.
+        assert handler.events("fargate_hook_installed") != []
+
+    def test_noop_when_stage_dir_env_unset(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Local dev (no Fargate image) has no stage dir env var — the
+        helper must no-op + warn, leaving the operator-local hook intact."""
+        baseline = tmp_path / "repo"
+        (baseline / ".git").mkdir(parents=True)
+        d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+        monkeypatch.delenv("DISPATCHER_FARGATE_HOOKS_DIR", raising=False)
+
+        worktree_path = baseline.parent / "worktrees" / "agent-aabbccdd"
+        hooks_dir = worktree_path / ".claude" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        operator_hook = hooks_dir / "preflight-bash.sh"
+        operator_hook.write_text("# operator-local\n", encoding="utf-8")
+
+        def fake_run(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("subprocess must not run on no-op path")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d._install_fargate_preflight_hook(worktree_path, "agent-aabbccdd")
+
+        # Operator-local hook untouched.
+        assert operator_hook.read_text(encoding="utf-8") == "# operator-local\n"
+        # Skip warning emitted.
+        skip_events = handler.events("fargate_hook_skip")
+        assert skip_events, "expected fargate_hook_skip warning"
+        assert any(
+            "DISPATCHER_FARGATE_HOOKS_DIR" in getattr(e, "reason", "")
+            for e in skip_events
+        )
+
+    def test_noop_when_stage_files_missing(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """If the env var is set but the staged hook files are missing
+        (e.g. a rogue local image / partial build), the helper must no-op
+        + warn, not crash the worktree creation."""
+        baseline = tmp_path / "repo"
+        (baseline / ".git").mkdir(parents=True)
+        # Stage dir exists but files don't.
+        stage_dir = tmp_path / "fargate-hooks"
+        stage_dir.mkdir()
+        monkeypatch.setenv("DISPATCHER_FARGATE_HOOKS_DIR", str(stage_dir))
+        d, _conn, handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+
+        worktree_path = baseline.parent / "worktrees" / "agent-aabbccdd"
+        hooks_dir = worktree_path / ".claude" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        operator_hook = hooks_dir / "preflight-bash.sh"
+        operator_hook.write_text("# operator-local\n", encoding="utf-8")
+
+        def fake_run(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("subprocess must not run on no-op path")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d._install_fargate_preflight_hook(worktree_path, "agent-aabbccdd")
+
+        # Operator-local hook untouched.
+        assert operator_hook.read_text(encoding="utf-8") == "# operator-local\n"
+        assert handler.events("fargate_hook_skip") != []
+
+    def test_not_called_in_legacy_mode(self, monkeypatch: Any, tmp_path: Path) -> None:
+        """When baseline_repo_root is None (local dev), _create_worktree
+        must not attempt to swap the hook — laptops keep the full
+        operator-local ruleset."""
+        d, _conn, _handler = _make_daemon(tmp_path, baseline_repo_root=None)
+
+        calls: dict[str, int] = {"install": 0}
+
+        def fake_install(*_args: Any, **_kwargs: Any) -> None:
+            calls["install"] += 1
+
+        monkeypatch.setattr(d, "_install_fargate_preflight_hook", fake_install)
+
+        def fake_run(_cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d._create_worktree("aabbccdd-eeff-0011-2233-445566778899")
+
+        assert calls["install"] == 0, "hook swap must be gated on Fargate mode"
+
+    def test_called_in_fargate_mode_after_worktree_add(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """End-to-end wiring check: _create_worktree in Fargate mode calls
+        _install_fargate_preflight_hook exactly once after git worktree add
+        succeeds."""
+        baseline = tmp_path / "repo"
+        (baseline / ".git").mkdir(parents=True)
+        d, _conn, _handler = _make_daemon(tmp_path, baseline_repo_root=baseline)
+
+        install_calls: list[tuple[Path, str]] = []
+
+        def fake_install(worktree_path: Path, agent_id: str) -> None:
+            install_calls.append((worktree_path, agent_id))
+
+        monkeypatch.setattr(d, "_install_fargate_preflight_hook", fake_install)
+
+        def fake_run(_cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        agent_id = "aabbccdd-eeff-0011-2233-445566778899"
+        wt = d._create_worktree(agent_id)
+
+        assert len(install_calls) == 1
+        assert install_calls[0] == (wt, agent_id)
+
+
+# --------------------------------------------------------------------------
 # _compute_worktree_path — consistent across claim path and _create_worktree
 # --------------------------------------------------------------------------
 

@@ -1251,6 +1251,34 @@ class TestSpawnPhaseSubprocess:
         assert "300" in captured["cmd"]
         assert "haiku" in captured["cmd"]
 
+    def test_command_includes_dangerously_skip_permissions_flag(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issue #2982 — every phase spawn must pass
+        ``--dangerously-skip-permissions`` so the in-container subagent's
+        Bash-tool permission policy does not block paths like
+        ``.githooks/pre-push`` that are outside the default allowlist.
+
+        This is the fix for the #2960 regression where ralph's Step 2.5
+        pre-push gate got permission-denied on six different invocation
+        variants, causing four consecutive identical test failures."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        for phase in ("plan", "ralph", "summary", "verify", "fix-ci", "retro"):
+            captured: dict[str, Any] = {}
+
+            def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+                captured["cmd"] = cmd
+                r = MagicMock()
+                r.returncode = 0
+                return r
+
+            monkeypatch.setattr(subprocess, "run", fake_run)
+            d._spawn_phase_subprocess(phase, tmp_path, f"agent-{phase}")
+            assert "--dangerously-skip-permissions" in captured["cmd"], (
+                f"phase={phase} cmd missing --dangerously-skip-permissions: {captured['cmd']}"
+            )
+
 
 # --------------------------------------------------------------------------
 # _run_subprocess_or_fail — timeout, non-zero exit, missing claude

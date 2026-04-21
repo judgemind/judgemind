@@ -220,6 +220,68 @@ COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
 RUN chmod +x /app/scripts/check-issue-author.sh
 
 # ---------------------------------------------------------------------------
+# Narrowed preflight hook for in-container subagents (issue #2982).
+#
+# The operator-local ``.claude/hooks/preflight-bash.sh`` blocks 12+ patterns
+# whose purpose is to prevent the *interactive* Claude CLI from stalling on
+# permission prompts (`$(...)`, heredocs, inline `python -c`, quoted
+# strings + `&&`/`;`, etc.). Inside the Fargate dispatcher container the
+# subagents (plan, ralph, summary, push_and_pr, verify, retro, fix-ci) run
+# non-interactively with ``--dangerously-skip-permissions`` — there are no
+# prompts, and those rules become pure drag. Concretely they blocked
+# ralph's Step 2.5 pre-push gate from executing at all on #2960, causing
+# four consecutive identical failures.
+#
+# We file-swap the hook at *worktree creation* time rather than (a) adding
+# an env-var branch inside the operator-local hook or (b) overwriting the
+# hook file inside the container image.
+#
+# Why not an env-var branch inside the operator-local hook?
+#   - every operator-side Bash tool call would pay for an env-var probe
+#   - one file diverges into two behaviors — easier to drift / hit bugs
+#   - the operator-local file would no longer be a pure audit trail of
+#     what blocks on laptops
+#
+# Why not overwrite in the image?
+#   - the subagent's cwd is the *worktree*, not ``/app``; hook paths in
+#     ``.claude/settings.json`` resolve relative to cwd, so the worktree's
+#     tracked hook file wins regardless of what ``/app`` contains
+#   - git-worktree tracked files are fresh copies from ``origin/main`` —
+#     the baseline clone's working tree doesn't feed into them either
+#
+# So we stage the Fargate hook at a stable in-image path and have the
+# daemon's :meth:`DispatcherDaemon._create_worktree` copy it over the
+# worktree's tracked hook file, then mark the file ``--skip-worktree`` so
+# git ignores the divergence (the ralph Step 2.5 pre-push gate would
+# otherwise see ``.claude/hooks/preflight-bash.sh`` as "modified" on
+# every worktree and potentially sweep it into the PR diff).
+#
+# Rationale for file-swap-on-worktree-create over the alternatives:
+#   - operator-local file is never touched — zero regression risk on laptops
+#   - no conditional inside the hook — easier to reason about what's enforced
+#   - ``--skip-worktree`` keeps the divergence invisible to git status /
+#     pre-push / PR diff
+#   - scope stays local to the Fargate path (baseline_repo_root is set)
+# The trade-off (a few lines of hook-swap code in the daemon) is worth it
+# for the clean separation.
+#
+# The narrower ``scripts/preflight-bash-fargate.sh`` only enforces the 4
+# safety-critical rules (git push to main, git worktree add inside a
+# worktree, cross-worktree writes, bare git stash pop/apply). See the
+# hook's header comment for the rationale per rule.
+#
+# We also COPY the ``.claude/hooks/preflight_cross_worktree.py`` helper
+# because the Fargate hook's cross-worktree-write check delegates to it
+# (same as the operator-local hook). The helper is staged next to the
+# hook in ``/app/fargate-hooks/`` so a single stage-dir COPY pattern
+# keeps the daemon code simple.
+# ---------------------------------------------------------------------------
+COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
+COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+RUN chmod +x /app/fargate-hooks/preflight-bash.sh
+ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
+
+# ---------------------------------------------------------------------------
 # Image provenance — GIT_SHA from build-args (CI sets it to the merge
 # commit SHA). The daemon reads GIT_SHA from the environment at startup
 # and persists it to `dispatcher.runs.version_sha` so post-hoc crash

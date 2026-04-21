@@ -67,6 +67,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -4000,7 +4001,141 @@ class DispatcherDaemon:
                 "branch": branch,
             },
         )
+
+        # Swap in the Fargate-narrow preflight hook in the worktree (issue
+        # #2982). Only runs in Fargate mode (baseline_repo_root set) — local
+        # dev keeps the operator-local hook so developers can still catch
+        # prompt-stalling patterns before the code lands. Failures are logged
+        # but non-fatal; if the swap can't run (e.g. the staged hook file is
+        # missing on a rogue local image), the operator-local hook just stays
+        # in place and the narrower rule set simply isn't active.
+        if self._cfg.baseline_repo_root is not None:
+            self._install_fargate_preflight_hook(worktree_path, agent_id)
+
         return worktree_path
+
+    def _install_fargate_preflight_hook(
+        self, worktree_path: Path, agent_id: str
+    ) -> None:
+        """Copy the narrowed Fargate preflight hook over the worktree's tracked
+        ``.claude/hooks/preflight-bash.sh`` and mark it ``skip-worktree`` so
+        git ignores the divergence.
+
+        Must be called AFTER :meth:`_create_worktree` has run ``git worktree
+        add`` successfully — the tracked hook file must exist on disk before
+        we overwrite it. See issue #2982 for the full motivation.
+
+        The staged source files live at ``$DISPATCHER_FARGATE_HOOKS_DIR/`` (set
+        by ``Dockerfile.dispatcher`` to ``/app/fargate-hooks``). If the env
+        var is unset, or the source files are missing, this is a no-op +
+        warning — the operator-local hook stays in place, matching the local
+        dev experience.
+        """
+        stage_dir_env = os.environ.get("DISPATCHER_FARGATE_HOOKS_DIR")
+        if not stage_dir_env:
+            self._log.warning(
+                "daemon.fargate_hook_skip",
+                extra={
+                    "event": "fargate_hook_skip",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "reason": "DISPATCHER_FARGATE_HOOKS_DIR unset",
+                },
+            )
+            return
+
+        stage_dir = Path(stage_dir_env)
+        source_hook = stage_dir / "preflight-bash.sh"
+        source_helper = stage_dir / "preflight_cross_worktree.py"
+        if not source_hook.exists() or not source_helper.exists():
+            self._log.warning(
+                "daemon.fargate_hook_skip",
+                extra={
+                    "event": "fargate_hook_skip",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "reason": "stage files missing",
+                    "stage_dir": str(stage_dir),
+                },
+            )
+            return
+
+        hooks_dir = worktree_path / ".claude" / "hooks"
+        target_hook = hooks_dir / "preflight-bash.sh"
+        target_helper = hooks_dir / "preflight_cross_worktree.py"
+
+        # ``git worktree add`` always recreates the tracked ``.claude/hooks/``
+        # tree, so the target paths will exist unless the branch being checked
+        # out diverges from main in that area. Defensive mkdir covers the
+        # divergence case without making the common case slower.
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            shutil.copyfile(source_hook, target_hook)
+            shutil.copymode(source_hook, target_hook)
+            shutil.copyfile(source_helper, target_helper)
+            shutil.copymode(source_helper, target_helper)
+        except OSError as exc:
+            self._log.warning(
+                "daemon.fargate_hook_copy_failed",
+                extra={
+                    "event": "fargate_hook_copy_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "error": str(exc),
+                },
+            )
+            return
+
+        # ``git update-index --skip-worktree`` tells git to pretend the file
+        # is unchanged even when it differs from the index. Without this, the
+        # diff would show up in every ralph Step 2.5 pre-push run, in
+        # ``git status``, and in the PR diff (which would fail the paths-
+        # filter gate on .claude/hooks/ and potentially replace the
+        # operator-local hook on merge). --skip-worktree is the correct tool
+        # here: it's per-worktree (not per-clone like --assume-unchanged),
+        # and git documents it as the "intentional local divergence" knob.
+        for target in (target_hook, target_helper):
+            # Repo-relative path for the update-index call.
+            rel = target.relative_to(worktree_path)
+            try:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(worktree_path),
+                        "update-index",
+                        "--skip-worktree",
+                        str(rel),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                # Non-fatal — the hook file is still swapped; the ``git
+                # status`` / pre-push / PR diff noise is the only regression.
+                self._log.warning(
+                    "daemon.fargate_hook_skip_worktree_failed",
+                    extra={
+                        "event": "fargate_hook_skip_worktree_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "path": str(rel),
+                        "error": str(exc),
+                    },
+                )
+
+        self._log.info(
+            "daemon.fargate_hook_installed",
+            extra={
+                "event": "fargate_hook_installed",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "worktree_path": str(worktree_path),
+            },
+        )
 
     def _fetch_issue_bundle(self, issue_number: int) -> dict[str, Any]:
         """Fetch issue body, comments, labels for the plan phase input.
@@ -5197,6 +5332,19 @@ class DispatcherDaemon:
             model,
             "--output-format",
             "json",
+            # ``--dangerously-skip-permissions`` bypasses the Bash-tool
+            # permission policy (the allowlist in
+            # ``.claude/settings.json``). Without it, paths not in the
+            # default allowlist — e.g. ``.githooks/pre-push`` — get
+            # rejected before the preflight hook even runs. The Fargate
+            # container image (see Dockerfile.dispatcher) ships a narrowed
+            # preflight hook that only enforces the 4 safety-critical
+            # rules, so the combination of skip-permissions + narrowed
+            # preflight is the minimum configuration that lets a subagent
+            # invoke ``.githooks/pre-push`` end-to-end. See issue #2982
+            # and the ralph Step 2.5 regression on #2960 (four
+            # consecutive permission-denied failures).
+            "--dangerously-skip-permissions",
         ]
 
         start = time.monotonic()
@@ -12301,6 +12449,14 @@ class DispatcherDaemon:
             str(DIAGNOSER_MAX_TURNS),
             "--model",
             DIAGNOSER_MODEL,
+            # See ``_spawn_phase_subprocess`` for the full rationale on
+            # why the Fargate dispatcher runs subagents with
+            # ``--dangerously-skip-permissions``. Same reasoning applies
+            # to the diagnoser subagent — non-interactive, protected by
+            # the narrowed preflight hook, needs to read PR/issue state
+            # and touch log files that the default permission policy
+            # would block. See issue #2982.
+            "--dangerously-skip-permissions",
         ]
         try:
             result = subprocess.run(
