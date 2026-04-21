@@ -545,6 +545,29 @@ class TestSpawnDiagnoserSubprocess:
         assert exit_code is None
         assert "claude" in tail.lower() or "not found" in tail.lower()
 
+    def test_command_includes_dangerously_skip_permissions_flag(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issue #2982 — the diagnoser subagent runs inside the Fargate
+        container just like the phase subagents, and must bypass the
+        Bash-tool permission policy to read its context (PR/issue state,
+        log files). The narrowed preflight hook still guards the 4
+        safety-critical patterns."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        captured: dict[str, Any] = {}
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured["cmd"] = cmd
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d._spawn_diagnoser_subprocess(42)
+        assert "--dangerously-skip-permissions" in captured["cmd"], captured["cmd"]
+
 
 # --------------------------------------------------------------------------
 # _read_recommendation — JSONB round-trip + validation
