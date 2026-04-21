@@ -43,6 +43,7 @@ Thumbs.db
 coverage/
 htmlcov/
 .coverage
+.coverage.*
 coverage.xml
 lcov.info
 .pytest_cache/

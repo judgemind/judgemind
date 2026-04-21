@@ -928,6 +928,92 @@ class TestResetDerivedTablesForCounty:
             assert list(first) == court_ids, f"expected court_ids={court_ids}, got {first}"
 
 
+class TestDeleteOpensearchDocsForCounty:
+    """Tests for delete_opensearch_docs_for_county() (#2568).
+
+    The global ``tentative_rulings_v1`` index cannot be reset under
+    ``--reset --county`` because that would wipe docs for every other
+    county.  And upsert-by-ruling_id only refreshes content for ruling_ids
+    that survive the rebuild — rulings dropped during rebuild remain as
+    orphans.  This helper issues a delete-by-query filtered on the target
+    county before the DB reset so the indexer rebuilds the county from a
+    clean slate.
+    """
+
+    def test_issues_delete_by_query_filtered_on_county(self) -> None:
+        """Calls _delete_by_query on tentative_rulings_v1 filtered on county."""
+        mock_client = MagicMock()
+        mock_client.indices.exists.return_value = True
+        mock_client.delete_by_query.return_value = {"deleted": 42}
+
+        with patch("opensearchpy.OpenSearch", return_value=mock_client):
+            result = rebuild_db.delete_opensearch_docs_for_county("http://os", "Contra Costa")
+
+        assert result == 42
+        mock_client.delete_by_query.assert_called_once()
+        kwargs = mock_client.delete_by_query.call_args.kwargs
+        assert kwargs["index"] == "tentative_rulings_v1"
+        assert kwargs["body"] == {"query": {"term": {"county": "Contra Costa"}}}
+        assert kwargs["refresh"] is True
+        assert kwargs["conflicts"] == "proceed"
+
+    def test_no_op_when_index_missing(self) -> None:
+        """Returns 0 without calling delete_by_query if the index is missing."""
+        mock_client = MagicMock()
+        mock_client.indices.exists.return_value = False
+
+        with patch("opensearchpy.OpenSearch", return_value=mock_client):
+            result = rebuild_db.delete_opensearch_docs_for_county("http://os", "Contra Costa")
+
+        assert result == 0
+        mock_client.delete_by_query.assert_not_called()
+
+    def test_uses_basic_auth_when_credentials_set(self) -> None:
+        """OPENSEARCH_USERNAME/PASSWORD env vars feed http_auth tuple."""
+        mock_client = MagicMock()
+        mock_client.indices.exists.return_value = True
+        mock_client.delete_by_query.return_value = {"deleted": 0}
+
+        with (
+            patch("opensearchpy.OpenSearch", return_value=mock_client) as mock_ctor,
+            patch.dict(
+                os.environ,
+                {
+                    "OPENSEARCH_USERNAME": "admin",
+                    "OPENSEARCH_PASSWORD": "s3cret",
+                },
+                clear=False,
+            ),
+        ):
+            rebuild_db.delete_opensearch_docs_for_county("http://os", "Ventura")
+
+        kwargs = mock_ctor.call_args.kwargs
+        assert kwargs["hosts"] == ["http://os"]
+        assert kwargs["timeout"] == 30
+        assert kwargs["max_retries"] == 3
+        assert kwargs["retry_on_timeout"] is True
+        assert kwargs["http_auth"] == ("admin", "s3cret")
+
+    def test_no_auth_when_credentials_unset(self) -> None:
+        """Missing env vars → http_auth not passed to the client ctor."""
+        mock_client = MagicMock()
+        mock_client.indices.exists.return_value = True
+        mock_client.delete_by_query.return_value = {"deleted": 0}
+
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("OPENSEARCH_USERNAME", None)
+        env.pop("OPENSEARCH_PASSWORD", None)
+
+        with (
+            patch("opensearchpy.OpenSearch", return_value=mock_client) as mock_ctor,
+            patch.dict(os.environ, env, clear=True),
+        ):
+            rebuild_db.delete_opensearch_docs_for_county("http://os", "Ventura")
+
+        kwargs = mock_ctor.call_args.kwargs
+        assert "http_auth" not in kwargs
+
+
 class TestMainPerCountyResetDispatch:
     """Tests for main()'s dispatch between global and per-county reset."""
 
@@ -1009,6 +1095,7 @@ class TestMainPerCountyResetDispatch:
         ctx = self._common_patches(
             tmp_path, ["rebuild_db.py", "--reset", "--county", "Santa Clara"]
         )
+        parent = MagicMock()
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
@@ -1020,6 +1107,7 @@ class TestMainPerCountyResetDispatch:
             patch("rebuild_db.reset_derived_tables") as mock_global_reset,
             patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
             patch("rebuild_db.reset_opensearch_index") as mock_os_reset,
+            patch("rebuild_db.delete_opensearch_docs_for_county") as mock_os_delete_county,
             patch("rebuild_db._fetch_rosters"),
             patch("rebuild_db._write_rebuild_marker"),
             patch(
@@ -1041,6 +1129,8 @@ class TestMainPerCountyResetDispatch:
             ),
             patch("sys.argv", ctx["argv"]),
         ):
+            parent.attach_mock(mock_os_delete_county, "os_delete_county")
+            parent.attach_mock(mock_per_county_reset, "per_county_reset")
             rebuild_db.main()
 
         mock_global_reset.assert_not_called()
@@ -1049,8 +1139,59 @@ class TestMainPerCountyResetDispatch:
         call_args = mock_per_county_reset.call_args
         assert call_args[0][1] == "ca"
         assert call_args[0][2] == "Santa Clara"
-        # Must skip OpenSearch index reset under per-county mode.
+        # Global OpenSearch index reset must not be called under --county mode.
         mock_os_reset.assert_not_called()
+        # Per-county OS delete-by-query runs once with (os_url, county).
+        mock_os_delete_county.assert_called_once_with("http://opensearch:9200", "Santa Clara")
+        # OS delete must run BEFORE the DB reset — a delete-by-query failure
+        # should abort the rebuild rather than leave the DB reset and OS
+        # half-stale.
+        method_names = [name for name, _, _ in parent.mock_calls]
+        os_idx = method_names.index("os_delete_county")
+        db_idx = method_names.index("per_county_reset")
+        assert os_idx < db_idx
+
+    def test_per_county_reset_skips_os_delete_when_url_unset(self, tmp_path: Any) -> None:
+        """Without ``OPENSEARCH_URL``, per-county DB reset still runs and the
+        OS delete is skipped entirely.
+        """
+        ctx = self._common_patches(
+            tmp_path, ["rebuild_db.py", "--reset", "--county", "Santa Clara"]
+        )
+        env = {k: v for k, v in os.environ.items()}
+        env.pop("OPENSEARCH_URL", None)
+        env["DATABASE_URL"] = "postgres://test"
+        env["S3_CACHE_DIR"] = ctx["cache_dir"]
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch(
+                "rebuild_db.list_local_keys",
+                return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
+            ),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db.reset_derived_tables") as mock_global_reset,
+            patch("rebuild_db.reset_derived_tables_for_county") as mock_per_county_reset,
+            patch("rebuild_db.delete_opensearch_docs_for_county") as mock_os_delete_county,
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._write_rebuild_marker"),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=ctx["mock_pool"],
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([ctx["mock_future"]]),
+            ),
+            patch.dict(os.environ, env, clear=True),
+            patch("sys.argv", ctx["argv"]),
+        ):
+            rebuild_db.main()
+
+        mock_global_reset.assert_not_called()
+        mock_per_county_reset.assert_called_once()
+        mock_os_delete_county.assert_not_called()
 
     def test_no_reset_does_not_touch_derived_tables(self, tmp_path: Any) -> None:
         """Without ``--reset``, neither reset function is called — existing

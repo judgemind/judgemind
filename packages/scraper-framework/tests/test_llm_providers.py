@@ -770,8 +770,9 @@ class TestCreateClient:
         assert client is mock_instance
 
     def test_unknown_provider_returns_none(self) -> None:
-        """Unknown provider returns None."""
-        client = create_client(provider="openai")
+        """Unknown provider returns None even when fallback keys are in env."""
+        with patch.dict("os.environ", {}, clear=True):
+            client = create_client(provider="openai")
         assert client is None
 
 
@@ -1238,4 +1239,5 @@ class TestCreateClientTypes:
 
     def test_unknown_provider_returns_none(self) -> None:
         """create_client returns None for an unsupported provider name."""
-        assert create_client(provider="openai") is None
+        with patch.dict("os.environ", {}, clear=True):
+            assert create_client(provider="openai") is None
