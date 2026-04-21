@@ -229,15 +229,28 @@ module "dispatcher_daemon" {
   # singleton and overlapping instances would double-spawn agents.
   desired_count = 1
 
-  # Memory sized for ralph's in-container pre-push gate (#2962).
-  # The spec §14 default (2 GiB) covers the daemon itself but not the
-  # per-agent ralph subprocess that runs `pytest packages/<pkg>/tests/`
-  # over the full 7200-test scraper-framework suite — pytest was
-  # SIGKILL'd by the kernel OOM reaper on #2568 after loading ~3% of
-  # tests. Bump to 8 GiB (Fargate 1 vCPU max; larger requires bumping
-  # CPU too) to give the pre-push gate headroom. Cost delta is minimal
-  # (~$0.04/hr extra for a singleton dev dispatcher).
-  task_memory = 8192
+  # CPU + memory sized for ralph's in-container pre-push gate (#2962) and
+  # anticipated cap>1 future state.
+  #
+  # Memory — #2568 showed pytest was SIGKILL'd running the 7200-test
+  # scraper-framework suite under the 2 GiB spec default. Bumped to 8 GiB
+  # on #2993 (2026-04-21) to unblock. Now bumping to 16 GiB so parallel
+  # pytest workers (`-n auto` per this PR) have headroom.
+  #
+  # CPU — 1 vCPU serializes daemon + ralph subprocess + pytest workers on
+  # a single core. #2613 ("watchdog for retired.cc-courts.org sunset
+  # signals") hit the 3h `subprocess_timeout_s` twice at 1 vCPU. Bumping
+  # to 4 vCPU so `pytest -n auto` can parallelize and ralph's
+  # reviewer/worker loop runs concurrently with the daemon's tick.
+  #
+  # Cost delta vs 1 vCPU + 8 GiB baseline: ~$0.12/hr (~$88/mo for the
+  # singleton dev dispatcher). Acceptable for a workload where each
+  # failed 3h ralph retry burns $20-40 in Claude API spend.
+  #
+  # Fargate CPU/RAM constraint: at 4 vCPU, RAM must be 8-30 GiB. 16 GiB
+  # lands mid-range.
+  task_cpu    = 4096
+  task_memory = 16384
 
   # Secret ARNs — populated incrementally as their owning issues land.
   # #2700 wires `github_token_secret_arn` (this ARN is the scoped PAT from
