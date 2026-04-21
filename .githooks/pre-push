@@ -228,7 +228,22 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             else
                 xdist_flag=""
             fi
-            if ! run_check "$pkg" "pytest" "$pkg_dir/.venv/bin/pytest" $xdist_flag "$pkg_dir/tests/" -x -q --tb=line; then
+            # Use pytest-testmon when available to skip tests whose
+            # covered source lines haven't changed since the last run
+            # (#2997). State is kept in $pkg_dir/.testmondata (gitignored,
+            # per-worktree). First run is a full suite; subsequent runs
+            # within the same worktree (e.g. ralph iteration 2+) re-run
+            # only the tests whose coverage map intersects the diff.
+            # Flag order matters: testmon filters the test list, xdist
+            # parallelizes whatever testmon selects. Defensive check
+            # mirrors the xdist pattern above so pre-push still works
+            # on venvs built before pytest-testmon was added to dev deps.
+            if "$pkg_dir/.venv/bin/python" -c "import testmon" 2>/dev/null; then
+                testmon_flag="--testmon"
+            else
+                testmon_flag=""
+            fi
+            if ! run_check "$pkg" "pytest" "$pkg_dir/.venv/bin/pytest" $testmon_flag $xdist_flag "$pkg_dir/tests/" -x -q --tb=line; then
                 echo "  Run: $pkg_dir/.venv/bin/pytest $pkg_dir/tests/ -v --tb=short" >&2
                 failures=$((failures + 1))
             fi
