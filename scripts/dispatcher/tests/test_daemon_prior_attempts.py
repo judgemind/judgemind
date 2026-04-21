@@ -189,15 +189,15 @@ class TestFetchPriorAttempts:
         assert result == []
 
     def test_query_excludes_infra_preempted(self, tmp_path: Path) -> None:
-        """SQL query uses ``phase NOT IN`` to exclude infra-preemption categories."""
+        """SQL query uses ``phase != ALL(%s)`` to exclude infra-preemption categories."""
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue.append([])
 
         d._fetch_prior_attempts(42)
 
         executed_sqls = [sql for sql, _ in conn.cursor_instance.executed]
-        assert any("phase NOT IN" in sql for sql in executed_sqls), (
-            "SQL must filter with 'phase NOT IN' to exclude infra-preemption phases"
+        assert any("phase != ALL" in sql for sql in executed_sqls), (
+            "SQL must filter with 'phase != ALL(%s)' to exclude infra-preemption phases"
         )
         assert any(
             "a.status IN ('failed', 'crashed')" in sql for sql in executed_sqls
@@ -276,8 +276,8 @@ class TestMaterializePriorAttempts:
         count = d._materialize_prior_attempts(worktree, 42)
 
         executed_sqls = [sql for sql, _ in conn.cursor_instance.executed]
-        assert any("phase NOT IN" in sql for sql in executed_sqls), (
-            "SQL must use 'phase NOT IN' to exclude infra-preemption categories"
+        assert any("phase != ALL" in sql for sql in executed_sqls), (
+            "SQL must use 'phase != ALL(%s)' to exclude infra-preemption categories"
         )
         assert count == 0
 
