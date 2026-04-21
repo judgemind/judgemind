@@ -29,7 +29,7 @@ Spec §6b's `.claude/skills/` + symlink plan works. The hidden WARN only surface
 1. **Installed CLIs locally** (worktree-level node, via npm):
    - `npm i -g @google/gemini-cli` → `gemini 0.38.2` at `~/.nvm/versions/node/v24.14.0/bin/gemini`.
    - `npm i -g opencode-ai` → `opencode 1.4.14` at `~/.nvm/versions/node/v24.14.0/bin/opencode`.
-2. **Created a throwaway test skill** at `.claude/skills/spike-hello/SKILL.md` using `scripts/write-claude-file.sh` (the PreToolUse hook blocks direct writes inside `.claude/`). Frontmatter intentionally includes Claude-specific fields:
+2. **Created a throwaway test skill** at .claude/skills/spike-hello/SKILL.md using `scripts/write-claude-file.sh` (the PreToolUse hook blocks direct writes inside `.claude/`). Frontmatter intentionally includes Claude-specific fields:
    ```yaml
    ---
    name: spike-hello
