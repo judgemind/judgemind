@@ -229,6 +229,24 @@ The transcription LLM prompt describes **visual structure, not text heuristics**
 
 **Reingestion.** Historical documents already in S3 can be reprocessed through the full pipeline using `scripts/reingest_from_s3.py`. Operates on **existing database records only** — it queries `documents` to find S3 keys to reprocess. For initial population of a county that has S3 data but no DB records, use `scripts/rebuild_db.py --county <name>`, which discovers documents directly from S3 keys.
 
+### 3.3.3 Scraper Development Constraints
+
+Rules every scraper author and reviewer must follow. These apply to new scrapers and changes to existing ones.
+
+**Never run production scraping from dev.** Fetching court pages to create local test fixtures is fine. Automated runs that post to the production capture pipeline, write to the production S3 bucket, or emit `document.captured` events on production Redis Streams are not. Dev and production share no scraper execution paths.
+
+**Archive before anything else.** Every captured document must be written to S3 before any extraction or transformation begins. If a downstream step fails, the raw content is preserved and can be reprocessed. This is the archive-first principle applied specifically to scrapers.
+
+**SHA-256 content hashing on every document.** Content hashes drive deduplication (skip if hash matches), upsert logic (new version if hash differs), and the content-addressed S3 key scheme. Every scraper must compute and emit a `sha256(content)` hash for every captured document.
+
+**Data correctness over completeness.** A missing field is acceptable; a wrong field is a bug. When evaluating scraper output quality, verify correctness first (is the extracted value accurate against the source?) then completeness (is the field populated?). High completeness with low correctness is worse than low completeness with high correctness. A sudden drop in completeness metrics is a signal to investigate correctness — not just a completeness problem.
+
+**Required fields.** A scraper is not shippable until it correctly extracts all of the following from source data present at development time: **judge name, motion type, case title, hearing date, outcome, parties**. Fields the court website does not provide may be left blank; fields the court website does provide must be extracted. Do not ship scrapers that leave extractable fields empty and rely on post-hoc backfills.
+
+**Regression tests against real fixtures.** Every scraper must ship with tests against archived real court pages covering typical rulings, edge cases, and known formatting variations. Each test must assert the value of every required field. "The scraper runs without error" is not a test.
+
+Key paths: framework in `packages/scraper-framework/src/framework/`, California courts in `packages/scraper-framework/src/courts/ca/`.
+
 ## 3.4 Application Layer
 
 ### 3.4.1 Dual API — GraphQL + Minimal REST
