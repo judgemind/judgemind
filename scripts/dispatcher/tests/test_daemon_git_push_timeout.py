@@ -9,9 +9,13 @@ The dispatcher daemon fires ``git push`` in two places:
 
 Both previously used ``timeout=120``, which was not enough to cover
 the pre-push hook's package test runs. On 2026-04-19 two overnight
-agents lost ralph's work when the 120s ceiling tripped mid-hook. The
-fix (this change) extracts the timeout to a module-level
-``GIT_PUSH_TIMEOUT_SECONDS`` constant set to 600s.
+agents lost ralph's work when the 120s ceiling tripped mid-hook.
+600s was still too tight: on 2026-04-21 agent c3a69458 (#2564) timed
+out at 600s with the hook still running the 7200-test scraper-
+framework suite on 4 vCPU Fargate. The fix (this change) extracts
+the timeout to a module-level ``GIT_PUSH_TIMEOUT_SECONDS`` constant
+set to 1800s (30 min), aligned with the ``push_and_pr`` stuck-
+timeout fallback.
 
 These tests guard against regressing back to a hardcoded value by
 walking the daemon module's AST and asserting every ``git push``
@@ -40,19 +44,19 @@ from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 _DAEMON_PATH = Path(daemon.__file__)
 
 
-def test_git_push_timeout_constant_is_600_seconds() -> None:
-    """The module-level ``GIT_PUSH_TIMEOUT_SECONDS`` constant is 600s.
+def test_git_push_timeout_constant_is_1800_seconds() -> None:
+    """The module-level ``GIT_PUSH_TIMEOUT_SECONDS`` constant is 1800s.
 
     Guards against a well-meaning "tighten this back down" edit that
-    would reintroduce the original 120s failure mode. If you need to
+    would reintroduce the 120s or 600s failure modes. If you need to
     change this value, update the call-site tests below AND the
     docstring explaining the rationale.
     """
     assert hasattr(daemon, "GIT_PUSH_TIMEOUT_SECONDS"), (
         "daemon module must define GIT_PUSH_TIMEOUT_SECONDS (#2882)"
     )
-    assert daemon.GIT_PUSH_TIMEOUT_SECONDS == 600, (
-        f"GIT_PUSH_TIMEOUT_SECONDS must be 600; got {daemon.GIT_PUSH_TIMEOUT_SECONDS}"
+    assert daemon.GIT_PUSH_TIMEOUT_SECONDS == 1800, (
+        f"GIT_PUSH_TIMEOUT_SECONDS must be 1800; got {daemon.GIT_PUSH_TIMEOUT_SECONDS}"
     )
 
 
