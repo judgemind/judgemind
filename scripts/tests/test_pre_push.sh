@@ -28,6 +28,7 @@
 #   6. Missing ruff -> WARNING only       no failure, WARNING in output
 #   7. Missing actionlint on workflow     WARNING only, exit 0
 #   8. Missing terraform on infra change  WARNING only, exit 0
+#  11. run_check helper surfaces ruff error tail + Full log path (#2973 AC1)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -465,6 +466,65 @@ elif ! echo "$hook_out" | grep -q "FAILED: scripts/check_schema_drift.sh"; then
     report_fail "expected 'FAILED: scripts/check_schema_drift.sh' in output" "$hook_out"
 else
     report_pass "hook rejects drift and names regenerate_schema.sh in the fix message"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 11: run_check helper surfaces ruff output tail + Full log path
+# ───────────────────────────────────────────────────────────────────────
+# Seeds testpkg with a clean src/good.py AND a syntactically-broken
+# src/bad.py, stubs a ruff binary in the package .venv so the hook uses
+# it, runs the hook, and asserts:
+#   - exit != 0
+#   - output contains "FAILED: ruff check for testpkg"
+#   - output contains "E999" or "SyntaxError" (ruff's syntax-error signal)
+#   - output contains "Full log: /tmp/prepush-testpkg-ruff-check.log"
+# This directly exercises AC1 (run_check tees combined output to a log and
+# prints the last 20 lines + log path on failure) without needing a real
+# ruff installation or pytest.
+echo "[scenario 11] run_check helper surfaces ruff error tail + Full log path"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-syntax-error
+seed_testpkg
+
+# Add a syntactically broken Python file that ruff will reject with E999.
+cat > "$WORK/packages/testpkg/src/bad.py" <<'PY'
+def greet( -> str:
+    return "hello"
+PY
+
+# Stub a ruff binary in the package .venv so the hook uses it (the hook
+# prefers $pkg_dir/.venv/bin/ruff over the global ruff). The stub:
+#   - exits 0 for "ruff format --check ..." (format passes)
+#   - exits 1 for "ruff check ..." and prints an E999 error
+mkdir -p "$WORK/packages/testpkg/.venv/bin"
+cat > "$WORK/packages/testpkg/.venv/bin/ruff" <<'RUFF'
+#!/usr/bin/env bash
+# Stub ruff: fail on "ruff check", pass on "ruff format --check"
+if [ "${1:-}" = "format" ]; then
+    exit 0
+fi
+# "ruff check" path — emit a fake E999 syntax error and exit 1
+echo "packages/testpkg/src/bad.py:1:16: E999 SyntaxError: invalid syntax"
+exit 1
+RUFF
+chmod +x "$WORK/packages/testpkg/.venv/bin/ruff"
+
+git -C "$WORK" add packages/testpkg
+git -C "$WORK" commit --quiet -m "feat: add testpkg with syntax error"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-syntax-error $feat_sha refs/heads/feature-syntax-error $ZERO_SHA"
+
+if [ "$hook_rc" -eq 0 ]; then
+    report_fail "expected hook to exit non-zero on ruff syntax error, got 0" "$hook_out"
+elif ! echo "$hook_out" | grep -q "FAILED: ruff check for testpkg"; then
+    report_fail "expected 'FAILED: ruff check for testpkg' in output (#2973 AC1)" "$hook_out"
+elif ! echo "$hook_out" | grep -qE "E999|SyntaxError"; then
+    report_fail "expected E999 or SyntaxError in output tail (#2973 AC1)" "$hook_out"
+elif ! echo "$hook_out" | grep -q "Full log: /tmp/prepush-testpkg-ruff-check.log"; then
+    report_fail "expected 'Full log: /tmp/prepush-testpkg-ruff-check.log' in output (#2973 AC1)" "$hook_out"
+else
+    report_pass "run_check helper surfaces ruff error tail and Full log path (#2973 AC1)"
 fi
 
 # ───────────────────────────────────────────────────────────────────────

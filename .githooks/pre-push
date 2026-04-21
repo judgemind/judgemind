@@ -14,6 +14,38 @@
 set -uo pipefail
 
 # -------------------------------------------------------------------
+# run_check <pkg> <check-name> <cmd> [args...]
+#
+# Runs the given command, teeing combined stdout+stderr into a log file
+# at /tmp/prepush-<pkg_sanitized>-<check_sanitized>.log.
+# On non-zero exit, prints the last 20 lines of the log plus the log path
+# to stderr, then returns the command's exit code so the caller can
+# increment failures.
+# -------------------------------------------------------------------
+run_check() {
+    local pkg="$1"
+    local check_name="$2"
+    shift 2
+    local pkg_safe check_safe log_file
+    pkg_safe="${pkg//\//_}"
+    check_safe="${check_name//\//_}"
+    check_safe="${check_safe// /-}"
+    log_file="/tmp/prepush-${pkg_safe}-${check_safe}.log"
+
+    local rc=0
+    "$@" > "$log_file" 2>&1 || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        echo "" >&2
+        echo "  FAILED: $check_name for $pkg" >&2
+        echo "  Last 20 lines of output:" >&2
+        tail -n 20 "$log_file" | sed 's/^/    /' >&2
+        echo "  Full log: $log_file" >&2
+    fi
+    return "$rc"
+}
+
+# -------------------------------------------------------------------
 # Determine the range of commits being pushed
 # -------------------------------------------------------------------
 # Git passes the remote name and URL as positional args.
@@ -162,17 +194,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
 
         # ruff check (lint)
-        if ! $ruff_cmd check $check_dirs 2>&1; then
-            echo "" >&2
-            echo "  FAILED: ruff check for $pkg" >&2
+        if ! run_check "$pkg" "ruff check" $ruff_cmd check $check_dirs; then
             echo "  Fix with: $ruff_cmd check --fix $check_dirs && $ruff_cmd format $check_dirs" >&2
             failures=$((failures + 1))
         fi
 
         # ruff format --check
-        if ! $ruff_cmd format --check $check_dirs 2>&1; then
-            echo "" >&2
-            echo "  FAILED: ruff format for $pkg" >&2
+        if ! run_check "$pkg" "ruff format" $ruff_cmd format --check $check_dirs; then
             echo "  Fix with: $ruff_cmd format $check_dirs" >&2
             failures=$((failures + 1))
         fi
@@ -190,9 +218,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
         if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
             echo "pre-push: running tests for Python package '$pkg'..." >&2
-            if ! "$pkg_dir/.venv/bin/pytest" "$pkg_dir/tests/" -x -q --tb=line 2>&1; then
-                echo "" >&2
-                echo "  FAILED: tests for $pkg" >&2
+            if ! run_check "$pkg" "pytest" "$pkg_dir/.venv/bin/pytest" "$pkg_dir/tests/" -x -q --tb=line; then
                 echo "  Run: $pkg_dir/.venv/bin/pytest $pkg_dir/tests/ -v --tb=short" >&2
                 failures=$((failures + 1))
             fi
@@ -218,13 +244,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         baselines_file="coverage-baselines.json"
         if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
             echo "pre-push: checking coverage floor for '$pkg'..." >&2
-            if ! python3 scripts/update-coverage-baselines.py \
+            if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
                     --package "$pkg_key" \
                     --coverage-file "$cov_file" \
                     --baselines-file "$baselines_file" \
-                    --dry-run 2>&1; then
-                echo "" >&2
-                echo "  FAILED: coverage floor check for $pkg" >&2
+                    --dry-run; then
                 echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
                 echo "  Add tests to restore coverage before pushing." >&2
                 failures=$((failures + 1))
@@ -246,12 +270,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
         if [ -f "$cov_file" ] && [ -x "$diff_cover_cmd" ]; then
             echo "pre-push: checking diff coverage for '$pkg'..." >&2
-            if ! "$diff_cover_cmd" "$cov_file" \
+            if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
                     --compare-branch=origin/main \
                     --fail-under=90 \
-                    --diff-range-notation='..' 2>&1; then
-                echo "" >&2
-                echo "  FAILED: diff coverage for $pkg" >&2
+                    --diff-range-notation='..'; then
                 echo "  New/changed lines have < 90% test coverage." >&2
                 echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
                 echo "  to see exactly which lines need tests." >&2
@@ -275,9 +297,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         if (cd "$pkg_dir" && npm run lint --if-present 2>&1) | grep -q "Missing script"; then
             echo "  No lint script found for $pkg — skipping" >&2
         else
-            if ! (cd "$pkg_dir" && npm run lint 2>&1); then
-                echo "" >&2
-                echo "  FAILED: npm run lint for $pkg" >&2
+            if ! run_check "$pkg" "npm run lint" bash -c "cd $(printf '%q' "$pkg_dir") && npm run lint"; then
                 echo "  Fix lint issues in $pkg_dir before pushing." >&2
                 failures=$((failures + 1))
             fi
@@ -301,9 +321,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
 
         echo "pre-push: running tests for TypeScript package '$pkg'..." >&2
-        if ! (cd "$pkg_dir" && npm test 2>&1); then
-            echo "" >&2
-            echo "  FAILED: tests for $pkg" >&2
+        if ! run_check "$pkg" "npm test" bash -c "cd $(printf '%q' "$pkg_dir") && npm test"; then
             echo "  Run: cd $pkg_dir && npm test" >&2
             failures=$((failures + 1))
         fi
@@ -318,13 +336,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         baselines_file="coverage-baselines.json"
         if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
             echo "pre-push: checking coverage floor for '$pkg'..." >&2
-            if ! python3 scripts/update-coverage-baselines.py \
+            if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
                     --package "packages/$pkg" \
                     --coverage-file "$cov_file" \
                     --baselines-file "$baselines_file" \
-                    --dry-run 2>&1; then
-                echo "" >&2
-                echo "  FAILED: coverage floor check for $pkg" >&2
+                    --dry-run; then
                 echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
                 echo "  Add tests to restore coverage before pushing." >&2
                 failures=$((failures + 1))
@@ -352,12 +368,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
         if [ -f "$cov_file" ] && [ -n "$diff_cover_cmd" ]; then
             echo "pre-push: checking diff coverage for '$pkg'..." >&2
-            if ! "$diff_cover_cmd" "$cov_file" \
+            if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
                     --compare-branch=origin/main \
                     --fail-under=90 \
-                    --diff-range-notation='..' 2>&1; then
-                echo "" >&2
-                echo "  FAILED: diff coverage for $pkg" >&2
+                    --diff-range-notation='..'; then
                 echo "  New/changed lines have < 90% test coverage." >&2
                 echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
                 echo "  to see exactly which lines need tests." >&2
@@ -373,9 +387,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         echo "pre-push: checking Terraform formatting..." >&2
 
         if command -v terraform &>/dev/null; then
-            if ! terraform fmt -check -recursive infra/terraform/ 2>&1; then
-                echo "" >&2
-                echo "  FAILED: terraform fmt" >&2
+            if ! run_check "terraform" "terraform fmt" terraform fmt -check -recursive infra/terraform/; then
                 echo "  Fix with: terraform fmt -recursive infra/terraform/" >&2
                 failures=$((failures + 1))
             fi
@@ -393,9 +405,7 @@ changed_workflows=$(echo "$changed_files" | grep '^\.github/workflows/' || true)
 if [ -n "$changed_workflows" ]; then
     echo "pre-push: checking GitHub Actions workflow files..." >&2
     if command -v actionlint &>/dev/null; then
-        if ! actionlint -ignore 'SC2086' $changed_workflows 2>&1; then
-            echo "" >&2
-            echo "  FAILED: actionlint" >&2
+        if ! run_check "_" "actionlint" actionlint -ignore 'SC2086' $changed_workflows; then
             echo "  Fix workflow syntax errors before pushing." >&2
             failures=$((failures + 1))
         fi
@@ -416,9 +426,7 @@ changed_ci_yml=$(echo "$changed_files" | grep -E '^\.github/workflows/ci\.yml$' 
 if [ -n "$changed_ci_yml" ]; then
     echo "pre-push: checking for modified-but-skipped CI jobs..." >&2
     if [ -x scripts/check-ci-job-skipped.sh ]; then
-        if ! scripts/check-ci-job-skipped.sh 2>&1; then
-            echo "" >&2
-            echo "  FAILED: scripts/check-ci-job-skipped.sh" >&2
+        if ! run_check "_" "scripts/check-ci-job-skipped.sh" scripts/check-ci-job-skipped.sh; then
             echo "  A job body in ci.yml was modified but its paths-filter" >&2
             echo "  gate doesn't match anything in the diff — the job will" >&2
             echo "  be SKIPPED on this PR's CI run and the change won't be" >&2
@@ -439,9 +447,7 @@ changed_markdown=$(echo "$changed_files" | grep -E '\.md$' || true)
 if [ -n "$changed_markdown" ]; then
     echo "pre-push: checking markdown links..." >&2
     if [ -x scripts/check-markdown-links.sh ]; then
-        if ! scripts/check-markdown-links.sh 2>&1; then
-            echo "" >&2
-            echo "  FAILED: scripts/check-markdown-links.sh" >&2
+        if ! run_check "_" "scripts/check-markdown-links.sh" scripts/check-markdown-links.sh; then
             echo "  Broken internal markdown pointer detected." >&2
             echo "  Fix the pointer, create the target, or drop the backticks" >&2
             echo "  if the token is illustrative prose rather than a real path." >&2
@@ -476,9 +482,7 @@ if [ -n "$changed_migrations" ]; then
         # Use --ci mode so the check spins up its own ephemeral postgres
         # container rather than relying on the docker-compose stack being
         # up. ~15s when postgres image is already cached; ~30-60s cold.
-        if ! scripts/check_schema_drift.sh --ci 2>&1; then
-            echo "" >&2
-            echo "  FAILED: scripts/check_schema_drift.sh" >&2
+        if ! run_check "_" "scripts/check_schema_drift.sh" scripts/check_schema_drift.sh --ci; then
             echo "  packages/api/src/data-access/schema.sql is out of sync with the" >&2
             echo "  migrations in packages/api/migrations/." >&2
             echo "" >&2
@@ -507,9 +511,7 @@ changed_dispatcher_deps=$(echo "$changed_files" \
 if [ -n "$changed_dispatcher_deps" ]; then
     echo "pre-push: checking dispatcher image dependency drift..." >&2
     if [ -x scripts/check-dispatcher-image-deps.sh ]; then
-        if ! scripts/check-dispatcher-image-deps.sh 2>&1; then
-            echo "" >&2
-            echo "  FAILED: scripts/check-dispatcher-image-deps.sh" >&2
+        if ! run_check "_" "scripts/check-dispatcher-image-deps.sh" scripts/check-dispatcher-image-deps.sh; then
             echo "  A Python import under scripts/dispatcher/ is not installed" >&2
             echo "  in Dockerfile.dispatcher. The dispatcher daemon will fail" >&2
             echo "  at runtime with ModuleNotFoundError in production." >&2
@@ -535,9 +537,7 @@ fi
 # than behind a path filter.
 if [ -x scripts/check-hyphen-underscore-collision.sh ]; then
     echo "pre-push: checking for filename separator collisions..." >&2
-    if ! scripts/check-hyphen-underscore-collision.sh 2>&1; then
-        echo "" >&2
-        echo "  FAILED: scripts/check-hyphen-underscore-collision.sh" >&2
+    if ! run_check "_" "scripts/check-hyphen-underscore-collision.sh" scripts/check-hyphen-underscore-collision.sh; then
         echo "  Two files in the same directory differ only by '-' vs '_'" >&2
         echo "  — rename one or delete the stale sibling. See #2751/#2754." >&2
         failures=$((failures + 1))
@@ -556,9 +556,7 @@ changed_scripts_py=$(echo "$changed_files" | grep -E '^scripts/[^/]+\.py$' || tr
 if [ -n "$changed_scripts_py" ]; then
     echo "pre-push: checking one-off/permanent markers on scripts/*.py..." >&2
     if [ -x scripts/check-script-headers.sh ]; then
-        if ! scripts/check-script-headers.sh 2>&1; then
-            echo "" >&2
-            echo "  FAILED: scripts/check-script-headers.sh" >&2
+        if ! run_check "_" "scripts/check-script-headers.sh" scripts/check-script-headers.sh; then
             echo "  A top-level one-off-pattern script is missing its marker." >&2
             echo "  Add '# one-off: true' or '# permanent: true' within the" >&2
             echo "  first 50 lines of the file. See docs/agent/code-standards.md" >&2
