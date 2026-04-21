@@ -1,5 +1,6 @@
 'use client';
 
+import type { CSSProperties } from 'react';
 import { SECTION_HEADING } from '@/lib/typography';
 import type { RecentCompletion } from '@/lib/dispatcher-queries';
 import { IssueLink, OutcomePill, PriorityBadge, PRLink } from './ui-primitives';
@@ -104,8 +105,19 @@ function RecentCompletionRow({
   const pacificTitle = Number.isFinite(endedMs)
     ? formatPacificDatetime(endedMs)
     : '';
+  // Magic Move (#2967): each completed row carries the agent identity
+  // so that the inner `agent-X` wrapper of the matching Active row can
+  // Magic Move into this slot when the agent transitions to a terminal
+  // state. See tmp/magic-move-proto.html for the reference visual.
+  const rowStyle = {
+    viewTransitionName: `agent-${completion.agentId}`,
+  } as CSSProperties;
   return (
-    <li className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50">
+    <li
+      className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50"
+      style={rowStyle}
+      data-testid={`completion-row-${completion.agentId}`}
+    >
       <span className="flex-shrink-0 pt-0.5">
         {/* #2900: pass failureSummary through as hover tooltip for
             failure terminals. Null on succeeded / needs_review /

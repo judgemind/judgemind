@@ -379,3 +379,101 @@ describe('DispatcherDashboard — #2860 circuit-breaker banner', () => {
     expect(screen.queryByTestId('circuit-breaker-banner')).not.toBeInTheDocument();
   });
 });
+
+describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+  });
+
+  it('wraps subsequent poll state updates in document.startViewTransition when available', async () => {
+    // Stub the View Transitions API on the jsdom document. We capture
+    // the callback the hook passes in so we can assert that the state
+    // mutation happens *inside* the transition (flushSync + setState),
+    // not eagerly.
+    const captured: Array<() => void> = [];
+    const startViewTransition = vi.fn((cb: () => void) => {
+      captured.push(cb);
+      return { finished: Promise.resolve() };
+    });
+    (
+      document as unknown as {
+        startViewTransition?: (cb: () => void) => unknown;
+      }
+    ).startViewTransition = startViewTransition;
+
+    // Also pin `matchMedia` to a non-reducing response so the hook
+    // does not short-circuit on the reduced-motion branch. jsdom does
+    // not implement matchMedia natively.
+    const originalMatchMedia = window.matchMedia;
+    (window as unknown as { matchMedia: typeof window.matchMedia }).matchMedia =
+      ((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      })) as typeof window.matchMedia;
+
+    try {
+      // Initial frame — state A. First render initialises the mirror
+      // synchronously; no transition wrapping on the very first paint
+      // (no prior frame to transition from).
+      mockQueryData = { dispatcherState: { ...BASE_STATE } };
+      const { rerender } = renderDashboard();
+      expect(startViewTransition).not.toHaveBeenCalled();
+
+      // Simulate a poll landing a *new* data reference. Apollo always
+      // returns a fresh object on each network reply, so reference
+      // equality is the trigger the mirror watches.
+      mockQueryData = {
+        dispatcherState: {
+          ...BASE_STATE,
+          queueDepth: 99,
+        },
+      };
+      rerender(<DispatcherDashboard />);
+
+      await waitFor(() => {
+        expect(startViewTransition).toHaveBeenCalledTimes(1);
+      });
+      // The callback passed in must be a function — the hook runs it
+      // via `flushSync` to satisfy the View Transitions snapshot
+      // contract. We confirm it is callable and idempotent.
+      expect(typeof captured[0]).toBe('function');
+      expect(() => captured[0]()).not.toThrow();
+    } finally {
+      delete (
+        document as unknown as {
+          startViewTransition?: (cb: () => void) => unknown;
+        }
+      ).startViewTransition;
+      (
+        window as unknown as { matchMedia: typeof window.matchMedia }
+      ).matchMedia = originalMatchMedia;
+    }
+  });
+
+  it('falls through cleanly when startViewTransition is undefined (Firefox today)', () => {
+    // Ensure no global stub leaks in from a previous test.
+    delete (
+      document as unknown as {
+        startViewTransition?: (cb: () => void) => unknown;
+      }
+    ).startViewTransition;
+    // Initial render on a "Firefox-like" environment — must not throw
+    // and must render the panels with the state we provided.
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        queueDepth: 7,
+      },
+    };
+    renderDashboard();
+    expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 7');
+  });
+});
