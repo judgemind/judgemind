@@ -545,14 +545,18 @@ class TestSpawnDiagnoserSubprocess:
         assert exit_code is None
         assert "claude" in tail.lower() or "not found" in tail.lower()
 
-    def test_command_includes_dangerously_skip_permissions_flag(
+    def test_command_includes_allow_dangerously_skip_permissions_flag(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """Issue #2982 — the diagnoser subagent runs inside the Fargate
         container just like the phase subagents, and must bypass the
         Bash-tool permission policy to read its context (PR/issue state,
         log files). The narrowed preflight hook still guards the 4
-        safety-critical patterns."""
+        safety-critical patterns.
+
+        Uses the ``--allow-`` variant because the plain
+        ``--dangerously-skip-permissions`` refuses under root/sudo and
+        the Fargate container runs as root."""
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
@@ -566,7 +570,13 @@ class TestSpawnDiagnoserSubprocess:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         d._spawn_diagnoser_subprocess(42)
-        assert "--dangerously-skip-permissions" in captured["cmd"], captured["cmd"]
+        assert "--allow-dangerously-skip-permissions" in captured["cmd"], captured[
+            "cmd"
+        ]
+        # Guard against regression to the plain flag which refuses under root.
+        assert "--dangerously-skip-permissions" not in captured["cmd"], captured[
+            "cmd"
+        ]
 
 
 # --------------------------------------------------------------------------

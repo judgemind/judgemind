@@ -1251,13 +1251,23 @@ class TestSpawnPhaseSubprocess:
         assert "300" in captured["cmd"]
         assert "haiku" in captured["cmd"]
 
-    def test_command_includes_dangerously_skip_permissions_flag(
+    def test_command_includes_allow_dangerously_skip_permissions_flag(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         """Issue #2982 — every phase spawn must pass
-        ``--dangerously-skip-permissions`` so the in-container subagent's
-        Bash-tool permission policy does not block paths like
+        ``--allow-dangerously-skip-permissions`` so the in-container
+        subagent's Bash-tool permission policy does not block paths like
         ``.githooks/pre-push`` that are outside the default allowlist.
+
+        The flag is the ``--allow-`` variant, NOT the plain
+        ``--dangerously-skip-permissions``. The plain flag refuses to run
+        under root/sudo (observed post-deploy on #2982's first attempt —
+        "cannot be used with root/sudo privileges for security reasons")
+        and the Fargate container has no ``USER`` line so it runs as
+        root. The ``--allow-`` variant is the same shape used by the
+        scoped-PAT MCP integration test (see
+        ``test_mcp_github_integration.py::_run_claude``) and works under
+        root.
 
         This is the fix for the #2960 regression where ralph's Step 2.5
         pre-push gate got permission-denied on six different invocation
@@ -1275,8 +1285,16 @@ class TestSpawnPhaseSubprocess:
 
             monkeypatch.setattr(subprocess, "run", fake_run)
             d._spawn_phase_subprocess(phase, tmp_path, f"agent-{phase}")
-            assert "--dangerously-skip-permissions" in captured["cmd"], (
-                f"phase={phase} cmd missing --dangerously-skip-permissions: {captured['cmd']}"
+            assert "--allow-dangerously-skip-permissions" in captured["cmd"], (
+                f"phase={phase} cmd missing --allow-dangerously-skip-permissions: "
+                f"{captured['cmd']}"
+            )
+            # Guard against regression: the plain --dangerously-skip-permissions
+            # refuses under root. Tests must not accidentally accept the plain
+            # flag as "close enough" to the --allow- variant.
+            assert "--dangerously-skip-permissions" not in captured["cmd"], (
+                f"phase={phase} cmd uses the plain --dangerously-skip-permissions "
+                f"flag which refuses under root/sudo: {captured['cmd']}"
             )
 
 
