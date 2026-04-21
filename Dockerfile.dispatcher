@@ -157,19 +157,33 @@ RUN npm install -g @anthropic-ai/claude-code@2.1.114
 # ---------------------------------------------------------------------------
 # Dispatcher user + HOME
 #
-# We stay on root for Phase 1 (ECS Fargate isolates the task at the
-# kernel level; an in-container non-root boundary adds complexity for no
-# additional security benefit against the attacker the daemon actually
-# faces — compromised issue content). Setting HOME explicitly so:
+# We run the daemon as a non-root user. Phase 1 originally deferred this
+# ("Fargate isolates the task at the kernel level; non-root adds
+# complexity for no additional security benefit against the attacker the
+# daemon actually faces"). Phase 2+ forced our hand: the Claude Code CLI
+# refuses to run with ``--dangerously-skip-permissions`` when UID=0
+# ("cannot be used with root/sudo privileges for security reasons"), and
+# #2982's narrowed preflight hook + ``--dangerously-skip-permissions``
+# is how ralph's Step 2.5 pre-push gate actually runs. See the root-UID
+# crash trace in #2986 — six consecutive agents crashed at plan-spawn
+# time before the killswitch flip.
+#
+# Setting HOME explicitly so:
 #   (a) the daemon's `socket.gethostname()` + env lookups are predictable;
-#   (b) any Node/NPM global caches from `claude-code` live somewhere
-#       other than /root, simplifying a future non-root switch.
+#   (b) Node/NPM global caches from `claude-code` live at
+#       /home/dispatcher, not /root, which dispatcher can actually read.
 # Per-subprocess HOME isolation for the `/task-v2-*` workers happens on
 # spawn (spec §14) — the daemon sets HOME=/tmp/agents/<agent_id> on each
 # child process so ~/.claude/ state cannot leak across agents.
+#
+# UID/GID 1000 is conventional and matches most development environments;
+# ECS Fargate doesn't care what UID we pick as long as it's consistent.
 # ---------------------------------------------------------------------------
 ENV HOME=/home/dispatcher
-RUN mkdir -p "$HOME"
+RUN groupadd --gid 1000 dispatcher \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --home-dir "$HOME" dispatcher \
+    && mkdir -p "$HOME" \
+    && chown -R dispatcher:dispatcher "$HOME"
 
 # ---------------------------------------------------------------------------
 # Baseline git checkout (issue #2804)
@@ -191,14 +205,19 @@ RUN mkdir -p "$HOME"
 # We only pre-create the parent directory here; the daemon itself is
 # responsible for the clone (so a restart on already-populated
 # ephemeral storage just does a `git fetch origin main` instead of
-# re-cloning). Writable as root — the container stays on root per the
-# USER note above.
+# re-cloning).
 #
 # Fargate ephemeral storage is 50 GiB (spike 0.6), baseline shallow
 # clone is ~100 MB, worktrees are ~700 MB each — easily fits even at
 # concurrency_cap=5.
+#
+# Ownership: the dispatcher user needs to create /var/lib/dispatcher/repo
+# (clone target) and /var/lib/dispatcher/worktrees/<agent_id> (per-agent
+# worktree dirs) at runtime. Chown the whole tree to dispatcher:dispatcher
+# after creating it so both paths are writable by the non-root daemon.
 # ---------------------------------------------------------------------------
-RUN mkdir -p /var/lib/dispatcher/worktrees
+RUN mkdir -p /var/lib/dispatcher/worktrees \
+    && chown -R dispatcher:dispatcher /var/lib/dispatcher
 ENV DISPATCHER_BASELINE_REPO_ROOT=/var/lib/dispatcher/repo
 
 WORKDIR /app
@@ -217,7 +236,8 @@ WORKDIR /app
 # ---------------------------------------------------------------------------
 COPY scripts/dispatcher/ /app/scripts/dispatcher/
 COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
-RUN chmod +x /app/scripts/check-issue-author.sh
+RUN chmod +x /app/scripts/check-issue-author.sh \
+    && chown -R dispatcher:dispatcher /app
 
 # ---------------------------------------------------------------------------
 # Narrowed preflight hook for in-container subagents (issue #2982).
@@ -278,7 +298,8 @@ RUN chmod +x /app/scripts/check-issue-author.sh
 # ---------------------------------------------------------------------------
 COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
 COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
-RUN chmod +x /app/fargate-hooks/preflight-bash.sh
+RUN chmod +x /app/fargate-hooks/preflight-bash.sh \
+    && chown -R dispatcher:dispatcher /app/fargate-hooks
 ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
 
 # ---------------------------------------------------------------------------
@@ -289,6 +310,19 @@ ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
 # ---------------------------------------------------------------------------
 ARG GIT_SHA=unknown
 ENV GIT_SHA=${GIT_SHA}
+
+# ---------------------------------------------------------------------------
+# Drop privileges before the entrypoint.
+#
+# The Claude Code CLI refuses ``--dangerously-skip-permissions`` when UID=0,
+# and #2982's preflight narrowing relies on that flag. Switching to the
+# dispatcher user (UID 1000) here satisfies the CLI check without losing
+# access to any path the daemon needs — /app, /home/dispatcher, and
+# /var/lib/dispatcher/* were all chown'd above, and system binaries
+# (python, node, npm, git, gh, claude) are world-readable at /usr/local
+# and /usr/bin.
+# ---------------------------------------------------------------------------
+USER dispatcher
 
 # ---------------------------------------------------------------------------
 # Entrypoint
