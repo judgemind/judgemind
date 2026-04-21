@@ -241,12 +241,12 @@ class TestGitPushFailedWritesFailureRow:
         d, conn, _handler = _make_daemon(tmp_path)
         agent_id = "aaaabbbb-0000-0000-0000-000000000001"
 
-        # Stub the git add / commit steps to succeed; fail on push.
-        add_ok = subprocess.CompletedProcess(
-            args=["git", "add"], returncode=0, stdout="", stderr=""
-        )
+        # Stub the git commit --amend step to succeed; fail on push.
+        # Issue #2971: daemon now amends ralph's placeholder commit
+        # instead of running ``git add -A && git commit -m <msg>``,
+        # so the subprocess sequence is [commit_amend, git_show, push].
         commit_ok = subprocess.CompletedProcess(
-            args=["git", "commit"], returncode=0, stdout="", stderr=""
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
         )
         push_fail = _make_push_result(
             returncode=1,
@@ -267,20 +267,20 @@ class TestGitPushFailedWritesFailureRow:
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
 
-        # Create a real worktree dir so the git add command path resolves.
+        # Create a real worktree dir so the git amend command path resolves.
         worktree = tmp_path / "worktree"
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        # Issue #2953: ``_push_and_open_pr`` now runs ``git show
+        # Issue #2953: ``_push_and_open_pr`` runs ``git show
         # --name-only HEAD`` between commit and push to detect
-        # dispatcher-self-PRs. The fourth entry below answers that
+        # dispatcher-self-PRs. The third entry below answers that
         # call with an empty file list (no self-deploy detected) so
         # the test's push-failed path is unaffected.
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
-        run_side_effects = [add_ok, commit_ok, git_show_empty, push_fail]
+        run_side_effects = [commit_ok, git_show_empty, push_fail]
         with patch("subprocess.run", side_effect=run_side_effects):
             d._push_and_open_pr(
                 agent_id=agent_id,
@@ -314,11 +314,10 @@ class TestGitPushFailedWritesFailureRow:
         d, conn, _handler = _make_daemon(tmp_path)
         agent_id = "aaaabbbb-0000-0000-0000-000000000002"
 
-        add_ok = subprocess.CompletedProcess(
-            args=["git", "add"], returncode=0, stdout="", stderr=""
-        )
+        # Issue #2971: subprocess sequence is now
+        # [commit_amend, git_show, push] (no separate ``git add -A``).
         commit_ok = subprocess.CompletedProcess(
-            args=["git", "commit"], returncode=0, stdout="", stderr=""
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
         )
         push_fail = _make_push_result(
             returncode=128,
@@ -346,7 +345,7 @@ class TestGitPushFailedWritesFailureRow:
         )
         with patch(
             "subprocess.run",
-            side_effect=[add_ok, commit_ok, git_show_empty, push_fail],
+            side_effect=[commit_ok, git_show_empty, push_fail],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=99, worktree=worktree)
 
@@ -376,11 +375,10 @@ class TestGitPushFailedWritesPhaseOutputRow:
         # Use a long stderr to verify it is NOT truncated.
         long_stderr = "pre-push: " + "x" * 5000
 
-        add_ok = subprocess.CompletedProcess(
-            args=["git", "add"], returncode=0, stdout="", stderr=""
-        )
+        # Issue #2971: subprocess sequence is now
+        # [commit_amend, git_show, push] (no separate ``git add -A``).
         commit_ok = subprocess.CompletedProcess(
-            args=["git", "commit"], returncode=0, stdout="", stderr=""
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
         )
         push_fail = _make_push_result(returncode=1, stderr=long_stderr)
 
@@ -405,7 +403,7 @@ class TestGitPushFailedWritesPhaseOutputRow:
         )
         with patch(
             "subprocess.run",
-            side_effect=[add_ok, commit_ok, git_show_empty, push_fail],
+            side_effect=[commit_ok, git_show_empty, push_fail],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=7, worktree=worktree)
 

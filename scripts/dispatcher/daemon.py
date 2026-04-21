@@ -7278,7 +7278,18 @@ class DispatcherDaemon:
     def _push_and_open_pr(
         self, agent_id: str, issue_number: int, worktree: Path
     ) -> None:
-        """Run the final mechanical steps: commit, push, open PR.
+        """Run the final mechanical steps: amend commit, push, open PR.
+
+        **Commit model (issue #2971).** Ralph's Step 2.5 commits its
+        work to a placeholder commit ("WIP: ralph output") and leaves
+        it in place on SHIP. This method amends that commit with
+        summary's conventional-commits message via ``git commit
+        --amend -F <file>``, then pushes. The pre-#2971 model (Ralph
+        resets to uncommitted, daemon runs ``git add -A && git commit
+        -m <msg>``) was removed because an incomplete reset silently
+        swallowed ralph's diff and produced ``git_commit_failed
+        exit_code=1 stderr_tail=""`` ("nothing to commit" goes to
+        stdout, not stderr).
 
         On failure at any step, the agent is marked ``failed``. On
         success (criteria all met), ``phase='awaiting_ci'`` so Phase 3B
@@ -7339,55 +7350,30 @@ class DispatcherDaemon:
             )
             return
 
-        # git add -A
-        try:
-            add_result = subprocess.run(
-                ["git", "-C", str(worktree), "add", "-A"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
-        except Exception as exc:
-            self._log.exception(
-                "daemon.git_add_failed",
-                extra={
-                    "event": "git_add_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "detail": str(exc),
-                },
-            )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
-                phase="push_and_pr",
-                exit_code=None,
-                issue_number=issue_number,
-            )
-            return
-        if add_result.returncode != 0:
-            self._log.warning(
-                "daemon.git_add_failed",
-                extra={
-                    "event": "git_add_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "exit_code": add_result.returncode,
-                    "stderr_tail": _stderr_tail(add_result.stderr),
-                },
-            )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
-                phase="push_and_pr",
-                exit_code=None,
-                issue_number=issue_number,
-            )
-            return
-
-        # git commit -F <file>. Write the message to a file in the
-        # worktree's tmp/ so we don't rely on shell quoting.
+        # git commit --amend -F <file>. Issue #2971: Ralph's Step 2.5
+        # commits its work directly (placeholder message "WIP: ralph
+        # output") and leaves the commit in place. We amend that commit
+        # with summary's conventional-commits message here, instead of
+        # the pre-#2971 ``git add -A && git commit -m <msg>`` pair that
+        # assumed ralph produced an uncommitted diff.
+        #
+        # Why amend instead of stage+commit: the old flow required Step
+        # 2.5 to undo its throwaway commit before returning, so the
+        # daemon could re-stage and commit fresh. An incomplete undo
+        # (observed 2026-04-21 02:59 UTC on agent cc6c5a07) produced a
+        # "nothing to commit" failure (``exit_code=1, stderr_tail=""``)
+        # because the working tree was already clean — the diff was
+        # trapped in the throwaway commit. Amending eliminates the
+        # juggling: ralph's commit is always in place, we just rewrite
+        # the message.
+        #
+        # Squash-merge compatibility: GitHub's squash-merge uses the PR
+        # title for the merged-main commit subject, so the number of
+        # commits on the PR branch is irrelevant to the merged history.
+        # Whether this call amends a single ralph commit or ralph
+        # landed multiple iteration commits (`--amend --no-edit -a` in
+        # Step 2.5's retry loop collapses iterations to one), the
+        # result on main is identical.
         commit_msg_path = worktree / "tmp" / "commit_msg.txt"
         commit_msg_path.parent.mkdir(parents=True, exist_ok=True)
         commit_msg_path.write_text(commit_message)
@@ -7399,6 +7385,7 @@ class DispatcherDaemon:
                     "-C",
                     str(worktree),
                     "commit",
+                    "--amend",
                     "-F",
                     str(commit_msg_path),
                 ],

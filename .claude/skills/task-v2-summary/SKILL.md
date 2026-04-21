@@ -30,7 +30,7 @@ Read `{worktree}/tmp/dispatcher-input/summary.json`. Required fields:
 - `issue_comments` (list of `{author, date, body}` — non-bots only).
 - `ralph_summary` (str) — the 1-3 sentence summary from ralph output.
 - `changed_files` (list of path).
-- `git_diff` (str) — full unified diff from `git diff origin/main...HEAD` (or `git diff HEAD` if commits not yet made).
+- `git_diff` (str) — full unified diff from `git diff origin/main...HEAD`. Post-#2971, ralph's Step 2.5 always commits its work before returning, so the range resolves against a committed HEAD and the diff is non-empty for every non-no-op SHIP. No working-tree-vs-committed-state branching is required on the summary side.
 - `worktree_path` (str).
 - `repo_root` (str).
 - `branch` (str) — worktree branch name.
@@ -157,6 +157,8 @@ Set `pr_title` equal to the subject line only (no body — GitHub uses the title
 
 Set `commit_message` to the subject plus an optional body (separated by a blank line). Include `Closes #<N>` in the body if applicable.
 
+**How the commit message reaches main.** The daemon's `push_and_pr` phase runs `git commit --amend -F <message-file>` to rewrite ralph's placeholder commit (`"WIP: ralph output"`) with the `commit_message` from this skill's output. When the PR is squash-merged, GitHub uses the **PR title** for the merged-main commit subject (not the constituent commit messages). So `pr_title` is the on-main authoritative subject; the amended `commit_message` is what maintainers see on the PR's commits tab and in `git log` on the feature branch. Keeping the two in sync (pr_title == subject line of commit_message) is intentional.
+
 ## Step 5 — Write the PR body
 
 Use this template for `pr_body_md`:
@@ -206,7 +208,7 @@ Emit `{worktree}/tmp/dispatcher-output/summary.json` with all fields above. Exit
 
 - **Does not open the PR.** Daemon does that after consuming this output.
 - **Does not post comments.** Daemon posts `process_summary_md` on the issue.
-- **Does not commit or push.** Daemon handles git operations.
+- **Does not commit or push.** Daemon handles git operations. (The daemon's `push_and_pr` runs `git commit --amend -F` to rewrite ralph's placeholder commit with this skill's `commit_message` output — see #2971.)
 - **Does not read GitHub directly.** All issue + comment + diff data comes through the input JSON.
 - **Does not run tests.** Any pre-PR check reruns happen in ralph's final iteration or the daemon's pre-push hook.
 

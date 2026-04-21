@@ -385,11 +385,12 @@ class TestSelfDeployDetectionPrePush:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        add_ok = subprocess.CompletedProcess(
-            args=["git", "add"], returncode=0, stdout="", stderr=""
-        )
+        # Issue #2971: subprocess sequence is now
+        # [commit_amend, git_show, push, pr_create]. The amend rewrites
+        # ralph's "WIP: ralph output" placeholder commit with summary's
+        # conventional-commits message; no separate ``git add -A`` runs.
         commit_ok = subprocess.CompletedProcess(
-            args=["git", "commit"], returncode=0, stdout="", stderr=""
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
         )
         # git show --name-only HEAD returns a list of files where the
         # first one is in ``scripts/dispatcher/`` — should trigger
@@ -417,7 +418,7 @@ class TestSelfDeployDetectionPrePush:
 
         with patch(
             "subprocess.run",
-            side_effect=[add_ok, commit_ok, git_show, push_ok, pr_create_ok],
+            side_effect=[commit_ok, git_show, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=2953, worktree=worktree)
 
@@ -461,11 +462,11 @@ class TestSelfDeployDetectionPrePush:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        add_ok = subprocess.CompletedProcess(
-            args=["git", "add"], returncode=0, stdout="", stderr=""
-        )
+        # Issue #2971: subprocess sequence is [commit_amend, git_show,
+        # push, pr_create] — the amend rewrites ralph's placeholder
+        # commit with summary's message.
         commit_ok = subprocess.CompletedProcess(
-            args=["git", "commit"], returncode=0, stdout="", stderr=""
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
         )
         git_show = subprocess.CompletedProcess(
             args=["git", "show"],
@@ -487,7 +488,7 @@ class TestSelfDeployDetectionPrePush:
 
         with patch(
             "subprocess.run",
-            side_effect=[add_ok, commit_ok, git_show, push_ok, pr_create_ok],
+            side_effect=[commit_ok, git_show, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=42, worktree=worktree)
 
@@ -518,11 +519,10 @@ class TestSelfDeployDetectionPrePush:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
-        add_ok = subprocess.CompletedProcess(
-            args=["git", "add"], returncode=0, stdout="", stderr=""
-        )
+        # Issue #2971: subprocess sequence is [commit_amend, git_show,
+        # push, pr_create].
         commit_ok = subprocess.CompletedProcess(
-            args=["git", "commit"], returncode=0, stdout="", stderr=""
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
         )
         # git show returns non-zero → _list_committed_files_at_head
         # returns [] → no skip reason detected.
@@ -546,7 +546,7 @@ class TestSelfDeployDetectionPrePush:
 
         with patch(
             "subprocess.run",
-            side_effect=[add_ok, commit_ok, git_show_fail, push_ok, pr_create_ok],
+            side_effect=[commit_ok, git_show_fail, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=50, worktree=worktree)
 
