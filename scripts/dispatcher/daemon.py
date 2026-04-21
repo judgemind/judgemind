@@ -470,10 +470,14 @@ GH_AUTH_SETUP_GIT_TIMEOUT_SECONDS = 10
 #: pipeline) regularly exceeds 3 minutes before the actual git push
 #: even starts. Two confirmed overnight failures on 2026-04-19 lost
 #: ralph's entire output when the 120s ceiling tripped mid-hook (issue
-#: #2882). 600s (10 min) is a comfortable ceiling for the slowest
-#: realistic package test run + git push + network, while still
-#: preventing a genuinely-stuck process from burning indefinitely.
-GIT_PUSH_TIMEOUT_SECONDS = 600
+#: #2882). 600s wasn't enough either: on 2026-04-21 agent c3a69458
+#: (#2564) timed out at 600s with the hook still running the scraper-
+#: framework suite — 7200 tests via ``pytest -n auto`` on 4 vCPU
+#: Fargate exceeded 10 min on a cold-cache first-pre-push. 1800s
+#: (30 min) covers the worst-case full suite while still catching a
+#: genuinely-stuck push; it aligns with the ``push_and_pr`` stuck
+#: timeout fallback of 30 min in :data:`STUCK_TIMEOUT_SECONDS`.
+GIT_PUSH_TIMEOUT_SECONDS = 1800
 
 #: Per-issue cooldown — skip an issue from candidate selection if its
 #: most recent ``dispatcher.agents`` row (any status) was created
