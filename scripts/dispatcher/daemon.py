@@ -6700,10 +6700,10 @@ class DispatcherDaemon:
                     "  ON pp.agent_id = a.agent_id AND pp.phase = 'push_and_pr' "
                     "WHERE a.issue_number = %s "
                     "  AND a.status IN ('failed', 'crashed') "
-                    "  AND a.phase NOT IN %s "
+                    "  AND a.phase != ALL(%s) "
                     "ORDER BY a.started_at DESC "
                     "LIMIT 3",
-                    (issue_number, tuple(non_infra_phases)),
+                    (issue_number, non_infra_phases),
                 )
                 rows = cur.fetchall()
             self._conn.commit()

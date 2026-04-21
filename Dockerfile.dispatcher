@@ -312,6 +312,29 @@ ARG GIT_SHA=unknown
 ENV GIT_SHA=${GIT_SHA}
 
 # ---------------------------------------------------------------------------
+# Git committer identity
+#
+# The daemon's ``_push_and_open_pr`` runs ``git commit --amend -F
+# <file>`` to rewrite Ralph's placeholder commit with Summary's
+# conventional-commits message. Git refuses to commit (exit 128,
+# "Committer identity unknown") unless ``user.name`` + ``user.email``
+# are set somewhere in the config chain. The non-root dispatcher
+# user has no ``~/.gitconfig`` by default.
+#
+# Observed on agent 44c031ee (#2565) at 2026-04-21 18:14 UTC: Ralph
+# shipped SHIP + Summary completed + daemon hit the amend step and
+# died with "empty ident name". Two hours of Ralph work lost.
+#
+# Set ``--system`` so every process in the image (daemon + spawned
+# subagents) inherits the identity via ``/etc/gitconfig`` without
+# needing per-user setup. Values are cosmetic — GitHub attributes
+# the merged commit to the PR author via the squash-merge flow, not
+# this identity.
+# ---------------------------------------------------------------------------
+RUN git config --system user.email "dispatcher@judgemind.org" \
+    && git config --system user.name "Judgemind Dispatcher"
+
+# ---------------------------------------------------------------------------
 # Drop privileges before the entrypoint.
 #
 # The Claude Code CLI refuses ``--dangerously-skip-permissions`` when UID=0,
