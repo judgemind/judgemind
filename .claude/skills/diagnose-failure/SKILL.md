@@ -144,7 +144,7 @@ Field rules:
 - `action` (required) — exactly one of the five strings above.
 - `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. This gets surfaced in operator dashboards and the §8 weekly report. The first 1-3 sentences are also written to `dispatcher.agents.failure_summary` (issue #2900) so the admin cockpit can show an LLM-authored tooltip on hover over the outcome glyph — keep the opening sentences self-contained ("what happened + why this action"), not mid-argument.
 - `hint` (conditional) — required when `action='retry_with_hint'`; the daemon posts it verbatim as an issue comment before enqueueing the retry marker. Ignored for other actions.
-- `new_scope` (conditional) — required when `action='reissue'`; the daemon replaces the issue body with this string. Should be a full, well-formed issue body with acceptance criteria — not a diff.
+- `new_scope` (conditional) — required when `action='reissue'`. **The daemon replaces the issue body wholesale** via `gh issue edit --body-file` (no splicing, no patching — Python writes the string to a file and `gh` edits the body). MUST be a complete, well-formed issue body with `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References` sections and any `Parent: #N` / `Blocked by #N` lines. A diff, patch, or partial body will truncate the issue. Issue #3010.
 
 Exit 0 regardless of recommendation. If the recommendation cannot be written (DB down, malformed JSON, subprocess error), exit non-zero so the daemon marks the diagnosis `status='failed'` and falls back to the fixed mechanical escalation policy.
 
@@ -172,6 +172,48 @@ Work through these questions in order. The first "yes" determines the action.
    - → **`close`**. The daemon will close with `status/invalid` and post the reasoning as the close comment.
 
 **When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context.
+
+---
+
+## Per-category guidance — AC-infeasibility categories (issue #3010)
+
+Two categories land in this skill via the post-exit parse path added for #3010:
+
+### `ralph_ac_infeasible` — ralph surfaced infeasibility
+
+**Context bundle extras.** In addition to the shared bundle shape, the daemon populates:
+
+- `infeasible_acs` (list of `{index, evidence}`) — the full array ralph emitted. `index` is 1-based into the issue body's acceptance-criteria list. `evidence` is a paragraph with the citable reason (grep output, file path, conflicting AC index).
+- `issue_acceptance_criteria` (list of str, 1-based-addressable) — the issue body's AC list extracted by the daemon so you can correlate `index` → criterion text without re-fetching.
+
+**Default action selection:**
+
+| Situation | Action | Why |
+|---|---|---|
+| One or two ACs cite a non-existent symbol, but the issue's core intent is clear and the AC can be rewritten | `reissue` | Author wrote ACs against an older codebase state; rewrite the offending AC(s) and let a fresh plan→ralph run satisfy the corrected list. `new_scope` MUST be the full rewritten issue body (wholesale replace — see §Output contract). |
+| The whole issue's premise is broken (e.g. it asks to remove a feature that was already removed, or to add a column that already exists) | `close` | The issue is invalid. The reasoning becomes the close comment. |
+| One AC is out-of-scope work (depends on a sibling open issue), but the rest of the issue is well-formed | `reissue` | Drop the blocking AC from the rewritten body and add `Blocked by #<sibling>` if appropriate. |
+| You cannot tell whether the AC is infeasible or just tricky, and the evidence paragraphs are hand-wavy | `escalate` | Prefer a human re-read over a wrong `reissue`. A human can re-label or rewrite; a wrong `reissue` destroys context. |
+
+**Do not pick `retry` or `retry_with_hint` for this category.** Ralph already evaluated the AC and found it structurally impossible — a second attempt with the same AC will hit the same wall. If the AC text is fine but ralph misread it, prefer `reissue` with a clarified `new_scope` over `retry_with_hint`.
+
+### `summary_ac_infeasible` — summary surfaced infeasibility
+
+**Context bundle extras.** Same as `ralph_ac_infeasible`, plus:
+
+- `ralph_diff` (str) — the full committed diff from ralph's SHIP run (ralph shipped, summary caught the structural impossibility downstream). Useful for aligning the `reissue` rewrite with what ralph already built.
+- `summary_ac_mapping` (list) — summary's `ac_mapping` array with `{index, criterion, status, evidence}` for every AC. Lets you see which ACs summary marked deferred / met / unmet_shape_mismatch / infeasible without re-running the classifier.
+- `deferred_acs` (list) — the `deferred_acs` list summary emitted (so you can distinguish deferred ACs from infeasible ones when reasoning about scope).
+
+**Default action selection:** same table as `ralph_ac_infeasible` with one addition:
+
+| Situation | Action | Why |
+|---|---|---|
+| The AC is fine as written; ralph shipped code that matches a different but valid reading of it | `reissue` | Rewrite the AC to match ralph's reading. Because `ralph_diff` is available, the `new_scope` body can explicitly reference "the implementation in commit `<sha>` satisfies this AC" and keep the PR alive via a downstream retry. This is the specific win `summary_ac_infeasible` enables: salvage ralph's work. |
+| Ralph shipped something out of scope AND summary correctly flagged the AC as infeasible | `reissue` or `close` — judgment call. `reissue` if the corrected AC is a small rewrite and ralph's diff is mostly reusable; `close` if the corrected AC would require a fundamentally different implementation. | Wasting ralph's diff is OK when the AC is structurally wrong; salvaging is OK when the AC is close to the right one. |
+| Summary flagged AC_INFEASIBLE on a single AC out of five, and the other four are met + deferred | `reissue` with a tightened AC | Same salvage path — ralph's diff covers the other four, so the rewritten body keeps the successful work intact and only rewrites the offending AC. |
+
+**`new_scope` semantics — applies to both categories.** `new_scope` is **always the complete rewritten issue body**. The daemon runs `gh issue edit --body-file <path>` with zero parsing or splicing — your output is the full body verbatim. Preserve the structure: `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References`, plus any `Parent: #N` / `Blocked by #N` lines. Do NOT emit a diff, a patch, a list of "changes", or a partial body — the body-file path is authoritative and partial content will truncate the issue.
 
 ---
 

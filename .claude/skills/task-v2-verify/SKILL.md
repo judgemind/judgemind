@@ -40,6 +40,7 @@ Optional:
 
 - `plan_text` (str) — from plan output; can clarify ambiguous criteria.
 - `scope_check` (list) — for context on what's intentionally out of scope.
+- `deferred_acs` (list) — carried forward from summary's output (`dispatcher.phase_outputs`). Shape: `[{"index": <int>, "reason": "marker" | "heuristic", "verify_instruction": "<Verify: line text>"}]`. When present, this skill runs the deferred ACs FIRST and labels each result as "deferred (marker|heuristic) → pass|fail"; the remaining ACs are labeled as "pre-merge validated, re-confirmed post-deploy". See [spec §6a `^summary-deferred-acs`](../../../docs/specs/dispatcher-v2-spec.md) and issue #3010. Absent or empty on pre-#3010 agents and on no-deploy/docs change types — the skill treats the verification universe as "every AC, no labeling" in that case.
 
 If the file is missing or malformed, exit 0 with verdict=`FAILED, failure_reason="input JSON missing or malformed"`.
 
@@ -92,7 +93,25 @@ If `deploy_status` is `null` or `conclusion != 'success'` and `change_type` is d
 
 ## Step 2 — Per-criterion verification
 
-For each acceptance criterion in `acceptance_criteria`, execute the verification action that the criterion's `Verify:` line names (per `docs/agent/issue-authoring.md`). Capture concrete evidence into `per_criterion_results[].evidence`:
+Order matters: **run the `deferred_acs` first** (they are the ACs summary intentionally skipped pre-merge — verifying them is the point of this phase), then run the non-deferred ACs as a belt. Within each group, execute the verification action that the criterion's `Verify:` line names (per `docs/agent/issue-authoring.md`) and capture concrete evidence into `per_criterion_results[].evidence`.
+
+### 2a — Run deferred ACs first (issue #3010)
+
+If `deferred_acs` is non-empty in the input bundle:
+
+1. For each entry `{index, reason, verify_instruction}`:
+   - Look up the AC text in `acceptance_criteria[index - 1]` (1-based → 0-based index).
+   - Execute the verification using `verify_instruction` as the primary source for the action (summary already extracted the exact `Verify:` line).
+   - Record the result in `per_criterion_results` with a label that surfaces the deferred classification: set `evidence` to begin with `"deferred (marker) → pass:"` or `"deferred (heuristic) → pass:"` followed by the concrete proof. Use `"deferred (marker) → fail: <why>"` when the verification fails.
+2. A `fail` on a deferred AC promotes the overall `verdict` to `FAILED` with a `failure_reason` that calls out the deferred AC by index (e.g. `"deferred AC #5 (post-deploy OpenSearch count) did not match expected after deploy"`).
+
+### 2b — Run non-deferred ACs as a belt
+
+For each AC NOT in `deferred_acs`, re-run the verification against the deployed environment. Summary already validated these against the pre-merge diff; the belt run confirms the deployed code still passes. Prefix each `evidence` with `"pre-merge validated, re-confirmed post-deploy:"` so operators reading the PR trail can see which verifications were time-shifted vs. redundantly re-run.
+
+**Default: 100% coverage.** The post-deploy evidence comment covers every AC. If a non-deferred AC is genuinely impossible to re-verify post-deploy (rare — e.g. a static analysis gate that only runs in CI), record `evidence` as `"pre-merge validated by summary (CI-only check, not re-runnable post-deploy): <summary's original evidence>"` and keep `verified=true`.
+
+### 2c — Per-AC verification rules (applies to 2a and 2b)
 
 - **Frontend criteria** ("Verify: page renders without errors") — screenshot or page-fetch. Evidence = screenshot filepath or first 500 chars of rendered HTML.
 - **Data criteria** ("Verify: SELECT count(*) FROM derived.documents WHERE …") — run the exact SQL via `scripts/dev-db-query.sh`. Evidence = the query + result.
@@ -100,9 +119,7 @@ For each acceptance criterion in `acceptance_criteria`, execute the verification
 - **Behavior criteria** ("Verify: ingestion worker processes a sample fixture without errors") — trigger the scenario (or find a recent occurrence in logs) and capture result.
 - **Log criteria** — MCP CloudWatch Logs Insights query; capture the matching log line(s). Limit to 5-10 lines per criterion to keep the evidence comment readable.
 
-If any criterion fails to verify, record `verified=false` in that row, and set the overall `verdict=FAILED` with `failure_reason` summarizing which criteria failed.
-
-For criteria that are explicitly "post-deploy only" and were marked `unmet` by summary, this phase is the one that resolves them.
+If any criterion fails to verify, record `verified=false` in that row, and set the overall `verdict=FAILED` with `failure_reason` summarizing which criteria failed (deferred or not).
 
 ## Step 3 — Build the evidence comment
 
@@ -124,11 +141,18 @@ For `verdict=VERIFIED`:
 
 | # | Criterion | Verified | Evidence |
 |---|-----------|----------|----------|
-| 1 | <criterion> | Yes | <proof, 1-3 lines> |
-| 2 | <criterion> | Yes | <proof> |
+| 1 | <criterion> | Yes | deferred (marker) → pass: curl dev.api.judgemind.org/... returned 200 |
+| 2 | <criterion> | Yes | deferred (heuristic) → pass: OpenSearch index count matches expected 2,444 |
+| 3 | <criterion> | Yes | pre-merge validated, re-confirmed post-deploy: pytest test_foo still green against merged sha |
 
 **Post-deploy verification: PASSED**
 ```
+
+Each row's `Evidence` column begins with one of three labels so a PR-trail reader can see which verifications were time-shifted from pre-merge (per spec §6a `^verify-deferred-acs`):
+
+- `deferred (marker) → pass:` — AC was tagged `(post-deploy)` by its author; summary skipped it pre-merge; verify ran it now.
+- `deferred (heuristic) → pass:` — AC matched the heuristic pattern; summary skipped it pre-merge; verify ran it now.
+- `pre-merge validated, re-confirmed post-deploy:` — summary validated against the diff, verify re-ran against the deployed environment as a belt.
 
 For `verdict=SKIPPED` (no deployed component):
 

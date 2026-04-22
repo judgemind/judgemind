@@ -34,6 +34,39 @@ Ralph reads `## Testable` from `{worktree}/tmp/ralph/task.md` (seeded by the cal
 
 When `## Testable: no`, the reviewer MUST NOT issue a REVISE for "no tests added" or "diff-coverage gate not satisfied" — those checks do not apply to the non-testable branch. Reviewer still verifies acceptance criteria, correctness, scope, stale references, and docs consistency.
 
+### AC_INFEASIBLE emit rules — when the worker + reviewer should raise this verdict
+
+The inner `/ralph` loop normally returns `SHIP` (reviewers approved) or `REVISE`/`BLOCKED` (max iterations / worker stuck). Starting with issue #3010, both the worker and the Claude reviewer may also surface `AC_INFEASIBLE` when one or more acceptance criteria cannot be satisfied as written — see [spec §6a `^ralph-ac-infeasible` footnote](../../../docs/specs/dispatcher-v2-spec.md). This is distinct from "hard to implement" (that stays a SHIP-after-iterations outcome) and from "max iterations reached" (that stays `ralph_max_iterations`).
+
+**Positive triggers — any one is sufficient to raise the verdict:**
+
+1. **Non-existent symbol.** The AC references a CLI flag, function, module, environment variable, file path, config key, or AWS resource that does NOT exist in the current codebase AND is NOT introduced by this PR's diff. Example: an AC reads `Verify: scripts/rebuild_db.py --court oc-riverside flushes the staging table` but `grep -n "\-\-court" scripts/rebuild_db.py` returns nothing and the PR doesn't add it. Cite the grep/find output as evidence.
+2. **Self-contradiction between ACs.** Two ACs in the same issue demand mutually exclusive outcomes. Example: AC #2 says "extracted judge names must preserve middle initials" and AC #5 says "normalize judge names to `Last, First` form without initials". Cite both AC indices.
+3. **Out-of-scope dependency.** The AC depends on work another not-yet-merged issue owns, AND the blocking relationship is not listed in the issue body's `Blocked by` section. Example: an AC depends on a new DB column `derived.rulings.enrichment_v2_confidence` that is owned by a sibling open issue; attempting to implement it here would duplicate schema changes. Cite the sibling issue number.
+
+**Negative guardrails — do NOT raise `AC_INFEASIBLE` for any of these:**
+
+- **"Hard to implement."** If the AC is legitimate but the implementation is tricky, keep iterating. Partial progress + clearer reviewer feedback is the right path; the verdict is `SHIP` (when done) or `ralph_max_iterations` (when budget is out), not `AC_INFEASIBLE`.
+- **Max iterations exhausted.** Hitting `max_iterations` is its own failure mode (`ralph_max_iterations` → BLOCKED with that reason). An iteration-budget exhaustion is not structural impossibility — the remedy is a retry with narrower scope, not a diagnoser reissue.
+- **Ambiguous wording.** If an AC's wording is ambiguous but reasonable implementations exist, pick the most defensible one and note the ambiguity in the PR body. Reserve `AC_INFEASIBLE` for ACs where NO implementation satisfies the literal text.
+- **Missing test fixture that the worker can create.** If the AC requires a fixture file, the worker should create it. A "fixture doesn't exist yet" situation is worker scope, not structural impossibility.
+
+**Emit mechanics.** Both the worker and the Claude reviewer may surface infeasibility. The worker signals it by writing:
+
+- `AC_INFEASIBLE` to `{worktree}/tmp/ralph/work-status.txt` (in place of `COMPLETE` / `STUCK`), AND
+- a JSON array of `{"index": <1-based>, "evidence": "<paragraph>"}` objects to `{worktree}/tmp/ralph/infeasible-acs.json`.
+
+The Claude reviewer signals it by writing:
+
+- `AC_INFEASIBLE` to `{worktree}/tmp/ralph/review-result.txt` (in place of `SHIP` / `REVISE`), AND
+- the same JSON array shape to `{worktree}/tmp/ralph/infeasible-acs.json` (append or merge with the worker's entries — dedupe by `index`).
+
+When either path writes the verdict, the outer loop (§2e) terminates with `ralph-done.txt` = `AC_INFEASIBLE` and the outer `/task-v2-ralph` wrapper reads `infeasible-acs.json` to populate its `infeasible_acs` output field. The daemon then routes to the diagnoser per spec §8.
+
+**Evidence is load-bearing.** Every `infeasible_acs` entry MUST cite concrete evidence (grep result, file path, conflicting AC index) so the diagnoser can recommend `reissue` vs. `escalate` vs. `close` without re-running the investigation. Paragraphs like "this feels wrong" or "I don't think this is right" are not evidence.
+
+---
+
 ### Status file
 
 The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/{agent-id}.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `.claude/worktrees/agent-ab4722a2` -> `{repo_root}/tmp/agent-status/agent-ab4722a2.txt`, or `worktrees/worker-2` -> `{repo_root}/tmp/agent-status/worker-2.txt`).
@@ -61,6 +94,7 @@ Create the state directory and seed the task file:
 ├── iteration.txt              # current iteration number (written before each iteration)
 ├── review-log.jsonl           # structured review log (appended by gemini_review.py and the loop)
 ├── touched-packages.txt       # Python packages with code changes (written by worker step 4)
+├── infeasible-acs.json        # written only on AC_INFEASIBLE verdict (worker / reviewer)
 └── ralph-done.txt             # completion signal for the calling /task workflow
 ```
 
@@ -151,6 +185,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > 8. Write your acceptance criteria self-check to `{worktree}/tmp/ralph/acceptance-check.txt` with a table mapping each criterion to its evidence.
 > 9. When all checks pass (including diff-coverage >= 90%) AND all locally-verifiable acceptance criteria are addressed, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
 > 10. If you cannot get checks passing after reasonable effort, write "STUCK" to `work-status.txt` and describe what's failing in `{worktree}/tmp/ralph/stuck-reason.txt`.
+> 11. **If during steps 1-8 you determine one or more acceptance criteria are structurally infeasible** per the §"AC_INFEASIBLE emit rules" above (non-existent symbol, self-contradiction, out-of-scope dependency), do NOT keep iterating and do NOT write COMPLETE. Instead, write `AC_INFEASIBLE` to `{worktree}/tmp/ralph/work-status.txt` AND write a JSON array of `{"index": <1-based>, "evidence": "<paragraph citing the grep output / file path / conflicting AC index>"}` entries to `{worktree}/tmp/ralph/infeasible-acs.json`. Apply the negative guardrails — do NOT raise this verdict for "hard to implement", max iterations, ambiguous wording, or missing fixtures you can create yourself.
 >
 > Rules:
 > - All work happens in `{worktree}`. All temp files go in `{worktree}/tmp/`.
@@ -190,6 +225,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 > 6. Write your acceptance criteria self-check to `{worktree}/tmp/ralph/acceptance-check.txt` with a table mapping each criterion to its evidence.
 > 7. When all applicable pre-PR checks pass AND all locally-verifiable acceptance criteria are addressed, write "COMPLETE" to `{worktree}/tmp/ralph/work-status.txt`.
 > 8. If you cannot get the plan implemented after reasonable effort (e.g. the plan's "What will change" section is unclear, or a required file doesn't exist), write "STUCK" to `work-status.txt` and describe what's failing in `{worktree}/tmp/ralph/stuck-reason.txt`.
+> 9. **If during steps 1-6 you determine one or more acceptance criteria are structurally infeasible** per the §"AC_INFEASIBLE emit rules" above (non-existent symbol, self-contradiction, out-of-scope dependency), do NOT keep iterating and do NOT write COMPLETE. Instead, write `AC_INFEASIBLE` to `{worktree}/tmp/ralph/work-status.txt` AND write a JSON array of `{"index": <1-based>, "evidence": "<paragraph citing the grep output / file path / conflicting AC index>"}` entries to `{worktree}/tmp/ralph/infeasible-acs.json`. Apply the negative guardrails — do NOT raise this verdict for "hard to implement" or ambiguous wording.
 >
 > Rules:
 > - All work happens in `{worktree}`. All temp files go in `{worktree}/tmp/`.
@@ -201,6 +237,7 @@ Spawn a **worker subagent** (using the Agent tool) with this prompt structure:
 After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`.
 
 - If **STUCK**: Stop the loop. Comment on the issue describing the blocker. Block the issue with `scripts/block-issue.sh <issue> <blocker>` (if a specific blocking issue exists) or add `status/blocked` manually. Return to the caller with failure status.
+- If **AC_INFEASIBLE**: Stop the loop. Do NOT comment on the issue (the diagnoser will own the follow-up action — reissue, escalate, or close). Do NOT block the issue. Write `AC_INFEASIBLE` to `{worktree}/tmp/ralph/ralph-done.txt` along with the current iteration count, leaving `{worktree}/tmp/ralph/infeasible-acs.json` in place for the outer `/task-v2-ralph` wrapper to read. Return to the caller — the daemon routes to the diagnoser from here.
 - If **COMPLETE**: Continue to the review phase (2b for testable, 2b' for non-testable).
 
 ### 2b — Sequential review phase (testable branch)
@@ -338,9 +375,10 @@ The Claude reviewer prompt applies to both branches:
 >    - **Unchecked test plan items**: If the PR includes a test plan with checkboxes, any unchecked items are **merge blockers**. An unchecked item means something was not verified — flag it as a REVISE reason. The author must either check the item (verify it) or remove it (not applicable).
 >    - **Diff-coverage gate** (testable only — skip for non-testable): confirm the worker's self-check reports diff-coverage ≥ 90%.
 >    - **Web Interface Guidelines (conditional)**: If any changed files have `.tsx` or `.css` extensions, read `~/.claude/commands/web-interface-guidelines.md` and check those files against its rules. Report violations as REVISE reasons with `file:line` format. Skip this criterion entirely if no `.tsx` or `.css` files appear in the diff.
-> 6. Make a binary decision:
+> 6. Make a decision — **one of three verdicts**:
 >    - **SHIP**: The implementation is correct, well-tested (or, for non-testable changes, implements the plan's "What will change" section faithfully), properly scoped, ALL locally-verifiable acceptance criteria are met, and ready for PR. Write "SHIP" to `{worktree}/tmp/ralph/review-result.txt`.
 >    - **REVISE**: Something needs to change. Write "REVISE" to `{worktree}/tmp/ralph/review-result.txt`. Then write specific, actionable feedback to `{worktree}/tmp/ralph/feedback.md` — describe exactly what needs to change and why. Be concrete: reference specific files, functions, and line numbers. **If any acceptance criterion is unmet, list it first in your feedback.**
+>    - **AC_INFEASIBLE**: One or more acceptance criteria are structurally impossible per the §"AC_INFEASIBLE emit rules" section (non-existent symbol, self-contradiction, out-of-scope dependency) — NOT "hard to implement", not "max iterations", not "ambiguous". Write "AC_INFEASIBLE" to `{worktree}/tmp/ralph/review-result.txt`. Write the JSON array of `{"index": <1-based>, "evidence": "<paragraph>"}` to `{worktree}/tmp/ralph/infeasible-acs.json` (merge with any entries the worker already wrote; dedupe by `index`). Err on the side of REVISE when uncertain — AC_INFEASIBLE requires citable evidence (grep output, file path, conflicting AC index), not a hunch. When you pick AC_INFEASIBLE, do NOT write feedback.md — the diagnoser owns the follow-up action.
 >
 > Scope boundaries:
 > - **Only flag issues introduced or modified by this diff.** Pre-existing code patterns that were not changed in this PR are out of scope — even if they look questionable. The worker is not responsible for fixing code they did not touch.
@@ -405,6 +443,8 @@ Run this script with any available Python 3 interpreter (e.g. a venv python from
 - **Non-testable branch:** Claude alone must SHIP. Both Gemini entries are always **SKIPPED** on this branch, so the same predicate — Claude SHIP AND Gemini standard SHIP-or-SKIPPED AND Gemini adversarial SHIP-or-SKIPPED — reduces to Claude SHIP. The predicate is uniform across branches.
 
 If the predicate is satisfied: the loop is done. Continue to Step 3.
+
+**AC_INFEASIBLE short-circuit.** If the worker wrote `AC_INFEASIBLE` to `work-status.txt` OR the Claude reviewer wrote `AC_INFEASIBLE` to `review-result.txt`, the loop terminates immediately with verdict `AC_INFEASIBLE`. Do NOT run subsequent reviewers. Do NOT run the next iteration. Do NOT invoke the persistent-dissent override (it does not apply to AC_INFEASIBLE). Write `AC_INFEASIBLE` to `{worktree}/tmp/ralph/ralph-done.txt` along with the iteration count, leave `infeasible-acs.json` in place, and return to the caller — the outer `/task-v2-ralph` wrapper will read both files and emit the dispatcher-facing JSON.
 
 - **Persistent-dissent override** (testable branch only): If ANY reviewer says **REVISE**, first check whether this is a persistent solo-dissent pattern. The override logic only applies when multiple reviewers actually ran — on the non-testable branch where only Claude runs, there is no dissent to override. Write and run a small Python script (`{worktree}/tmp/ralph/check_dissent.py`):
 
@@ -481,6 +521,16 @@ iterations: <N>
 next-steps: The /task workflow MUST now continue with: A.2b (process summary), A.3 (stage, commit, push), A.4 (verify no merge conflicts), A.5 (monitor CI), A.6 (update PR test plan), A.7 (merge PR), A.8 (verify deployment, functional health, and acceptance criteria if applicable), A.9 (retrospective). THE TASK IS NOT COMPLETE UNTIL ALL THESE STEPS FINISH.
 ```
 
+**AC_INFEASIBLE completion signal (issue #3010).** When the §2e short-circuit fires, write this content to `ralph-done.txt` instead (again, substituting the actual iteration count):
+
+```
+status: AC_INFEASIBLE
+iterations: <N>
+next-steps: The daemon will read infeasible-acs.json, write a dispatcher.failures(category='ralph_ac_infeasible') row, and route to the diagnoser. No commit, no push, no PR. The outer /task-v2-ralph wrapper propagates the infeasible_acs array to the dispatcher.
+```
+
+Leave `{worktree}/tmp/ralph/infeasible-acs.json` in place so the outer wrapper can pass it through. Do NOT commit, push, or open a PR. Return to the caller.
+
 The code is ready for commit. Return control to the calling workflow (`/task` Path A or `/task-v2-ralph`), which handles process summary, staging, committing, pushing, PR creation, CI monitoring, and cleanup.
 
 **Do not commit, push, or open a PR from this skill.**
@@ -503,6 +553,7 @@ Under dispatcher v2, the calling `/task-v2-ralph` skill parses `ralph-done.txt` 
 - **Unchecked test plan items are merge blockers.** Reviewers must flag unchecked test plan checkboxes as REVISE reasons. A PR with unchecked items is not ready to ship.
 - **Unmet acceptance criteria are always REVISE.** Reviewers must verify every acceptance criterion individually. Code quality alone is not sufficient for SHIP — all locally-verifiable acceptance criteria must be met.
 - **"No tests added" is not a REVISE reason on the non-testable branch.** Applying test-coverage standards to a docs-only or migration-only diff is a category error that deadlocks the loop. The reviewer must distinguish the branches by reading `## Testable` in `task.md`.
+- **AC_INFEASIBLE requires citable evidence (issue #3010).** The worker or Claude reviewer may surface `AC_INFEASIBLE` when an AC references a non-existent symbol, self-contradicts another AC, or depends on out-of-scope work — see §"AC_INFEASIBLE emit rules". "Hard to implement", "max iterations exhausted", and ambiguous wording are NOT triggers. When uncertain, prefer REVISE — the diagnoser cannot reason about a hunch.
 - **Persistent-dissent override** (testable branch only). If one reviewer says REVISE for 2+ consecutive iterations while the other two say SHIP, and the detection function (`detect_persistent_dissent`) confirms the pattern, the loop treats it as SHIP. This prevents a single reviewer from blocking convergence on theoretical grounds that the other reviewers have already evaluated and dismissed. The override is logged to `review-log.jsonl` with type `dissent_override` for audit. This override only applies when exactly one reviewer dissents — if two reviewers REVISE, that is a genuine concern and the override does not trigger. On the non-testable branch, only Claude reviews, so the override is inapplicable and the REVISE path always re-runs the worker.
 - **Do not use `run_in_background` anywhere in the ralph loop.** All commands — test suites, lint, format checks, git commands, reviewer invocations, and worker subagents — must run in the foreground. Subagents are already running as background tasks from the parent's perspective. Further backgrounding causes completion notifications to route to the wrong context, leading to confusion and lost results.
 
