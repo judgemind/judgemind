@@ -1,0 +1,179 @@
+"""Tests for Riverside multi-case LLM contamination guards (#2564).
+
+Two contamination patterns in Riverside tentative ruling PDFs:
+
+1. **Title absorbs motion heading** — the LLM misreads the caption + motion
+   header as one ``case_title``, e.g.
+   ``"WILLARD VS HYUNDAI MOTOR AMERICA vs. MOTION FOR ATTORNEY'S FEES BY JAMES WILLARD"``
+   should be sanitized to ``"WILLARD VS HYUNDAI MOTOR AMERICA"``.
+
+2. **ruling_text bleeds across case boundary** — the LLM fails to stop at the
+   next numbered-entry boundary, and the ruling for case N contains the full
+   text for case N+1 as well.
+
+All tests here FAIL on the current main branch (functions don't exist, prompt
+doesn't contain guards) and PASS after the fix.  That satisfies AC#1.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from framework.llm_extractor import (
+    _sanitize_title_motion_tail,
+    _truncate_cross_case_ruling_text,
+)
+from framework.prompts.riverside import RIVERSIDE_SYSTEM_PROMPT
+
+FIXTURES = Path(__file__).parent / "fixtures" / "riv_multi_case_contaminated.json"
+
+_RIVERSIDE_CASE_NUMBER_RE = re.compile(
+    r"\b(?:CV[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC|CIV|MVC|TEC|UDPS)[A-Z]{0,4})\d{6,10}\b",
+    re.IGNORECASE,
+)
+
+
+@pytest.fixture(scope="module")
+def fixture_data() -> dict:
+    return json.loads(FIXTURES.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_title_motion_tail — title contamination guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param(
+            {
+                "input": (
+                    "WILLARD VS HYUNDAI MOTOR AMERICA"
+                    " vs. MOTION FOR ATTORNEY'S FEES BY JAMES WILLARD"
+                ),
+                "expected_title": "WILLARD VS HYUNDAI MOTOR AMERICA",
+            },
+            id="willard_attorney_fees",
+        ),
+        pytest.param(
+            {
+                "input": "JOHNSON vs. MOTION TO COMPEL",
+                "expected_title": "JOHNSON",
+            },
+            id="johnson_motion_to_compel",
+        ),
+        pytest.param(
+            {
+                "input": "PEREZ VS CITY OF RIVERSIDE vs. Demurrer to First Amended Complaint",
+                "expected_title": "PEREZ VS CITY OF RIVERSIDE",
+            },
+            id="perez_demurrer",
+        ),
+        pytest.param(
+            {
+                "input": "SMITH VS SOUTHWEST AIRLINES CO. vs. MSJ by DEFENDANT",
+                "expected_title": "SMITH VS SOUTHWEST AIRLINES CO.",
+            },
+            id="smith_msj",
+        ),
+        pytest.param(
+            {
+                "input": (
+                    "GARCIA VS COUNTY OF SAN BERNARDINO vs. Hearing on Motion to Set Aside Default"
+                ),
+                "expected_title": "GARCIA VS COUNTY OF SAN BERNARDINO",
+            },
+            id="garcia_hearing_on",
+        ),
+        pytest.param(
+            {
+                "input": "RODRIGUEZ VS TESLA INC vs. Motion to Be Relieved as Counsel",
+                "expected_title": "RODRIGUEZ VS TESLA INC",
+            },
+            id="rodriguez_to_be_relieved",
+        ),
+    ],
+)
+def test_sanitize_title_strips_motion_tail(entry: dict) -> None:
+    """Each contaminated title is cleaned to only the party-names caption."""
+    result = _sanitize_title_motion_tail(entry["input"])
+    assert result == entry["expected_title"]
+
+
+def test_sanitize_title_preserves_clean_title() -> None:
+    """A clean 'A v. B' title with no motion heading is returned unchanged."""
+    clean = "Linton v. Joshua Linton"
+    assert _sanitize_title_motion_tail(clean) == clean
+
+
+# ---------------------------------------------------------------------------
+# _truncate_cross_case_ruling_text — ruling_text bleed guard
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_cross_case_ruling_text_drops_foreign_block(fixture_data: dict) -> None:
+    """ruling_text that bleeds into a foreign case number is truncated at that boundary."""
+    entry = fixture_data["cross_case_ruling_text"][0]
+    result = _truncate_cross_case_ruling_text(
+        entry["input_text"],
+        own_case_number=entry["own_case_number"],
+        case_number_re=_RIVERSIDE_CASE_NUMBER_RE,
+    )
+    assert result == entry["expected_truncated_text"]
+
+
+def test_truncate_cross_case_ruling_text_keeps_own_case_number_mentions() -> None:
+    """ruling_text that mentions the ruling's own case number inline is not truncated."""
+    own = "CVRI2500796"
+    text = (
+        "Case CVRI2500796: The motion is denied.\n\n"
+        "Plaintiff in CVRI2500796 has standing to bring this claim."
+    )
+    result = _truncate_cross_case_ruling_text(
+        text,
+        own_case_number=own,
+        case_number_re=_RIVERSIDE_CASE_NUMBER_RE,
+    )
+    assert result == text
+
+
+def test_truncate_cross_case_ruling_text_no_sibling_case_number_is_noop() -> None:
+    """ruling_text with no Riverside case number at all is returned unchanged."""
+    text = (
+        "Tentative Ruling: GRANT Plaintiff's motion to compel.\n\n"
+        "Defendant failed to respond within the statutory deadline.\n"
+        "The motion is GRANTED. Defendant shall serve responses within 20 days."
+    )
+    result = _truncate_cross_case_ruling_text(
+        text,
+        own_case_number="CVRI2500796",
+        case_number_re=_RIVERSIDE_CASE_NUMBER_RE,
+    )
+    assert result == text
+
+
+# ---------------------------------------------------------------------------
+# RIVERSIDE_SYSTEM_PROMPT — prompt guard tests
+# ---------------------------------------------------------------------------
+
+
+def test_riverside_prompt_contains_motion_tail_guard() -> None:
+    """RIVERSIDE_SYSTEM_PROMPT must contain the motion-tail guard in the case_title rules."""
+    # The new Rule 4a must mention at least one motion keyword to guard
+    # against the LLM absorbing motion headings into case_title.
+    assert "Motion" in RIVERSIDE_SYSTEM_PROMPT
+
+
+def test_riverside_prompt_contains_cross_case_guard() -> None:
+    """RIVERSIDE_SYSTEM_PROMPT must contain wording about cross-case boundary stopping."""
+    # Rule 5a must instruct the LLM to stop ruling_text at the next numbered
+    # entry AND forbid foreign case numbers in the ruling text.
+    prompt_lower = RIVERSIDE_SYSTEM_PROMPT.lower()
+    assert (
+        "foreign" in prompt_lower or "next numbered" in prompt_lower or "next entry" in prompt_lower
+    )

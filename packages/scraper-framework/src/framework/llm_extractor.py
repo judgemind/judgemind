@@ -104,6 +104,17 @@ _CASE_BOUNDARY_RE = re.compile(
 # OC-style county prefix: "30-2024-01393434" -> "2024-01393434"
 _COUNTY_PREFIX_RE = re.compile(r"^\d{2,4}-(\d{4}-\d+)$")
 
+# Riverside case-number pattern (duplicated from courts.ca.riverside_tentatives
+# to avoid a courts→framework import inversion).  Used by the cross-case
+# ruling_text truncation sanitizer (#2564).
+# Covers:
+#   CV + 2-4 letter location code + 6-8 digits (e.g. CVPS2306157, CVRI2500796)
+#   RIC, MCC, PSC, SWC, INC, CIV, MVC, TEC, UDPS + 0-4 letters + 6-10 digits
+_RIVERSIDE_CASE_NUMBER_RE = re.compile(
+    r"\b(?:CV[A-Z]{2,4}|(?:RIC|MCC|PSC|SWC|INC|CIV|MVC|TEC|UDPS)[A-Z]{0,4})\d{6,10}\b",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # LLM result cache
 # ---------------------------------------------------------------------------
@@ -764,6 +775,190 @@ def _truncate_concatenated_case_titles(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: Riverside title motion-tail sanitizer (#2564)
+# ---------------------------------------------------------------------------
+#
+# Riverside LLM extractions sometimes produce an ``extracted_case_title`` that
+# absorbs the motion heading following the party-name caption.  The LLM reads
+# the PDF caption line (e.g. ``WILLARD VS HYUNDAI MOTOR AMERICA``) together
+# with the motion description that immediately follows (e.g.
+# ``MOTION FOR ATTORNEY'S FEES BY JAMES WILLARD``), and joins them with a
+# second ``vs.`` separator to produce a contaminated title like:
+#
+#   ``"WILLARD VS HYUNDAI MOTOR AMERICA vs. MOTION FOR ATTORNEY'S FEES BY JAMES WILLARD"``
+#
+# The sanitizer detects this pattern by looking for a ``v.`` / ``vs.`` token
+# followed by a recognized motion keyword, and strips everything from that
+# separator onward.  The result is the clean party-names caption.
+
+# Matches a second adversarial separator (``v.`` / ``vs.``) followed
+# immediately by a motion keyword — the telltale sign of title contamination.
+# Applied case-insensitively; anchored at the separator so the preceding
+# party-name text is preserved intact.
+_MOTION_HEADING_TAIL_RE = re.compile(
+    r"\s+v[s]?\.\s+(?:Motion|Msc|Petition|Demurrer|MSJ|Hearing\s+on|"
+    r"To\s+(?:Be|Set|Compel)|For\s+(?:Attorney|Summary))"
+    r".*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _sanitize_title_motion_tail(title: str) -> str:
+    """Strip motion-heading tail from a contaminated ``case_title`` (#2564).
+
+    When the Riverside LLM absorbs a motion heading into the case title,
+    the result looks like::
+
+        "WILLARD VS HYUNDAI MOTOR AMERICA vs. MOTION FOR ATTORNEY'S FEES BY JAMES WILLARD"
+
+    This function strips everything from the second adversarial separator
+    (``v.`` / ``vs.``) onward when it is immediately followed by a motion
+    keyword.  Clean titles (single ``v.`` / ``vs.`` separator with no
+    following motion keyword) are returned unchanged.
+
+    This is a pure, side-effect-free helper.  Callers are responsible for
+    deciding when to apply it (e.g. only for Riverside-origin rulings).
+    """
+    result = _MOTION_HEADING_TAIL_RE.sub("", title)
+    return result.rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: Riverside cross-case ruling_text truncation (#2564)
+# ---------------------------------------------------------------------------
+#
+# Riverside LLM extractions sometimes produce a ``ruling_text`` that bleeds
+# across case boundaries — the LLM fails to stop at the next numbered-entry
+# line (e.g. ``2.``) and continues transcribing the next case's content.
+# The result is a single ``ruling_text`` that contains the full ruling for
+# case N followed immediately by the header and ruling for case N+1.
+#
+# This is detectable because the text for the next case begins with a foreign
+# Riverside case number (a case number different from the ruling's own
+# ``extracted_case_number``).  The sanitizer truncates at the first
+# occurrence of such a foreign case number.
+#
+# Design notes:
+#
+# * ``own_case_number`` is normalised before comparison so ``CVRI2500796``
+#   matches regardless of whether the text has ``CVRI 2500796`` or
+#   ``cvri2500796``.
+# * The function is generic over any ``case_number_re`` pattern so it can
+#   be unit-tested without a live Riverside fixture and potentially reused
+#   for other counties in the future.
+
+
+def _truncate_cross_case_ruling_text(
+    text: str,
+    *,
+    own_case_number: str | None,
+    case_number_re: re.Pattern,
+) -> str:
+    """Truncate *text* at the first foreign Riverside case number (#2564).
+
+    Scans *text* for all case-number matches using *case_number_re*.  For
+    each match, if the normalised match value differs from
+    *own_case_number* (normalised), truncate *text* at the start of that
+    match and return the prefix.  If no foreign case number is found,
+    *text* is returned unchanged.
+
+    Parameters
+    ----------
+    text:
+        The ``ruling_text`` value to sanitize.
+    own_case_number:
+        The ruling's own case number (e.g. ``"CVRI2500796"``).  When
+        ``None``, any matching case number is considered foreign and
+        triggers truncation.
+    case_number_re:
+        Compiled regex pattern that matches candidate Riverside case
+        numbers.  Callers should pass the Riverside-specific pattern
+        (``CV[A-Z]{2,4}`` + ``RIC/MCC/...`` prefixes) to avoid false
+        positives from other county formats.
+
+    Returns
+    -------
+    str
+        The sanitized ruling text (possibly unchanged).
+    """
+    own_norm = own_case_number.upper().strip() if own_case_number else None
+
+    for m in case_number_re.finditer(text):
+        candidate = m.group(0).upper().strip()
+        if own_norm is None or candidate != own_norm:
+            # Found a foreign case number — truncate here.
+            return text[: m.start()]
+
+    return text
+
+
+def _sanitize_riverside_rulings(
+    rulings: list[ExtractedRuling],
+    *,
+    case_number_re: re.Pattern,
+) -> list[ExtractedRuling]:
+    """Apply Riverside-specific title and ruling_text sanitizers (#2564).
+
+    Applies two deterministic post-processors to every ruling in *rulings*:
+
+    1. :func:`_sanitize_title_motion_tail` — strips motion-heading tails
+       from ``extracted_case_title`` when the LLM absorbed a motion header
+       into the title field.
+    2. :func:`_truncate_cross_case_ruling_text` — truncates ``ruling_text``
+       at the first occurrence of a foreign Riverside case number, preventing
+       bleed-across of ruling text from the next case in the PDF.
+
+    Both sanitizers are pure helpers; this function wires them over a list
+    and emits structured log entries for each change so production can
+    observe the guard's activity.
+
+    This post-processor is idempotent — re-applying it to already-clean
+    rulings is a no-op.
+    """
+    for i, ruling in enumerate(rulings):
+        updates: dict = {}
+
+        # --- Title sanitization ---
+        original_title = ruling.extracted_case_title
+        if original_title:
+            clean_title = _sanitize_title_motion_tail(original_title)
+            if clean_title != original_title:
+                updates["extracted_case_title"] = clean_title
+                logger.info(
+                    "llm_extractor.title_motion_tail_stripped",
+                    case_number=ruling.extracted_case_number,
+                    before=original_title,
+                    after=clean_title,
+                )
+
+        # --- Cross-case ruling_text truncation ---
+        original_text = ruling.ruling_text
+        if original_text:
+            clean_text = _truncate_cross_case_ruling_text(
+                original_text,
+                own_case_number=ruling.extracted_case_number,
+                case_number_re=case_number_re,
+            )
+            if clean_text != original_text:
+                # Identify the foreign case number that triggered truncation.
+                foreign_match = case_number_re.search(original_text[len(clean_text) :])
+                foreign_cn = foreign_match.group(0) if foreign_match else "unknown"
+                updates["ruling_text"] = clean_text
+                logger.warning(
+                    "llm_extractor.ruling_text_truncated_at_foreign_case_number",
+                    case_number=ruling.extracted_case_number,
+                    foreign_case_number=foreign_cn,
+                    before_len=len(original_text),
+                    after_len=len(clean_text),
+                )
+
+        if updates:
+            rulings[i] = ruling.model_copy(update=updates)
+
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: calendar-listing-only detection (#2446)
 # ---------------------------------------------------------------------------
 
@@ -1309,6 +1504,7 @@ def _apply_text_cache_hit_filters(
     rulings = _filter_citation_artifacts(rulings)
     rulings = _truncate_concatenated_case_titles(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
+    rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
     if len(rulings) != original_count:
         logger.info(
             "llm_extractor.cache_hit_filters_dropped",
@@ -1670,6 +1866,13 @@ class LlmExtractor:
         # misinterpreting inline citations (Requests for Judicial Notice)
         # as separate rulings.  See #2448.
         rulings = _filter_citation_artifacts(rulings)
+
+        # Post-processing: Riverside title and ruling_text sanitizers (#2564).
+        # Strip motion-heading tails from case_title and truncate ruling_text
+        # at the first foreign Riverside case number.  Both sanitizers are
+        # no-ops on clean rulings and on non-Riverside documents (the
+        # cross-case truncator only triggers on CVRI/CVSW/RIC/… tokens).
+        rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
 
         # Write to cache
         if self._cache is not None and rulings:
