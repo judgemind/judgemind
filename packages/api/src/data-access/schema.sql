@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 33 migrations.
+-- Generated from 38 migrations.
 
 
 
@@ -80,8 +80,6 @@ CREATE TYPE public.validation_status AS ENUM (
 );
 
 
--- Name: issue_cooldown_remaining_seconds(integer, integer); Type: FUNCTION; Schema: dispatcher; Owner: -
-
 CREATE FUNCTION dispatcher.issue_cooldown_remaining_seconds(p_issue_number integer, p_cooldown_seconds integer) RETURNS integer
     LANGUAGE sql STABLE
     AS $$
@@ -94,12 +92,8 @@ CREATE FUNCTION dispatcher.issue_cooldown_remaining_seconds(p_issue_number integ
 $$;
 
 
--- Name: FUNCTION issue_cooldown_remaining_seconds(p_issue_number integer, p_cooldown_seconds integer); Type: COMMENT; Schema: dispatcher; Owner: -
-
 COMMENT ON FUNCTION dispatcher.issue_cooldown_remaining_seconds(p_issue_number integer, p_cooldown_seconds integer) IS 'Returns the seconds remaining in the cooldown window keyed on MAX(started_at) for any prior agent row for this issue. NULL when there is no prior row (never attempted). 0 when cooldown has elapsed (GREATEST keeps it non-negative). Issue #3001.';
 
-
--- Name: issue_has_active_agent(integer); Type: FUNCTION; Schema: dispatcher; Owner: -
 
 CREATE FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) RETURNS boolean
     LANGUAGE sql STABLE
@@ -112,8 +106,6 @@ CREATE FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) RETURN
     );
 $$;
 
-
--- Name: FUNCTION issue_has_active_agent(p_issue_number integer); Type: COMMENT; Schema: dispatcher; Owner: -
 
 COMMENT ON FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) IS 'Returns TRUE when dispatcher.agents has any row for this issue with status IN (''running'', ''retrying'', ''succeeded'', ''needs_review''). Mirrors ACTIVE_AGENT_STATUSES in scripts/dispatcher/daemon.py:354. Issue #3001.';
 
@@ -542,7 +534,8 @@ CREATE TABLE dispatcher.phase_outputs (
     tokens_cache_read bigint,
     tokens_cache_write bigint,
     cost_usd numeric(10,4),
-    model_used text
+    model_used text,
+    patch_id uuid
 );
 
 
@@ -568,6 +561,9 @@ COMMENT ON COLUMN dispatcher.phase_outputs.cost_usd IS 'Claude Code''s list-pric
 
 
 COMMENT ON COLUMN dispatcher.phase_outputs.model_used IS 'The resolved Claude model the phase ran on (e.g. ``"sonnet"``, ``"claude-sonnet-4-5"``). Free-form text — adding a new model never requires a migration. Nullable. Issue #2869.';
+
+
+COMMENT ON COLUMN dispatcher.phase_outputs.patch_id IS 'FK to dispatcher.ralph_patches when this is the ralph SHIP row; NULL for every other phase and for ralph non-SHIP exits. ON DELETE SET NULL so phase_outputs survives patch cleanup. Issue #3012.';
 
 
 CREATE SEQUENCE dispatcher.phase_outputs_output_id_seq
@@ -624,6 +620,25 @@ COMMENT ON COLUMN dispatcher.queue_snapshots.run_id IS 'Owning daemon run. Snaps
 
 
 COMMENT ON COLUMN dispatcher.queue_snapshots.issues_json IS 'Enriched issue metadata as observed at scan time: [{number, title, labels: [string], createdAt}, ...]. Populated by the daemon from the ``gh issue list --json number,title,labels,createdAt`` response. Source of truth for the /admin/dispatcher queue-ready panel (issue #2820). Kept in lock-step with ``issue_numbers`` — the two columns MUST describe the same issues in the same order.';
+
+
+CREATE TABLE dispatcher.ralph_patches (
+    patch_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    agent_id uuid NOT NULL,
+    issue_number integer NOT NULL,
+    patch_content text NOT NULL,
+    commit_sha text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+COMMENT ON TABLE dispatcher.ralph_patches IS 'Patches from ralph SHIP exits, persisted for the narrow window between SHIP and a successful gh pr create. Issue #3012.';
+
+
+COMMENT ON COLUMN dispatcher.ralph_patches.patch_content IS 'git format-patch -1 HEAD --stdout output. Applied with git am when a retry inherits the prior SHIP.';
+
+
+COMMENT ON COLUMN dispatcher.ralph_patches.commit_sha IS 'ralph''s HEAD SHA at SHIP time. Nullable — written when git rev-parse succeeds; informational only (the patch is the authoritative artifact).';
 
 
 CREATE TABLE dispatcher.retry_markers (
@@ -1003,6 +1018,10 @@ ALTER TABLE ONLY dispatcher.queue_snapshots
     ADD CONSTRAINT queue_snapshots_pkey PRIMARY KEY (snapshot_id);
 
 
+ALTER TABLE ONLY dispatcher.ralph_patches
+    ADD CONSTRAINT ralph_patches_pkey PRIMARY KEY (patch_id);
+
+
 ALTER TABLE ONLY dispatcher.retry_markers
     ADD CONSTRAINT retry_markers_pkey PRIMARY KEY (marker_id);
 
@@ -1223,6 +1242,12 @@ CREATE INDEX idx_dispatcher_retry_markers_pending ON dispatcher.retry_markers US
 CREATE INDEX idx_dispatcher_terminal_outcomes_ended_at ON dispatcher.terminal_outcomes USING btree (ended_at DESC);
 
 
+CREATE INDEX ralph_patches_created_at_idx ON dispatcher.ralph_patches USING btree (created_at);
+
+
+CREATE INDEX ralph_patches_issue_idx ON dispatcher.ralph_patches USING btree (issue_number);
+
+
 CREATE INDEX idx_alert_events_sub_id ON public.alert_events USING btree (subscription_id);
 
 
@@ -1383,12 +1408,20 @@ ALTER TABLE ONLY dispatcher.phase_outputs
     ADD CONSTRAINT phase_outputs_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
 
 
+ALTER TABLE ONLY dispatcher.phase_outputs
+    ADD CONSTRAINT phase_outputs_patch_id_fkey FOREIGN KEY (patch_id) REFERENCES dispatcher.ralph_patches(patch_id) ON DELETE SET NULL;
+
+
 ALTER TABLE ONLY dispatcher.phase_transitions
     ADD CONSTRAINT phase_transitions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
 
 
 ALTER TABLE ONLY dispatcher.queue_snapshots
     ADD CONSTRAINT queue_snapshots_run_id_fkey FOREIGN KEY (run_id) REFERENCES dispatcher.runs(run_id) ON DELETE CASCADE;
+
+
+ALTER TABLE ONLY dispatcher.ralph_patches
+    ADD CONSTRAINT ralph_patches_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
 
 
 ALTER TABLE ONLY dispatcher.retry_markers

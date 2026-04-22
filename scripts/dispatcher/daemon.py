@@ -124,6 +124,16 @@ DEFAULT_PHASE_OUTPUT_RETENTION_DAYS = 30
 #: ``notification_retention_days`` row in ``dispatcher.config``. Issue #2779.
 DEFAULT_NOTIFICATION_RETENTION_DAYS = 30
 
+#: Default retention window for ``dispatcher.ralph_patches``. Safety-net
+#: only — the happy-path cleanup is the ``DELETE`` at ``gh pr create``
+#: success in :meth:`_push_and_open_pr`. Seven days catches pathological
+#: cases (daemon crash between SHIP and PR create, operator force-stop)
+#: without keeping large patch blobs indefinitely. Not operator-tunable
+#: today — if that changes, add a ``ralph_patch_retention_days`` row in
+#: ``dispatcher.config`` and thread it through ``_read_retention_days``
+#: the same way the other targets do. Issue #3012.
+DEFAULT_RALPH_PATCH_RETENTION_DAYS = 7
+
 #: Default repo the daemon watches. Overridden by the ``GITHUB_REPO``
 #: env var, wired in the terraform module.
 DEFAULT_GITHUB_REPO = "judgemind/judgemind"
@@ -4424,6 +4434,461 @@ class DispatcherDaemon:
         except (TypeError, ValueError):  # pragma: no cover — defensive
             return 0
 
+    # ── ralph patch persistence (issue #3012) ──────────────────────────
+    #
+    # Persist ralph's SHIP'd diff to ``dispatcher.ralph_patches`` so a
+    # daemon restart between SHIP and a successful ``gh pr create`` does
+    # not lose the work. Three helpers:
+    #
+    #   - :meth:`_capture_and_persist_ralph_patch` runs after
+    #     ``verdict=SHIP`` in :meth:`_run_ralph_phase`. It captures the
+    #     patch with ``git format-patch -1 HEAD --stdout``, DELETEs any
+    #     prior row for the same ``issue_number`` (supersede semantics),
+    #     INSERTs the fresh row, and UPDATEs the matching ralph
+    #     ``phase_outputs`` row's ``patch_id`` FK.
+    #   - :meth:`_delete_ralph_patches_for_agent` runs after ``gh pr
+    #     create`` succeeds in :meth:`_push_and_open_pr`. Once the
+    #     branch is on origin, the postgres copy is redundant.
+    #   - :meth:`_apply_prior_ralph_patch` runs at the top of
+    #     :meth:`_run_ralph_phase` BEFORE ralph spawns. If a prior SHIP
+    #     for the same issue exists in ``ralph_patches``, it tries to
+    #     ``git am`` the patch onto the fresh worktree. On apply success,
+    #     ralph iterates on top of the inherited diff. On apply failure,
+    #     it aborts cleanly (``git am --abort``) and records the patch
+    #     text so ralph can see it in ``prior_attempts.md``.
+    #
+    # All three are best-effort by design — a DB error does not fail the
+    # agent, it just logs and falls through to the pre-#3012 behavior.
+    # The feature is a latency/cost optimization layered on top of the
+    # existing pipeline; it must not be able to wedge the pipeline.
+
+    def _capture_and_persist_ralph_patch(
+        self,
+        agent_id: str,
+        issue_number: int,
+        worktree: Path,
+    ) -> str | None:
+        """Capture ralph's SHIP'd diff, persist to postgres, return patch_id.
+
+        Runs at the end of :meth:`_run_ralph_phase` on ``verdict=SHIP``.
+        The commit model after #2971 is "ralph commits directly, daemon
+        amends" — so at SHIP time HEAD carries ralph's placeholder
+        commit (``WIP: ralph output``) and the diff is trapped in that
+        one commit. ``git format-patch -1 HEAD --stdout`` dumps the
+        full patch (including the ``--- a/path`` / ``+++ b/path``
+        hunks ``git am`` needs to replay).
+
+        Supersedes any prior row for the same ``issue_number`` — covers
+        the retry-after-failure case where a prior agent SHIPped but
+        never got its PR created (c3a69458 @ 2026-04-21).
+
+        On success, also UPDATEs the matching ``phase_outputs`` row's
+        ``patch_id`` FK so the admin page and diagnoser can correlate
+        the ralph SHIP row to its persisted patch.
+
+        Returns the new ``patch_id`` on success, ``None`` on any
+        failure (empty patch, git error, DB error). All failures are
+        logged but non-fatal — the happy path continues in
+        :meth:`_push_and_open_pr` regardless.
+        """
+        assert self._conn is not None, "connect() must run before persist"
+
+        # Capture the patch via git format-patch -1 HEAD --stdout.
+        # A 60s timeout is generous — format-patch is local-only and
+        # typically finishes in <1s even on large worktrees.
+        try:
+            patch_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "format-patch",
+                    "-1",
+                    "HEAD",
+                    "--stdout",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "daemon.ralph_patch_capture_failed",
+                extra={
+                    "event": "ralph_patch_capture_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return None
+        if patch_result.returncode != 0 or not (patch_result.stdout or "").strip():
+            # Empty or failed patch → nothing to persist. Empty is
+            # legitimately possible if ralph's "SHIP" commit has no
+            # tracked changes (shouldn't happen per the #2971 contract,
+            # but don't blow up on it).
+            self._log.info(
+                "daemon.ralph_patch_empty_or_failed",
+                extra={
+                    "event": "ralph_patch_empty_or_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "exit_code": patch_result.returncode,
+                    "stderr_tail": _stderr_tail(patch_result.stderr),
+                },
+            )
+            return None
+        patch_content = patch_result.stdout
+
+        # Best-effort HEAD SHA — informational only, NULL on failure.
+        commit_sha: str | None = None
+        try:
+            sha_result = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if sha_result.returncode == 0:
+                candidate = (sha_result.stdout or "").strip()
+                if candidate:
+                    commit_sha = candidate
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        # Supersede + INSERT + UPDATE phase_outputs.patch_id in a single
+        # transaction so observers never see a mid-state (stale row
+        # deleted but new row not yet inserted). ``cur.fetchone()``
+        # after the INSERT retrieves the generated ``patch_id``; we
+        # bind that to both the phase_outputs UPDATE and the return
+        # value.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM dispatcher.ralph_patches WHERE issue_number = %s",
+                    (issue_number,),
+                )
+                cur.execute(
+                    "INSERT INTO dispatcher.ralph_patches "
+                    "    (agent_id, issue_number, patch_content, commit_sha) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "RETURNING patch_id",
+                    (agent_id, issue_number, patch_content, commit_sha),
+                )
+                row = cur.fetchone()
+                patch_id = str(row[0]) if row and row[0] else None
+                if patch_id is not None:
+                    cur.execute(
+                        "UPDATE dispatcher.phase_outputs "
+                        "SET patch_id = %s "
+                        "WHERE agent_id = %s AND phase = 'ralph'",
+                        (patch_id, agent_id),
+                    )
+            self._conn.commit()
+        except Exception as exc:
+            self._log.exception(
+                "daemon.ralph_patch_persist_failed",
+                extra={
+                    "event": "ralph_patch_persist_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        self._log.info(
+            "daemon.ralph_patch_persisted",
+            extra={
+                "event": "ralph_patch_persisted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "patch_id": patch_id,
+                "commit_sha": commit_sha,
+                "patch_bytes": len(patch_content),
+            },
+        )
+        return patch_id
+
+    def _delete_ralph_patches_for_agent(self, agent_id: str) -> int:
+        """DELETE this agent's ``ralph_patches`` row after ``gh pr create``.
+
+        Runs at the end of :meth:`_push_and_open_pr` on a successful PR
+        open. Once the branch is on origin and the PR exists, the
+        postgres copy is redundant — origin/<branch> is the durable
+        source. Targeting by ``agent_id`` (rather than ``issue_number``)
+        ensures a racing second claim on the same issue won't clobber
+        a newer agent's patch: the row we just wrote carries this
+        agent's id.
+
+        Returns the row count deleted. A value of 0 is fine — it just
+        means we're on the fallback path (patch capture earlier failed,
+        no row to clean up). A DB error logs + rolls back; the PR is
+        already open so we don't block the happy path on cleanup.
+        """
+        assert self._conn is not None, "connect() must run before delete"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM dispatcher.ralph_patches WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                deleted = cur.rowcount or 0
+            self._conn.commit()
+        except Exception as exc:
+            self._log.exception(
+                "daemon.ralph_patch_delete_failed",
+                extra={
+                    "event": "ralph_patch_delete_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "detail": str(exc),
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+
+        self._log.info(
+            "daemon.ralph_patch_deleted",
+            extra={
+                "event": "ralph_patch_deleted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "rows_deleted": deleted,
+            },
+        )
+        return deleted
+
+    def _apply_prior_ralph_patch(
+        self,
+        agent_id: str,
+        issue_number: int,
+        worktree: Path,
+    ) -> dict[str, Any] | None:
+        """Apply a prior SHIP'd patch to the fresh worktree, if one exists.
+
+        Called at the top of :meth:`_run_ralph_phase` before ralph is
+        spawned. If a prior agent on this issue SHIPped but never got a
+        PR created, the patch is sitting in ``dispatcher.ralph_patches``
+        from :meth:`_capture_and_persist_ralph_patch`. This helper:
+
+        1. Queries the latest ``ralph_patches`` row for ``issue_number``.
+        2. If none exists → returns ``None`` (no-op first-attempt path).
+        3. If one exists, writes the patch to
+           ``{worktree}/tmp/dispatcher-input/prior-ralph.patch`` and
+           tries ``git am <patchfile>``.
+        4. On apply success → returns
+           ``{"applied": True, "patch_id": ..., "commit_sha": ..., "bytes": ...}``.
+           Ralph starts with the prior diff already on HEAD and iterates
+           on top.
+        5. On apply failure → runs ``git am --abort`` to restore the
+           clean worktree state, then returns
+           ``{"applied": False, "patch_id": ..., "patch_content": ..., "reason": ...}``
+           so the caller can surface the patch text to ralph via
+           ``prior_attempts.md``.
+
+        A DB lookup failure returns ``None`` — same effect as "no prior
+        patch" — so a transient postgres hiccup never wedges the agent.
+        """
+        assert self._conn is not None, "connect() must run before query"
+
+        # Query the latest patch for this issue (ORDER BY created_at
+        # DESC so if somehow two rows exist, we pick the newest).
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT patch_id, patch_content, commit_sha, agent_id "
+                    "FROM dispatcher.ralph_patches "
+                    "WHERE issue_number = %s "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (issue_number,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception as exc:
+            self._log.exception(
+                "daemon.ralph_patch_query_failed",
+                extra={
+                    "event": "ralph_patch_query_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        if row is None:
+            return None
+
+        prior_patch_id = str(row[0])
+        patch_content = row[1] or ""
+        prior_commit_sha = row[2] or None
+        prior_agent_id = str(row[3]) if row[3] is not None else None
+        if not patch_content.strip():
+            # Defensive — NOT NULL constraint guarantees non-null, but
+            # the content could be an empty-ish blob from a pathological
+            # capture. Treat as "no usable patch".
+            return None
+
+        # Guard: don't try to inherit from *this same* agent. That
+        # shouldn't happen in normal flow (prior SHIP rows belong to a
+        # previous agent id), but tier-1 retry paths re-use agent_id,
+        # and re-applying a patch to a worktree that's already at the
+        # same commit just produces "patch does not apply" noise.
+        if prior_agent_id == agent_id:
+            self._log.info(
+                "daemon.ralph_patch_self_inherit_skipped",
+                extra={
+                    "event": "ralph_patch_self_inherit_skipped",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "patch_id": prior_patch_id,
+                },
+            )
+            return None
+
+        # Write patch to a scratch file under {worktree}/tmp/.
+        input_dir = worktree / "tmp" / "dispatcher-input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        patch_file = input_dir / "prior-ralph.patch"
+        try:
+            patch_file.write_text(patch_content, encoding="utf-8")
+        except OSError as exc:
+            self._log.warning(
+                "daemon.ralph_patch_write_failed",
+                extra={
+                    "event": "ralph_patch_write_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return None
+
+        # Try ``git am <patchfile>``.  --3way gives a better chance of
+        # success when base has moved; without it, any drift produces
+        # an apply failure even for non-overlapping hunks. Keeping
+        # semantics the issue specified, but --3way is the gentler
+        # form that doesn't hurt when base matches.
+        try:
+            am_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "am",
+                    "--3way",
+                    str(patch_file),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "daemon.ralph_patch_am_invocation_failed",
+                extra={
+                    "event": "ralph_patch_am_invocation_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "patch_id": prior_patch_id,
+                    "detail": str(exc),
+                },
+            )
+            # Best-effort abort in case am started but we lost the
+            # process — ignore errors since there may be no in-progress
+            # am to abort.
+            self._git_am_abort(worktree)
+            return {
+                "applied": False,
+                "patch_id": prior_patch_id,
+                "patch_content": patch_content,
+                "reason": f"am invocation failed: {exc}",
+            }
+
+        if am_result.returncode == 0:
+            self._log.info(
+                "daemon.ralph_patch_applied",
+                extra={
+                    "event": "ralph_patch_applied",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "patch_id": prior_patch_id,
+                    "prior_commit_sha": prior_commit_sha,
+                    "patch_bytes": len(patch_content),
+                },
+            )
+            return {
+                "applied": True,
+                "patch_id": prior_patch_id,
+                "commit_sha": prior_commit_sha,
+                "bytes": len(patch_content),
+            }
+
+        # Apply failed — abort cleanly so the worktree is back to
+        # origin/main HEAD before ralph spawns.
+        reason = _stderr_tail(am_result.stderr) or f"exit={am_result.returncode}"
+        self._git_am_abort(worktree)
+        self._log.warning(
+            "daemon.ralph_patch_apply_failed",
+            extra={
+                "event": "ralph_patch_apply_failed",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "patch_id": prior_patch_id,
+                "exit_code": am_result.returncode,
+                "stderr_tail": reason,
+            },
+        )
+        return {
+            "applied": False,
+            "patch_id": prior_patch_id,
+            "patch_content": patch_content,
+            "reason": reason,
+        }
+
+    def _git_am_abort(self, worktree: Path) -> None:
+        """Best-effort ``git am --abort`` to restore a clean worktree.
+
+        Ignores exit codes — the abort is itself allowed to fail
+        (e.g. if there's no in-progress am), and we've already logged
+        the underlying apply failure.
+        """
+        try:
+            subprocess.run(
+                ["git", "-C", str(worktree), "am", "--abort"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:  # pragma: no cover — defensive
+            pass
+
     def _update_agent_phase(self, agent_id: str, phase: str) -> None:
         """UPDATE ``dispatcher.agents.phase`` so the scheduler + admin
         page see where the agent currently sits."""
@@ -6829,6 +7294,63 @@ class DispatcherDaemon:
         (output_dir / "prior_attempts.md").write_text(content, encoding="utf-8")
         return len(attempts)
 
+    def _append_unapplied_patch_to_prior_attempts(
+        self,
+        worktree: Path,
+        patch_info: dict[str, Any],
+    ) -> None:
+        """Append an unapplied prior SHIP'd patch to ``prior_attempts.md``.
+
+        Called from :meth:`_run_ralph_phase` when
+        :meth:`_apply_prior_ralph_patch` returned ``{"applied": False}``.
+        The patch couldn't be ``git am``'d onto the fresh worktree
+        (base drift, conflicts, corrupt patch), but the patch text is
+        still useful — ralph can see the *intended* diff and
+        cherry-pick or re-derive manually.
+
+        Appends (creates if missing) to
+        ``{worktree}/tmp/dispatcher-output/prior_attempts.md`` so the
+        ralph skill's existing prior-attempts surfacing picks it up
+        verbatim. Best-effort — a write failure just means ralph misses
+        the patch context, which is the pre-#3012 status quo.
+        """
+        output_dir = worktree / "tmp" / "dispatcher-output"
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+
+        target = output_dir / "prior_attempts.md"
+        patch_content = patch_info.get("patch_content") or ""
+        patch_id = patch_info.get("patch_id") or "unknown"
+        reason = patch_info.get("reason") or "unknown"
+
+        section = (
+            f"\n\n---\n\n## Prior SHIP'd patch (did NOT apply cleanly)\n\n"
+            f"**Patch id:** {patch_id}\n\n"
+            f"**Apply failure reason:** {reason}\n\n"
+            f"A previous agent SHIP'd this issue but the daemon did not reach "
+            f"``gh pr create`` (crash, deploy, timeout). The patch below was "
+            f"their final diff. ``git am`` could not replay it onto the fresh "
+            f"worktree (base drift, conflicts, etc.), so you are starting from "
+            f"clean origin/main — but you can cherry-pick / re-derive the "
+            f"relevant hunks manually from this text.\n\n"
+            f"```diff\n{patch_content}\n```\n"
+        )
+
+        try:
+            if target.exists():
+                existing = target.read_text(encoding="utf-8")
+                target.write_text(existing + section, encoding="utf-8")
+            else:
+                # No prior_attempts.md yet — write a standalone file
+                # with just the patch section. Strip the leading
+                # newlines + separator so the first-section case looks
+                # clean.
+                target.write_text(section.lstrip("\n-").lstrip(), encoding="utf-8")
+        except OSError:  # pragma: no cover — defensive
+            return
+
     def _run_plan_phase(self, agent_id: str, issue_number: int, worktree: Path) -> bool:
         """Run ``/task-v2-plan``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "planning")
@@ -6988,12 +7510,36 @@ class DispatcherDaemon:
         """Run ``/task-v2-ralph``. Returns True to continue, False to stop."""
         self._update_agent_phase(agent_id, "ralph")
 
+        # ── Prior-SHIP'd patch inheritance (#3012) ─────────────────────────
+        # If a prior agent on this issue SHIPped but never got a PR
+        # created (daemon restart between ralph exit and ``gh pr
+        # create``), the patch is sitting in ``dispatcher.ralph_patches``.
+        # Try to apply it to the fresh worktree so ralph iterates on top
+        # of the inherited diff rather than re-ralph'ing from scratch.
+        #
+        # ``prior_patch_info`` shape:
+        #   None                              — no prior patch (first attempt)
+        #   {"applied": True, ...}            — patch applied; HEAD has the diff
+        #   {"applied": False, "patch_content": ..., "reason": ...}
+        #                                     — apply failed; patch text is
+        #                                       included so _materialize_prior_attempts
+        #                                       can surface it to ralph
+        prior_patch_info = self._apply_prior_ralph_patch(
+            agent_id, issue_number, worktree
+        )
+        # ── end prior-SHIP'd patch inheritance ─────────────────────────────
+
         # ── Prior-attempt context (#2984) ──────────────────────────────────
         # Before seeding the ralph input bundle, materialize prior failed
         # attempts (non-infra-preempted) into prior_attempts.md so the
         # /task-v2-ralph skill can surface them to fresh workers.  The call
         # is a no-op (returns 0, writes no file) on first-attempt spawns.
         prior_attempts_count = self._materialize_prior_attempts(worktree, issue_number)
+        # If a prior SHIP'd patch failed to apply cleanly, append its
+        # text to prior_attempts.md so ralph can see the intended diff
+        # and cherry-pick / re-derive manually.
+        if prior_patch_info is not None and not prior_patch_info.get("applied"):
+            self._append_unapplied_patch_to_prior_attempts(worktree, prior_patch_info)
         self._log.info(
             "daemon.ralph_spawn",
             extra={
@@ -7002,6 +7548,12 @@ class DispatcherDaemon:
                 "agent_id": agent_id,
                 "issue_number": issue_number,
                 "prior_attempts_count": prior_attempts_count,
+                "prior_patch_applied": (
+                    bool(prior_patch_info and prior_patch_info.get("applied"))
+                ),
+                "prior_patch_id": (
+                    prior_patch_info.get("patch_id") if prior_patch_info else None
+                ),
             },
         )
         # ── end prior-attempt context ──────────────────────────────────────
@@ -7140,6 +7692,16 @@ class DispatcherDaemon:
                 issue_number=issue_number,
             )
             return False
+
+        # ── SHIP'd — persist the patch (#3012) ─────────────────────────────
+        # Capture ralph's SHIP'd diff to ``dispatcher.ralph_patches`` so a
+        # daemon restart between here and a successful ``gh pr create``
+        # does not lose the work. Supersedes any prior row for the same
+        # issue (covers retry-after-failure). Returns None on capture /
+        # DB failure; that's non-fatal — the happy path continues and
+        # pre-#3012 behavior resumes (loss on daemon restart).
+        self._capture_and_persist_ralph_patch(agent_id, issue_number, worktree)
+        # ── end SHIP patch persist ─────────────────────────────────────────
 
         self._agent_ralph_output = ralph_output
         return True
@@ -8147,6 +8709,17 @@ class DispatcherDaemon:
                 "is_draft": is_needs_review,
             },
         )
+
+        # ── Cleanup persisted ralph patch (#3012) ──────────────────────────
+        # The branch is now on origin and the PR exists — origin/<branch>
+        # is the durable source and the postgres copy is redundant.
+        # DELETE by agent_id so a racing second claim on the same issue
+        # doesn't clobber a newer agent's patch (rows keyed by the
+        # specific agent that wrote them). Best-effort — the PR is open,
+        # so a delete failure just means the housekeeping sweep will
+        # catch it within 7 days.
+        self._delete_ralph_patches_for_agent(agent_id)
+        # ── end cleanup ────────────────────────────────────────────────────
 
         if is_needs_review:
             # #2856: side-effect — post an issue comment linking the
@@ -13810,6 +14383,17 @@ class DispatcherDaemon:
             "created_at",
             "notification_retention_days",
             DEFAULT_NOTIFICATION_RETENTION_DAYS,
+        ),
+        (
+            # Safety-net only — happy-path cleanup is the DELETE inside
+            # ``_push_and_open_pr`` after a successful ``gh pr create``.
+            # The 7-day TTL catches pathological cases (daemon crash
+            # between SHIP and PR create, operator force-stop) without
+            # keeping large patch blobs indefinitely. Issue #3012.
+            "ralph_patches",
+            "created_at",
+            "ralph_patch_retention_days",
+            DEFAULT_RALPH_PATCH_RETENTION_DAYS,
         ),
     )
 

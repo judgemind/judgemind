@@ -84,6 +84,8 @@ Read `{worktree}/tmp/dispatcher-input/ralph.json`. Required fields:
 
 If the file is missing or malformed, exit 0 with `verdict=BLOCKED, block_reason="input JSON missing or malformed"`.
 
+**Pre-applied prior SHIP'd patch (#3012).** The daemon may have `git am`-applied a prior SHIP'd patch onto your fresh worktree before invoking you, when a previous agent on this issue ran ralph to SHIP but the daemon never reached `gh pr create` (restart, push timeout, crash). If applied cleanly, HEAD already carries the prior agent's `WIP: ralph output` commit — iterate on top of the inherited diff (`git diff origin/main...HEAD`) rather than re-implementing from scratch. If `git am` failed (base drift, conflicts), HEAD is clean origin/main and the patch text appears in `prior_attempts.md` under a `## Prior SHIP'd patch (did NOT apply cleanly)` section so the worker can cherry-pick manually. Transparent from the skill's perspective — no new input field; the worktree and `prior_attempts.md` arrive pre-populated.
+
 ---
 
 ## Output contract

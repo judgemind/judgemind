@@ -664,6 +664,7 @@ class TestHousekeepingTickAllLiveTargets:
             "blocked_snapshots",
             "phase_outputs",
             "notifications",
+            "ralph_patches",
         }
 
         # One DELETE per live target, and each uses the right column.
@@ -678,12 +679,14 @@ class TestHousekeepingTickAllLiveTargets:
             "blocked_snapshots",
             "phase_outputs",
             "notifications",
+            "ralph_patches",
         }
         # Per-target column assertions — matches the migration schema.
         assert "observed_at <" in deletes_by_table["queue_snapshots"][0]
         assert "observed_at <" in deletes_by_table["blocked_snapshots"][0]
         assert "ts <" in deletes_by_table["phase_outputs"][0]
         assert "created_at <" in deletes_by_table["notifications"][0]
+        assert "created_at <" in deletes_by_table["ralph_patches"][0]
 
     def test_per_target_failure_isolation_across_live_targets(
         self, monkeypatch: pytest.MonkeyPatch
