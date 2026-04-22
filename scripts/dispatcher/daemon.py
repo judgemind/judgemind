@@ -294,6 +294,16 @@ PHASE_MAX_TURNS = {
 #: deploy status and poses structured evidence, no complex reasoning.
 #: Retro uses Haiku — a quick review of structured input that produces
 #: structured output; no complex reasoning required.
+#:
+#: .. note::
+#:    Ralph is **attempt-aware** (#2955). The value recorded here is the
+#:    default used by attempts 1..``MAX_RETRY_ATTEMPTS-1``; the final
+#:    budgeted attempt is upgraded to Opus by
+#:    :func:`_ralph_model_for_attempt`, called from
+#:    :meth:`DispatcherDaemon._spawn_phase_subprocess`. The admin UI,
+#:    metering (``phase_outputs.model_used``), and CloudWatch logs all
+#:    surface the *actually-used* model so operators can retroactively
+#:    separate Sonnet-ralph from Opus-ralph runs.
 PHASE_MODELS = {
     "plan": "opus",
     "ralph": "sonnet",
@@ -302,6 +312,35 @@ PHASE_MODELS = {
     "verify": "haiku",
     "retro": "haiku",
 }
+
+
+def _ralph_model_for_attempt(attempt_n: int) -> str:
+    """Return the ``--model`` value for a ralph attempt (#2955).
+
+    ``attempt_n`` is 1-indexed: the first run is attempt 1 and the
+    final budgeted retry is :data:`MAX_RETRY_ATTEMPTS`. On the final
+    attempt the model is upgraded from ``sonnet`` to ``opus`` — if
+    Sonnet has already failed ``MAX_RETRY_ATTEMPTS-1`` times on the
+    same issue, burning the last attempt on the same model yields
+    the same result. Opus on the final attempt gives the queue a
+    real shot at unblocking before the agent is given up on.
+
+    Only ralph is upgraded (plan already uses Opus; summary, fix-ci,
+    verify, and retro keep their static defaults). The "final attempt"
+    calculation counts only budgeted retries — infra-preemption
+    retries preserve ``retries_used`` via
+    :meth:`DispatcherDaemon._process_retry_markers`, so an agent that
+    caught two dispatcher redeploys mid-ralph does not skip straight
+    to Opus on its next real spawn (issue #2936 + #2955).
+
+    Defensive: attempts numerically past :data:`MAX_RETRY_ATTEMPTS`
+    stay on Opus rather than silently downgrading. The 3-attempt cap
+    itself is enforced by :meth:`_create_retry_marker`.
+    """
+    if attempt_n >= MAX_RETRY_ATTEMPTS:
+        return "opus"
+    return PHASE_MODELS["ralph"]
+
 
 #: The three happy-path phases 3A orchestrates, in execution order.
 #: Post-PR phases (``fix_ci``, ``verify``, ``retro``) are 3B-3E scope.
@@ -4434,6 +4473,23 @@ class DispatcherDaemon:
         except (TypeError, ValueError):  # pragma: no cover — defensive
             return 0
 
+    def _model_for_phase(self, phase: str, agent_id: str) -> str:
+        """Return the ``--model`` value to hand to ``claude -p`` for *phase*.
+
+        Most phases use the static :data:`PHASE_MODELS` entry. ``ralph``
+        is attempt-aware (#2955): the final budgeted attempt upgrades
+        to Opus via :func:`_ralph_model_for_attempt`. The 1-indexed
+        attempt number is derived from :meth:`_current_attempt_for`
+        (which returns ``retries_used``, 0-indexed) plus 1.
+
+        Scope: ralph only. Plan is already Opus. Summary / fix-ci /
+        verify / retro keep their static defaults.
+        """
+        if phase == "ralph":
+            attempt_n = self._current_attempt_for(agent_id) + 1
+            return _ralph_model_for_attempt(attempt_n)
+        return PHASE_MODELS[phase]
+
     # ── ralph patch persistence (issue #3012) ──────────────────────────
     #
     # Persist ralph's SHIP'd diff to ``dispatcher.ralph_patches`` so a
@@ -5805,7 +5861,7 @@ class DispatcherDaemon:
         is the correct knob for "start the child process in this directory".
         """
         max_turns = PHASE_MAX_TURNS[phase]
-        model = PHASE_MODELS[phase]
+        model = self._model_for_phase(phase, agent_id)
         log_path = worktree / "tmp" / f"claude-p-{phase}.log"
         stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
         stderr_path = worktree / "tmp" / f"claude-p-{phase}.stderr.log"
