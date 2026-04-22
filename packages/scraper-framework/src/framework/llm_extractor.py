@@ -115,6 +115,25 @@ _RIVERSIDE_CASE_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# San Bernardino case-number pattern.  Covers CIVSB*/CIVRS* prefixes used by
+# San Bernardino (SB) and Rancho Cucamonga (RS) divisions.
+# Spaces inside the case number (e.g. "CIVSB 2600093") are normalised by the
+# scraper before reaching this layer, so the pattern does not need to handle
+# internal whitespace.  See #2565.
+_SB_CASE_NUMBER_RE = re.compile(
+    r"\bCIV(?:SB|RS)\s*\d{5,8}\b",
+    re.IGNORECASE,
+)
+
+# Matches a case_title that is a role-literal placeholder: the LLM emitted the
+# role word ("Plaintiff", "Defendant", "Petitioner", "Respondent") as the party
+# name instead of the real name from the ruling body.  Both singular and plural
+# forms are covered.  See #2565.
+_ROLE_LITERAL_TITLE_RE = re.compile(
+    r"^\s*(?:Plaintiff|Defendant|Petitioner|Respondent)s?\s+v[s]?\.?\s",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # LLM result cache
 # ---------------------------------------------------------------------------
@@ -959,6 +978,165 @@ def _sanitize_riverside_rulings(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: San Bernardino title and ruling_text sanitizers (#2565)
+# ---------------------------------------------------------------------------
+#
+# San Bernardino LLM extractions can produce two contamination patterns:
+#
+# 1. **Concatenated captions**: the LLM fuses adjacent case captions from a
+#    multi-case PDF into one ``extracted_case_title``, e.g.
+#    ``"Smith v. Jones Doe v. Roe"``.  Fixed by the generic
+#    ``_truncate_concatenated_case_titles`` (which already runs on every
+#    county).
+#
+# 2. **Cross-case ruling_text bleed**: the LLM fails to stop at the
+#    horizontal-rule / repeated-header boundary and copies the next case's
+#    content into the current ruling's ``ruling_text``.  Fixed by
+#    ``_truncate_cross_case_ruling_text`` parametrised with the SB regex.
+#
+# 3. **Role-literal titles**: the LLM emits ``"Plaintiff v. Defendant"``
+#    instead of the real party names.  Fixed by
+#    ``_rebuild_title_from_parties`` when ``extracted_parties`` is populated.
+#
+# This is an exact structural parallel of ``_sanitize_riverside_rulings``
+# from #2564.  The two sanitisers are intentionally kept as separate
+# county-scoped wrappers (not merged into a generic helper) to make per-county
+# log markers precise and to keep each county's configuration self-contained.
+
+
+def _rebuild_title_from_parties(
+    title: str | None,
+    parties: list,
+) -> str | None:
+    """Rebuild a role-literal ``case_title`` from ``extracted_parties`` (#2565).
+
+    If *title* matches ``_ROLE_LITERAL_TITLE_RE`` (e.g. ``"Plaintiff v. Defendant"``),
+    attempt to reconstruct ``"<first-plaintiff> v. <first-defendant>"`` from
+    *parties*.  Returns ``None`` when the title does not match the pattern or
+    when the required parties are not available (so the caller can leave the
+    field unchanged or emit a warning).
+
+    Parameters
+    ----------
+    title:
+        The raw ``extracted_case_title`` from the LLM.
+    parties:
+        The ``extracted_parties`` list from the same ruling.  Elements are
+        ``ExtractedParty`` instances (or duck-typed equivalents) with ``name``
+        and ``role`` attributes.
+
+    Returns
+    -------
+    str | None
+        Rebuilt title string, or ``None`` if the pattern does not match or
+        parties are insufficient to rebuild.
+    """
+    if not title or not _ROLE_LITERAL_TITLE_RE.match(title):
+        return None
+
+    # Determine which role pair to look for.  Petitions use petitioner/respondent;
+    # everything else uses plaintiff/defendant.
+    title_lower = title.lower().strip()
+    if title_lower.startswith("petitioner"):
+        plaintiff_roles = {"petitioner"}
+        defendant_roles = {"respondent"}
+    else:
+        plaintiff_roles = {"plaintiff"}
+        defendant_roles = {"defendant"}
+
+    plaintiff_name: str | None = None
+    defendant_name: str | None = None
+    for party in parties:
+        role = getattr(party, "role", None) or ""
+        name = getattr(party, "name", None) or ""
+        if not name:
+            continue
+        if role.lower() in plaintiff_roles and plaintiff_name is None:
+            plaintiff_name = name
+        elif role.lower() in defendant_roles and defendant_name is None:
+            defendant_name = name
+
+    if plaintiff_name and defendant_name:
+        return f"{plaintiff_name} v. {defendant_name}"
+    return None
+
+
+def _sanitize_san_bernardino_rulings(
+    rulings: list[ExtractedRuling],
+    *,
+    case_number_re: re.Pattern,
+) -> list[ExtractedRuling]:
+    """Apply San Bernardino-specific title and ruling_text sanitizers (#2565).
+
+    Applies two deterministic post-processors to every ruling in *rulings*
+    whose ``extracted_case_number`` matches *case_number_re*, making this
+    function a **no-op on non-SB documents**:
+
+    1. :func:`_truncate_cross_case_ruling_text` — truncates ``ruling_text``
+       at the first occurrence of a foreign SB case number.
+    2. :func:`_rebuild_title_from_parties` — when ``extracted_case_title``
+       is a role-literal placeholder (e.g. ``"Plaintiff v. Defendant"``),
+       replaces it with the real party names from ``extracted_parties``.
+
+    Concatenated-caption titles are handled upstream by the generic
+    ``_truncate_concatenated_case_titles`` which already runs on all counties.
+
+    Both sanitizers are pure helpers; this function wires them over the list
+    and emits structured log entries for each change so production can observe
+    the guard's activity.
+
+    This post-processor is idempotent — re-applying it to already-clean
+    rulings is a no-op.
+    """
+    for i, ruling in enumerate(rulings):
+        # Scope to SB case numbers only — skip non-SB rulings entirely.
+        if not ruling.extracted_case_number or not case_number_re.search(
+            ruling.extracted_case_number
+        ):
+            continue
+
+        updates: dict = {}
+
+        # --- Cross-case ruling_text truncation ---
+        original_text = ruling.ruling_text
+        if original_text:
+            clean_text = _truncate_cross_case_ruling_text(
+                original_text,
+                own_case_number=ruling.extracted_case_number,
+                case_number_re=case_number_re,
+            )
+            if clean_text != original_text:
+                foreign_match = case_number_re.search(original_text[len(clean_text) :])
+                foreign_cn = foreign_match.group(0) if foreign_match else "unknown"
+                updates["ruling_text"] = clean_text
+                logger.warning(
+                    "llm_extractor.sb_ruling_text_truncated_at_foreign_case_number",
+                    case_number=ruling.extracted_case_number,
+                    foreign_case_number=foreign_cn,
+                    before_len=len(original_text),
+                    after_len=len(clean_text),
+                )
+
+        # --- Role-literal title rebuild ---
+        original_title = ruling.extracted_case_title
+        if original_title:
+            rebuilt = _rebuild_title_from_parties(original_title, ruling.extracted_parties)
+            if rebuilt is not None:
+                updates["extracted_case_title"] = rebuilt
+                logger.info(
+                    "llm_extractor.sb_title_role_literal_rebuilt",
+                    case_number=ruling.extracted_case_number,
+                    before=original_title,
+                    after=rebuilt,
+                )
+
+        if updates:
+            rulings[i] = ruling.model_copy(update=updates)
+
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: calendar-listing-only detection (#2446)
 # ---------------------------------------------------------------------------
 
@@ -1505,6 +1683,7 @@ def _apply_text_cache_hit_filters(
     rulings = _truncate_concatenated_case_titles(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
     if len(rulings) != original_count:
         logger.info(
             "llm_extractor.cache_hit_filters_dropped",
@@ -1873,6 +2052,12 @@ class LlmExtractor:
         # no-ops on clean rulings and on non-Riverside documents (the
         # cross-case truncator only triggers on CVRI/CVSW/RIC/… tokens).
         rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+
+        # Post-processing: San Bernardino title and ruling_text sanitizers (#2565).
+        # Truncate ruling_text at foreign CIVSB/CIVRS case numbers and rebuild
+        # role-literal titles (e.g. "Plaintiff v. Defendant") from extracted_parties.
+        # No-op on non-SB documents (scoped to CIVSB/CIVRS case numbers).
+        rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
 
         # Write to cache
         if self._cache is not None and rulings:

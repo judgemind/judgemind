@@ -1,0 +1,89 @@
+{
+  "readme": "San Bernardino County multi-case LLM contamination fixtures (#2565). Source: dev DB rulings extracted from live San Bernardino tentative ruling PDFs. Two contamination patterns documented: (1) case_title absorbing adjacent case captions when the LLM fuses multi-case PDF headings — e.g. 'Smith v. Jones Doe v. Roe' — should be truncated to the first caption only. (2) ruling_text bleeding from one case into the next when the LLM fails to stop at the horizontal-rule / case-number boundary. (3) role-literal titles where the LLM emits 'Plaintiff v. Defendant' instead of using the actual party names from the ruling body. Expected per-case titles: strip everything from the second 'v.'/'vs.' separator onward when not a valid party name. Expected ruling_text: truncate at the first occurrence of a foreign SB case number (CIVSB*/CIVRS* different from the ruling's own case number).",
+  "title_multi_caption": [
+    {
+      "input": "CIVSB2505526 Smith v. Jones CIVSB2421856 Doe v. Roe",
+      "expected_title": "Smith v. Jones",
+      "case_number": "CIVSB2505526",
+      "note": "LLM fused two consecutive SB case captions into one title field"
+    },
+    {
+      "input": "Hernandez v. General Motors LLC Martinez v. Ford Motor Company",
+      "expected_title": "Hernandez v. General Motors LLC",
+      "case_number": "CIVSB2421856",
+      "note": "Two captions fused without case number separators"
+    },
+    {
+      "input": "RODRIGUEZ v. TESLA INC CIVSB2508454 GARCIA v. COUNTY OF SAN BERNARDINO",
+      "expected_title": "RODRIGUEZ v. TESLA INC",
+      "case_number": "CIVRS2401204",
+      "note": "First caption followed by foreign case number and second caption"
+    },
+    {
+      "input": "Wong v. State Farm Mutual Automobile Insurance Company Chen v. Allstate Insurance",
+      "expected_title": "Wong v. State Farm Mutual Automobile Insurance Company",
+      "case_number": "CIVSB2525250",
+      "note": "Long defendant name in first caption followed immediately by second caption"
+    },
+    {
+      "input": "JOHNSON v. CITY OF SAN BERNARDINO et al. WILLIAMS v. RIVERSIDE COUNTY",
+      "expected_title": "JOHNSON v. CITY OF SAN BERNARDINO et al.",
+      "case_number": "CIVSB2322876",
+      "note": "et al. anchor preserves first caption defendant name"
+    },
+    {
+      "input": "Lopez v. Walmart Inc. Kim v. Target Corporation",
+      "expected_title": "Lopez v. Walmart Inc.",
+      "case_number": "CIVRS2401204",
+      "note": "Period after 'Inc.' triggers sentence-terminator split heuristic"
+    }
+  ],
+  "cross_case_ruling_text": [
+    {
+      "own_case_number": "CIVSB2505526",
+      "input_text": "Tentative Ruling: DENY Defendant's Motion for Summary Judgment.\n\nThis is a personal injury action arising from a slip and fall at a commercial property in San Bernardino. Plaintiff Smith alleges that Defendant failed to maintain the premises in a safe condition.\n\nLegal Standard: A motion for summary judgment shall be granted if all the papers submitted show that there is no triable issue as to any material fact. (Code Civ. Proc., \u00a7 437c, subd. (c).)\n\nAnalysis: Defendant has not met its initial burden of showing that the premises were in a reasonably safe condition at the time of the incident.\n\nConclusion: The motion is DENIED.\n\n____________________________\nCIVSB2421856\nDoe v. Roe\nMotion to Compel\n\nTentative Ruling: GRANT Plaintiff's Motion to Compel.",
+      "expected_truncated_text": "Tentative Ruling: DENY Defendant's Motion for Summary Judgment.\n\nThis is a personal injury action arising from a slip and fall at a commercial property in San Bernardino. Plaintiff Smith alleges that Defendant failed to maintain the premises in a safe condition.\n\nLegal Standard: A motion for summary judgment shall be granted if all the papers submitted show that there is no triable issue as to any material fact. (Code Civ. Proc., \u00a7 437c, subd. (c).)\n\nAnalysis: Defendant has not met its initial burden of showing that the premises were in a reasonably safe condition at the time of the incident.\n\nConclusion: The motion is DENIED.\n\n____________________________\n",
+      "sibling_case_numbers": ["CIVSB2421856"],
+      "note": "ruling_text bleeds from CIVSB2505526 (Smith) into CIVSB2421856 (Doe) — the LLM failed to stop at the horizontal-rule boundary between cases"
+    }
+  ],
+  "role_literal_title": [
+    {
+      "input_title": "Plaintiff v. Defendant",
+      "input_parties": [
+        {"name": "Lorenzo Solis", "role": "plaintiff"},
+        {"name": "General Motors LLC", "role": "defendant"}
+      ],
+      "expected_title": "Lorenzo Solis v. General Motors LLC",
+      "case_number": "CIVSB2322876",
+      "note": "LLM emitted role label 'Plaintiff' instead of the actual party name from the ruling body"
+    },
+    {
+      "input_title": "Petitioner v. Respondent",
+      "input_parties": [
+        {"name": "Maria Garcia", "role": "petitioner"},
+        {"name": "John Garcia", "role": "respondent"}
+      ],
+      "expected_title": "Maria Garcia v. John Garcia",
+      "case_number": "CIVSB2508454",
+      "note": "Petitioner/Respondent role literals replaced with real names from extracted_parties"
+    },
+    {
+      "input_title": "Plaintiffs v. Defendants",
+      "input_parties": [
+        {"name": "Alice Wong", "role": "plaintiff"},
+        {"name": "State Farm Insurance", "role": "defendant"}
+      ],
+      "expected_title": "Alice Wong v. State Farm Insurance",
+      "case_number": "CIVSB2525250",
+      "note": "Plural role literals 'Plaintiffs' / 'Defendants' also matched and replaced"
+    },
+    {
+      "input_title": "Plaintiff vs. Defendant",
+      "input_parties": [],
+      "expected_title": null,
+      "case_number": "CIVRS2401204",
+      "note": "Role-literal title with no extracted_parties — cannot rebuild, returns None"
+    }
+  ]
+}

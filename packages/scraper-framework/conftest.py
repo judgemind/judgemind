@@ -20,3 +20,35 @@ collect_ignore_glob = [
     "tests/test_reingest_from_s3.py",
     "tests/test_reingest_registry.py",
 ]
+
+
+def pytest_configure(config: object) -> None:
+    """Patch pytest-xdist DSession to tolerate the worker_workerfinished race.
+
+    pytest-xdist 3.8.0 (and earlier) has a race where ``worker_workerfinished``
+    can be called for a node that was already removed from ``_active_nodes``
+    during shutdown.  The stock implementation uses ``set.remove()``, which
+    raises ``KeyError`` and causes an INTERNALERROR exit code even when all
+    tests pass (exit code 3 instead of 0).
+
+    We wrap the method and swallow ``KeyError`` so that the spurious INTERNALERROR
+    never reaches the top-level error handler.
+
+    See: https://github.com/pytest-dev/pytest-xdist/issues/1075
+    """
+    try:
+        from xdist.dsession import DSession  # type: ignore[import-untyped]
+
+        _original = DSession.worker_workerfinished
+
+        def _safe_worker_workerfinished(self: object, node: object) -> None:
+            try:
+                _original(self, node)
+            except KeyError:
+                # Node already removed from _active_nodes — harmless shutdown race.
+                pass
+
+        DSession.worker_workerfinished = _safe_worker_workerfinished  # type: ignore[method-assign]
+    except ImportError:
+        # pytest-xdist not installed; nothing to patch.
+        pass
