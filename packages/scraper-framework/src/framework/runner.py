@@ -227,6 +227,8 @@ def _build_registry() -> list[tuple[str, type, callable]]:
 
     from courts.ca.cc_tentatives import CCTentativeRulingsScraper
     from courts.ca.cc_tentatives import default_config as cc_config
+    from courts.ca.cc_tentatives_portal import CCTentativesPortalScraper
+    from courts.ca.cc_tentatives_portal import default_config as cc_portal_config
     from courts.ca.fresno_tentatives import FresnoTentativeRulingsScraper
     from courts.ca.fresno_tentatives import default_config as fresno_config
     from courts.ca.governor_appointments import GovernorAppointmentsScraper
@@ -267,6 +269,7 @@ def _build_registry() -> list[tuple[str, type, callable]]:
     _REGISTRY.extend(
         [
             ("ca-cc-tentatives", CCTentativeRulingsScraper, cc_config),
+            ("ca-cc-tentatives-portal", CCTentativesPortalScraper, cc_portal_config),
             ("ca-fresno-tentatives-civil", FresnoTentativeRulingsScraper, fresno_config),
             ("ca-governor-appointments", GovernorAppointmentsScraper, gov_appt_config),
             ("ca-la-tentatives-civil", LATentativeRulingsScraper, la_config),
