@@ -37,6 +37,16 @@ This is the harness-limitation path surfaced by the Phase 1 gate smoke test (iss
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, any Task tool call, or any other operation. `/task-v2-ralph` is already a dispatcher-spawned background subprocess — further backgrounding causes completion notifications to surface in the wrong context and loses results.
 
+**IMPORTANT — Heartbeat lines (issue #3017).** Ralph is the long-tail phase where hangs actually happen. Emit distinctive heartbeat tokens to stdout at every major internal boundary so CloudWatch Log Insights can answer "which iteration / reviewer / subprocess was ralph stuck on when the stream went silent?". Run the Bash tool with `echo <TOKEN>` at each boundary:
+
+- `echo ITER_START <n>` at the top of each outer-skill iteration (Step 2 re-entry via the Step 2.5 pre-push gate counts as a new iteration).
+- `echo WORKER_START <n>` immediately before spawning the `/ralph` worker subagent (Step 2 / Step 2.5 re-invocation path).
+- `echo REVIEWER_START gemini-standard` / `echo REVIEWER_START gemini-adversarial` / `echo REVIEWER_START claude` — the inner `/ralph` skill emits these before each reviewer pass. Listed here so grep queries and operators know what to expect.
+- `echo PYTEST_START` before the `bash .githooks/pre-push` invocation in Step 2.5b (the pre-push hook invokes pytest internally; this heartbeat fires once per Step 2.5 attempt).
+- `echo PUSH_START` is not fired by ralph itself — that one lives on the daemon's git-push path, which already has its own structured-log event (`daemon.git_push_started`) and does not go through a subprocess stream. Documented here for symmetry so operators know why they will not see it in the ralph jsonl.
+
+Each `echo` is a single Bash-tool call — the stream-forwarder (`scripts/dispatcher/stream_forwarder.py`) picks it up from subprocess stdout, tags it with `agent_id`, `issue_number`, `phase=ralph`, `stream=stdout`, and mirrors it to `{worktree}/.dispatcher/ralph-<agent_id>.jsonl`. In CloudWatch: `filter @message like /ITER_START/` returns N lines per ralph run matching `iterations_used` from `phase_succeeded`.
+
 **IMPORTANT — Subagent isolation.** The context-budget analysis in spike 0.3 (`docs/investigations/dispatcher-v2-spike-0.3.md`) shows `/task-v2-ralph` stays inside the 200k-token window ONLY if each worker + each reviewer runs as a fresh-context subagent (Task tool). Inline workers break this guarantee. Do not inline.
 
 **Implementation choice (per issue #2732):** This skill invokes the existing `/ralph` skill as its inner loop. `/ralph` already implements the worker + three-reviewer cycle with fresh-context Task-tool subagents and per-iteration state files under `{worktree}/tmp/ralph/`. `/task-v2-ralph` is the thin outer wrapper that (a) seeds `task.md` from `plan.json`, (b) invokes `/ralph`, (c) runs the local pre-push gate (Step 2.5), (d) parses `{worktree}/tmp/ralph/ralph-done.txt` into the output JSON. Keeps the implementation in one place and ensures parity with the current `/task` workflow's ralph behavior.

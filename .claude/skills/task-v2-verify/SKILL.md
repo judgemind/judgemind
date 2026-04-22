@@ -15,6 +15,13 @@ Verify phase for the dispatcher v2 per-phase task pipeline (`docs/specs/dispatch
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation.
 
+**IMPORTANT — Heartbeat lines (issue #3017).** Emit two distinctive heartbeat lines to stdout so CloudWatch Log Insights can answer "what was the last thing the skill did before its stream went silent?" during a hang. Run the Bash tool with:
+
+- `echo PHASE_START verify` immediately after reading this SKILL.md (before Step 1).
+- `echo PHASE_DONE <verdict>` right before writing the output JSON (Step N — the last step), where `<verdict>` matches the verdict/go field the output JSON will carry.
+
+These are plain `echo` statements — the dispatcher daemon's stream-forwarder (`scripts/dispatcher/stream_forwarder.py`) picks them up from subprocess stdout and tags them with `agent_id`, `issue_number`, `phase=verify`, `stream=stdout` in CloudWatch + a real-time JSONL mirror at `{worktree}/.dispatcher/verify-<agent_id>.jsonl`. The grep-friendly `PHASE_START` / `PHASE_DONE` tokens make it trivial to filter phase boundaries: `filter @message like /PHASE_START/`.
+
 **IMPORTANT — Never deploy to production.** Verification runs against dev only. Production deploys are human-only per `CLAUDE.md`.
 
 **IMPORTANT — Post the comment? No.** The daemon posts the comment after reading this skill's output. This skill does not call `gh issue comment` — it only produces the markdown.

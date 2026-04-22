@@ -84,6 +84,26 @@ if TYPE_CHECKING:  # pragma: no cover — types only
     from psycopg import Connection
 
 
+# The stream forwarder lives in a sibling module so tests can exercise
+# it without pulling in the daemon's DB + GitHub dependencies. See
+# ``scripts/dispatcher/stream_forwarder.py`` + issue #3017. Imported at
+# module scope so monkeypatching
+# (``dispatcher.daemon.stream_subprocess_output_async``) in tests is
+# straightforward.
+#
+# Uses a relative import so the module works under both import styles:
+# ``python -m scripts.dispatcher.daemon`` (Fargate production) AND
+# ``from dispatcher import daemon`` after tests put ``scripts/`` on
+# ``sys.path``. Both invocations load daemon.py as part of a
+# ``dispatcher`` package, so ``from .stream_forwarder import ...``
+# resolves in both. A hard-coded absolute import would require a
+# try/except fallback that the
+# ``scripts/check-dispatcher-image-deps.py`` CI guard flags as a
+# missing pip dep (the fallback top-level ``dispatcher`` is not a pip
+# package — it is a sibling module).
+from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
+
+
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
@@ -5797,18 +5817,34 @@ class DispatcherDaemon:
           keep working unchanged, and operators can still ``cat``,
           ``tail``, or ``grep`` a single file during incident triage.
 
+        **Real-time stream forwarding (#3017).** Each line of child
+        stdout+stderr is also forwarded to :data:`self._log` (tagged
+        ``agent_id``, ``issue_number``, ``phase``, ``stream``,
+        ``raw_message``) and mirrored into
+        ``{worktree}/.dispatcher/{phase}-{agent_id}.jsonl`` in real time
+        by :func:`stream_subprocess_output_async`. This lets operators
+        see a ralph hang's last tool call in CloudWatch or via
+        ``tail -f`` on the JSONL file — the pre-#3017 code called
+        :func:`subprocess.run` which buffered all output until exit, so
+        a stuck subprocess produced no breadcrumbs at all. The
+        tee-to-file behaviour of the forwarder keeps the pre-#3017
+        capture files intact, so metering (:meth:`_parse_phase_usage`)
+        and triage helpers continue to work unchanged.
+
         The worktree is passed as the subprocess's CWD via
-        ``subprocess.run(..., cwd=...)`` — NOT as a ``--cwd`` flag. The
-        ``claude`` CLI does not accept a ``--cwd`` flag; passing one
+        :class:`subprocess.Popen` ``cwd=`` — NOT as a ``--cwd`` flag.
+        The ``claude`` CLI does not accept a ``--cwd`` flag; passing one
         makes every phase subprocess exit 1 within 400ms with
-        ``error: unknown option '--cwd'`` (#2821). Python's stdlib ``cwd=``
-        is the correct knob for "start the child process in this directory".
+        ``error: unknown option '--cwd'`` (#2821). Python's stdlib
+        ``cwd=`` is the correct knob for "start the child process in
+        this directory".
         """
         max_turns = PHASE_MAX_TURNS[phase]
         model = PHASE_MODELS[phase]
         log_path = worktree / "tmp" / f"claude-p-{phase}.log"
         stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
         stderr_path = worktree / "tmp" / f"claude-p-{phase}.stderr.log"
+        jsonl_path = worktree / ".dispatcher" / f"{phase}-{agent_id}.jsonl"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -5837,12 +5873,14 @@ class DispatcherDaemon:
         ]
 
         start = time.monotonic()
+        issue_number = self._agent_issue_number(agent_id)
         self._log.info(
             "daemon.phase_started",
             extra={
                 "event": "phase_started",
                 "run_id": self._run_id,
                 "agent_id": agent_id,
+                "issue_number": issue_number,
                 "phase": phase,
                 "model": model,
                 "max_turns": max_turns,
@@ -5850,20 +5888,54 @@ class DispatcherDaemon:
             },
         )
 
+        proc: subprocess.Popen[str] | None = None
+        returncode = -1
         try:
             with (
                 stdout_path.open("w", encoding="utf-8") as stdout_file,
                 stderr_path.open("w", encoding="utf-8") as stderr_file,
             ):
-                result = subprocess.run(
+                # ``bufsize=1`` (line-buffered) + ``text=True`` is what
+                # makes the forwarder see lines as they arrive rather
+                # than in 8KB chunks. Without these, a slow child (long
+                # tool call) would appear silent in CloudWatch for
+                # seconds-to-minutes at a time — defeating the point of
+                # #3017. See the docstring of
+                # :func:`stream_subprocess_output_async`.
+                proc = subprocess.Popen(  # noqa: S603 — cmd is a literal list of trusted strings
                     cmd,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS,
-                    check=False,
+                    bufsize=1,
                     cwd=str(worktree),
                 )
+                threads = stream_subprocess_output_async(
+                    proc,
+                    agent_id=agent_id,
+                    issue_number=issue_number,
+                    phase=phase,
+                    logger=self._log,
+                    jsonl_path=jsonl_path,
+                    stdout_sink=stdout_file,
+                    stderr_sink=stderr_file,
+                )
+                try:
+                    returncode = proc.wait(timeout=CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    # Kill the child so the reader threads receive EOF
+                    # and can join. Then re-raise so the caller's
+                    # existing ``TimeoutExpired`` handler fires.
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=10)
+                    except (
+                        subprocess.TimeoutExpired
+                    ):  # pragma: no cover — SIGKILL should always succeed
+                        pass
+                    threads.join(timeout=10)
+                    raise
+                threads.join(timeout=10)
             duration = time.monotonic() - start
         finally:
             # Always compose the combined ``.log`` view, even on timeout /
@@ -5874,7 +5946,40 @@ class DispatcherDaemon:
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
             )
-        return result.returncode, duration
+        return returncode, duration
+
+    def _agent_issue_number(self, agent_id: str) -> int | None:
+        """Best-effort lookup of ``dispatcher.agents.issue_number`` by agent id.
+
+        Returns ``None`` if the row is missing, the column is NULL, or
+        the DB call fails. The forwarder accepts ``None`` — the
+        structured-log ``issue_number`` field is simply serialized as
+        JSON null so CloudWatch Log Insights can still filter by
+        ``agent_id`` + ``phase``. Issue #3017.
+        """
+        conn = self._conn
+        if conn is None:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT issue_number FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        except Exception:  # pragma: no cover — defensive
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None or row[0] is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):  # pragma: no cover — defensive
+            return None
 
     @staticmethod
     def _compose_phase_log(
@@ -13387,8 +13492,22 @@ class DispatcherDaemon:
 
         Returns ``(exit_code, stderr_tail)``. ``exit_code=None`` means
         the subprocess timed out or could not be launched. Isolated
-        here so tests can monkeypatch ``subprocess.run`` without
+        here so tests can monkeypatch ``subprocess.Popen`` without
         touching the surrounding DB-write logic.
+
+        **Real-time stream forwarding (#3017).** Like
+        :meth:`_spawn_phase_subprocess`, every stdout/stderr line from
+        the diagnoser is structured-logged and mirrored to
+        ``{repo_root}/tmp/.dispatcher/diagnose-<diagnosis_id>.jsonl`` so
+        a malformed-JSON diagnoser recommendation (see
+        ``recommendation_missing_or_malformed_json`` in
+        :meth:`_consume_diagnosis`) has a triageable trail. ``agent_id``
+        is logged as ``f"diagnose-{diagnosis_id}"`` so CloudWatch Log
+        Insights can group diagnoser output alongside the failed agent
+        it was diagnosing.
+
+        The diagnoser runs at the repo root (no per-agent worktree) so
+        the JSONL mirror goes under ``{repo_root}/tmp/.dispatcher/``.
         """
         cmd = [
             "claude",
@@ -13407,28 +13526,63 @@ class DispatcherDaemon:
             # would block. See issue #2982.
             "--dangerously-skip-permissions",
         ]
+
+        repo_root = Path.cwd()
+        jsonl_path = (
+            repo_root / "tmp" / ".dispatcher" / f"diagnose-{diagnosis_id}.jsonl"
+        )
+        stderr_buf: list[str] = []
+        stdout_buf: list[str] = []
+
+        class _ListSink:
+            """File-like sink that appends each write to ``buf``."""
+
+            def __init__(self, buf: list[str]) -> None:
+                self._buf = buf
+
+            def write(self, data: str) -> int:
+                self._buf.append(data)
+                return len(data)
+
+            def flush(self) -> None:
+                return None
+
         try:
-            result = subprocess.run(
+            proc: subprocess.Popen[str] = subprocess.Popen(  # noqa: S603 — literal trusted cmd
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
+                bufsize=1,
             )
-        except subprocess.TimeoutExpired as exc:
-            tail = ""
-            if exc.stderr:
-                tail = (
-                    exc.stderr.decode("utf-8", errors="replace")
-                    if isinstance(exc.stderr, bytes)
-                    else str(exc.stderr)
-                )[-500:]
-            return None, tail
         except FileNotFoundError:
             return None, "claude binary not found"
 
-        stderr_tail = (result.stderr or "")[-500:]
-        return result.returncode, stderr_tail
+        threads = stream_subprocess_output_async(
+            proc,
+            agent_id=f"diagnose-{diagnosis_id}",
+            issue_number=None,
+            phase="diagnose",
+            logger=self._log,
+            jsonl_path=jsonl_path,
+            stdout_sink=_ListSink(stdout_buf),
+            stderr_sink=_ListSink(stderr_buf),
+        )
+        try:
+            returncode = proc.wait(timeout=DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                pass
+            threads.join(timeout=10)
+            tail = ("".join(stderr_buf))[-500:]
+            return None, tail
+
+        threads.join(timeout=10)
+        stderr_tail = ("".join(stderr_buf))[-500:]
+        return returncode, stderr_tail
 
     def _read_recommendation(self, diagnosis_id: int) -> dict[str, Any] | None:
         """Read ``dispatcher.diagnoses.recommendation`` for the given row.

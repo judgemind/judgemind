@@ -15,6 +15,13 @@ Summary phase for the dispatcher v2 per-phase task pipeline (`docs/specs/dispatc
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation. This subprocess is already a dispatcher-spawned background task.
 
+**IMPORTANT — Heartbeat lines (issue #3017).** Emit two distinctive heartbeat lines to stdout so CloudWatch Log Insights can answer "what was the last thing the skill did before its stream went silent?" during a hang. Run the Bash tool with:
+
+- `echo PHASE_START summary` immediately after reading this SKILL.md (before Step 1).
+- `echo PHASE_DONE <verdict>` right before writing the output JSON (Step N — the last step), where `<verdict>` matches the verdict/go field the output JSON will carry.
+
+These are plain `echo` statements — the dispatcher daemon's stream-forwarder (`scripts/dispatcher/stream_forwarder.py`) picks them up from subprocess stdout and tags them with `agent_id`, `issue_number`, `phase=summary`, `stream=stdout` in CloudWatch + a real-time JSONL mirror at `{worktree}/.dispatcher/summary-<agent_id>.jsonl`. The grep-friendly `PHASE_START` / `PHASE_DONE` tokens make it trivial to filter phase boundaries: `filter @message like /PHASE_START/`.
+
 **IMPORTANT — No side effects.** This phase does not modify code, does not commit, does not push, does not comment on GitHub. The only write is the output JSON at `{worktree}/tmp/dispatcher-output/summary.json`.
 
 ---

@@ -68,6 +68,7 @@ sys.modules["psycopg"] = _psycopg_stub
 import psycopg  # noqa: E402  — re-import after stub install
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._popen_fake import make_popen_factory  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -1193,15 +1194,11 @@ class TestSpawnPhaseSubprocess:
 
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
             captured["cmd"] = cmd
-            captured["timeout"] = kwargs.get("timeout")
             captured["cwd"] = kwargs.get("cwd")
-            r = MagicMock()
-            r.returncode = 0
-            return r
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
 
         exit_code, duration = d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
         assert exit_code == 0
@@ -1210,14 +1207,13 @@ class TestSpawnPhaseSubprocess:
         assert "-p" in captured["cmd"]
         assert "/task-v2-plan agent-uuid" in captured["cmd"]
         # --cwd is NOT a claude CLI flag; the worktree goes through
-        # subprocess.run's cwd= kwarg instead (#2821).
+        # subprocess.Popen's cwd= kwarg instead (#2821).
         assert "--cwd" not in captured["cmd"]
         assert captured["cwd"] == str(tmp_path)
         assert "--max-turns" in captured["cmd"]
         assert "500" in captured["cmd"]  # plan — 10× bumped in #2885
         assert "--model" in captured["cmd"]
         assert "opus" in captured["cmd"]
-        assert captured["timeout"] == 180 * 60
         assert handler.events("phase_started") != []
         log_path = tmp_path / "tmp" / "claude-p-plan.log"
         assert log_path.exists()
@@ -1229,13 +1225,10 @@ class TestSpawnPhaseSubprocess:
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        def on_start(cmd: list[str], _kwargs: dict[str, Any]) -> None:
             captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
         assert "5000" in captured["cmd"]
         assert "sonnet" in captured["cmd"]
@@ -1247,13 +1240,10 @@ class TestSpawnPhaseSubprocess:
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        def on_start(cmd: list[str], _kwargs: dict[str, Any]) -> None:
             captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
         d._spawn_phase_subprocess("summary", tmp_path, "agent-uuid")
         assert "300" in captured["cmd"]
         assert "haiku" in captured["cmd"]
@@ -1274,13 +1264,14 @@ class TestSpawnPhaseSubprocess:
         for phase in ("plan", "ralph", "summary", "verify", "fix-ci", "retro"):
             captured: dict[str, Any] = {}
 
-            def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-                captured["cmd"] = cmd
-                r = MagicMock()
-                r.returncode = 0
-                return r
+            def on_start(
+                cmd: list[str], _kwargs: dict[str, Any], _c: dict[str, Any] = captured
+            ) -> None:
+                _c["cmd"] = cmd
 
-            monkeypatch.setattr(subprocess, "run", fake_run)
+            monkeypatch.setattr(
+                subprocess, "Popen", make_popen_factory(on_start=on_start)
+            )
             d._spawn_phase_subprocess(phase, tmp_path, f"agent-{phase}")
             assert "--dangerously-skip-permissions" in captured["cmd"], (
                 f"phase={phase} cmd missing --dangerously-skip-permissions: {captured['cmd']}"

@@ -39,6 +39,8 @@ _TASK_V2_SUMMARY_SKILL = (
 _TASK_V2_VERIFY_SKILL = (
     _REPO_ROOT / ".claude" / "skills" / "task-v2-verify" / "SKILL.md"
 )
+_TASK_V2_PLAN_SKILL = _REPO_ROOT / ".claude" / "skills" / "task-v2-plan" / "SKILL.md"
+_TASK_V2_RETRO_SKILL = _REPO_ROOT / ".claude" / "skills" / "task-v2-retro" / "SKILL.md"
 _DIAGNOSE_FAILURE_SKILL = (
     _REPO_ROOT / ".claude" / "skills" / "diagnose-failure" / "SKILL.md"
 )
@@ -351,3 +353,92 @@ class TestDiagnoseFailureContracts:
             "diagnose-failure/SKILL.md must document the wholesale-replace "
             "requirement for new_scope (issue #3010)"
         )
+
+
+# ------------------------------------------------------------------
+# Issue #3017 — Per-skill heartbeat lines contract coverage.
+# ------------------------------------------------------------------
+
+
+class TestTaskV2SimpleSkillHeartbeats:
+    """plan / summary / verify / retro each emit PHASE_START / PHASE_DONE
+    heartbeat tokens to stdout so CloudWatch Log Insights can answer
+    "what was the last thing the skill did before going silent?" during
+    a hang (issue #3017)."""
+
+    def test_plan_emits_phase_start_and_phase_done(self) -> None:
+        content = _read(_TASK_V2_PLAN_SKILL)
+        assert "PHASE_START plan" in content, (
+            "task-v2-plan/SKILL.md must document the PHASE_START plan heartbeat "
+            "(issue #3017)"
+        )
+        assert "PHASE_DONE" in content, (
+            "task-v2-plan/SKILL.md must document the PHASE_DONE heartbeat (issue #3017)"
+        )
+        assert "#3017" in content
+
+    def test_summary_emits_phase_start_and_phase_done(self) -> None:
+        content = _read(_TASK_V2_SUMMARY_SKILL)
+        assert "PHASE_START summary" in content, (
+            "task-v2-summary/SKILL.md must document the PHASE_START summary "
+            "heartbeat (issue #3017)"
+        )
+        assert "PHASE_DONE" in content
+        assert "#3017" in content
+
+    def test_verify_emits_phase_start_and_phase_done(self) -> None:
+        content = _read(_TASK_V2_VERIFY_SKILL)
+        assert "PHASE_START verify" in content
+        assert "PHASE_DONE" in content
+        assert "#3017" in content
+
+    def test_retro_emits_phase_start_and_phase_done(self) -> None:
+        content = _read(_TASK_V2_RETRO_SKILL)
+        assert "PHASE_START retro" in content
+        assert "PHASE_DONE" in content
+        assert "#3017" in content
+
+
+class TestTaskV2RalphHeartbeats:
+    """Ralph is the long-tail phase where hangs actually happen. It
+    emits a richer set of heartbeats: ITER_START, WORKER_START,
+    REVIEWER_START, PYTEST_START, PUSH_START (issue #3017)."""
+
+    def test_ralph_emits_iter_start(self) -> None:
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "ITER_START" in content, (
+            "task-v2-ralph/SKILL.md must document the ITER_START heartbeat "
+            "(issue #3017)"
+        )
+
+    def test_ralph_emits_worker_start(self) -> None:
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "WORKER_START" in content
+
+    def test_ralph_emits_reviewer_start(self) -> None:
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "REVIEWER_START" in content
+
+    def test_ralph_emits_pytest_start(self) -> None:
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "PYTEST_START" in content
+
+    def test_ralph_documents_push_start(self) -> None:
+        """PUSH_START is documented in ralph even though it fires on
+        the daemon side — operators reading the ralph jsonl need to know
+        what to expect and what NOT to expect."""
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "PUSH_START" in content
+
+    def test_ralph_references_issue_3017(self) -> None:
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "#3017" in content, (
+            "task-v2-ralph/SKILL.md must reference issue #3017 in the "
+            "heartbeat section for traceability"
+        )
+
+    def test_ralph_references_stream_forwarder(self) -> None:
+        """The heartbeat section must name the stream-forwarder module
+        so operators know where CloudWatch tagging happens."""
+        content = _read(_TASK_V2_RALPH_SKILL)
+        assert "stream_forwarder.py" in content or "stream-forwarder" in content
