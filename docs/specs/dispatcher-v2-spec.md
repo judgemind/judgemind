@@ -128,19 +128,20 @@ The scheduler drives a per-phase state machine for each active agent. Each tick:
 5. **Advance per-agent state machines.** For each active agent, determine the next phase based on `dispatcher.agents.phase` and spawn the corresponding subprocess. Phase map (see §6a for skill definitions):
 
    ```
-   (new)           → claim        [mechanical]
-   claim           → planning     [claude -p /task-v2-plan]
-   planning        → setup        [mechanical: install deps]
-   setup           → ralph        [claude -p /task-v2-ralph]
-   ralph           → summary      [claude -p /task-v2-summary]
-   summary         → push_and_pr  [mechanical: git + gh pr create]
-   push_and_pr     → ci_watch     [mechanical: gh run watch]
-   ci_watch:green  → merge        [mechanical: gh pr merge]
-   ci_watch:red    → ci_fix       [claude -p /task-v2-fix-ci]
-   merge           → deploy_watch [mechanical: gh run watch on deploy wf]
-   deploy_watch    → verify       [claude -p /task-v2-verify]
-   verify          → retro        [claude -p /task-v2-retro]
-   retro           → done         [mechanical: cleanup]
+   (new)                    → claim        [mechanical]
+   claim                    → planning     [claude -p /task-v2-plan]
+   planning                 → setup        [mechanical: install deps]
+   setup                    → ralph        [claude -p /task-v2-ralph]
+   ralph:ship               → summary      [claude -p /task-v2-summary]
+   ralph:ac_infeasible      → diagnose     [claude -p /diagnose-failure; §8]
+   summary                  → push_and_pr  [mechanical: git + gh pr create]
+   push_and_pr              → ci_watch     [mechanical: gh run watch]
+   ci_watch:green           → merge        [mechanical: gh pr merge]
+   ci_watch:red             → ci_fix       [claude -p /task-v2-fix-ci]
+   merge                    → deploy_watch [mechanical: gh run watch on deploy wf]
+   deploy_watch             → verify       [claude -p /task-v2-verify]
+   verify                   → retro        [claude -p /task-v2-retro]
+   retro                    → done         [mechanical: cleanup]
    ```
 
 6. **Spawn subprocess for current phase.** For agents whose phase calls for an LLM: build the input bundle from `dispatcher.*` + git state, write to `{worktree}/tmp/dispatcher-input/<phase>.json`, spawn `claude -p '/task-v2-<phase> <agent_id>'` with `--max-turns 500` and the subprocess-wide 180-min timeout. Each phase reads the input JSON and writes `{worktree}/tmp/dispatcher-output/<phase>.json`, which the daemon parses and persists to `dispatcher.phase_outputs` before advancing `dispatcher.agents.phase`.
@@ -156,7 +157,7 @@ New skills in .claude/skills/task-v2-\*/SKILL.md, each narrowly scoped to one ph
 | Skill | Input | Output | Typical context budget |
 |---|---|---|---|
 | `/task-v2-plan` | issue #N, issue body+comments | plan text, scope-check findings, go/no-go signal | ~10 min |
-| `/task-v2-ralph`[^ralph-subagent][^ralph-runs-every-type] | plan from above, worktree path | SHIP verdict + implementation diff in git | ~45-90 min (multi-invocation internally, same as today) |
+| `/task-v2-ralph`[^ralph-subagent][^ralph-runs-every-type][^ralph-ac-infeasible] | plan from above, worktree path | SHIP verdict + implementation diff in git, OR `AC_INFEASIBLE` verdict with `infeasible_acs` array (see footnote) | ~45-90 min (multi-invocation internally, same as today) |
 | `/task-v2-summary` | issue body + git diff | process-summary comment (AC mapping), commit message, PR body | ~10 min |
 | `/task-v2-fix-ci` | PR #N, CI failure logs | patch + commit message, OR explicit "give up — blocker" signal | ~15-30 min |
 | `/task-v2-verify` | PR #N, deploy status, AC list | verification evidence comment with per-criterion proof | ~10-15 min |
@@ -165,6 +166,8 @@ New skills in .claude/skills/task-v2-\*/SKILL.md, each narrowly scoped to one ph
 [^ralph-subagent]: **Context-budget assumption:** The outer `/task-v2-ralph` process must keep its context bounded by spawning each worker + reviewer as a fresh-context subagent (Task tool or equivalent). If the Phase 1 implementation runs workers+reviewers inline, peak context balloons to 150-200k+ and a sub-split into `/task-v2-ralph-worker` + `/task-v2-ralph-review` becomes mandatory. See spike 0.3 findings (#2685, `docs/investigations/dispatcher-v2-spike-0.3.md`).
 
 [^ralph-runs-every-type]: **Ralph runs for every `change_type` (#2845, supersedes #2767).** The daemon routes every agent through `plan → ralph → summary` regardless of the plan output's `change_type`. Plan is read-only by contract (`.claude/skills/task-v2-plan/SKILL.md` line 18: "This phase is read-only against the repo and GitHub. Do not edit code"), so for non-testable change types — `docs`, `db_migration`, `dx_tooling`, `no_deployed_component` — ralph is still the phase that produces the committed diff. #2767 (Option B) tried to skip ralph for these types and emit `SHIP, iterations_used=0, changed_files=[]`; because plan was not in fact producing a diff, the resulting agents all shipped empty worktrees and failed the summary AC-gate (see #2832 / #2831 / #2712 on 2026-04-19 for three consecutive cap=1 failures). #2845 removes the short-circuit entirely. The inner `/ralph` skill now reads `## Testable` from `task.md` and branches: testable types run the full TDD + 3-reviewer loop; non-testable types skip TDD / diff-coverage / Gemini passes and run a single Claude reviewer. See `.claude/skills/task-v2-ralph/SKILL.md` §"Design decision" and `.claude/skills/ralph/SKILL.md` §"Change-type-aware behavior".
+
+[^ralph-ac-infeasible]: **`AC_INFEASIBLE` verdict and the `infeasible_acs` array.** Ralph's verdict enum is `SHIP | AC_INFEASIBLE`. The non-SHIP verdict exists for the case where ralph's worker+reviewer loop determines that one or more acceptance criteria cannot be satisfied as written — typical triggers are references to a non-existent symbol (a CLI flag that isn't in the codebase), self-contradictions between two ACs, or scope that exceeds the issue (the AC demands work the issue's other ACs assume is already done). Rather than grinding iterations toward a target it cannot hit or quietly ignoring the AC, ralph emits `verdict: "AC_INFEASIBLE"` with `infeasible_acs: [{index: N, evidence: "<what I looked for and why it's not here>"}]`. An array lets ralph flag multiple ACs in one pass — a single root cause (e.g. two ACs both referencing the same non-existent flag) shouldn't force a sequential re-plan per AC. The daemon detects this in post-exit parse (§8 `ralph_ac_infeasible` row) and routes through the existing diagnoser (Tier 3), whose `reissue` action rewrites the offending AC(s) and triggers a fresh plan→ralph, `escalate` flags for human, and `close` marks the issue `status/invalid`. AI-authored ACs (from retros, audits, spotchecks) are increasingly common and bring the same failure modes as any context-limited author — the pipeline must be robust against its own upstream mistakes.
 
 **Per-phase context budget — measured in spike 0.3.** Analytical measurement (chars/3.5 heuristic + bounded tool-call estimates) against fixtures from #2513 (the 108-min long-tail candidate) + PR #2534 showed all six phases land comfortably inside the 200k-token window with 4×+ headroom. Peak was `/task-v2-fix-ci` at ~42k tokens (~21% of window); `/task-v2-ralph` stays bounded at ~39k (~20%) specifically because its worker+reviewer subagents run in fresh contexts (see the footnote on the ralph row). No sub-split is required. Spike 0.3 scheduled a follow-up empirical re-measurement on Fargate against production skills (#2714). See `docs/investigations/dispatcher-v2-spike-0.3.md`.
 
@@ -266,6 +269,7 @@ Model selection at the CLI: Claude uses `--model <alias\|id>` (aliases `opus`/`s
 | `no_commit_on_exit` | 2 | SubagentStop hook | Fix: retry once in a fresh worktree (covers interrupted-mid-work cases) |
 | `no_push_on_exit` | 2 | SubagentStop hook | Fix: daemon pushes the branch itself and opens PR if missing (no agent retry needed — daemon finishes the last step) |
 | `ralph_max_iterations` | 2 | Post-exit parse of `{worktree}/tmp/ralph/ralph-done.txt` | Fix: one more retry with hint `ralph hit max iterations on attempt N — check test flakes or consider narrower scope` |
+| `ralph_ac_infeasible` | 3 | Post-exit parse of ralph output's `infeasible_acs` array | Ralph flagged one or more ACs as infeasible — diagnose immediately (no mechanical retry fixes a malformed AC). |
 | `ci_red_after_retries` | 3 | Scheduler | PR has failing CI and `dispatcher.agents.retries_used >= 3` — diagnose immediately |
 
 **Escalation:** 3 failures on the same issue in 24h → add `status/needs-human` + `priority/p1` (no p0 — human-only), post comment with the full taxonomy history, fire Telegram with the issue URL. Daemon moves on. (For Tier 2/3 failures, the diagnoser may escalate sooner; see below.)
@@ -280,7 +284,7 @@ Rationale: the operator is not continuously available. Escalating straight to hu
 
 **Flow:**
 
-1. Daemon writes a `dispatcher.diagnoses` row with `status='pending'` and a context bundle (agent_id, failure_id, issue number + body, recent `phase_transitions`, `ralph-done.txt` if present, PR URL, CI log URL, prior failures on the same issue, plus `prior_mechanical_fix` for Tier 2).
+1. Daemon writes a `dispatcher.diagnoses` row with `status='pending'` and a context bundle (agent_id, failure_id, issue number + body, recent `phase_transitions`, `ralph-done.txt` if present, PR URL, CI log URL, prior failures on the same issue, plus `prior_mechanical_fix` for Tier 2). For `ralph_ac_infeasible`, the bundle also carries the `infeasible_acs` array from the failure's `details` JSON so the diagnoser can see which specific ACs ralph flagged and the evidence it gathered.
 2. Daemon spawns `claude -p /diagnose-failure <diagnosis_id>` — a new one-shot skill, ~5-min wall-clock budget.
 3. Skill reads the context, investigates as needed (the transcript, issue thread, CI logs), writes a structured JSON to `dispatcher.diagnoses.recommendation`:
    ```json
@@ -288,7 +292,7 @@ Rationale: the operator is not continuously available. Escalating straight to hu
      "action": "retry" | "retry_with_hint" | "reissue" | "escalate" | "close",
      "reasoning": "<one paragraph>",
      "hint": "<optional: comment text to post on the issue before retry>",
-     "new_scope": "<optional: rewritten acceptance criteria if action='reissue'>"
+     "new_scope": "<optional: rewritten issue body if action='reissue'>"
    }
    ```
 4. Daemon consumes the recommendation deterministically:
