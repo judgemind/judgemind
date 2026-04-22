@@ -11,7 +11,17 @@ docker compose up -d postgres redis    # minimum for local work
 docker compose up -d                   # full stack
 ```
 
-**Local database:** `postgres://judgemind:localdev@localhost:5432/judgemind`
+**Local databases (two, managed by docker-compose):**
+
+| Database | URL | Used by |
+|---|---|---|
+| `judgemind` (operational) | `postgres://judgemind:localdev@localhost:5432/judgemind` | `DATABASE_URL` — local API, scripts, `/spotcheck`, `/audit` |
+| `judgemind_test` (test-only) | `postgres://judgemind:localdev@localhost:5432/judgemind_test` | `TEST_DATABASE_URL` — integration tests in `packages/api/tests/*.integration.test.ts` |
+
+Both databases are created on first `docker compose up` (the second via
+`packages/api/src/data-access/init-test-db.sh`). The split keeps integration
+tests from migrating or mutating the operational database — see #3006 for
+the incident that motivated it.
 
 ## Schema management
 
@@ -56,7 +66,8 @@ This rebuilds the entire database from archived S3 content: seeds courts from S3
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `DATABASE_URL` | Postgres connection | (required) |
+| `DATABASE_URL` | Operational Postgres connection (API, scripts) | (required) |
+| `TEST_DATABASE_URL` | Integration-test Postgres connection. Must point at a local/test DB — `applyMigrations()` in `packages/api/tests/setup-db.ts` rejects any hostname outside `{localhost, 127.0.0.1, postgres}`. Unset → `npm test` runs unit-only. See #3006. | (unset → unit-only) |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379` |
 | `S3_CACHE_DIR` | Local S3 cache directory | (disabled) |
 | `S3_LOCAL_ONLY` | Skip S3, cache-only | `0` |

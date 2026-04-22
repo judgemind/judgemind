@@ -16,6 +16,11 @@ services:
       POSTGRES_PASSWORD: localdev
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # 00-* runs first: creates the separate `judgemind_test` database used
+      # by integration tests (TEST_DATABASE_URL — see #3006 and
+      # docs/agent/local-dev.md). Keeping it separate from the operational
+      # `judgemind` database prevents tests from migrating shared state.
+      - ./packages/api/src/data-access/init-test-db.sh:/docker-entrypoint-initdb.d/00-init-test-db.sh
       - ./packages/api/src/data-access/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U judgemind"]

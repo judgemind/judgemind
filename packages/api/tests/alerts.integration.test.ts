@@ -38,7 +38,8 @@ vi.mock('../src/email/send', () => ({
 
 const pool = new Pool({
   connectionString:
-    process.env.DATABASE_URL ?? 'postgresql://judgemind:localdev@localhost:5432/judgemind',
+    process.env.TEST_DATABASE_URL ??
+    'postgresql://judgemind:localdev@localhost:5432/judgemind_test',
 });
 
 let app: FastifyInstance;
