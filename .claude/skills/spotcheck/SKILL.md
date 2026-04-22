@@ -124,11 +124,23 @@ Record findings in `{worktree}/tmp/spotcheck/originals_findings.md`.
 
 The originals sampled in Step 2 come from the documents table, so they always have DB rows. To also catch **orphaned S3 objects** (archived but never ingested), run the S3-based sampler for 2-3 counties:
 
+> **Two-shape S3 key gotcha (see #2583):** S3 contains two key shapes — legacy date-partitioned keys (`raw/YYYY/MM/DD/<uuid>.ext`) and flat-hash keys (`raw/<sha256-hex>.<ext>`). The sampler pulls from all S3 objects under `ca/<county>/`, so date-partitioned keys (which the DB never references by that path) inflate the orphan rate to 60–90% regardless of actual bugs. Until #2629 lands a proper regression guard (`scripts/spotcheck/check_s3_orphan_rate.py`), apply the post-filter below to get a meaningful orphan count.
+
 ```
 scripts/run-py.sh scripts/spotcheck/sample.py --from originals --county "<County>" --n 10 --output {worktree}/tmp/spotcheck/s3_sample_<county>.json
 ```
 
-Compare the sampled S3 keys against the `originals_by_county` data. Any S3 key not in the documents table is an orphan — note the count per county. Tracking the orphan rate over time helps measure progress (see #2583).
+After sampling, filter to flat-hash keys only before computing the orphan rate (regex matches `scripts/archive/migrate_s3_keys.py`'s `NEW_KEY_PATTERN`):
+
+```python
+import json, re
+flat = re.compile(r".*/raw/[0-9a-f]{64}\.[a-z]+$")
+data = json.load(open("{worktree}/tmp/spotcheck/s3_sample_<county>.json"))
+flat_keys = [k for k in data["s3_keys"] if flat.match(k)]
+print(f"{len(flat_keys)} flat-hash keys out of {len(data['s3_keys'])} sampled")
+```
+
+Compare `flat_keys` against the `originals_by_county` data. Any flat-hash key not in the documents table is an orphan — note the count per county. Tracking the flat-hash orphan rate over time helps measure progress (see #2583).
 
 ---
 
