@@ -477,7 +477,34 @@ If the predicate is satisfied: the loop is done. Continue to Step 3.
 
 - If the required reviewer(s) say **REVISE** (and no persistent-dissent override applies): Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — block the issue with `scripts/block-issue.sh <issue> <blocker>` (if applicable) or add `status/blocked` manually, and return with failure. Otherwise:
   - Consolidate feedback from ALL reviewers that said REVISE into `{worktree}/tmp/ralph/feedback.md`. Include feedback from `gemini-feedback.md`, `adversarial-feedback.md`, and/or `feedback.md` as appropriate. On the non-testable branch, only Claude's `feedback.md` is relevant (the Gemini files are SKIPPED placeholders).
+  - Before bumping `iteration.txt`, **persist the current iteration's patch** (see 2f below).
   - Create new todos for the next iteration (using the branch-appropriate todo list from Step 1), then return to 2a.
+
+### 2f — Persist per-iteration patch (#3026)
+
+At the end of every iteration (whether the loop decision is SHIP, REVISE, or BLOCKED), invoke the per-iteration persistence helper so the patch is saved to `dispatcher.ralph_patches` before the next iteration begins (or before the loop ends). This is the resilience hook from #3026: a daemon crash, timeout, or retry mid-loop can resume from the most recent iteration's state instead of re-ralph'ing from scratch.
+
+**Prerequisite:** the worker has committed the iteration's work via `git commit --amend --no-edit` (Step 2.5a in `/task-v2-ralph`, or the inner commit step in non-testable branches). The helper reads `git format-patch origin/main..HEAD --stdout` so a commit must exist.
+
+**Invocation (single Bash call, no heredoc):**
+
+```
+python3 {worktree}/scripts/dispatcher/persist_ralph_iteration.py --worktree {worktree} --agent-id {agent_id} --issue-number {N} --iteration {iteration} --verdict {VERDICT}
+```
+
+Where:
+- `{agent_id}` and `{N}` come from the ralph input bundle (ralph receives these via `{worktree}/tmp/dispatcher-input/ralph.json`, or the outer `/task-v2-ralph` wrapper — propagate them into the inner `/ralph` via the worker's state).
+- `{iteration}` is the current value in `{worktree}/tmp/ralph/iteration.txt`.
+- `{VERDICT}` is:
+  - `LOOP` when reviewers said REVISE and the loop will continue to the next iteration.
+  - `SHIP` when reviewers agreed to SHIP (or the persistent-dissent override fired).
+  - `ABORT` when the worker wrote STUCK or the loop is stopping with BLOCKED.
+
+**Failure behaviour.** The helper exits 0 on every failure path (missing `DATABASE_URL` env — e.g. local smoke tests, subprocess error, DB outage). A stdout line of the form `persisted=<uuid>`, `skipped=<reason>`, or `error=<detail>` is emitted for log forensics but does not affect ralph's control flow. **Never branch on the helper's exit code** — it is always 0.
+
+**When to skip.** If `git format-patch origin/main..HEAD --stdout` would produce no output (working tree matches `origin/main` — a no-op iteration, which is unusual), the helper emits `skipped=empty_or_failed_format_patch` and returns. No special handling needed.
+
+This hook is the cross-agent / same-agent resume path's upstream write: the daemon's unified resume lookup (`DispatcherDaemon._apply_prior_ralph_patch`) queries the most-recent row for the issue within the 7-day TTL, regardless of `agent_id`, so any iteration's saved patch is a valid starting point for a future retry.
 
 ---
 

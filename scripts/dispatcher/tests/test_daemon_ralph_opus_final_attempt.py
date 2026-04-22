@@ -24,6 +24,14 @@ Same mocking strategy as :mod:`test_daemon_token_metering` — psycopg
 is stubbed before the daemon import so the test runner never needs a
 real DB or the ``psycopg`` wheel. No ``claude`` / ``gh`` / ``git``
 subprocesses run.
+
+Implementation note (#3022): ``_spawn_phase_subprocess`` uses
+``subprocess.Popen`` + the async stream forwarder, not
+``subprocess.run``. Each test must monkeypatch ``subprocess.Popen`` and
+``daemon.stream_subprocess_output_async`` together so the forwarder
+plumbing is short-circuited — otherwise the tests try to spawn a real
+``claude`` binary and fail with ``FileNotFoundError``. See the
+``_patch_popen_and_forwarder`` fixture below.
 """
 
 from __future__ import annotations
@@ -191,6 +199,42 @@ def _extract_model_arg(cmd: list[str]) -> str:
     return cmd[cmd.index("--model") + 1]
 
 
+def _patch_popen_and_forwarder(
+    monkeypatch: Any,
+    captured: dict[str, Any] | None = None,
+) -> None:
+    """Install test doubles for ``subprocess.Popen`` + the stream forwarder.
+
+    ``_spawn_phase_subprocess`` (#3022) calls:
+    1. ``subprocess.Popen(cmd, ...)`` — we intercept to capture ``cmd``.
+    2. ``stream_subprocess_output_async(proc, ...)`` — the async
+       forwarder that would normally spawn reader threads; we replace
+       it with a no-op that returns a handle with a ``.join(timeout)``.
+    3. ``proc.wait(timeout=...)`` — we return 0.
+
+    If ``captured`` is provided, the invoked ``cmd`` list is stored under
+    ``captured["cmd"]`` on Popen invocation.
+    """
+    fake_proc = MagicMock()
+    fake_proc.wait.return_value = 0
+    fake_proc.returncode = 0
+    fake_proc.stdout = None
+    fake_proc.stderr = None
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> Any:
+        if captured is not None:
+            captured["cmd"] = cmd
+        return fake_proc
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    fake_threads = MagicMock()
+    fake_threads.join.return_value = None
+    monkeypatch.setattr(
+        daemon, "stream_subprocess_output_async", lambda *a, **kw: fake_threads
+    )
+
+
 class TestRalphSpawnUsesAttemptAwareModel:
     """``_spawn_phase_subprocess("ralph", ...)`` reads
     ``dispatcher.agents.retries_used`` via :meth:`_current_attempt_for`
@@ -204,14 +248,7 @@ class TestRalphSpawnUsesAttemptAwareModel:
         conn.cursor_instance.fetch_queue = [(0,)]
 
         captured: dict[str, Any] = {}
-
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        _patch_popen_and_forwarder(monkeypatch, captured)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
 
         assert _extract_model_arg(captured["cmd"]) == "sonnet"
@@ -225,14 +262,7 @@ class TestRalphSpawnUsesAttemptAwareModel:
         conn.cursor_instance.fetch_queue = [(daemon.MAX_RETRY_ATTEMPTS - 1,)]
 
         captured: dict[str, Any] = {}
-
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        _patch_popen_and_forwarder(monkeypatch, captured)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
 
         assert _extract_model_arg(captured["cmd"]) == "opus"
@@ -248,14 +278,7 @@ class TestRalphSpawnUsesAttemptAwareModel:
         conn.cursor_instance.fetch_queue = [(daemon.MAX_RETRY_ATTEMPTS - 2,)]
 
         captured: dict[str, Any] = {}
-
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        _patch_popen_and_forwarder(monkeypatch, captured)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
 
         assert _extract_model_arg(captured["cmd"]) == "sonnet"
@@ -270,12 +293,7 @@ class TestRalphSpawnUsesAttemptAwareModel:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [(daemon.MAX_RETRY_ATTEMPTS - 1,)]
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        _patch_popen_and_forwarder(monkeypatch)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
 
         starts = handler.events("phase_started")
@@ -291,12 +309,7 @@ class TestRalphSpawnUsesAttemptAwareModel:
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [(0,)]
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        _patch_popen_and_forwarder(monkeypatch)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
 
         starts = handler.events("phase_started")
@@ -321,14 +334,7 @@ class TestRalphSpawnUsesAttemptAwareModel:
         conn.cursor_instance.fetch_queue = []
 
         captured: dict[str, Any] = {}
-
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        _patch_popen_and_forwarder(monkeypatch, captured)
         d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
 
         assert _extract_model_arg(captured["cmd"]) == daemon.PHASE_MODELS["plan"]

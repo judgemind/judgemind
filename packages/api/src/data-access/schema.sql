@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 38 migrations.
+-- Generated from 39 migrations.
 
 
 
@@ -628,7 +628,9 @@ CREATE TABLE dispatcher.ralph_patches (
     issue_number integer NOT NULL,
     patch_content text NOT NULL,
     commit_sha text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    iteration_n integer,
+    verdict text
 );
 
 
@@ -639,6 +641,12 @@ COMMENT ON COLUMN dispatcher.ralph_patches.patch_content IS 'git format-patch -1
 
 
 COMMENT ON COLUMN dispatcher.ralph_patches.commit_sha IS 'ralph''s HEAD SHA at SHIP time. Nullable — written when git rev-parse succeeds; informational only (the patch is the authoritative artifact).';
+
+
+COMMENT ON COLUMN dispatcher.ralph_patches.iteration_n IS '1-based ralph iteration number at the time the row was written. NULL for legacy #3013 rows (pre-#3026 migration) and for SHIP rows (the SHIP DELETE-supersede path carries verdict=SHIP with iteration_n=NULL). Non-NULL for per-iteration intermediate rows. Issue #3026.';
+
+
+COMMENT ON COLUMN dispatcher.ralph_patches.verdict IS 'Ralph verdict when the row was captured: LOOP (iteration continuing), SHIP (terminal SHIP), ABORT (gave up), or NULL (legacy pre-#3026). Not CHECK-constrained so forward-version daemons can introduce new verdicts without a migration. Issue #3026.';
 
 
 CREATE TABLE dispatcher.retry_markers (
