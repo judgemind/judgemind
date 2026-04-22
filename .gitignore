@@ -75,6 +75,10 @@ worktrees/
 
 # Agent lock files (per-worktree, ephemeral)
 .agent-lock
+.claude/scheduled_tasks.lock
+
+# Vite cache
+.vite/
 
 # Task-claim agent_id sidecar (pre-#2927 — kept to ignore any
 # historical files lingering on dev machines; the current
