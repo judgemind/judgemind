@@ -444,9 +444,18 @@ class TestApplyPriorRalphPatch:
             "Subject: [PATCH] WIP: ralph output\n"
             "---\n"
         )
-        # Row shape: (patch_id, patch_content, commit_sha, agent_id)
+        # Row shape (#3026): (patch_id, patch_content, commit_sha,
+        # agent_id, iteration_n, verdict, age_seconds).
         conn.cursor_instance.fetch_queue = [
-            ("prior-patch-uuid", patch_content, "prior-sha-abc", "prior-agent-uuid"),
+            (
+                "prior-patch-uuid",
+                patch_content,
+                "prior-sha-abc",
+                "prior-agent-uuid",
+                3,
+                "LOOP",
+                120.0,
+            ),
         ]
 
         am_ok = subprocess.CompletedProcess(
@@ -464,6 +473,10 @@ class TestApplyPriorRalphPatch:
             "applied": True,
             "patch_id": "prior-patch-uuid",
             "commit_sha": "prior-sha-abc",
+            "source_agent_id": "prior-agent-uuid",
+            "iteration_n": 3,
+            "verdict": "LOOP",
+            "age_seconds": 120.0,
             "bytes": len(patch_content),
         }
         # The patch file is written into tmp/dispatcher-input/.
@@ -473,18 +486,26 @@ class TestApplyPriorRalphPatch:
         # Success event emitted.
         assert handler.events("ralph_patch_applied")
 
-    def test_apply_conflicts_aborts_and_returns_applied_false(
-        self, tmp_path: Path
-    ) -> None:
-        """git am failure → runs ``git am --abort``, returns
-        {applied: False, patch_content: ..., reason: ...}."""
+    def test_apply_conflict_leaves_am_in_progress(self, tmp_path: Path) -> None:
+        """git am conflict (#3026) → daemon does NOT run ``git am
+        --abort``; the worktree is left in am-in-progress state so
+        ralph can decide continue-vs-abort. Returns
+        {applied: False, conflicted: True, patch_content, ...}."""
         d, conn, handler = _make_daemon(tmp_path)
         worktree = tmp_path / "worktree"
         worktree.mkdir()
 
         patch_content = "From abc...\npatch body with conflicts\n"
         conn.cursor_instance.fetch_queue = [
-            ("prior-patch-uuid", patch_content, None, "prior-agent"),
+            (
+                "prior-patch-uuid",
+                patch_content,
+                None,
+                "prior-agent",
+                2,
+                "LOOP",
+                600.0,
+            ),
         ]
 
         am_fail = subprocess.CompletedProcess(
@@ -493,11 +514,14 @@ class TestApplyPriorRalphPatch:
             stdout="",
             stderr="error: patch failed: src/foo.py:1\nerror: patch does not apply",
         )
-        am_abort_ok = subprocess.CompletedProcess(
-            args=["git", "am", "--abort"], returncode=0, stdout="", stderr=""
+        diff_u = subprocess.CompletedProcess(
+            args=["git", "diff"],
+            returncode=0,
+            stdout="src/foo.py\n",
+            stderr="",
         )
 
-        with patch("subprocess.run", side_effect=[am_fail, am_abort_ok]) as run_mock:
+        with patch("subprocess.run", side_effect=[am_fail, diff_u]) as run_mock:
             result = d._apply_prior_ralph_patch(
                 agent_id="new-agent",
                 issue_number=3012,
@@ -506,43 +530,81 @@ class TestApplyPriorRalphPatch:
 
         assert result is not None
         assert result["applied"] is False
+        assert result["conflicted"] is True
         assert result["patch_id"] == "prior-patch-uuid"
         assert result["patch_content"] == patch_content
+        assert result["source_agent_id"] == "prior-agent"
+        assert result["iteration_n"] == 2
+        assert result["verdict"] == "LOOP"
+        assert result["age_seconds"] == 600.0
+        assert result["conflict_files"] == ["src/foo.py"]
         assert "patch does not apply" in result["reason"]
 
-        # git am --abort was called exactly once after the failed am.
+        # CRITICAL (#3026): ``git am --abort`` must NOT be called on
+        # the conflict-handoff path. The worktree is left in the
+        # am-in-progress state so ralph can inspect it.
         abort_calls = [
             call
             for call in run_mock.call_args_list
             if len(call.args[0]) >= 5 and call.args[0][3:5] == ["am", "--abort"]
         ]
-        assert len(abort_calls) == 1
-        # Warning log emitted.
-        assert handler.events("ralph_patch_apply_failed")
+        assert len(abort_calls) == 0
+        # Conflict event emitted (replaces the pre-#3026
+        # ``ralph_patch_apply_failed`` event).
+        assert handler.events("ralph_patch_apply_conflict")
 
-    def test_self_inherit_skipped(self, tmp_path: Path) -> None:
-        """If the prior row's agent_id equals the current agent's,
-        skip — same agent re-running the same phase should not
-        re-apply its own patch to an already-at-HEAD worktree."""
+    def test_unified_resume_lookup_uses_ttl_predicate(self, tmp_path: Path) -> None:
+        """The resume SELECT uses the 7-day TTL predicate AND returns
+        the most-recent row regardless of agent_id (unified lookup,
+        #3026). Same-agent rows are valid resume candidates — the
+        pre-#3026 self-inherit guard is removed."""
         d, conn, handler = _make_daemon(tmp_path)
         worktree = tmp_path / "worktree"
         worktree.mkdir()
 
         same_agent_id = "same-agent-uuid"
+        # Prior row is the SAME agent as the caller — post-#3026 this
+        # must be applied, not skipped, because fresh worktrees always
+        # start at origin/main HEAD so there's no "already at HEAD"
+        # conflict to worry about.
         conn.cursor_instance.fetch_queue = [
-            ("prior-patch-uuid", "patch body", None, same_agent_id),
+            (
+                "prior-patch-uuid",
+                "patch body\n",
+                None,
+                same_agent_id,
+                1,
+                "LOOP",
+                30.0,
+            ),
         ]
-
-        with patch("subprocess.run") as run_mock:
+        am_ok = subprocess.CompletedProcess(
+            args=["git", "am"], returncode=0, stdout="Applying\n", stderr=""
+        )
+        with patch("subprocess.run", side_effect=[am_ok]):
             result = d._apply_prior_ralph_patch(
                 agent_id=same_agent_id,
                 issue_number=123,
                 worktree=worktree,
             )
 
-        assert result is None
-        assert run_mock.call_count == 0
-        assert handler.events("ralph_patch_self_inherit_skipped")
+        assert result is not None
+        assert result["applied"] is True
+        assert result["source_agent_id"] == same_agent_id
+        # Verify the SELECT query carries the TTL predicate.
+        selects = [
+            (sql, params)
+            for sql, params in conn.cursor_instance.executed
+            if "SELECT" in sql and "FROM dispatcher.ralph_patches" in sql
+        ]
+        assert len(selects) == 1
+        sql, params = selects[0]
+        assert "make_interval(days => %s)" in sql
+        # Parameters: (issue_number, retention_days).
+        assert params[0] == 123
+        assert params[1] == daemon.DEFAULT_RALPH_PATCH_RETENTION_DAYS
+        # No self-inherit skip event; the unified lookup applies.
+        assert not handler.events("ralph_patch_self_inherit_skipped")
 
     def test_db_query_failure_returns_none(self, tmp_path: Path) -> None:
         """A DB error on the SELECT is non-fatal — returns None
@@ -577,6 +639,9 @@ class TestAppendUnappliedPatch:
     ``prior_attempts.md`` so the worker can cherry-pick manually."""
 
     def test_appends_when_prior_attempts_md_exists(self, tmp_path: Path) -> None:
+        """Invocation-failure branch (``conflicted=False``) — renders
+        the legacy "Prior ralph patch" heading with the patch text
+        below for manual cherry-pick."""
         d, _conn, _handler = _make_daemon(tmp_path)
         worktree = tmp_path / "worktree"
         (worktree / "tmp" / "dispatcher-output").mkdir(parents=True)
@@ -587,24 +652,25 @@ class TestAppendUnappliedPatch:
             worktree,
             {
                 "applied": False,
+                "conflicted": False,
                 "patch_id": "pid-1",
                 "patch_content": "From abc...\npatch body\n",
-                "reason": "patch does not apply",
+                "reason": "am invocation failed: timeout",
             },
         )
 
         content = existing.read_text()
         assert "Attempt 1 content." in content
-        assert "## Prior SHIP'd patch (did NOT apply cleanly)" in content
+        assert "## Prior ralph patch (did NOT apply cleanly)" in content
         assert "pid-1" in content
-        assert "patch does not apply" in content
+        assert "am invocation failed" in content
         # The patch body is present, fenced as a diff block.
         assert "```diff" in content
         assert "patch body" in content
 
     def test_creates_file_when_prior_attempts_md_missing(self, tmp_path: Path) -> None:
-        """If prior_attempts.md doesn't exist (no prior FAILED attempts
-        but we did have a SHIP'd-but-not-pushed patch), still write a
+        """If prior_attempts.md doesn't exist and the am failed before
+        conflict resolution (invocation failure), still write a
         standalone file so the worker gets the patch context."""
         d, _conn, _handler = _make_daemon(tmp_path)
         worktree = tmp_path / "worktree"
@@ -613,6 +679,7 @@ class TestAppendUnappliedPatch:
             worktree,
             {
                 "applied": False,
+                "conflicted": False,
                 "patch_id": "pid-2",
                 "patch_content": "standalone patch body\n",
                 "reason": "no current patch",
@@ -622,8 +689,51 @@ class TestAppendUnappliedPatch:
         target = worktree / "tmp" / "dispatcher-output" / "prior_attempts.md"
         assert target.exists()
         content = target.read_text()
-        assert "Prior SHIP'd patch" in content
+        assert "Prior ralph patch" in content
         assert "standalone patch body" in content
+
+    def test_conflicted_branch_renders_resume_block(self, tmp_path: Path) -> None:
+        """Conflict-handoff branch (#3026, ``conflicted=True``) — renders
+        the RESUME WITH CONFLICT structured prompt block for ralph."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "worktree"
+
+        d._append_unapplied_patch_to_prior_attempts(
+            worktree,
+            {
+                "applied": False,
+                "conflicted": True,
+                "patch_id": "pid-3",
+                "patch_content": "patch body\n",
+                "source_agent_id": "aaaabbbbccccdddd",
+                "iteration_n": 4,
+                "verdict": "LOOP",
+                "age_seconds": 3725.0,  # 1h 2m
+                "conflict_files": ["src/foo.py", "src/bar.py"],
+                "reason": "patch does not apply",
+            },
+            issue_number=3026,
+        )
+
+        target = worktree / "tmp" / "dispatcher-output" / "prior_attempts.md"
+        content = target.read_text()
+        # Structured block heading must appear verbatim — ralph's
+        # worker is trained to recognise this exact phrase.
+        assert "RESUME WITH CONFLICT" in content
+        assert "issue #3026" in content
+        assert "agent aaaabbbb" in content  # agent_id_short
+        assert "iteration 4" in content
+        assert "verdict LOOP" in content
+        assert "1h 2m ago" in content
+        assert "2 files are in conflict" in content
+        assert "git am --continue" in content
+        assert "git am --abort" in content
+        # Patch body is still included for manual inspection.
+        assert "```diff" in content
+        assert "patch body" in content
+        # Conflict files listed.
+        assert "src/foo.py" in content
+        assert "src/bar.py" in content
 
 
 # --------------------------------------------------------------------------

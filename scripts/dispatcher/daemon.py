@@ -896,6 +896,35 @@ def _stderr_tail(stderr: str | bytes | None) -> str:
     return stderr[-STRUCTURED_LOG_STDERR_MAX:]
 
 
+def _format_age_ago(seconds: float) -> str:
+    """Render a compact human-readable age like ``2h 15m ago`` (#3026).
+
+    Used to populate the ``{age_ago}`` placeholder in the RESUME WITH
+    CONFLICT prompt block. Resolution is intentionally coarse — ralph
+    only needs to know "is this patch stale or fresh" to make the
+    continue-vs-abort judgment; exact seconds add noise.
+
+    Buckets:
+
+    * < 60 s   → ``"just now"``
+    * < 60 min → ``"{N}m ago"``
+    * < 24 h   → ``"{N}h {M}m ago"``
+    * else     → ``"{N}d {H}h ago"``
+    """
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"{minutes}m ago"
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m ago"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    return f"{days}d {hours}h ago"
+
+
 def _classify_push_failure(stderr: str) -> str:
     """Classify a ``git push`` non-zero exit by inspecting stderr.
 
@@ -4642,6 +4671,15 @@ class DispatcherDaemon:
         # after the INSERT retrieves the generated ``patch_id``; we
         # bind that to both the phase_outputs UPDATE and the return
         # value.
+        #
+        # Note on verdict column (#3026): this helper runs on the SHIP
+        # path, so the inserted row carries ``verdict='SHIP'`` with
+        # ``iteration_n=NULL``. Per-iteration intermediate rows (written
+        # by :meth:`_persist_ralph_iteration_patch`) carry the actual
+        # iteration number and verdict. The DELETE-by-issue_number
+        # supersede here cleans up all intermediate rows for the same
+        # issue, so the post-SHIP table state has exactly one row for
+        # this agent/issue (the authoritative SHIP row).
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -4650,10 +4688,11 @@ class DispatcherDaemon:
                 )
                 cur.execute(
                     "INSERT INTO dispatcher.ralph_patches "
-                    "    (agent_id, issue_number, patch_content, commit_sha) "
-                    "VALUES (%s, %s, %s, %s) "
+                    "    (agent_id, issue_number, patch_content, commit_sha, "
+                    "     iteration_n, verdict) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) "
                     "RETURNING patch_id",
-                    (agent_id, issue_number, patch_content, commit_sha),
+                    (agent_id, issue_number, patch_content, commit_sha, None, "SHIP"),
                 )
                 row = cur.fetchone()
                 patch_id = str(row[0]) if row and row[0] else None
@@ -4754,43 +4793,69 @@ class DispatcherDaemon:
         issue_number: int,
         worktree: Path,
     ) -> dict[str, Any] | None:
-        """Apply a prior SHIP'd patch to the fresh worktree, if one exists.
+        """Apply a prior ralph patch to the fresh worktree, if one exists.
 
         Called at the top of :meth:`_run_ralph_phase` before ralph is
-        spawned. If a prior agent on this issue SHIPped but never got a
-        PR created, the patch is sitting in ``dispatcher.ralph_patches``
-        from :meth:`_capture_and_persist_ralph_patch`. This helper:
+        spawned. Runs the **unified resume lookup** (#3026): the most
+        recent patch for ``issue_number``, any ``agent_id``, any
+        ``verdict``, within the 7-day TTL. This is the single code path
+        for both same-agent resume (daemon restart mid-ralph) and
+        cross-agent resume (fresh claim on an issue whose prior
+        attempts were abandoned).
 
-        1. Queries the latest ``ralph_patches`` row for ``issue_number``.
+        1. Queries the latest ``ralph_patches`` row for ``issue_number``
+           within the 7-day TTL, ordered by ``created_at DESC``.
         2. If none exists → returns ``None`` (no-op first-attempt path).
         3. If one exists, writes the patch to
            ``{worktree}/tmp/dispatcher-input/prior-ralph.patch`` and
-           tries ``git am <patchfile>``.
+           tries ``git am --3way <patchfile>``.
         4. On apply success → returns
-           ``{"applied": True, "patch_id": ..., "commit_sha": ..., "bytes": ...}``.
+           ``{"applied": True, "patch_id": ..., "commit_sha": ...,
+             "source_agent_id": ..., "iteration_n": ..., "verdict": ...,
+             "bytes": ...}``.
            Ralph starts with the prior diff already on HEAD and iterates
            on top.
-        5. On apply failure → runs ``git am --abort`` to restore the
-           clean worktree state, then returns
-           ``{"applied": False, "patch_id": ..., "patch_content": ..., "reason": ...}``
-           so the caller can surface the patch text to ralph via
-           ``prior_attempts.md``.
+        5. On apply **conflict** → **does NOT abort** (issue #3026
+           conflict-handoff contract). The worktree is left in the
+           conflicted am-in-progress state (``.git/rebase-apply/``
+           intact, unmerged index entries) so ralph can inspect and
+           decide whether to ``git am --continue`` or ``git am --abort``.
+           Returns
+           ``{"applied": False, "conflicted": True, "patch_id": ...,
+             "patch_content": ..., "source_agent_id": ...,
+             "iteration_n": ..., "verdict": ..., "age_seconds": ...,
+             "conflict_files": [...], "reason": ...}``
+           so the caller can build the "RESUME WITH CONFLICT" prompt
+           block that goes into ralph's task.md.
 
         A DB lookup failure returns ``None`` — same effect as "no prior
         patch" — so a transient postgres hiccup never wedges the agent.
+
+        Same-agent-resume note (#3026 supersedes #3013): the previous
+        self-inherit guard is removed because the unified lookup
+        semantics explicitly allow same-agent rows. Fresh worktrees are
+        always at origin/main HEAD on ralph entry, so applying the
+        agent's own last iteration is a valid resume of cumulative work.
         """
         assert self._conn is not None, "connect() must run before query"
 
-        # Query the latest patch for this issue (ORDER BY created_at
-        # DESC so if somehow two rows exist, we pick the newest).
+        # Query the latest patch for this issue within the 7-day TTL.
+        # The TTL predicate is redundant with the housekeeping sweep
+        # (which runs on the same 7-day window) but keeps a partial-
+        # sweep state from surfacing stale patches. Any agent_id, any
+        # verdict — same-agent resume, cross-agent resume, legacy rows
+        # from #3013 era all flow through this single lookup.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT patch_id, patch_content, commit_sha, agent_id "
+                    "SELECT patch_id, patch_content, commit_sha, agent_id, "
+                    "       iteration_n, verdict, "
+                    "       EXTRACT(EPOCH FROM (now() - created_at)) "
                     "FROM dispatcher.ralph_patches "
                     "WHERE issue_number = %s "
+                    "  AND created_at > now() - make_interval(days => %s) "
                     "ORDER BY created_at DESC LIMIT 1",
-                    (issue_number,),
+                    (issue_number, DEFAULT_RALPH_PATCH_RETENTION_DAYS),
                 )
                 row = cur.fetchone()
             self._conn.commit()
@@ -4818,28 +4883,17 @@ class DispatcherDaemon:
         patch_content = row[1] or ""
         prior_commit_sha = row[2] or None
         prior_agent_id = str(row[3]) if row[3] is not None else None
+        prior_iteration_n = row[4] if len(row) > 4 else None
+        prior_verdict = row[5] if len(row) > 5 else None
+        age_seconds_raw = row[6] if len(row) > 6 else None
+        try:
+            age_seconds = float(age_seconds_raw) if age_seconds_raw is not None else 0.0
+        except (TypeError, ValueError):
+            age_seconds = 0.0
         if not patch_content.strip():
             # Defensive — NOT NULL constraint guarantees non-null, but
             # the content could be an empty-ish blob from a pathological
             # capture. Treat as "no usable patch".
-            return None
-
-        # Guard: don't try to inherit from *this same* agent. That
-        # shouldn't happen in normal flow (prior SHIP rows belong to a
-        # previous agent id), but tier-1 retry paths re-use agent_id,
-        # and re-applying a patch to a worktree that's already at the
-        # same commit just produces "patch does not apply" noise.
-        if prior_agent_id == agent_id:
-            self._log.info(
-                "daemon.ralph_patch_self_inherit_skipped",
-                extra={
-                    "event": "ralph_patch_self_inherit_skipped",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "patch_id": prior_patch_id,
-                },
-            )
             return None
 
         # Write patch to a scratch file under {worktree}/tmp/.
@@ -4861,11 +4915,9 @@ class DispatcherDaemon:
             )
             return None
 
-        # Try ``git am <patchfile>``.  --3way gives a better chance of
-        # success when base has moved; without it, any drift produces
-        # an apply failure even for non-overlapping hunks. Keeping
-        # semantics the issue specified, but --3way is the gentler
-        # form that doesn't hurt when base matches.
+        # Try ``git am --3way <patchfile>``. --3way gives a better
+        # chance of success when base has moved; without it, any drift
+        # produces an apply failure even for non-overlapping hunks.
         try:
             am_result = subprocess.run(
                 [
@@ -4894,13 +4946,21 @@ class DispatcherDaemon:
                 },
             )
             # Best-effort abort in case am started but we lost the
-            # process — ignore errors since there may be no in-progress
-            # am to abort.
+            # process. Unlike the conflict path below, an invocation
+            # failure leaves no structured am-in-progress state for
+            # ralph to inspect, so aborting is safer than leaving
+            # undefined git state.
             self._git_am_abort(worktree)
             return {
                 "applied": False,
+                "conflicted": False,
                 "patch_id": prior_patch_id,
                 "patch_content": patch_content,
+                "source_agent_id": prior_agent_id,
+                "iteration_n": prior_iteration_n,
+                "verdict": prior_verdict,
+                "age_seconds": age_seconds,
+                "conflict_files": [],
                 "reason": f"am invocation failed: {exc}",
             }
 
@@ -4914,6 +4974,9 @@ class DispatcherDaemon:
                     "issue_number": issue_number,
                     "patch_id": prior_patch_id,
                     "prior_commit_sha": prior_commit_sha,
+                    "source_agent_id": prior_agent_id,
+                    "iteration_n": prior_iteration_n,
+                    "verdict": prior_verdict,
                     "patch_bytes": len(patch_content),
                 },
             )
@@ -4921,29 +4984,53 @@ class DispatcherDaemon:
                 "applied": True,
                 "patch_id": prior_patch_id,
                 "commit_sha": prior_commit_sha,
+                "source_agent_id": prior_agent_id,
+                "iteration_n": prior_iteration_n,
+                "verdict": prior_verdict,
+                "age_seconds": age_seconds,
                 "bytes": len(patch_content),
             }
 
-        # Apply failed — abort cleanly so the worktree is back to
-        # origin/main HEAD before ralph spawns.
+        # Apply failed with a conflict. Per issue #3026, the daemon
+        # does NOT ``git am --abort`` here — the worktree is left in
+        # the conflicted am-in-progress state so ralph can inspect
+        # the unmerged files, read the conflict markers, and decide
+        # whether to ``git am --continue`` (resolve + keep prior work)
+        # or ``git am --abort`` (discard + start fresh from main).
+        #
+        # The conflict-handoff contract is documented in
+        # ``.claude/skills/task-v2-ralph/SKILL.md`` §"Resume with
+        # conflict". The daemon surfaces the RESUME WITH CONFLICT
+        # prompt block (built via ``_format_resume_with_conflict_block``)
+        # in ralph's task.md; ralph's worker makes the judgment call.
         reason = _stderr_tail(am_result.stderr) or f"exit={am_result.returncode}"
-        self._git_am_abort(worktree)
+        conflict_files = self._list_git_am_conflict_files(worktree)
         self._log.warning(
-            "daemon.ralph_patch_apply_failed",
+            "daemon.ralph_patch_apply_conflict",
             extra={
-                "event": "ralph_patch_apply_failed",
+                "event": "ralph_patch_apply_conflict",
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "issue_number": issue_number,
                 "patch_id": prior_patch_id,
+                "source_agent_id": prior_agent_id,
+                "iteration_n": prior_iteration_n,
+                "verdict": prior_verdict,
                 "exit_code": am_result.returncode,
                 "stderr_tail": reason,
+                "conflict_file_count": len(conflict_files),
             },
         )
         return {
             "applied": False,
+            "conflicted": True,
             "patch_id": prior_patch_id,
             "patch_content": patch_content,
+            "source_agent_id": prior_agent_id,
+            "iteration_n": prior_iteration_n,
+            "verdict": prior_verdict,
+            "age_seconds": age_seconds,
+            "conflict_files": conflict_files,
             "reason": reason,
         }
 
@@ -4964,6 +5051,275 @@ class DispatcherDaemon:
             )
         except Exception:  # pragma: no cover — defensive
             pass
+
+    def _list_git_am_conflict_files(self, worktree: Path) -> list[str]:
+        """Return the list of files in unmerged (conflict) state.
+
+        Called on the conflict-handoff path of
+        :meth:`_apply_prior_ralph_patch`. ``git diff --name-only
+        --diff-filter=U`` lists paths with unmerged index entries —
+        exactly the files ``git am`` marked as conflicts.
+
+        Returns an empty list on subprocess failure so the caller's
+        placeholder formatting uses ``K=0`` rather than raising. The
+        conflict count is advisory in the RESUME WITH CONFLICT prompt
+        block (it tells ralph how much work it's inheriting); a wrong
+        count does not affect correctness.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=U",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:  # pragma: no cover — defensive
+            return []
+        if result.returncode != 0:
+            return []
+        return [
+            line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+        ]
+
+    def _persist_ralph_iteration_patch(
+        self,
+        agent_id: str,
+        issue_number: int,
+        iteration_n: int,
+        verdict: str,
+        worktree: Path,
+    ) -> str | None:
+        """Persist a per-iteration ralph patch snapshot (#3026).
+
+        Called by the daemon at end-of-iteration (via a ralph-invoked
+        helper CLI, see ``scripts/dispatcher/persist_ralph_iteration.py``)
+        after ralph has committed the iteration's work with the
+        placeholder ``WIP: ralph output`` message (see
+        ``.claude/skills/task-v2-ralph/SKILL.md`` §2.5a).
+
+        Unlike :meth:`_capture_and_persist_ralph_patch` — which runs
+        only on the SHIP verdict and supersedes prior rows via DELETE-
+        by-issue-number — this helper is **additive**: it INSERTs a
+        new row per iteration, keyed on (agent_id, iteration_n,
+        verdict). Rows accumulate for the agent's lifetime so a mid-
+        run daemon crash or cross-agent retry can replay the most
+        recent intermediate state.
+
+        The patch is captured via ``git format-patch origin/main..HEAD
+        --stdout`` (full cumulative range, not ``-1 HEAD``) so a
+        resume on a branch with multiple commits still replays
+        everything. Matches the resume path's ``git am --3way``.
+
+        Returns the new ``patch_id`` on success, ``None`` on any
+        failure (empty patch, git error, DB error). All failures are
+        logged but non-fatal — the happy path continues and a missed
+        intermediate write just means the resume inherits the
+        previous iteration's state instead of this one.
+
+        The three bundled assurances:
+
+        1. The INSERT does not delete prior rows — intermediate rows
+           accumulate so a crash after iteration N+1 still has
+           iteration N available.
+        2. On SHIP, the existing #3013 supersede-by-issue-number
+           DELETE path (see :meth:`_capture_and_persist_ralph_patch`)
+           cleans up these intermediate rows; the authoritative SHIP
+           row replaces them.
+        3. The 7-day TTL housekeeping sweep catches everything
+           abandoned (daemon crash, operator stop, ralph BLOCKED).
+        """
+        assert self._conn is not None, "connect() must run before persist"
+
+        # Capture the cumulative patch via git format-patch
+        # origin/main..HEAD --stdout. Full range (not -1 HEAD) so
+        # resumes work across multiple commits on the branch — e.g.
+        # when a prior iteration's `git am --continue` left an
+        # additional commit beyond the placeholder. Ralph amends
+        # in-place per #2971 so there's typically one commit, but the
+        # range form is safe regardless.
+        try:
+            patch_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "format-patch",
+                    "origin/main..HEAD",
+                    "--stdout",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "daemon.ralph_iteration_patch_capture_failed",
+                extra={
+                    "event": "ralph_iteration_patch_capture_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "iteration_n": iteration_n,
+                    "verdict": verdict,
+                    "detail": str(exc),
+                },
+            )
+            return None
+        if patch_result.returncode != 0 or not (patch_result.stdout or "").strip():
+            self._log.info(
+                "daemon.ralph_iteration_patch_empty_or_failed",
+                extra={
+                    "event": "ralph_iteration_patch_empty_or_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "iteration_n": iteration_n,
+                    "verdict": verdict,
+                    "exit_code": patch_result.returncode,
+                    "stderr_tail": _stderr_tail(patch_result.stderr),
+                },
+            )
+            return None
+        patch_content = patch_result.stdout
+
+        # Best-effort HEAD SHA — same pattern as _capture_and_persist_ralph_patch.
+        commit_sha: str | None = None
+        try:
+            sha_result = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if sha_result.returncode == 0:
+                candidate = (sha_result.stdout or "").strip()
+                if candidate:
+                    commit_sha = candidate
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        # Additive INSERT (no DELETE). Intermediate rows accumulate.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.ralph_patches "
+                    "    (agent_id, issue_number, patch_content, commit_sha, "
+                    "     iteration_n, verdict) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) "
+                    "RETURNING patch_id",
+                    (
+                        agent_id,
+                        issue_number,
+                        patch_content,
+                        commit_sha,
+                        iteration_n,
+                        verdict,
+                    ),
+                )
+                row = cur.fetchone()
+                patch_id = str(row[0]) if row and row[0] else None
+            self._conn.commit()
+        except Exception as exc:
+            self._log.exception(
+                "daemon.ralph_iteration_patch_persist_failed",
+                extra={
+                    "event": "ralph_iteration_patch_persist_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "iteration_n": iteration_n,
+                    "verdict": verdict,
+                    "detail": str(exc),
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        self._log.info(
+            "daemon.ralph_iteration_patch_persisted",
+            extra={
+                "event": "ralph_iteration_patch_persisted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "iteration_n": iteration_n,
+                "verdict": verdict,
+                "patch_id": patch_id,
+                "commit_sha": commit_sha,
+                "patch_bytes": len(patch_content),
+            },
+        )
+        return patch_id
+
+    @staticmethod
+    def _format_resume_with_conflict_block(
+        issue_number: int,
+        conflict_info: dict[str, Any],
+    ) -> str:
+        """Render the RESUME WITH CONFLICT prompt block (#3026).
+
+        Called by :meth:`_run_ralph_phase` when
+        :meth:`_apply_prior_ralph_patch` returned
+        ``{"applied": False, "conflicted": True, ...}``. The returned
+        string is appended to the agent's ``prior_attempts.md`` so the
+        ralph skill surfaces it to the worker via ``task.md``.
+
+        The block's exact wording matches the #3026 issue body
+        contract — ralph's worker is trained to recognise this
+        heading and handle the ``git am --continue`` vs. ``git am
+        --abort`` decision accordingly. Do not reword without also
+        updating ``.claude/skills/task-v2-ralph/SKILL.md`` and the
+        ralph worker prompt in ``.claude/skills/ralph/SKILL.md``.
+        """
+        source_agent_id = conflict_info.get("source_agent_id") or "unknown"
+        agent_id_short = source_agent_id[:8] if source_agent_id else "unknown"
+        iter_n = conflict_info.get("iteration_n")
+        iter_display = str(iter_n) if iter_n is not None else "SHIP (no iteration)"
+        verdict = conflict_info.get("verdict") or "(unknown)"
+        age_seconds = float(conflict_info.get("age_seconds") or 0.0)
+        age_ago = _format_age_ago(age_seconds)
+        conflict_files = conflict_info.get("conflict_files") or []
+        k = len(conflict_files)
+
+        lines = [
+            "RESUME WITH CONFLICT",
+            "",
+            f"You are resuming work on issue #{issue_number}. A prior attempt saved a",
+            f"cumulative patch (agent {agent_id_short}, iteration {iter_display},",
+            f"verdict {verdict}, saved {age_ago}). The daemon attempted to",
+            f"apply it with `git am --3way` and {k} files are in conflict.",
+            "",
+            "Your options:",
+            "1. Resolve the conflicts and `git am --continue`. Use this path",
+            "   if the prior work is a reasonable starting point and the",
+            "   conflicts are tractable.",
+            "2. `git am --abort` and start fresh from main. Use this path if",
+            "   the prior work is stale, wrong for the current issue",
+            "   understanding, or the conflict volume exceeds what's worth",
+            "   salvaging.",
+            "",
+            "Use your judgment. Both paths are valid — prior work is",
+            "advisory, not binding.",
+        ]
+        if conflict_files:
+            lines.append("")
+            lines.append("Conflict files:")
+            for path in conflict_files:
+                lines.append(f"  - {path}")
+        return "\n".join(lines)
 
     def _update_agent_phase(self, agent_id: str, phase: str) -> None:
         """UPDATE ``dispatcher.agents.phase`` so the scheduler + admin
@@ -7459,21 +7815,36 @@ class DispatcherDaemon:
         self,
         worktree: Path,
         patch_info: dict[str, Any],
+        *,
+        issue_number: int | None = None,
     ) -> None:
-        """Append an unapplied prior SHIP'd patch to ``prior_attempts.md``.
+        """Append an unapplied prior ralph patch to ``prior_attempts.md``.
 
         Called from :meth:`_run_ralph_phase` when
         :meth:`_apply_prior_ralph_patch` returned ``{"applied": False}``.
-        The patch couldn't be ``git am``'d onto the fresh worktree
-        (base drift, conflicts, corrupt patch), but the patch text is
-        still useful — ralph can see the *intended* diff and
-        cherry-pick or re-derive manually.
+
+        Two branches (#3026):
+
+        * **Conflict branch** (``patch_info["conflicted"] == True``):
+          the daemon LEFT the worktree in the ``git am --3way``
+          conflict state (per the #3026 conflict-handoff contract).
+          The section written is the structured "RESUME WITH
+          CONFLICT" block from
+          :meth:`_format_resume_with_conflict_block` — ralph reads
+          the heading and handles the ``git am --continue`` vs.
+          ``git am --abort`` decision on its own.
+
+        * **Invocation-failure branch** (``patch_info["conflicted"] ==
+          False``): ``git am`` failed before conflict resolution
+          started (invocation error, corrupt patch). The worktree is
+          aborted clean; the patch text is surfaced verbatim so ralph
+          can cherry-pick manually.
 
         Appends (creates if missing) to
         ``{worktree}/tmp/dispatcher-output/prior_attempts.md`` so the
         ralph skill's existing prior-attempts surfacing picks it up
-        verbatim. Best-effort — a write failure just means ralph misses
-        the patch context, which is the pre-#3012 status quo.
+        verbatim. Best-effort — a write failure just means ralph
+        misses the patch context, which is the pre-#3012 status quo.
         """
         output_dir = worktree / "tmp" / "dispatcher-output"
         try:
@@ -7485,19 +7856,44 @@ class DispatcherDaemon:
         patch_content = patch_info.get("patch_content") or ""
         patch_id = patch_info.get("patch_id") or "unknown"
         reason = patch_info.get("reason") or "unknown"
+        conflicted = bool(patch_info.get("conflicted"))
 
-        section = (
-            f"\n\n---\n\n## Prior SHIP'd patch (did NOT apply cleanly)\n\n"
-            f"**Patch id:** {patch_id}\n\n"
-            f"**Apply failure reason:** {reason}\n\n"
-            f"A previous agent SHIP'd this issue but the daemon did not reach "
-            f"``gh pr create`` (crash, deploy, timeout). The patch below was "
-            f"their final diff. ``git am`` could not replay it onto the fresh "
-            f"worktree (base drift, conflicts, etc.), so you are starting from "
-            f"clean origin/main — but you can cherry-pick / re-derive the "
-            f"relevant hunks manually from this text.\n\n"
-            f"```diff\n{patch_content}\n```\n"
-        )
+        if conflicted:
+            # Conflict-handoff path — surface the structured
+            # RESUME WITH CONFLICT prompt block so ralph's worker
+            # handles the continue-vs-abort judgment. See
+            # ``.claude/skills/task-v2-ralph/SKILL.md`` §"Resume with
+            # conflict" for the contract.
+            effective_issue = issue_number if issue_number is not None else 0
+            resume_block = self._format_resume_with_conflict_block(
+                effective_issue, patch_info
+            )
+            section = (
+                f"\n\n---\n\n## {resume_block.splitlines()[0]}\n\n"
+                f"**Patch id:** {patch_id}\n\n"
+                f"**Apply failure reason:** {reason}\n\n"
+                f"{resume_block}\n\n"
+                f"Reference — the patch bytes follow (the worktree already has"
+                f" these partially applied in the am-in-progress state; this"
+                f" block is for manual inspection if you choose `git am"
+                f" --abort`):\n\n"
+                f"```diff\n{patch_content}\n```\n"
+            )
+        else:
+            # Legacy non-conflict failure path (invocation error,
+            # corrupt patch). Worktree is clean; patch is advisory.
+            section = (
+                f"\n\n---\n\n## Prior ralph patch (did NOT apply cleanly)\n\n"
+                f"**Patch id:** {patch_id}\n\n"
+                f"**Apply failure reason:** {reason}\n\n"
+                f"A previous agent's ralph iteration was saved but the daemon"
+                f" could not ``git am`` it onto the fresh worktree (invocation"
+                f" error, corrupt patch). The worktree was aborted clean — you"
+                f" are starting from origin/main. The patch text below is"
+                f" advisory; cherry-pick or re-derive the relevant hunks"
+                f" manually if they look useful.\n\n"
+                f"```diff\n{patch_content}\n```\n"
+            )
 
         try:
             if target.exists():
@@ -7700,7 +8096,9 @@ class DispatcherDaemon:
         # text to prior_attempts.md so ralph can see the intended diff
         # and cherry-pick / re-derive manually.
         if prior_patch_info is not None and not prior_patch_info.get("applied"):
-            self._append_unapplied_patch_to_prior_attempts(worktree, prior_patch_info)
+            self._append_unapplied_patch_to_prior_attempts(
+                worktree, prior_patch_info, issue_number=issue_number
+            )
         self._log.info(
             "daemon.ralph_spawn",
             extra={
@@ -7711,6 +8109,9 @@ class DispatcherDaemon:
                 "prior_attempts_count": prior_attempts_count,
                 "prior_patch_applied": (
                     bool(prior_patch_info and prior_patch_info.get("applied"))
+                ),
+                "prior_patch_conflicted": (
+                    bool(prior_patch_info and prior_patch_info.get("conflicted"))
                 ),
                 "prior_patch_id": (
                     prior_patch_info.get("patch_id") if prior_patch_info else None

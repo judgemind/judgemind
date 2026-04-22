@@ -94,7 +94,26 @@ Read `{worktree}/tmp/dispatcher-input/ralph.json`. Required fields:
 
 If the file is missing or malformed, exit 0 with `verdict=BLOCKED, block_reason="input JSON missing or malformed"`.
 
-**Pre-applied prior SHIP'd patch (#3012).** The daemon may have `git am`-applied a prior SHIP'd patch onto your fresh worktree before invoking you, when a previous agent on this issue ran ralph to SHIP but the daemon never reached `gh pr create` (restart, push timeout, crash). If applied cleanly, HEAD already carries the prior agent's `WIP: ralph output` commit — iterate on top of the inherited diff (`git diff origin/main...HEAD`) rather than re-implementing from scratch. If `git am` failed (base drift, conflicts), HEAD is clean origin/main and the patch text appears in `prior_attempts.md` under a `## Prior SHIP'd patch (did NOT apply cleanly)` section so the worker can cherry-pick manually. Transparent from the skill's perspective — no new input field; the worktree and `prior_attempts.md` arrive pre-populated.
+**Pre-applied prior ralph patch (#3012, extended by #3026).** The daemon may have `git am --3way`-applied a prior ralph patch onto your fresh worktree before invoking you, when a previous agent on this issue produced cumulative work (per-iteration snapshot or terminal SHIP) but the daemon never reached `gh pr create` (restart, push timeout, crash, retry exhaustion). The unified resume lookup picks the most-recent patch for the `issue_number` within a 7-day TTL — any `agent_id`, any `verdict`. Three outcomes:
+
+1. **Clean apply.** HEAD carries the prior `WIP: ralph output` commit. Iterate on top of the inherited diff (`git diff origin/main...HEAD`) rather than re-implementing from scratch. No additional signal in `task.md`.
+2. **Conflict, am-in-progress left intact (#3026 conflict-handoff).** The daemon did **NOT** run `git am --abort`. The worktree is in the `git am --3way` conflict state (unmerged index entries, `.git/rebase-apply/` present, conflict markers in affected files). A structured **"RESUME WITH CONFLICT"** block appears at the top of `prior_attempts.md` (which the inner `/ralph` surfaces into `task.md`). The ralph worker **decides** whether to resolve + `git am --continue` or `git am --abort` + start fresh — see §"Resume with conflict" below for the contract.
+3. **Invocation error (no conflict resolution possible).** `git am` failed before conflict resolution (corrupt patch, subprocess error). The daemon aborted the am cleanly; HEAD is at origin/main. The patch text appears in `prior_attempts.md` under a `## Prior ralph patch (did NOT apply cleanly)` section so the worker can cherry-pick manually.
+
+Transparent from the skill's perspective — no new input field; the worktree state and `prior_attempts.md` arrive pre-populated.
+
+### Resume with conflict (#3026 contract)
+
+When `prior_attempts.md` contains a heading whose first line reads `RESUME WITH CONFLICT`, the inner `/ralph` worker enters a special first-iteration path:
+
+1. **Inspect the worktree.** `git status` shows unmerged paths; `git diff --diff-filter=U --name-only` lists them; `.git/rebase-apply/` is present. The block names the source `agent_id` (short), iteration number, verdict, and age; the conflict file list and count are also surfaced.
+2. **Decide: continue or abort.** This is the worker's judgment call. Guidelines:
+   - Choose **`git am --continue`** (after resolving conflicts) when: the prior work is recent (< 24 h) AND directly relevant to the current issue understanding AND the conflict volume is tractable (typically ≤ 5 files with surface-level conflicts) AND the acceptance criteria have not materially changed. Resolve the conflict markers, `git add` the resolved files, run `git am --continue`. The am-in-progress finalises into a commit on the branch; proceed into iteration 1 normally.
+   - Choose **`git am --abort`** when: the prior work is stale (> 48 h) OR wrong for the current understanding (issue comments contradict the prior diff) OR the conflict volume is unbounded (entire file rewrites on both sides) OR the prior verdict was `ABORT` already. Run `git am --abort`; HEAD returns to `origin/main`; proceed as a fresh first iteration.
+3. **Both paths are valid.** The RESUME WITH CONFLICT block is advisory — the daemon surfaces prior work so it isn't lost, not as a directive. A worker that chooses `--abort` is not wasting work; it's exercising the judgment the contract explicitly asks for.
+4. **After deciding**, the worker need not rewrite `task.md` — the block stays in `prior_attempts.md` as a breadcrumb either way; what matters is that the git state on disk reflects the chosen path before iteration 1 begins.
+
+The block's exact wording is fixed (daemon side — `DispatcherDaemon._format_resume_with_conflict_block`) so pattern-matching the literal `RESUME WITH CONFLICT` heading is safe.
 
 ---
 
