@@ -84,7 +84,15 @@ def _make_mock_conn() -> tuple[MagicMock, MagicMock]:
 
 
 def _make_worker(pg_dsn: str = "postgresql://localhost/test") -> tuple[IngestionWorker, MagicMock]:
-    """Return a worker with mocked OpenSearch and S3."""
+    """Return a worker with mocked OpenSearch and S3.
+
+    The framework LLM extractor (_get_framework_extractor) is stubbed to return
+    None so that _llm_split_document returns False immediately — preventing real
+    Anthropic API calls in tests that exercise the single-document path.  Tests
+    that specifically exercise the split/extraction path override this via
+    patch.object(worker, "_get_framework_extractor", ...) or
+    patch.object(worker, "_llm_split_document", ...) directly.
+    """
     redis_mock = MagicMock()
     os_mock = MagicMock()
     s3_mock = MagicMock()
@@ -98,6 +106,9 @@ def _make_worker(pg_dsn: str = "postgresql://localhost/test") -> tuple[Ingestion
         s3_client=s3_mock,
         archive_bucket="test-bucket",
     )
+    # Prevent real Anthropic API calls: when no framework extractor is available,
+    # _llm_split_document returns False and single-document processing proceeds.
+    worker._get_framework_extractor = lambda: None  # type: ignore[method-assign]
     return worker, os_mock
 
 
@@ -205,7 +216,10 @@ def test_process_event_indexes_new_fields_in_opensearch(
         motion_type="demurrer",
         case_title="In re Marriage of Smith",
     )
-    worker.process_event(event)
+    # Bypass LLM split so the event's own fields (motion_type, outcome) flow
+    # through to OpenSearch without being overridden by LLM extraction.
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
 
     os_mock.index.assert_called_once()
     indexed_doc = os_mock.index.call_args.kwargs["body"]
@@ -235,7 +249,8 @@ def test_process_event_passes_outcome_and_motion_type_from_event(
     mock_cur.rowcount = 1
 
     event = _make_event(outcome="denied", motion_type="demurrer")
-    worker.process_event(event)
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
 
     # Find the INSERT INTO rulings call
     ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]
@@ -299,7 +314,8 @@ def test_process_event_event_fields_override_regex(
         outcome="denied",
         motion_type="demurrer",
     )
-    worker.process_event(event)
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
 
     ruling_calls = [c for c in mock_cur.execute.call_args_list if "INTO rulings" in str(c)]
     assert len(ruling_calls) == 1
@@ -2139,7 +2155,8 @@ def test_process_event_llm_matches_ruling_by_case_number(
         case_title=None,
         ruling_text="Some ruling text",
     )
-    worker.process_event(event)
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
 
     # Should use the second ruling (matching case_number), not the first
     ruling_calls = [c for c in mock_cur.execute.call_args_list if "INSERT INTO rulings" in str(c)]

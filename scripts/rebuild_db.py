@@ -951,6 +951,55 @@ def reset_opensearch_index(os_url: str) -> None:
         )
 
 
+def delete_opensearch_docs_for_county(os_url: str, county: str) -> int:
+    """Delete OS docs for one county before per-county DB rebuild.
+
+    Pairs with reset_derived_tables_for_county(): the global OS index can't
+    be reset (would wipe other counties), and upsert-by-ruling_id only
+    refreshes content for ruling_ids that survive the rebuild. Without this,
+    rulings dropped during rebuild remain as orphans in OS. See #2568.
+
+    Returns the number of OS docs deleted (0 if index missing).
+    """
+    from opensearchpy import OpenSearch
+
+    os_kwargs: dict = {
+        "hosts": [os_url],
+        "timeout": 30,
+        "max_retries": 3,
+        "retry_on_timeout": True,
+    }
+    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
+    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
+    if os_user and os_pass:
+        os_kwargs["http_auth"] = (os_user, os_pass)
+    client = OpenSearch(**os_kwargs)
+
+    index_name = "tentative_rulings_v1"
+    if not client.indices.exists(index=index_name):
+        logger.info(
+            "OpenSearch index does not exist, nothing to delete",
+            index=index_name,
+            county=county,
+        )
+        return 0
+
+    response = client.delete_by_query(
+        index=index_name,
+        body={"query": {"term": {"county": county}}},
+        refresh=True,
+        conflicts="proceed",
+    )
+    deleted = int(response.get("deleted", 0)) if isinstance(response, dict) else 0
+    logger.info(
+        "Deleted per-county OpenSearch docs",
+        index=index_name,
+        county=county,
+        deleted=deleted,
+    )
+    return deleted
+
+
 def _fetch_rosters(
     conn: psycopg.Connection,
     s3_client: Any,
@@ -1147,13 +1196,17 @@ def main() -> None:
     # Orange, Riverside, Fresno) is safe.
     if args.reset:
         if args.county:
-            # Skip the OpenSearch index reset — the global index self-heals
-            # as new rulings are indexed during the rebuild.  See #2465.
+            # Delete the county's OS docs FIRST so a failure there aborts
+            # before we reset the DB — otherwise we'd be left with a fresh
+            # DB and stale OS orphans.  See #2568.
+            if os_url:
+                delete_opensearch_docs_for_county(os_url, args.county)
+            else:
+                logger.info(
+                    "OPENSEARCH_URL not set — skipping per-county "
+                    "OpenSearch delete-by-query"
+                )
             reset_derived_tables_for_county(conn, args.state, args.county)
-            logger.info(
-                "Per-county reset — skipping OpenSearch index reset "
-                "(global index self-heals on re-index)"
-            )
         else:
             reset_derived_tables(conn)
             if os_url:
