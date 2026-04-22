@@ -864,14 +864,13 @@ class TestCaptureThenApplyRoundtrip:
         _git(agent_a, "commit", "-m", "WIP: ralph output", "--quiet")
 
         # Capture the patch the way ``_capture_and_persist_ralph_patch``
-        # does — ``git format-patch -1 HEAD --stdout``.
-        result = subprocess.run(
-            ["git", "-C", str(agent_a), "format-patch", "-1", "HEAD", "--stdout"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        patch_bytes = result.stdout
+        # does — ``git format-patch -1 HEAD --stdout``. Routed through
+        # ``_git`` so the hermetic env (no user.email / user.name lookup)
+        # propagates — CI runners don't set a global identity, and
+        # format-patch inherits the committer env from the caller.
+        patch_bytes = _git(
+            agent_a, "format-patch", "-1", "HEAD", "--stdout", check=True
+        ).stdout
         assert "new_file.py" in patch_bytes
         assert "WIP: ralph output" in patch_bytes
 
@@ -884,12 +883,13 @@ class TestCaptureThenApplyRoundtrip:
         patch_file = agent_b / "prior-ralph.patch"
         patch_file.write_text(patch_bytes)
 
-        am = subprocess.run(
-            ["git", "-C", str(agent_b), "am", "--3way", str(patch_file)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        # ``git am`` re-uses committer/author from the patch header but
+        # still requires a default identity to be resolvable. Route
+        # through ``_git`` so the test env's GIT_AUTHOR_* /
+        # GIT_COMMITTER_* envs apply — matches the hermetic pattern in
+        # test_daemon_amend_commit.py and avoids the "empty ident name"
+        # failure on CI runners that don't set a global git identity.
+        am = _git(agent_b, "am", "--3way", str(patch_file), check=False)
         assert am.returncode == 0, (
             f"git am failed: stderr={am.stderr!r} stdout={am.stdout!r}"
         )
