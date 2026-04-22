@@ -94,23 +94,28 @@ Write `{worktree}/tmp/dispatcher-output/ralph.json` with these fields, then exit
 {
   "agent_id": "<echo>",
   "issue_number": <int>,
-  "verdict": "SHIP" | "BLOCKED",
+  "verdict": "SHIP" | "AC_INFEASIBLE" | "BLOCKED",
   "iterations_used": <int, 1..max_iterations>,
   "block_reason": null | "<string>",
   "changed_files": ["<path>", ...],
+  "infeasible_acs": [ {"index": <int>, "evidence": "<paragraph>"} ],
   "summary": "<1-3 sentence implementation summary>",
   "ralph_done_path": "<worktree>/tmp/ralph/ralph-done.txt" | null,
   "review_log_path": "<worktree>/tmp/ralph/review-log.jsonl" | null
 }
 ```
 
-Always exit 0. BLOCKED is not a subprocess error — the daemon reads verdict from JSON.
+Always exit 0. BLOCKED and AC_INFEASIBLE are not subprocess errors — the daemon reads `verdict` from JSON.
 
 `iterations_used` is `1..max_iterations` when the ralph loop runs (which is every non-BLOCKED path). The pre-#2845 short-circuit that emitted `iterations_used=0` for non-testable types no longer exists.
 
-`ralph_done_path` and `review_log_path` are non-null whenever the ralph loop ran (every SHIP path). They are `null` only when Step 0's Task-tool availability check fails and the skill exits BLOCKED without spawning a worker.
+`ralph_done_path` and `review_log_path` are non-null whenever the ralph loop ran (every SHIP / AC_INFEASIBLE path). They are `null` only when Step 0's Task-tool availability check fails and the skill exits BLOCKED without spawning a worker.
+
+`infeasible_acs` MUST be present and non-empty when `verdict == "AC_INFEASIBLE"`; absent or `[]` on SHIP/BLOCKED. Each entry is `{"index": <1-based into the issue body's acceptance-criteria list>, "evidence": "<one paragraph naming the missing symbol / contradicting AC / out-of-scope dependency>"}`. An array (not a single object) lets ralph flag multiple ACs in one pass — a single root cause (e.g. two ACs both referencing the same non-existent CLI flag) should not force sequential re-plan cycles. See the inner `/ralph` skill's §"AC_INFEASIBLE emit rules" for the positive triggers and negative guardrails the worker + reviewer apply.
 
 On SHIP: ralph has committed the implementation diff to the worktree branch with the placeholder message `"WIP: ralph output"` (see Step 2.5), AND the local `.githooks/pre-push` hook passed against that commit. The daemon's `summary` phase reads the diff via `git diff origin/main...HEAD`; the daemon's `push_and_pr` phase amends ralph's commit with summary's conventional-commits message (`git commit --amend -F <file>`) and pushes. Issue #2971.
+
+On AC_INFEASIBLE: ralph did not ship a diff. The daemon detects the verdict in post-exit parse, writes a `dispatcher.failures(category='ralph_ac_infeasible', details={infeasible_acs, agent_id, issue_number})` row, and routes the agent to the diagnoser (Tier 3 — spec §8). Summary and push_and_pr are skipped. Whatever partial work landed on the worktree branch is discarded when the daemon drops the worktree on diagnoser handoff.
 
 On BLOCKED: the working tree may contain partial work (committed or uncommitted). The daemon decides whether to retry (fresh worktree) or diagnose (`§8` Tier 2/3 flow).
 
@@ -301,8 +306,11 @@ Map to output `verdict`:
 | ralph-done.txt | output.verdict | block_reason |
 |---|---|---|
 | `SHIP` | `SHIP` | `null` |
+| `AC_INFEASIBLE` | `AC_INFEASIBLE` | `null` (populate `infeasible_acs` instead) |
 | `REVISE` | `BLOCKED` | `max_iterations reached without SHIP` |
 | `BLOCKED` | `BLOCKED` | `"<text from ralph-done.txt body>"` |
+
+When `ralph-done.txt` is `AC_INFEASIBLE`, the inner `/ralph` skill has also written `{worktree}/tmp/ralph/infeasible-acs.json` — a JSON array of `{index, evidence}` objects (see the inner `/ralph` skill's AC_INFEASIBLE emit path). Read that file and pass it through verbatim as the `infeasible_acs` field of the output JSON. On any other verdict the file is absent — emit `"infeasible_acs": []` so downstream consumers can rely on the field's presence.
 
 If Step 2.5 overrode the verdict to BLOCKED (pre-push hook failed and max_iterations was reached on the re-invocation path), use the Step 2.5 `block_reason` instead of the table above.
 

@@ -641,7 +641,8 @@ class TestCategoryDisplayNames:
     def test_category_display_names_map_contents(self) -> None:
         """Lock the full ``_CATEGORY_DISPLAY_NAMES`` map contents so a
         typo or accidental deletion on any row surfaces immediately.
-        Issue #2902 added three push-failure sub-kinds."""
+        Issue #2902 added three push-failure sub-kinds. Issue #3010
+        added two AC-infeasibility categories."""
         assert daemon.DispatcherDaemon._CATEGORY_DISPLAY_NAMES == {
             "subprocess_turn_limit": "turn limit reached",
             "subprocess_crash": "subprocess crashed",
@@ -653,6 +654,9 @@ class TestCategoryDisplayNames:
             "push_failed": "git push failed",
             "pre_push_hook_rejected": "pre-push hook rejected",
             "git_push_network": "git push network error",
+            # AC-infeasibility (#3010).
+            "ralph_ac_infeasible": "AC infeasible (ralph)",
+            "summary_ac_infeasible": "AC infeasible (summary)",
         }
 
     def test_push_failed_renders_as_git_push_failed(self, tmp_path: Path) -> None:

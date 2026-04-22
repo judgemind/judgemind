@@ -713,6 +713,16 @@ FAILURE_CATEGORY_SUBPROCESS_AUTH_FAIL = "subprocess_auth_fail"
 #: fixes "the CI-fixing skill couldn't fix CI three times in a row".
 FAILURE_CATEGORY_CI_RED_AFTER_RETRIES = "ci_red_after_retries"
 
+#: Tier-3 failure categories from spec §8 for AC-infeasibility (issue
+#: #3010). Both are written by post-exit parse of the structured phase
+#: output JSON — ``ralph_ac_infeasible`` when ``ralph.json.verdict ==
+#: "AC_INFEASIBLE"`` and ``summary_ac_infeasible`` when
+#: ``summary.json.verdict == "AC_INFEASIBLE"``. Neither has a mechanical
+#: retry (the AC is structurally wrong, not flaky), so both route
+#: directly to the diagnoser for ``reissue`` / ``escalate`` / ``close``.
+FAILURE_CATEGORY_RALPH_AC_INFEASIBLE = "ralph_ac_infeasible"
+FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE = "summary_ac_infeasible"
+
 #: Git-push failure categories for the ``push_and_pr`` phase (issue #2902).
 #: ``push_failed`` is the generic catch-all; the two sub-kinds are
 #: classifier-derived from stderr content via ``_classify_push_failure``.
@@ -878,13 +888,19 @@ TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
     }
 )
 
-#: Tier-3 categories that diagnose on first occurrence (spec §8). Today
-#: only ``ci_red_after_retries`` qualifies — the 3B fix-CI loop has
-#: already burned its 3 mechanical retries, so there is no reliable
-#: mechanical remedy left.
+#: Tier-3 categories that diagnose on first occurrence (spec §8).
+#: ``ci_red_after_retries`` — the 3B fix-CI loop has already burned its
+#: 3 mechanical retries, so there is no reliable mechanical remedy left.
+#: ``ralph_ac_infeasible`` / ``summary_ac_infeasible`` (issue #3010) —
+#: ralph or summary determined one or more ACs are structurally
+#: impossible (non-existent symbol, self-contradiction, out-of-scope
+#: dependency); no mechanical retry fixes a malformed AC, so the
+#: diagnoser picks ``reissue`` / ``escalate`` / ``close`` immediately.
 TIER_3_CATEGORIES: frozenset[str] = frozenset(
     {
         FAILURE_CATEGORY_CI_RED_AFTER_RETRIES,
+        FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+        FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
     }
 )
 
@@ -4788,6 +4804,12 @@ class DispatcherDaemon:
         "push_failed": "git push failed",
         "pre_push_hook_rejected": "pre-push hook rejected",
         "git_push_network": "git push network error",
+        # AC-infeasibility (#3010). Tier 3 — routed directly to the
+        # diagnoser. Rendered as "AC infeasible (ralph)" /
+        # "AC infeasible (summary)" so operators see where in the
+        # pipeline the infeasibility was detected.
+        "ralph_ac_infeasible": "AC infeasible (ralph)",
+        "summary_ac_infeasible": "AC infeasible (summary)",
     }
 
     @staticmethod
@@ -7044,6 +7066,61 @@ class DispatcherDaemon:
             },
         )
 
+        if verdict == "AC_INFEASIBLE":
+            # Issue #3010 — ralph surfaced a structurally-impossible AC.
+            # Route to the diagnoser (Tier 3) immediately; no summary,
+            # no push_and_pr, no mechanical retry. Ralph's worktree
+            # diff (if any) is discarded on diagnoser handoff.
+            infeasible_acs = ralph_output.get("infeasible_acs") or []
+            # Normalize to a list of dicts with int-coerced indices so
+            # the diagnoser's context bundle has a clean shape even if
+            # the skill emitted strings or a single dict.
+            normalized_infeasible: list[dict[str, Any]] = []
+            if isinstance(infeasible_acs, list):
+                for entry in infeasible_acs:
+                    if not isinstance(entry, dict):
+                        continue
+                    idx = entry.get("index")
+                    try:
+                        idx_int = int(idx) if idx is not None else None
+                    except (TypeError, ValueError):
+                        idx_int = None
+                    evidence = entry.get("evidence")
+                    normalized_infeasible.append(
+                        {
+                            "index": idx_int,
+                            "evidence": str(evidence) if evidence is not None else "",
+                        }
+                    )
+            self._log.info(
+                "daemon.ralph_ac_infeasible",
+                extra={
+                    "event": "ralph_ac_infeasible",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "infeasible_acs_count": len(normalized_infeasible),
+                },
+            )
+            self._write_failure(
+                agent_id=agent_id,
+                category=FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+                detected_by="ralph_output_parse",
+                details={
+                    "infeasible_acs": normalized_infeasible,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="failed",
+                phase="ralph",
+                exit_code=exit_code,
+                issue_number=issue_number,
+            )
+            return False
+
         if verdict != "SHIP":
             self._log.info(
                 "daemon.ralph_not_ship",
@@ -7206,6 +7283,64 @@ class DispatcherDaemon:
                 "exit_code": exit_code,
             },
         )
+
+        summary_verdict = str(summary_output.get("verdict") or "").upper()
+        if summary_verdict == "AC_INFEASIBLE":
+            # Issue #3010 — summary found a structurally-impossible AC
+            # after ralph already shipped. Ralph's diff is discarded;
+            # daemon writes a failure row and routes to the diagnoser
+            # (Tier 3). The diagnoser bundle carries ralph's diff +
+            # summary's AC mapping so the reissue rewrite can align
+            # with what ralph already built.
+            infeasible_acs_raw = summary_output.get("infeasible_acs") or []
+            normalized_infeasible: list[dict[str, Any]] = []
+            if isinstance(infeasible_acs_raw, list):
+                for entry in infeasible_acs_raw:
+                    if not isinstance(entry, dict):
+                        continue
+                    idx = entry.get("index")
+                    try:
+                        idx_int = int(idx) if idx is not None else None
+                    except (TypeError, ValueError):
+                        idx_int = None
+                    evidence = entry.get("evidence")
+                    normalized_infeasible.append(
+                        {
+                            "index": idx_int,
+                            "evidence": str(evidence) if evidence is not None else "",
+                        }
+                    )
+            self._log.info(
+                "daemon.summary_ac_infeasible",
+                extra={
+                    "event": "summary_ac_infeasible",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "infeasible_acs_count": len(normalized_infeasible),
+                },
+            )
+            self._write_failure(
+                agent_id=agent_id,
+                category=FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
+                detected_by="summary_output_parse",
+                details={
+                    "infeasible_acs": normalized_infeasible,
+                    "deferred_acs": summary_output.get("deferred_acs") or [],
+                    "ralph_diff": git_diff,
+                    "summary_ac_mapping": summary_output.get("ac_mapping") or [],
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="failed",
+                phase="summary",
+                exit_code=exit_code,
+                issue_number=issue_number,
+            )
+            return False
 
         unmet = summary_output.get("unmet_criteria") or []
         if unmet:
@@ -9313,6 +9448,35 @@ class DispatcherDaemon:
         deploy_status = self._select_deploy_status(deploy_runs)
         change_type = self._infer_change_type(deploy_runs)
 
+        # Issue #3010 — fetch summary's persisted output so we can thread
+        # ``deferred_acs`` through to the verify skill. The verify skill
+        # runs the deferred ACs first (summary skipped them pre-merge)
+        # and labels each as "deferred (marker|heuristic) → pass|fail"
+        # in the evidence comment. Absent/empty on pre-#3010 agents and
+        # on no-deploy types — verify treats the universe as "every AC,
+        # no labeling" in that case (see task-v2-verify SKILL.md).
+        summary_persisted = self._fetch_phase_output(agent_id, "summary") or {}
+        deferred_acs_raw = summary_persisted.get("deferred_acs") or []
+        deferred_acs: list[dict[str, Any]] = []
+        if isinstance(deferred_acs_raw, list):
+            for entry in deferred_acs_raw:
+                if not isinstance(entry, dict):
+                    continue
+                idx = entry.get("index")
+                try:
+                    idx_int = int(idx) if idx is not None else None
+                except (TypeError, ValueError):
+                    idx_int = None
+                reason = str(entry.get("reason") or "")
+                verify_instruction = str(entry.get("verify_instruction") or "")
+                deferred_acs.append(
+                    {
+                        "index": idx_int,
+                        "reason": reason,
+                        "verify_instruction": verify_instruction,
+                    }
+                )
+
         verify_input = {
             "agent_id": agent_id,
             "issue_number": issue_number,
@@ -9324,6 +9488,7 @@ class DispatcherDaemon:
             "merged_commit_sha": merge_sha,
             "worktree_path": str(worktree),
             "repo_root": str(worktree),
+            "deferred_acs": deferred_acs,
         }
         self._write_phase_input(worktree, "verify", verify_input)
 
@@ -12497,7 +12662,40 @@ class DispatcherDaemon:
         if isinstance(details, dict):
             ci_log_url = details.get("ci_log_url") or None
 
-        return {
+        # Issue #3010 — AC-infeasibility context extras. The diagnoser
+        # skill's per-category guidance for ``ralph_ac_infeasible`` and
+        # ``summary_ac_infeasible`` reads these fields; on other
+        # categories they stay absent so the bundle shape is unchanged.
+        infeasible_acs: list[dict[str, Any]] | None = None
+        deferred_acs: list[dict[str, Any]] | None = None
+        ralph_diff: str | None = None
+        summary_ac_mapping: list[dict[str, Any]] | None = None
+        issue_acceptance_criteria: list[str] | None = None
+        if candidate["category"] in (
+            FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+            FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
+        ):
+            if isinstance(details, dict):
+                raw_inf = details.get("infeasible_acs") or []
+                if isinstance(raw_inf, list):
+                    infeasible_acs = [e for e in raw_inf if isinstance(e, dict)]
+            if issue_body:
+                issue_acceptance_criteria = self._extract_acceptance_criteria(
+                    issue_body
+                )
+            if candidate["category"] == FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE:
+                if isinstance(details, dict):
+                    raw_def = details.get("deferred_acs") or []
+                    if isinstance(raw_def, list):
+                        deferred_acs = [e for e in raw_def if isinstance(e, dict)]
+                    raw_diff = details.get("ralph_diff")
+                    if isinstance(raw_diff, str):
+                        ralph_diff = raw_diff
+                    raw_map = details.get("summary_ac_mapping") or []
+                    if isinstance(raw_map, list):
+                        summary_ac_mapping = [e for e in raw_map if isinstance(e, dict)]
+
+        bundle: dict[str, Any] = {
             "agent_id": agent_id,
             "failure_id": failure_id,
             "failure_category": candidate["category"],
@@ -12514,6 +12712,17 @@ class DispatcherDaemon:
             "prior_mechanical_fix": prior_mechanical_fix,
             "worktree_path": worktree_path,
         }
+        if infeasible_acs is not None:
+            bundle["infeasible_acs"] = infeasible_acs
+        if issue_acceptance_criteria is not None:
+            bundle["issue_acceptance_criteria"] = issue_acceptance_criteria
+        if deferred_acs is not None:
+            bundle["deferred_acs"] = deferred_acs
+        if ralph_diff is not None:
+            bundle["ralph_diff"] = ralph_diff
+        if summary_ac_mapping is not None:
+            bundle["summary_ac_mapping"] = summary_ac_mapping
+        return bundle
 
     def _insert_pending_diagnosis(
         self,
