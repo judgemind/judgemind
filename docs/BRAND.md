@@ -50,6 +50,32 @@ is a shadcn hover-surface gray. Use `text-brand-accent`.
 | Red 700 | `#b91c1c` | Error, destructive, "denied" outcomes |
 | Stone 500 | `#78716c` | Neutral/muted outcomes |
 
+### Using stone in code
+
+The visual palette is stone, but `.tsx` code must **not** reference
+Tailwind `stone-*` classes directly (e.g. `bg-stone-100`, `text-stone-700`).
+Those classes bypass the theming layer and break dark mode.
+Use the semantic tokens instead — they resolve to the correct stone shade in
+light mode and shift automatically in dark mode via CSS custom properties in
+`globals.css` (no per-component `dark:bg-stone-900` rules needed):
+
+```tsx
+// DO — semantic tokens (stone shade shown in comment)
+<p className="text-foreground">…</p>          {/* stone-900 light / stone-50 dark */}
+<p className="text-muted-foreground">…</p>    {/* stone-500 */}
+<div className="bg-muted">…</div>             {/* stone-100 light / stone-800 dark */}
+<div className="bg-secondary">…</div>         {/* stone-100 light / stone-800 dark */}
+<div className="bg-card">…</div>              {/* white light / stone-950 dark */}
+<div className="border-border">…</div>        {/* stone-300 light / stone-700 dark */}
+
+// DON'T — raw stone classes fail CI the same way bg-gray-200 does
+<div className="bg-stone-200">…</div>  // ✗ blocked by check-hardcoded-colors.sh
+```
+
+`scripts/check-hardcoded-colors.sh` (introduced in #1444) guards `slate`,
+`gray`, `zinc`, `stone`, and `neutral` class names in `packages/web/src/**/*.tsx`.
+A `bg-stone-200` in production code will fail CI.
+
 ## Design Principles
 
 1. **Function first.** The chrome gets out of the way. Content — rulings, case numbers, judge names — is the product.
