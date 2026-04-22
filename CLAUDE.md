@@ -36,7 +36,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Watch CI to completion (`gh run watch`) before doing anything else after pushing.
 - Create a PR immediately after your first push to a branch.
 - Re-fetch GitHub issue or PR state before acting on it if more than a few minutes have elapsed.
-- Set `timeout: 1200000` (20 minutes) on Bash commands that may take longer than 2 minutes: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, any data-processing script.
+- Set `timeout: 1200000` (20 minutes) on Bash commands that may take longer than 2 minutes: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh --script`, `scripts/rebuild_db.sh`, any data-processing script.
 
 ## Enforced Rules — Automated Checks
 

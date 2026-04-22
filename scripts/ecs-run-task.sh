@@ -21,6 +21,7 @@
 #   - AWS CLI v2
 #   - Credentials for the judgemind AWS account (155326049300)
 #   - The ingestion worker task definition must exist
+# When invoked from a Claude Code Bash tool call, set `timeout: 1200000` (20 minutes) — oneshot reingests commonly exceed the 2-minute default.
 #
 # Usage:
 #   scripts/ecs-run-task.sh <script-path> [-- script-args...]

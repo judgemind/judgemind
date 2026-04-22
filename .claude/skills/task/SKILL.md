@@ -747,7 +747,7 @@ Worktree cleanup is handled automatically by Claude Code when the agent exits.
 - **All temp files go in `{worktree}/tmp/`**, not `/tmp/`.
 - **Multi-line Python always goes in a `.py` file**, never `-c '...'`.
 - **No `run_in_background`.** All commands — CI watches, test suites, deploy watches, and reviewer invocations — must run in the foreground. Subagents are already background tasks from the parent's perspective. Further backgrounding causes `<task-notification>` messages to surface in the wrong context, leading to confusion and lost results.
-- **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, and any data-processing script.
+- **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh --script`, `scripts/rebuild_db.sh`, and any data-processing script.
 - **After any context reset, run §A.0 / §B.0 recovery** — `{worktree}/scripts/check-task-recovery.sh {worktree}` is the authoritative "am I done?" check.
 - **Prefer MCP for reads** (`mcp__github__get_issue`, `get_pull_request`, `list_issues`, `list_pull_requests`, `get_pull_request_status`). Keep `gh` for writes and for workflow-run operations. See `docs/agent/github-api-access.md`.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.
