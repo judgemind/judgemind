@@ -24,9 +24,11 @@ from pathlib import Path
 import pytest
 
 from framework.llm_extractor import (
+    _sanitize_riverside_rulings,
     _sanitize_title_motion_tail,
     _truncate_cross_case_ruling_text,
 )
+from framework.llm_schema import ExtractedRuling
 from framework.prompts.riverside import RIVERSIDE_SYSTEM_PROMPT
 
 FIXTURES = Path(__file__).parent / "fixtures" / "riv_multi_case_contaminated.json"
@@ -155,6 +157,42 @@ def test_truncate_cross_case_ruling_text_no_sibling_case_number_is_noop() -> Non
         case_number_re=_RIVERSIDE_CASE_NUMBER_RE,
     )
     assert result == text
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_riverside_rulings — orchestrator covers logger + model_copy paths
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_riverside_rulings_cleans_contaminated_title() -> None:
+    """_sanitize_riverside_rulings applies title sanitizer and calls model_copy (#2564)."""
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2105192",
+        extracted_case_title=(
+            "WILLARD VS HYUNDAI MOTOR AMERICA vs. MOTION FOR ATTORNEY'S FEES BY JAMES WILLARD"
+        ),
+        ruling_text="Tentative Ruling: GRANT.",
+    )
+    result = _sanitize_riverside_rulings([ruling], case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    assert result[0].extracted_case_title == "WILLARD VS HYUNDAI MOTOR AMERICA"
+    assert result[0].ruling_text == "Tentative Ruling: GRANT."
+
+
+def test_sanitize_riverside_rulings_truncates_cross_case_ruling_text() -> None:
+    """_sanitize_riverside_rulings truncates ruling_text at a foreign case number (#2564)."""
+    text = (
+        "Tentative Ruling: DENY.\n\n"
+        "Analysis: The motion lacks merit.\n\n"
+        "2.\nCVRI2500736\nSERNA VS JOHNSON\nTentative: GRANT."
+    )
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500796",
+        extracted_case_title="Linton v. Joshua Linton",
+        ruling_text=text,
+    )
+    result = _sanitize_riverside_rulings([ruling], case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    assert "CVRI2500736" not in result[0].ruling_text
+    assert result[0].ruling_text.startswith("Tentative Ruling: DENY.")
 
 
 # ---------------------------------------------------------------------------
