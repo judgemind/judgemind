@@ -33,7 +33,8 @@ types.setTypeParser(1184, (val: string) => val);
 
 const pool = new Pool({
   connectionString:
-    process.env.DATABASE_URL ?? 'postgresql://judgemind:localdev@localhost:5432/judgemind',
+    process.env.TEST_DATABASE_URL ??
+    'postgresql://judgemind:localdev@localhost:5432/judgemind_test',
 });
 
 // Unique marker suffix — lets us clean up only rows we inserted even if the

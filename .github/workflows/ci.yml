@@ -443,7 +443,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
+      # TEST_DATABASE_URL (not DATABASE_URL) — integration tests read the
+      # test-only var so `npm test` run in any operational env (e.g. a ralph
+      # subagent inside the dispatcher container) cannot accidentally migrate
+      # the operational dev RDS database. See #3006.
+      TEST_DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
       OPENSEARCH_URL: http://localhost:9200
     steps:
       - uses: actions/checkout@v6
@@ -453,7 +457,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Run database migrations
-        run: npm run db:migrate
+        # Run migrations directly against TEST_DATABASE_URL. We do NOT reuse
+        # `npm run db:migrate` (which wraps seed-and-migrate.mjs) because that
+        # script reads `DATABASE_URL` and is the deploy migration path (#3006
+        # scope boundary — do not touch the deploy path). node-pg-migrate is
+        # configured via .node-pg-migraterc to read DATABASE_URL, so we pass
+        # TEST_DATABASE_URL through it for this step only.
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: npx node-pg-migrate up --no-timestamp
       - name: Lint
         run: npm run lint
       - name: Type check

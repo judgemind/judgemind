@@ -34,10 +34,16 @@ npm install
 npm run lint
 npm run typecheck
 
-# Run tests
+# Run tests — unit-only if TEST_DATABASE_URL unset or unreachable,
+# full suite (unit + integration) if TEST_DATABASE_URL points at a
+# reachable test DB. See #3006 and docs/agent/local-dev.md.
 npm test
 
-# Run migrations
+# Run integration tests only (requires TEST_DATABASE_URL — host must be
+# in the {localhost, 127.0.0.1, postgres} allowlist)
+TEST_DATABASE_URL=postgres://judgemind:localdev@localhost:5432/judgemind_test npm run test:integration
+
+# Run migrations (deploy / operational path — uses DATABASE_URL)
 DATABASE_URL=... npm run db:migrate
 
 # Start dev server

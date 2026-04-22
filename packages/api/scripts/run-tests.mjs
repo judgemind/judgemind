@@ -2,20 +2,31 @@
 /**
  * Test runner that detects DB availability and runs the appropriate test scope.
  *
- * - DB reachable with SSL bypass: runs all tests (unit + integration) with
- *   NODE_TLS_REJECT_UNAUTHORIZED=0 so pg pool connections succeed against RDS.
- * - DB not reachable: runs unit tests only (integration tests require a DB).
+ * - TEST_DATABASE_URL set AND reachable: runs all tests (unit + integration)
+ *   with NODE_TLS_REJECT_UNAUTHORIZED=0 so pg pool connections succeed against
+ *   RDS-style self-signed certs (used locally against RDS tunnels; CI's
+ *   postgres service container uses plain TCP and is unaffected).
+ * - TEST_DATABASE_URL unset OR unreachable: runs unit tests only (integration
+ *   tests require a DB).
  *
  * This is the script wired to `npm test` (the pre-push hook target). The
  * `test:unit` and `test:integration` scripts in package.json are unchanged and
  * used by developers for targeted runs.
  *
+ * WHY TEST_DATABASE_URL (#3006): the operational `DATABASE_URL` env var is
+ * exposed to many service containers (including the dispatcher Fargate task,
+ * which spawns ralph subagents). Reading `DATABASE_URL` here would cause
+ * ralph's pre-push `npm test` to probe — and if reachable, migrate — the
+ * operational dev RDS database. Using a dedicated `TEST_DATABASE_URL` that
+ * is only set in test environments (local dev, CI) keeps test DB setup
+ * strictly out of the operational code path.
+ *
  * SSL note: NODE_TLS_REJECT_UNAUTHORIZED=0 is acceptable here because:
  *   1. This is test code, not production.
  *   2. CI uses a local postgres container (no SSL), so the flag is a no-op there.
- *   3. In Fargate (against dev RDS), the self-signed cert chain is a known
- *      operational reality — strict cert validation adds no security value in
- *      the test context.
+ *   3. In any test scenario we point at RDS, the self-signed cert chain is a
+ *      known operational reality — strict cert validation adds no security
+ *      value in the test context.
  */
 
 import { execSync, spawnSync } from 'node:child_process';
@@ -26,16 +37,15 @@ import pg from 'pg';
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const apiDir = join(__dirname, '..');
 
-const DB_URL =
-  process.env.DATABASE_URL ?? 'postgresql://judgemind:localdev@localhost:5432/judgemind';
+const TEST_DB_URL = process.env.TEST_DATABASE_URL;
 
 /**
  * Check DB reachability using a permissive SSL connection (3s timeout).
  * Returns true if a query succeeds, false otherwise.
  */
-async function isDbAvailable() {
+async function isDbAvailable(url) {
   const pool = new pg.Pool({
-    connectionString: DB_URL,
+    connectionString: url,
     ssl: { rejectUnauthorized: false },
     connectionTimeoutMillis: 3000,
   });
@@ -49,7 +59,10 @@ async function isDbAvailable() {
   }
 }
 
-const dbAvailable = await isDbAvailable();
+// If TEST_DATABASE_URL is unset, skip the reachability probe entirely and go
+// straight to unit-only mode. This is the guardrail that keeps ralph's
+// pre-push test run from ever touching an operational DB (#3006).
+const dbAvailable = TEST_DB_URL ? await isDbAvailable(TEST_DB_URL) : false;
 
 if (dbAvailable) {
   console.log('DB available — running all tests (unit + integration)');
@@ -58,8 +71,8 @@ if (dbAvailable) {
 }
 
 // When DB is available, set NODE_TLS_REJECT_UNAUTHORIZED=0 so that pg Pool
-// instances inside individual integration test files can also connect to RDS
-// without failing on the self-signed certificate chain. This env var is
+// instances inside individual integration test files can also connect
+// without failing on self-signed certificate chains. This env var is
 // inherited by vitest worker processes.
 const env = { ...process.env };
 if (dbAvailable) {

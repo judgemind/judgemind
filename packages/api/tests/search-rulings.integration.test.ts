@@ -3,7 +3,8 @@
  *
  * Requires both PostgreSQL and OpenSearch to be running locally.
  * OpenSearch must be accessible at http://localhost:9200 (or OPENSEARCH_URL).
- * PostgreSQL must be accessible at the standard DATABASE_URL.
+ * PostgreSQL must be accessible at TEST_DATABASE_URL (see #3006 for why this
+ * is distinct from the operational DATABASE_URL).
  *
  * The tests seed data into both PG (court, judge, case, ruling) and OpenSearch
  * (tentative_rulings index), then exercise the GraphQL query with various
@@ -37,7 +38,8 @@ types.setTypeParser(1184, (val: string) => val);
 
 const pool = new Pool({
   connectionString:
-    process.env.DATABASE_URL ?? 'postgresql://judgemind:localdev@localhost:5432/judgemind',
+    process.env.TEST_DATABASE_URL ??
+    'postgresql://judgemind:localdev@localhost:5432/judgemind_test',
 });
 
 const osClient = new Client({
