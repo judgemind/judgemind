@@ -3,9 +3,11 @@
 #
 # Covers the three documented exit codes of the wrapper (and the underlying
 # preflight_no_duplicate_pr function it delegates to):
-#   0 — duplicate PR found; the existing PR number is printed to stdout
-#   1 — no duplicate PR
-#   2 — error (missing argument, gh CLI unavailable, or API failure)
+#   0 — duplicate PR found; a "duplicate:" line is printed to stdout with the
+#       existing PR number
+#   1 — no duplicate PR; an "ok:" line is printed to stdout
+#   2 — error (missing argument, gh CLI unavailable, or API failure); an
+#       "error:" line is printed to stderr
 #
 # Usage:
 #   scripts/tests/test_check_duplicate_pr.sh
@@ -93,14 +95,20 @@ MOCKGH
 chmod +x "$MOCK_BIN_DIR/gh"
 
 exit_code=0
-"$WRAPPER" 99999 > /dev/null 2>&1 || exit_code=$?
+output=$("$WRAPPER" 99999 2>/dev/null) || exit_code=$?
 if [[ "$exit_code" -eq 1 ]]; then
     pass "exits 1 when no duplicate PR exists"
 else
     fail "exits 1 when no duplicate PR exists" "expected exit 1, got $exit_code"
 fi
 
-# ── Test 3: exit 0 and prints PR number when a duplicate exists ────────────
+if [[ "$output" == *"ok"* ]]; then
+    pass "prints ok line to stdout when no duplicate"
+else
+    fail "prints ok line to stdout when no duplicate" "expected stdout containing 'ok', got '$output'"
+fi
+
+# ── Test 3: exit 0 and prints duplicate line when a duplicate exists ────────
 
 # Mock gh pr list returning a PR whose title contains "(#42)" on the first
 # (title-search) call, then an empty array for the branch-name call if reached.
@@ -129,17 +137,17 @@ else
     fail "exits 0 when a duplicate PR exists" "expected exit 0, got $exit_code"
 fi
 
-if [[ "$output" == "1234" ]]; then
-    pass "prints duplicate PR number to stdout"
+if [[ "$output" == *"duplicate:"* && "$output" == *"1234"* ]]; then
+    pass "prints duplicate line with PR number to stdout"
 else
-    fail "prints duplicate PR number to stdout" "expected '1234', got '$output'"
+    fail "prints duplicate line with PR number to stdout" "expected stdout containing 'duplicate:' and '1234', got '$output'"
 fi
 
 # ── Test 4: strips a leading '#' from the issue argument ───────────────────
 
 exit_code=0
 output=$("$WRAPPER" "#42" 2>/dev/null) || exit_code=$?
-if [[ "$exit_code" -eq 0 && "$output" == "1234" ]]; then
+if [[ "$exit_code" -eq 0 && "$output" == *"duplicate:"* && "$output" == *"1234"* ]]; then
     pass "strips leading '#' from the issue argument"
 else
     fail "strips leading '#' from the issue argument" "exit=$exit_code output='$output'"
@@ -155,11 +163,17 @@ MOCKGH
 chmod +x "$MOCK_BIN_DIR/gh"
 
 exit_code=0
-"$WRAPPER" 42 > /dev/null 2>&1 || exit_code=$?
+stderr_output=$("$WRAPPER" 42 2>&1 >/dev/null) || exit_code=$?
 if [[ "$exit_code" -eq 2 ]]; then
     pass "exits 2 when gh pr list fails"
 else
     fail "exits 2 when gh pr list fails" "expected exit 2, got $exit_code"
+fi
+
+if [[ "$stderr_output" == *"error:"* ]]; then
+    pass "prints error line to stderr when gh pr list fails"
+else
+    fail "prints error line to stderr when gh pr list fails" "expected stderr containing 'error:', got '$stderr_output'"
 fi
 
 # ── Test 6: exit 2 when gh is not installed ────────────────────────────────

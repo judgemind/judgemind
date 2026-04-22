@@ -371,9 +371,9 @@ Immediately open a PR after the first push — never push without creating one. 
 
 (`check-duplicate-pr.sh` is a thin wrapper around `preflight_no_duplicate_pr` in `scripts/preflight.sh`. The wrapper lets the check run in a single Bash tool call — `source scripts/preflight.sh && preflight_no_duplicate_pr <N>` trips the preflight hook's "quoted strings combined with &&" check. See #2706.)
 
-- If it returns **0** (duplicate found), the existing PR number is printed to stdout. **Adopt that PR** instead of creating a new one — push to the existing branch and use `gh pr edit` to update the body if needed.
-- If it returns **1** (no duplicate), proceed to create the PR normally.
-- If it returns **2** (error), proceed to create the PR (fail-open).
+- If it returns **0** (duplicate found), a `duplicate:` line is printed to stdout containing the existing PR number. **Adopt that PR** instead of creating a new one — push to the existing branch and use `gh pr edit` to update the body if needed.
+- If it returns **1** (no duplicate), an `ok:` line is printed to stdout. Proceed to create the PR normally.
+- If it returns **2** (error), an `error:` line is printed to stderr. Proceed to create the PR (fail-open).
 
 The PR body must include `Closes #N` so the unblock workflow fires on merge.
 
