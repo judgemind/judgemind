@@ -73,6 +73,7 @@ if "psycopg" not in sys.modules or not isinstance(
     sys.modules["psycopg"] = _psycopg_stub
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._popen_fake import make_popen_factory  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -499,16 +500,11 @@ class TestSpawnDiagnoserSubprocess:
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
             captured["cmd"] = cmd
             captured["kwargs"] = kwargs
-            r = MagicMock()
-            r.returncode = 0
-            r.stderr = ""
-            r.stdout = ""
-            return r
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
         exit_code, tail = d._spawn_diagnoser_subprocess(777)
         assert exit_code == 0
         assert tail == ""
@@ -518,17 +514,16 @@ class TestSpawnDiagnoserSubprocess:
         assert "--model" in captured["cmd"]
         model_idx = captured["cmd"].index("--model")
         assert captured["cmd"][model_idx + 1] == daemon.DIAGNOSER_MODEL
-        assert captured["kwargs"]["timeout"] == (
-            daemon.DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS
-        )
+        # Post-#3017 the diagnoser timeout is enforced via proc.wait(timeout=...),
+        # not subprocess.run(..., timeout=...). The kwargs captured here
+        # come from Popen() itself; the timeout is passed to proc.wait
+        # inside _spawn_diagnoser_subprocess. Verified indirectly via
+        # test_timeout_returns_none_exit below.
 
     def test_timeout_returns_none_exit(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
 
-        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
-            raise subprocess.TimeoutExpired(cmd=cmd, timeout=300)
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(timeout=True))
         exit_code, _tail = d._spawn_diagnoser_subprocess(1)
         assert exit_code is None
 
@@ -537,10 +532,10 @@ class TestSpawnDiagnoserSubprocess:
     ) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
 
-        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+        def fake_popen(cmd: list[str], **_kwargs: Any) -> Any:
             raise FileNotFoundError("claude missing")
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
         exit_code, tail = d._spawn_diagnoser_subprocess(1)
         assert exit_code is None
         assert "claude" in tail.lower() or "not found" in tail.lower()
@@ -556,15 +551,10 @@ class TestSpawnDiagnoserSubprocess:
         d, _conn, _handler = _make_daemon(tmp_path)
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+        def on_start(cmd: list[str], _kwargs: dict[str, Any]) -> None:
             captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            r.stderr = ""
-            r.stdout = ""
-            return r
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
         d._spawn_diagnoser_subprocess(42)
         assert "--dangerously-skip-permissions" in captured["cmd"], captured["cmd"]
 

@@ -47,6 +47,7 @@ _psycopg_stub.errors = _psycopg_errors
 sys.modules.setdefault("psycopg", _psycopg_stub)
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._popen_fake import make_popen_factory  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -149,13 +150,10 @@ class TestSpawnAddsOutputFormatJsonFlag:
 
         captured: dict[str, Any] = {}
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        def on_start(cmd: list[str], _kwargs: dict[str, Any]) -> None:
             captured["cmd"] = cmd
-            r = MagicMock()
-            r.returncode = 0
-            return r
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
         d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
 
         cmd = captured["cmd"]
@@ -170,19 +168,23 @@ class TestSpawnAddsOutputFormatJsonFlag:
         """``--output-format json`` would corrupt the JSON envelope if stderr
         merged into stdout. The spawn helper must split the streams so
         :meth:`_parse_phase_usage` can ``json.loads`` the stdout file
-        directly."""
+        directly.
+
+        Post-#3017: the spawn helper uses :class:`subprocess.Popen` with
+        a stream-forwarder that tees each line to the per-stream sink
+        files — same two output files, same split content, different
+        plumbing.
+        """
         d, _conn, _handler = _make_daemon(tmp_path)
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            # Simulate claude writing to the two provided file handles —
-            # the stdlib's subprocess.run threads them through directly.
-            kwargs["stdout"].write('{"usage":{"input_tokens":1}}')
-            kwargs["stderr"].write("boot-log line\n")
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stdout_chunks=['{"usage":{"input_tokens":1}}\n'],
+                stderr_chunks=["boot-log line\n"],
+            ),
+        )
         d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
 
         stdout_path = tmp_path / "tmp" / "claude-p-plan.stdout.json"
@@ -202,14 +204,14 @@ class TestSpawnAddsOutputFormatJsonFlag:
         single ``cat``-able triage target."""
         d, _conn, _handler = _make_daemon(tmp_path)
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            kwargs["stdout"].write('{"result":"ok"}')
-            kwargs["stderr"].write("stderr content")
-            r = MagicMock()
-            r.returncode = 0
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stdout_chunks=['{"result":"ok"}\n'],
+                stderr_chunks=["stderr content\n"],
+            ),
+        )
         d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
 
         combined = tmp_path / "tmp" / "claude-p-plan.log"
@@ -230,13 +232,14 @@ class TestSpawnAddsOutputFormatJsonFlag:
         output the streams captured before the fault."""
         d, _conn, _handler = _make_daemon(tmp_path)
 
-        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
-            kwargs["stderr"].write("crash-trace here")
-            r = MagicMock()
-            r.returncode = 1
-            return r
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stderr_chunks=["crash-trace here\n"],
+                returncode=1,
+            ),
+        )
         exit_code, _duration = d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
         assert exit_code == 1
         combined = tmp_path / "tmp" / "claude-p-plan.log"
