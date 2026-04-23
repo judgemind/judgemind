@@ -139,3 +139,45 @@ variable "heartbeat_stale_seconds" {
   type        = number
   default     = 300
 }
+
+# ─── Oneshot task launcher (scripts/ecs-run-task.sh) ────────────────────────
+# When these ARNs are wired, the daemon's task role gets the permission set
+# required by `scripts/ecs-run-task.sh` so ralph phases can launch data
+# scripts (rebuild_db, backfills, orphan cleanup, etc.) from the daemon
+# context without needing a human to run them on a laptop. See #3048.
+#
+# Scope: dev-only. Writes stay scoped to the `judgemind-oneshot-${env}`
+# task-definition family and the dev cluster; `iam:PassRole` is scoped to
+# the ingestion worker's task and execution roles (the roles the oneshot
+# task assumes). Leave empty to skip the policy entirely — the daemon's
+# self-invocation policy (`task_run_task_self`) is untouched.
+
+variable "oneshot_source_task_role_arn" {
+  description = "ARN of the task role the oneshot task definition will assume (typically the ingestion worker / scraper task role). When set alongside oneshot_source_execution_role_arn, the daemon's task role is granted the permission set required by scripts/ecs-run-task.sh. Empty disables the feature."
+  type        = string
+  default     = ""
+}
+
+variable "oneshot_source_execution_role_arn" {
+  description = "ARN of the execution role the oneshot task definition will use (typically the shared ECS task execution role). When set alongside oneshot_source_task_role_arn, the daemon's task role is granted the permission set required by scripts/ecs-run-task.sh."
+  type        = string
+  default     = ""
+}
+
+variable "oneshot_maintenance_task_role_arn" {
+  description = "ARN of the optional maintenance role that scripts/ecs-run-task.sh --role can swap in. When set, iam:PassRole is also granted for this role so the --role override works from the daemon context."
+  type        = string
+  default     = ""
+}
+
+variable "oneshot_script_bucket_arn" {
+  description = "ARN of the S3 bucket where scripts/ecs-run-task.sh uploads scripts larger than the 8KB command-override limit (typically judgemind-assets-<env>). When set, the daemon task role is granted PutObject/DeleteObject under oneshot-scripts/*. Empty disables S3 uploads — scripts under ~6KB still work inline."
+  type        = string
+  default     = ""
+}
+
+variable "oneshot_ecr_scraper_repository_arn" {
+  description = "ARN of the ECR repository that hosts the scraper/ingestion-worker image (used by scripts/ecs-run-task.sh to resolve image digests). When set, the daemon task role is granted ecr:DescribeImages on that repo. Empty disables — ecs-run-task.sh still works using the service image without the digest-check step."
+  type        = string
+  default     = ""
+}

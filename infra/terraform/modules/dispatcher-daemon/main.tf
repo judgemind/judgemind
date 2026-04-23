@@ -257,6 +257,184 @@ resource "aws_iam_role_policy" "task_run_task_self" {
   })
 }
 
+# Oneshot task launcher — permissions required by
+# `scripts/ecs-run-task.sh` so the daemon can run data scripts
+# (rebuild_db, backfills, orphan cleanup) without a human on a laptop.
+# See #3048 for the root cause: the `task_run_task_self` policy above
+# only permits RunTask on the dispatcher's own family, which blocks
+# every data-script path from ralph.
+#
+# Wiring lives in `environments/dev/main.tf`: the caller passes the
+# ingestion worker's task + execution role ARNs, the shared assets
+# bucket ARN, and the scraper ECR repo ARN. If either of the two role
+# ARNs is empty the policy is skipped entirely — preserves a safe
+# default for callers that haven't opted in (e.g. staging / throwaway
+# test stacks).
+#
+# Scope invariants (audited in dev apply + `get-role-policy`):
+#   - RunTask restricted to the `judgemind-oneshot-${env}` family on
+#     `var.ecs_cluster_arn` — daemon cannot start prod tasks or spawn
+#     arbitrary workloads.
+#   - Deregister restricted to the same family. The daemon cannot
+#     rewrite the ingestion-worker or dispatcher task defs.
+#   - DescribeTaskDefinition uses `Resource = "*"` because the AWS API
+#     does not accept ARN scoping on that action (same pattern as the
+#     scheduler role); the cluster-ARN condition on RunTask is the
+#     defence-in-depth control.
+#   - PassRole limited to the ingestion worker's task + execution roles
+#     (and the optional maintenance role) — the oneshot task cannot
+#     assume the daemon's own task role or any cross-environment role.
+#   - S3 PutObject/DeleteObject scoped to `oneshot-scripts/*` under the
+#     caller-supplied assets bucket.
+#   - ecr:DescribeImages on the caller-supplied scraper repo ARN only.
+#
+# Widening any of the above should be paired with an updated issue
+# reference — #3048 is the current scope boundary.
+locals {
+  oneshot_enabled = (
+    var.oneshot_source_task_role_arn != "" &&
+    var.oneshot_source_execution_role_arn != ""
+  )
+  oneshot_family_arn_pattern = "arn:aws:ecs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task-definition/judgemind-oneshot-${var.environment}:*"
+  oneshot_pass_role_arns = compact([
+    var.oneshot_source_task_role_arn,
+    var.oneshot_source_execution_role_arn,
+    var.oneshot_maintenance_task_role_arn,
+  ])
+}
+
+resource "aws_iam_role_policy" "task_run_oneshot" {
+  count = local.oneshot_enabled ? 1 : 0
+
+  name = "${local.service_name}-task-run-oneshot"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      [
+        {
+          # AWS requires Resource = "*" for RegisterTaskDefinition — the
+          # API does not accept ARN scoping. Deregister accepts an ARN,
+          # so that one below is pinned to the oneshot family.
+          Sid      = "AllowRegisterOneshotTaskDefinition"
+          Effect   = "Allow"
+          Action   = "ecs:RegisterTaskDefinition"
+          Resource = "*"
+        },
+        {
+          Sid      = "AllowDeregisterOneshotTaskDefinition"
+          Effect   = "Allow"
+          Action   = "ecs:DeregisterTaskDefinition"
+          Resource = local.oneshot_family_arn_pattern
+        },
+        {
+          # DescribeTaskDefinition reads the source (ingestion worker)
+          # task def as a template and the freshly registered oneshot
+          # task def. AWS requires `*` on this action.
+          Sid      = "AllowDescribeTaskDefinitions"
+          Effect   = "Allow"
+          Action   = "ecs:DescribeTaskDefinition"
+          Resource = "*"
+        },
+        {
+          # Launch the oneshot task. Restricted to the oneshot family on
+          # the dev cluster — no other family, no other cluster.
+          Sid      = "AllowRunOneshotTask"
+          Effect   = "Allow"
+          Action   = "ecs:RunTask"
+          Resource = local.oneshot_family_arn_pattern
+          Condition = {
+            ArnEquals = {
+              "ecs:cluster" = var.ecs_cluster_arn
+            }
+          }
+        },
+        {
+          # DescribeTasks (poll loop) and DescribeServices (resolve
+          # networking). Gated on the dev cluster via the condition.
+          Sid    = "AllowDescribeRunningTasks"
+          Effect = "Allow"
+          Action = [
+            "ecs:DescribeTasks",
+            "ecs:DescribeServices",
+          ]
+          Resource = "*"
+          Condition = {
+            ArnEquals = {
+              "ecs:cluster" = var.ecs_cluster_arn
+            }
+          }
+        },
+        {
+          # Pass the ingestion worker's task + execution roles to the
+          # oneshot task. Without this, RunTask fails with
+          # `AccessDeniedException: User ... is not authorized to pass
+          # role ... because no identity-based policy allows the
+          # iam:PassRole action`.
+          Sid      = "AllowPassOneshotRoles"
+          Effect   = "Allow"
+          Action   = "iam:PassRole"
+          Resource = local.oneshot_pass_role_arns
+          Condition = {
+            StringEquals = {
+              "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+            }
+          }
+        },
+        {
+          # Resolve the `--role <name>` override in ecs-run-task.sh. The
+          # script calls `aws iam get-role --role-name <name>` to map a
+          # role name to an ARN before RunTask. Scoped to the account's
+          # judgemind-* roles for this environment.
+          Sid      = "AllowResolveMaintenanceRole"
+          Effect   = "Allow"
+          Action   = "iam:GetRole"
+          Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/judgemind-*-${var.environment}"
+        },
+        {
+          # Stream logs from the running oneshot task. The script tails
+          # the ingestion-worker log group (that's where oneshot tasks
+          # write — the log config is inherited from the source task
+          # def). Scoped to the dev account's judgemind-* log groups so
+          # the daemon cannot read unrelated log groups.
+          Sid    = "AllowReadOneshotLogs"
+          Effect = "Allow"
+          Action = [
+            "logs:DescribeLogStreams",
+            "logs:GetLogEvents",
+            "logs:FilterLogEvents",
+          ]
+          Resource = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/judgemind-*:*"
+        },
+      ],
+      var.oneshot_script_bucket_arn != "" ? [
+        {
+          # Upload scripts >8KB via pre-signed URL. Scoped to the
+          # oneshot-scripts/ prefix inside the caller-supplied bucket.
+          Sid    = "AllowUploadOneshotScripts"
+          Effect = "Allow"
+          Action = [
+            "s3:PutObject",
+            "s3:DeleteObject",
+          ]
+          Resource = "${var.oneshot_script_bucket_arn}/oneshot-scripts/*"
+        },
+      ] : [],
+      var.oneshot_ecr_scraper_repository_arn != "" ? [
+        {
+          # Resolve the latest image digest in the scraper ECR repo
+          # (stale-image detection path in ecs-run-task.sh).
+          Sid      = "AllowDescribeScraperImages"
+          Effect   = "Allow"
+          Action   = "ecr:DescribeImages"
+          Resource = var.oneshot_ecr_scraper_repository_arn
+        },
+      ] : [],
+    )
+  })
+}
+
 resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
   name = "${local.service_name}-task-ecs-exec-ssm"
   role = aws_iam_role.task.id

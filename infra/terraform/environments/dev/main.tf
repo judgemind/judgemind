@@ -283,6 +283,28 @@ module "dispatcher_daemon" {
 
   github_repo = "judgemind/judgemind"
 
+  # #3048 — grant the daemon's task role the IAM permissions needed by
+  # `scripts/ecs-run-task.sh` so ralph phases can run data scripts
+  # (rebuild_db, backfills, orphan cleanup) from the daemon context.
+  # Scoped to the `judgemind-oneshot-dev` family on this cluster; PassRole
+  # is pinned to the ingestion worker task + execution roles. See the
+  # `task_run_oneshot` policy in modules/dispatcher-daemon/main.tf for
+  # the full scope invariants. Keep these wired in dev only — production
+  # data-script execution stays human-gated.
+  oneshot_source_task_role_arn      = module.iam_scraper.role_arn
+  oneshot_source_execution_role_arn = module.compute.task_execution_role_arn
+  # `oneshot_maintenance_task_role_arn` stays empty — the
+  # `iam_maintenance` module is declared but not instantiated in dev. If
+  # a follow-up wires the module, plumb `module.iam_maintenance.role_arn`
+  # through here so `scripts/ecs-run-task.sh --role judgemind-maintenance-dev`
+  # also works from the daemon context.
+  oneshot_maintenance_task_role_arn = ""
+  # The `judgemind-assets-dev` bucket is provisioned outside Terraform
+  # (legacy). ARN pattern is deterministic — S3 bucket ARNs don't have a
+  # region or account-id segment, so hard-coding is safe here.
+  oneshot_script_bucket_arn          = "arn:aws:s3:::judgemind-assets-dev"
+  oneshot_ecr_scraper_repository_arn = module.ecr.repository_arn
+
   # Heartbeat alarm wired to the shared SNS topic once the daemon starts
   # emitting HeartbeatAge (Phase 2). Kept enabled in Phase 1 so the alarm
   # resource lands with the rest of the module; `treat_missing_data =
