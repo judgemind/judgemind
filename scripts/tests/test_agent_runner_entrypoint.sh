@@ -191,6 +191,15 @@ done
 # Set CLAUDE_RESULT_OVERRIDE to the exact JSON payload to emit. Set
 # CLAUDE_RESULT_OVERRIDE_SKILL to scope the override to one skill
 # only; leave unset to apply it to every skill invocation.
+#
+# CLAUDE_STDERR_OVERRIDE lets tests write a stderr payload the
+# entrypoint captures via its `2> $AGENT_WORKSPACE/claude-p-<phase>.stderr.log`
+# redirect — exercise the #3131 diag path's stderr_head_1024 field.
+if [[ -n "${CLAUDE_STDERR_OVERRIDE:-}" ]]; then
+    if [[ -z "${CLAUDE_RESULT_OVERRIDE_SKILL:-}" || "${CLAUDE_RESULT_OVERRIDE_SKILL}" == "$skill" ]]; then
+        printf '%s\n' "$CLAUDE_STDERR_OVERRIDE" >&2
+    fi
+fi
 if [[ -n "${CLAUDE_RESULT_OVERRIDE:-}" ]]; then
     if [[ -z "${CLAUDE_RESULT_OVERRIDE_SKILL:-}" || "${CLAUDE_RESULT_OVERRIDE_SKILL}" == "$skill" ]]; then
         printf '%s\n' "$CLAUDE_RESULT_OVERRIDE"
@@ -1042,6 +1051,204 @@ if printf '%s' "$out" | grep -q "claude_result_non_object"; then
 else
     fail "malformed JSON output surfaces via claude_result_non_object" \
          "output: $out"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 12: #3131 — non-object `.result` also emits a
+# `claude_result_non_object_diag` event with structured triage fields
+# (result_type, result_bytes, result_head_512). Without this, every
+# ECS agent dies opaquely — operators have no way to tell whether
+# claude said "Unknown command" vs a conversational response vs a
+# permission denial without a second deploy-instrument cycle.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t12.txt"
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t12_workspace="$TEST_TMP/t12-workspace"
+mkdir -p "$t12_workspace"
+
+# Exact "Unknown command" payload that hit every Stage 3 smoke agent.
+set +e
+out=$(AGENT_ID="cccccccc-dddd-eeee-ffff-000000000000" \
+      ISSUE_NUMBER="3131" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t12_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "Unknown command: /task-v2-plan"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="plan" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# The diag event must have fired.
+if printf '%s' "$out" | grep -q "claude_result_non_object_diag"; then
+    pass "non-object .result emits claude_result_non_object_diag"
+else
+    fail "non-object .result emits claude_result_non_object_diag" \
+         "output tail: $(printf '%s' "$out" | tail -20)"
+fi
+
+# The diag line must carry the structured type field — `.result` was a
+# JSON string, so `jq .result | type` returns "string". This is the
+# single most important field for #3131 triage: it tells us at a
+# glance that claude returned a conversational/error string, not the
+# structured envelope the skill is supposed to emit.
+diag_line=$(printf '%s' "$out" | grep "claude_result_non_object_diag" | head -n 1)
+if printf '%s' "$diag_line" | grep -q 'result_type.*string'; then
+    pass "diag event carries result_type=string for string .result"
+else
+    fail "diag event carries result_type=string for string .result" \
+         "diag line: $diag_line"
+fi
+
+# The diag line must carry the actual payload text in result_head_512.
+# The string "Unknown command: /task-v2-plan" is 31 bytes, well under
+# the 512 cap.
+if printf '%s' "$diag_line" | grep -q 'Unknown command: /task-v2-plan'; then
+    pass "diag event result_head_512 contains the actual .result text"
+else
+    fail "diag event result_head_512 contains the actual .result text" \
+         "diag line: $diag_line"
+fi
+
+# result_bytes is the byte count of `.result | tostring`. "Unknown
+# command: /task-v2-plan" is 31 bytes. Assert the field is present
+# and numeric; exact value doesn't matter (jq versions may differ in
+# tostring whitespace handling, though for a raw string they
+# shouldn't).
+if printf '%s' "$diag_line" | grep -qE 'result_bytes": "[0-9]+"'; then
+    pass "diag event carries numeric result_bytes"
+else
+    fail "diag event carries numeric result_bytes" \
+         "diag line: $diag_line"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 13: #3131 — when claude writes to stderr, the diag event
+# carries the first 1024 bytes of that stderr file. Exercises the
+# `stderr_head_1024` field independently of the `.result` path.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t13.txt"
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t13_workspace="$TEST_TMP/t13-workspace"
+mkdir -p "$t13_workspace"
+
+# Stderr payload representative of a real claude-cli failure: a line
+# about a skill-resolution problem. Keep under 1024 bytes so the test
+# asserts against the full payload, not a truncation boundary.
+stderr_payload='Error: skill /task-v2-plan not found in any registry. Searched: /home/dispatcher/.claude/skills, /app/.claude/skills, /var/lib/agent-runner/repo/.claude/skills'
+
+set +e
+out=$(AGENT_ID="dddddddd-eeee-ffff-0000-111111111111" \
+      ISSUE_NUMBER="3131" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t13_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "Unknown command: /task-v2-plan"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="plan" \
+      CLAUDE_STDERR_OVERRIDE="$stderr_payload" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+diag_line=$(printf '%s' "$out" | grep "claude_result_non_object_diag" | head -n 1)
+
+# stderr_head_1024 field should contain a distinctive substring of the
+# stub's stderr payload. Don't assert the full string — log() escapes
+# embedded `"` / `\` and the test parses its own stdout capture which
+# picks up shell-quoting noise.
+if printf '%s' "$diag_line" | grep -q 'stderr_head_1024'; then
+    pass "diag event carries stderr_head_1024 when claude writes to stderr"
+else
+    fail "diag event carries stderr_head_1024 when claude writes to stderr" \
+         "diag line: $diag_line"
+fi
+
+if printf '%s' "$diag_line" | grep -q 'skill /task-v2-plan not found'; then
+    pass "stderr_head_1024 contains the actual stderr text"
+else
+    fail "stderr_head_1024 contains the actual stderr text" \
+         "diag line: $diag_line"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 14: #3131 — when claude writes NOTHING to stderr, the diag
+# event OMITS the stderr_head_1024 field entirely rather than emitting
+# an empty value. Keeps CloudWatch log lines short on the common case
+# and signals "no stderr" unambiguously.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t14.txt"
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t14_workspace="$TEST_TMP/t14-workspace"
+mkdir -p "$t14_workspace"
+
+set +e
+out=$(AGENT_ID="eeeeeeee-ffff-0000-1111-222222222222" \
+      ISSUE_NUMBER="3131" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t14_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "Unknown command: /task-v2-plan"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="plan" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+diag_line=$(printf '%s' "$out" | grep "claude_result_non_object_diag" | head -n 1)
+if printf '%s' "$diag_line" | grep -q 'stderr_head_1024'; then
+    fail "diag event omits stderr_head_1024 when claude stderr is empty" \
+         "diag line unexpectedly contains stderr_head_1024: $diag_line"
+else
+    pass "diag event omits stderr_head_1024 when claude stderr is empty"
+fi
+
+# The existing `claude_result_non_object` event should still fire
+# alongside the diag event — downstream consumers (CloudWatch
+# Insights queries, log parsers) rely on the original event name and
+# must not be broken by the diag addition.
+if printf '%s' "$out" | grep -q 'claude_result_non_object"'; then
+    pass "original claude_result_non_object event still fires (no regression)"
+else
+    fail "original claude_result_non_object event still fires (no regression)" \
+         "output tail: $(printf '%s' "$out" | tail -30)"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

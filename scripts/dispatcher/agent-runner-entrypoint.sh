@@ -445,7 +445,86 @@ run_claude_phase() {
     if jq -e '.result | type == "object"' "$_out_file" >/dev/null 2>&1; then
         jq -c '.result' "$_out_file" 2>/dev/null || printf '{}'
     else
+        # Self-diagnosing branch (#3131). Every ECS agent today is dying
+        # because `.result` comes back non-object; operators have no way
+        # to see WHY without a second deploy-instrument cycle. Log the
+        # structured triage fields directly on the failure event so the
+        # first post-deploy ECS agent surfaces the actual payload in
+        # CloudWatch. Preserves the existing `claude_result_non_object`
+        # event name (load-bearing for log-insights queries) and adds a
+        # sibling `claude_result_non_object_diag` event carrying:
+        #
+        #   * result_type   — jq's type of `.result` (string/null/number/...).
+        #   * result_bytes  — byte length of `.result` stringified.
+        #   * result_head_512  — first 512 bytes of `.result` stringified,
+        #     newlines replaced with `\n` and double quotes escaped so
+        #     the line stays a single JSON-ish record the log() function
+        #     can emit without breaking CloudWatch line boundaries.
+        #   * stderr_head_1024 — first 1024 bytes of the sibling
+        #     `.stderr.log` file, same escaping. Omitted when the stderr
+        #     file is empty / missing so the common "no stderr" case
+        #     isn't noise.
+        #
+        # All payload extraction happens in-process via `jq` + shell
+        # builtins — no extra tools, no new dependencies. Bash 3.2
+        # compatible (`cut -c` + `tr` + `sed`; no `${var:0:512}` slicing
+        # on multi-byte-safe boundaries is required because we're only
+        # emitting the first 512 BYTES for triage, not interpreting them).
         log "claude_result_non_object" "phase=$_phase" "out_file=$_out_file"
+
+        _result_type=$(jq -r '.result | type' "$_out_file" 2>/dev/null || printf 'unparseable')
+        # `.result | tostring` stringifies any type — strings pass
+        # through, objects/arrays/null serialize to their JSON form.
+        # `-r` emits raw (no wrapping quotes) so the byte count matches
+        # the actual payload length. Falls back to the raw file on a
+        # parse failure (malformed JSON) so the diag still shows the
+        # first 512 bytes of whatever claude wrote.
+        _result_str_file="$AGENT_WORKSPACE/claude-p-$_phase.result.str"
+        if ! jq -r '.result | tostring' "$_out_file" > "$_result_str_file" 2>/dev/null; then
+            cp "$_out_file" "$_result_str_file" 2>/dev/null || printf '' > "$_result_str_file"
+        fi
+        _result_bytes=$(wc -c < "$_result_str_file" 2>/dev/null | tr -d ' ' || printf '0')
+
+        # Shape for embedding in log() key=value pairs. log() handles
+        # double-quote escaping; we handle backslash escaping (log()
+        # doesn't) and control-char squashing (so the output stays one
+        # line and does not split CloudWatch log events). Order matters:
+        # escape backslashes FIRST so we don't double-escape the ones we
+        # just added. Use `tr` to replace newlines/CRs/tabs with spaces
+        # rather than emitting literal `\n` (which would require
+        # teaching log() to not re-escape the backslash). This keeps
+        # the triage payload human-readable in CloudWatch at the cost
+        # of losing exact whitespace boundaries — fine for a first-512
+        # smoke.
+        _result_head_512=$(head -c 512 "$_result_str_file" 2>/dev/null \
+            | tr '\n\r\t' '   ' \
+            | sed -e 's/\\/\\\\/g' || printf '')
+
+        # Stderr tail — only emit when non-empty so the common healthy
+        # path doesn't bloat log lines.
+        _stderr_file="$AGENT_WORKSPACE/claude-p-$_phase.stderr.log"
+        _stderr_head_1024=""
+        if [[ -s "$_stderr_file" ]]; then
+            _stderr_head_1024=$(head -c 1024 "$_stderr_file" 2>/dev/null \
+                | tr '\n\r\t' '   ' \
+                | sed -e 's/\\/\\\\/g' || printf '')
+        fi
+
+        if [[ -n "$_stderr_head_1024" ]]; then
+            log "claude_result_non_object_diag" \
+                "phase=$_phase" \
+                "result_type=$_result_type" \
+                "result_bytes=$_result_bytes" \
+                "result_head_512=$_result_head_512" \
+                "stderr_head_1024=$_stderr_head_1024"
+        else
+            log "claude_result_non_object_diag" \
+                "phase=$_phase" \
+                "result_type=$_result_type" \
+                "result_bytes=$_result_bytes" \
+                "result_head_512=$_result_head_512"
+        fi
+
         printf '{}'
     fi
 }
