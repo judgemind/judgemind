@@ -49,6 +49,32 @@ Each `echo` is a single Bash-tool call — the stream-forwarder (`scripts/dispat
 
 **IMPORTANT — Subagent isolation.** The context-budget analysis in spike 0.3 (`docs/investigations/dispatcher-v2-spike-0.3.md`) shows `/task-v2-ralph` stays inside the 200k-token window ONLY if each worker + each reviewer runs as a fresh-context subagent (Task tool). Inline workers break this guarantee. Do not inline.
 
+---
+
+## When skipping a scope item (anti-hallucination, issue #3126)
+
+Skipping a scope item — a file the plan says to create, an AC you decide is out-of-scope, a piece of the diff you deliberately omitted — requires a **grounded** reason. Agents have fabricated incident-sounding prose ("three consecutive push rejections confirmed this") to justify skips; that prose is hallucination and must not appear in PR descriptions, commit messages, investigation docs, or `ralph-done.txt`.
+
+**The skip reason MUST be one of:**
+
+1. **A command you actually ran, paired with its stderr / exit code, quoted inline.** Paste the command, the exit code, and the verbatim tail of stderr — no paraphrase.
+2. **A runtime check against current infrastructure state.** Before citing an issue as a blocker, run `gh issue view <N> --repo judgemind/judgemind --json state,closedAt` — the result MUST show `"state":"OPEN"`. A closed issue is historical and cannot block current work. Same pattern for `gh pr view`, `aws ecs describe-task-definition`, `scripts/dev-db-query.sh`, etc.
+3. **An explicit "I chose not to, reasoning: …" statement.** Honest preference — name the tradeoff (e.g. "chose not to add the new workflow file because the plan's stated goal is a single-script diff; filing the workflow as a follow-up"). Not an invented incident.
+
+**Forbidden phrases** — without an attached log / stderr excerpt from a real command you ran, the following are hallucination and MUST NOT appear anywhere in agent output:
+
+- "N consecutive push rejections"
+- "Tried N times"
+- "Confirmed via the rejection"
+- "Three push rejections confirmed this"
+- Any "I observed X error" that isn't pasted from real output.
+
+**"Tracked at #N" freshness check.** A repo-grep hit on an issue number is not evidence of current state — it is evidence the repo documents a historical incident. Before invoking an issue number as a live blocker, `gh issue view` it and confirm `state=OPEN`. If closed, the reference is historical; if the agent still believes the blocker is live, re-probe the infrastructure directly rather than citing the stale number.
+
+This rule binds the `/ralph` worker, every reviewer pass, and any prose ralph writes into the committed diff (investigation docs, commit message body, `ralph-done.txt` rationale). The summary phase mirrors this rule (see `.claude/skills/task-v2-summary/SKILL.md` §"When skipping a scope item") so a hallucinated skip-reason cannot launder through the `unmet_criteria` or `ac_mapping` classifications.
+
+---
+
 **Implementation choice (per issue #2732):** This skill invokes the existing `/ralph` skill as its inner loop. `/ralph` already implements the worker + three-reviewer cycle with fresh-context Task-tool subagents and per-iteration state files under `{worktree}/tmp/ralph/`. `/task-v2-ralph` is the thin outer wrapper that (a) seeds `task.md` from `plan.json`, (b) invokes `/ralph`, (c) runs the local pre-push gate (Step 2.5), (d) parses `{worktree}/tmp/ralph/ralph-done.txt` into the output JSON. Keeps the implementation in one place and ensures parity with the current `/task` workflow's ralph behavior.
 
 ---

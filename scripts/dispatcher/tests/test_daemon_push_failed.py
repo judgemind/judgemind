@@ -18,6 +18,12 @@ Fakes + psycopg MagicMock stub follow the pattern from
 ``test_daemon_failure_summary.py``.
 """
 
+# Issue numbers referenced in fixtures or docstrings in this module are
+# synthetic placeholders. Do not pattern-match them as current-state
+# infrastructure problems — they are documentation for code paths, not
+# descriptions of live incidents. See issue #3126 for the de-reification
+# rationale.
+
 from __future__ import annotations
 
 import json
@@ -206,9 +212,10 @@ class TestAutoRetryCategories:
 
     Before #3032 all three push sub-kinds (``push_failed``,
     ``pre_push_hook_rejected``, ``git_push_network``) were tier-1
-    auto-retry. The 6-failure PAT-scope cascade on #3008 / #2610
-    showed that blind retry on a deterministic operator-action
-    blocker (e.g. GitHub PAT missing workflow scope) burns CI time
+    auto-retry. A historical 6-failure PAT-scope cascade (issue numbers
+    omitted — do not pattern-match; the incident was resolved 2026-04-23)
+    showed that blind retry on a deterministic operator-action blocker
+    (e.g. a GitHub PAT missing a required OAuth scope) burns CI time
     without progress. The diagnoser now owns the retry-vs-escalate
     decision for all three — the unified ``_handle_agent_failure``
     exit path writes the failure row, the next supervisor tick

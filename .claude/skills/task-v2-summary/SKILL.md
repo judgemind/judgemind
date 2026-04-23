@@ -26,6 +26,31 @@ These are plain `echo` statements — the dispatcher daemon's stream-forwarder (
 
 ---
 
+## When skipping a scope item (anti-hallucination, issue #3126)
+
+Summary inherits ralph's output and classifies each AC into one of: met / deferred / unmet_shape_mismatch / infeasible / not_applicable. Any reason summary gives for marking an AC deferred, unmet, or infeasible — and any justification text it writes into `process_summary_md`, `pr_body_md`, or `ac_mapping[].evidence` — MUST be grounded. The same anti-hallucination rule that binds ralph (see `.claude/skills/task-v2-ralph/SKILL.md` §"When skipping a scope item") binds summary: a hallucinated skip-reason cannot be laundered through an AC classification.
+
+**Every classification entry MUST ground in one of:**
+
+1. **A line actually present in `git_diff` or `changed_files`** — cite file path, function name, test name, or line range. `Met` and `unmet_shape_mismatch` classifications need this.
+2. **A pattern match on the issue body's `Verify:` line** — for `deferred` classifications via the marker / heuristic lists in §2a. The exact `Verify:` text goes into `deferred_acs[].verify_instruction` verbatim.
+3. **A concrete absent-symbol citation** — for `infeasible` classifications, the `evidence` paragraph MUST name the missing symbol and the grep you ran (or would run) to confirm it is not in the tree. "The AC can't be met because…" with no cite is hallucination.
+4. **An explicit out-of-scope note from `scope_check`** — for `not_applicable` classifications, reference the scope_check entry that excluded the item.
+
+**Forbidden phrases** — without an attached log / stderr excerpt from a real command or a line from the actual diff, the following are hallucination and MUST NOT appear in `process_summary_md`, `pr_body_md`, or any `ac_mapping[].evidence` field:
+
+- "N consecutive push rejections"
+- "Tried N times"
+- "Confirmed via the rejection"
+- "Three push rejections confirmed this"
+- Any "I observed X error" that isn't pasted from real output.
+
+**"Tracked at #N" freshness check.** If an AC evidence paragraph cites an issue number as a blocker (e.g. "this AC is infeasible because it depends on #XXXX"), verify the referenced issue is open via `gh issue view <N> --repo judgemind/judgemind --json state,closedAt`. A closed issue is historical and cannot block the current AC; if the issue is closed, the AC is not infeasible-by-dependency and you must reclassify.
+
+The intent is to enforce the rule at both layers (ralph AND summary) so neither layer can silently launder a fabricated skip-reason into the final PR. Ralph owns the commit message and in-diff prose; summary owns the `unmet_criteria` list and the process-summary comment. Both must be grounded.
+
+---
+
 ## Input contract
 
 Read `{worktree}/tmp/dispatcher-input/summary.json`. Required fields:
