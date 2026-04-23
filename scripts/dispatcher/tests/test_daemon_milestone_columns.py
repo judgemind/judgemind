@@ -416,9 +416,12 @@ class TestSelfDeployDetectionPrePush:
 
         from unittest.mock import patch
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show, push_ok, pr_create_ok],
+            side_effect=[rev_list_ahead, commit_ok, git_show, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=2953, worktree=worktree)
 
@@ -486,9 +489,12 @@ class TestSelfDeployDetectionPrePush:
 
         from unittest.mock import patch
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show, push_ok, pr_create_ok],
+            side_effect=[rev_list_ahead, commit_ok, git_show, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=42, worktree=worktree)
 
@@ -544,9 +550,18 @@ class TestSelfDeployDetectionPrePush:
 
         from unittest.mock import patch
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_fail, push_ok, pr_create_ok],
+            side_effect=[
+                rev_list_ahead,
+                commit_ok,
+                git_show_fail,
+                push_ok,
+                pr_create_ok,
+            ],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=50, worktree=worktree)
 

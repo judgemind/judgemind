@@ -578,6 +578,18 @@ PHASE_RETRO_DONE = "retro_done"
 #: Cleanup still runs from this terminal-with-retro-failed state.
 PHASE_RETRO_FAILED = "retro_failed"
 
+#: Phase value written when :meth:`_push_and_open_pr` detects that
+#: ralph's §2.5d no-op guardrail fired — the working tree was clean
+#: on SHIP and no commit was created on top of ``origin/main``. The
+#: deliverable for a no-op SHIP is ralph's evidence comment on the
+#: issue (data-only tasks like SQL backfills); there is nothing to
+#: push or PR. Distinct terminal phase so the admin cockpit can
+#: filter / count these separately from the normal
+#: ``done``/``retro_done`` success states, and so a post-hoc query
+#: like ``SELECT count(*) FROM dispatcher.agents WHERE phase='no_op'``
+#: trivially counts them. Status remains ``succeeded``. Issue #3039.
+PHASE_NO_OP = "no_op"
+
 #: Phase value written after ``scripts/cleanup_worktree.sh`` succeeds.
 #: This is the final terminal phase for a successful agent — no further
 #: supervisor advances apply.
@@ -3986,10 +3998,21 @@ class DispatcherDaemon:
         self._setup_git_credentials()
 
         if (baseline / ".git").exists():
-            # Existing clone — fetch so worktrees branch from up-to-date
-            # ``origin/main``. Cheap (shallow fetch) and prevents
+            # Existing clone — unshallow if needed, then fetch so
+            # worktrees branch from up-to-date ``origin/main``. Prevents
             # "worktree branched from a stale main" bugs as the daemon
             # stays up across many merges.
+            #
+            # Issue #3039: pre-#3039 the baseline was cloned shallow
+            # (``--depth=1 --no-tags``), which produced orphan-commit
+            # PRs on the ralph "no-op SHIP" path (``git commit --amend``
+            # against HEAD dropped the unreachable parent and ``gh pr
+            # create`` failed with "no history in common with main").
+            # Any container image built before the fix still has a
+            # shallow on-disk baseline from a prior boot; unshallow it
+            # here so the correctness fix applies without a full
+            # re-clone or container rebuild.
+            self._unshallow_baseline_if_needed()
             self._baseline_fetch_origin_main()
             self._log.info(
                 "daemon.baseline_clone_ready",
@@ -4004,13 +4027,21 @@ class DispatcherDaemon:
 
         # Fresh clone. Create the parent directory (e.g. /var/lib/dispatcher/)
         # so the sibling worktrees directory can also be created later.
+        #
+        # Issue #3039: DO NOT pass ``--depth=1`` / ``--no-tags`` here.
+        # The shallow boundary commit has no accessible parent; a later
+        # ``git commit --amend`` against that commit (ralph's no-op SHIP
+        # path in :meth:`_push_and_open_pr`) produces an orphan root
+        # commit and ``gh pr create`` fails with "no history in common
+        # with main". A full clone of judgemind/judgemind is under 200MB
+        # and finishes in ~30-60s on the ECS task cold path — tasks run
+        # for hours, so the one-time cost is invisible and the
+        # correctness win is absolute.
         baseline.parent.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             "git",
             "clone",
-            "--depth=1",
-            "--no-tags",
             BASELINE_CLONE_URL,
             str(baseline),
         ]
@@ -4073,6 +4104,125 @@ class DispatcherDaemon:
         if result.returncode != 0:
             stderr_preview = _stderr_tail(result.stderr)
             raise RuntimeError(f"git fetch exit={result.returncode}: {stderr_preview}")
+
+    def _unshallow_baseline_if_needed(self) -> None:
+        """Upgrade a pre-existing shallow baseline to a full clone.
+
+        Issue #3039. The pre-#3039 :meth:`ensure_baseline_clone` wrote
+        shallow clones (``git clone --depth=1 --no-tags``). After the
+        fix lands, any container image whose ephemeral storage still
+        contains a shallow clone from a prior boot would continue to
+        hit the orphan-commit bug. This method detects that state
+        (``git rev-parse --is-shallow-repository == "true"``) and
+        runs ``git fetch --unshallow origin main`` to upgrade it in
+        place — no full re-clone, no container rebuild required.
+
+        Best-effort. A failure here does NOT raise — the caller's
+        :meth:`_baseline_fetch_origin_main` is still going to run and
+        will surface any actual connectivity or auth problem. The
+        worst case of a silent unshallow failure is that the next
+        no-op SHIP continues to produce orphan commits (the pre-#3039
+        status quo), which logs are already instrumented to detect.
+        """
+        baseline = self._cfg.baseline_repo_root
+        if baseline is None:  # pragma: no cover — guarded by callers
+            return
+
+        is_shallow_cmd = [
+            "git",
+            "-C",
+            str(baseline),
+            "rev-parse",
+            "--is-shallow-repository",
+        ]
+        try:
+            probe = subprocess.run(
+                is_shallow_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            self._log.warning(
+                "daemon.baseline_unshallow_probe_failed",
+                extra={
+                    "event": "baseline_unshallow_probe_failed",
+                    "run_id": self._run_id,
+                    "baseline_repo_root": str(baseline),
+                    "detail": str(exc),
+                },
+            )
+            return
+
+        if probe.returncode != 0:
+            self._log.warning(
+                "daemon.baseline_unshallow_probe_failed",
+                extra={
+                    "event": "baseline_unshallow_probe_failed",
+                    "run_id": self._run_id,
+                    "baseline_repo_root": str(baseline),
+                    "exit_code": probe.returncode,
+                    "stderr_tail": _stderr_tail(probe.stderr),
+                },
+            )
+            return
+
+        if (probe.stdout or "").strip() != "true":
+            # Already a full clone — nothing to do. No event; the
+            # common case should stay quiet.
+            return
+
+        unshallow_cmd = [
+            "git",
+            "-C",
+            str(baseline),
+            "fetch",
+            "--unshallow",
+            "origin",
+            "main",
+        ]
+        try:
+            result = subprocess.run(
+                unshallow_cmd,
+                capture_output=True,
+                text=True,
+                timeout=BASELINE_CLONE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            self._log.warning(
+                "daemon.baseline_unshallow_failed",
+                extra={
+                    "event": "baseline_unshallow_failed",
+                    "run_id": self._run_id,
+                    "baseline_repo_root": str(baseline),
+                    "detail": str(exc),
+                },
+            )
+            return
+
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.baseline_unshallow_failed",
+                extra={
+                    "event": "baseline_unshallow_failed",
+                    "run_id": self._run_id,
+                    "baseline_repo_root": str(baseline),
+                    "exit_code": result.returncode,
+                    "stderr_tail": _stderr_tail(result.stderr),
+                },
+            )
+            return
+
+        self._log.info(
+            "daemon.baseline_unshallowed",
+            extra={
+                "event": "baseline_unshallowed",
+                "run_id": self._run_id,
+                "baseline_repo_root": str(baseline),
+            },
+        )
 
     def _create_worktree(self, agent_id: str) -> Path:
         """``git worktree add`` a fresh worktree + branch for this agent.
@@ -5657,6 +5807,55 @@ class DispatcherDaemon:
                 if path.startswith(prefix):
                     return VERIFY_SKIP_REASON_SELF_DEPLOY
         return None
+
+    def _is_noop_ship(self, worktree: Path) -> bool:
+        """Return True when ralph SHIPped without creating a commit.
+
+        Issue #3039. Ralph's §2.5d "no-op guardrail" skips the
+        pre-push commit when the working tree is clean at SHIP time
+        (data-only / no-code-change task whose deliverable is the
+        evidence comment ralph posts on the issue). In that state
+        the worktree branch tip is still ``origin/main`` and there
+        is nothing to amend, push, or PR.
+
+        Implementation: ``git rev-list --count origin/main..HEAD``.
+        Return value ``0`` → no-op SHIP; any positive integer → real
+        commits on the branch. Subprocess failures fail-closed to
+        ``False`` (treat as "normal commits ahead" and let the rest
+        of :meth:`_push_and_open_pr` run normally — worst case is the
+        pre-#3039 failure mode, which is already instrumented by the
+        ``pr_create_failed`` classifier).
+
+        Pure on a single ``subprocess.run`` so the unit tests can
+        stub it with the standard ``patch('subprocess.run',
+        side_effect=[...])`` pattern used across the dispatcher
+        tests.
+        """
+        cmd = [
+            "git",
+            "-C",
+            str(worktree),
+            "rev-list",
+            "--count",
+            "origin/main..HEAD",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        if result.returncode != 0:
+            return False
+        try:
+            ahead = int((result.stdout or "").strip())
+        except ValueError:
+            return False
+        return ahead == 0
 
     def _list_committed_files_at_head(self, worktree: Path) -> list[str]:
         """Return the file list of the most recent commit on ``worktree``.
@@ -9023,6 +9222,53 @@ class DispatcherDaemon:
         marks ready + merges, or closes.
         """
         self._update_agent_phase(agent_id, "push_and_pr")
+
+        # Issue #3039: ralph §2.5d "no-op guardrail" SHIP detection.
+        # When ralph's working tree was clean at SHIP time (no code
+        # changes needed — e.g. data-only SQL backfill task whose
+        # deliverable is ralph's evidence comment on the issue), ralph
+        # intentionally did not create a commit. The branch tip is
+        # still ``origin/main`` and ``git rev-list --count
+        # origin/main..HEAD`` returns 0.
+        #
+        # Pre-#3039 the daemon unconditionally ran ``git commit
+        # --amend`` below, which against the shallow-boundary ``HEAD``
+        # produced an orphan root commit ("no history in common with
+        # main" from ``gh pr create``). Even with the shallow-clone
+        # fix (Fix a), amending ``origin/main`` on a non-shallow clone
+        # would rewrite the main-branch commit on the local branch
+        # tip — the resulting PR's diff would be empty and
+        # confusing, and a push would fail because the branch is
+        # not ahead of origin/main.
+        #
+        # The ralph skill already logs "pre-push gate skipped —
+        # working tree clean; no commit created" for this path. The
+        # daemon mirrors that with a clean terminal: mark the agent
+        # ``status='succeeded' phase=PHASE_NO_OP`` and emit
+        # :event:`daemon.push_and_pr_skipped_no_op`. No amend, no
+        # push, no PR. Ralph's issue comment is the deliverable.
+        if self._is_noop_ship(worktree):
+            self._log.info(
+                "daemon.push_and_pr_skipped_no_op",
+                extra={
+                    "event": "push_and_pr_skipped_no_op",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": (
+                        "origin/main..HEAD is empty — ralph's §2.5d "
+                        "no-op guardrail fired; no commit to push."
+                    ),
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="succeeded",
+                phase=PHASE_NO_OP,
+                exit_code=0,
+                issue_number=issue_number,
+            )
+            return
 
         unmet_criteria = self._agent_unmet_criteria or []
         is_needs_review = bool(unmet_criteria)
