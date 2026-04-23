@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
 # one-off: true
-"""Backfill previous_version_id for pre-#2569 superseded documents (#2653).
+"""Backfill previous_version_id and change_type for pre-existing content-hash
+dedup losers (#2653, parent #2569, live-code fix in #2650).
 
-The #2569 commit wired up the live ingestion path to populate
-previous_version_id = <winner_id> and change_type = 'duplicate_content' on
-content-hash dedup losers.  This script performs the matching backfill for
-losers that were superseded by the earlier #2458 code path — those rows have
-status='superseded' but previous_version_id IS NULL AND change_type IS NULL.
+Finds ``derived.documents`` rows where ``status='superseded'``,
+``previous_version_id IS NULL``, and ``change_type IS NULL`` — these are
+pre-existing losers that were marked superseded before the live-code fix in
+#2650 started populating those fields.
 
-Matching strategy: for each loser, look up active rulings in the loser's
-case_id (using derived.rulings, filtered to ruling_text_hash IS NOT NULL to
-mirror the partial unique index semantics).  If the case has exactly one
-distinct ruling_text_hash the winner's document_id is unambiguous and we link
-it.  If multiple distinct hashes exist the intended match cannot be recovered
-without re-extracting from S3, so we log WARN and skip (ambiguous).  If no
-rulings exist we log WARN and skip (no_winner).
+For each loser it attempts to find the winner document via:
+  1. (preferred) ``case_id`` match — find all active documents sharing the
+     same ``case_id`` as the loser and use ``pick_winner_for_loser`` to
+     resolve when exactly one candidate exists.
+  2. (fallback, when loser has ``case_id IS NULL``) staging.captures sibling
+     via ``content_hash`` -> ``promoted_document_id``.
+
+If exactly one candidate is found, it UPDATEs
+``previous_version_id = winner_id, change_type = 'duplicate_content'``.
+If zero or more-than-one candidates are found, it logs WARN and skips.
+
+The UPDATE WHERE clause (``previous_version_id IS NULL AND change_type IS
+NULL``) makes the script fully idempotent and safe against concurrent runs.
 
 This is an ECS oneshot script: no local imports from scripts/, only stdlib +
 installed packages.
 
 Usage (ECS):
     scripts/ecs-run-task.sh scripts/backfill_previous_version_id.py -- --dry-run
-    scripts/ecs-run-task.sh scripts/backfill_previous_version_id.py -- --limit 100
+    scripts/ecs-run-task.sh scripts/backfill_previous_version_id.py -- --dry-run --limit 5
+    scripts/ecs-run-task.sh scripts/backfill_previous_version_id.py -- --county orange
     scripts/ecs-run-task.sh scripts/backfill_previous_version_id.py
 
 Options:
     --dry-run       Show what would be updated without writing to DB.
     --limit N       Maximum number of loser rows to process (default: all).
+    --county NAME   Scope to one county (case-insensitive, default: all).
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections import defaultdict
 
 # Ensure the scraper-framework source is importable
 sys.path.insert(
@@ -52,141 +61,200 @@ from framework.logging import configure_structlog  # noqa: E402
 configure_structlog(contextvars=True)
 logger = structlog.get_logger()
 
-# Sentinel string returned by the SQL query when a case has 2+ distinct
-# ruling_text_hashes — the winner cannot be determined without S3 re-extraction.
-_AMBIGUOUS_SENTINEL = "AMBIGUOUS"
+# ---------------------------------------------------------------------------
+# SQL constants
+# ---------------------------------------------------------------------------
+
+# SELECT all pre-existing superseded losers (no previous_version_id yet).
+_SELECT_LOSERS = """
+    SELECT
+        d.id::text        AS loser_id,
+        d.case_id::text   AS loser_case_id,
+        co.county         AS county
+    FROM derived.documents d
+    JOIN derived.courts co ON co.id = d.court_id
+    WHERE d.status = 'superseded'
+      AND d.previous_version_id IS NULL
+      AND d.change_type IS NULL
+"""
+
+# Find active siblings sharing the same case_id (primary strategy).
+_SELECT_CASE_CANDIDATES = """
+    SELECT id::text
+    FROM derived.documents
+    WHERE case_id = %s::uuid
+      AND status = 'active'
+      AND id != %s::uuid
+"""
+
+# Fallback: find active siblings via staging.captures content_hash.
+_SELECT_CAPTURE_CANDIDATES = """
+    SELECT DISTINCT cap2.promoted_document_id::text AS id
+    FROM staging.captures cap1
+    JOIN staging.captures cap2
+        ON  cap2.content_hash = cap1.content_hash
+        AND cap2.promoted_document_id IS NOT NULL
+        AND cap2.promoted_document_id != %s::uuid
+    JOIN derived.documents d
+        ON d.id = cap2.promoted_document_id
+        AND d.status = 'active'
+    WHERE cap1.promoted_document_id = %s::uuid
+"""
+
+# Idempotent UPDATE -- trailing WHERE guard prevents double-writes.
+_UPDATE_LOSER = (
+    "UPDATE derived.documents "
+    "SET previous_version_id = %s::uuid, "
+    "    change_type = 'duplicate_content' "
+    "WHERE id = %s::uuid "
+    "  AND previous_version_id IS NULL "
+    "  AND change_type IS NULL"
+)
+
+_BATCH_SIZE = 100
 
 
-def fetch_loser_winner_pairs(
+# ---------------------------------------------------------------------------
+# Pure helper -- testable without a live DB
+# ---------------------------------------------------------------------------
+
+
+def pick_winner_for_loser(candidates: list[dict]) -> str | None:
+    """Return the winner document id, or None if the decision is ambiguous.
+
+    Parameters
+    ----------
+    candidates:
+        Each dict must have at least an ``"id"`` key (str UUID).  The list
+        should contain only *active* sibling documents for the loser.
+
+    Returns
+    -------
+    str | None
+        The winner id when exactly one candidate exists, else ``None``
+        (covers both the zero-candidate and the >=2-candidate cases).
+    """
+    if len(candidates) == 1:
+        return candidates[0]["id"]
+    # 0 candidates -> no winner; >=2 -> ambiguous
+    return None
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_losers(
     conn: psycopg.Connection,
     *,
     limit: int | None = None,
+    county: str | None = None,
 ) -> list[dict]:
-    """Fetch loser documents paired with their unambiguous winner (or sentinel).
+    """Fetch pre-existing superseded losers that need backfilling."""
+    query = _SELECT_LOSERS
+    params: list[object] = []
 
-    Returns a list of dicts with keys:
-        loser_id   (str)  — document id of the superseded loser
-        case_id    (str)  — case the loser belongs to
-        s3_key     (str)  — loser's S3 key (for logging)
-        county     (str)  — court county (for per-county reporting)
-        winner_id  (str | None)
-            - UUID string when exactly one distinct ruling_text_hash exists for
-              the case (unambiguous match)
-            - 'AMBIGUOUS' when 2+ distinct hashes exist
-            - None when no rulings exist (no_winner)
+    if county:
+        query += " AND lower(co.county) = lower(%s)"
+        params.append(county)
 
-    The SELECT already excludes rows where previous_version_id IS NOT NULL or
-    change_type IS NOT NULL, so re-running the script is idempotent.
-    """
-    query = """
-        WITH winners AS (
-            SELECT
-                r.case_id,
-                COUNT(DISTINCT r.ruling_text_hash) AS distinct_hashes,
-                MIN(r.document_id::text) AS winner_id
-            FROM derived.rulings r
-            WHERE r.ruling_text_hash IS NOT NULL
-            GROUP BY r.case_id
-        )
-        SELECT
-            d.id::text                              AS loser_id,
-            d.case_id::text                         AS case_id,
-            d.s3_key                                AS s3_key,
-            co.county                               AS county,
-            CASE
-                WHEN w.case_id IS NULL          THEN NULL
-                WHEN w.distinct_hashes = 1      THEN w.winner_id
-                ELSE 'AMBIGUOUS'
-            END                                     AS winner_id
-        FROM derived.documents d
-        JOIN derived.courts co ON co.id = d.court_id
-        LEFT JOIN winners w ON w.case_id = d.case_id
-        WHERE d.status = 'superseded'
-          AND d.previous_version_id IS NULL
-          AND d.change_type IS NULL
-        ORDER BY co.county, d.id
-    """
+    query += " ORDER BY co.county, d.id"
+
     if limit is not None:
         query += f" LIMIT {limit}"
 
     with conn.cursor() as cur:
-        cur.execute(query)
+        cur.execute(query, params or None)
         rows = cur.fetchall()
 
     return [
         {
             "loser_id": row[0],
-            "case_id": row[1],
-            "s3_key": row[2],
-            "county": row[3],
-            "winner_id": row[4],
+            "loser_case_id": row[1],
+            "county": row[2],
         }
         for row in rows
     ]
 
 
-def apply_link(
+def find_candidates_by_case_id(
     conn: psycopg.Connection,
     loser_id: str,
-    winner_id: str,
-) -> None:
-    """UPDATE a single loser document to set previous_version_id + change_type.
+    case_id: str,
+) -> list[dict]:
+    """Find active documents sharing case_id with the loser."""
+    with conn.cursor() as cur:
+        cur.execute(_SELECT_CASE_CANDIDATES, (case_id, loser_id))
+        rows = cur.fetchall()
+    return [{"id": row[0]} for row in rows]
 
-    Mirrors the live writer shape in packages/scraper-framework/src/ingestion/db.py
-    lines 1783-1791.  The WHERE clause guards against accidentally re-updating a
-    row that was already linked since the loser set was fetched.
+
+def find_candidates_by_capture_hash(
+    conn: psycopg.Connection,
+    loser_id: str,
+) -> list[dict]:
+    """Fallback: find active documents via staging.captures content_hash.
+
+    Used when the loser's case_id is NULL and the primary strategy is
+    unavailable.
     """
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE derived.documents "
-            "SET previous_version_id = %s::uuid, "
-            "    change_type = 'duplicate_content' "
-            "WHERE id = %s::uuid "
-            "  AND previous_version_id IS NULL "
-            "  AND change_type IS NULL",
-            (winner_id, loser_id),
-        )
+        cur.execute(_SELECT_CAPTURE_CANDIDATES, (loser_id, loser_id))
+        rows = cur.fetchall()
+    return [{"id": row[0]} for row in rows]
 
 
-def summarize(rows: list[dict]) -> dict:
-    """Aggregate outcome rows into a summary dict.
+def apply_update_batch(
+    conn: psycopg.Connection,
+    updates: list[tuple[str, str]],
+    *,
+    dry_run: bool,
+) -> int:
+    """Execute a batch of UPDATE statements inside a single transaction.
 
-    Args:
-        rows: list of dicts, each with keys 'county' and 'outcome'.
-              Outcome values: 'updated', 'ambiguous', 'no_winner'.
+    Parameters
+    ----------
+    updates:
+        List of ``(winner_id, loser_id)`` tuples.
+    dry_run:
+        If ``True``, log the intended updates but do not execute.
 
-    Returns:
-        {
-            'updated_per_county': {county: count, ...},
-            'ambiguous': int,
-            'no_winner': int,
-        }
+    Returns
+    -------
+    int
+        Number of intended links (dry-run) or rows actually updated (write).
     """
-    updated_per_county: dict[str, int] = {}
-    ambiguous = 0
-    no_winner = 0
+    if dry_run:
+        for winner_id, loser_id in updates:
+            logger.info(
+                "DRY RUN: would link loser to winner",
+                loser_id=loser_id,
+                winner_id=winner_id,
+            )
+        return len(updates)
 
-    for row in rows:
-        outcome = row["outcome"]
-        county = row["county"]
-        if outcome == "updated":
-            updated_per_county[county] = updated_per_county.get(county, 0) + 1
-        elif outcome == "ambiguous":
-            ambiguous += 1
-        elif outcome == "no_winner":
-            no_winner += 1
-
-    return {
-        "updated_per_county": updated_per_county,
-        "ambiguous": ambiguous,
-        "no_winner": no_winner,
-    }
+    updated = 0
+    with conn.cursor() as cur:
+        for winner_id, loser_id in updates:
+            cur.execute(_UPDATE_LOSER, (winner_id, loser_id))
+            updated += cur.rowcount
+    conn.commit()
+    return updated
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:  # noqa: C901 -- acceptable complexity for a one-off script
     """Run the previous_version_id backfill."""
     parser = argparse.ArgumentParser(
-        description="Backfill previous_version_id for pre-#2569 superseded documents.",
+        description=(
+            "Backfill previous_version_id + change_type='duplicate_content' "
+            "on pre-existing content-hash dedup losers (#2653)."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -199,6 +267,12 @@ def main() -> None:
         default=None,
         help="Maximum number of loser rows to process (default: all).",
     )
+    parser.add_argument(
+        "--county",
+        type=str,
+        default=None,
+        help="Scope to one county by name (case-insensitive, default: all).",
+    )
     args = parser.parse_args()
 
     db_url = os.environ.get("DATABASE_URL")
@@ -208,76 +282,83 @@ def main() -> None:
 
     conn = psycopg.connect(db_url, autocommit=False)
     try:
-        pairs = fetch_loser_winner_pairs(conn, limit=args.limit)
-        logger.info("Fetched loser rows", count=len(pairs))
+        losers = fetch_losers(conn, limit=args.limit, county=args.county)
+        total = len(losers)
+        logger.info(
+            "Fetched superseded losers to process",
+            total=total,
+            dry_run=args.dry_run,
+            county=args.county,
+        )
 
-        if not pairs:
-            logger.info(
-                "No unlinked superseded documents found — backfill already complete"
-            )
+        if not losers:
+            logger.info("No losers to process -- all superseded docs already linked")
             return
 
-        outcome_rows: list[dict] = []
+        linked = 0
+        unlinkable = 0
+        unlinkable_reasons: dict[str, int] = defaultdict(int)
+        county_counts: dict[str, int] = defaultdict(int)
+        pending_updates: list[tuple[str, str]] = []
 
-        for pair in pairs:
-            loser_id = pair["loser_id"]
-            case_id = pair["case_id"]
-            s3_key = pair["s3_key"]
-            county = pair["county"]
-            winner_id = pair["winner_id"]
+        def flush_batch() -> None:
+            nonlocal linked
+            if pending_updates:
+                linked += apply_update_batch(
+                    conn, pending_updates, dry_run=args.dry_run
+                )
+                pending_updates.clear()
+
+        for loser in losers:
+            loser_id = loser["loser_id"]
+            loser_case_id = loser["loser_case_id"]
+            county = loser["county"]
+
+            if loser_case_id is not None:
+                candidates = find_candidates_by_case_id(conn, loser_id, loser_case_id)
+                strategy = "case_id"
+            else:
+                candidates = find_candidates_by_capture_hash(conn, loser_id)
+                strategy = "capture_hash"
+
+            winner_id = pick_winner_for_loser(candidates)
 
             if winner_id is None:
+                if len(candidates) == 0:
+                    reason = "no_candidates"
+                else:
+                    reason = "ambiguous"
                 logger.warning(
-                    "no_winner: case has zero rulings with a text hash",
+                    "unlinkable",
                     loser_id=loser_id,
-                    case_id=case_id,
-                    s3_key=s3_key,
                     county=county,
+                    strategy=strategy,
+                    reason=reason,
+                    candidate_count=len(candidates),
                 )
-                outcome_rows.append({"county": county, "outcome": "no_winner"})
+                unlinkable += 1
+                unlinkable_reasons[reason] += 1
                 continue
 
-            if winner_id == _AMBIGUOUS_SENTINEL:
-                logger.warning(
-                    "ambiguous: case has multiple distinct ruling hashes — "
-                    "cannot determine winner without S3 re-extraction",
-                    loser_id=loser_id,
-                    case_id=case_id,
-                    s3_key=s3_key,
-                    county=county,
-                )
-                outcome_rows.append({"county": county, "outcome": "ambiguous"})
-                continue
+            pending_updates.append((winner_id, loser_id))
+            county_counts[county] += 1
 
-            # Unambiguous match
-            if args.dry_run:
-                logger.info(
-                    "DRY RUN: would link loser to winner",
-                    loser_id=loser_id,
-                    winner_id=winner_id,
-                    county=county,
-                )
-            else:
-                apply_link(conn, loser_id, winner_id)
-                conn.commit()
-                logger.info(
-                    "Linked loser to winner",
-                    loser_id=loser_id,
-                    winner_id=winner_id,
-                    county=county,
-                )
+            if len(pending_updates) >= _BATCH_SIZE:
+                flush_batch()
 
-            outcome_rows.append({"county": county, "outcome": "updated"})
+        flush_batch()  # final partial batch
 
-        summary = summarize(outcome_rows)
         logger.info(
-            "Backfill complete",
+            "backfill_previous_version_id_summary",
+            event="backfill_previous_version_id_summary",
+            total_scanned=total,
+            linked=linked,
+            unlinkable=unlinkable,
+            unlinkable_reasons=dict(unlinkable_reasons),
+            per_county=dict(county_counts),
             dry_run=args.dry_run,
-            total=len(pairs),
-            updated_per_county=summary["updated_per_county"],
-            ambiguous=summary["ambiguous"],
-            no_winner=summary["no_winner"],
         )
+
     finally:
         conn.close()
 
