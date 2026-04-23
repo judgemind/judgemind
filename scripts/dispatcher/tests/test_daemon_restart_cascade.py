@@ -966,7 +966,7 @@ class TestProcessRetryMarkersInfraPreemption:
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
 
         gh_calls: list[tuple[int, list[str]]] = []
-        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: gh_calls.append((n, l)))
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, labels: gh_calls.append((n, labels)))
 
         processed = d._process_retry_markers()
         assert processed == 1
@@ -1001,7 +1001,7 @@ class TestProcessRetryMarkersInfraPreemption:
             issue_number=2925,
         )
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
-        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: None)
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, labels: None)
 
         terminal_calls: list[dict[str, Any]] = []
 

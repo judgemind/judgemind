@@ -755,7 +755,7 @@ class TestProcessRetryMarkers:
             ],
         ]
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
-        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: None)
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, labels: None)
 
         processed = d._process_retry_markers()
         assert processed == 1
@@ -813,7 +813,7 @@ class TestProcessRetryMarkers:
             ],
         ]
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
-        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, l: None)
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, labels: None)
 
         processed = d._process_retry_markers()
         assert processed == 1
