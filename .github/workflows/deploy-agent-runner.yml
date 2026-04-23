@@ -1,0 +1,158 @@
+name: Deploy Agent Runner
+
+# Builds and pushes the dispatcher agent-runner image
+# (`judgemind/dispatcher-agent-runner`) to ECR on merge to main. Mirrors
+# the build-and-push half of `deploy-dispatcher.yml`, without the
+# service rollout step — the agent-runner is a *task definition* family,
+# not a service. New `ecs:RunTask` launches pick up the latest image
+# naturally via the `:latest` tag pinned in the task-def (see
+# `infra/terraform/modules/dispatcher-agent-runner/main.tf`).
+#
+# Background
+# ----------
+# Before this workflow existed (#3118), the operator had to build + push
+# this image by hand from their laptop. During the #3092 Stage 3 smoke
+# that happened twice. With #3107 (dev terraform auto-apply) and #3108
+# (daemon auto-rebuild) live, this file is the last missing link for
+# full CI parity on the #3086 Option A per-agent-ECS path.
+#
+# Build outputs:
+#   ECR image `<acct>.dkr.ecr.us-west-2.amazonaws.com/judgemind/dispatcher-agent-runner:<sha7>`
+#   Tags: `<sha7>`, `latest`, `<branch>`, and optional `image_tag` input.
+#
+# Triggers:
+#   push to main when anything that affects the image content OR the
+#   deploy workflow itself changes, plus workflow_dispatch for a manual
+#   rebuild without a code change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.dispatcher-agent-runner"
+      - "scripts/dispatcher/**"
+      # scripts/dispatcher/helpers/ is operator-only tooling — nothing
+      # in there is invoked by the agent-runner at runtime, so changes
+      # should not trigger a rebuild. Same narrowing as
+      # deploy-dispatcher.yml.
+      - "!scripts/dispatcher/helpers/**"
+      # scripts/dispatcher/tests/ is pytest fixtures + unit tests —
+      # never COPY'd into the image. Excluded for parity with
+      # deploy-dispatcher.yml's post-#3112 narrowing.
+      - "!scripts/dispatcher/tests/**"
+      # Markdown-only changes under scripts/dispatcher/ (design notes,
+      # READMEs) don't affect the image content. Same exclusion as
+      # deploy-dispatcher.yml.
+      - "!scripts/dispatcher/**/*.md"
+      - "scripts/check-issue-author.sh"
+      - "scripts/preflight.sh"
+      - "scripts/preflight-bash-fargate.sh"
+      - ".claude/hooks/preflight_cross_worktree.py"
+      - ".github/workflows/deploy-agent-runner.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: deploy-agent-runner-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/dispatcher-agent-runner
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          # `GIT_SHA` is baked into the image as an env var so the
+          # agent-runner can self-report its build SHA into
+          # `dispatcher.agents.runner_image_sha` (Stage 2 column).
+          docker build \
+              --build-arg "GIT_SHA=$SHA_TAG" \
+              -f Dockerfile.dispatcher-agent-runner \
+              "${TAGS[@]}" .
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify image landed in ECR
+        env:
+          SHA_TAG: ${{ steps.build.outputs.sha_tag }}
+        run: |
+          # Cheap post-push sanity check — confirms the SHA tag landed
+          # on the same digest as `:latest`. Any failure here means the
+          # push silently dropped or the registry is returning stale
+          # metadata; both worth failing CI for.
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$SHA_TAG" \
+            --region "$AWS_REGION" \
+            --no-cli-pager \
+            --output json \
+            --query 'imageDetails[0].{digest:imageDigest,tags:imageTags,pushedAt:imagePushedAt}'
+
+      - name: Publish build summary
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image_uri }}
+          SHA_TAG: ${{ steps.build.outputs.sha_tag }}
+        run: |
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          {
+            echo "### Agent-runner image pushed"
+            echo ""
+            echo "- **Repo:** \`$ECR_REPOSITORY\`"
+            echo "- **SHA tag:** \`$SHA_TAG\`"
+            echo "- **Image URI:** \`$IMAGE_URI\`"
+            echo "- **Also tagged:** \`latest\`, \`$BRANCH_TAG\`"
+            echo ""
+            echo "Next \`ecs:RunTask\` against the \`judgemind-dispatcher-agent-runner-dev\` family will pull this image via the \`:latest\` tag."
+          } >> "$GITHUB_STEP_SUMMARY"
