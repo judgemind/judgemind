@@ -68,7 +68,31 @@ case "$PHASE" in
     claiming|setup)
         NEXT="A.2 — implement and review (ralph loop) or direct implementation for non-testable tasks"
         ;;
-    ralph-worker*|ralph-reviewer*|implementing)
+    ralph-worker*|ralph-reviewer*)
+        # Consult ralph-done.txt to determine which branch of the ralph loop we are in.
+        RALPH_DONE="$WORKTREE/tmp/ralph/ralph-done.txt"
+        if [ ! -f "$RALPH_DONE" ]; then
+            # ralph-done.txt absent — ralph is mid-loop (worker still running or never completed)
+            RALPH_ITER=$(echo "$PHASE" | grep -oE '[0-9]+' | head -n 1)
+            if [ -z "$RALPH_ITER" ]; then
+                RALPH_ITER="unknown"
+            fi
+            NEXT="resume the ralph loop from iteration $RALPH_ITER — re-read .claude/skills/ralph/SKILL.md Step 2 and continue"
+        else
+            FIRST_LINE=$(head -n 1 "$RALPH_DONE")
+            if echo "$FIRST_LINE" | grep -q "SHIP"; then
+                # ralph completed with SHIP — proceed to post-ralph summary step
+                NEXT="A.2b — post process summary on issue (MANDATORY before commit)"
+            elif echo "$FIRST_LINE" | grep -qE "MAX_ITERATIONS|AC_INFEASIBLE|STUCK"; then
+                # ralph hit a terminal blocker — teardown the label interlock
+                NEXT="teardown: release status/in-progress label (gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress) per task §A.2 STUCK path, then stop"
+            else
+                # Unknown content in ralph-done.txt — conservative: point to A.2b
+                NEXT="A.2b — post process summary on issue (check ralph-done.txt content first)"
+            fi
+        fi
+        ;;
+    implementing)
         NEXT="A.2b — post process summary on issue (MANDATORY before commit)"
         ;;
     pushing)
@@ -91,6 +115,65 @@ case "$PHASE" in
         ;;
     retrospective)
         NEXT="Step 5c — file retro issues, then 5d — generate timing summary"
+        ;;
+    # /audit phases
+    audit-setup)
+        NEXT="continue with audit Step 1 — begin category 1.1 (adversarial code review); resume in .claude/skills/audit/SKILL.md §1.1"
+        ;;
+    audit-category-1.1)
+        NEXT="continue with category 1.2 — CLAUDE.md hygiene; resume in .claude/skills/audit/SKILL.md §1.2"
+        ;;
+    audit-category-1.2)
+        NEXT="continue with category 1.3 — architecture drift; resume in .claude/skills/audit/SKILL.md §1.3"
+        ;;
+    audit-category-1.3)
+        NEXT="continue with category 1.4 — test quality; resume in .claude/skills/audit/SKILL.md §1.4"
+        ;;
+    audit-category-1.4)
+        NEXT="continue with category 1.5 — performance; resume in .claude/skills/audit/SKILL.md §1.5"
+        ;;
+    audit-category-1.5)
+        NEXT="continue with category 1.6 — Security; resume in .claude/skills/audit/SKILL.md §1.6"
+        ;;
+    audit-category-1.6)
+        NEXT="continue with category 1.7 — dependency health; resume in .claude/skills/audit/SKILL.md §1.7"
+        ;;
+    audit-category-1.7)
+        NEXT="continue with category 1.8 — CI health; resume in .claude/skills/audit/SKILL.md §1.8"
+        ;;
+    audit-category-1.8)
+        NEXT="continue with category 1.9 — scripts directory hygiene; resume in .claude/skills/audit/SKILL.md §1.9"
+        ;;
+    audit-category-1.9)
+        NEXT="continue with Step 2 — deduplicate findings; resume in .claude/skills/audit/SKILL.md §Step 2"
+        ;;
+    audit-dedup)
+        NEXT="continue with Step 3 — file issues; resume in .claude/skills/audit/SKILL.md §Step 3"
+        ;;
+    audit-file-issues)
+        NEXT="continue with Step 4 — write summary report; resume in .claude/skills/audit/SKILL.md §Step 4"
+        ;;
+    audit-report)
+        NEXT="continue with Step 5 — notify completion and write phase=done; resume in .claude/skills/audit/SKILL.md §Step 5"
+        ;;
+    # /spotcheck phases
+    spotcheck-step-0)
+        NEXT="continue with §1 (rulings direction review); resume in .claude/skills/spotcheck/SKILL.md §Step 1"
+        ;;
+    spotcheck-step-1)
+        NEXT="continue with §2 (originals direction review); resume in .claude/skills/spotcheck/SKILL.md §Step 2"
+        ;;
+    spotcheck-step-2)
+        NEXT="continue with §2.5 (S3 orphan check) then §3 (screenshots) and §4 (cross-reference); resume in .claude/skills/spotcheck/SKILL.md §2.5"
+        ;;
+    spotcheck-step-2.5)
+        NEXT="continue with §3 (screenshots, optional) then §4 (cross-reference and file issues); resume in .claude/skills/spotcheck/SKILL.md §Step 3"
+        ;;
+    spotcheck-step-4)
+        NEXT="continue with §5 — write summary report; resume in .claude/skills/spotcheck/SKILL.md §Step 5"
+        ;;
+    spotcheck-step-5)
+        NEXT="write phase=done to the status file — spotcheck is complete"
         ;;
     *)
         NEXT="Re-read .claude/skills/task/SKILL.md and determine which step corresponds to phase='$PHASE'"
