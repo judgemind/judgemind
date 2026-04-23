@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import pytest
 import structlog.testing
 
 from framework import BaseScraper, CapturedDocument, ContentFormat, ScraperConfig
@@ -355,3 +356,62 @@ def test_process_document_no_warning_for_html_without_text() -> None:
 
     pdf_warnings = [e for e in cap_logs if "image-only PDF" in e.get("event", "")]
     assert not pdf_warnings, "No PDF warning for HTML documents"
+
+
+# ---------------------------------------------------------------------------
+# ScraperPreconditionFailure + _require_precondition (#2667)
+# ---------------------------------------------------------------------------
+
+
+def test_require_precondition_raises_on_false() -> None:
+    """_require_precondition(False, msg) must raise ScraperPreconditionFailure with the
+    given message, and ScraperPreconditionFailure must be a RuntimeError subclass.
+    """
+    from framework import ScraperPreconditionFailure
+
+    config = _make_config()
+    scraper = DummyScraper(docs=[], config=config)
+
+    with pytest.raises(ScraperPreconditionFailure, match="session acquisition failed") as exc_info:
+        scraper._require_precondition(False, "session acquisition failed")
+
+    # Confirm subclass contract: existing pytest.raises(RuntimeError, ...) assertions
+    # in court-specific tests continue to pass unchanged.
+    assert isinstance(exc_info.value, RuntimeError)
+
+
+def test_require_precondition_passes_on_true() -> None:
+    """_require_precondition(True, msg) must return None without raising."""
+    config = _make_config()
+    scraper = DummyScraper(docs=[], config=config)
+
+    result = scraper._require_precondition(True, "session acquisition failed")
+    assert result is None
+
+
+def test_require_precondition_surfaces_as_run_failure() -> None:
+    """Integration: a scraper that calls _require_precondition(False, ...) inside
+    fetch_documents should cause run() to return a ScraperHealthEvent with
+    success=False and the error message captured in error_message.
+
+    This guards the end-to-end silent-zero-records regression (#2620) at the
+    framework level: the failure must be visible, not silently swallowed as a
+    zero-records success.
+    """
+    config = _make_config()
+
+    class PreconditionFailScraper(BaseScraper):
+        def fetch_documents(self) -> list[CapturedDocument]:
+            self._require_precondition(False, "missing session — cannot fetch rulings")
+            return []  # unreachable
+
+        def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+            return doc
+
+    scraper = PreconditionFailScraper(config=config)
+    health = scraper.run()
+
+    assert health.success is False
+    assert health.records_captured == 0
+    assert health.error_message is not None
+    assert "missing" in health.error_message

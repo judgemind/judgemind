@@ -25,6 +25,20 @@ from .storage import S3Archiver
 logger = structlog.get_logger(__name__)
 
 
+class ScraperPreconditionFailure(RuntimeError):  # noqa: N818
+    """Raised when a prerequisite step (e.g. session acquisition, auth handshake)
+    fails before any documents can be fetched.
+
+    Subclasses RuntimeError (not plain Exception) so that existing
+    ``pytest.raises(RuntimeError, match=...)`` assertions in court-specific
+    tests continue to pass unchanged — ``isinstance(ScraperPreconditionFailure(...),
+    RuntimeError) is True``.
+
+    Canonical example: SF civil tentative scraper session acquisition (#2620).
+    Introduced in #2667.
+    """
+
+
 class BaseScraper(abc.ABC):
     """Abstract base class for all Judgemind court scrapers.
 
@@ -38,6 +52,13 @@ class BaseScraper(abc.ABC):
     - Event emission
     - Retry with exponential backoff
     - Health reporting
+
+    Precondition failures:
+        If ``fetch_documents`` requires a prerequisite step (session acquisition,
+        auth token, proxy handshake) that, when it fails, prevents fetching *any*
+        documents, call ``self._require_precondition(cond, msg)`` instead of
+        returning ``[]``.  Returning ``[]`` would be recorded by ``run()`` as a
+        successful zero-records run and mask silent outages — see #2620.
     """
 
     def __init__(
@@ -137,6 +158,28 @@ class BaseScraper(abc.ABC):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _require_precondition(self, cond: bool, msg: str) -> None:
+        """Raise ScraperPreconditionFailure if *cond* is falsy.
+
+        Use this in ``fetch_documents`` for prerequisite steps — session
+        acquisition, auth token exchange, proxy handshake — that, when they
+        fail, prevent *any* documents from being fetched.  Calling
+        ``return []`` instead would be indistinguishable from a legitimate
+        "no rulings today" result: ``run()`` would record
+        ``success=True, records=0``, masking silent outages in CloudWatch.
+
+        Example::
+
+            self._require_precondition(
+                self._session_id is not None,
+                "session acquisition failed",
+            )
+
+        Origin: #2620 (SF civil silent-zero bug), introduced in #2667.
+        """
+        if not cond:
+            raise ScraperPreconditionFailure(msg)
 
     def _process_document(self, doc: CapturedDocument) -> None:
         """Inline CSS → hash → derive deterministic ID → parse → archive → emit.
