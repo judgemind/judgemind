@@ -118,14 +118,24 @@ WITH
     WHERE agent_id = '${agent_id}'
   ),
   transitions AS (
+    -- phase_transitions.ts is the phase-END timestamp (the row is inserted
+    -- when a phase EXITS). So the duration of a given row's phase is
+    -- ts - (prev row's ts, or agent.started_at for the first row). Using
+    -- LEAD would give the duration of the NEXT phase, which was the old
+    -- bug — this script now reports the correct phase duration under the
+    -- correct phase name.
     SELECT COALESCE(jsonb_agg(t), '[]'::jsonb) AS data FROM (
       SELECT jsonb_build_object(
         'phase',       phase,
         'ts_utc',      to_char(ts AT TIME ZONE 'UTC',               'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
         'ts_pt',       to_char(ts AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"'),
-        'phase_duration', CASE
-          WHEN LEAD(ts) OVER (ORDER BY ts) IS NULL THEN NULL
-          ELSE to_char(LEAD(ts) OVER (ORDER BY ts) - ts, 'FMHH24:MI:SS') END,
+        'phase_duration', to_char(
+          ts - COALESCE(
+            LAG(ts) OVER (ORDER BY ts),
+            (SELECT started_at FROM dispatcher.agents WHERE agent_id = '${agent_id}')
+          ),
+          'FMHH24:MI:SS'
+        ),
         'autocompact_count', autocompact_count
       ) AS t
       FROM dispatcher.phase_transitions
@@ -225,7 +235,7 @@ echo "$timeline" | jq -r '
       if ($root.transitions | length) == 0
         then ["  (none)"]
         else ($root.transitions | map(
-          "  \(.ts_utc)  (\(.ts_pt))  \(.phase)\(if .phase_duration then "  [\(.phase_duration)]" else "  [ongoing]" end)\(if .autocompact_count and .autocompact_count > 0 then "  ac=\(.autocompact_count)" else "" end)"
+          "  ended \(.ts_utc)  (\(.ts_pt))  \(.phase)  ran [\(.phase_duration)]\(if .autocompact_count and .autocompact_count > 0 then "  ac=\(.autocompact_count)" else "" end)"
         ))
       end
     ) + ["", "── failures ──"] + (
