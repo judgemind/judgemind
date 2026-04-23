@@ -30,13 +30,30 @@
 # use the in-process subprocess path.
 #
 # Per-phase mechanical side effects — the parts that today live in
-# `daemon._handle_phase_*` (push-and-pr's `git push` + `gh pr create`,
-# awaiting_ci's `gh pr checks` poll, etc.) — are stubbed as
-# per-phase helper functions (`_handle_phase_push_and_pr`, etc.) that
-# return sentinel outputs for verdict-driven phases (plan, ralph,
-# summary, push_and_pr, fix_ci, verify) and TODO exits for the
-# mechanical-only phases (merge, awaiting_ci, awaiting_deploy, retro).
-# Stage 2 fleshes each stub out.
+# `daemon._handle_phase_*` — split across three tiers in the Stage 1b
+# entrypoint (post-#3117):
+#
+#   1. **Claude-driven phases** (planning, ralph, summary, fix_ci,
+#      verify) → `run_claude_phase "<phase>"` which looks up the skill
+#      name via `phase_to_skill` and invokes `claude -p /task-v2-...`.
+#   2. **Mechanical pseudo-phase: claiming** → no-op; advances
+#      immediately to `planning`. The daemon has already written the
+#      agent row by the time this task boots, so the claim step is
+#      nothing but a lifecycle marker.
+#   3. **Mechanical phases with side effects** — `push_and_pr` has a
+#      minimal in-process implementation (`handle_push_and_pr` ==
+#      `git push` + `gh pr create`). `awaiting_ci`, `merge`,
+#      `awaiting_deploy`, `retro`, and `setup` are stubbed: they
+#      advance to the documented "next" phase on the happy path so
+#      the smoke test can reach `done` without a full daemon
+#      integration. Stage 2 fleshes each stub out.
+#
+# The phase → skill-name mapping (`phase_to_skill`) is explicit and
+# dies on an unknown phase. Prior to #3117 the entrypoint constructed
+# `/task-v2-$_phase` directly, which silently failed with "Unknown
+# command" for the `planning`/`plan` and `fix_ci`/`fix-ci` drift and
+# for the two mechanical phases (`claiming`, `push_and_pr`) that
+# never had skills.
 #
 # macOS bash 3.2 compatibility
 # ----------------------------
@@ -309,7 +326,17 @@ except ImportError:
 
 payload = json.load(sys.stdin)
 current_phase = payload.get("current_phase", "")
-output = payload.get("output") or {}
+output = payload.get("output")
+# Defensive coercion (#3117): a failed claude invocation (e.g. sandbox
+# deny, skill-name typo returning "Unknown command: ...", network
+# error) can surface as a plain-string `.result`. The downstream
+# transition functions call ``output.get("verdict")``, which crashes
+# with AttributeError on a str. Coerce any non-dict output to {} so
+# the transition falls through the missing-verdict branch and the
+# caller persists a structured failure row instead of crashing the
+# runner with a stack trace.
+if not isinstance(output, dict):
+    output = {}
 transition = pt.next_phase_from_verdict(current_phase, output)
 fields = [
     transition.action.value if transition.action else "",
@@ -349,6 +376,31 @@ transition_for() {
 # bundles) lands in Stage 2. Stage 1b proves the wire — not the
 # finish-line finesse.
 
+# Phase → skill name mapping (#3117). The phase-name constants emitted
+# by `scripts/dispatcher/phase_transitions.py` use underscored/present-
+# participle names (planning, fix_ci). The actual Claude skills on disk
+# are hyphenated/root-verb (task-v2-plan, task-v2-fix-ci). We do NOT
+# construct `/task-v2-$_phase` directly; we map to the literal skill
+# name via this case statement so any drift (new phase, renamed skill)
+# surfaces as an explicit die() instead of a silent "Unknown command"
+# string coming back from claude.
+#
+# Bash 3.2: a case statement is used instead of an associative array
+# (declare -A is bash 4+).
+phase_to_skill() {
+    # $1 = phase name. Prints the matching skill suffix (no `task-v2-`
+    # prefix) on stdout. die()s if no mapping exists.
+    case "$1" in
+        planning)  printf 'plan' ;;
+        ralph)     printf 'ralph' ;;
+        summary)   printf 'summary' ;;
+        fix_ci)    printf 'fix-ci' ;;
+        verify)    printf 'verify' ;;
+        retro)     printf 'retro' ;;
+        *)         die "no_skill_mapping_for_phase=$1" ;;
+    esac
+}
+
 run_claude_phase() {
     _phase="$1"
     _out_file="$AGENT_WORKSPACE/claude-p-$_phase.stdout.json"
@@ -359,12 +411,18 @@ run_claude_phase() {
         return 0
     fi
 
-    log "claude_phase_begin" "phase=$_phase"
+    # Map phase name → skill suffix. A bad phase (e.g. accidentally
+    # routed `claiming` or `push_and_pr` through this function) aborts
+    # the runner via die() so the symptom surfaces at test time, not
+    # as a silent "Unknown command" in production CloudWatch.
+    _skill=$(phase_to_skill "$_phase")
+
+    log "claude_phase_begin" "phase=$_phase" "skill=$_skill"
     # Do NOT fail the script on a non-zero exit — parse the envelope
     # and let the caller decide. Redirect stderr to a sibling file for
     # triage parity with the daemon.
     set +e
-    claude -p "/task-v2-$_phase $AGENT_ID" \
+    claude -p "/task-v2-$_skill $AGENT_ID" \
         --output-format json \
         --dangerously-skip-permissions \
         > "$_out_file" \
@@ -374,10 +432,22 @@ run_claude_phase() {
     log "claude_phase_done" "phase=$_phase" "exit_code=$_rc"
 
     # The `result` field of `claude -p --output-format json` is either
-    # a string (legacy path) or an object. The task-v2-* skills emit
-    # JSON objects in `result` (parsed by the daemon); we forward it
-    # unchanged for the transition shim.
-    jq -c '.result // {}' "$_out_file" 2>/dev/null || printf '{}'
+    # a string (legacy path, or a skill error like "Unknown command: ...")
+    # or an object. The task-v2-* skills emit JSON objects in `result`
+    # (parsed by the daemon); we forward an object unchanged for the
+    # transition shim.
+    #
+    # Defensive (#3117): when `.result` is not a JSON object, coerce
+    # to `{}` here so the downstream transition shim + persist path
+    # see a dict-shaped output and don't crash on `.get("verdict")`.
+    # The raw `.result` string is preserved on disk in `_out_file`
+    # for triage.
+    if jq -e '.result | type == "object"' "$_out_file" >/dev/null 2>&1; then
+        jq -c '.result' "$_out_file" 2>/dev/null || printf '{}'
+    else
+        log "claude_result_non_object" "phase=$_phase" "out_file=$_out_file"
+        printf '{}'
+    fi
 }
 
 persist_phase_output() {
@@ -405,6 +475,90 @@ persist_phase_output() {
     db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
              VALUES ('$AGENT_ID', '$_phase', '$_escaped'::jsonb);"
     log "phase_output_persisted" "phase=$_phase"
+}
+
+handle_push_and_pr() {
+    # Mechanical implementation of the push_and_pr phase (#3117).
+    #
+    # This phase is NOT claude-driven — the daemon handles push + PR
+    # creation inline today via `_handle_phase_push_and_pr` (daemon.py
+    # ~L10544). Prior to this fix the entrypoint's phase-dispatch case
+    # lumped `push_and_pr` in with the claude-driven branches and
+    # called `/task-v2-push_and_pr`, which returned "Unknown command"
+    # (the skill does not exist).
+    #
+    # Stage 1b scope: the minimal viable push + PR, enough to get the
+    # smoke to exercise the phase boundary. Rich failure handling
+    # (commit --amend with the summary phase's commit_message, self-
+    # deploy detection, unmet-AC draft-PR, git_push_failed diagnoser
+    # routing) stays in the daemon's implementation and lands on the
+    # agent-runner side in a later Stage 2 PR.
+    #
+    # Prints the phase-output JSON envelope on stdout so the caller
+    # can persist it via persist_phase_output and drive the transition
+    # shim. Output shape matches `transition_from_push_and_pr`:
+    #   {"no_op": true}   → terminal success (no commit to push)
+    #   {"no_op": false}  → advance to awaiting_ci
+    #
+    # Note: if `AGENT_RUNNER_DRY_RUN=1`, emit `{"no_op": true}` so the
+    # loop reaches a terminal phase without actually shelling out.
+
+    if [[ "$AGENT_RUNNER_DRY_RUN" == "1" ]]; then
+        log "push_and_pr_dry_run"
+        printf '{"no_op": true}'
+        return 0
+    fi
+
+    # Detect the #3039 no-op-SHIP guardrail: ralph's SHIP with a clean
+    # working tree means `origin/main..HEAD` is empty — there's nothing
+    # to push and no PR to open. Terminate as no_op so the transition
+    # shim flips the agent to `succeeded`.
+    _ahead_count=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
+    if [[ "$_ahead_count" == "0" ]]; then
+        log "push_and_pr_no_op" "reason=clean_worktree_on_ship"
+        printf '{"no_op": true}'
+        return 0
+    fi
+
+    log "push_and_pr_push_begin" "branch=$BRANCH_NAME"
+    set +e
+    git -C "$REPO_ROOT" push -u origin "$BRANCH_NAME" \
+        > "$AGENT_WORKSPACE/git-push.stdout.log" \
+        2> "$AGENT_WORKSPACE/git-push.stderr.log"
+    _push_rc=$?
+    set -e
+    log "push_and_pr_push_done" "exit_code=$_push_rc"
+    if [[ "$_push_rc" -ne 0 ]]; then
+        log "push_and_pr_push_failed" "exit_code=$_push_rc"
+        # Emit a minimal failure envelope; the transition shim will
+        # route to the diagnoser via the unrecognized/non-SHIP path.
+        printf '{"no_op": false, "push_failed": true}'
+        return 0
+    fi
+
+    # Open the PR against main. `gh pr create` auto-picks the current
+    # branch as head and --base main. The title comes from the last
+    # commit subject on the branch (Stage 2 will plumb the summary
+    # phase's pr_title through here; Stage 1b keeps it minimal).
+    log "push_and_pr_pr_create_begin"
+    set +e
+    gh pr create \
+        --repo judgemind/judgemind \
+        --base main \
+        --head "$BRANCH_NAME" \
+        --fill \
+        > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
+        2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
+    _pr_rc=$?
+    set -e
+    log "push_and_pr_pr_create_done" "exit_code=$_pr_rc"
+    if [[ "$_pr_rc" -ne 0 ]]; then
+        log "push_and_pr_pr_create_failed" "exit_code=$_pr_rc"
+        printf '{"no_op": false, "pr_create_failed": true}'
+        return 0
+    fi
+
+    printf '{"no_op": false}'
 }
 
 persist_ralph_patch() {
@@ -525,8 +679,14 @@ while true; do
 
     # Phases the Stage 1b entrypoint actually runs. Each case writes
     # its phase_output, computes the transition, advances, and loops.
+    #
+    # Claude-driven phases (#3117): only the phases that map to a real
+    # `task-v2-*` skill belong here. `claiming` and `push_and_pr` are
+    # mechanical — they were incorrectly included in the original
+    # Stage 1b dispatch, which called `/task-v2-claiming` /
+    # `/task-v2-push_and_pr` and got "Unknown command" back.
     case "$_current" in
-        claiming|planning|ralph|summary|push_and_pr|fix_ci|verify)
+        planning|ralph|summary|fix_ci|verify)
             _output=$(run_claude_phase "$_current")
             persist_phase_output "$_current" "$_output"
             if [[ "$_current" == "ralph" ]]; then
@@ -559,6 +719,44 @@ while true; do
                     ;;
                 unrecognized|*)
                     log "transition_unrecognized" "phase=$_current" "action=$_action"
+                    advance_phase "daemon_restart_abandoned" "crashed"
+                    ;;
+            esac
+            ;;
+        claiming)
+            # Mechanical pseudo-phase (#3117): the daemon writes
+            # phase='claiming' only briefly while it inserts the
+            # dispatcher.agents row; the claim itself is a pure DB
+            # write, not an LLM pass. Any ECS task whose phase column
+            # reads `claiming` at boot is a post-claim lifecycle
+            # artifact — the claim already happened before the task
+            # was launched. Advance immediately to `planning` so the
+            # phase loop starts the real work without shelling out to
+            # a nonexistent `/task-v2-claiming` skill.
+            log "claiming_no_op_advance_to_planning"
+            persist_phase_output "claiming" '{"no_op": true}'
+            advance_phase "planning"
+            ;;
+        push_and_pr)
+            # Mechanical phase (#3117). See handle_push_and_pr for the
+            # git push + gh pr create implementation. On success the
+            # transition shim advances to awaiting_ci (or to no_op
+            # terminal if the worktree was clean at ralph SHIP time).
+            _output=$(handle_push_and_pr)
+            persist_phase_output "push_and_pr" "$_output"
+            _transition=$(transition_for "push_and_pr" "$_output")
+            _action=$(printf '%s' "$_transition" | cut -f1)
+            _next=$(printf '%s' "$_transition" | cut -f2)
+            _status=$(printf '%s' "$_transition" | cut -f3)
+            case "$_action" in
+                advance)
+                    advance_phase "$_next"
+                    ;;
+                advance_with_status)
+                    advance_phase "$_next" "$_status"
+                    ;;
+                *)
+                    log "push_and_pr_transition_unrecognized" "action=$_action"
                     advance_phase "daemon_restart_abandoned" "crashed"
                     ;;
             esac
