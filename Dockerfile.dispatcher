@@ -154,6 +154,19 @@ RUN pip install --no-cache-dir \
 # ---------------------------------------------------------------------------
 RUN npm install -g @anthropic-ai/claude-code@2.1.114
 
+# Canary: verify the platform-native binary actually installed. The
+# `@anthropic-ai/claude-code-<platform>` packages are declared as
+# ``optionalDependencies``, which npm is allowed to silently skip on fetch
+# failure. The top-level install exits 0 either way, so a registry hiccup
+# that drops the matching platform dep produces a wrapper that prints an
+# error stub to stderr and exits — which at subprocess-spawn time surfaces
+# as ``OSError: [Errno 8] Exec format error: 'claude'`` and wedges every
+# agent the daemon claims (observed on the #3040 build at 2026-04-23
+# 03:48Z: "added 1 package in 3m" instead of the healthy "added 2
+# packages in 3s"). Failing the build here instead catches that class of
+# regression before the image ships.
+RUN claude --version
+
 # ---------------------------------------------------------------------------
 # Dispatcher user + HOME
 #
