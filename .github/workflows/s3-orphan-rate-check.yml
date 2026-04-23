@@ -1,0 +1,319 @@
+name: S3 Orphan-Rate Regression Guard
+
+on:
+  schedule:
+    # Daily at 15:15 UTC — offset from the zero-record check (14:30) and
+    # data-quality check (:15) so schedules do not collide.
+    - cron: '15 15 * * *'
+  # Allow manual trigger for debugging / issue verification.
+  workflow_dispatch:
+    inputs:
+      county:
+        description: "County to check (e.g. 'Santa Clara'). Defaults to matrix."
+        required: false
+        type: string
+      threshold:
+        description: "Orphan-rate threshold for failure (default: 0.05)"
+        required: false
+        type: string
+      n:
+        description: "Sample size per county (default: 100)"
+        required: false
+        type: string
+
+# Only one orphan-rate check at a time.
+concurrency:
+  group: s3-orphan-rate-check
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  orphan-rate-check:
+    name: S3 orphan-rate check — ${{ matrix.county }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        county:
+          - Santa Clara
+          - Orange
+          - Contra Costa
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/spotcheck/check_s3_orphan_rate.py
+            scripts/ecs-run-task.sh
+            scripts/ecs-logs.sh
+            scripts/notify-telegram.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build script arguments
+        id: args
+        run: |
+          COUNTY="${{ inputs.county || matrix.county }}"
+          ARGS="--county \"$COUNTY\""
+          if [ -n "${{ inputs.n }}" ]; then
+            ARGS="$ARGS --n ${{ inputs.n }}"
+          fi
+          if [ -n "${{ inputs.threshold }}" ]; then
+            ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+          fi
+          echo "script_args=$ARGS" >> "$GITHUB_OUTPUT"
+          # Slugify county for label use
+          COUNTY_SLUG=$(echo "$COUNTY" | tr ' ' '_' | tr '[:upper:]' '[:lower:]')
+          echo "county_slug=$COUNTY_SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: Run S3 orphan-rate check on ECS
+        id: check
+        env:
+          SCRIPT_ARGS: ${{ steps.args.outputs.script_args }}
+        run: |
+          set +e
+          eval scripts/ecs-run-task.sh \
+            --cpu 256 --memory 512 \
+            --timeout 600 \
+            --latest-image \
+            scripts/spotcheck/check_s3_orphan_rate.py -- $SCRIPT_ARGS 2>&1 \
+            | tee /tmp/check_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          # Extract the JSON line from mixed ECS log output. The script prints
+          # a single-line JSON blob to stdout; the ECS wrapper adds surrounding
+          # log lines. We find the first line that looks like a JSON object.
+          python3 - <<'PY'
+          import json, sys
+          text = open("/tmp/check_output.txt").read()
+          blob = None
+          for line in text.splitlines():
+              line = line.strip()
+              if line.startswith("{") and line.endswith("}"):
+                  try:
+                      json.loads(line)
+                      blob = line
+                  except Exception:
+                      pass
+          if blob is None:
+              print("Could not find JSON line in output; assuming healthy.")
+              blob = '{"county": "unknown", "total_flat_hash": 0, "sampled": 0, "orphan_count": 0, "orphan_rate": 0.0, "threshold": 0.05, "passed": true}'
+          open("/tmp/check_json.txt", "w").write(blob)
+          PY
+
+          PASSED=$(python3 -c "import json; print(json.load(open('/tmp/check_json.txt'))['passed'])")
+          if [ "$PASSED" = "True" ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "S3 orphan rate is within threshold."
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "S3 orphan rate exceeds threshold (exit code $EXIT_CODE)."
+          fi
+
+      - name: Extract alert summary
+        if: steps.check.outputs.healthy == 'false'
+        id: summary
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          data = json.load(open("/tmp/check_json.txt"))
+          county = data.get("county", "unknown")
+          rate_pct = round(data.get("orphan_rate", 0) * 100, 2)
+          threshold_pct = round(data.get("threshold", 0.05) * 100, 2)
+          sampled = data.get("sampled", 0)
+          orphan_count = data.get("orphan_count", 0)
+          total = data.get("total_flat_hash", 0)
+
+          lines = [
+              f"**County:** {county}",
+              f"**Total flat-hash keys:** {total}",
+              f"**Sampled:** {sampled}",
+              f"**Orphan count:** {orphan_count}",
+              f"**Orphan rate:** {rate_pct}% (threshold: {threshold_pct}%)",
+          ]
+          open("/tmp/alert_summary.md", "w").write("\n".join(lines))
+          open("/tmp/alert_telegram.txt", "w").write(
+              f"{county}: {orphan_count}/{sampled} sampled keys are orphans ({rate_pct}% >= {threshold_pct}% threshold)"
+          )
+          PY
+
+          echo "Alert summary:"
+          cat /tmp/alert_summary.md
+
+      - name: Check for existing open issue
+        if: steps.check.outputs.healthy == 'false'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COUNTY_SLUG: ${{ steps.args.outputs.county_slug }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "s3-orphan-rate-alert" \
+            --json number,title \
+            --limit 10 \
+            -q ".[] | select(.title | contains(\"$COUNTY_SLUG\")) | .number" \
+            | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open s3-orphan-rate-alert issue already exists for ${COUNTY_SLUG}: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        id: create-issue
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COUNTY_SLUG: ${{ steps.args.outputs.county_slug }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## S3 Orphan-Rate Alert: $COUNTY_SLUG"
+            echo ""
+            echo "The S3 orphan-rate check has detected that the orphan rate"
+            echo "for **$COUNTY_SLUG** exceeds the configured threshold."
+            echo ""
+            echo "An S3 orphan is a flat-hash key that exists in S3 but has"
+            echo "no corresponding row in \`derived.documents\`. A rising"
+            echo "orphan rate indicates documents captured to S3 are not being"
+            echo "ingested into the database — a silent data-loss failure mode."
+            echo ""
+            echo "### Details"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo "- **Check script:** \`scripts/spotcheck/check_s3_orphan_rate.py\`"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Run the check manually at higher sample size to confirm:"
+            echo "   \`scripts/ecs-run-task.sh scripts/spotcheck/check_s3_orphan_rate.py -- --county \"${COUNTY_SLUG}\" --n 500\`"
+            echo "2. Check ECS ingestion worker logs for errors around the time"
+            echo "   the orphans were created."
+            echo "3. If the orphan rate is a known transient spike, close this"
+            echo "   issue with a comment explaining the root cause."
+            echo "4. For persistent orphans, run \`scripts/rebuild_db.py --county ${COUNTY_SLUG}\`"
+            echo "   to re-ingest missing documents from S3."
+            echo ""
+            echo "This issue was created automatically by the S3 orphan-rate"
+            echo "workflow. It will not create duplicates while this issue is open."
+          } > /tmp/issue_body.md
+
+          ISSUE_URL=$(gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "S3 orphan-rate alert: ${COUNTY_SLUG}" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/scraping,s3-orphan-rate-alert,agent/ready")
+
+          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        if: steps.create-issue.outputs.created == 'true'
+        continue-on-error: true
+        run: |
+          ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
+          ISSUE_NUM="${ISSUE_URL##*/}"
+          TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
+
+          {
+            echo "<b>S3 Orphan-Rate Alert</b>"
+            echo ""
+            echo "${TG_SUMMARY}"
+            echo ""
+            echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
+          } > /tmp/tg_message.txt
+
+          scripts/notify-telegram.sh --message-file /tmp/tg_message.txt
+
+      - name: Update existing issue with new alert
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.existing.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "### Update: still in breach at ${TIMESTAMP}"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "**Workflow run:** ${RUN_URL}"
+          } > /tmp/comment_body.md
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/comment_body.md
+
+      - name: Auto-close resolved orphan-rate issues
+        if: steps.check.outputs.healthy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COUNTY_SLUG: ${{ steps.args.outputs.county_slug }}
+        run: |
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "s3-orphan-rate-alert" \
+            --json number,title \
+            -q ".[] | select(.title | contains(\"$COUNTY_SLUG\")) | .number")
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open s3-orphan-rate-alert issues to close for ${COUNTY_SLUG}."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing issue #${ISSUE_NUM} — orphan rate is back within threshold."
+
+            {
+              echo "S3 orphan rate for **${COUNTY_SLUG}** is back within threshold. Auto-closing."
+              echo ""
+              echo "**Passing workflow run:** ${RUN_URL}"
+            } > /tmp/close_comment.md
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/close_comment.md
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done
