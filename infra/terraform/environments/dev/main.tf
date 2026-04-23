@@ -291,9 +291,63 @@ module "dispatcher_daemon" {
   alert_sns_topic_arn = module.compute.alerts_topic_arn
 }
 
+# ─── Dispatcher agent-runner task def (Stage 1b, #3090) ─────────────────────
+# One-shot ECS task definition run per-agent via `ecs:RunTask`. Stage 1b
+# ships the task def + entrypoint; Stage 2 (#3091) adds the daemon-side
+# launcher. Until Stage 2 lands, operators invoke this task manually via
+# `aws ecs run-task --overrides` (see the PR body in #3090 for the exact
+# command). No ECS service is provisioned — agent-runners are one-shot
+# leaves, not long-running singletons.
+module "dispatcher_agent_runner" {
+  source = "../../modules/dispatcher-agent-runner"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  ecr_repository_url = module.ecr.dispatcher_agent_runner_repository_url
+
+  # Stage 1b baseline: 0.5 vCPU / 1 GiB. Bump (along with task_memory) if
+  # Stage 3 smoke shows the ralph workload needs more headroom.
+  task_cpu    = 512
+  task_memory = 1024
+
+  # Secret wiring — same ARNs the daemon uses.
+  anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
+  db_connection_secret_arn     = module.database.db_connection_secret_arn
+  github_token_secret_arn      = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+
+  github_repo = "judgemind/judgemind"
+  repo_url    = "https://github.com/judgemind/judgemind.git"
+}
+
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url
+}
+
+output "dispatcher_agent_runner_task_definition_family" {
+  description = "Dev dispatcher agent-runner task definition family (used with `aws ecs run-task --task-definition`)"
+  value       = module.dispatcher_agent_runner.task_definition_family
+}
+
+output "dispatcher_agent_runner_log_group" {
+  description = "Dev CloudWatch log group for dispatcher agent-runner container output"
+  value       = module.dispatcher_agent_runner.log_group_name
+}
+
+output "dispatcher_agent_runner_task_role_arn" {
+  description = "Dev dispatcher agent-runner task role ARN (narrow: DB + PAT secret read, log-group scoped log writes — no RunTask, no ECS Exec)"
+  value       = module.dispatcher_agent_runner.task_role_arn
+}
+
+output "dispatcher_agent_runner_security_group_id" {
+  description = "Dev dispatcher agent-runner security group ID (outbound HTTPS + Postgres only)"
+  value       = module.dispatcher_agent_runner.security_group_id
+}
+
+output "dispatcher_agent_runner_ecr_repository_url" {
+  description = "Dev ECR repository URL for the dispatcher agent-runner image"
+  value       = module.ecr.dispatcher_agent_runner_repository_url
 }
 
 output "vpc_id" {

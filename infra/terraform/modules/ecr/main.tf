@@ -210,3 +210,75 @@ resource "aws_ecr_repository_policy" "dispatcher" {
     ]
   })
 }
+
+# ─── Dispatcher Agent-Runner Repository ──────────────────────────────────────
+# Per-agent ECS task image (Stage 1b of #3086; issue #3090). Holds the
+# `Dockerfile.dispatcher-agent-runner` image — same CLI + skills payload
+# as the daemon image but with the agent-runner entrypoint baked in.
+# Kept as a distinct repo from `judgemind/dispatcher` so the image build
+# workflows and lifecycle policies stay independent (the agent-runner
+# will land its own `deploy-agent-runner.yml` in a followup PR; until
+# then operators push manually for the Stage 1b smoke).
+
+resource "aws_ecr_repository" "dispatcher_agent_runner" {
+  name                 = "judgemind/dispatcher-agent-runner"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "dispatcher_agent_runner" {
+  repository = aws_ecr_repository.dispatcher_agent_runner.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Purge untagged images after 1 day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Retain last 10 tagged images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["v", "staging", "prod", "sha-"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 10
+        }
+        action = { type = "expire" }
+      }
+    ]
+  })
+}
+
+resource "aws_ecr_repository_policy" "dispatcher_agent_runner" {
+  count      = var.enable_pull_policy ? 1 : 0
+  repository = aws_ecr_repository.dispatcher_agent_runner.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowECSTaskExecutionPull"
+        Effect = "Allow"
+        Principal = {
+          AWS = var.ecs_task_execution_role_arn
+        }
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+      }
+    ]
+  })
+}

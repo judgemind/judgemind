@@ -36,6 +36,15 @@ on:
       # a rollout. Excluded so new helpers can be added without a
       # gratuitous redeploy or a workflow-yml edit each time.
       - "!scripts/dispatcher/helpers/**"
+      # scripts/dispatcher/agent-runner-entrypoint.sh is the entrypoint
+      # for the separate `judgemind/dispatcher-agent-runner` image
+      # (#3090, Stage 1b of #3086). It is NOT baked into the daemon
+      # image and the daemon does not invoke it at runtime — the
+      # dispatcher-daemon Dockerfile's `COPY scripts/dispatcher/` ships
+      # it for forward-compat only. Changes to the entrypoint should
+      # not force a daemon redeploy; the agent-runner image has its
+      # own (future) build workflow.
+      - "!scripts/dispatcher/agent-runner-entrypoint.sh"
       - "scripts/check-issue-author.sh"
       - ".github/workflows/deploy-dispatcher.yml"
       # scripts/wait-for-rollout.sh is invoked by the deploy-to-dev job
