@@ -602,6 +602,15 @@ jobs:
       # daemon tests mock the client by method assignment.
       - name: Verify dispatcher image installs every Python import used by the daemon
         run: scripts/check-dispatcher-image-deps.sh
+      # Issues #3062 (audit) + #3072 (this check): every
+      # ``self._mark_agent_terminal`` call site in
+      # ``scripts/dispatcher/daemon.py`` must carry a nearby
+      # ``ROUTING (#N)`` comment documenting whether the site routes
+      # through ``_handle_agent_failure`` or is intentionally unrouted.
+      # This would have caught the #3054 ralph_not_ship bug at author
+      # time.
+      - name: Verify every daemon terminal site has a ROUTING comment
+        run: scripts/check-terminal-routing-comments.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
       # that adding a new shell test is just `touch + chmod +x` — no
