@@ -1442,13 +1442,16 @@ class TestSupervisorTickIntegration:
 
 
 class TestVerifyPhaseSpawnCwd:
-    """Issue #3055 — on the recovery path (force-new-deployment drops the
-    per-agent worktree from ephemeral storage), the verify phase spawn must
-    still discover ``.claude/skills/task-v2-verify/SKILL.md``. Paralleling
-    #3034's diagnoser fix, the fix sets ``cwd=baseline_repo_root`` for the
-    verify spawn (in Fargate mode). Other phases continue to run inside
-    the per-agent worktree because they need the working tree available
-    for git operations."""
+    """Issue #3055 (verify) + #3065 (retro generalization) — on the
+    recovery path (force-new-deployment drops the per-agent worktree from
+    ephemeral storage), every post-merge phase spawn must still discover
+    its ``.claude/skills/task-v2-<phase>/SKILL.md``. Paralleling #3034's
+    diagnoser fix, the fix sets ``cwd=baseline_repo_root`` for every
+    phase listed in
+    :data:`dispatcher.daemon.POST_MERGE_PHASES_USING_BASELINE_CWD`
+    (currently ``verify`` and ``retro``) in Fargate mode. Pre-merge
+    phases continue to run inside the per-agent worktree because they
+    need the working tree available for git operations."""
 
     def test_verify_spawn_uses_baseline_repo_root_as_cwd(
         self, monkeypatch: Any, tmp_path: Path
@@ -1534,15 +1537,99 @@ class TestVerifyPhaseSpawnCwd:
             f"Expected {worktree!s}, got {captured['kwargs']['cwd']!r}"
         )
 
-    def test_non_verify_phases_always_use_worktree_as_cwd(
+    def test_retro_spawn_uses_baseline_repo_root_as_cwd(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        """Regression guard: the #3055 fix must NOT change the cwd for
-        plan / ralph / summary / fix-ci / retro spawns. Those phases run
-        pre-merge inside a live worktree, need the worktree's working
-        tree for git operations, and are not subject to the recovery-path
-        bug (the worktree can't be wiped while the agent is still
-        pre-merge and advancing)."""
+        """Issue #3065 — generalization of #3055 to the retro phase.
+        In Fargate mode (``baseline_repo_root`` set), the retro phase
+        subprocess must be launched with ``cwd=str(baseline_repo_root)``
+        so the ``task-v2-retro`` skill is discoverable even when the
+        per-agent worktree was wiped by a container restart between
+        merge and retro."""
+        from dispatcher.tests._popen_fake import make_popen_factory
+
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stdout_chunks=('{"result":"ok","is_error":false}\n',),
+                on_start=on_start,
+            ),
+        )
+        monkeypatch.setattr(d, "_agent_issue_number", lambda _aid: 42)
+
+        d._spawn_phase_subprocess("retro", worktree, "agent-id")
+
+        assert captured["kwargs"]["cwd"] == str(baseline), (
+            f"Popen cwd for retro must be the baseline_repo_root. "
+            f"Expected {baseline!s}, got {captured['kwargs']['cwd']!r}"
+        )
+
+    def test_retro_spawn_falls_back_to_worktree_in_local_mode(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """In local-dev mode (``baseline_repo_root`` unset), the retro
+        phase spawn must still pass ``cwd=str(worktree)`` — the per-agent
+        worktree IS the skill-containing tree in local dev."""
+        from dispatcher.tests._popen_fake import make_popen_factory
+
+        d, _conn, _handler = _make_daemon(tmp_path)
+        assert d._cfg.baseline_repo_root is None  # local-dev mode
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stdout_chunks=('{"result":"ok","is_error":false}\n',),
+                on_start=on_start,
+            ),
+        )
+        monkeypatch.setattr(d, "_agent_issue_number", lambda _aid: 42)
+
+        d._spawn_phase_subprocess("retro", worktree, "agent-id")
+
+        assert captured["kwargs"]["cwd"] == str(worktree), (
+            f"Popen cwd for retro in local-dev mode must be the worktree. "
+            f"Expected {worktree!s}, got {captured['kwargs']['cwd']!r}"
+        )
+
+    def test_pre_merge_phases_always_use_worktree_as_cwd(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Regression guard: the #3055 / #3065 generalization must NOT
+        change the cwd for ``plan`` / ``ralph`` / ``summary`` / ``fix-ci``
+        spawns. Those phases run pre-merge inside a live worktree, need
+        the worktree's working tree for git operations, and are not
+        subject to the recovery-path bug (the worktree can't be wiped
+        while the agent is still pre-merge and advancing).
+
+        Extend the tuple below if a new pre-merge phase is added. Do
+        not add post-merge phases here — those belong in
+        :data:`dispatcher.daemon.POST_MERGE_PHASES_USING_BASELINE_CWD`
+        and in the positive-side per-phase tests above."""
+        from dispatcher.daemon import POST_MERGE_PHASES_USING_BASELINE_CWD
         from dispatcher.tests._popen_fake import make_popen_factory
 
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -1569,7 +1656,17 @@ class TestVerifyPhaseSpawnCwd:
         # assertion set.
         monkeypatch.setattr(d, "_start_ralph_head_watcher", lambda **_kwargs: None)
 
-        for phase in ("plan", "ralph", "summary", "fix-ci", "retro"):
+        pre_merge_phases = ("plan", "ralph", "summary", "fix-ci")
+        # Belt-and-braces: make sure the tuple above and the post-merge
+        # set are disjoint, so a future edit adding a phase to both
+        # surfaces as a test failure rather than silent drift.
+        assert set(pre_merge_phases) & POST_MERGE_PHASES_USING_BASELINE_CWD == set(), (
+            f"Pre-merge and post-merge phase sets must not overlap. "
+            f"Intersection: "
+            f"{set(pre_merge_phases) & POST_MERGE_PHASES_USING_BASELINE_CWD}"
+        )
+
+        for phase in pre_merge_phases:
             monkeypatch.setattr(
                 subprocess,
                 "Popen",
@@ -1582,9 +1679,23 @@ class TestVerifyPhaseSpawnCwd:
 
         for phase, cwd in captured_cwds.items():
             assert cwd == str(worktree), (
-                f"Non-verify phase {phase!r} must run in worktree cwd, "
+                f"Pre-merge phase {phase!r} must run in worktree cwd, "
                 f"not the baseline. Got cwd={cwd!r}, expected {worktree!s}."
             )
+
+    def test_post_merge_phase_set_membership(self) -> None:
+        """Issue #3065 — the module-level frozenset is the single source
+        of truth for which phases run post-merge. Lock in the current
+        membership (``verify``, ``retro``) so the generalization is not
+        silently undone, and adding a new post-merge phase is an
+        intentional edit accompanied by a test update."""
+        from dispatcher.daemon import POST_MERGE_PHASES_USING_BASELINE_CWD
+
+        assert POST_MERGE_PHASES_USING_BASELINE_CWD == frozenset({"verify", "retro"}), (
+            "POST_MERGE_PHASES_USING_BASELINE_CWD membership changed. If "
+            "intentional, update this assertion AND add a per-phase "
+            "cwd test for the new member. See #3065 for rationale."
+        )
 
 
 class TestVerifyRecoveryShortCircuit:
