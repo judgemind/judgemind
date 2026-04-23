@@ -623,9 +623,9 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         to the REST API endpoint.
 
         Raises:
-            RuntimeError: If session acquisition fails after all retries.
-                This propagates through ``BaseScraper.run()`` and causes
-                the run to be recorded with ``success=False`` instead of
+            ScraperPreconditionFailure: If session acquisition fails after all
+                retries.  This propagates through ``BaseScraper.run()`` and
+                causes the run to be recorded with ``success=False`` instead of
                 silently reporting ``records=0 + status=success``. See
                 #2620 — previously this method returned ``[]`` on session
                 failure, which the base runner treated as a successful
@@ -639,12 +639,11 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
             self._session_id = asyncio.run(self._acquire_session())
 
         if not self._session_id:
-            # Raise so BaseScraper.run() records status=failed. Returning []
-            # here would be indistinguishable from a legitimate "no rulings
-            # today" result and would mark the run successful, hiding silent
-            # outages (#2620).
             self._log.error("Failed to acquire session — cannot fetch rulings")
-            raise RuntimeError("SF civil session acquisition failed after all retries")
+        self._require_precondition(
+            self._session_id is not None,
+            "SF civil session acquisition failed after all retries",
+        )
 
         self._log.info("Session acquired", session_id_prefix=self._session_id[:8])
 

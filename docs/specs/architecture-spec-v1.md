@@ -245,6 +245,8 @@ Rules every scraper author and reviewer must follow. These apply to new scrapers
 
 **Regression tests against real fixtures.** Every scraper must ship with tests against archived real court pages covering typical rulings, edge cases, and known formatting variations. Each test must assert the value of every required field. "The scraper runs without error" is not a test.
 
+**Precondition failures must raise.** If `fetch_documents` has a prerequisite step (session acquisition, auth, proxy handshake) that, when it fails, prevents fetching any documents, it MUST call `self._require_precondition(...)` (which raises `ScraperPreconditionFailure`). Returning `[]` would be recorded as a successful zero-records run by `BaseScraper.run()` and mask silent outages — see #2620.
+
 Key paths: framework in `packages/scraper-framework/src/framework/`, California courts in `packages/scraper-framework/src/courts/ca/`.
 
 ## 3.4 Application Layer
