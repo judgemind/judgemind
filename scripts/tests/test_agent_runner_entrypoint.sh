@@ -422,6 +422,23 @@ for expected in planning ralph summary push_and_pr verify; do
     fi
 done
 
+# Verify the phase_outputs INSERT column list matches the real
+# `dispatcher.phase_outputs` schema — specifically, that it does NOT
+# include a `status` column. Regression guard for #3115: the initial
+# Stage 1b entrypoint diverged from the daemon's insert shape by
+# adding a `status` column that doesn't exist in the schema, which
+# crashed every per-agent ECS task at the first phase-output persist.
+# Authoritative schema columns (as of migration 41): output_id,
+# agent_id, phase, output_json, ts, log_text, attempt, tokens_*,
+# cost_usd, model_used, patch_id. No `status`.
+if grep -F "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
+     | grep -q "status" 2>/dev/null; then
+    fail "phase_outputs INSERT omits nonexistent status column (#3115)" \
+         "Found 'status' in INSERT column list. Sample: $(grep -m1 "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" | head -c 300)"
+else
+    pass "phase_outputs INSERT omits nonexistent status column (#3115)"
+fi
+
 # Verify ralph_patches was inserted on ralph SHIP.
 if grep -q "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log"; then
     pass "inserts ralph_patches row on ralph SHIP"
