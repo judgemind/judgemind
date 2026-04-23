@@ -178,9 +178,18 @@ class TestPushAndOpenPrUsesAmend:
             stderr="",
         )
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_empty, push_ok, pr_create_ok],
+            side_effect=[
+                rev_list_ahead,
+                commit_ok,
+                git_show_empty,
+                push_ok,
+                pr_create_ok,
+            ],
         ) as run_mock:
             d._push_and_open_pr(
                 agent_id="amend-test-0000-0000-0000-000000000001",
@@ -249,9 +258,18 @@ class TestPushAndOpenPrUsesAmend:
             stderr="",
         )
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_empty, push_ok, pr_create_ok],
+            side_effect=[
+                rev_list_ahead,
+                commit_ok,
+                git_show_empty,
+                push_ok,
+                pr_create_ok,
+            ],
         ) as run_mock:
             d._push_and_open_pr(
                 agent_id="amend-test-0000-0000-0000-000000000002",
@@ -297,9 +315,18 @@ class TestPushAndOpenPrUsesAmend:
             stderr="",
         )
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_empty, push_ok, pr_create_ok],
+            side_effect=[
+                rev_list_ahead,
+                commit_ok,
+                git_show_empty,
+                push_ok,
+                pr_create_ok,
+            ],
         ):
             d._push_and_open_pr(
                 agent_id="amend-test-0000-0000-0000-000000000003",

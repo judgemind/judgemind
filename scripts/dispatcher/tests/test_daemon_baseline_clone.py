@@ -240,8 +240,16 @@ class TestEnsureBaselineClone:
         clone_calls = [c for c in calls if c[:2] == ["git", "clone"]]
         assert len(clone_calls) == 1
         clone_cmd = clone_calls[0]
-        assert "--depth=1" in clone_cmd
-        assert "--no-tags" in clone_cmd
+        # Issue #3039: must NOT pass --depth=1 / --no-tags. A shallow
+        # baseline produces orphan-commit PRs on the ralph no-op SHIP
+        # path (``git commit --amend`` against the shallow boundary
+        # commit drops the unreachable parent).
+        assert "--depth=1" not in clone_cmd, (
+            f"Shallow clone regression — --depth=1 re-introduced: {clone_cmd}"
+        )
+        assert "--no-tags" not in clone_cmd, (
+            f"Shallow clone regression — --no-tags re-introduced: {clone_cmd}"
+        )
         assert daemon.BASELINE_CLONE_URL in clone_cmd
         assert str(baseline) in clone_cmd
         # No fetch when the path is missing — clone already pulls main.
@@ -264,7 +272,14 @@ class TestEnsureBaselineClone:
             calls.append(cmd)
             r = MagicMock()
             r.returncode = 0
-            r.stdout = ""
+            # Issue #3039: the unshallow probe runs ``git rev-parse
+            # --is-shallow-repository`` — default to ``false`` so the
+            # unshallow-fetch branch doesn't run in this "already full"
+            # baseline case.
+            if "rev-parse" in cmd and "--is-shallow-repository" in cmd:
+                r.stdout = "false\n"
+            else:
+                r.stdout = ""
             r.stderr = ""
             return r
 
@@ -278,10 +293,14 @@ class TestEnsureBaselineClone:
             for c in calls
             if c[:2] == ["git", "-C"] and "fetch" in c and "origin" in c
         ]
+        # Issue #3039: exactly one fetch — the normal baseline fetch.
+        # The unshallow fetch is gated on the is-shallow probe returning
+        # ``true``, which we mocked to ``false``, so no --unshallow call.
         assert len(fetch_calls) == 1
         fetch_cmd = fetch_calls[0]
         assert fetch_cmd[2] == str(baseline)
         assert fetch_cmd[-2:] == ["origin", "main"]
+        assert "--unshallow" not in fetch_cmd
         # No clone when the path exists.
         assert not any(c[:2] == ["git", "clone"] for c in calls)
 

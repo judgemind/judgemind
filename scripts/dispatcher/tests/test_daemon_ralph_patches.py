@@ -851,9 +851,18 @@ class TestPushAndOpenPrDeletesRalphPatch:
             stderr="",
         )
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_empty, push_ok, pr_create_ok],
+            side_effect=[
+                rev_list_ahead,
+                commit_ok,
+                git_show_empty,
+                push_ok,
+                pr_create_ok,
+            ],
         ):
             d._push_and_open_pr(
                 agent_id=agent_id,
@@ -901,8 +910,12 @@ class TestPushAndOpenPrDeletesRalphPatch:
             stderr="fatal: unable to access",
         )
 
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         with patch(
-            "subprocess.run", side_effect=[commit_ok, git_show_empty, push_fail]
+            "subprocess.run",
+            side_effect=[rev_list_ahead, commit_ok, git_show_empty, push_fail],
         ):
             d._push_and_open_pr(
                 agent_id=agent_id,

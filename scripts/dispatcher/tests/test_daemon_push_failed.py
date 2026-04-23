@@ -295,15 +295,23 @@ class TestGitPushFailedWritesFailureRow:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
+        # Issue #3039: ``_push_and_open_pr`` runs ``git rev-list
+        # --count origin/main..HEAD`` at the top to detect ralph's
+        # no-op SHIP path. A ``stdout="1\n"`` means one commit ahead
+        # (normal SHIP), so the method proceeds to the commit+push
+        # path under test.
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         # Issue #2953: ``_push_and_open_pr`` runs ``git show
         # --name-only HEAD`` between commit and push to detect
-        # dispatcher-self-PRs. The third entry below answers that
+        # dispatcher-self-PRs. The entry below answers that
         # call with an empty file list (no self-deploy detected) so
         # the test's push-failed path is unaffected.
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
-        run_side_effects = [commit_ok, git_show_empty, push_fail]
+        run_side_effects = [rev_list_ahead, commit_ok, git_show_empty, push_fail]
         with patch("subprocess.run", side_effect=run_side_effects):
             d._push_and_open_pr(
                 agent_id=agent_id,
@@ -361,6 +369,11 @@ class TestGitPushFailedWritesFailureRow:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
+        # Issue #3039: rev-list probe at the top — return "1" ahead so
+        # the no-op guardrail does not short-circuit.
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         # Issue #2953: inject a no-op ``git show --name-only HEAD``
         # between commit and push for the self-deploy detection step.
         git_show_empty = subprocess.CompletedProcess(
@@ -368,7 +381,7 @@ class TestGitPushFailedWritesFailureRow:
         )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_empty, push_fail],
+            side_effect=[rev_list_ahead, commit_ok, git_show_empty, push_fail],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=99, worktree=worktree)
 
@@ -419,6 +432,11 @@ class TestGitPushFailedWritesPhaseOutputRow:
         worktree.mkdir()
         (worktree / "tmp").mkdir()
 
+        # Issue #3039: rev-list probe at the top — return "1" ahead so
+        # the no-op guardrail does not short-circuit.
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
         # Issue #2953: inject a no-op ``git show --name-only HEAD``
         # between commit and push for the self-deploy detection step.
         git_show_empty = subprocess.CompletedProcess(
@@ -426,7 +444,7 @@ class TestGitPushFailedWritesPhaseOutputRow:
         )
         with patch(
             "subprocess.run",
-            side_effect=[commit_ok, git_show_empty, push_fail],
+            side_effect=[rev_list_ahead, commit_ok, git_show_empty, push_fail],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=7, worktree=worktree)
 
