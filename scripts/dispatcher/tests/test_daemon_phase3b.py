@@ -1434,3 +1434,369 @@ class TestSupervisorTickIntegration:
         summary = d.supervisor_tick()
         assert handler.events("advance_pass_failed")
         assert summary["agents_advanced"] == 0
+
+
+# --------------------------------------------------------------------------
+# #3055 — verify-phase spawn cwd + recovery short-circuit on merged agents
+# --------------------------------------------------------------------------
+
+
+class TestVerifyPhaseSpawnCwd:
+    """Issue #3055 — on the recovery path (force-new-deployment drops the
+    per-agent worktree from ephemeral storage), the verify phase spawn must
+    still discover ``.claude/skills/task-v2-verify/SKILL.md``. Paralleling
+    #3034's diagnoser fix, the fix sets ``cwd=baseline_repo_root`` for the
+    verify spawn (in Fargate mode). Other phases continue to run inside
+    the per-agent worktree because they need the working tree available
+    for git operations."""
+
+    def test_verify_spawn_uses_baseline_repo_root_as_cwd(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """In Fargate mode (``baseline_repo_root`` set), the verify phase
+        subprocess must be launched with ``cwd=str(baseline_repo_root)`` so
+        the ``task-v2-verify`` skill is discoverable even when the per-agent
+        worktree was wiped by a container restart."""
+        from dispatcher.tests._popen_fake import make_popen_factory
+
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stdout_chunks=('{"result":"ok","is_error":false}\n',),
+                on_start=on_start,
+            ),
+        )
+        # ``_spawn_phase_subprocess`` calls ``_agent_issue_number`` which
+        # hits the DB; short-circuit it to avoid stubbing the whole cursor
+        # state for this narrowly-scoped assertion.
+        monkeypatch.setattr(d, "_agent_issue_number", lambda _aid: 42)
+
+        d._spawn_phase_subprocess("verify", worktree, "agent-id")
+
+        assert "cwd" in captured["kwargs"], (
+            "Popen must be invoked with cwd= so the /task-v2-verify skill "
+            f"is discoverable (got kwargs={sorted(captured['kwargs'])})"
+        )
+        assert captured["kwargs"]["cwd"] == str(baseline), (
+            f"Popen cwd for verify must be the baseline_repo_root. "
+            f"Expected {baseline!s}, got {captured['kwargs']['cwd']!r}"
+        )
+
+    def test_verify_spawn_falls_back_to_worktree_in_local_mode(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """In local-dev mode (``baseline_repo_root`` unset), the verify phase
+        spawn must still pass ``cwd=str(worktree)`` — the per-agent worktree
+        IS the skill-containing tree in local dev because ``_compute_worktree_path``
+        falls back to ``<repo_root>/.claude/worktrees/agent-*``."""
+        from dispatcher.tests._popen_fake import make_popen_factory
+
+        d, _conn, _handler = _make_daemon(tmp_path)
+        assert d._cfg.baseline_repo_root is None  # local-dev mode
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            make_popen_factory(
+                stdout_chunks=('{"result":"ok","is_error":false}\n',),
+                on_start=on_start,
+            ),
+        )
+        monkeypatch.setattr(d, "_agent_issue_number", lambda _aid: 42)
+
+        d._spawn_phase_subprocess("verify", worktree, "agent-id")
+
+        assert captured["kwargs"]["cwd"] == str(worktree), (
+            f"Popen cwd for verify in local-dev mode must be the worktree. "
+            f"Expected {worktree!s}, got {captured['kwargs']['cwd']!r}"
+        )
+
+    def test_non_verify_phases_always_use_worktree_as_cwd(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Regression guard: the #3055 fix must NOT change the cwd for
+        plan / ralph / summary / fix-ci / retro spawns. Those phases run
+        pre-merge inside a live worktree, need the worktree's working
+        tree for git operations, and are not subject to the recovery-path
+        bug (the worktree can't be wiped while the agent is still
+        pre-merge and advancing)."""
+        from dispatcher.tests._popen_fake import make_popen_factory
+
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline  # Fargate mode
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured_cwds: dict[str, str] = {}
+
+        def make_on_start(
+            phase: str,
+        ) -> Any:
+            def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
+                captured_cwds[phase] = kwargs.get("cwd", "")
+
+            return on_start
+
+        monkeypatch.setattr(d, "_agent_issue_number", lambda _aid: 42)
+        # Avoid firing the ralph head watcher during ralph-phase spawns
+        # — it spawns a thread that polls git and would complicate the
+        # assertion set.
+        monkeypatch.setattr(d, "_start_ralph_head_watcher", lambda **_kwargs: None)
+
+        for phase in ("plan", "ralph", "summary", "fix-ci", "retro"):
+            monkeypatch.setattr(
+                subprocess,
+                "Popen",
+                make_popen_factory(
+                    stdout_chunks=('{"result":"ok","is_error":false}\n',),
+                    on_start=make_on_start(phase),
+                ),
+            )
+            d._spawn_phase_subprocess(phase, worktree, "agent-id")
+
+        for phase, cwd in captured_cwds.items():
+            assert cwd == str(worktree), (
+                f"Non-verify phase {phase!r} must run in worktree cwd, "
+                f"not the baseline. Got cwd={cwd!r}, expected {worktree!s}."
+            )
+
+
+class TestVerifyRecoveryShortCircuit:
+    """Issue #3055 — when the daemon restarts mid-awaiting_deploy and the
+    supervisor tick re-enters :meth:`_run_verify_and_complete` on an agent
+    whose PR has already merged, the behaviour must be:
+
+    1. If ``verified_at`` is already stamped, skip the subprocess entirely
+       and advance phase → done (the prior verify ran; the phase advance
+       was what the crashed daemon missed).
+    2. If ``verified_at`` is NULL but ``merged_at`` is stamped, and the
+       verify subprocess fails (phase_output_missing, nonzero exit,
+       timeout), do NOT flip the row to ``status='failed'``. Restore
+       status='succeeded' and advance phase → done. The agent row's
+       ``merged_at`` is authoritative — a post-merge verify infra
+       failure is bookkeeping noise, not a product regression, and
+       must not tip the admin cockpit colour from green ✓ to red ✗.
+    """
+
+    def _agent(
+        self,
+        tmp_path: Path,
+        *,
+        phase: str = "awaiting_deploy",
+        pr_number: int = 3051,
+    ) -> dict[str, Any]:
+        worktree = tmp_path / "wt"
+        worktree.mkdir(exist_ok=True)
+        return {
+            "agent_id": "cdf48cc7",
+            "issue_number": 3051,
+            "phase": phase,
+            "pr_number": pr_number,
+            "worktree_path": str(worktree),
+            "retries_used": 0,
+            "status": "succeeded",
+        }
+
+    def test_verified_at_already_stamped_short_circuits_to_done(
+        self, tmp_path: Path
+    ) -> None:
+        """When ``verified_at`` is already stamped, re-entering
+        ``_run_verify_and_complete`` must skip the subprocess and just
+        advance phase to ``done`` so retro picks up the row."""
+        d, conn, handler = _make_daemon(tmp_path)
+        agent = self._agent(tmp_path)
+        pr_status: dict[str, Any] = {}
+        deploy_runs: list[dict[str, Any]] = []
+
+        # _read_verify_skip_reason fetches first (returns None → no skip).
+        # _read_merged_at_and_verified_at fetches second (merged=True,
+        # verified=True).
+        conn.cursor_instance.fetch_queue = [
+            (None,),  # verify_skip_reason
+            (True, True),  # (merged_at IS NOT NULL, verified_at IS NOT NULL)
+        ]
+
+        # Subprocess MUST NOT be spawned on the short-circuit path.
+        spawn_called: dict[str, int] = {"n": 0}
+
+        def forbid_spawn(*_a: Any, **_kw: Any) -> None:
+            spawn_called["n"] += 1
+
+        d._spawn_phase_subprocess = forbid_spawn  # type: ignore[method-assign]
+
+        d._run_verify_and_complete(agent, pr_status, "merge-sha", deploy_runs)
+
+        assert spawn_called["n"] == 0, (
+            "Re-entering verify on an already-verified agent must not "
+            "spawn the subprocess again"
+        )
+        # The short-circuit logs verify_already_completed AND advances
+        # phase to ``done`` — both are required for the admin cockpit
+        # to render the row correctly.
+        assert handler.events("verify_already_completed")
+        phase_done_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "SET phase" in e[0]
+            and e[1] is not None
+            and "done" in e[1]
+        ]
+        assert phase_done_updates, (
+            "Short-circuit must still advance phase=done so retro runs "
+            "on the next supervisor tick"
+        )
+
+    def test_phase_output_missing_on_merged_agent_preserves_succeeded(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """When the verify subprocess returns exit 0 but fails to write
+        ``verify.json`` (the #3055 recovery-path failure mode — claude
+        CLI ran but the skill was not resolvable in the post-restart
+        worktree), the pre-#3055 behaviour was to call
+        :meth:`_handle_agent_failure` which flipped the row to
+        ``status='failed'`` and handed it to the Opus diagnoser. On a
+        merged PR that's wrong — restore ``status='succeeded'`` and
+        advance phase → ``done`` instead."""
+        d, conn, handler = _make_daemon(tmp_path)
+        agent = self._agent(tmp_path)
+        pr_status: dict[str, Any] = {}
+        deploy_runs: list[dict[str, Any]] = []
+
+        # First: _read_verify_skip_reason returns None.
+        # Second: _read_merged_at_and_verified_at returns (True, False) —
+        # PR merged but verify has never run.
+        conn.cursor_instance.fetch_queue = [
+            (None,),
+            (True, False),
+        ]
+
+        # Short-circuit the input-assembly helpers so we land directly
+        # on the phase_output_missing branch.
+        d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "issue_number": agent["issue_number"],
+                "issue_title": "t",
+                "issue_body": "- [ ] criterion",
+                "issue_comments": [],
+                "issue_labels": [],
+                "blocked_by": [],
+                "parent_issue": None,
+            }
+        )
+        d._select_deploy_status = MagicMock(return_value=None)  # type: ignore[method-assign]
+        d._infer_change_type = MagicMock(return_value="dx")  # type: ignore[method-assign]
+        d._touched_services_from_runs = MagicMock(return_value=[])  # type: ignore[method-assign]
+        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
+        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
+        # The output file is not written — simulate the #3055 failure.
+        d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
+        # Guard rail: the failure handler must NOT be called on the
+        # merged-agent path.
+        handle_failure_calls: list[Any] = []
+
+        def forbid_handle_failure(**kwargs: Any) -> None:
+            handle_failure_calls.append(kwargs)
+
+        d._handle_agent_failure = forbid_handle_failure  # type: ignore[method-assign]
+
+        d._run_verify_and_complete(agent, pr_status, "merge-sha", deploy_runs)
+
+        assert not handle_failure_calls, (
+            "Must NOT flip status=failed on a phase_output_missing "
+            "verify failure when the PR has already merged"
+        )
+        # The dedicated observability event must fire.
+        assert handler.events("verify_infra_failure_post_merge")
+        # The row must be restored to status=succeeded + phase=done.
+        restore_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "SET status = 'succeeded'" in e[0]
+            and "phase = 'done'" in e[0]
+        ]
+        assert restore_updates, (
+            "Must restore status='succeeded' + phase='done' on the "
+            "merged-agent recovery failure path"
+        )
+
+    def test_phase_output_missing_on_unmerged_agent_still_flips_failed(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Regression guard: on the rare ``merged_at IS NULL`` code path
+        (pre-#2953 agents, or a state inconsistency), the original
+        failure routing via :meth:`_handle_agent_failure` must still
+        fire. Otherwise we'd silently hide genuine verify regressions
+        for agents whose merge-time columns somehow never got stamped."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        agent = self._agent(tmp_path)
+        pr_status: dict[str, Any] = {}
+        deploy_runs: list[dict[str, Any]] = []
+
+        conn.cursor_instance.fetch_queue = [
+            (None,),
+            (False, False),  # not merged, not verified
+        ]
+
+        d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "issue_number": agent["issue_number"],
+                "issue_title": "t",
+                "issue_body": "- [ ] criterion",
+                "issue_comments": [],
+                "issue_labels": [],
+                "blocked_by": [],
+                "parent_issue": None,
+            }
+        )
+        d._select_deploy_status = MagicMock(return_value=None)  # type: ignore[method-assign]
+        d._infer_change_type = MagicMock(return_value="dx")  # type: ignore[method-assign]
+        d._touched_services_from_runs = MagicMock(return_value=[])  # type: ignore[method-assign]
+        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
+        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
+        d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        handle_failure_calls: list[Any] = []
+
+        def record_handle_failure(**kwargs: Any) -> None:
+            handle_failure_calls.append(kwargs)
+
+        d._handle_agent_failure = record_handle_failure  # type: ignore[method-assign]
+
+        d._run_verify_and_complete(agent, pr_status, "merge-sha", deploy_runs)
+
+        assert handle_failure_calls, (
+            "Legacy (unmerged) phase_output_missing path must still "
+            "route through _handle_agent_failure so genuine failures "
+            "reach the Opus diagnoser"
+        )
+        assert handle_failure_calls[0]["category"] == (
+            daemon.FAILURE_CATEGORY_PHASE_OUTPUT_MISSING
+        )
