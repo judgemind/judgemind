@@ -6,8 +6,10 @@ import logging
 
 from botocore.exceptions import BotoCoreError, ClientError
 
+from .hashing import sha256_hex
 from .models import CapturedDocument, ContentFormat
 from .s3_cache import make_s3_client
+from .s3_integrity import S3MislabelError
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,13 @@ class S3Archiver:
                 raise
 
         content_type = _content_type(doc.content_format)
+        computed_hash = sha256_hex(doc.raw_content)
+        if computed_hash != doc.content_hash:
+            raise S3MislabelError(
+                f"content_hash mismatch before S3 PUT: "
+                f"doc.content_hash={doc.content_hash!r} "
+                f"but sha256_hex(raw_content)={computed_hash!r}"
+            )
         try:
             self._client.put_object(
                 Bucket=self.bucket,
