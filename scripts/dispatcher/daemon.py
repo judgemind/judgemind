@@ -18228,11 +18228,12 @@ class DispatcherDaemon:
                             "observed_phase": current_phase,
                         },
                     )
-                    # ROUTING (#3062 #3091): NOT routed via
+                    # ROUTING (#3062): NOT routed via
                     # ``_handle_agent_failure`` — container exit 0
-                    # means the agent-runner completed successfully;
-                    # the gap is a bookkeeping issue the daemon can
-                    # close without a diagnoser round-trip.
+                    # means the agent-runner (#3091) completed
+                    # successfully; the row gap is a bookkeeping issue
+                    # the daemon can close without a diagnoser
+                    # round-trip.
                     self._mark_agent_terminal(
                         agent_id,
                         status="succeeded",
@@ -18282,10 +18283,10 @@ class DispatcherDaemon:
                     },
                 )
                 exit_code_for_failure = exit_codes[0] if exit_codes else None
-                # ROUTING (#3062 #3091): ROUTED via
-                # ``_handle_agent_failure`` so the diagnoser can
-                # classify — ``agent_task_stopped_unexpectedly`` is the
-                # per-agent-ECS sibling of the subprocess-mode
+                # ROUTING (#3062): ROUTED via ``_handle_agent_failure``
+                # so the diagnoser can classify —
+                # ``agent_task_stopped_unexpectedly`` is the
+                # per-agent-ECS (#3091) sibling of the subprocess-mode
                 # ``subprocess_crash`` tier-1 failure.
                 self._handle_agent_failure(
                     agent_id=agent_id,
