@@ -26,6 +26,50 @@ Create a working directory for audit state:
 {worktree}/tmp/audit/
 ```
 
+### Status file setup
+
+Set up the agent status file for post-compaction recovery. The agent id is derived from the worktree path (e.g. `agent-ab4722a2`). Create the status directory if needed:
+
+```
+mkdir -p {repo_root}/tmp/agent-status
+```
+
+Write the initial status file at `{repo_root}/tmp/agent-status/{agent-id}.txt`:
+
+```
+issue: audit
+phase: audit-setup
+updated: <ISO-8601 timestamp>
+summary: Setting up audit working directory and fetching data
+autocompact_count: 0
+```
+
+Use the Write tool to create or overwrite this file at each phase transition throughout the audit.
+
+---
+
+## Step 0a — Post-compaction recovery (READ FIRST after any context reset)
+
+**When this applies:** Your context just went through autocompaction (the conversation summary references "previous conversation"), or you are otherwise starting a turn without a clear memory of which step you are in. Autocompaction preserves what was done but elides procedural imperatives, so the summary alone cannot tell you whether the audit is complete — the **status file** is authoritative (see #2545).
+
+**What to do — mechanical procedure:**
+
+1. **Run the recovery check:**
+   ```
+   {worktree}/scripts/check-task-recovery.sh {worktree}
+   ```
+   - **Exit 0 (`DONE`):** the status file shows `phase: done`. The audit is actually complete. You may emit your final report and end the turn.
+   - **Exit 1 (`RESUME`):** work remains. The script prints the next required step (e.g. `continue with category 1.6 — Security`). Resume from that step — do NOT emit `end_turn`, do NOT produce a final report.
+   - **Exit 2 (`UNKNOWN`):** the status file is missing or malformed. Assume work remains. Re-read this SKILL.md from the top and reconstruct phase from the state of `{worktree}/tmp/audit/` before proceeding.
+
+2. **Increment `autocompact_count`** in the status file. If the file has no such field, add one initialized to `1`.
+
+3. **Re-read this SKILL.md** from the step named in the `RESUME` output before taking any further action.
+
+4. **Do NOT emit `end_turn`** until `check-task-recovery.sh` returns exit 0 (`DONE`).
+
+---
+
 Fetch the list of recently merged PRs (the last 20) via MCP:
 
 ```
@@ -70,6 +114,8 @@ Work through each category in order. For each finding, record it in `{worktree}/
 
 ### 1.1 — Adversarial code review (recent changes)
 
+**Write status: `phase: audit-category-1.1`, `summary: Adversarial code review of recent PRs`** before starting this category.
+
 Review the last 20 merged PRs for real bugs that slipped through review:
 
 1. For each PR, read the diff using `gh pr diff <N> --repo judgemind/judgemind` (MCP has no unified-diff endpoint — this is the one `gh` read this skill retains). For just the file list without the patch text, prefer `mcp__github__get_pull_request_files`.
@@ -83,6 +129,8 @@ Review the last 20 merged PRs for real bugs that slipped through review:
 
 ### 1.2 — CLAUDE.md hygiene
 
+**Write status: `phase: audit-category-1.2`, `summary: CLAUDE.md hygiene review`** before starting this category.
+
 Read `CLAUDE.md` and cross-reference with the actual codebase:
 
 1. **Contradictions** — rules that conflict with each other or with code in `docs/`.
@@ -93,6 +141,8 @@ Read `CLAUDE.md` and cross-reference with the actual codebase:
 
 ### 1.3 — Architecture drift
 
+**Write status: `phase: audit-category-1.3`, `summary: Architecture drift scan`** before starting this category.
+
 Scan for code and infrastructure that has drifted from its intended design:
 
 1. **Dead code** — functions with zero callers (use Grep to verify), unreachable branches, orphaned files not imported anywhere.
@@ -102,6 +152,8 @@ Scan for code and infrastructure that has drifted from its intended design:
 5. **Schema drift** — tables, columns, or indexes in migration files or `schema.sql` that are not used in application code (or vice versa).
 
 ### 1.4 — Test quality
+
+**Write status: `phase: audit-category-1.4`, `summary: Test quality review`** before starting this category.
 
 Evaluate the test suite beyond what coverage metrics catch:
 
@@ -114,6 +166,8 @@ Focus on modules touched by recent PRs first, then broaden if time permits.
 
 ### 1.5 — Performance
 
+**Write status: `phase: audit-category-1.5`, `summary: Performance anti-pattern scan`** before starting this category.
+
 Look for common performance anti-patterns:
 
 1. **Sequential I/O** — loops making individual network calls (DB queries, HTTP requests, S3 operations) where batching or concurrency would be appropriate.
@@ -123,6 +177,8 @@ Look for common performance anti-patterns:
 5. **Missing indexes** — queries in application code that filter/sort on columns without corresponding DB indexes.
 
 ### 1.6 — Security
+
+**Write status: `phase: audit-category-1.6`, `summary: Security review`** before starting this category.
 
 Check for security issues in the codebase:
 
@@ -134,6 +190,8 @@ Check for security issues in the codebase:
 
 ### 1.7 — Dependency health
 
+**Write status: `phase: audit-category-1.7`, `summary: Dependency health review`** before starting this category.
+
 Review dependency freshness and hygiene:
 
 1. **Outdated dependencies** — major version bumps available for key dependencies.
@@ -142,6 +200,8 @@ Review dependency freshness and hygiene:
 4. **Version conflicts** — different packages pinning incompatible versions of the same dependency.
 
 ### 1.8 — CI health
+
+**Write status: `phase: audit-category-1.8`, `summary: CI health review`** before starting this category.
 
 Monitor CI pipeline performance to detect slow jobs before they bottleneck agent throughput. Every `/task` agent blocks on `gh run watch` during the PR cycle, so slow CI directly impacts overall velocity.
 
@@ -202,6 +262,8 @@ For each threshold violation or trend regression, file a `priority/p1` `type/dx`
 
 ### 1.9 — Scripts directory hygiene
 
+**Write status: `phase: audit-category-1.9`, `summary: Scripts directory hygiene check`** before starting this category.
+
 Monitor the `scripts/` directory for one-off script accumulation. After #2095 archived 55 scripts, the directory was cleaned to ~29 `.py` files. This check prevents re-accumulation.
 
 #### Checks
@@ -259,6 +321,8 @@ For missing headers, file a single `priority/p3` `type/dx` issue listing the scr
 
 ## Step 2 — Deduplicate findings
 
+**Write status: `phase: audit-dedup`, `summary: Deduplicating findings against open issues`** before starting this step.
+
 **Do not rely on the Step 0 snapshot.** The open issues list fetched at the start of the audit may be stale — other agents may have closed or modified issues during Step 1, which can take 30+ minutes. Re-fetch the current state before cross-referencing.
 
 ### 2.1 — Re-fetch open issues
@@ -301,6 +365,8 @@ If the issue has been closed since the list was fetched, treat the finding as ne
 
 ## Step 3 — File issues
 
+**Write status: `phase: audit-file-issues`, `summary: Filing issues for non-duplicate findings`** before starting this step.
+
 For each non-duplicate finding:
 
 1. Determine the appropriate labels:
@@ -328,6 +394,8 @@ Each issue body should include:
 ---
 
 ## Step 4 — Write summary report
+
+**Write status: `phase: audit-report`, `summary: Writing audit summary report`** before starting this step.
 
 Write a comprehensive summary to `{worktree}/tmp/audit/report.md`:
 
@@ -373,6 +441,8 @@ Write a comprehensive summary to `{worktree}/tmp/audit/report.md`:
 ---
 
 ## Step 5 — Notify completion
+
+**Write status: `phase: done`, `summary: Audit complete — N issues filed`** after writing the report.
 
 The dispatcher will send a Telegram notification when the audit agent completes. No explicit notification step is needed — the report in `{worktree}/tmp/audit/report.md` and the filed issues are the deliverables.
 

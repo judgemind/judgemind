@@ -30,9 +30,34 @@ Bidirectional spot-check across all active counties:
 
 
 > **MCP vs `aws` CLI:** the spotcheck stays on `scripts/ecs-run-task.sh` for the oneshot Fargate launch (handles network config, log streaming, exit-code propagation — not MCP-replaceable) and on `aws s3 cp` for downloading the spotcheck JSON and PDF artifacts (no MCP S3 coverage in Phase A). For ad-hoc post-run health checks against the dev cluster (`DescribeServices` on the ingestion worker, Logs Insights queries against `/ecs/judgemind-ingestion-worker-dev`), prefer the `mcp__awslabs_ecs-mcp-server__*` and `mcp__awslabs_cloudwatch-mcp-server__*` tools — see `docs/agent/aws-api-access.md`.
+
+---
+
+## Step 0a — Post-compaction recovery (READ FIRST after any context reset)
+
+**When this applies:** Your context just went through autocompaction (the conversation summary references "previous conversation"), or you are otherwise starting a turn without a clear memory of which step you are in. Autocompaction preserves what was done but elides procedural imperatives, so the summary alone cannot tell you whether the spotcheck is complete — the **status file** is authoritative (see #2545).
+
+**What to do — mechanical procedure:**
+
+1. **Run the recovery check:**
+   ```
+   {worktree}/scripts/check-task-recovery.sh {worktree}
+   ```
+   - **Exit 0 (`DONE`):** the status file shows `phase: done`. The spotcheck is actually complete. You may emit your final report and end the turn.
+   - **Exit 1 (`RESUME`):** work remains. The script prints the next required step (e.g. `continue with §2.5 (S3 orphan check) then §3 (screenshots) and §4 (cross-reference)`). Resume from that step — do NOT emit `end_turn`, do NOT produce a final report.
+   - **Exit 2 (`UNKNOWN`):** the status file is missing or malformed. Assume work remains. Re-read this SKILL.md from the top and reconstruct phase from the state of `{worktree}/tmp/spotcheck/` before proceeding.
+
+2. **Increment `autocompact_count`** in the status file. If the file has no such field, add one initialized to `1`.
+
+3. **Re-read this SKILL.md** from the step named in the `RESUME` output before taking any further action.
+
+4. **Do NOT emit `end_turn`** until `check-task-recovery.sh` returns exit 0 (`DONE`).
+
 ---
 
 ## Step 0 — Run the one-shot spotcheck script
+
+**Write status: `phase: spotcheck-step-0`, `summary: Running ECS spotcheck script`** at the start of this step. The status file lives at `{repo_root}/tmp/agent-status/{agent-id}.txt`; create the directory if needed (`mkdir -p {repo_root}/tmp/agent-status`).
 
 The spotcheck script (`scripts/spotcheck/run_spotcheck.py`) runs on ECS and does all DB work in one shot: samples rulings and originals per county, fetches all paired data, detects the all-same-case bug, and writes the full result JSON to S3.
 
@@ -68,6 +93,8 @@ Run the download script. Skip keys that are null.
 
 ## Step 1 — Review rulings direction (DB → Originals)
 
+**Write status: `phase: spotcheck-step-1`, `summary: Reviewing rulings direction (DB → Originals)`** before starting this step.
+
 **Review EVERY sampled ruling, not just flagged ones.** The summary stats (null judges, UNKNOWN case numbers, etc.) are triage hints for where to look harder, but you must check every ruling against its original PDF. Do not skip items because a field looks normal in the JSON — the whole point is to verify the JSON against the source.
 
 For each county in `rulings_by_county`, review all sampled rulings.
@@ -98,6 +125,8 @@ Record findings in `{worktree}/tmp/spotcheck/rulings_findings.md`.
 
 ## Step 2 — Review originals direction (S3 → DB)
 
+**Write status: `phase: spotcheck-step-2`, `summary: Reviewing originals direction (S3 → DB)`** before starting this step.
+
 **Review EVERY sampled original, not just flagged ones.** The `all_same_case` and `zero_derived` flags are triage hints, but you must open each PDF and verify all derived rulings against the source. A document with `all_same_case: false` and 7 distinct titles can still have wrong outcomes, wrong motion types, or truncated text.
 
 For each county in `originals_by_county`, review all sampled originals.
@@ -121,6 +150,8 @@ Check for:
 Record findings in `{worktree}/tmp/spotcheck/originals_findings.md`.
 
 ### 2.5 — S3 orphan check (supplementary)
+
+**Write status: `phase: spotcheck-step-2.5`, `summary: Running S3 orphan check`** before starting this sub-step.
 
 The originals sampled in Step 2 come from the documents table, so they always have DB rows. To also catch **orphaned S3 objects** (archived but never ingested), run the S3-based sampler for 2-3 counties:
 
@@ -158,6 +189,8 @@ Check for garbled titles, missing fields, layout issues. Record in `{worktree}/t
 ---
 
 ## Step 4 — Cross-reference and file issues
+
+**Write status: `phase: spotcheck-step-4`, `summary: Cross-referencing findings and filing issues`** before starting this step.
 
 ### 4.1 — Fetch open issues
 
@@ -204,6 +237,8 @@ gh issue create --repo judgemind/judgemind \
 
 ## Step 5 — Summary report
 
+**Write status: `phase: spotcheck-step-5`, `summary: Writing spotcheck summary report`** before starting this step.
+
 Write to `{worktree}/tmp/spotcheck/report.md` and print to stdout:
 
 ```markdown
@@ -233,6 +268,8 @@ Write to `{worktree}/tmp/spotcheck/report.md` and print to stdout:
 ## Overall Assessment
 [Good / Needs attention / Critical]
 ```
+
+After writing the report, **write status: `phase: done`, `summary: Spotcheck complete — N issues filed`**.
 
 ---
 

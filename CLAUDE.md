@@ -17,13 +17,13 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Never use `run_in_background` in any subagent (`/task`, `/ralph`, `/tdd`, or Agent-spawned workers). All commands inside subagents run synchronously.
 - Never commit directly to `main` during autonomous task work.
 - **You MAY merge your own PRs** after `/ralph` and CI are green: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
-- Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps 4.4–4.11; A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
+- Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
 - Never deploy to production. Production deploys are human-only.
 - Never set `priority/p0` on issues unless explicitly told to by a human.
 - Never skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - Never share venvs between worktrees. Each worktree gets its own `.venv`.
 - Never create additional worktrees from inside a worktree via `git worktree add`. Fix bad state with `git checkout -- .` / `git clean -fd` rather than creating a new worktree.
-- Never close a task or remove a worktree without posting a verification evidence comment on the issue. See §4.10 Step 3.
+- Never close a task or remove a worktree without posting a verification evidence comment on the issue. See §A.8 Step 3.
 - Never merge user-visible affordances that haven't been exercised end-to-end. "The page renders" / "the service returns 200" is not evidence. Half-built behind a flag is fine; half-built and reachable by users is the bug.
 - Never bypass a safety check with `--force` or a manual workaround. When a check blocks you, trust it.
 - Never run `gh auth switch` without an explicit user instruction.

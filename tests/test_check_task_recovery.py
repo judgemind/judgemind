@@ -108,11 +108,16 @@ def test_blocked_phase_returns_done() -> None:
 
 
 def test_ralph_worker_phase_returns_resume() -> None:
-    """Exit 1 (RESUME) when phase is `ralph-worker (1)` — mid-implementation."""
+    """Exit 1 (RESUME) pointing to A.2b when phase is `ralph-worker (1)` and ralph-done.txt has SHIP."""
     with tempfile.TemporaryDirectory() as tmp:
         worktree, status_path = _build_fake_worktree(tmp, "agent-ralph")
         with open(status_path, "w") as f:
             f.write("issue: #2500\nphase: ralph-worker (1)\nupdated: x\nsummary: y\n")
+        # Write ralph-done.txt with SHIP so the script routes to A.2b
+        ralph_dir = os.path.join(worktree, "tmp", "ralph")
+        os.makedirs(ralph_dir, exist_ok=True)
+        with open(os.path.join(ralph_dir, "ralph-done.txt"), "w") as f:
+            f.write("SHIP\nAll acceptance criteria met.\n")
         result = run_script(worktree)
         assert result.returncode == 1, (
             f"expected exit 1 (RESUME), got {result.returncode}: "
@@ -120,6 +125,40 @@ def test_ralph_worker_phase_returns_resume() -> None:
         )
         assert "RESUME" in result.stdout
         assert "A.2b" in result.stdout  # Next step advice
+
+
+def test_ralph_worker_no_done_file_returns_ralph_loop() -> None:
+    """Exit 1 (RESUME) pointing to ralph Step 2 when ralph-done.txt is absent."""
+    with tempfile.TemporaryDirectory() as tmp:
+        worktree, status_path = _build_fake_worktree(tmp, "agent-ralph-mid")
+        with open(status_path, "w") as f:
+            f.write("issue: #2500\nphase: ralph-worker (3)\nupdated: x\nsummary: y\n")
+        # Do NOT create ralph-done.txt — ralph is mid-loop
+        result = run_script(worktree)
+        assert result.returncode == 1, (
+            f"expected exit 1 (RESUME), got {result.returncode}: "
+            f"stdout={result.stdout!r}"
+        )
+        assert "RESUME" in result.stdout
+        # Should point to ralph Step 2, not A.2b
+        assert "ralph" in result.stdout.lower()
+        assert "A.2b" not in result.stdout
+
+
+def test_ralph_worker_done_file_returns_a2b() -> None:
+    """Exit 1 (RESUME) pointing to A.2b explicitly when ralph-done.txt first line is SHIP."""
+    with tempfile.TemporaryDirectory() as tmp:
+        worktree, status_path = _build_fake_worktree(tmp, "agent-ralph-ship")
+        with open(status_path, "w") as f:
+            f.write("issue: #2501\nphase: ralph-reviewer (2)\nupdated: x\nsummary: y\n")
+        ralph_dir = os.path.join(worktree, "tmp", "ralph")
+        os.makedirs(ralph_dir, exist_ok=True)
+        with open(os.path.join(ralph_dir, "ralph-done.txt"), "w") as f:
+            f.write("SHIP\nAll reviewers approved.\n")
+        result = run_script(worktree)
+        assert result.returncode == 1
+        assert "RESUME" in result.stdout
+        assert "A.2b" in result.stdout
 
 
 def test_pushing_phase_returns_resume() -> None:
@@ -188,19 +227,55 @@ def test_empty_phase_field_returns_unknown() -> None:
         assert "UNKNOWN" in result.stderr
 
 
+def test_audit_category_phase_returns_resume_with_next_category() -> None:
+    """Exit 1 (RESUME) with a meaningful next-step for audit-category-1.5."""
+    with tempfile.TemporaryDirectory() as tmp:
+        worktree, status_path = _build_fake_worktree(tmp, "agent-audit")
+        with open(status_path, "w") as f:
+            f.write("issue: audit\nphase: audit-category-1.5\nupdated: x\nsummary: y\n")
+        result = run_script(worktree)
+        assert result.returncode == 1, (
+            f"expected exit 1 (RESUME), got {result.returncode}: "
+            f"stdout={result.stdout!r}"
+        )
+        assert "RESUME" in result.stdout
+        # Should mention the next category (1.6 Security) or audit SKILL.md
+        assert "1.6" in result.stdout or "Security" in result.stdout or "audit" in result.stdout.lower()
+
+
+def test_spotcheck_step_phase_returns_resume_with_next_step() -> None:
+    """Exit 1 (RESUME) with a meaningful next-step for spotcheck-step-2."""
+    with tempfile.TemporaryDirectory() as tmp:
+        worktree, status_path = _build_fake_worktree(tmp, "agent-spotcheck")
+        with open(status_path, "w") as f:
+            f.write("issue: spotcheck\nphase: spotcheck-step-2\nupdated: x\nsummary: y\n")
+        result = run_script(worktree)
+        assert result.returncode == 1, (
+            f"expected exit 1 (RESUME), got {result.returncode}: "
+            f"stdout={result.stdout!r}"
+        )
+        assert "RESUME" in result.stdout
+        # Should mention the S3 orphan check (2.5) or screenshots/cross-reference
+        assert "2.5" in result.stdout or "orphan" in result.stdout.lower() or "spotcheck" in result.stdout.lower()
+
+
 def main() -> int:
     tests = [
         ("missing status file -> UNKNOWN", test_missing_status_file_returns_unknown),
         ("phase=done -> DONE", test_done_phase_returns_done),
         ("phase=verified -> DONE", test_verified_phase_returns_done),
         ("phase=blocked -> DONE", test_blocked_phase_returns_done),
-        ("phase=ralph-worker -> RESUME", test_ralph_worker_phase_returns_resume),
+        ("phase=ralph-worker + SHIP done file -> A.2b", test_ralph_worker_phase_returns_resume),
+        ("phase=ralph-worker + no done file -> ralph loop", test_ralph_worker_no_done_file_returns_ralph_loop),
+        ("phase=ralph-reviewer + SHIP done file -> A.2b", test_ralph_worker_done_file_returns_a2b),
         ("phase=pushing -> RESUME", test_pushing_phase_returns_resume),
         ("phase=verifying -> RESUME", test_verifying_phase_returns_resume),
         ("phase=ci-watch (N) -> RESUME", test_ci_watch_phase_returns_resume),
         ("unknown phase -> RESUME with hint", test_unknown_phase_returns_resume_with_hint),
         ("bad worktree path -> UNKNOWN", test_bad_worktree_path_returns_unknown),
         ("empty phase field -> UNKNOWN", test_empty_phase_field_returns_unknown),
+        ("phase=audit-category-1.5 -> RESUME with next category", test_audit_category_phase_returns_resume_with_next_category),
+        ("phase=spotcheck-step-2 -> RESUME with next step", test_spotcheck_step_phase_returns_resume_with_next_step),
     ]
     for desc, fn in tests:
         run_test(desc, fn)
