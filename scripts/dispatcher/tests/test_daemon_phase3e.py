@@ -638,13 +638,20 @@ class TestRunRetroPhaseFailures:
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
 
+        # Issue #3089: ``_file_retro_issue`` now routes through the
+        # shared 3-attempt 1s+2s retry helper (``_subprocess_with_retry``).
+        # The first retro's ``gh issue create`` exhausts all 3 attempts
+        # → the second retro still runs on its own first attempt and
+        # succeeds. Total subprocess.run calls: 3 (first retro) + 1
+        # (second retro) = 4.
         call_n = {"i": 0}
 
         def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
             r = MagicMock()
             call_n["i"] += 1
-            # First call fails, second succeeds.
-            if call_n["i"] == 1:
+            # First retro (call 1/2/3) all fail with 503 — exhaust retry.
+            # Second retro (call 4) succeeds.
+            if call_n["i"] <= 3:
                 r.returncode = 1
                 r.stdout = ""
                 r.stderr = "github 503"
@@ -655,14 +662,17 @@ class TestRunRetroPhaseFailures:
             return r
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda *_a, **_kw: None)
         d._run_retro_phase(agent)
 
-        # Both calls happened.
-        assert call_n["i"] == 2
-        # First failed, second succeeded → 1 issue created.
+        # First retro: 3 retry attempts exhausted. Second retro: 1 attempt.
+        assert call_n["i"] == 4
+        # First retro failed, second succeeded → 1 issue created.
         created = handler.events("retro_issue_created")
         assert len(created) == 1
-        # Failure logged.
+        # Failure logged (the retry-exhausted WARNING OR the
+        # ``retro_issue_create_failed`` nonzero_exit WARNING — either
+        # counts as "failure was recorded").
         failures = handler.events("retro_issue_create_failed")
         assert len(failures) == 1
 

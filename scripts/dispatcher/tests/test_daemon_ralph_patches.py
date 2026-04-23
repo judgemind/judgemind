@@ -913,9 +913,22 @@ class TestPushAndOpenPrDeletesRalphPatch:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
-        with patch(
-            "subprocess.run",
-            side_effect=[rev_list_ahead, commit_ok, git_show_empty, push_fail],
+        # Issue #3089: ``git push`` now retries 3 times before falling
+        # through to ``_handle_agent_failure``. Provide three push_fail
+        # results and stub ``time.sleep`` to keep the test fast.
+        with (
+            patch(
+                "subprocess.run",
+                side_effect=[
+                    rev_list_ahead,
+                    commit_ok,
+                    git_show_empty,
+                    push_fail,
+                    push_fail,
+                    push_fail,
+                ],
+            ),
+            patch("dispatcher.daemon.time.sleep"),
         ):
             d._push_and_open_pr(
                 agent_id=agent_id,

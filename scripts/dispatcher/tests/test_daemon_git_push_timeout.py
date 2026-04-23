@@ -60,44 +60,84 @@ def test_git_push_timeout_constant_is_1800_seconds() -> None:
     )
 
 
+def _list_literals_have_git_push(cmd_arg: ast.expr) -> bool:
+    """Return True if ``cmd_arg`` is a list literal with ``git`` + ``push``.
+
+    Accepts both:
+      - direct list literal passed to subprocess.run
+      - list literal bound to a local name then passed to either
+        subprocess.run or self._subprocess_with_retry.
+    """
+    if not isinstance(cmd_arg, ast.List):
+        return False
+    literals: list[str] = []
+    for elt in cmd_arg.elts:
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            literals.append(elt.value)
+        else:
+            literals.append("")
+    return bool(literals) and literals[0] == "git" and "push" in literals
+
+
+def _resolve_name_to_list(name: str, tree: ast.Module, call_line: int) -> ast.List | None:
+    """Find the nearest preceding ``<name> = [...]`` assignment before call_line."""
+    best: ast.List | None = None
+    best_line = -1
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and node.lineno < call_line:
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == name
+                    and isinstance(node.value, ast.List)
+                    and node.lineno > best_line
+                ):
+                    best = node.value
+                    best_line = node.lineno
+    return best
+
+
 def _collect_subprocess_run_push_calls() -> list[ast.Call]:
-    """Return every ``subprocess.run(...)`` call in daemon.py whose
-    first positional arg starts with ``['git', '-C', ..., 'push', ...]``.
+    """Return every git-push subprocess call in daemon.py.
+
+    Matches both pre-#3089 direct ``subprocess.run([... 'git' ... 'push' ...])``
+    and post-#3089 ``self._subprocess_with_retry([... 'git' ... 'push' ...])``
+    (which wraps ``subprocess.run`` with retry). Also resolves the
+    ``cmd = [...]; self._subprocess_with_retry(cmd, ...)`` name-binding
+    pattern.
     """
     tree = ast.parse(_DAEMON_PATH.read_text())
     out: list[ast.Call] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        # Match ``subprocess.run(...)``.
         func = node.func
-        if not (
+        is_subprocess_run = (
             isinstance(func, ast.Attribute)
             and func.attr == "run"
             and isinstance(func.value, ast.Name)
             and func.value.id == "subprocess"
-        ):
+        )
+        is_retry_helper = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "_subprocess_with_retry"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "self"
+        )
+        if not (is_subprocess_run or is_retry_helper):
             continue
         if not node.args:
             continue
         cmd_arg = node.args[0]
-        if not isinstance(cmd_arg, ast.List):
+        # Inline list literal.
+        if _list_literals_have_git_push(cmd_arg):
+            out.append(node)
             continue
-        # Extract string literals so we can detect ``"git" ... "push"``.
-        literals: list[str] = []
-        for elt in cmd_arg.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                literals.append(elt.value)
-            else:
-                # Non-literal elements (e.g. ``str(worktree)``, branch
-                # variables) don't carry the command shape we care about
-                # — skip them for detection purposes.
-                literals.append("")
-        if not literals or literals[0] != "git":
-            continue
-        if "push" not in literals:
-            continue
-        out.append(node)
+        # ``cmd = [...]; self._subprocess_with_retry(cmd, ...)`` pattern.
+        if isinstance(cmd_arg, ast.Name):
+            resolved = _resolve_name_to_list(cmd_arg.id, tree, node.lineno)
+            if resolved is not None and _list_literals_have_git_push(resolved):
+                out.append(node)
     return out
 
 

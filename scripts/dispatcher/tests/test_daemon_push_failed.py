@@ -311,8 +311,22 @@ class TestGitPushFailedWritesFailureRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
-        run_side_effects = [rev_list_ahead, commit_ok, git_show_empty, push_fail]
-        with patch("subprocess.run", side_effect=run_side_effects):
+        # Issue #3089: ``git push`` now routes through the shared
+        # 3-attempt retry helper, so the failing push consumes 3
+        # ``subprocess.run`` calls instead of 1. ``time.sleep`` is
+        # stubbed to keep the test fast.
+        run_side_effects = [
+            rev_list_ahead,
+            commit_ok,
+            git_show_empty,
+            push_fail,
+            push_fail,
+            push_fail,
+        ]
+        with (
+            patch("subprocess.run", side_effect=run_side_effects),
+            patch("dispatcher.daemon.time.sleep"),
+        ):
             d._push_and_open_pr(
                 agent_id=agent_id,
                 issue_number=42,
@@ -379,9 +393,20 @@ class TestGitPushFailedWritesFailureRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
-        with patch(
-            "subprocess.run",
-            side_effect=[rev_list_ahead, commit_ok, git_show_empty, push_fail],
+        # Issue #3089: 3-attempt retry — 3 push_fail results needed.
+        with (
+            patch(
+                "subprocess.run",
+                side_effect=[
+                    rev_list_ahead,
+                    commit_ok,
+                    git_show_empty,
+                    push_fail,
+                    push_fail,
+                    push_fail,
+                ],
+            ),
+            patch("dispatcher.daemon.time.sleep"),
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=99, worktree=worktree)
 
@@ -442,9 +467,20 @@ class TestGitPushFailedWritesPhaseOutputRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
-        with patch(
-            "subprocess.run",
-            side_effect=[rev_list_ahead, commit_ok, git_show_empty, push_fail],
+        # Issue #3089: 3-attempt retry — 3 push_fail results needed.
+        with (
+            patch(
+                "subprocess.run",
+                side_effect=[
+                    rev_list_ahead,
+                    commit_ok,
+                    git_show_empty,
+                    push_fail,
+                    push_fail,
+                    push_fail,
+                ],
+            ),
+            patch("dispatcher.daemon.time.sleep"),
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=7, worktree=worktree)
 
