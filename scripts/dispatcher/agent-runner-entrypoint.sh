@@ -361,6 +361,393 @@ transition_for() {
     printf '%s' "$_payload" | python3 "$TRANSITION_SHIM"
 }
 
+# ── Python helper: phase_input shim (#3133) ────────────────────────────────
+#
+# The task-v2-* skills read their inputs from
+# ``{worktree}/tmp/dispatcher-input/<phase>.json``. The daemon's
+# subprocess path writes those files via ``_write_phase_input`` before
+# spawning each ``claude -p`` subprocess — and in the absence of that
+# file each skill's guard clause fires, short-circuiting to a
+# ``go=false`` / ``verdict=BLOCKED`` fallback and writing a human-
+# readable reason to stdout as a plain-string ``.result`` (captured by
+# #3131's diag). The agent-runner has no equivalent plumbing, so every
+# ECS-mode agent before #3133 hit this input-missing path on planning
+# and terminated at ``daemon_restart_abandoned``.
+#
+# This shim mirrors a minimal subset of the daemon's
+# :meth:`DispatcherDaemon._fetch_issue_bundle` +
+# :meth:`_write_phase_input` so each claude phase sees a well-formed
+# input file at the contract's expected path. It shells out to ``gh
+# issue view --json`` for the plan-phase issue bundle (the daemon's
+# own path uses the same CLI); non-interactive auth is already wired
+# up in the entrypoint's ``gh auth login --with-token`` step earlier.
+#
+# Stage 1b scope (#3133): plan + ralph inputs are built fully so the
+# smoke exercises planning → ralph with real object `.result` values.
+# summary / fix-ci / verify / retro inputs are minimal — they include
+# the required identifier fields (agent_id, issue_number, worktree_path)
+# plus whatever the shim can derive locally, but the richer context
+# (git diff, CI failing jobs, deploy status, phase_transitions) stays
+# the daemon's job. Each of those skills will still BLOCK cleanly when
+# its input is incomplete, which is the correct behaviour for a
+# smoke-only image — Stage 2 fleshes out the per-phase wiring.
+#
+# Module lookup matches phase_transitions_shim.py: PHASE_INPUT_DIR /
+# PHASE_INPUT_PARENT env vars let tests stub the script at a writable
+# location without bake-time paths.
+
+PHASE_INPUT_SHIM="${AGENT_RUNNER_PHASE_INPUT_SHIM:-$AGENT_WORKSPACE/phase_input_shim.py}"
+
+if [[ "$PHASE_INPUT_SHIM" == "$AGENT_WORKSPACE/phase_input_shim.py" ]]; then
+    _input_shim_path="$AGENT_WORKSPACE/phase_input_shim.py"
+    cat <<'PYEOF' > "$_input_shim_path"
+"""Entrypoint-internal shim: build ``dispatcher-input/<phase>.json``.
+
+Invoked with argv = [phase, agent_id, issue_number, repo_root]. Writes
+``{repo_root}/tmp/dispatcher-input/<phase>.json`` matching each skill's
+input contract (see .claude/skills/task-v2-<phase>/SKILL.md).
+
+Minimal Stage 1b scope (#3133):
+  * planning — full input via ``gh issue view --json`` (mirrors the
+    daemon's ``_fetch_issue_bundle``). Non-bot comments filtered.
+    ``Blocked by #N`` + ``Parent: #N`` parsed from body.
+  * ralph — plan output from ``dispatcher-output/plan.json`` + the
+    identifiers; ``max_iterations`` defaults to 5 matching the daemon.
+  * summary / fix-ci / verify / retro — identifier fields + whatever
+    can be derived locally (prior phase outputs, branch name, git diff
+    for summary). Fields the daemon has (CI job logs, deploy status,
+    phase_transitions timing) are left empty; each skill short-circuits
+    with a structured BLOCKED verdict rather than a string ``.result``.
+
+Exit codes: 0 on write success, 2 on unrecoverable error (caller
+should log + continue — the skill's missing-input path still works).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    """Thin wrapper so tests can stub via PATH shims."""
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _parse_blocked_by(body: str) -> list[int]:
+    """Mirror DispatcherDaemon._parse_blocked_by."""
+    return [int(m) for m in re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body)]
+
+
+def _parse_parent_issue(body: str) -> int | None:
+    """Mirror DispatcherDaemon._parse_parent_issue."""
+    match = re.search(r"(?im)^\s*parent\s*:\s*#(\d+)\s*$", body)
+    return int(match.group(1)) if match else None
+
+
+def _fetch_issue_bundle(repo: str, issue_number: int) -> dict:
+    """Mirror DispatcherDaemon._fetch_issue_bundle (minus metering)."""
+    if not issue_number:
+        return {
+            "issue_number": 0,
+            "issue_title": "",
+            "issue_body": "",
+            "issue_comments": [],
+            "issue_labels": [],
+            "blocked_by": [],
+            "parent_issue": None,
+            "issue_updated_at": "",
+        }
+    cmd = [
+        "gh",
+        "issue",
+        "view",
+        str(issue_number),
+        "--repo",
+        repo,
+        "--json",
+        "number,title,body,labels,comments,updatedAt",
+    ]
+    outcome = _run(cmd, timeout=30)
+    if outcome.returncode != 0:
+        # Fall back to empty bundle so the skill's guard clause still
+        # produces a clean go=false rather than a crash. The daemon's
+        # path raises; the agent-runner's is best-effort.
+        return {
+            "issue_number": issue_number,
+            "issue_title": "",
+            "issue_body": "",
+            "issue_comments": [],
+            "issue_labels": [],
+            "blocked_by": [],
+            "parent_issue": None,
+            "issue_updated_at": "",
+        }
+    try:
+        payload = json.loads(outcome.stdout or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    raw_comments = payload.get("comments") or []
+    filtered: list[dict] = []
+    for comment in raw_comments:
+        if not isinstance(comment, dict):
+            continue
+        author = comment.get("author") or {}
+        login = author.get("login", "") if isinstance(author, dict) else ""
+        if login.endswith("[bot]"):
+            continue
+        filtered.append(
+            {
+                "author": login,
+                "author_association": comment.get("authorAssociation", ""),
+                "date": comment.get("createdAt", ""),
+                "body": comment.get("body", ""),
+            }
+        )
+    labels = [
+        entry.get("name", "")
+        for entry in (payload.get("labels") or [])
+        if isinstance(entry, dict)
+    ]
+    body = payload.get("body") or ""
+    return {
+        "issue_number": issue_number,
+        "issue_title": payload.get("title", ""),
+        "issue_body": body,
+        "issue_comments": filtered,
+        "issue_labels": labels,
+        "blocked_by": _parse_blocked_by(body),
+        "parent_issue": _parse_parent_issue(body),
+        "issue_updated_at": payload.get("updatedAt", ""),
+    }
+
+
+def _read_prior_output(repo_root: Path, phase: str) -> dict:
+    """Read ``{repo_root}/tmp/dispatcher-output/<phase>.json`` if present."""
+    path = repo_root / "tmp" / "dispatcher-output" / f"{phase}.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _git_diff(repo_root: Path) -> str:
+    """``git diff origin/main...HEAD`` from the repo root. Empty on failure."""
+    try:
+        out = _run(
+            ["git", "-C", str(repo_root), "diff", "origin/main...HEAD"],
+            timeout=60,
+        )
+    except Exception:
+        return ""
+    return out.stdout if out.returncode == 0 else ""
+
+
+def _git_changed_files(repo_root: Path) -> list[str]:
+    """``git diff --name-only origin/main...HEAD``. Empty on failure."""
+    try:
+        out = _run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "diff",
+                "--name-only",
+                "origin/main...HEAD",
+            ],
+            timeout=30,
+        )
+    except Exception:
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+
+
+def _git_current_branch(repo_root: Path) -> str:
+    """Current branch name via ``git rev-parse --abbrev-ref HEAD``."""
+    try:
+        out = _run(
+            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    return (out.stdout or "").strip() if out.returncode == 0 else ""
+
+
+def _build_input(
+    phase: str,
+    agent_id: str,
+    issue_number: int,
+    repo_root: Path,
+    github_repo: str,
+) -> dict:
+    """Dispatch to the per-phase builder."""
+    base = {
+        "agent_id": agent_id,
+        "issue_number": issue_number,
+        "worktree_path": str(repo_root),
+        "repo_root": str(repo_root),
+    }
+    if phase == "plan":
+        bundle = _fetch_issue_bundle(github_repo, issue_number)
+        return {**base, **bundle}
+    if phase == "ralph":
+        plan = _read_prior_output(repo_root, "plan")
+        return {
+            **base,
+            "plan": plan,
+            "max_iterations": 5,
+            "dependencies_installed": plan.get("dependencies_to_install", []) or [],
+        }
+    if phase == "summary":
+        bundle = _fetch_issue_bundle(github_repo, issue_number)
+        plan = _read_prior_output(repo_root, "plan")
+        ralph = _read_prior_output(repo_root, "ralph")
+        changed_files = ralph.get("changed_files") or _git_changed_files(repo_root)
+        return {
+            **base,
+            "issue_title": bundle.get("issue_title", ""),
+            "issue_body": bundle.get("issue_body", ""),
+            "issue_comments": bundle.get("issue_comments", []),
+            "ralph_summary": ralph.get("summary", "") if isinstance(ralph, dict) else "",
+            "changed_files": changed_files,
+            "git_diff": _git_diff(repo_root),
+            "branch": _git_current_branch(repo_root),
+            "plan_acceptance_criteria": plan.get("acceptance_criteria", []) or [],
+            "scope_check": plan.get("scope_check", []) or [],
+        }
+    if phase == "fix-ci":
+        plan = _read_prior_output(repo_root, "plan")
+        return {
+            **base,
+            "pr_number": 0,
+            "branch": _git_current_branch(repo_root),
+            "failing_jobs": [],
+            "git_diff_base_to_head": _git_diff(repo_root),
+            "previous_fix_attempts": 0,
+            "change_type": plan.get("change_type", "") if isinstance(plan, dict) else "",
+        }
+    if phase == "verify":
+        plan = _read_prior_output(repo_root, "plan")
+        return {
+            **base,
+            "pr_number": 0,
+            "acceptance_criteria": plan.get("acceptance_criteria", []) or [],
+            "change_type": plan.get("change_type", "") if isinstance(plan, dict) else "",
+            "touched_services": [],
+            "deploy_status": None,
+            "merged_commit_sha": "",
+            "plan_text": plan.get("plan_text", "") if isinstance(plan, dict) else "",
+            "scope_check": plan.get("scope_check", []) or [],
+            "deferred_acs": [],
+        }
+    if phase == "retro":
+        return {
+            **base,
+            "pr_number": 0,
+            "phase_transitions": [],
+            "failures": [],
+            "ralph_iterations": 0,
+            "ci_attempts": 0,
+            "fix_ci_attempts": 0,
+            "total_duration_s": 0,
+            "diff_stats": {"files_changed": 0, "insertions": 0, "deletions": 0},
+            "scope_check_followups": [],
+            "plan_follow_ups": [],
+        }
+    # Unknown phase — return the base shape; skill will BLOCK on
+    # missing required fields, which is the correct behaviour.
+    return base
+
+
+def main() -> int:
+    if len(sys.argv) != 5:
+        print(
+            "usage: phase_input_shim.py <phase> <agent_id> <issue_number> "
+            "<repo_root>",
+            file=sys.stderr,
+        )
+        return 2
+    phase = sys.argv[1]
+    agent_id = sys.argv[2]
+    try:
+        issue_number = int(sys.argv[3]) if sys.argv[3] else 0
+    except ValueError:
+        issue_number = 0
+    repo_root = Path(sys.argv[4]).resolve()
+    github_repo = os.environ.get("GITHUB_REPO", "judgemind/judgemind")
+
+    payload = _build_input(phase, agent_id, issue_number, repo_root, github_repo)
+
+    input_dir = repo_root / "tmp" / "dispatcher-input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    # Normalize skill-suffix naming for the on-disk file (daemon writes
+    # `fix-ci.json` even though the phase-column value is `fix_ci`).
+    file_phase = phase
+    out_path = input_dir / f"{file_phase}.json"
+    out_path.write_text(json.dumps(payload, indent=2, default=str))
+    print(str(out_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+fi
+
+# Shell helper: build the input file for the given phase. The phase
+# argument matches the skill-suffix (``plan``, ``ralph``, ``summary``,
+# ``fix-ci``, ``verify``, ``retro``), which differs from the phase-
+# column value (``planning`` vs ``plan``, ``fix_ci`` vs ``fix-ci``).
+# ``run_claude_phase`` does the mapping before calling us.
+write_phase_input() {
+    _phase_suffix="$1"
+    _issue_for_input="${ISSUE_NUMBER:-0}"
+    if ! python3 "$PHASE_INPUT_SHIM" \
+        "$_phase_suffix" \
+        "$AGENT_ID" \
+        "$_issue_for_input" \
+        "$REPO_ROOT" \
+        > "$AGENT_WORKSPACE/phase-input-$_phase_suffix.log" \
+        2>> "$AGENT_WORKSPACE/phase-input-$_phase_suffix.log"; then
+        log "phase_input_write_failed" "phase=$_phase_suffix"
+        return 1
+    fi
+    log "phase_input_written" "phase=$_phase_suffix"
+    return 0
+}
+
+# Read the skill's structured output from
+# ``{repo_root}/tmp/dispatcher-output/<skill_suffix>.json`` and print
+# the minified JSON to stdout. Returns non-zero when the file is
+# missing / unparseable so ``run_claude_phase`` can fall back to the
+# ``.result`` envelope + diag path.
+read_phase_output() {
+    _phase_suffix="$1"
+    _out_path="$REPO_ROOT/tmp/dispatcher-output/$_phase_suffix.json"
+    if [[ ! -s "$_out_path" ]]; then
+        return 1
+    fi
+    # ``jq -c '.'`` validates JSON and emits on one line. Failure
+    # (malformed file) → non-zero exit, empty stdout, caller falls
+    # through to the ``.result`` branch.
+    if ! jq -c '.' "$_out_path" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # ── Phase runners -----------------------------------------------------------
 #
 # Each runner executes one phase and prints its phase-output JSON to
@@ -417,6 +804,16 @@ run_claude_phase() {
     # as a silent "Unknown command" in production CloudWatch.
     _skill=$(phase_to_skill "$_phase")
 
+    # Write the phase's dispatcher-input JSON before invoking claude
+    # (#3133). Without this, every task-v2-* skill hits its input-
+    # missing guard and returns a plain-string `.result` — which is
+    # exactly the failure mode the Step 1 diag captured. The shim is
+    # best-effort: if gh is unreachable or the issue is gone, it still
+    # writes a partial payload so the skill at least has the base
+    # identifier fields and can produce a structured BLOCKED verdict
+    # rather than a null-deref.
+    write_phase_input "$_skill" || true
+
     log "claude_phase_begin" "phase=$_phase" "skill=$_skill"
     # Do NOT fail the script on a non-zero exit — parse the envelope
     # and let the caller decide. Redirect stderr to a sibling file for
@@ -431,17 +828,28 @@ run_claude_phase() {
     set -e
     log "claude_phase_done" "phase=$_phase" "exit_code=$_rc"
 
-    # The `result` field of `claude -p --output-format json` is either
-    # a string (legacy path, or a skill error like "Unknown command: ...")
-    # or an object. The task-v2-* skills emit JSON objects in `result`
-    # (parsed by the daemon); we forward an object unchanged for the
-    # transition shim.
-    #
-    # Defensive (#3117): when `.result` is not a JSON object, coerce
-    # to `{}` here so the downstream transition shim + persist path
-    # see a dict-shaped output and don't crash on `.get("verdict")`.
-    # The raw `.result` string is preserved on disk in `_out_file`
-    # for triage.
+    # Output resolution order (#3133):
+    #   1. ``{repo_root}/tmp/dispatcher-output/<skill_suffix>.json`` —
+    #      the skill's structured output file. This is how the daemon
+    #      reads verdict/plan-body/etc. — see
+    #      :meth:`DispatcherDaemon._read_phase_output`. Before #3133
+    #      the agent-runner ignored this file entirely and read only
+    #      the claude `.result` envelope, which is the conversation
+    #      text summary (string), not the structured JSON the skill
+    #      actually wrote.
+    #   2. ``.result`` as a JSON object — legacy path + defensive
+    #      fallback for skills that return a dict directly. Kept for
+    #      back-compat with any skill that hasn't migrated to the
+    #      dispatcher-output/ contract.
+    #   3. ``{}`` with the #3131 diag event — skill crashed before
+    #      writing its output and the envelope itself isn't a dict.
+    _file_output=""
+    if _file_output=$(read_phase_output "$_skill"); then
+        log "phase_output_file_read" "phase=$_phase" "skill=$_skill"
+        printf '%s' "$_file_output"
+        return 0
+    fi
+
     if jq -e '.result | type == "object"' "$_out_file" >/dev/null 2>&1; then
         jq -c '.result' "$_out_file" 2>/dev/null || printf '{}'
     else

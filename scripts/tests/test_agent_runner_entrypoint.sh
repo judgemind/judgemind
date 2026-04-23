@@ -1251,6 +1251,180 @@ else
          "output tail: $(printf '%s' "$out" | tail -30)"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test 15: #3133 — the entrypoint writes {repo_root}/tmp/dispatcher-input/
+# plan.json before invoking claude, with the plan skill's required fields
+# populated. This is the direct fix for the diag captured in smoke run
+# 9010f81dd24a46e0882fd54ef45af213: the plan skill's `.result` came back
+# as a string "Plan phase blocked: the daemon did not write {worktree}/
+# tmp/dispatcher-input/plan.json..." because the entrypoint never wrote
+# that file.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t15.txt"
+# Start at planning and walk exactly once through the claude invocation,
+# then fall into the terminal dead-branch via an unexpected phase.
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+CLAUDE_VERDICT_FIXTURE="$TEST_TMP/verdicts-t15.tsv"
+cat > "$CLAUDE_VERDICT_FIXTURE" <<'EOF'
+plan	OK
+ralph	SHIP
+summary	OK
+fix-ci	PATCHED
+verify	VERIFIED
+EOF
+
+t15_workspace="$TEST_TMP/t15-workspace"
+mkdir -p "$t15_workspace"
+
+# The entrypoint will build REPO_ROOT=$AGENT_WORKSPACE/repo — the
+# phase input shim writes to $REPO_ROOT/tmp/dispatcher-input/. After
+# the entrypoint runs we inspect that path to verify both the file
+# presence and its content shape.
+set +e
+out=$(AGENT_ID="15151515-1515-1515-1515-151515151515" \
+      ISSUE_NUMBER="3133" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t15_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=2 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+plan_input_path="$t15_workspace/repo/tmp/dispatcher-input/plan.json"
+if [[ -f "$plan_input_path" ]]; then
+    pass "#3133 — entrypoint writes dispatcher-input/plan.json before claude"
+else
+    fail "#3133 — entrypoint writes dispatcher-input/plan.json before claude" \
+         "expected file not found: $plan_input_path. Output tail: $(printf '%s' "$out" | tail -15)"
+fi
+
+if [[ -f "$plan_input_path" ]] && jq -e '.agent_id == "15151515-1515-1515-1515-151515151515"' "$plan_input_path" >/dev/null 2>&1; then
+    pass "#3133 — plan.json carries agent_id echo"
+else
+    fail "#3133 — plan.json carries agent_id echo" \
+         "content: $(cat "$plan_input_path" 2>/dev/null || echo '<missing>')"
+fi
+
+if [[ -f "$plan_input_path" ]] && jq -e '.issue_number == 3133' "$plan_input_path" >/dev/null 2>&1; then
+    pass "#3133 — plan.json carries issue_number"
+else
+    fail "#3133 — plan.json carries issue_number" \
+         "content: $(cat "$plan_input_path" 2>/dev/null || echo '<missing>')"
+fi
+
+if [[ -f "$plan_input_path" ]] && jq -e '.worktree_path | test("repo$")' "$plan_input_path" >/dev/null 2>&1; then
+    pass "#3133 — plan.json carries worktree_path pointing at repo clone"
+else
+    fail "#3133 — plan.json carries worktree_path pointing at repo clone" \
+         "content: $(cat "$plan_input_path" 2>/dev/null || echo '<missing>')"
+fi
+
+# The entrypoint should log a phase_input_written event so operators
+# can confirm via CloudWatch that the file-write side effect actually
+# happened (no silent no-op when gh is absent).
+if printf '%s' "$out" | grep -q 'phase_input_written.*"phase": "plan"'; then
+    pass "#3133 — entrypoint logs phase_input_written event for plan"
+else
+    fail "#3133 — entrypoint logs phase_input_written event for plan" \
+         "output tail: $(printf '%s' "$out" | tail -30)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 16: #3133 — when the skill writes dispatcher-output/<phase>.json,
+# the entrypoint uses THAT content as the phase output rather than the
+# claude .result envelope. This is the other half of the fix: even if
+# the skill's .result is a string summary, the daemon-path equivalent
+# (read the structured output file) correctly extracts the verdict.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t16.txt"
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+CLAUDE_VERDICT_FIXTURE=""
+
+t16_workspace="$TEST_TMP/t16-workspace"
+mkdir -p "$t16_workspace"
+
+# Pre-stage the dispatcher-output file that the skill would normally
+# write. The test stubs claude to return a string .result (the failure
+# shape from the pre-fix world), so if the entrypoint correctly prefers
+# the output file, the phase will carry the file's verdict to the
+# transition shim and advance cleanly to ralph — not fall through the
+# diag branch.
+#
+# The file must live at $AGENT_WORKSPACE/repo/tmp/dispatcher-output/
+# because that's where REPO_ROOT resolves inside the entrypoint when
+# AGENT_WORKSPACE is set.
+repo_root_t16="$t16_workspace/repo"
+mkdir -p "$repo_root_t16/.git" "$repo_root_t16/tmp/dispatcher-output"
+cat > "$repo_root_t16/tmp/dispatcher-output/plan.json" <<'PLANOUT'
+{
+  "agent_id": "16161616-1616-1616-1616-161616161616",
+  "issue_number": 3133,
+  "go": true,
+  "block_reason": null,
+  "plan_text": "fixture plan body",
+  "acceptance_criteria": ["AC1"],
+  "scope_check": [],
+  "relevant_files": [],
+  "relevant_docs": [],
+  "change_type": "dx_tooling",
+  "dependencies_to_install": []
+}
+PLANOUT
+
+set +e
+out=$(AGENT_ID="16161616-1616-1616-1616-161616161616" \
+      ISSUE_NUMBER="3133" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t16_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "Plan phase blocked: ..."}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="plan" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=2 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+if printf '%s' "$out" | grep -q 'phase_output_file_read.*"phase": "planning"'; then
+    pass "#3133 — entrypoint reads dispatcher-output/plan.json when present"
+else
+    fail "#3133 — entrypoint reads dispatcher-output/plan.json when present" \
+         "output tail: $(printf '%s' "$out" | tail -30)"
+fi
+
+# With a well-formed plan.json on disk, the .result-branch diag event
+# should NOT fire — the file takes precedence over the string .result.
+if printf '%s' "$out" | grep -q 'claude_result_non_object_diag'; then
+    fail "#3133 — output-file path suppresses .result diag when file present" \
+         "diag event unexpectedly fired. output tail: $(printf '%s' "$out" | tail -30)"
+else
+    pass "#3133 — output-file path suppresses .result diag when file present"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
