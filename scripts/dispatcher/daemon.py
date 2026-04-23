@@ -899,6 +899,57 @@ FAILURE_CATEGORY_GIT_PUSH_NETWORK = "git_push_network"
 FAILURE_CATEGORY_PR_CREATE_FAILED = "pr_create_failed"
 FAILURE_CATEGORY_PHASE_OUTPUT_MISSING = "phase_output_missing"
 
+#: Tier-2 first-occurrence category from issue #3067 — the daemon-side
+#: ``git commit --amend`` invoked by ``_push_and_open_pr`` after ralph
+#: SHIPped failed (exception or non-zero exit). The worktree still holds
+#: ralph's changes so a ``retry`` from the diagnoser can succeed; but a
+#: deterministic break (hook script bug, pre-push coverage floor
+#: regression caught at amend-time) wants ``escalate`` /
+#: ``file_prerequisite_task``. Routing the two call sites in
+#: ``_push_and_open_pr`` through ``_handle_agent_failure`` writes a
+#: ``dispatcher.failures`` row the diagnoser picks up on the next
+#: supervisor tick.
+FAILURE_CATEGORY_GIT_COMMIT_FAILED = "git_commit_failed"
+
+#: Tier-3 category from issue #3068 — the ``/task-v2-fix-ci`` subprocess
+#: returned ``verdict='BLOCKED'`` with a ``block_reason``. Exact analog
+#: of :data:`FAILURE_CATEGORY_RALPH_NOT_SHIP` (#3054): "implementation
+#: can't continue" with no mechanical retry that fixes it. The
+#: diagnoser's ``block_on_existing_task`` / ``file_prerequisite_task``
+#: / ``block_and_comment`` / ``escalate`` actions all apply depending
+#: on the ``block_reason`` text fix-ci surfaced.
+FAILURE_CATEGORY_FIX_CI_BLOCKED = "fix_ci_blocked"
+
+#: Tier-2 first-occurrence category from issue #3069 — the
+#: ``_apply_fix_ci_patch`` method has eight ``_mark_agent_terminal``
+#: sites covering ``fix_ci_missing_commit_message`` + every git-add /
+#: git-commit / git-push failure mode for the fix-ci patch. Pre-#3069
+#: none wrote a ``dispatcher.failures`` row — a deterministic
+#: operator-action blocker (e.g. PAT scope) was indistinguishable from
+#: a flaky push. Routing the cluster under this one category lets the
+#: Opus diagnoser pick retry vs escalate based on the ``sub_reason``
+#: carried in ``details``. Mirrors the #3032 push+PR refactor shape.
+FAILURE_CATEGORY_FIX_CI_APPLY_FAILED = "fix_ci_apply_failed"
+
+#: Tier-2 first-occurrence category from issue #3070 — post-merge
+#: deploy workflow failed (``_advance_awaiting_deploy`` classifies the
+#: deploy runs as ``failure``). The diagnoser can ``file_prerequisite_
+#: task`` (e.g. "infra broken, fix deploy role") or ``block_and_
+#: comment`` on the issue; pre-#3070 operators had to triage from the
+#: ``daemon.deploy_failed`` CloudWatch event alone.
+FAILURE_CATEGORY_DEPLOY_FAILED = "deploy_failed"
+
+#: Tier-3 category from issue #3071 — post-merge ``/task-v2-verify``
+#: subprocess returned ``verdict='FAILED'``. Genuine regression signal
+#: (the deployed code didn't behave as expected). Post-merge context
+#: is different from pre-merge failures: the PR is merged, the code is
+#: on main. ``retry`` is a no-op in this case; the relevant diagnoser
+#: actions are ``file_prerequisite_task`` (file a priority/p1
+#: regression issue), ``block_and_comment`` (with repro steps), or
+#: ``escalate``. See :file:`.claude/skills/diagnose-failure/SKILL.md`
+#: for the dedicated per-category guidance.
+FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE = "verify_failed_post_merge"
+
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
 #: ``subprocess_auth_fail`` (halt — no retry) are intentionally
@@ -1094,6 +1145,10 @@ TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
         FAILURE_CATEGORY_GIT_PUSH_NETWORK,
         FAILURE_CATEGORY_PR_CREATE_FAILED,
         FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+        # Audit-gap follow-ups from #3062 (tier-2 first-occurrence):
+        FAILURE_CATEGORY_GIT_COMMIT_FAILED,  # #3067
+        FAILURE_CATEGORY_FIX_CI_APPLY_FAILED,  # #3069
+        FAILURE_CATEGORY_DEPLOY_FAILED,  # #3070
     }
 )
 
@@ -1117,6 +1172,9 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
         FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
         FAILURE_CATEGORY_RALPH_NOT_SHIP,
+        # Audit-gap follow-ups from #3062 (tier-3 first-occurrence):
+        FAILURE_CATEGORY_FIX_CI_BLOCKED,  # #3068
+        FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,  # #3071
     }
 )
 
@@ -10098,23 +10156,28 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
-            # ROUTING (#3062): NOT routed through
-            # ``_handle_agent_failure`` — pre-push ``git commit
-            # --amend`` exception. Filed as a follow-up in #3062
-            # because this is ralph_not_ship-adjacent: ralph SHIPped
-            # but the mechanical commit step crashed, so the
-            # diagnoser could usefully ``retry`` (worktree still
-            # holds ralph's changes). See follow-up for a
-            # ``FAILURE_CATEGORY_GIT_COMMIT_FAILED`` route.
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # ROUTING (#3062 #3067): ROUTED via ``_handle_agent_failure``
+            # — pre-push ``git commit --amend`` exception. Ralph SHIPped
+            # and the worktree still holds the changes, so the diagnoser
+            # can usefully ``retry`` on a transient exec / fs error, or
+            # ``escalate`` / ``file_prerequisite_task`` when the stderr
+            # shows a deterministic break (pre-push hook bug, coverage
+            # floor regression). Tier-2 first-occurrence.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
+                category=FAILURE_CATEGORY_GIT_COMMIT_FAILED,
+                stderr_tail="",
                 exit_code=None,
+                details={
+                    "sub_reason": "commit_exception",
+                    "detail": str(exc),
+                },
                 issue_number=issue_number,
             )
             return
         if commit_result.returncode != 0:
+            tail = _stderr_tail(commit_result.stderr)
             self._log.warning(
                 "daemon.git_commit_failed",
                 extra={
@@ -10122,19 +10185,25 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": commit_result.returncode,
-                    "stderr_tail": _stderr_tail(commit_result.stderr),
+                    "stderr_tail": tail,
                 },
             )
-            # ROUTING (#3062): NOT routed — see the exception branch
-            # above for the same rationale. Non-zero ``git commit
-            # --amend`` exit commonly indicates ralph's reset didn't
-            # produce a diff (the pre-#2971 bug class). Follow-up in
-            # #3062.
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # ROUTING (#3062 #3067): ROUTED via ``_handle_agent_failure``
+            # — non-zero ``git commit --amend`` exit. Commonly indicates
+            # ralph's reset didn't produce a diff (pre-#2971 bug class)
+            # or a local pre-push hook aborted the amend. Diagnoser
+            # reads stderr_tail + ralph_done + worktree state and picks
+            # retry / escalate / file_prerequisite_task accordingly.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
-                exit_code=None,
+                category=FAILURE_CATEGORY_GIT_COMMIT_FAILED,
+                stderr_tail=tail,
+                exit_code=commit_result.returncode,
+                details={
+                    "sub_reason": "commit_nonzero_exit",
+                    "exit_code": commit_result.returncode,
+                },
                 issue_number=issue_number,
             )
             return
@@ -11187,6 +11256,7 @@ class DispatcherDaemon:
             )
             return
         # verdict == "BLOCKED" or unrecognized
+        block_reason = fix_ci_output.get("block_reason")
         self._log.warning(
             "daemon.fix_ci_blocked",
             extra={
@@ -11195,20 +11265,30 @@ class DispatcherDaemon:
                 "agent_id": agent_id,
                 "pr_number": pr_number,
                 "verdict": verdict,
-                "block_reason": fix_ci_output.get("block_reason"),
+                "block_reason": block_reason,
             },
         )
-        # ROUTING (#3062): NOT currently routed. This is an exact
-        # analog of the ralph_not_ship bug #3054 fixed — fix-ci
-        # returned a BLOCKED verdict with a ``block_reason``, no
-        # mechanical retry will help, and the diagnoser's
-        # ``block_on_existing_task`` / ``file_prerequisite_task`` /
-        # ``block_and_comment`` actions are exactly the right
-        # responses. Audit follow-up filed — should introduce
-        # ``FAILURE_CATEGORY_FIX_CI_BLOCKED`` as a tier-3 category
-        # and route via ``_handle_agent_failure``.
-        self._mark_agent_terminal(
-            agent_id, status="failed", phase="awaiting_ci", exit_code=exit_code
+        # ROUTING (#3062 #3068): ROUTED via ``_handle_agent_failure``
+        # with the tier-3 ``FAILURE_CATEGORY_FIX_CI_BLOCKED`` category.
+        # Exact analog of the ralph_not_ship fix (#3054): fix-ci
+        # returned BLOCKED with a ``block_reason``, no mechanical retry
+        # will help, and the diagnoser's ``block_on_existing_task`` /
+        # ``file_prerequisite_task`` / ``block_and_comment`` /
+        # ``escalate`` actions are the right responses.
+        self._handle_agent_failure(
+            agent_id=agent_id,
+            phase="awaiting_ci",
+            category=FAILURE_CATEGORY_FIX_CI_BLOCKED,
+            stderr_tail="",
+            exit_code=exit_code,
+            details={
+                "verdict": verdict,
+                "block_reason": block_reason,
+                "pr_number": pr_number,
+                "retries_used": retries_used,
+                "issue_number": issue_number,
+            },
+            issue_number=issue_number,
         )
 
     @staticmethod
@@ -11276,6 +11356,47 @@ class DispatcherDaemon:
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         return f"agent/{short_id}"
 
+    def _handle_fix_ci_apply_failure(
+        self,
+        *,
+        agent_id: str,
+        sub_reason: str,
+        stderr_tail: str = "",
+        exit_code: int | None = None,
+        pr_number: int | None = None,
+        issue_number: int | None = None,
+        retries_used: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Route a fix-ci-apply failure through :meth:`_handle_agent_failure`.
+
+        Issue #3069: the eight terminal call sites inside
+        :meth:`_apply_fix_ci_patch` were pre-#3069 direct
+        ``_mark_agent_terminal`` calls with no failure row, making a
+        deterministic operator-action blocker (e.g. PAT scope on fix-ci
+        push) indistinguishable from a flaky push. This helper wraps
+        the common envelope so each site's call is one line and the
+        ``sub_reason`` carries the specific branch into the diagnoser's
+        ``details``. Mirrors the #3032 push+PR refactor shape.
+        """
+        details: dict[str, Any] = {
+            "sub_reason": sub_reason,
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "retries_used": retries_used,
+        }
+        if detail is not None:
+            details["detail"] = detail
+        self._handle_agent_failure(
+            agent_id=agent_id,
+            phase="awaiting_ci",
+            category=FAILURE_CATEGORY_FIX_CI_APPLY_FAILED,
+            stderr_tail=stderr_tail,
+            exit_code=exit_code,
+            details=details,
+            issue_number=issue_number,
+        )
+
     def _apply_fix_ci_patch(
         self, agent: dict[str, Any], fix_ci_output: dict[str, Any]
     ) -> None:
@@ -11288,21 +11409,27 @@ class DispatcherDaemon:
         increment ``retries_used`` and leave the agent in
         ``awaiting_ci`` so the next supervisor tick re-polls.
 
-        ROUTING (#3062): the eight ``_mark_agent_terminal(status="failed")``
-        call sites inside this method are NOT routed through
-        ``_handle_agent_failure``. They cover
-        ``fix_ci_missing_commit_message`` + every git-add / git-commit
-        / git-push failure mode for the fix-ci patch. Audit follow-up
-        in #3062 proposes routing the whole cluster under a new
-        ``FAILURE_CATEGORY_FIX_CI_APPLY_FAILED`` tier-2 first-
-        occurrence category so the Opus diagnoser can distinguish a
-        flaky push (retry) from a deterministic worktree / permissions
-        break (escalate) — mirrors the #3032 push+PR refactor shape.
+        ROUTING (#3062 #3069): the eight
+        ``_mark_agent_terminal(status="failed")`` call sites inside
+        this method are now ROUTED through
+        :meth:`_handle_fix_ci_apply_failure` (and thence
+        :meth:`_handle_agent_failure`) under the tier-2 first-
+        occurrence ``FAILURE_CATEGORY_FIX_CI_APPLY_FAILED`` category.
+        Each site passes a distinct ``sub_reason`` string
+        (``missing_commit_message`` / ``git_add_exception`` /
+        ``git_add_nonzero_exit`` / ``git_commit_exception`` /
+        ``git_commit_nonzero_exit`` / ``git_push_timeout`` /
+        ``git_push_exception`` / ``git_push_nonzero_exit``) in
+        ``details`` so the diagnoser can distinguish a flaky push
+        (retry) from a deterministic worktree / permissions break
+        (escalate). Mirrors the #3032 push+PR refactor shape.
         """
         agent_id = agent["agent_id"]
         worktree = Path(agent["worktree_path"])
         branch = self._branch_for_agent(agent_id)
         retries_used = agent["retries_used"]
+        issue_number = agent.get("issue_number")
+        pr_number = agent.get("pr_number")
 
         commit_message = str(fix_ci_output.get("commit_message") or "").strip()
         if not commit_message:
@@ -11314,8 +11441,13 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="missing_commit_message",
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
             )
             return
 
@@ -11328,7 +11460,7 @@ class DispatcherDaemon:
                 timeout=60,
                 check=False,
             )
-        except Exception:
+        except Exception as exc:
             self._log.exception(
                 "daemon.fix_ci_git_add_failed",
                 extra={
@@ -11337,11 +11469,18 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_add_exception",
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
+                detail=str(exc),
             )
             return
         if add_result.returncode != 0:
+            tail = _stderr_tail(add_result.stderr)
             self._log.warning(
                 "daemon.fix_ci_git_add_failed",
                 extra={
@@ -11349,11 +11488,18 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": add_result.returncode,
-                    "stderr_tail": _stderr_tail(add_result.stderr),
+                    "stderr_tail": tail,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_add_nonzero_exit",
+                stderr_tail=tail,
+                exit_code=add_result.returncode,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
             )
             return
 
@@ -11377,7 +11523,7 @@ class DispatcherDaemon:
                 timeout=60,
                 check=False,
             )
-        except Exception:
+        except Exception as exc:
             self._log.exception(
                 "daemon.fix_ci_git_commit_failed",
                 extra={
@@ -11386,14 +11532,21 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_commit_exception",
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
+                detail=str(exc),
             )
             return
         if commit_result.returncode != 0:
             # ``git commit`` exits non-zero if nothing is staged —
             # that means the skill reported PATCHED but wrote no diff.
             # Treat as block.
+            tail = _stderr_tail(commit_result.stderr)
             self._log.warning(
                 "daemon.fix_ci_git_commit_failed",
                 extra={
@@ -11401,11 +11554,18 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": commit_result.returncode,
-                    "stderr_tail": _stderr_tail(commit_result.stderr),
+                    "stderr_tail": tail,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_commit_nonzero_exit",
+                stderr_tail=tail,
+                exit_code=commit_result.returncode,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
             )
             return
 
@@ -11436,11 +11596,17 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_push_timeout",
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
+                detail=str(exc),
             )
             return
-        except Exception:
+        except Exception as exc:
             self._log.exception(
                 "daemon.fix_ci_git_push_failed",
                 extra={
@@ -11449,11 +11615,18 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_push_exception",
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
+                detail=str(exc),
             )
             return
         if push_result.returncode != 0:
+            tail = _stderr_tail(push_result.stderr)
             self._log.warning(
                 "daemon.fix_ci_git_push_failed",
                 extra={
@@ -11461,11 +11634,18 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": push_result.returncode,
-                    "stderr_tail": _stderr_tail(push_result.stderr),
+                    "stderr_tail": tail,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+            self._handle_fix_ci_apply_failure(
+                agent_id=agent_id,
+                sub_reason="git_push_nonzero_exit",
+                stderr_tail=tail,
+                exit_code=push_result.returncode,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                retries_used=retries_used,
             )
             return
 
@@ -11583,16 +11763,28 @@ class DispatcherDaemon:
                     "deploy_runs": deploy_runs,
                 },
             )
-            # ROUTING (#3062): NOT currently routed. A deploy workflow
-            # failure post-merge IS diagnoser-actionable — the
-            # diagnoser could ``file_prerequisite_task`` (e.g.
-            # "infra broken, fix deploy role") or
-            # ``block_and_comment`` on the issue. Audit follow-up
-            # proposes ``FAILURE_CATEGORY_DEPLOY_FAILED`` as a tier-2
-            # first-occurrence category. For now, operators triage
-            # from the ``daemon.deploy_failed`` event in CloudWatch.
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_deploy", exit_code=None
+            # ROUTING (#3062 #3070): ROUTED via ``_handle_agent_failure``
+            # with the tier-2 first-occurrence
+            # ``FAILURE_CATEGORY_DEPLOY_FAILED`` category. A deploy
+            # workflow failure post-merge is diagnoser-actionable — the
+            # diagnoser picks ``file_prerequisite_task`` (e.g. "infra
+            # broken, fix deploy role"), ``block_and_comment``, or
+            # ``escalate`` based on the deploy-run metadata surfaced
+            # via ``details``.
+            issue_number_val = agent.get("issue_number")
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_deploy",
+                category=FAILURE_CATEGORY_DEPLOY_FAILED,
+                stderr_tail="",
+                exit_code=None,
+                details={
+                    "pr_number": pr_number,
+                    "merge_sha": merge_sha,
+                    "deploy_runs": deploy_runs,
+                    "issue_number": issue_number_val,
+                },
+                issue_number=issue_number_val,
             )
             return
 
@@ -11963,6 +12155,7 @@ class DispatcherDaemon:
 
         verdict = str(verify_output.get("verdict") or "").upper()
         if verdict == "FAILED":
+            failure_reason = verify_output.get("failure_reason")
             self._log.warning(
                 "daemon.verify_failed",
                 extra={
@@ -11970,7 +12163,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "pr_number": pr_number,
-                    "failure_reason": verify_output.get("failure_reason"),
+                    "failure_reason": failure_reason,
                 },
             )
             # Issue #2953: verify failed post-merge is a genuine
@@ -11980,16 +12173,29 @@ class DispatcherDaemon:
             # tooltip can read "merged X · verify failed" instead of
             # hiding the shipment entirely.
             #
-            # ROUTING (#3062): NOT currently routed. A post-merge
-            # verify failure is genuine regression signal and
-            # diagnoser-actionable (file a priority/p1 regression
-            # issue via ``file_prerequisite_task``; or
-            # ``block_and_comment`` with repro steps). Audit follow-
-            # up proposes ``FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE``
-            # so the diagnoser gets the merged PR + verify evidence
-            # bundle and can pick the right escalation shape.
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="done", exit_code=exit_code
+            # ROUTING (#3062 #3071): ROUTED via ``_handle_agent_failure``
+            # with the tier-3 ``FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE``
+            # category. Post-merge context differs from pre-merge
+            # failures: the PR is merged, the code is on main.
+            # ``retry`` is a no-op; the diagnoser's primary actions
+            # are ``file_prerequisite_task`` (p1 regression issue),
+            # ``block_and_comment`` (repro steps), or ``escalate``.
+            # See :file:`.claude/skills/diagnose-failure/SKILL.md` for
+            # the dedicated per-category guidance.
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="done",
+                category=FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
+                stderr_tail="",
+                exit_code=exit_code,
+                details={
+                    "pr_number": pr_number,
+                    "merge_sha": merge_sha,
+                    "failure_reason": failure_reason,
+                    "evidence_md": evidence_md,
+                    "issue_number": issue_number,
+                },
+                issue_number=issue_number,
             )
             return
 
