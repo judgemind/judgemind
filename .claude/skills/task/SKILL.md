@@ -557,6 +557,8 @@ A successful deploy only means the new image is running — not that the service
 
 **Script-producing tasks:** If a task produces a backfill, migration, or one-off fixup script that is meant to be run, executing it on dev and verifying results is part of the definition of done. When filing issues that include "create a backfill script" or similar, always include "backfill executed on dev and results verified" in the acceptance criteria.
 
+**Dispatcher PRs — concurrent-merge cancellation:** When two dispatcher PRs merge within a few minutes of each other, `deploy-dispatcher.yml`'s `concurrency: cancel-in-progress: true` can cancel the earlier PR's `deploy-to-dev` stage even after a successful build-and-push. The later PR's rollout is usually a superset and still ships the earlier PR's code — but the observability is misleading (your deploy run shows CANCELLED). Use `scripts/verify-pr-in-deployed-sha.sh <pr-number>` as the go-to check for "did my PR actually land in the deployed dispatcher?" The helper fetches the PR's merge SHA via `gh pr view --json mergeCommit`, reads the latest `version_sha` from the dispatcher's CloudWatch startup log in `/ecs/judgemind-dispatcher-dev`, and runs `git merge-base --is-ancestor`. Exit 0 = landed, exit 1 = not yet deployed, exit 2 = usage/data error (missing arg, PR not merged, CloudWatch empty, git can't resolve the deployed SHA locally). See #3076.
+
 **Acceptance criteria re-verification (MANDATORY for deployed changes):**
 
 After verifying deployment health, go back to the issue's acceptance criteria and verify EACH one against the live environment. This is distinct from the A.2b process summary (which verifies against code/tests) — this step verifies against deployed reality.
