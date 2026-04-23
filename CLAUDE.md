@@ -254,7 +254,7 @@ See **`docs/specs/architecture-spec-v1.md` §3.3** for the full ingestion pipeli
 - **Do NOT add `tags` blocks to individual resources** — the AWS provider's `default_tags` handles this.
 - Never commit AWS credentials or state files.
 - **Always run `terraform init` with `-lockfile=readonly`** for agent-side validation (#2582). See `docs/agent/code-standards.md` §Terraform.
-- **Dev terraform apply is automated.** After a PR that touches `infra/terraform/` merges, the dispatcher runs `terraform apply` for dev. Production applies remain human-only.
+- **Dev terraform apply is automated.** The `dev-apply` job in `.github/workflows/terraform.yml` runs `terraform apply -auto-approve` against `environments/dev` on every `push:main` that touches `infra/terraform/**`, once the plan job succeeds. Production applies remain human-only — there is no apply job for `environments/production/`. See `docs/agent/infrastructure-reference.md` §Terraform for the troubleshooting flow when the workflow fails.
 
 ### Running Data Scripts on Dev
 

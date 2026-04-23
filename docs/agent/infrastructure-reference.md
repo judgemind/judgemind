@@ -55,15 +55,28 @@ vercel list judgemind-web-dev --token "$VERCEL_API_TOKEN"
 
 ### Terraform apply after merge
 
-**Dev apply is automated by the dispatcher.** When the dispatcher merges a PR that touches `infra/terraform/`, it automatically runs `terraform apply` for the dev environment. The dispatcher detects infra PRs by checking changed file paths, determines which environments need an apply, and handles init/plan/apply inline. See `.claude/skills/dispatcher/SKILL.md` "Auto-apply dev terraform" for the full procedure.
+**Dev apply is automated by the `Terraform / dev-apply` GitHub Actions job** (`.github/workflows/terraform.yml`). When a PR that touches `infra/terraform/**` merges to `main`, the `terraform` job runs validate + plan first; if that passes, the `dev-apply` job runs `terraform -chdir=infra/terraform/environments/dev apply -auto-approve -input=false -lock-timeout=120s` against the merge commit. Apply output (including the "Apply complete! N added, M changed, K destroyed" summary) is captured as a step summary on the workflow run for audit. The `dev-apply` job is gated on `push:main` + `paths: infra/terraform/**`, so PR events never trigger an apply.
 
-**If the dispatcher is not running** (e.g., during interactive sessions), the subagent that authored the PR must apply to dev manually:
-```
-terraform -chdir=$REPO_ROOT/infra/terraform/environments/dev apply -target=module.<module_name> -auto-approve
-```
-Verify the apply succeeds. If it fails, file a `priority/p1` issue.
+**Production applies are NOT automated.** `environments/production/` is human-only and has no apply job in the workflow.
 
-**For DNS/hosting environments** that require the Cloudflare API token:
+**If the `dev-apply` workflow fails:**
+
+1. Pull the latest `main` and re-run apply locally against the dev environment:
+   ```
+   terraform -chdir=infra/terraform/environments/dev init
+   terraform -chdir=infra/terraform/environments/dev plan
+   terraform -chdir=infra/terraform/environments/dev apply -auto-approve -input=false -lock-timeout=120s
+   ```
+2. If the failure is a state lock timeout, check for a concurrent apply (prior failed run still holding the lock) via the DynamoDB lock table `judgemind-terraform-locks`. The local apply with `-lock-timeout=120s` is typically enough to ride out transient locks.
+3. If the failure is a legitimate apply error (IAM, resource conflict, module bug), fix the root cause and land a follow-up PR.
+4. File a `priority/p1` issue if the failure looks like a workflow regression (e.g., the job no longer fires, creds expired).
+
+**Targeted module applies** (e.g., while debugging an isolated module):
+```
+terraform -chdir=infra/terraform/environments/dev apply -target=module.<module_name> -auto-approve
+```
+
+**For DNS/hosting environments** that require the Cloudflare API token (not yet wired into the workflow — these stay manual):
 ```
 scripts/with-secret.sh -e CLOUDFLARE_API_TOKEN=judgemind/cloudflare/api-token -- terraform -chdir=infra/terraform/environments/dns apply -auto-approve
 ```
