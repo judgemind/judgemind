@@ -1,0 +1,22 @@
+{
+  "_fixture": "sb_r12_20260303_0df41117.pdf",
+  "_description": "San Bernardino Dept R12 (Judge Kory Mathewson). 1-page PDF with 1 ruling (7 compel motions, single case).",
+  "_captured": "2026-03-03",
+  "courthouse": "Rancho Cucamonga Justice Center",
+  "department": "R12",
+  "judge_name": "Kory Mathewson",
+  "page_count": 1,
+  "case_count": 1,
+  "primary_case_number": "CIVRS2502080",
+  "case_number_format": "CIV{LOCATION}{YYNNNNN}",
+  "hearing_date": "March 3, 2026",
+  "expected_cases": [
+    {
+      "case_number": "CIVRS2502080",
+      "case_title": "Angela Carmell v. Kathleen Janet Genus-Robinson-Haywood",
+      "motion_type": "compel",
+      "outcome": "moot"
+    }
+  ],
+  "_notes": "Single-case PDF. Header format: 'Department R12 - Judge Kory Mathewson'. 7 motions to compel all ruled moot with sanctions."
+}

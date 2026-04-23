@@ -1,0 +1,118 @@
+'use client';
+
+import { useState } from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { Menu, Moon, Sun, LogOut, User } from 'lucide-react';
+import { useTheme } from '@/providers/ThemeProvider';
+import { useAuth } from '@/providers/AuthProvider';
+import { Sidebar } from '@/components/layout/Sidebar';
+import { Wordmark } from '@/components/Wordmark';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
+
+export function Header() {
+  const { theme, toggle } = useTheme();
+  const { user, loading, logout } = useAuth();
+  const pathname = usePathname();
+  const isAuthPage = pathname.startsWith('/auth');
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  return (
+    <>
+      <header className="sticky top-0 z-50 flex h-14 items-center border-b bg-background px-4">
+        {/* Hamburger — visible only on mobile (below md breakpoint), hidden on auth pages.
+            Tablet (md–lg) uses an icon-only sidebar; desktop (lg+) uses the full sidebar. */}
+        {!isAuthPage && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setMenuOpen(true)}
+            aria-label="Toggle menu"
+            className="mr-2 md:hidden"
+          >
+            <Menu className="h-5 w-5" aria-hidden="true" />
+          </Button>
+        )}
+
+        <Link href="/" className="mr-8 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2">
+          <Wordmark size="sm" />
+        </Link>
+
+        {/* Spacer — sidebar owns all navigation */}
+        <div className="flex-1" />
+
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={toggle}
+            aria-label="Toggle dark mode"
+          >
+            {theme === 'dark' ? (
+              <Sun className="h-5 w-5" aria-hidden="true" />
+            ) : (
+              <Moon className="h-5 w-5" aria-hidden="true" />
+            )}
+          </Button>
+
+          {!loading && (
+            <>
+              {user ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="icon" aria-label="User menu">
+                      <User className="h-5 w-5" aria-hidden="true" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48">
+                    <DropdownMenuLabel className="font-normal">
+                      <p className="text-sm font-medium">{user.displayName ?? 'Account'}</p>
+                      <p className="text-xs text-muted-foreground">{user.email}</p>
+                    </DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={() => void logout()}>
+                      <LogOut className="mr-2 h-4 w-4" aria-hidden="true" />
+                      Log out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              ) : (
+                <Button variant="outline" size="sm" asChild>
+                  <Link href="/auth/login">Log in</Link>
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      </header>
+
+      {/* Mobile slide-out menu using shadcn Sheet — hidden on auth pages */}
+      {!isAuthPage && (
+        <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
+          <SheetContent side="left" className="w-64 p-0">
+            <SheetHeader className="border-b px-4 py-3">
+              <SheetTitle>
+                <Wordmark size="sm" />
+              </SheetTitle>
+            </SheetHeader>
+            <Sidebar onLinkClick={() => setMenuOpen(false)} />
+          </SheetContent>
+        </Sheet>
+      )}
+    </>
+  );
+}

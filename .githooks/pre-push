@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+# pre-push hook: run lint/format/test checks on changed packages before pushing.
+#
+# Prevents pushes that would fail CI on issues detectable locally — missing
+# ruff format, unused imports, terraform fmt, and broken tests.
+#
+# Detects which packages have changes being pushed and runs the appropriate
+# checks for each package type (Python, TypeScript, Terraform). Tests are
+# only run for packages with actual code changes (not just docs or config).
+#
+# Ref: https://github.com/judgemind/judgemind/issues/81
+# Ref: https://github.com/judgemind/judgemind/issues/378
+
+set -uo pipefail
+
+# -------------------------------------------------------------------
+# run_check <pkg> <check-name> <cmd> [args...]
+#
+# Runs the given command, teeing combined stdout+stderr into a log file
+# at /tmp/prepush-<pkg_sanitized>-<check_sanitized>.log.
+# On non-zero exit, prints the last 20 lines of the log plus the log path
+# to stderr, then returns the command's exit code so the caller can
+# increment failures.
+# -------------------------------------------------------------------
+run_check() {
+    local pkg="$1"
+    local check_name="$2"
+    shift 2
+    local pkg_safe check_safe log_file
+    pkg_safe="${pkg//\//_}"
+    check_safe="${check_name//\//_}"
+    check_safe="${check_safe// /-}"
+    log_file="/tmp/prepush-${pkg_safe}-${check_safe}.log"
+
+    local rc=0
+    "$@" > "$log_file" 2>&1 || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        echo "" >&2
+        echo "  FAILED: $check_name for $pkg" >&2
+        echo "  Last 20 lines of output:" >&2
+        tail -n 20 "$log_file" | sed 's/^/    /' >&2
+        echo "  Full log: $log_file" >&2
+    fi
+    return "$rc"
+}
+
+# -------------------------------------------------------------------
+# Determine the range of commits being pushed
+# -------------------------------------------------------------------
+# Git passes the remote name and URL as positional args.
+# Stdin contains one line per ref being pushed, with four space-separated
+# fields in this exact order:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# See `man githooks` (pre-push section) for the authoritative spec.
+#
+# The variable names below MUST match this order. Getting the 3rd and 4th
+# fields swapped (e.g. reading them as `remote_sha _rest`) is silent: the
+# new-branch zero-SHA check never fires because field 3 is always a ref
+# name (never a SHA), and `git diff <remote-ref> <local-sha>` against the
+# local tracking copy of the remote ref returns empty for a first push of
+# a brand-new branch — causing all downstream per-package checks to be
+# skipped. See #2487 for the regression and test that caught it.
+#
+# We diff between remote_sha and local_sha to find changed files.
+
+remote="$1"
+# url="$2"  # unused
+
+failures=0
+push_ref=""
+push_is_new_branch=false
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Track the ref and whether it's new for the PR check at the end
+    push_ref="$local_ref"
+
+    # Skip delete pushes
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        continue
+    fi
+
+    # If this is a new branch (remote_sha is all zeros), diff against the
+    # merge-base with origin/main so we check all new commits.
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        push_is_new_branch=true
+        # Fetch main to make sure we have it
+        git fetch "$remote" main --quiet 2>/dev/null || true
+        merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
+        if [ -z "$merge_base" ]; then
+            echo "pre-push: could not determine merge-base with $remote/main; skipping checks" >&2
+            continue
+        fi
+        remote_sha="$merge_base"
+    fi
+
+    # Get list of changed files
+    changed_files=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)
+    if [ -z "$changed_files" ]; then
+        continue
+    fi
+
+    # ---------------------------------------------------------------
+    # Detect changed packages
+    # ---------------------------------------------------------------
+    changed_python_pkgs=""
+    changed_ts_pkgs=""
+    changed_terraform=false
+    # Track packages with code changes (not just docs/config) for test runs
+    python_pkgs_with_code=""
+    ts_pkgs_with_code=""
+
+    while IFS= read -r file; do
+        # Python packages: packages/<pkg>/ with a pyproject.toml
+        if [[ "$file" =~ ^packages/([^/]+)/ ]]; then
+            pkg="${BASH_REMATCH[1]}"
+            if [ -f "packages/$pkg/pyproject.toml" ]; then
+                if ! echo "$changed_python_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                    changed_python_pkgs="$changed_python_pkgs $pkg"
+                fi
+                # Check if this is a code file (src/ or tests/ .py files)
+                if [[ "$file" =~ ^packages/[^/]+/(src|tests)/.+\.py$ ]]; then
+                    if ! echo "$python_pkgs_with_code" | grep -qw "$pkg" 2>/dev/null; then
+                        python_pkgs_with_code="$python_pkgs_with_code $pkg"
+                    fi
+                fi
+            elif [ -f "packages/$pkg/package.json" ]; then
+                if ! echo "$changed_ts_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                    changed_ts_pkgs="$changed_ts_pkgs $pkg"
+                fi
+                # Check if this is a code file (.ts, .tsx, .js, .jsx in src/ or tests/)
+                if [[ "$file" =~ ^packages/[^/]+/(src|tests|__tests__|lib)/.+\.(ts|tsx|js|jsx)$ ]]; then
+                    if ! echo "$ts_pkgs_with_code" | grep -qw "$pkg" 2>/dev/null; then
+                        ts_pkgs_with_code="$ts_pkgs_with_code $pkg"
+                    fi
+                fi
+            fi
+        fi
+
+        # Python packages under infra/<dir>/ with a pyproject.toml (e.g. Lambda handlers)
+        if [[ "$file" =~ ^infra/([^/]+)/ ]]; then
+            infra_pkg="${BASH_REMATCH[1]}"
+            if [ -f "infra/$infra_pkg/pyproject.toml" ]; then
+                # Use infra/<dir> as the "package" identifier to avoid collisions
+                pkg_id="infra/$infra_pkg"
+                if ! echo "$changed_python_pkgs" | grep -qF "$pkg_id" 2>/dev/null; then
+                    changed_python_pkgs="$changed_python_pkgs $pkg_id"
+                fi
+                # Check if this is a code file (.py in any subdirectory or root)
+                if [[ "$file" =~ \.py$ ]]; then
+                    if ! echo "$python_pkgs_with_code" | grep -qF "$pkg_id" 2>/dev/null; then
+                        python_pkgs_with_code="$python_pkgs_with_code $pkg_id"
+                    fi
+                fi
+            fi
+        fi
+
+        # Terraform: infra/terraform/
+        if [[ "$file" =~ ^infra/terraform/ ]]; then
+            changed_terraform=true
+        fi
+    done <<< "$changed_files"
+
+    # ---------------------------------------------------------------
+    # Run checks for Python packages
+    # ---------------------------------------------------------------
+    for pkg in $changed_python_pkgs; do
+        # Determine package directory: infra/* packages use pkg as-is,
+        # packages/* packages are prefixed with "packages/"
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+        fi
+        echo "pre-push: checking Python package '$pkg'..." >&2
+
+        # Prefer the package's own venv ruff, fall back to global
+        if [ -x "$pkg_dir/.venv/bin/ruff" ]; then
+            ruff_cmd="$pkg_dir/.venv/bin/ruff"
+        elif command -v ruff &>/dev/null; then
+            ruff_cmd="ruff"
+        else
+            echo "  WARNING: ruff not found for $pkg — skipping lint/format checks" >&2
+            echo "  Install with: pip install ruff" >&2
+            continue
+        fi
+
+        # Determine check directories (src/ and tests/ if they exist)
+        check_dirs=""
+        [ -d "$pkg_dir/src" ] && check_dirs="$check_dirs $pkg_dir/src"
+        [ -d "$pkg_dir/tests" ] && check_dirs="$check_dirs $pkg_dir/tests"
+        if [ -z "$check_dirs" ]; then
+            check_dirs="$pkg_dir"
+        fi
+
+        # ruff check (lint)
+        if ! run_check "$pkg" "ruff check" $ruff_cmd check $check_dirs; then
+            echo "  Fix with: $ruff_cmd check --fix $check_dirs && $ruff_cmd format $check_dirs" >&2
+            failures=$((failures + 1))
+        fi
+
+        # ruff format --check
+        if ! run_check "$pkg" "ruff format" $ruff_cmd format --check $check_dirs; then
+            echo "  Fix with: $ruff_cmd format $check_dirs" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run tests for Python packages (code changes only)
+    # ---------------------------------------------------------------
+    for pkg in $python_pkgs_with_code; do
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+        fi
+
+        if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
+            echo "pre-push: running tests for Python package '$pkg'..." >&2
+            # Use pytest-xdist when available for parallel test execution
+            # (8x speedup on the 7200-test scraper-framework suite with
+            # 4 vCPU in the Fargate dispatcher; negligible overhead on
+            # small suites). Defensive check against venvs built before
+            # pytest-xdist was added to the package's dev deps.
+            if "$pkg_dir/.venv/bin/python" -c "import xdist" 2>/dev/null; then
+                xdist_flag="-n auto"
+            else
+                xdist_flag=""
+            fi
+            # Use pytest-testmon when available to skip tests whose
+            # covered source lines haven't changed since the last run
+            # (#2997). State is kept in $pkg_dir/.testmondata (gitignored,
+            # per-worktree). First run is a full suite; subsequent runs
+            # within the same worktree (e.g. ralph iteration 2+) re-run
+            # only the tests whose coverage map intersects the diff.
+            # Flag order matters: testmon filters the test list, xdist
+            # parallelizes whatever testmon selects. Defensive check
+            # mirrors the xdist pattern above so pre-push still works
+            # on venvs built before pytest-testmon was added to dev deps.
+            if "$pkg_dir/.venv/bin/python" -c "import testmon" 2>/dev/null; then
+                testmon_flag="--testmon"
+            else
+                testmon_flag=""
+            fi
+            if ! run_check "$pkg" "pytest" "$pkg_dir/.venv/bin/pytest" $testmon_flag $xdist_flag "$pkg_dir/tests/" -x -q --tb=line; then
+                echo "  Run: $pkg_dir/.venv/bin/pytest $pkg_dir/tests/ -v --tb=short" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: pytest not found for $pkg — skipping tests" >&2
+            echo "  Install with: $pkg_dir/.venv/bin/pip install -e '.[dev]'" >&2
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Coverage floor check for Python packages (after tests generate coverage.xml)
+    # ---------------------------------------------------------------
+    for pkg in $python_pkgs_with_code; do
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+            pkg_key="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+            pkg_key="packages/$pkg"
+        fi
+
+        cov_file="$pkg_dir/coverage.xml"
+        baselines_file="coverage-baselines.json"
+        if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
+            echo "pre-push: checking coverage floor for '$pkg'..." >&2
+            if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
+                    --package "$pkg_key" \
+                    --coverage-file "$cov_file" \
+                    --baselines-file "$baselines_file" \
+                    --dry-run; then
+                echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
+                echo "  Add tests to restore coverage before pushing." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Diff coverage check for Python packages (after tests generate coverage.xml)
+    # ---------------------------------------------------------------
+    for pkg in $python_pkgs_with_code; do
+        if [[ "$pkg" == infra/* ]]; then
+            pkg_dir="$pkg"
+        else
+            pkg_dir="packages/$pkg"
+        fi
+
+        cov_file="$pkg_dir/coverage.xml"
+        diff_cover_cmd="$pkg_dir/.venv/bin/diff-cover"
+        if [ -f "$cov_file" ] && [ -x "$diff_cover_cmd" ]; then
+            echo "pre-push: checking diff coverage for '$pkg'..." >&2
+            if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
+                    --compare-branch=origin/main \
+                    --fail-under=90 \
+                    --diff-range-notation='..'; then
+                echo "  New/changed lines have < 90% test coverage." >&2
+                echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
+                echo "  to see exactly which lines need tests." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run checks for TypeScript packages
+    # ---------------------------------------------------------------
+    for pkg in $changed_ts_pkgs; do
+        pkg_dir="packages/$pkg"
+        echo "pre-push: checking TypeScript package '$pkg'..." >&2
+
+        if [ ! -f "$pkg_dir/package.json" ]; then
+            continue
+        fi
+
+        # Check if npm run lint is available
+        if (cd "$pkg_dir" && npm run lint --if-present 2>&1) | grep -q "Missing script"; then
+            echo "  No lint script found for $pkg — skipping" >&2
+        else
+            if ! run_check "$pkg" "npm run lint" bash -c "cd $(printf '%q' "$pkg_dir") && npm run lint"; then
+                echo "  Fix lint issues in $pkg_dir before pushing." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run tests for TypeScript packages (code changes only)
+    # ---------------------------------------------------------------
+    for pkg in $ts_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+
+        if [ ! -f "$pkg_dir/package.json" ]; then
+            continue
+        fi
+
+        # Check if a test script exists in package.json
+        if ! grep -q '"test"' "$pkg_dir/package.json" 2>/dev/null; then
+            echo "  No test script found for $pkg — skipping tests" >&2
+            continue
+        fi
+
+        echo "pre-push: running tests for TypeScript package '$pkg'..." >&2
+        if ! run_check "$pkg" "npm test" bash -c "cd $(printf '%q' "$pkg_dir") && npm test"; then
+            echo "  Run: cd $pkg_dir && npm test" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Coverage floor check for TypeScript packages (after tests generate lcov.info)
+    # ---------------------------------------------------------------
+    for pkg in $ts_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+        cov_file="$pkg_dir/coverage/lcov.info"
+        baselines_file="coverage-baselines.json"
+        if [ -f "$cov_file" ] && [ -f "$baselines_file" ] && [ -f "scripts/update-coverage-baselines.py" ]; then
+            echo "pre-push: checking coverage floor for '$pkg'..." >&2
+            if ! run_check "$pkg" "coverage floor" python3 scripts/update-coverage-baselines.py \
+                    --package "packages/$pkg" \
+                    --coverage-file "$cov_file" \
+                    --baselines-file "$baselines_file" \
+                    --dry-run; then
+                echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
+                echo "  Add tests to restore coverage before pushing." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Diff coverage check for TypeScript packages (after tests generate lcov.info)
+    # ---------------------------------------------------------------
+    for pkg in $ts_pkgs_with_code; do
+        pkg_dir="packages/$pkg"
+        cov_file="$pkg_dir/coverage/lcov.info"
+        # Try to find diff-cover from any available Python venv
+        diff_cover_cmd=""
+        if command -v diff-cover &>/dev/null; then
+            diff_cover_cmd="diff-cover"
+        else
+            for venv_dir in packages/*/.venv infra/*/.venv; do
+                if [ -x "$venv_dir/bin/diff-cover" ]; then
+                    diff_cover_cmd="$venv_dir/bin/diff-cover"
+                    break
+                fi
+            done
+        fi
+        if [ -f "$cov_file" ] && [ -n "$diff_cover_cmd" ]; then
+            echo "pre-push: checking diff coverage for '$pkg'..." >&2
+            if ! run_check "$pkg" "diff coverage" "$diff_cover_cmd" "$cov_file" \
+                    --compare-branch=origin/main \
+                    --fail-under=90 \
+                    --diff-range-notation='..'; then
+                echo "  New/changed lines have < 90% test coverage." >&2
+                echo "  Run: scripts/check-diff-coverage.sh $pkg --skip-tests" >&2
+                echo "  to see exactly which lines need tests." >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    # ---------------------------------------------------------------
+    # Run checks for Terraform
+    # ---------------------------------------------------------------
+    if [ "$changed_terraform" = true ]; then
+        echo "pre-push: checking Terraform formatting..." >&2
+
+        if command -v terraform &>/dev/null; then
+            if ! run_check "terraform" "terraform fmt" terraform fmt -check -recursive infra/terraform/; then
+                echo "  Fix with: terraform fmt -recursive infra/terraform/" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: terraform not found — skipping fmt check" >&2
+        fi
+    fi
+
+done
+
+# -------------------------------------------------------------------
+# GitHub Actions workflow lint (actionlint)
+# -------------------------------------------------------------------
+changed_workflows=$(echo "$changed_files" | grep '^\.github/workflows/' || true)
+if [ -n "$changed_workflows" ]; then
+    echo "pre-push: checking GitHub Actions workflow files..." >&2
+    if command -v actionlint &>/dev/null; then
+        if ! run_check "_" "actionlint" actionlint -ignore 'SC2086' $changed_workflows; then
+            echo "  Fix workflow syntax errors before pushing." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: actionlint not found — skipping workflow lint (brew install actionlint)" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
+# CI job-skipped check — run whenever .github/workflows/ci.yml changes
+# -------------------------------------------------------------------
+# Catches the #2505 / #2410 footgun: a PR modifies a job body in ci.yml
+# whose if-gate paths-filter doesn't match anything in the diff, so the
+# job would be SKIPPED on that PR's CI run and the modification is never
+# actually exercised. Mirrors the CI `ci-job-skipped-check` job so the
+# failure is caught before the push even reaches CI (#2527).
+changed_ci_yml=$(echo "$changed_files" | grep -E '^\.github/workflows/ci\.yml$' || true)
+if [ -n "$changed_ci_yml" ]; then
+    echo "pre-push: checking for modified-but-skipped CI jobs..." >&2
+    if [ -x scripts/check-ci-job-skipped.sh ]; then
+        if ! run_check "_" "scripts/check-ci-job-skipped.sh" scripts/check-ci-job-skipped.sh; then
+            echo "  A job body in ci.yml was modified but its paths-filter" >&2
+            echo "  gate doesn't match anything in the diff — the job will" >&2
+            echo "  be SKIPPED on this PR's CI run and the change won't be" >&2
+            echo "  exercised. See issue #2527 for background." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-ci-job-skipped.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
+# Markdown link check — run whenever any .md file is in the push
+# -------------------------------------------------------------------
+# Mirrors the CI `markdown-links-check` job so broken internal pointers
+# are caught locally before the 2-3 minute CI round trip (#2464).
+changed_markdown=$(echo "$changed_files" | grep -E '\.md$' || true)
+if [ -n "$changed_markdown" ]; then
+    echo "pre-push: checking markdown links..." >&2
+    if [ -x scripts/check-markdown-links.sh ]; then
+        if ! run_check "_" "scripts/check-markdown-links.sh" scripts/check-markdown-links.sh; then
+            echo "  Broken internal markdown pointer detected." >&2
+            echo "  Fix the pointer, create the target, or drop the backticks" >&2
+            echo "  if the token is illustrative prose rather than a real path." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-markdown-links.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
+# Schema drift check — run whenever packages/api/migrations/*.sql changes
+# -------------------------------------------------------------------
+# Mirrors the CI `schema-drift-check` job so `schema.sql` falling out of
+# sync with the migrations (e.g. agent added a migration but forgot to
+# run `scripts/regenerate_schema.sh`) is caught locally before the ~10
+# minute CI round trip (#2702). The check requires Docker with a running
+# postgres container — if Docker is unavailable we emit a WARNING and
+# skip, matching the pattern used for ruff/actionlint/terraform above.
+changed_migrations=$(echo "$changed_files" | grep -E '^packages/api/migrations/.+\.sql$' || true)
+if [ -n "$changed_migrations" ]; then
+    echo "pre-push: checking schema drift (packages/api/src/data-access/schema.sql vs migrations)..." >&2
+    if ! command -v docker &>/dev/null; then
+        echo "  WARNING: docker not found — skipping schema drift check" >&2
+        echo "  Install Docker Desktop to enable local schema drift checks." >&2
+    elif ! docker info &>/dev/null; then
+        echo "  WARNING: docker daemon not running — skipping schema drift check" >&2
+        echo "  Start Docker Desktop to enable local schema drift checks." >&2
+    elif [ ! -x scripts/check_schema_drift.sh ]; then
+        echo "  WARNING: scripts/check_schema_drift.sh not found or not executable — skipping" >&2
+    else
+        # Use --ci mode so the check spins up its own ephemeral postgres
+        # container rather than relying on the docker-compose stack being
+        # up. ~15s when postgres image is already cached; ~30-60s cold.
+        if ! run_check "_" "scripts/check_schema_drift.sh" scripts/check_schema_drift.sh --ci; then
+            echo "  packages/api/src/data-access/schema.sql is out of sync with the" >&2
+            echo "  migrations in packages/api/migrations/." >&2
+            echo "" >&2
+            echo "  To fix: run scripts/regenerate_schema.sh" >&2
+            echo "" >&2
+            echo "  This same check runs in CI as schema-drift-check (~10 minutes" >&2
+            echo "  round trip). Catching it locally saves a full CI cycle." >&2
+            failures=$((failures + 1))
+        fi
+    fi
+fi
+
+# -------------------------------------------------------------------
+# Dispatcher image dependency drift — run when the daemon or its
+# Dockerfile changes (#2776)
+# -------------------------------------------------------------------
+# Cross-checks every non-stdlib import under scripts/dispatcher/ against
+# the pip install step in Dockerfile.dispatcher. Motivated by the #2773
+# boto3 scope miss: PR #2771 added `import boto3` inside the daemon but
+# did not add boto3 to Dockerfile.dispatcher. The daemon unit tests mock
+# the client by method assignment, so the image missing boto3 only
+# surfaced in production logs ~24h post-deploy. Mirrors the CI step so
+# the failure is caught locally before CI runs (~2 minute round trip).
+changed_dispatcher_deps=$(echo "$changed_files" \
+    | grep -E '^(scripts/dispatcher/.+\.py|Dockerfile\.dispatcher)$' || true)
+if [ -n "$changed_dispatcher_deps" ]; then
+    echo "pre-push: checking dispatcher image dependency drift..." >&2
+    if [ -x scripts/check-dispatcher-image-deps.sh ]; then
+        if ! run_check "_" "scripts/check-dispatcher-image-deps.sh" scripts/check-dispatcher-image-deps.sh; then
+            echo "  A Python import under scripts/dispatcher/ is not installed" >&2
+            echo "  in Dockerfile.dispatcher. The dispatcher daemon will fail" >&2
+            echo "  at runtime with ModuleNotFoundError in production." >&2
+            echo "" >&2
+            echo "  Fix: add the missing package to the pip install step in" >&2
+            echo "  Dockerfile.dispatcher. See issue #2776 for background." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-dispatcher-image-deps.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
+# Filename separator hygiene — always cheap, always run
+# -------------------------------------------------------------------
+# Flags same-directory filename pairs that differ only by `-` vs `_`
+# (see #2751/#2754 for the incident: a broken hyphen variant of
+# check_schema_drift.sh coexisted with the correct underscore version,
+# agents picked the alphabetically-first wrong one). The check only
+# walks scripts/, packages/*/src/, packages/*/tests/, and infra/ — a
+# few hundred dirs on this repo — so it runs unconditionally rather
+# than behind a path filter.
+if [ -x scripts/check-hyphen-underscore-collision.sh ]; then
+    echo "pre-push: checking for filename separator collisions..." >&2
+    if ! run_check "_" "scripts/check-hyphen-underscore-collision.sh" scripts/check-hyphen-underscore-collision.sh; then
+        echo "  Two files in the same directory differ only by '-' vs '_'" >&2
+        echo "  — rename one or delete the stale sibling. See #2751/#2754." >&2
+        failures=$((failures + 1))
+    fi
+fi
+
+# -------------------------------------------------------------------
+# Script header marker check — run whenever scripts/*.py changes
+# -------------------------------------------------------------------
+# Mirrors the CI `script-headers-check` job so one-off/permanent marker
+# violations are caught locally before the CI round trip. See #2533 —
+# top-level scripts whose filename matches the one-off pattern
+# (backfill, cleanup, fix, dedup, merge, migrate, remediat) must carry
+# `# one-off: true` or `# permanent: true` in the first 50 lines.
+changed_scripts_py=$(echo "$changed_files" | grep -E '^scripts/[^/]+\.py$' || true)
+if [ -n "$changed_scripts_py" ]; then
+    echo "pre-push: checking one-off/permanent markers on scripts/*.py..." >&2
+    if [ -x scripts/check-script-headers.sh ]; then
+        if ! run_check "_" "scripts/check-script-headers.sh" scripts/check-script-headers.sh; then
+            echo "  A top-level one-off-pattern script is missing its marker." >&2
+            echo "  Add '# one-off: true' or '# permanent: true' within the" >&2
+            echo "  first 50 lines of the file. See docs/agent/code-standards.md" >&2
+            echo "  §Python scripts and issue #2533." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-script-headers.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
+# PR existence check (advisory — runs before push completes)
+# -------------------------------------------------------------------
+# Git has no native post-push hook. We check here as the closest
+# alternative. For existing remote branches we query gh for a PR;
+# for new branches we print a reminder since no PR can exist yet.
+
+pr_check_branch=""
+if [ -n "$push_ref" ]; then
+    pr_check_branch="${push_ref#refs/heads/}"
+fi
+
+if [ -n "$pr_check_branch" ] && [ "$pr_check_branch" != "main" ] && [ "$pr_check_branch" != "master" ]; then
+    if command -v gh &>/dev/null; then
+        if [ "$push_is_new_branch" = true ]; then
+            echo "" >&2
+            echo "--------------------------------------------------------------------" >&2
+            echo "REMINDER: This is a new branch push. Create a PR after push:" >&2
+            echo "  gh pr create --base main --head $pr_check_branch" >&2
+            echo "--------------------------------------------------------------------" >&2
+        else
+            # Branch exists on remote — check for an open PR
+            pr_count=$(gh pr list --head "$pr_check_branch" --repo judgemind/judgemind --json number --jq 'length' 2>/dev/null || echo "")
+            if [ "$pr_count" = "0" ]; then
+                echo "" >&2
+                echo "====================================================================" >&2
+                echo "WARNING: No PR exists for branch '$pr_check_branch'." >&2
+                echo "Create one now:" >&2
+                echo "  gh pr create --base main --head $pr_check_branch" >&2
+                echo "====================================================================" >&2
+            fi
+        fi
+    fi
+fi
+
+# -------------------------------------------------------------------
+# Report results
+# -------------------------------------------------------------------
+if [ "$failures" -gt 0 ]; then
+    echo "" >&2
+    echo "====================================================================" >&2
+    echo "pre-push: $failures check(s) failed. Push aborted." >&2
+    echo "" >&2
+    echo "Fix the issues above and try again. These are the same checks" >&2
+    echo "that CI runs — catching them locally saves time and CI minutes." >&2
+    echo "====================================================================" >&2
+    exit 1
+fi
+
+exit 0

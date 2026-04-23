@@ -1,0 +1,16 @@
+{
+  "ruling_text": "Sandy Perez v. Georgina Raya\n\nThe Court intends to GRANT Counsel Loren Merlin's motion to be relieved as counsel of record for Plaintiff Sandy Perez. All Judicial Council forms have been properly completed as mandated by California Rules of Court Rule 3.1362. Accordingly, the motion is granted. Counsel for Plaintiff to give notice of this Court's ruling. The ruling regarding counsel being relieved will become effective upon counsel filing proof of service with the court that Plaintiff has been served with the court's order.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "motion_to_be_relieved_as_counsel",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Sandy Perez"
+      ],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/23/575445b7-5a3b-5d11-84fc-e5775ae07836.pdf",
+  "notes": ""
+}

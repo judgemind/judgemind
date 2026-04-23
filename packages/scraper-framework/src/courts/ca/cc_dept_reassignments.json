@@ -1,0 +1,30 @@
+[
+  {
+    "old_department": "9",
+    "new_department": "34",
+    "effective_date": "2026-01-05",
+    "filters": null,
+    "note": "Dept 9 (Unlimited Civil, Martinez) reassigned to Dept 34 effective 2026-01-05"
+  },
+  {
+    "old_department": "18",
+    "new_department": "32",
+    "effective_date": "2026-01-05",
+    "filters": null,
+    "note": "Dept 18 reassigned to Dept 32 effective 2026-01-05"
+  },
+  {
+    "old_department": "34",
+    "new_department": "14",
+    "effective_date": "2026-01-05",
+    "filters": {"case_number_prefix": "L", "courthouse": "Richmond Courthouse"},
+    "note": "Dept 34 Limited Civil (Richmond) reassigned to Dept 14 effective 2026-01-05"
+  },
+  {
+    "old_department": "39",
+    "new_department": "10",
+    "effective_date": "2026-03-02",
+    "filters": null,
+    "note": "Dept 39 reassigned to Dept 10 effective 2026-03-02"
+  }
+]

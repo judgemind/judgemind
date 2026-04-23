@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Ryan Kaehler v. Sierra Running Company\n\nTentative Ruling:\n\nThe motion is taken off calendar as it does not appear from the court’s record that\nmoving papers were filed.\n\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure\nsection 1019.5, subdivision (a), no further written order is necessary. The minute order\nadopting this tentative ruling will serve as the order of the court and service by the clerk\nwill constitute notice of the order.\nTentative Ruling\nIssued By: JS on 3/24/2026 .",
+  "expected": {
+    "case_title": null,
+    "motion_type": "demurrer",
+    "outcome": "granted_in_part",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/bd2de03c-1ab3-5b34-994c-f45d027c70e5.pdf",
+  "notes": ""
+}

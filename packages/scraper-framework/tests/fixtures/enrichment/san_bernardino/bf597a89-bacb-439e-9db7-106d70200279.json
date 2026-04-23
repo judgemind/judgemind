@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Jose Garcia v. Larry E. Meregillano, et al.\n\nPlaintiff Garcia's Deem Admit RFAs (Set 3) against Defendant Meregillano is MOOT except for sanctions. Sanctions are awarded in the amount of $628.00 against Defendant Meregillano and his attorney of record, Law Offices of Marc E. Grossman, due within 30 days of this ruling.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "motion_to_strike",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/san_bernardino/superior_court/raw/2026/03/24/23c31fa1-3005-556a-98b4-0c65e5b14b13.pdf",
+  "notes": ""
+}

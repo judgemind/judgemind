@@ -1,0 +1,2576 @@
+#!/usr/bin/env python3
+# venv: scraper-framework
+# permanent: true
+"""Data quality monitoring — collection health and field completeness checks.
+
+Queries the database and flags counties with unhealthy ruling ingest
+rates, stale scrapers, zero new rulings, or field completeness regressions.
+
+Usage:
+    scripts/with-secret.sh \\
+        -e DATABASE_URL=judgemind/dev/db/connection:.url \\
+        -- packages/scraper-framework/.venv/bin/python3 scripts/data-quality-check.py
+
+Options:
+    --json              Machine-readable JSON output (default).
+    --text              Human-readable text output.
+    --county NAME       Check only the specified county.
+    --update-baselines  Snapshot current field completeness as baselines (ratchet up only).
+    --store-results     Store check results to S3 for trend analysis.
+    --weekly-summary    Generate a markdown weekly summary from stored snapshots.
+
+Exit code: 0 if all healthy, 1 if alerts found.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import os
+import statistics
+import sys
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import psycopg
+
+# dq_trend_storage is lazily imported only when --store-results or
+# --weekly-summary is used.  This avoids a hard ModuleNotFoundError when
+# the script runs as an ECS oneshot (only the main script is uploaded).
+_dq_trend_storage = None
+
+
+def _import_trend_storage():  # noqa: ANN202
+    """Lazy-import dq_trend_storage on first use."""
+    global _dq_trend_storage  # noqa: PLW0603
+    if _dq_trend_storage is None:
+        import dq_trend_storage as _mod
+
+        _dq_trend_storage = _mod
+    return _dq_trend_storage
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Resolve repo root from scripts/ directory.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+
+DEFAULT_BASELINES_PATH = _REPO_ROOT / "data-quality-baselines.json"
+
+# Fallback path inside the Docker image.  When running as an ECS oneshot
+# (uploaded to /tmp/_oneshot_script), the repo root is not available.
+# The Docker build copies baselines into the image at this path.  See #2323.
+DOCKER_BASELINES_PATH = Path("/app/data-quality-baselines.json")
+
+
+def _resolve_baselines_path() -> Path:
+    """Return the best available baselines file path.
+
+    Priority:
+      1. Repo-relative path (works in local dev and CI).
+      2. Docker image path (works in ECS oneshot tasks).
+      3. Repo-relative path (returned even if missing — caller handles absence).
+    """
+    if DEFAULT_BASELINES_PATH.exists():
+        return DEFAULT_BASELINES_PATH
+    if DOCKER_BASELINES_PATH.exists():
+        return DOCKER_BASELINES_PATH
+    # Neither exists — return the default so callers produce the usual
+    # "file not found" warning with a recognisable path.
+    return DEFAULT_BASELINES_PATH
+
+
+# Thresholds
+INGEST_DROP_THRESHOLD = 0.5  # Flag if below 50% of 7-day average
+DAILY_SCRAPER_STALE_HOURS = (
+    26  # Must exceed the 24h daily schedule interval (+ 2h buffer for runtime/skew)
+)
+FREQUENT_SCRAPER_STALE_HOURS = 2
+
+# Field completeness regression thresholds (percentage points below baseline).
+FIELD_DROP_P1_THRESHOLD = 10.0  # >10pp drop = p1
+FIELD_DROP_P2_THRESHOLD = 5.0  # 5-10pp drop = p2
+
+# Window for recent-only field completeness checks (days).
+FIELD_COMPLETENESS_WINDOW_DAYS = 7
+
+# Grace period (minutes) — exclude documents created this recently so the
+# ingestion pipeline has time to process them before they are evaluated.
+# Increased from 30 to 60 (#1887) to handle bulk backfills that may take
+# longer than 30 minutes to complete enrichment.
+FIELD_COMPLETENESS_GRACE_MINUTES = 60
+
+# Minimum number of documents in the window for field completeness checks.
+# Counties with fewer than this many documents are skipped to avoid noisy
+# alerts from tiny sample sizes (e.g. 1 bad doc out of 3 total = 33% drop).
+MIN_FIELD_CHECK_SAMPLE_SIZE = 5
+
+# Bulk ingest detection — if the number of documents in the check window
+# exceeds this multiplier times the total_documents baseline, we assume a
+# bulk backfill or re-ingest occurred.  Field completeness and orphaned
+# document alerts are downgraded to P2 informational instead of triggering
+# false-positive regressions while enrichment catches up.  (#1887)
+BULK_INGEST_MULTIPLIER = 3.0
+
+# Rebuild-in-progress detection — when rebuild_db.py --reset runs, it writes
+# a marker row to data_quality_metrics.  The data quality check reads this
+# marker and downgrades P1 alerts to P2 informational while a rebuild is
+# active.  This prevents noisy P1 alerts from masking real issues during
+# the multi-hour rebuild window.  (#2222)
+REBUILD_MARKER_COUNTY = "_system"
+REBUILD_MARKER_METRIC = "rebuild_in_progress"
+REBUILD_MARKER_TTL_HOURS = 4.0  # Safety valve: stale markers are ignored
+
+REBUILD_MARKER_QUERY = """
+    SELECT metric_value, recorded_at
+    FROM data_quality_metrics
+    WHERE county = %s
+      AND metric_name = %s
+    ORDER BY recorded_at DESC
+    LIMIT 1
+"""
+
+
+@dataclass
+class Alert:
+    """A single data quality alert."""
+
+    county: str
+    metric: str  # ingest_rate, scraper_stale, zero_rulings, field_completeness, orphaned_documents, ecs_service_health
+    severity: str  # p1, p2
+    expected: float | int | str
+    actual: float | int | str
+    message: str
+
+
+@dataclass
+class Baselines:
+    """Per-county baseline configuration."""
+
+    expected_daily_rulings: float
+    schedule_type: str  # daily, frequent
+    posting_days: list[str] | None = None  # e.g. ["Mon", "Tue", "Wed", "Thu"]
+    max_expected_gap_hours: float | None = None  # explicit override
+    low_volume: bool = False  # Suppress field_completeness_low_sample alerts
+    min_days_zero_before_alert: int = 1  # Consecutive zero days needed for P1 (#1916)
+
+
+def load_baselines(
+    path: Path | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Baselines]:
+    """Load per-county baselines from JSON config file or pre-parsed dict.
+
+    Args:
+        path: Path to baselines JSON file. Defaults to repo root.
+        raw: Pre-parsed baselines dict (takes priority over file path).
+            Useful when running as an ECS oneshot where the file is unavailable.
+
+    Returns:
+        Dict mapping county name to Baselines.
+    """
+    if raw is None:
+        baselines_path = path or _resolve_baselines_path()
+        if not baselines_path.exists():
+            logger.warning(
+                "Baselines file not found at %s, using empty baselines",
+                baselines_path,
+            )
+            return {}
+        with open(baselines_path) as f:
+            raw = json.load(f)
+    result: dict[str, Baselines] = {}
+    for county, config in raw.get("counties", {}).items():
+        result[county] = Baselines(
+            expected_daily_rulings=config.get("expected_daily_rulings", 0),
+            schedule_type=config.get("schedule_type", "daily"),
+            posting_days=config.get("posting_days"),
+            max_expected_gap_hours=config.get("max_expected_gap_hours"),
+            low_volume=config.get("low_volume", False),
+            min_days_zero_before_alert=config.get("min_days_zero_before_alert", 1),
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DB queries
+# ---------------------------------------------------------------------------
+#
+# Timezone safety note (#1844):
+#
+# All timestamp columns (captured_at, created_at, last_seen_at, started_at)
+# are TIMESTAMPTZ.  Comparisons between TIMESTAMPTZ values (e.g.
+# ``d.captured_at >= %s`` with a timezone-aware Python datetime parameter)
+# are inherently timezone-safe — PostgreSQL compares the underlying UTC
+# values regardless of the session timezone setting.
+#
+# The only session-timezone-dependent operation is converting a TIMESTAMPTZ
+# to a date or timestamp-without-timezone, such as ``DATE(captured_at)``.
+# Any such conversion MUST use ``AT TIME ZONE 'UTC'`` explicitly.
+# Currently only RULING_COUNTS_7D_PER_DAY_QUERY uses DATE(), and it
+# already includes the explicit timezone qualifier.
+#
+# Do NOT add ``AT TIME ZONE 'UTC'`` to bare TIMESTAMPTZ comparisons — that
+# would convert the column to timestamp-without-timezone and change the
+# comparison semantics incorrectly.
+# ---------------------------------------------------------------------------
+
+RULING_COUNTS_24H_QUERY = """
+    SELECT ct.county, COUNT(d.id) AS ruling_count
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+      AND d.captured_at >= %s
+      {county_filter}
+    GROUP BY ct.county
+"""
+
+RULING_COUNTS_7D_QUERY = """
+    SELECT ct.county,
+           COUNT(d.id) AS ruling_count
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+      AND d.captured_at >= %s
+      AND d.captured_at < %s
+      {county_filter}
+    GROUP BY ct.county
+"""
+
+# Per-day counts for the 7-day window — used for median-based baseline.
+# Explicit ``AT TIME ZONE 'UTC'`` ensures the date grouping matches the
+# Python code's UTC-based window calculations, regardless of the database
+# session timezone setting.
+RULING_COUNTS_7D_PER_DAY_QUERY = """
+    SELECT ct.county,
+           DATE(d.captured_at AT TIME ZONE 'UTC') AS capture_date,
+           COUNT(d.id) AS ruling_count
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+      AND d.captured_at >= %s
+      AND d.captured_at < %s
+      {county_filter}
+    GROUP BY ct.county, DATE(d.captured_at AT TIME ZONE 'UTC')
+"""
+
+# The 7-day window spans [now-7d, now-24h) = exactly 6 days.
+ROLLING_WINDOW_DAYS = 6.0
+
+ALL_ACTIVE_COUNTIES_QUERY = """
+    SELECT DISTINCT ct.county
+    FROM courts ct
+    WHERE ct.is_active = TRUE
+    {county_filter}
+    ORDER BY ct.county
+"""
+
+LATEST_SCRAPER_RUN_QUERY = """
+    WITH ranked_runs AS (
+        SELECT sr.scraper_id, ct.county, sr.started_at, sr.status,
+               ROW_NUMBER() OVER(PARTITION BY sr.scraper_id ORDER BY sr.started_at DESC) AS rn
+        FROM scraper_runs sr
+        JOIN courts ct ON ct.id = sr.court_id
+        WHERE 1=1
+        {county_filter}
+    )
+    SELECT scraper_id, county, started_at, status
+    FROM ranked_runs
+    WHERE rn = 1
+"""
+
+LATEST_CAPTURE_PER_COUNTY_QUERY = """
+    SELECT ct.county,
+           GREATEST(MAX(d.last_seen_at), MAX(d.captured_at)) AS last_capture
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+    {county_filter}
+    GROUP BY ct.county
+"""
+
+SCRAPER_SUCCESS_RATE_24H_QUERY = """
+    SELECT ct.county,
+           COUNT(*) AS total_runs,
+           COUNT(CASE WHEN sr.status = 'success' THEN 1 END) AS success_count,
+           json_agg(
+               json_build_object(
+                   'status', sr.status,
+                   'error_message', sr.error_message
+               ) ORDER BY sr.started_at DESC
+           ) FILTER (WHERE sr.status != 'success') AS error_details
+    FROM scraper_runs sr
+    JOIN courts ct ON ct.id = sr.court_id
+    WHERE sr.started_at >= %s
+    {county_filter}
+    GROUP BY ct.county
+"""
+
+RULING_COUNT_BY_TYPE_QUERY = """
+    SELECT ct.county, d.document_type, COUNT(d.id) AS count
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    WHERE d.status = 'active'
+      AND d.captured_at >= %s
+      {county_filter}
+    GROUP BY ct.county, d.document_type
+"""
+
+FIELD_GAP_DOCS_QUERY = """
+    SELECT ct.county, d.id AS doc_id
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    JOIN rulings r ON r.document_id = d.id
+    LEFT JOIN cases c ON c.id = d.case_id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND d.created_at <= %s
+      AND (
+          r.judge_id IS NULL
+          OR r.motion_type IS NULL
+          OR r.outcome IS NULL
+          OR d.hearing_date IS NULL
+          OR NOT EXISTS (SELECT 1 FROM case_parties cp WHERE cp.case_id = c.id)
+      )
+      {county_filter}
+    GROUP BY ct.county, d.id
+    ORDER BY ct.county
+"""
+
+# Same field structure as AUDIT_QUERY in audit_field_completeness.py, but
+# scoped to recent documents (last N days) for faster, regression-focused checks.
+# audit_field_completeness.py scans all documents; this query only checks recent ones.
+FIELD_COMPLETENESS_QUERY = """
+    SELECT
+        ct.county,
+        COUNT(d.id) AS total_docs,
+        COUNT(r.id) AS has_ruling,
+        COUNT(r.judge_id) AS has_judge,
+        COUNT(r.motion_type) AS has_motion_type,
+        COUNT(r.outcome) AS has_outcome,
+        COUNT(CASE WHEN c.case_title IS NOT NULL THEN 1 END) AS has_title,
+        COUNT(CASE WHEN c.case_number NOT LIKE 'UNKNOWN-%%' THEN 1 END) AS has_case_number,
+        COUNT(CASE WHEN EXISTS (
+            SELECT 1 FROM case_parties cp WHERE cp.case_id = c.id
+        ) THEN 1 END) AS has_parties,
+        COUNT(d.hearing_date) AS has_hearing_date,
+        COUNT(c.case_type) AS has_case_type
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    JOIN rulings r ON r.document_id = d.id
+    LEFT JOIN cases c ON c.id = d.case_id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND d.created_at <= %s
+    {county_filter}
+    GROUP BY ct.county ORDER BY ct.county
+"""
+
+# Threshold for orphaned document alerts (percentage of documents with no ruling).
+ORPHANED_DOCS_P1_THRESHOLD = 20.0  # >20% orphaned = p1
+ORPHANED_DOCS_P2_THRESHOLD = 5.0  # 5-20% orphaned = p2
+
+# Threshold for ruling-to-document ratio alerts (#2230).
+# A ratio below this value indicates rulings are being silently dropped.
+# Normal ratio is ~1.0 (one ruling per document); some counties may be >1.0
+# when multi-ruling documents exist.
+RULING_DOC_RATIO_THRESHOLD = 0.5
+
+ORPHANED_DOCUMENTS_QUERY = """
+    SELECT
+        ct.county,
+        COUNT(d.id) AS total_docs,
+        COUNT(CASE WHEN r.id IS NULL THEN 1 END) AS orphaned_docs
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN rulings r ON r.document_id = d.id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND d.created_at <= %s
+    {county_filter}
+    GROUP BY ct.county ORDER BY ct.county
+"""
+
+RULING_DOC_RATIO_QUERY = """
+    SELECT
+        ct.county,
+        COUNT(DISTINCT d.id) AS total_docs,
+        COUNT(DISTINCT r.id) AS total_rulings
+    FROM documents d
+    JOIN courts ct ON ct.id = d.court_id
+    LEFT JOIN rulings r ON r.document_id = d.id
+    WHERE d.status = 'active'
+      AND d.created_at >= %s
+      AND d.created_at <= %s
+    {county_filter}
+    GROUP BY ct.county ORDER BY ct.county
+"""
+
+
+def load_field_baselines(
+    path: Path | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Load per-county field completeness baselines from JSON config file or dict.
+
+    Args:
+        path: Path to baselines JSON file. Defaults to repo root.
+        raw: Pre-parsed baselines dict (takes priority over file path).
+            Useful when running as an ECS oneshot where the file is unavailable.
+
+    Returns:
+        Dict mapping county name to dict of field name -> baseline percentage.
+    """
+    if raw is None:
+        baselines_path = path or _resolve_baselines_path()
+        if not baselines_path.exists():
+            return {}
+        with open(baselines_path) as f:
+            raw = json.load(f)
+    return raw.get("field_completeness", {})
+
+
+def load_expected_null_rates(
+    path: Path | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Load per-county expected null rates from JSON config file or dict.
+
+    Expected null rates document the irreducible null-field rates per county
+    caused by structural limitations in the source data (e.g., OC calendar-list
+    PDFs that contain only motion titles with no ruling text).
+
+    When configured, ``check_field_completeness`` caps the effective baseline
+    for a county+field at ``100 - expected_null_rate``, preventing false-positive
+    alerts for known irreducible gaps.
+
+    Args:
+        path: Path to baselines JSON file. Defaults to repo root.
+        raw: Pre-parsed baselines dict (takes priority over file path).
+            Useful when running as an ECS oneshot where the file is unavailable.
+
+    Returns:
+        Dict mapping county name to dict of field name -> expected null rate
+        percentage (0-100).  Only numeric entries are returned; keys starting
+        with ``_`` (e.g., ``_note``) are excluded.
+    """
+    if raw is None:
+        baselines_path = path or DEFAULT_BASELINES_PATH
+        if not baselines_path.exists():
+            return {}
+        with open(baselines_path) as f:
+            raw = json.load(f)
+
+    result: dict[str, dict[str, float]] = {}
+    for county, fields in raw.get("expected_null_rates", {}).items():
+        if county.startswith("_"):
+            continue
+        if not isinstance(fields, dict):
+            continue
+        county_rates: dict[str, float] = {}
+        for field, value in fields.items():
+            if field.startswith("_"):
+                continue
+            if isinstance(value, (int, float)):
+                county_rates[field] = float(value)
+        if county_rates:
+            result[county] = county_rates
+    return result
+
+
+def save_field_baselines(
+    current_completeness: dict[str, dict[str, float]],
+    path: Path | None = None,
+    *,
+    totals: dict[str, int] | None = None,
+) -> None:
+    """Save field completeness baselines, ratcheting up only.
+
+    Updates baselines only if current values are higher than existing ones
+    or if no baseline exists for a county/field. Never lowers baselines.
+
+    When *totals* is provided, ``total_documents`` for each county is
+    overwritten (not ratcheted) because it represents the current expected
+    window size that changes naturally over time after backfills.
+
+    Args:
+        current_completeness: Dict of county -> field -> current percentage.
+        path: Path to baselines JSON file. Defaults to repo root.
+        totals: Optional dict of county -> total document count in the
+            check window.  When provided, updates the ``total_documents``
+            baseline for each county.
+    """
+    baselines_path = path or DEFAULT_BASELINES_PATH
+    if baselines_path.exists():
+        with open(baselines_path) as f:
+            raw = json.load(f)
+    else:
+        raw = {}
+
+    existing = raw.get("field_completeness", {})
+
+    for county, fields in current_completeness.items():
+        if county not in existing:
+            existing[county] = {}
+        for field, pct in fields.items():
+            old_pct = existing[county].get(field, 0.0)
+            # Ratchet: only update if current is higher or no baseline exists.
+            if pct > old_pct:
+                existing[county][field] = round(pct, 1)
+
+    # Update total_documents (overwrite, not ratchet) when totals provided.
+    # NOTE: total_documents counts active documents that have at least one
+    # ruling record (from _query_field_completeness's JOIN rulings).  It does
+    # NOT include orphaned documents (those with no ruling).  This is the
+    # denominator for all field completeness percentages.  See also the
+    # _definitions key in data-quality-baselines.json.
+    if totals is not None:
+        for county, doc_count in totals.items():
+            if county not in existing:
+                existing[county] = {}
+            existing[county]["total_documents"] = doc_count
+
+    raw["field_completeness"] = existing
+    with open(baselines_path, "w") as f:
+        json.dump(raw, f, indent=2)
+        f.write("\n")
+
+    logger.info("Field completeness baselines updated at %s", baselines_path)
+
+
+def _query_field_completeness(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
+    """Query the database for current field completeness percentages.
+
+    Only considers documents created within the last FIELD_COMPLETENESS_WINDOW_DAYS
+    and at least FIELD_COMPLETENESS_GRACE_MINUTES ago, to focus on recent
+    regressions while excluding documents still being processed by the
+    ingestion pipeline.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+
+    Returns:
+        Tuple of:
+        - Dict mapping county name to dict of field name -> percentage (0-100).
+        - Dict mapping county name to total document count in the window.
+    """
+    county_filter, county_params = _build_county_filter(county)
+    cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_cutoff = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+    result: dict[str, dict[str, float]] = {}
+    totals: dict[str, int] = {}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            FIELD_COMPLETENESS_QUERY.format(county_filter=county_filter),
+            (cutoff, grace_cutoff, *county_params),
+        )
+        for row in cur.fetchall():
+            (
+                county_name,
+                total,
+                has_ruling,
+                has_judge,
+                has_motion_type,
+                has_outcome,
+                has_title,
+                has_case_number,
+                has_parties,
+                has_hearing_date,
+                has_case_type,
+            ) = row
+
+            if total == 0:
+                continue
+
+            totals[county_name] = total
+
+            counts = {
+                "ruling": has_ruling,
+                "judge": has_judge,
+                "motion_type": has_motion_type,
+                "outcome": has_outcome,
+                "case_title": has_title,
+                "case_number": has_case_number,
+                "parties": has_parties,
+                "hearing_date": has_hearing_date,
+                "case_type": has_case_type,
+            }
+
+            result[county_name] = {
+                field: round(count / total * 100, 1) for field, count in counts.items()
+            }
+
+    return result, totals
+
+
+def _is_bulk_ingest(
+    county_name: str,
+    window_doc_count: int,
+    field_baselines: dict[str, dict[str, float]],
+) -> bool:
+    """Detect whether a county likely experienced a bulk ingest.
+
+    Compares the number of documents in the check window against the
+    ``total_documents`` baseline.  If the window count exceeds
+    ``BULK_INGEST_MULTIPLIER`` times the baseline, the county is
+    considered to be in a bulk-ingest state and field completeness /
+    orphaned document alerts should be downgraded.
+
+    Args:
+        county_name: Name of the county.
+        window_doc_count: Number of documents in the check window.
+        field_baselines: Per-county field baselines (contains
+            ``total_documents`` key).
+
+    Returns:
+        True if bulk ingest is detected, False otherwise.
+    """
+    county_fb = field_baselines.get(county_name, {})
+    baseline_total = county_fb.get("total_documents", 0)
+    if baseline_total <= 0:
+        return False
+    return window_doc_count > BULK_INGEST_MULTIPLIER * baseline_total
+
+
+def check_field_completeness(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    field_baselines: dict[str, dict[str, float]],
+    county: str | None = None,
+    baselines: dict[str, Baselines] | None = None,
+    expected_null_rates: dict[str, dict[str, float]] | None = None,
+) -> list[Alert]:
+    """Check field completeness against baselines and flag regressions.
+
+    Counties with fewer than ``MIN_FIELD_CHECK_SAMPLE_SIZE`` documents in the
+    window are skipped to avoid noisy alerts from tiny sample sizes. A P2
+    informational alert is emitted instead so the county is not silently
+    ignored — unless the county is marked ``low_volume`` in the baselines,
+    in which case the alert is suppressed (logged at DEBUG) since the low
+    sample size is expected and permanent.
+
+    When a bulk ingest is detected (window doc count exceeds
+    ``BULK_INGEST_MULTIPLIER`` times the ``total_documents`` baseline),
+    field completeness alerts are downgraded to P2 informational with a
+    note that a bulk operation likely occurred (#1887).
+
+    When *expected_null_rates* is provided, the effective baseline for a
+    county+field is capped at ``100 - expected_null_rate``.  This accounts
+    for irreducible null rates caused by structural limitations in the source
+    data (e.g., OC calendar-list PDFs that contain only motion titles with
+    no ruling text).  See #2318.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        field_baselines: Per-county, per-field baseline percentages.
+        county: Optional county filter.
+        baselines: Per-county baseline configurations (used to check the
+            ``low_volume`` flag). If *None*, all counties emit the
+            informational alert (backward-compatible default).
+        expected_null_rates: Per-county, per-field expected null rate
+            percentages (0-100).  When configured, the effective baseline
+            for a county+field is ``min(baseline, 100 - null_rate)``.
+            If *None*, no adjustment is applied (backward-compatible default).
+
+    Returns:
+        List of alerts for field completeness regressions.
+    """
+    alerts: list[Alert] = []
+    current, totals = _query_field_completeness(conn, now, county)
+
+    for county_name, fields in current.items():
+        county_field_baselines = field_baselines.get(county_name, {})
+        if not county_field_baselines:
+            continue
+
+        total_docs = totals.get(county_name, 0)
+        if total_docs < MIN_FIELD_CHECK_SAMPLE_SIZE:
+            # Check if this county is marked as low_volume — if so, suppress
+            # the informational alert since low sample size is expected.
+            county_config = baselines.get(county_name) if baselines else None
+            if county_config and county_config.low_volume:
+                logger.debug(
+                    "%s: only %d document(s) in %d-day window, skipping "
+                    "field completeness check (low_volume county, "
+                    "minimum sample size: %d)",
+                    county_name,
+                    total_docs,
+                    FIELD_COMPLETENESS_WINDOW_DAYS,
+                    MIN_FIELD_CHECK_SAMPLE_SIZE,
+                )
+            else:
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="field_completeness_low_sample",
+                        severity="p2",
+                        expected=MIN_FIELD_CHECK_SAMPLE_SIZE,
+                        actual=total_docs,
+                        message=(
+                            f"{county_name}: only {total_docs} document(s) in "
+                            f"{FIELD_COMPLETENESS_WINDOW_DAYS}-day window, skipping "
+                            f"field completeness check "
+                            f"(minimum sample size: {MIN_FIELD_CHECK_SAMPLE_SIZE})"
+                        ),
+                    )
+                )
+            continue
+
+        # Bulk ingest detection: if the window doc count far exceeds the
+        # baseline, enrichment is likely still catching up.  Downgrade all
+        # field completeness alerts for this county to a single P2
+        # informational alert instead of firing false-positive regressions.
+        if _is_bulk_ingest(county_name, total_docs, field_baselines):
+            baseline_total = county_field_baselines.get("total_documents", 0)
+            logger.info(
+                "%s: bulk ingest detected (%d docs in window vs %d baseline). "
+                "Downgrading field completeness alerts.",
+                county_name,
+                total_docs,
+                baseline_total,
+            )
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="field_completeness_bulk_ingest",
+                    severity="p2",
+                    expected=baseline_total,
+                    actual=total_docs,
+                    message=(
+                        f"{county_name}: {total_docs} documents in "
+                        f"{FIELD_COMPLETENESS_WINDOW_DAYS}-day window vs "
+                        f"{baseline_total} baseline "
+                        f"(>{BULK_INGEST_MULTIPLIER:.0f}x). "
+                        f"Likely bulk ingest — skipping field completeness "
+                        f"regression check while enrichment catches up."
+                    ),
+                )
+            )
+            continue
+
+        # Load expected null rates for this county (if configured).
+        county_null_rates = (
+            expected_null_rates.get(county_name, {}) if expected_null_rates else {}
+        )
+
+        for field, current_pct in fields.items():
+            baseline_pct = county_field_baselines.get(field, 0.0)
+
+            # Ignore fields with 0% baseline (county genuinely lacks the field).
+            if baseline_pct == 0.0:
+                continue
+
+            # Cap the effective baseline at (100 - expected_null_rate) when
+            # an expected null rate is configured for this county+field.
+            # This prevents false-positive alerts for irreducible null rates
+            # caused by structural limitations in the source data (#2318).
+            effective_baseline = baseline_pct
+            null_rate = county_null_rates.get(field)
+            if null_rate is not None and null_rate > 0:
+                ceiling = 100.0 - null_rate
+                effective_baseline = min(baseline_pct, ceiling)
+
+            drop = effective_baseline - current_pct
+
+            if drop > FIELD_DROP_P1_THRESHOLD:
+                severity = "p1"
+            elif drop > FIELD_DROP_P2_THRESHOLD:
+                severity = "p2"
+            else:
+                continue
+
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="field_completeness",
+                    severity=severity,
+                    expected=effective_baseline,
+                    actual=current_pct,
+                    message=(
+                        f"{county_name}: {field} completeness dropped from "
+                        f"{effective_baseline:.1f}% to {current_pct:.1f}% "
+                        f"({drop:.1f}pp drop)"
+                    ),
+                )
+            )
+
+    return alerts
+
+
+def check_orphaned_documents(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+    field_baselines: dict[str, dict[str, float]] | None = None,
+) -> list[Alert]:
+    """Check for orphaned documents (documents with no ruling reference).
+
+    Orphaned documents indicate data integrity issues — typically from
+    backfill scripts that created document rows without corresponding
+    ruling rows.  This check surfaces the problem as a dedicated alert
+    instead of letting it pollute field completeness metrics.
+
+    When a bulk ingest is detected (window doc count exceeds
+    ``BULK_INGEST_MULTIPLIER`` times the ``total_documents`` baseline),
+    orphaned document alerts are downgraded to P2 informational with a
+    note that a bulk operation likely occurred (#1887).
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+        field_baselines: Per-county field baselines (used for bulk-ingest
+            detection via ``total_documents``). If *None*, bulk-ingest
+            detection is skipped (backward-compatible default).
+
+    Returns:
+        List of alerts for orphaned documents.
+    """
+    alerts: list[Alert] = []
+    county_filter, county_params = _build_county_filter(county)
+    cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_cutoff = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            ORPHANED_DOCUMENTS_QUERY.format(county_filter=county_filter),
+            (cutoff, grace_cutoff, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, total_docs, orphaned_count = row
+
+            if total_docs == 0 or orphaned_count == 0:
+                continue
+
+            orphaned_pct = round(orphaned_count / total_docs * 100, 1)
+
+            if orphaned_pct > ORPHANED_DOCS_P1_THRESHOLD:
+                severity = "p1"
+            elif orphaned_pct > ORPHANED_DOCS_P2_THRESHOLD:
+                severity = "p2"
+            else:
+                continue
+
+            # Bulk ingest detection: downgrade to P2 informational if the
+            # window doc count far exceeds the baseline.
+            if field_baselines and _is_bulk_ingest(
+                county_name, total_docs, field_baselines
+            ):
+                baseline_total = field_baselines.get(county_name, {}).get(
+                    "total_documents", 0
+                )
+                logger.info(
+                    "%s: bulk ingest detected (%d docs in window vs %d baseline). "
+                    "Downgrading orphaned documents alert.",
+                    county_name,
+                    total_docs,
+                    baseline_total,
+                )
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="orphaned_documents_bulk_ingest",
+                        severity="p2",
+                        expected=0,
+                        actual=orphaned_count,
+                        message=(
+                            f"{county_name}: {orphaned_count} of {total_docs} "
+                            f"documents ({orphaned_pct}%) have no ruling reference. "
+                            f"Likely bulk ingest ({total_docs} docs vs "
+                            f"{baseline_total} baseline, "
+                            f">{BULK_INGEST_MULTIPLIER:.0f}x) — "
+                            f"downgraded while enrichment catches up."
+                        ),
+                    )
+                )
+                continue
+
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="orphaned_documents",
+                    severity=severity,
+                    expected=0,
+                    actual=orphaned_count,
+                    message=(
+                        f"{county_name}: {orphaned_count} of {total_docs} "
+                        f"documents ({orphaned_pct}%) have no ruling reference"
+                    ),
+                )
+            )
+
+    return alerts
+
+
+def check_ruling_document_ratio(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+    field_baselines: dict[str, dict[str, float]] | None = None,
+) -> list[Alert]:
+    """Check ruling-to-document ratio per county (#2230).
+
+    Computes ``COUNT(rulings) / COUNT(documents)`` per county in the recent
+    time window.  A ratio below ``RULING_DOC_RATIO_THRESHOLD`` (default 0.5)
+    signals that rulings are being silently dropped during ingestion — e.g.
+    when ``insert_document_and_ruling`` skips ruling insertion due to a
+    missing required field.
+
+    Normal ratio is ~1.0 (one ruling per document).  Counties with
+    multi-ruling documents may exceed 1.0.
+
+    When a bulk ingest is detected, the alert is downgraded to P2
+    informational (same pattern as ``check_orphaned_documents``).
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+        field_baselines: Per-county field baselines (used for bulk-ingest
+            detection via ``total_documents``).  If *None*, bulk-ingest
+            detection is skipped (backward-compatible default).
+
+    Returns:
+        List of alerts for low ruling-to-document ratios.
+    """
+    alerts: list[Alert] = []
+    county_filter, county_params = _build_county_filter(county)
+    cutoff = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_cutoff = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_DOC_RATIO_QUERY.format(county_filter=county_filter),
+            (cutoff, grace_cutoff, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, total_docs, total_rulings = row
+
+            if total_docs == 0:
+                continue
+
+            raw_ratio = total_rulings / total_docs
+            if raw_ratio >= RULING_DOC_RATIO_THRESHOLD:
+                continue
+
+            # Round only for display — comparison uses the raw value above.
+            ratio = round(raw_ratio, 3)
+            severity = "p1"
+
+            # Bulk ingest detection: downgrade to P2 informational if the
+            # window doc count far exceeds the baseline.
+            if field_baselines and _is_bulk_ingest(
+                county_name, total_docs, field_baselines
+            ):
+                baseline_total = field_baselines.get(county_name, {}).get(
+                    "total_documents", 0
+                )
+                logger.info(
+                    "%s: bulk ingest detected (%d docs in window vs %d baseline). "
+                    "Downgrading ruling-document ratio alert.",
+                    county_name,
+                    total_docs,
+                    baseline_total,
+                )
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="ruling_document_ratio_bulk_ingest",
+                        severity="p2",
+                        expected=RULING_DOC_RATIO_THRESHOLD,
+                        actual=ratio,
+                        message=(
+                            f"{county_name}: ruling-to-document ratio is {ratio:.3f} "
+                            f"({total_rulings} rulings / {total_docs} documents), "
+                            f"below threshold {RULING_DOC_RATIO_THRESHOLD}. "
+                            f"Likely bulk ingest ({total_docs} docs vs "
+                            f"{baseline_total} baseline, "
+                            f">{BULK_INGEST_MULTIPLIER:.0f}x) — "
+                            f"downgraded while enrichment catches up."
+                        ),
+                    )
+                )
+                continue
+
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="ruling_document_ratio",
+                    severity=severity,
+                    expected=RULING_DOC_RATIO_THRESHOLD,
+                    actual=ratio,
+                    message=(
+                        f"{county_name}: ruling-to-document ratio is {ratio:.3f} "
+                        f"({total_rulings} rulings / {total_docs} documents), "
+                        f"below threshold {RULING_DOC_RATIO_THRESHOLD}. "
+                        f"Rulings may be silently dropped during ingestion."
+                    ),
+                )
+            )
+
+    return alerts
+
+
+# ---------------------------------------------------------------------------
+# ECS service health check
+# ---------------------------------------------------------------------------
+
+# Default ECS services to monitor when no baselines config is available.
+DEFAULT_ECS_SERVICES: list[dict[str, str]] = [
+    {
+        "cluster": "judgemind-dev",
+        "service": "judgemind-ingestion-worker-dev",
+        "display_name": "Ingestion Worker (dev)",
+    },
+    {
+        "cluster": "judgemind-dev",
+        "service": "judgemind-api-dev",
+        "display_name": "API (dev)",
+    },
+]
+
+
+@dataclass
+class EcsServiceConfig:
+    """Configuration for an ECS service to health-check."""
+
+    cluster: str
+    service: str
+    display_name: str
+
+
+def load_ecs_service_configs(
+    raw: dict[str, Any] | None = None,
+    path: Path | None = None,
+) -> list[EcsServiceConfig]:
+    """Load ECS service monitoring config from baselines JSON.
+
+    Reads the ``ecs_services`` key from the baselines file.  Falls back to
+    ``DEFAULT_ECS_SERVICES`` when the key is absent or the file is unavailable.
+
+    Args:
+        raw: Pre-parsed baselines dict (takes priority over file path).
+        path: Path to baselines JSON file. Defaults to repo root.
+
+    Returns:
+        List of EcsServiceConfig to check.
+    """
+    if raw is None:
+        baselines_path = path or _resolve_baselines_path()
+        if baselines_path.exists():
+            with open(baselines_path) as f:
+                raw = json.load(f)
+        else:
+            raw = {}
+
+    services_raw = raw.get("ecs_services", None)
+    if services_raw is None:
+        services_raw = DEFAULT_ECS_SERVICES
+
+    return [
+        EcsServiceConfig(
+            cluster=s["cluster"],
+            service=s["service"],
+            display_name=s.get("display_name", s["service"]),
+        )
+        for s in services_raw
+    ]
+
+
+def check_ecs_service_health(
+    ecs_configs: list[EcsServiceConfig] | None = None,
+    ecs_client: Any | None = None,
+) -> list[Alert]:
+    """Check ECS service health — alerts when runningCount < desiredCount.
+
+    This detects ingestion worker downtime caused by deployment cycling or
+    other ECS issues.  Each configured service is queried via the ECS
+    ``describe_services`` API.
+
+    Args:
+        ecs_configs: List of services to check.  Defaults to
+            ``DEFAULT_ECS_SERVICES`` converted to ``EcsServiceConfig``.
+        ecs_client: Optional pre-built boto3 ECS client (for testing).
+            When *None*, a client is created lazily via ``boto3.client('ecs')``.
+
+    Returns:
+        List of alerts for unhealthy ECS services.
+    """
+    if ecs_configs is None:
+        ecs_configs = [EcsServiceConfig(**s) for s in DEFAULT_ECS_SERVICES]
+
+    if not ecs_configs:
+        return []
+
+    if ecs_client is None:
+        try:
+            import boto3  # noqa: I001
+
+            ecs_client = boto3.client("ecs")
+        except ImportError:
+            logger.warning("boto3 not available — skipping ECS service health check")
+            return []
+        except Exception:
+            logger.warning(
+                "Failed to create ECS client — skipping ECS service health check",
+                exc_info=True,
+            )
+            return []
+
+    alerts: list[Alert] = []
+
+    # Group services by cluster for efficient batch API calls.
+    by_cluster: dict[str, list[EcsServiceConfig]] = {}
+    for cfg in ecs_configs:
+        by_cluster.setdefault(cfg.cluster, []).append(cfg)
+
+    for cluster, services in by_cluster.items():
+        service_names = [s.service for s in services]
+        display_map = {s.service: s.display_name for s in services}
+
+        try:
+            response = ecs_client.describe_services(
+                cluster=cluster,
+                services=service_names,
+            )
+        except Exception:
+            logger.warning(
+                "ECS describe_services failed for cluster %s — skipping",
+                cluster,
+                exc_info=True,
+            )
+            continue
+
+        for svc in response.get("services", []):
+            svc_name = svc.get("serviceName", "unknown")
+            running = svc.get("runningCount", 0)
+            desired = svc.get("desiredCount", 0)
+            display = display_map.get(svc_name, svc_name)
+
+            if desired == 0:
+                # Service is intentionally scaled to zero — skip.
+                continue
+
+            if running < desired:
+                severity = "p1" if running == 0 else "p2"
+                alerts.append(
+                    Alert(
+                        county="INFRASTRUCTURE",
+                        metric="ecs_service_health",
+                        severity=severity,
+                        expected=desired,
+                        actual=running,
+                        message=(
+                            f"{display}: runningCount={running}, "
+                            f"desiredCount={desired} — service is degraded"
+                        ),
+                    )
+                )
+
+        # Check for services that were not found in the response.
+        found_names = {s.get("serviceName") for s in response.get("services", [])}
+        for svc_name in service_names:
+            if svc_name not in found_names:
+                display = display_map.get(svc_name, svc_name)
+                alerts.append(
+                    Alert(
+                        county="INFRASTRUCTURE",
+                        metric="ecs_service_health",
+                        severity="p1",
+                        expected="exists",
+                        actual="not found",
+                        message=(
+                            f"{display}: ECS service not found in cluster {cluster}"
+                        ),
+                    )
+                )
+
+    return alerts
+
+
+def _build_county_filter(county: str | None) -> tuple[str, tuple[str, ...]]:
+    """Build a SQL WHERE clause fragment for county filtering.
+
+    Args:
+        county: County name to filter on, or None for all counties.
+
+    Returns:
+        Tuple of (SQL fragment, params tuple).
+    """
+    if county:
+        return "AND ct.county = %s", (county,)
+    return "", ()
+
+
+def is_rebuild_in_progress(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime | None = None,
+) -> bool:
+    """Check whether a database rebuild is currently in progress.
+
+    Queries the ``data_quality_metrics`` table for the most recent
+    ``rebuild_in_progress`` marker written by ``rebuild_db.py``.  The
+    marker is considered active when:
+
+    1. The most recent row has ``metric_value = 1.0`` (rebuild started,
+       not yet completed).
+    2. The row's ``recorded_at`` is within ``REBUILD_MARKER_TTL_HOURS``
+       of *now* (safety valve against stale markers from crashed rebuilds).
+
+    Args:
+        conn: Database connection.
+        now: Override current time (for testing).
+
+    Returns:
+        True if a rebuild is actively in progress, False otherwise.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                REBUILD_MARKER_QUERY,
+                (REBUILD_MARKER_COUNTY, REBUILD_MARKER_METRIC),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logger.warning(
+            "Failed to check rebuild marker — assuming no rebuild in progress",
+            exc_info=True,
+        )
+        return False
+
+    if row is None:
+        return False
+
+    metric_value, recorded_at = row
+
+    # metric_value == 1.0 means rebuild started; 0.0 means completed.
+    if float(metric_value) != 1.0:
+        return False
+
+    # Safety valve: ignore stale markers (e.g. rebuild process crashed).
+    age_hours = (now - recorded_at).total_seconds() / 3600
+    if age_hours > REBUILD_MARKER_TTL_HOURS:
+        logger.info(
+            "Rebuild marker is stale (%.1fh old, TTL: %.1fh) — "
+            "ignoring and resuming normal alerting.",
+            age_hours,
+            REBUILD_MARKER_TTL_HOURS,
+        )
+        return False
+
+    logger.info(
+        "Active rebuild detected (marker %.1fh old). "
+        "P1 alerts will be downgraded to P2.",
+        age_hours,
+    )
+    return True
+
+
+def _downgrade_p1_alerts_for_rebuild(alerts: list[Alert]) -> list[Alert]:
+    """Downgrade all P1 alerts to P2 with a rebuild-in-progress note.
+
+    Called when ``is_rebuild_in_progress()`` returns True.  Preserves
+    the original alert information but changes severity from ``p1`` to
+    ``p2`` and appends a note to the message.
+
+    Args:
+        alerts: List of alerts from all check functions.
+
+    Returns:
+        New list with P1 alerts downgraded to P2.
+    """
+    result: list[Alert] = []
+    for alert in alerts:
+        if alert.severity == "p1":
+            result.append(
+                Alert(
+                    county=alert.county,
+                    metric=alert.metric,
+                    severity="p2",
+                    expected=alert.expected,
+                    actual=alert.actual,
+                    message=f"{alert.message} (rebuild in progress — downgraded from P1)",
+                )
+            )
+        else:
+            result.append(alert)
+    return result
+
+
+def _24h_overlaps_posting_day(
+    now: datetime,
+    posting_days: list[str] | None,
+) -> bool:
+    """Return True if *today* is a posting day.
+
+    When *posting_days* is ``None`` or empty, every day is considered a
+    posting day and the function returns ``True``.
+
+    Only today is checked — not yesterday.  On non-posting days, zero
+    new rulings is expected regardless of whether yesterday was a posting
+    day.  The separate staleness check handles the case where content is
+    too old.
+    """
+    if not posting_days:
+        return True
+
+    # _DAY_ABBREVS is ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    posting_weekdays: set[int] = set()
+    for day in posting_days:
+        try:
+            posting_weekdays.add(_DAY_ABBREVS.index(day))
+        except ValueError:
+            continue
+
+    if not posting_weekdays:
+        return True
+
+    today_wd = now.weekday()  # Mon=0 .. Sun=6
+    return today_wd in posting_weekdays
+
+
+def _count_posting_days_in_window(
+    start: datetime,
+    end: datetime,
+    posting_days: list[str] | None,
+) -> float:
+    """Count the number of posting days in a date range.
+
+    The window is inclusive of the start date and exclusive of the end date,
+    matching the half-open interval ``[start, end)`` used by the 7-day query.
+
+    When *posting_days* is ``None`` or empty, every day is considered a
+    posting day and the function returns the number of calendar days in the
+    window.
+
+    Args:
+        start: Start of the window (inclusive).
+        end: End of the window (exclusive).
+        posting_days: List of day abbreviations (Mon-Sun) when the court
+            posts content, or ``None`` for "every day".
+
+    Returns:
+        Number of posting days in the window.  Always >= 1.0 to prevent
+        division-by-zero in the caller.
+    """
+    total_days = (end - start).days
+    if total_days <= 0:
+        return 1.0
+
+    if not posting_days:
+        return float(total_days)
+
+    posting_weekdays: set[int] = set()
+    for day in posting_days:
+        if day in _DAY_ABBREVS:
+            posting_weekdays.add(_DAY_ABBREVS.index(day))
+
+    if not posting_weekdays:
+        return float(total_days)
+
+    count = 0
+    for offset in range(total_days):
+        day_wd = (start + timedelta(days=offset)).weekday()
+        if day_wd in posting_weekdays:
+            count += 1
+
+    # Return at least 1.0 to avoid division by zero.
+    return max(float(count), 1.0)
+
+
+def _compute_baseline_daily(
+    per_day_counts: dict[str, int],
+    posting_days: list[str] | None,
+    window_start: datetime,
+    window_end: datetime,
+) -> float:
+    """Compute a spike-resistant daily baseline for ingest rate comparison.
+
+    Uses the **25th percentile** (lower quartile) of per-day ruling counts
+    over the window.  The 25th percentile is more robust to backfill spikes
+    than the median: even if 50% of days in the window have inflated counts
+    (e.g. from bulk re-ingests), the 25th percentile stays near the normal
+    daily rate.  This directly addresses the false-positive alerts described
+    in #1866 where a single 800+ ruling backfill day inflated the median.
+
+    Fills in zero-count days for dates with no rulings so that the percentile
+    correctly accounts for inactive days.  For counties with *posting_days*,
+    only posting days are included (non-posting days are expected to be zero
+    and should not dilute the baseline).
+
+    For small samples (fewer than 4 posting days in the window), falls back
+    to the minimum value — the most conservative approach to prevent false
+    positives when there are very few data points.
+
+    Args:
+        per_day_counts: Mapping of ISO date string (``YYYY-MM-DD``) to
+            ruling count for that day.
+        posting_days: Optional list of day abbreviations (Mon-Sun) when
+            the court posts content, or ``None`` for "every day".
+        window_start: Start of the window (inclusive).
+        window_end: End of the window (exclusive).
+
+    Returns:
+        25th percentile daily ruling count (or minimum for small samples).
+        Returns 0.0 when no relevant days exist in the window.
+    """
+    total_days = (window_end - window_start).days
+    if total_days <= 0:
+        return 0.0
+
+    posting_weekdays: set[int] | None = None
+    if posting_days:
+        posting_weekdays = set()
+        for day in posting_days:
+            if day in _DAY_ABBREVS:
+                posting_weekdays.add(_DAY_ABBREVS.index(day))
+        # If no valid posting days parsed, treat as "every day".
+        if not posting_weekdays:
+            posting_weekdays = None
+
+    daily_values: list[int] = []
+    for offset in range(total_days):
+        day_dt = window_start + timedelta(days=offset)
+        # Skip non-posting days when posting_days is configured.
+        if posting_weekdays is not None and day_dt.weekday() not in posting_weekdays:
+            continue
+        date_key = day_dt.strftime("%Y-%m-%d")
+        daily_values.append(per_day_counts.get(date_key, 0))
+
+    if not daily_values:
+        return 0.0
+
+    # For small samples (< 4 values), statistics.quantiles requires at
+    # least 2 data points with n=4 method, but produces unreliable
+    # percentiles.  Fall back to the minimum which is the most
+    # conservative baseline (least likely to cause false positives).
+    if len(daily_values) < 4:
+        return float(min(daily_values))
+
+    # statistics.quantiles(data, n=4) returns [Q1, Q2, Q3].
+    # Q1 (25th percentile) is index 0.
+    quartiles = statistics.quantiles(daily_values, n=4)
+    return float(quartiles[0])
+
+
+def check_ingest_rates(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    baselines: dict[str, Baselines],
+    county: str | None = None,
+) -> list[Alert]:
+    """Check ruling ingest rates against 7-day 25th-percentile baseline.
+
+    Uses the **25th percentile** (lower quartile) of per-day ruling counts
+    over the 7-day window.  The 25th percentile is more robust than the
+    median to backfill spikes (#1866): even if multiple days in the window
+    have inflated counts from bulk re-ingests, the 25th percentile stays
+    near the normal daily rate.
+
+    Uses ``captured_at`` (when the court posted the ruling) rather than
+    ``created_at`` (when the pipeline processed it) so that backfill or
+    catch-up batches do not inflate the rolling average with artificial
+    spikes.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        baselines: Per-county baseline config.
+        county: Optional county filter.
+
+    Returns:
+        List of alerts for counties with low ingest rates.
+    """
+    alerts: list[Alert] = []
+    county_filter, county_params = _build_county_filter(county)
+
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_7d = now - timedelta(days=7)
+
+    # Get 24h counts
+    counts_24h: dict[str, int] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_24H_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            counts_24h[row[0]] = row[1]
+
+    # Get 7-day per-day counts (excluding last 24h for the baseline).
+    # Returns (county, date, count) rows; used to compute the 25th
+    # percentile per-day count which is robust to backfill spikes (#1866).
+    per_day_7d: dict[str, dict[str, int]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_7D_PER_DAY_QUERY.format(county_filter=county_filter),
+            (cutoff_7d, cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name_row = row[0]
+            # The date may come back as a date object or string depending
+            # on the driver; normalise to YYYY-MM-DD string.
+            date_val = row[1]
+            date_key = (
+                date_val.isoformat()
+                if hasattr(date_val, "isoformat")
+                else str(date_val)
+            )
+            per_day_7d.setdefault(county_name_row, {})[date_key] = row[2]
+
+    # Get all active counties to check for zeros
+    all_counties: list[str] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            ALL_ACTIVE_COUNTIES_QUERY.format(county_filter=county_filter),
+            county_params,
+        )
+        all_counties = [row[0] for row in cur.fetchall()]
+
+    for county_name in all_counties:
+        count_24h = counts_24h.get(county_name, 0)
+        baseline = baselines.get(county_name)
+
+        # Compute the 25th percentile of per-day counts over the 7-day
+        # window.  The 25th percentile is robust to backfill spikes —
+        # even multiple spike days will not inflate the baseline (#1866).
+        # For counties with posting_days, only posting days contribute.
+        posting_days = baseline.posting_days if baseline else None
+        county_per_day = per_day_7d.get(county_name, {})
+        daily_baseline = _compute_baseline_daily(
+            county_per_day, posting_days, cutoff_7d, cutoff_24h
+        )
+
+        expected_daily = baseline.expected_daily_rulings if baseline else daily_baseline
+
+        # Zero-ruling alert (critical).
+        # Suppress on non-posting days: if the county has a posting_days
+        # schedule and the 24h window doesn't overlap any posting day,
+        # zero rulings is expected — not an alert.
+        # Also suppress for low_volume counties (expected_daily < 1.0 or
+        # low_volume flag): zero-count days are statistically normal for
+        # counties like Santa Clara (0.1/day) — see #1886.
+        posting_days = baseline.posting_days if baseline else None
+        is_low_volume = baseline.low_volume if baseline else False
+        suppress_zero_rulings = is_low_volume or expected_daily < 1.0
+        if count_24h == 0 and expected_daily > 0 and not suppress_zero_rulings:
+            if _24h_overlaps_posting_day(now, posting_days):
+                # Check min_days_zero_before_alert (#1916): for counties
+                # requiring multiple consecutive zero days before a P1,
+                # count recent consecutive zero days from per_day_7d and
+                # downgrade to P2 if the threshold is not met.
+                min_days = baseline.min_days_zero_before_alert if baseline else 1
+                consecutive_zeros = _count_consecutive_zero_days(county_per_day, now)
+                # consecutive_zeros counts zero days *before* today;
+                # today itself is also zero, so total = consecutive_zeros + 1.
+                if consecutive_zeros + 1 >= min_days:
+                    alerts.append(
+                        Alert(
+                            county=county_name,
+                            metric="zero_rulings",
+                            severity="p1",
+                            expected=expected_daily,
+                            actual=0,
+                            message=(
+                                f"{county_name}: zero new rulings in 24h "
+                                f"(expected ~{expected_daily:.1f}/day)"
+                            ),
+                        )
+                    )
+                elif min_days > 1:
+                    # Single zero day for a county that requires multiple
+                    # consecutive zeros — downgrade to P2 informational.
+                    alerts.append(
+                        Alert(
+                            county=county_name,
+                            metric="zero_rulings",
+                            severity="p2",
+                            expected=expected_daily,
+                            actual=0,
+                            message=(
+                                f"{county_name}: zero new rulings in 24h "
+                                f"(expected ~{expected_daily:.1f}/day, "
+                                f"P1 requires {min_days} consecutive zero days)"
+                            ),
+                        )
+                    )
+        # Ingest rate drop alert — suppress when expected_daily is zero
+        # (no active scraper, e.g. San Diego) and on non-posting days
+        # (weekends) just like zero_rulings above.
+        elif (
+            expected_daily > 0
+            and daily_baseline > 0
+            and count_24h < daily_baseline * INGEST_DROP_THRESHOLD
+        ):
+            if _24h_overlaps_posting_day(now, posting_days):
+                alerts.append(
+                    Alert(
+                        county=county_name,
+                        metric="ingest_rate",
+                        severity="p2",
+                        expected=round(daily_baseline, 1),
+                        actual=count_24h,
+                        message=(
+                            f"{county_name}: {count_24h} rulings in 24h, "
+                            f"7-day baseline is {daily_baseline:.1f}/day "
+                            f"(>{INGEST_DROP_THRESHOLD * 100:.0f}% drop)"
+                        ),
+                    )
+                )
+
+    return alerts
+
+
+def _count_consecutive_zero_days(
+    county_per_day: dict[str, int],
+    now: datetime,
+) -> int:
+    """Count consecutive zero-ruling days working backwards from 2 days ago.
+
+    Examines per-day counts in the 7-day window ``[now-7d, now-24h)``.
+    Days absent from ``county_per_day`` are treated as zero-count days.
+    Starts from ``now - 2d`` (the last full day guaranteed to be in the
+    7-day window, since the window excludes the last 24 hours) and counts
+    backwards until a nonzero day is found or the window is exhausted.
+
+    Note: the caller already knows today (the last 24h) has zero rulings
+    via ``count_24h == 0``.  This function counts additional consecutive
+    zero days *before* today to determine whether the multi-day threshold
+    is met.
+
+    Args:
+        county_per_day: Mapping of ``YYYY-MM-DD`` date strings to ruling
+            counts for a single county over the 7-day lookback window.
+        now: Current timestamp (used to determine window boundaries).
+
+    Returns:
+        Number of consecutive zero-ruling days before today (from the
+        7-day window data).
+    """
+    count = 0
+    # Start from 2 days ago — "yesterday" (now-1d) falls partially in the
+    # 24h exclusion zone and may not be in per_day_7d.  The 7D query covers
+    # [now-7d, now-24h), so now-2d is the last reliable full day.
+    for days_back in range(2, 8):
+        day = now - timedelta(days=days_back)
+        day_key = day.strftime("%Y-%m-%d")
+        if county_per_day.get(day_key, 0) > 0:
+            break
+        count += 1
+    return count
+
+
+# Day-of-week abbreviations used in posting_days config.
+_DAY_ABBREVS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _calculate_stale_threshold(
+    now: datetime,
+    schedule_type: str,
+    posting_days: list[str] | None,
+    max_expected_gap_hours: float | None,
+) -> float:
+    """Calculate the staleness threshold in hours for a county.
+
+    For counties with ``posting_days`` set, the threshold accounts for
+    expected gaps when no new content is posted (e.g. weekends).  The
+    threshold is the number of hours from the *end* of the most recent
+    posting day to ``now``, plus a buffer equal to the base threshold
+    for that schedule type.
+
+    Args:
+        now: Current timestamp (must be timezone-aware).
+        schedule_type: "daily" or "frequent".
+        posting_days: Optional list of day abbreviations (Mon-Sun) when
+            the court posts content.
+        max_expected_gap_hours: Explicit override.  If set, returned
+            directly without further calculation.
+
+    Returns:
+        Staleness threshold in hours.
+    """
+    if max_expected_gap_hours is not None:
+        return max_expected_gap_hours
+
+    base_threshold = (
+        FREQUENT_SCRAPER_STALE_HOURS
+        if schedule_type == "frequent"
+        else DAILY_SCRAPER_STALE_HOURS
+    )
+
+    if not posting_days:
+        return base_threshold
+
+    # Map day abbreviations to weekday integers (Mon=0 .. Sun=6).
+    posting_weekdays: set[int] = set()
+    for day in posting_days:
+        if day in _DAY_ABBREVS:
+            posting_weekdays.add(_DAY_ABBREVS.index(day))
+
+    if not posting_weekdays:
+        return base_threshold
+
+    # Walk backwards from today to find the most recent posting day.
+    # Start from today (if today is a posting day, the scraper should
+    # have run today so the gap is just the base threshold).
+    current_weekday = now.weekday()  # Mon=0 .. Sun=6
+    for days_back in range(8):  # at most 7 days back + today
+        check_day = (current_weekday - days_back) % 7
+        if check_day in posting_weekdays:
+            if days_back == 0:
+                # Today is a posting day — use the normal base threshold.
+                return base_threshold
+            # The last posting day was ``days_back`` days ago.  The
+            # expected gap is approximately ``days_back * 24`` hours,
+            # plus the base buffer to allow the scraper time to run.
+            return days_back * 24.0 + base_threshold
+
+    # Should never reach here (we check 8 days covering a full week),
+    # but fall back to a safe large value.
+    return 7 * 24.0 + base_threshold  # pragma: no cover
+
+
+def check_scraper_staleness(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    baselines: dict[str, Baselines],
+    county: str | None = None,
+) -> list[Alert]:
+    """Check for stale scrapers that haven't produced recent data.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        baselines: Per-county baseline config (for schedule_type).
+        county: Optional county filter.
+
+    Returns:
+        List of alerts for stale scrapers.
+    """
+    alerts: list[Alert] = []
+    county_filter, county_params = _build_county_filter(county)
+
+    # Try scraper_runs first
+    scraper_last_run: dict[str, tuple[str, datetime, str]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            LATEST_SCRAPER_RUN_QUERY.format(county_filter=county_filter),
+            county_params,
+        )
+        for row in cur.fetchall():
+            scraper_id, county_name, started_at, status = row
+            scraper_last_run[county_name] = (scraper_id, started_at, status)
+
+    # Fall back to MAX(last_seen_at, captured_at) for counties without scraper_runs.
+    # last_seen_at is updated on every document upsert (even when content is
+    # unchanged), so it accurately reflects the last time the scraper ran —
+    # unlike captured_at which only reflects the first insert.
+    capture_fallback: dict[str, datetime] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            LATEST_CAPTURE_PER_COUNTY_QUERY.format(county_filter=county_filter),
+            county_params,
+        )
+        for row in cur.fetchall():
+            if row[1] is not None:
+                capture_fallback[row[0]] = row[1]
+
+    # Check all counties with baselines
+    counties_to_check = set(scraper_last_run.keys()) | set(capture_fallback.keys())
+    if county:
+        counties_to_check = {c for c in counties_to_check if c == county}
+
+    for county_name in sorted(counties_to_check):
+        baseline = baselines.get(county_name)
+        schedule_type = baseline.schedule_type if baseline else "daily"
+        posting_days = baseline.posting_days if baseline else None
+        max_gap_override = baseline.max_expected_gap_hours if baseline else None
+        stale_threshold_hours = _calculate_stale_threshold(
+            now, schedule_type, posting_days, max_gap_override
+        )
+
+        last_activity: datetime | None = None
+        source = "unknown"
+
+        if county_name in scraper_last_run:
+            _, started_at, _ = scraper_last_run[county_name]
+            last_activity = started_at
+            source = "scraper_runs"
+        elif county_name in capture_fallback:
+            last_activity = capture_fallback[county_name]
+            source = "documents.last_seen_at"
+
+        if last_activity is None:
+            continue
+
+        hours_since = (now - last_activity).total_seconds() / 3600
+
+        # last_seen_at is updated on every document upsert (including dedup'd
+        # re-scrapes), so it accurately reflects scraper activity.  No
+        # multiplier needed — the normal threshold applies regardless of
+        # data source.  See #986.
+        effective_threshold = stale_threshold_hours
+
+        if hours_since > effective_threshold:
+            alerts.append(
+                Alert(
+                    county=county_name,
+                    metric="scraper_stale",
+                    severity="p1" if hours_since > effective_threshold * 4 else "p2",
+                    expected=f"<{effective_threshold}h",
+                    actual=f"{hours_since:.1f}h",
+                    message=(
+                        f"{county_name}: scraper stale for {hours_since:.1f}h "
+                        f"(threshold: {effective_threshold}h, source: {source})"
+                    ),
+                )
+            )
+
+    return alerts
+
+
+@dataclass
+class CheckResult:
+    """Full result from a data quality check run."""
+
+    alerts: list[Alert]
+    county_metrics: dict[str, dict[str, Any]]
+
+
+def _collect_full_metrics(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    now: datetime,
+    county: str | None = None,
+    baselines: dict[str, Baselines] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Collect all per-county metrics for persistence to data_quality_metrics.
+
+    Collects ruling counts, 7-day averages, field completeness, scraper health,
+    and metadata suitable for the data_quality_metrics table.
+
+    Args:
+        conn: Database connection.
+        now: Current timestamp for time calculations.
+        county: Optional county filter.
+        baselines: Per-county baseline configurations. When provided, the
+            7-day average divides by posting days instead of calendar days.
+
+    Returns:
+        Dict mapping county name to a flat metrics dict.  Each value dict
+        contains metric_name -> {value, metadata} pairs.
+    """
+    county_filter, county_params = _build_county_filter(county)
+    result: dict[str, dict[str, Any]] = {}
+
+    def _ensure(county_name: str) -> dict[str, Any]:
+        if county_name not in result:
+            result[county_name] = {}
+        return result[county_name]
+
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_7d = now - timedelta(days=7)
+
+    # --- Ruling count 24h ---
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_24H_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, count = row[0], row[1]
+            _ensure(county_name)["ruling_count_24h"] = {
+                "value": count,
+                "metadata": None,  # type breakdown added below
+            }
+
+    # --- Ruling count by type (metadata for ruling_count_24h) ---
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNT_BY_TYPE_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        type_breakdown: dict[str, dict[str, int]] = {}
+        for row in cur.fetchall():
+            county_name, doc_type, count = row[0], row[1], row[2]
+            if county_name not in type_breakdown:
+                type_breakdown[county_name] = {}
+            type_breakdown[county_name][doc_type or "unknown"] = count
+
+    for county_name, breakdown in type_breakdown.items():
+        metrics = _ensure(county_name)
+        if "ruling_count_24h" in metrics:
+            metrics["ruling_count_24h"]["metadata"] = {
+                "by_doc_type": breakdown,
+            }
+
+    # --- Ruling count 7d average (mean + baseline) ---
+    # First collect per-day counts for the baseline computation.
+    per_day_7d: dict[str, dict[str, int]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_7D_PER_DAY_QUERY.format(county_filter=county_filter),
+            (cutoff_7d, cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            cn = row[0]
+            date_val = row[1]
+            date_key = (
+                date_val.isoformat()
+                if hasattr(date_val, "isoformat")
+                else str(date_val)
+            )
+            per_day_7d.setdefault(cn, {})[date_key] = row[2]
+
+    # Also collect totals for the mean (backwards compatibility).
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_COUNTS_7D_QUERY.format(county_filter=county_filter),
+            (cutoff_7d, cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name = row[0]
+            total_7d = row[1]
+            # Use posting-day-aware denominator when baselines are available.
+            county_baseline = baselines.get(county_name) if baselines else None
+            posting_days_cfg = county_baseline.posting_days if county_baseline else None
+            window_posting_days = _count_posting_days_in_window(
+                cutoff_7d,
+                cutoff_24h,
+                posting_days_cfg,
+            )
+            avg = round(total_7d / window_posting_days, 2)
+            baseline_val = round(
+                _compute_baseline_daily(
+                    per_day_7d.get(county_name, {}),
+                    posting_days_cfg,
+                    cutoff_7d,
+                    cutoff_24h,
+                ),
+                2,
+            )
+            _ensure(county_name)["ruling_count_7d_avg"] = {
+                "value": avg,
+                "metadata": {
+                    "total_7d_window": total_7d,
+                    "window_days": window_posting_days,
+                    "baseline_7d": baseline_val,
+                },
+            }
+
+    # --- Field completeness ---
+    field_completeness, _fc_totals = _query_field_completeness(conn, now, county)
+
+    # Collect doc IDs with field gaps for metadata.
+    gap_docs: dict[str, list[str]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            FIELD_GAP_DOCS_QUERY.format(county_filter=county_filter),
+            (
+                now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS),
+                now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES),
+                *county_params,
+            ),
+        )
+        for row in cur.fetchall():
+            county_name, doc_id = row[0], str(row[1])
+            if county_name not in gap_docs:
+                gap_docs[county_name] = []
+            # Cap at 20 doc IDs per county for metadata size.
+            if len(gap_docs[county_name]) < 20:
+                gap_docs[county_name].append(doc_id)
+
+    for county_name, fields in field_completeness.items():
+        metrics = _ensure(county_name)
+        gap_doc_ids = gap_docs.get(county_name, [])
+        gap_metadata = {"docs_with_gaps": gap_doc_ids} if gap_doc_ids else None
+
+        # Overall field completeness (average of all individual fields).
+        if fields:
+            overall_pct = round(sum(fields.values()) / len(fields), 2)
+            metrics["field_completeness_pct"] = {
+                "value": overall_pct,
+                "metadata": gap_metadata,
+            }
+
+        # Individual field completeness metrics.
+        _field_metric_map = {
+            "judge": "field_completeness_judge",
+            "motion_type": "field_completeness_motion_type",
+            "parties": "field_completeness_parties",
+            "outcome": "field_completeness_outcome",
+            "hearing_date": "field_completeness_hearing_date",
+        }
+        for field_key, metric_name in _field_metric_map.items():
+            if field_key in fields:
+                metrics[metric_name] = {
+                    "value": fields[field_key],
+                    "metadata": gap_metadata,
+                }
+
+    # --- Scraper last success age ---
+    with conn.cursor() as cur:
+        cur.execute(
+            LATEST_SCRAPER_RUN_QUERY.format(county_filter=county_filter),
+            county_params,
+        )
+        for row in cur.fetchall():
+            _scraper_id, county_name, started_at, status = row
+            if status == "success" and started_at is not None:
+                hours_since = round((now - started_at).total_seconds() / 3600, 2)
+                _ensure(county_name)["scraper_last_success_age_hours"] = {
+                    "value": hours_since,
+                    "metadata": None,
+                }
+
+    # --- Scraper success rate 24h ---
+    with conn.cursor() as cur:
+        cur.execute(
+            SCRAPER_SUCCESS_RATE_24H_QUERY.format(county_filter=county_filter),
+            (cutoff_24h, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name = row[0]
+            total_runs = row[1]
+            success_count = row[2]
+            error_details_json = row[3]
+            rate = round(success_count / total_runs * 100, 2) if total_runs > 0 else 0.0
+
+            error_metadata: dict[str, Any] = {
+                "total_runs": total_runs,
+                "success_count": success_count,
+            }
+            # Summarize error types for metadata.
+            if error_details_json:
+                error_types: dict[str, int] = {}
+                for err in error_details_json:
+                    err_msg = err.get("error_message") or "unknown"
+                    # Truncate long error messages for metadata.
+                    err_key = err_msg[:100]
+                    error_types[err_key] = error_types.get(err_key, 0) + 1
+                error_metadata["error_types"] = error_types
+
+            _ensure(county_name)["scraper_run_success_rate_24h"] = {
+                "value": rate,
+                "metadata": error_metadata,
+            }
+
+    # --- Ruling-to-document ratio (#2230) ---
+    cutoff_fc = now - timedelta(days=FIELD_COMPLETENESS_WINDOW_DAYS)
+    grace_fc = now - timedelta(minutes=FIELD_COMPLETENESS_GRACE_MINUTES)
+    with conn.cursor() as cur:
+        cur.execute(
+            RULING_DOC_RATIO_QUERY.format(county_filter=county_filter),
+            (cutoff_fc, grace_fc, *county_params),
+        )
+        for row in cur.fetchall():
+            county_name, total_docs, total_rulings = row
+            if total_docs == 0:
+                continue
+            ratio = round(total_rulings / total_docs, 3)
+            _ensure(county_name)["ruling_document_ratio"] = {
+                "value": ratio,
+                "metadata": {
+                    "total_documents": total_docs,
+                    "total_rulings": total_rulings,
+                },
+            }
+
+    return result
+
+
+def _format_metrics_for_snapshot(
+    full_metrics: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Convert ``_collect_full_metrics`` output to the legacy snapshot format.
+
+    The S3 trend-storage layer expects a simpler structure:
+    ``{county: {ruling_count_24h: int, field_completeness: {field: pct,
+    ...}}}``.  This helper adapts the richer ``_collect_full_metrics``
+    output to that format.
+
+    Args:
+        full_metrics: Output of ``_collect_full_metrics``.
+
+    Returns:
+        Dict in the legacy snapshot format.
+    """
+    snapshot_data: dict[str, dict[str, Any]] = {}
+    for county_name, metrics in full_metrics.items():
+        county_data: dict[str, Any] = {}
+        if "ruling_count_24h" in metrics:
+            county_data["ruling_count_24h"] = metrics["ruling_count_24h"]["value"]
+
+        # Re-construct the field_completeness dict from the individual metrics.
+        _field_prefix = "field_completeness_"
+        fc_data = {
+            k.replace(_field_prefix, ""): v["value"]
+            for k, v in metrics.items()
+            if k.startswith(_field_prefix) and k != "field_completeness_pct"
+        }
+        if fc_data:
+            county_data["field_completeness"] = fc_data
+
+        if "ruling_document_ratio" in metrics:
+            county_data["ruling_document_ratio"] = metrics["ruling_document_ratio"][
+                "value"
+            ]
+
+        if county_data:
+            snapshot_data[county_name] = county_data
+    return snapshot_data
+
+
+# ---------------------------------------------------------------------------
+# Metrics persistence
+# ---------------------------------------------------------------------------
+
+INSERT_METRICS_QUERY = """
+    INSERT INTO data_quality_metrics (recorded_at, county, metric_name, metric_value, metadata)
+    VALUES (%s, %s, %s, %s, %s)
+"""
+
+
+def persist_metrics(
+    conn: psycopg.Connection,  # type: ignore[type-arg]
+    county_metrics: dict[str, dict[str, Any]],
+    now: datetime | None = None,
+) -> int:
+    """Write collected metrics to the data_quality_metrics table.
+
+    Uses batched inserts via ``executemany`` to minimize round-trips.
+    Failures are logged but do not raise — the check run must not be
+    blocked by metrics storage.
+
+    Args:
+        conn: Database connection (reused from the check run).
+        county_metrics: Dict from ``_collect_full_metrics``.  Each value
+            is a dict of metric_name -> {value, metadata}.
+        now: Timestamp for the recorded_at column.  Defaults to UTC now.
+
+    Returns:
+        Number of metric rows inserted, or 0 on failure.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    rows: list[tuple[datetime, str, str, float, str | None]] = []
+    for county_name, metrics in county_metrics.items():
+        for metric_name, metric_data in metrics.items():
+            value = metric_data["value"]
+            metadata = metric_data.get("metadata")
+            metadata_json = json.dumps(metadata) if metadata is not None else None
+            rows.append((now, county_name, metric_name, float(value), metadata_json))
+
+    if not rows:
+        logger.info("No metrics to persist.")
+        return 0
+
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(INSERT_METRICS_QUERY, rows)
+        conn.commit()
+        logger.info("Persisted %d metric rows to data_quality_metrics.", len(rows))
+        return len(rows)
+    except Exception:
+        logger.exception(
+            "Failed to persist %d metrics to data_quality_metrics — "
+            "continuing without metrics storage.",
+            len(rows),
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def run_checks(
+    dsn: str,
+    *,
+    county: str | None = None,
+    baselines_path: Path | None = None,
+    baselines_raw: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    update_baselines: bool = False,
+    check_ecs: bool = False,
+) -> list[Alert]:
+    """Run all data quality checks.
+
+    Args:
+        dsn: Database connection string.
+        county: Optional county name filter.
+        baselines_path: Path to baselines JSON file.
+        baselines_raw: Pre-parsed baselines dict (takes priority over path).
+        now: Override current time (for testing).
+        update_baselines: If True, snapshot current field completeness
+            as baselines (ratchet up only) and skip alerting.
+        check_ecs: If True, also check ECS service health via AWS API.
+
+    Returns:
+        List of all alerts found.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    baselines = load_baselines(baselines_path, raw=baselines_raw)
+    field_baselines = load_field_baselines(baselines_path, raw=baselines_raw)
+    exp_null_rates = load_expected_null_rates(baselines_path, raw=baselines_raw)
+    alerts: list[Alert] = []
+
+    with psycopg.connect(dsn) as conn:
+        rebuild_active = is_rebuild_in_progress(conn, now)
+
+        alerts.extend(check_ingest_rates(conn, now, baselines, county))
+        alerts.extend(check_scraper_staleness(conn, now, baselines, county))
+
+        if update_baselines:
+            current, totals = _query_field_completeness(conn, now, county)
+            save_field_baselines(current, baselines_path, totals=totals)
+        else:
+            alerts.extend(
+                check_field_completeness(
+                    conn,
+                    now,
+                    field_baselines,
+                    county,
+                    baselines,
+                    expected_null_rates=exp_null_rates,
+                )
+            )
+
+        alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
+        alerts.extend(check_ruling_document_ratio(conn, now, county, field_baselines))
+
+    if check_ecs:
+        ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
+        alerts.extend(check_ecs_service_health(ecs_configs))
+
+    # Downgrade P1 alerts during active rebuilds (#2222).
+    if rebuild_active:
+        alerts = _downgrade_p1_alerts_for_rebuild(alerts)
+
+    return alerts
+
+
+def run_checks_full(
+    dsn: str,
+    *,
+    county: str | None = None,
+    baselines_path: Path | None = None,
+    baselines_raw: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    update_baselines: bool = False,
+    persist: bool = False,
+    check_ecs: bool = False,
+) -> CheckResult:
+    """Run all data quality checks and collect county metrics.
+
+    Like ``run_checks`` but also returns the per-county metrics snapshot
+    needed for trend storage.  When ``persist=True``, writes all collected
+    metrics to the ``data_quality_metrics`` table.
+
+    Args:
+        dsn: Database connection string.
+        county: Optional county name filter.
+        baselines_path: Path to baselines JSON file.
+        baselines_raw: Pre-parsed baselines dict (takes priority over path).
+        now: Override current time (for testing).
+        update_baselines: If True, snapshot current field completeness
+            as baselines (ratchet up only) and skip alerting.
+        persist: If True, write metrics to the data_quality_metrics table.
+        check_ecs: If True, also check ECS service health via AWS API.
+
+    Returns:
+        CheckResult with alerts and county metrics.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    baselines = load_baselines(baselines_path, raw=baselines_raw)
+    field_baselines = load_field_baselines(baselines_path, raw=baselines_raw)
+    exp_null_rates = load_expected_null_rates(baselines_path, raw=baselines_raw)
+    alerts: list[Alert] = []
+
+    with psycopg.connect(dsn) as conn:
+        rebuild_active = is_rebuild_in_progress(conn, now)
+
+        alerts.extend(check_ingest_rates(conn, now, baselines, county))
+        alerts.extend(check_scraper_staleness(conn, now, baselines, county))
+
+        if update_baselines:
+            current, totals = _query_field_completeness(conn, now, county)
+            save_field_baselines(current, baselines_path, totals=totals)
+        else:
+            alerts.extend(
+                check_field_completeness(
+                    conn,
+                    now,
+                    field_baselines,
+                    county,
+                    baselines,
+                    expected_null_rates=exp_null_rates,
+                )
+            )
+
+        alerts.extend(check_orphaned_documents(conn, now, county, field_baselines))
+        alerts.extend(check_ruling_document_ratio(conn, now, county, field_baselines))
+
+        # Single metric collection pass — we derive the legacy snapshot
+        # format from the full metrics to avoid duplicate queries.
+        full_metrics = _collect_full_metrics(conn, now, county, baselines)
+        county_metrics = _format_metrics_for_snapshot(full_metrics)
+
+        if persist:
+            persist_metrics(conn, full_metrics, now)
+
+    if check_ecs:
+        ecs_configs = load_ecs_service_configs(raw=baselines_raw, path=baselines_path)
+        alerts.extend(check_ecs_service_health(ecs_configs))
+
+    # Downgrade P1 alerts during active rebuilds (#2222).
+    if rebuild_active:
+        alerts = _downgrade_p1_alerts_for_rebuild(alerts)
+
+    return CheckResult(alerts=alerts, county_metrics=county_metrics)
+
+
+def format_json(alerts: list[Alert]) -> str:
+    """Format alerts as JSON.
+
+    Args:
+        alerts: List of Alert objects.
+
+    Returns:
+        JSON string.
+    """
+    return json.dumps(
+        {
+            "healthy": len(alerts) == 0,
+            "alert_count": len(alerts),
+            "alerts": [asdict(a) for a in alerts],
+        },
+        indent=2,
+        default=str,
+    )
+
+
+def format_text(alerts: list[Alert]) -> str:
+    """Format alerts as human-readable text.
+
+    Args:
+        alerts: List of Alert objects.
+
+    Returns:
+        Formatted text string.
+    """
+    if not alerts:
+        return "All counties healthy. No alerts."
+    lines = [f"Found {len(alerts)} alert(s):", ""]
+    for a in alerts:
+        severity_marker = "[P1]" if a.severity == "p1" else "[P2]"
+        lines.append(f"  {severity_marker} {a.message}")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Data quality monitoring — collection health and field completeness checks.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="Machine-readable JSON output (default).",
+    )
+    parser.add_argument(
+        "--text",
+        action="store_true",
+        help="Human-readable text output.",
+    )
+    parser.add_argument(
+        "--county",
+        type=str,
+        default=None,
+        help="Check only this county.",
+    )
+    parser.add_argument(
+        "--baselines",
+        type=str,
+        default=None,
+        help="Path to baselines JSON file.",
+    )
+    parser.add_argument(
+        "--baselines-json",
+        type=str,
+        default=None,
+        help=(
+            "Baselines as an inline JSON string. Takes priority over --baselines. "
+            "Useful for ECS oneshot where the baselines file is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--baselines-base64",
+        type=str,
+        default=None,
+        help=(
+            "Baselines as a base64-encoded JSON string. Takes priority over "
+            "--baselines and --baselines-json. Avoids shell quoting issues "
+            "when passing JSON through multiple shell layers (e.g. GitHub "
+            "Actions -> ecs-run-task.sh -> ECS container)."
+        ),
+    )
+    parser.add_argument(
+        "--update-baselines",
+        action="store_true",
+        help="Snapshot current field completeness as baselines (ratchet up only).",
+    )
+    parser.add_argument(
+        "--store-results",
+        action="store_true",
+        default=False,
+        help="Store check results to S3 for trend analysis.",
+    )
+    parser.add_argument(
+        "--s3-bucket",
+        type=str,
+        default="judgemind-assets-dev",
+        help="S3 bucket for trend storage (default: judgemind-assets-dev).",
+    )
+    parser.add_argument(
+        "--weekly-summary",
+        action="store_true",
+        default=False,
+        help="Generate a markdown weekly summary from stored snapshots.",
+    )
+    parser.add_argument(
+        "--persist-metrics",
+        action="store_true",
+        default=False,
+        help="Write per-county metrics to the data_quality_metrics table.",
+    )
+    parser.add_argument(
+        "--check-ecs",
+        action="store_true",
+        default=False,
+        help="Also check ECS service health (runningCount vs desiredCount).",
+    )
+    args = parser.parse_args()
+
+    # Weekly summary mode: load snapshots from S3 and generate report.
+    # Does not require a database connection.
+    if args.weekly_summary:
+        ts = _import_trend_storage()
+        snapshots = ts.load_snapshots(bucket=args.s3_bucket)
+        print(ts.generate_weekly_summary(snapshots))
+        sys.exit(0)
+
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        logger.error("DATABASE_URL environment variable is required")
+        sys.exit(1)
+
+    baselines_path = Path(args.baselines) if args.baselines else None
+
+    # Parse inline baselines if provided (takes priority over file path).
+    # This is used when running as an ECS oneshot where the baselines file
+    # is not available alongside the script.
+    # Priority: --baselines-base64 > --baselines-json > --baselines (file path).
+    baselines_raw: dict[str, Any] | None = None
+    if args.baselines_base64:
+        try:
+            decoded = base64.b64decode(args.baselines_base64).decode("utf-8")
+            baselines_raw = json.loads(decoded)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.error("Failed to decode --baselines-base64: %s", exc)
+            sys.exit(1)
+    elif args.baselines_json:
+        try:
+            baselines_raw = json.loads(args.baselines_json)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse --baselines-json as JSON")
+            sys.exit(1)
+
+    if args.store_results or args.persist_metrics:
+        # Use run_checks_full to also collect county metrics for storage.
+        check_result = run_checks_full(
+            dsn,
+            county=args.county,
+            baselines_path=baselines_path,
+            baselines_raw=baselines_raw,
+            update_baselines=args.update_baselines,
+            persist=args.persist_metrics,
+            check_ecs=args.check_ecs,
+        )
+        alerts = check_result.alerts
+
+        if args.store_results:
+            ts = _import_trend_storage()
+            now = datetime.now(UTC)
+
+            snapshot = ts.Snapshot(
+                timestamp=now.isoformat(),
+                county_metrics=check_result.county_metrics,
+                alerts=[asdict(a) for a in alerts],
+            )
+            ts.store_snapshot(snapshot, bucket=args.s3_bucket)
+
+            # Also run trend detection and include trend alerts in output.
+            snapshots = ts.load_snapshots(bucket=args.s3_bucket, now=now)
+            trend_alerts = ts.detect_trends(snapshots, now=now)
+            if trend_alerts:
+                for ta in trend_alerts:
+                    alerts.append(
+                        Alert(
+                            county=ta.county,
+                            metric=ta.metric,
+                            severity=ta.severity,
+                            expected=ta.prior_avg,
+                            actual=ta.current_avg,
+                            message=ta.message,
+                        )
+                    )
+    else:
+        alerts = run_checks(
+            dsn,
+            county=args.county,
+            baselines_path=baselines_path,
+            baselines_raw=baselines_raw,
+            update_baselines=args.update_baselines,
+            check_ecs=args.check_ecs,
+        )
+
+    if args.text:
+        print(format_text(alerts))
+    else:
+        print(format_json(alerts))
+
+    # Log a completion marker for CloudWatch metric filters.
+    # This allows a CloudWatch alarm to detect when the check stops running.
+    logger.info("data_quality_check_complete alert_count=%d", len(alerts))
+
+    sys.exit(0 if len(alerts) == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

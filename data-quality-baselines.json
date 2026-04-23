@@ -1,0 +1,293 @@
+{
+  "counties": {
+    "Los Angeles": {
+      "expected_daily_rulings": 50,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    },
+    "Orange": {
+      "expected_daily_rulings": 20,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    },
+    "Santa Clara": {
+      "expected_daily_rulings": 0.1,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu"],
+      "low_volume": true,
+      "min_days_zero_before_alert": 2
+    },
+    "San Francisco": {
+      "expected_daily_rulings": 0.5,
+      "schedule_type": "daily",
+      "posting_days": ["Tue", "Thu"],
+      "low_volume": true,
+      "min_days_zero_before_alert": 2
+    },
+    "Riverside": {
+      "expected_daily_rulings": 15,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    },
+    "San Bernardino": {
+      "expected_daily_rulings": 3,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+      "min_days_zero_before_alert": 2,
+      "_note": "Lowered from 10 to 3 (#1769): court posts 1-4 new PDFs/hearing day. Spikes (20+) occur when existing PDFs are updated, not from new postings. 49 PDFs on index page spanning ~4 weeks."
+    },
+    "San Diego": {
+      "expected_daily_rulings": 0,
+      "schedule_type": "daily",
+      "posting_days": [],
+      "low_volume": true
+    },
+    "Ventura": {
+      "expected_daily_rulings": 5,
+      "schedule_type": "daily",
+      "posting_days": ["Tue", "Wed", "Thu", "Fri"]
+    },
+    "Contra Costa": {
+      "expected_daily_rulings": 15,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    },
+    "Fresno": {
+      "expected_daily_rulings": 3,
+      "schedule_type": "daily",
+      "posting_days": ["Tue", "Wed", "Thu"],
+      "low_volume": true,
+      "min_days_zero_before_alert": 2
+    },
+    "Federal": {
+      "expected_daily_rulings": 10,
+      "schedule_type": "daily",
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+      "_note": "CourtListener data (federal court opinions). Different court type from CA state courts but uses same ingestion pipeline. Sat rulings are rare (<2%) so not included in posting_days."
+    }
+  },
+  "ecs_services": [
+    {
+      "cluster": "judgemind-dev",
+      "service": "judgemind-ingestion-worker-dev",
+      "display_name": "Ingestion Worker (dev)"
+    },
+    {
+      "cluster": "judgemind-dev",
+      "service": "judgemind-api-dev",
+      "display_name": "API (dev)"
+    }
+  ],
+  "expected_null_rates": {
+    "_updated": "2026-04-01",
+    "_note": "Per-county expected null rates for fields where the source data structurally lacks extractable information. These are irreducible: no extraction improvement will lower them. The check_field_completeness function caps the effective baseline at (100 - expected_null_rate) to prevent false-positive alerts. See #2304 investigation and #2318.",
+    "Orange": {
+      "outcome": 17.0,
+      "motion_type": 15.0,
+      "_note": "Calendar-list PDFs contain only motion titles with no ruling text. ~66 of 113 null-outcome rulings have ruling_text < 100 chars. Residual null rate excluding stub-text: ~0.5%."
+    },
+    "Santa Clara": {
+      "outcome": 2.0,
+      "motion_type": 10.0,
+      "_note": "Cross-reference entries ('See Line N for tentative ruling') share rulings across calendar lines. Resolution tracked in #2317."
+    }
+  },
+  "field_completeness": {
+    "_updated": "2026-03-31",
+    "_note": "Baselines reset after full database rebuild on 2026-03-31 (#2264). All documents re-ingested from S3 archive with fresh created_at timestamps, bringing the entire corpus into the 7-day check window. Numbers reflect current extraction pipeline reality post-rebuild.",
+    "_definitions": {
+      "total_documents": "Count of active documents that have at least one ruling record (JOIN documents d ... JOIN rulings r ON r.document_id = d.id) within the field completeness check window. This is the denominator for all field completeness percentages. It does NOT include orphaned documents (those with no ruling)."
+    },
+    "Los Angeles": {
+      "total_documents": 2843,
+      "ruling": 100.0,
+      "judge": 35.0,
+      "motion_type": 98.0,
+      "outcome": 99.0,
+      "case_title": 93.0,
+      "case_number": 89.0,
+      "parties": 97.0,
+      "hearing_date": 100.0,
+      "case_type": 97.0,
+      "_known_gaps": {
+        "judge": "~65% of rulings lack judge extraction post-rebuild. Significant regression from pre-rebuild 94.5% — rebuild re-ingested all docs but enrichment judge resolution may not have re-run for all records.",
+        "case_title": "~7% of rulings lack case_title. Some LA HTML docs may have unrecognized heading formats.",
+        "case_number": "~11% of rulings lack case_number extraction."
+      }
+    },
+    "Orange": {
+      "total_documents": 1401,
+      "ruling": 100.0,
+      "judge": 94.0,
+      "motion_type": 85.0,
+      "outcome": 83.0,
+      "case_title": 97.0,
+      "case_number": 72.0,
+      "parties": 92.0,
+      "hearing_date": 97.0,
+      "case_type": 95.0,
+      "_known_gaps": {
+        "judge": "OC judge improved to ~95% post-rebuild (up from 41%). Scraper-provided judge_name restoration (#2063 fix) and backfill now effective.",
+        "motion_type": "~15% of OC rulings lack motion_type extraction.",
+        "outcome": "~17% of OC rulings lack outcome extraction.",
+        "case_number": "~28% of OC rulings have UNKNOWN case numbers. OC North JC PDFs structurally lack case numbers.",
+        "parties": "~8% of docs missing party extraction."
+      }
+    },
+    "Riverside": {
+      "total_documents": 648,
+      "ruling": 100.0,
+      "judge": 13.0,
+      "motion_type": 78.0,
+      "outcome": 85.0,
+      "case_title": 97.0,
+      "case_number": 97.0,
+      "parties": 43.0,
+      "hearing_date": 100.0,
+      "case_type": 96.0,
+      "_known_gaps": {
+        "judge": "~87% of rulings lack judge extraction. Riverside PDFs rarely contain judge info; enrichment pipeline improvements needed.",
+        "parties": "~57% of rulings lack party extraction. Riverside PDF documents have party names embedded in complex formats not matched by enrichment.",
+        "motion_type": "~22% of docs missing motion_type extraction.",
+        "outcome": "~15% of docs missing outcome extraction."
+      }
+    },
+    "San Bernardino": {
+      "total_documents": 160,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 86.0,
+      "outcome": 85.0,
+      "case_title": 99.0,
+      "case_number": 91.0,
+      "parties": 98.0,
+      "hearing_date": 100.0,
+      "case_type": 100.0,
+      "_known_gaps": {
+        "_note": "Post-rebuild SB has ~160 docs. Field completeness regressed from previous 100% baselines — rebuild captured different document mix. Baselines set with margin to avoid false-positive P1 alerts as the 7-day window shifts.",
+        "motion_type": "~14% of docs missing motion_type.",
+        "outcome": "~15% of docs missing outcome.",
+        "case_number": "~9% of docs missing case_number."
+      }
+    },
+    "San Diego": {
+      "total_documents": 1,
+      "ruling": 100.0,
+      "judge": 0.0,
+      "motion_type": 0.0,
+      "outcome": 0.0,
+      "case_title": 100.0,
+      "case_number": 100.0,
+      "parties": 100.0,
+      "hearing_date": 100.0,
+      "case_type": 0.0,
+      "_known_gaps": {
+        "_note": "San Diego has only 1 doc in the 7-day window (down from 6). Extremely low sample size makes percentages meaningless. Most fields at 0% due to the single document lacking extraction."
+      }
+    },
+    "San Francisco": {
+      "total_documents": 162,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 94.0,
+      "outcome": 100.0,
+      "case_title": 100.0,
+      "case_number": 98.0,
+      "parties": 100.0,
+      "hearing_date": 100.0,
+      "case_type": 99.0,
+      "_known_gaps": {
+        "_note": "SF volume increased to 162 docs post-rebuild (up from 84). Field completeness improved across the board.",
+        "motion_type": "~6% of SF rulings lack motion_type (improved from 35% gap)."
+      }
+    },
+    "Santa Clara": {
+      "total_documents": 83,
+      "ruling": 100.0,
+      "judge": 100.0,
+      "motion_type": 90.0,
+      "outcome": 98.0,
+      "case_title": 98.0,
+      "case_number": 98.0,
+      "parties": 97.0,
+      "hearing_date": 98.0,
+      "case_type": 100.0,
+      "_known_gaps": {
+        "_note": "Santa Clara post-rebuild: 83 docs in window (down from 189). Completeness slightly adjusted.",
+        "motion_type": "~10% of SC rulings lack motion_type extraction."
+      }
+    },
+    "Ventura": {
+      "total_documents": 269,
+      "ruling": 100.0,
+      "judge": 14.0,
+      "motion_type": 61.0,
+      "outcome": 53.0,
+      "case_title": 100.0,
+      "case_number": 74.0,
+      "parties": 33.0,
+      "hearing_date": 100.0,
+      "case_type": 95.0,
+      "_known_gaps": {
+        "judge": "~86% of Ventura rulings lack judge extraction. Regression from previous 100% — rebuild re-ingested all docs but Ventura PDFs may lack judge metadata.",
+        "motion_type": "~39% of Ventura rulings lack motion_type. Probate/guardianship/trust event types not matched by enrichment. See #1767.",
+        "outcome": "~47% of Ventura rulings lack outcome extraction. Significant gap — likely Ventura's PDF formats are not well-handled by the outcome extraction pipeline.",
+        "parties": "~67% of Ventura rulings lack party extraction. Ventura PDFs have complex party name formats.",
+        "case_number": "~26% of Ventura rulings lack case_number extraction."
+      }
+    },
+    "Contra Costa": {
+      "total_documents": 207,
+      "ruling": 100.0,
+      "judge": 99.0,
+      "motion_type": 90.0,
+      "outcome": 84.0,
+      "case_title": 99.0,
+      "case_number": 99.0,
+      "parties": 81.0,
+      "hearing_date": 99.0,
+      "case_type": 87.0,
+      "_known_gaps": {
+        "parties": "~19% of Contra Costa rulings lack party extraction. Probate cases have non-standard party formats.",
+        "outcome": "~16% of rulings lack outcome extraction.",
+        "motion_type": "~10% of rulings lack motion_type extraction.",
+        "case_type": "~13% of rulings lack case_type extraction."
+      }
+    },
+    "Fresno": {
+      "total_documents": 35,
+      "ruling": 100.0,
+      "judge": 0.0,
+      "motion_type": 94.0,
+      "outcome": 100.0,
+      "case_title": 94.0,
+      "case_number": 94.0,
+      "parties": 94.0,
+      "hearing_date": 100.0,
+      "case_type": 97.0,
+      "_known_gaps": {
+        "judge": "0% judge extraction — Fresno PDFs contain only judge initials (e.g. 'lmg', 'DTT') in the 'Issued By:' line, not full names. No judge resolution possible without a dept-to-judge roster.",
+        "_note": "Low volume county (35 docs across 4 departments). Baselines set with margin for small sample size."
+      }
+    },
+    "Federal": {
+      "total_documents": 205,
+      "ruling": 100.0,
+      "judge": 48.0,
+      "motion_type": 96.0,
+      "outcome": 100.0,
+      "case_title": 91.0,
+      "case_number": 80.0,
+      "parties": 94.0,
+      "hearing_date": 86.0,
+      "case_type": 65.0,
+      "_known_gaps": {
+        "judge": "~52% of federal rulings lack judge extraction. CourtListener data has different metadata structure from CA state courts.",
+        "hearing_date": "~14% of federal rulings lack hearing_date. Federal opinions may not always have associated hearing dates.",
+        "case_number": "~20% of rulings lack case_number extraction.",
+        "case_type": "~35% of rulings lack case_type. Federal case type taxonomy differs from CA state courts.",
+        "_note": "Federal data sourced from CourtListener (Free Law Project API). Different court type from CA state courts — field completeness patterns differ due to distinct data structure and metadata availability."
+      }
+    }
+  }
+}

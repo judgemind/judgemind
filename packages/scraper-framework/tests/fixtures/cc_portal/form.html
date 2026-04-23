@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tentative Rulings Search | Contra Costa Superior Court</title>
+</head>
+<body>
+<h1>Search Tentative Rulings</h1>
+<form method="get" action="/tentative-rulings">
+  <div class="form-item">
+    <label for="case-number">Case Number</label>
+    <input type="text" id="case-number" name="case_number" value="">
+  </div>
+  <div class="form-item">
+    <label for="field-judge">Judicial Officer</label>
+    <select name="field_judge_target_id" id="field-judge">
+      <option value="All">- Any -</option>
+      <option value="238">JOHN P DEVINE</option>
+      <option value="242">CHARLES S TREAT</option>
+      <option value="245">BENJAMIN REYES</option>
+      <option value="276">DANIELLE K DOUGLAS</option>
+      <option value="278">SHARA E BELTRAMO</option>
+      <option value="280">EDWARD G WEIL</option>
+    </select>
+  </div>
+  <input type="submit" value="Search">
+</form>
+</body>
+</html>

@@ -1,0 +1,51 @@
+{
+  "name": "judgemind-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Judgemind GraphQL + REST API",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "eslint src/ tests/ --no-error-on-unmatched-pattern",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "test:unit": "vitest run --passWithNoTests .unit.test",
+    "test:integration": "vitest run --passWithNoTests .integration.test",
+    "test:watch": "vitest",
+    "db:migrate": "tsc && node scripts/seed-and-migrate.mjs",
+    "db:migrate:down": "node-pg-migrate down --no-timestamp",
+    "db:migrate:create": "node-pg-migrate create --migration-file-language sql --no-timestamp"
+  },
+  "dependencies": {
+    "@apollo/server": "^4.10",
+    "@aws-sdk/client-s3": "^3.1004.0",
+    "@aws-sdk/client-ses": "^3.1000.0",
+    "@aws-sdk/s3-request-presigner": "^3.1004.0",
+    "@opensearch-project/opensearch": "^3.5.1",
+    "bcryptjs": "^2.4",
+    "dataloader": "^2.2.3",
+    "fastify": "^4.26",
+    "graphql": "^16.8",
+    "jsonwebtoken": "^9.0",
+    "node-pg-migrate": "^7.0",
+    "pg": "^8.11",
+    "pino": "^8.19",
+    "redis": "^4.6",
+    "zod": "^3.22"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2",
+    "@types/jsonwebtoken": "^9",
+    "@types/node": "^20",
+    "@types/pg": "^8",
+    "@typescript-eslint/eslint-plugin": "^7",
+    "@typescript-eslint/parser": "^7",
+    "eslint": "^8",
+    "tsx": "^4.7",
+    "typescript": "^5.4",
+    "vitest": "^1.4",
+    "@vitest/coverage-v8": "^1.4"
+  }
+}

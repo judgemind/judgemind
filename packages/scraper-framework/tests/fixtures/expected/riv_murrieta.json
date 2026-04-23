@@ -1,0 +1,18 @@
+{
+  "_fixture": "riv_murrieta.pdf",
+  "_description": "Riverside Murrieta Courthouse — Dept M205 (Judge Belinda Handy). 1-page 'No Tentative Rulings' for 2026-03-02.",
+  "_link_text": "Department M205 - Honorable Belinda Handy",
+  "_captured": "2026-03-02",
+  "courthouse": "Murrieta Courthouse",
+  "department": "M205",
+  "judge_name": "Belinda Handy",
+  "page_count": 1,
+  "case_count": 0,
+  "hearing_date": "March 2, 2026",
+  "ruling_text_contains": [
+    "No Tentative Rulings March 2, 2026",
+    "Department M205"
+  ],
+  "_edge_case": "no_tentative_rulings",
+  "_notes": "Current-dated 'No Tentative Rulings' placeholder. Unlike Dept 260 (stale 2023 PDF), this one has today's date. Scraper must distinguish: 0 cases is valid, not an error."
+}

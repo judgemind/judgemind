@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Cvri2600127 Pierson v. I.H. Investments\n\nMOTION TO DISMISS FOR FAILURE\nTO PROSECUTE\nTentative Ruling: Motion is Denied as Moot. Plaintiff is again ordered to pay the prior sanctions\nof $3,040.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "mtd",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/riverside/superior_court/raw/2026/03/24/d8d29f3e-2265-5937-b8c2-75880da6012f.pdf",
+  "notes": ""
+}

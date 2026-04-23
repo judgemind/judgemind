@@ -1,0 +1,22 @@
+{
+  "_fixture": "sb_r17_20260302_817a3a84.pdf",
+  "_description": "San Bernardino Dept R17 (Judge Gilbert G. Ochoa). 8-page PDF with 1 case (2 related motions to set aside default).",
+  "_captured": "2026-03-02",
+  "courthouse": "Rancho Cucamonga Justice Center",
+  "department": "R17",
+  "judge_name": "Gilbert G. Ochoa",
+  "page_count": 8,
+  "case_count": 1,
+  "primary_case_number": "CIVSB2412500",
+  "case_number_format": "CIV{LOCATION}{YYNNNNN}",
+  "hearing_date": "March 2, 2026",
+  "expected_cases": [
+    {
+      "case_number": "CIVSB2412500",
+      "case_title": "Li Wang v. Youbo He",
+      "motion_type": "set aside default",
+      "outcome": "denied"
+    }
+  ],
+  "_notes": "Single-case PDF with 2 related motions (He + Xu). Header format: 'Department R17- Judge Gilbert G. Ochoa' (dash attached to dept). Both motions denied."
+}

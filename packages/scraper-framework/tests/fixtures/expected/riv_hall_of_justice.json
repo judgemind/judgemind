@@ -1,0 +1,18 @@
+{
+  "_fixture": "riv_hall_of_justice.pdf",
+  "_description": "Riverside Hall of Justice — Dept 260. 1-page 'No Tentative Rulings' placeholder PDF from 2023.",
+  "_link_text": "Department 260",
+  "_captured": "2026-03-02",
+  "courthouse": "Hall of Justice",
+  "department": "260",
+  "judge_name": null,
+  "page_count": 1,
+  "case_count": 0,
+  "hearing_date": null,
+  "ruling_text_contains": [
+    "No Tentative Rulings for",
+    "Department 260"
+  ],
+  "_edge_case": "no_tentative_rulings",
+  "_notes": "Placeholder PDF: 'No Tentative Rulings for Department 260'. Link text has no judge name — scraper gets None for judge_name. This is a 2023 document still linked from the index. Important edge case: scraper must handle no-ruling PDFs without crashing."
+}

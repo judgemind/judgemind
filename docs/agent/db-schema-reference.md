@@ -1,0 +1,133 @@
+# Database Schema Quick Reference
+
+Quick-reference for agents writing SQL scripts. **Always check this before using
+`ON CONFLICT`** — the target must match an existing UNIQUE constraint.
+
+## Commonly Confused Tables
+
+### `parties` vs `case_parties`
+
+These two tables serve different purposes. Confusing them causes bugs
+(see #1455 / #1559 where a script queried `parties.case_id`, which does not exist).
+
+| Table | Purpose | Key columns | Has `case_id`? |
+|---|---|---|---|
+| `parties` | **Party entity table** — one row per unique party (person or org) | `id`, `canonical_name`, `party_type` | **No** |
+| `case_parties` | **Junction table** — links a case to a party with a role | `id`, `case_id`, `party_id`, `role` | **Yes** |
+
+**Rules of thumb:**
+- To find which parties are in a case: query `case_parties WHERE case_id = ...`
+- To look up a party by name: query `parties WHERE canonical_name = ...`
+- To get parties for a case with names: `JOIN case_parties cp ON cp.case_id = c.id JOIN parties p ON p.id = cp.party_id`
+- **Never** write `parties.case_id` or `JOIN parties p ON p.case_id = ...` — the column does not exist.
+
+The same entity/junction split applies to other relationships:
+
+| Entity table | Junction table |
+|---|---|
+| `judges` | `case_judges` |
+| `attorneys` | `case_attorneys` |
+| `parties` | `case_parties` |
+
+## Unique Constraints by Table
+
+| Table | Unique constraint columns | Source |
+|---|---|---|
+| `courts` | `(id)` PK | schema.sql |
+| `courts` | `(court_code)` | schema.sql |
+| `judges` | `(id)` PK | schema.sql |
+| `judges` | `(canonical_name, court_id)` | migration 10 |
+| `judge_aliases` | `(id)` PK | schema.sql |
+| `attorneys` | `(id)` PK | schema.sql |
+| `attorney_aliases` | `(id)` PK | schema.sql |
+| `parties` | `(id)` PK | schema.sql |
+| `party_aliases` | `(id)` PK | schema.sql |
+| `cases` | `(id)` PK | schema.sql |
+| `cases` | `(court_id, case_number)` | schema.sql |
+| `case_judges` | `(case_id, judge_id)` PK | schema.sql |
+| `case_attorneys` | `(id)` PK | schema.sql |
+| `case_attorneys` | `(case_id, attorney_id, role)` | migration 8 |
+| `case_parties` | `(id)` PK | schema.sql |
+| `case_parties` | `(case_id, party_id, role)` | migration 7 |
+| `documents` | `(id)` PK | schema.sql |
+| `rulings` | `(id)` PK | schema.sql |
+| `rulings` | `(document_id)` | migration 3 |
+| `rulings` | `(case_id, ruling_text_hash)` partial | schema.sql |
+| `users` | `(id)` PK | schema.sql |
+| `users` | `(email)` | schema.sql |
+| `users` | `(google_id)` | migration 2 |
+| `users` | `(api_key)` | schema.sql |
+| `refresh_tokens` | `(id)` PK | schema.sql |
+| `refresh_tokens` | `(token_hash)` | migration 2 |
+| `alert_subscriptions` | `(id)` PK | schema.sql |
+| `alert_events` | `(id)` PK | schema.sql |
+| `staging.captures` | `(id)` PK | schema.sql |
+| `staging.ruled_items` | `(id)` PK | schema.sql |
+| `court_directory_snapshots` | `(id)` PK | schema.sql |
+| `scraper_runs` | `(id)` PK | schema.sql |
+| `data_quality_metrics` | `(id)` PK | schema.sql |
+
+## Common ON CONFLICT patterns
+
+### Valid patterns
+
+```sql
+-- Courts: upsert by court_code
+INSERT INTO courts (...) VALUES (...)
+ON CONFLICT (court_code) DO UPDATE SET ...
+
+-- Cases: upsert by natural key
+INSERT INTO cases (...) VALUES (...)
+ON CONFLICT (court_id, case_number) DO UPDATE SET ...
+
+-- Judges: upsert by canonical name + court
+INSERT INTO judges (...) VALUES (...)
+ON CONFLICT (canonical_name, court_id) DO UPDATE SET ...
+
+-- Documents: upsert by deterministic UUID
+INSERT INTO documents (...) VALUES (...)
+ON CONFLICT (id) DO UPDATE SET ...
+
+-- Rulings: upsert by document
+INSERT INTO rulings (...) VALUES (...)
+ON CONFLICT (document_id) DO UPDATE SET ...
+
+-- Join tables: idempotent insert
+INSERT INTO case_parties (...) VALUES (...)
+ON CONFLICT (case_id, party_id, role) DO NOTHING
+
+INSERT INTO case_judges (...) VALUES (...)
+ON CONFLICT (case_id, judge_id) DO NOTHING
+```
+
+### Invalid patterns (will fail at runtime)
+
+```sql
+-- WRONG: parties has no UNIQUE on canonical_name alone
+INSERT INTO parties (canonical_name) VALUES (...)
+ON CONFLICT (canonical_name) DO UPDATE ...
+
+-- WRONG: party_aliases has no non-PK UNIQUE constraint
+INSERT INTO party_aliases (...) VALUES (...)
+ON CONFLICT (party_id, raw_name) DO NOTHING
+
+-- WRONG: case_parties UNIQUE is (case_id, party_id, role), not (case_id, party_id)
+INSERT INTO case_parties (...) VALUES (...)
+ON CONFLICT (case_id, party_id) DO UPDATE ...
+```
+
+## Automated check
+
+CI runs `scripts/check-sql-conflicts.py` which validates all `ON CONFLICT`
+targets against the `UNIQUE_CONSTRAINTS` map. This map is **auto-generated**
+from `schema.sql` and migration files at startup — no manual updates needed.
+
+## Keeping this document in sync
+
+When you add a migration that creates or drops a UNIQUE constraint:
+
+1. `scripts/check-sql-conflicts.py` will automatically detect the new
+   constraint from `schema.sql` and migration files — no manual update needed.
+2. Update this table above.
+3. If the constraint should also be in `schema.sql` for local dev, update
+   that file too (and the `check_schema_drift.sh` check will enforce it).

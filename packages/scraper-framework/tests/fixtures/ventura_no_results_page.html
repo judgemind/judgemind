@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ventura County Superior Court - Tentative Rulings</title>
+</head>
+<body>
+    <div class="container">
+        <h1>Tentative Rulings Search</h1>
+        <form action="/CaseInquiry/TentativeRulings" method="post">
+            <input name="__RequestVerificationToken" type="hidden" value="CfDJ8NcV7abc123def456ghi789_TEST_TOKEN_VALUE" />
+            <div class="form-group">
+                <label for="SearchFromDate">Search From Date</label>
+                <input type="text" id="SearchFromDate" name="SearchFromDate" value="3/15/2026" class="form-control" />
+            </div>
+            <button type="submit" class="btn btn-primary">Search</button>
+        </form>
+
+        <p class="text-info">No tentative rulings found for the selected date.</p>
+    </div>
+</body>
+</html>

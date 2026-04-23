@@ -1,0 +1,20 @@
+{
+  "_fixture": "riv_page.html",
+  "_description": "Riverside civil tentative rulings index page. 17 PDF links, not all current (some from 2023/2024).",
+  "_captured": "2026-03-02",
+  "pdf_link_count": 17,
+  "courthouse_distribution": {
+    "Palm Springs (PS)": 3,
+    "Murrieta (M)": 3,
+    "Moreno Valley (MV)": 1,
+    "Hall of Justice numbered (01-15)": 9,
+    "Corona (C)": 1
+  },
+  "link_text_format": "Department CODE - Honorable Firstname Lastname [Suffix]",
+  "first_link_example": {
+    "text": "Department 260",
+    "href": "/system/files/2023-10/2%20-%20No%20Tentatives%20Dept.%20260.pdf"
+  },
+  "_edge_case": "stale_links",
+  "_notes": "IMPORTANT: Many links point to PDFs from 2023 or 2024, not current rulings. The site does not always update all links daily. Scraper must handle stale/old PDFs. SSL cert issue — verify_ssl=False required."
+}

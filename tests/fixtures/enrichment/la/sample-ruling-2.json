@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Thompson v. City of Palm Springs\nDemurrer to Second Amended Complaint\nThe demurrer is OVERRULED. The complaint adequately states a cause of action for wrongful termination.",
+  "expected": {
+    "case_title": "Thompson v. City of Palm Springs",
+    "motion_type": "demurrer",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": ["Thompson"],
+      "defendants": ["City of Palm Springs"]
+    }
+  },
+  "source_doc": "s3://judgemind-archives-dev/ca/la/2026/03/sample2.pdf",
+  "notes": "Demurrer overruled = denied"
+}

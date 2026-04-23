@@ -1,0 +1,198 @@
+"""San Bernardino Superior Court — Civil Tentative Rulings Scraper (Pattern 2).
+
+Verified against live site 2026-03-23:
+  URL:  https://old.sb-court.org/GeneralInfo/TentativeRulings.aspx
+  49 PDF links found on index page (spanning ~4 weeks)
+  No Playwright required; httpx fetch works directly.
+  Typical posting rate: 1-4 new PDFs per hearing day (#1769).
+
+Link text format: filename only — e.g. "CVS24030426.pdf"
+  No judge name or dept in link text; both extracted later from PDF text.
+
+PDF filename pattern: CV{LOC}{DEPT}{MMDDYY}.pdf
+  LOC  = location code (first letter): S=San Bernardino, R=Rancho Cucamonga
+  DEPT = department number (e.g. 12, 24, 36)
+  MMDDYY = month+day+2-digit year
+
+Judge/dept extraction from PDF page 1 text (two observed formats):
+  Primary:  "Department R12 - Judge Kory Mathewson"
+            (handles regular dash, en-dash U+2013, em-dash U+2014, and
+            no-space before dash like "R17- Judge")
+  Fallback: "BEFORE THE HONORABLE JOSEPH WIDMAN"
+            (title-cased on extraction; used by Dept S36)
+
+Case number format: CIV + 2 uppercase letters + optional space + 5-8 digits
+  e.g. CIVRS2502080, CIVSB2416631, CIVSB 2600093 (Dept S36 uses a space)
+
+Courthouse mapping (conservative — only S and R confirmed from fixtures):
+  S* → San Bernardino Justice Center
+  R* → Rancho Cucamonga Justice Center
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from typing import Any
+
+from framework import CapturedDocument, ScheduleWindow, ScraperConfig
+
+from .pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+
+INDEX_URL = "https://old.sb-court.org/GeneralInfo/TentativeRulings.aspx"
+BASE_URL = "https://old.sb-court.org"
+
+# Link text = filename: "CVS24030426.pdf" → department "S24"
+_LINK_TEXT_RE = re.compile(r"CV(?P<department>[A-Z]\d+)\d{6}\.pdf", re.IGNORECASE)
+
+# PDF header primary format: "Department R12 - Judge Kory Mathewson"
+# \S+? (non-greedy) handles "R17-" (dash attached) as well as "R12 -" (spaced)
+# Character class [-\u2013\u2014] covers ASCII hyphen, en-dash, and em-dash
+_DEPT_JUDGE_RE = re.compile(
+    r"Department\s+\S+?\s*[-\u2013\u2014]\s*Judge\s+(?P<judge_name>[^\n]+)",
+    re.IGNORECASE,
+)
+
+# PDF header fallback: "BEFORE THE HONORABLE JOSEPH WIDMAN" (Dept S36 format)
+_HONORABLE_RE = re.compile(
+    r"BEFORE THE HONORABLE\s+(?P<judge_name>[^\n]+)",
+    re.IGNORECASE,
+)
+
+# Case numbers like "CIVRS2502080", "CIVSB2416631", "CIVSB 2600093" (Dept S36
+# uses a space between the location code and digits).  The optional \s* handles
+# both formats; extracted values are normalised (space removed) in parse_document.
+_CASE_NUMBER_RE = re.compile(r"\bCIV[A-Z]{2}\s*\d{5,8}\b")
+
+# Regex: letter prefix, optional hyphen, digits — matches both "S17" and "S-17".
+_SB_DEPT_HYPHEN_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
+
+
+def _normalize_sb_department(dept: str) -> str:
+    """Strip hyphens from SB department codes: ``S-17`` -> ``S17``, ``R-14`` -> ``R14``.
+
+    The canonical format is non-hyphenated (e.g. ``S17``, ``R14``).
+    Hyphenated variants sometimes appear in LLM extraction or PDF text.
+    This normalizes them to the canonical form.
+    """
+    m = _SB_DEPT_HYPHEN_RE.match(dept.strip())
+    if m:
+        return f"{m.group(1)}{m.group(2)}"
+    return dept.strip()
+
+
+# Filename date: CV{LOC}{DEPT}{MMDDYY}.pdf → extract MMDDYY
+_FILENAME_DATE_RE = re.compile(r"CV[A-Z]\d+(\d{6})\.pdf$", re.IGNORECASE)
+
+
+def _sb_hearing_date_from_filename(filename: str) -> datetime | None:
+    """Parse hearing date from SB filename like 'CVS24030426.pdf' → 03/04/2026."""
+    m = _FILENAME_DATE_RE.search(filename)
+    if not m:
+        return None
+    mmddyy = m.group(1)
+    try:
+        month = int(mmddyy[0:2])
+        day = int(mmddyy[2:4])
+        year = 2000 + int(mmddyy[4:6])
+        return datetime(year, month, day)
+    except (ValueError, IndexError):
+        return None
+
+
+def _sb_judge_from_pdf_text(text: str) -> str | None:
+    """Extract judge name from SB PDF page 1 text, trying two known formats."""
+    m = _DEPT_JUDGE_RE.search(text)
+    if m:
+        return m.group("judge_name").strip()
+    m2 = _HONORABLE_RE.search(text)
+    if m2:
+        # HONORABLE format is all-caps; title-case for consistency
+        return m2.group("judge_name").strip().title()
+    return None
+
+
+def _sb_courthouse(dept: str) -> str | None:
+    """Map a department code to its courthouse name."""
+    dept_upper = dept.upper()
+    if dept_upper.startswith("S"):
+        return "San Bernardino Justice Center"
+    if dept_upper.startswith("R"):
+        return "Rancho Cucamonga Justice Center"
+    return None
+
+
+class SBTentativeRulingsScraper(PdfLinkScraper):
+    """San Bernardino County civil tentative rulings — PDF-link pattern.
+
+    Department is extracted from the PDF filename (link text).
+    Judge name is extracted from PDF page 1 text in parse_document(), because
+    the SB listing page shows only the filename as link text.
+    """
+
+    def __init__(self, config: ScraperConfig, **kwargs: Any) -> None:
+        pdf_config = PdfLinkConfig(
+            index_url=INDEX_URL,
+            pdf_base_url=BASE_URL,
+            link_text_re=_LINK_TEXT_RE,
+            courthouse_from_dept=_sb_courthouse,
+            verify_ssl=True,
+            case_number_re=_CASE_NUMBER_RE,
+        )
+        super().__init__(config, pdf_config=pdf_config, **kwargs)
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        """Extract case numbers (via super), judge name, and hearing date."""
+        doc = super().parse_document(doc)
+
+        # Normalise department: strip hyphens (e.g. "S-17" → "S17") (#2123).
+        if doc.department:
+            doc.department = _normalize_sb_department(doc.department)
+
+        # Normalise case numbers: remove any internal whitespace that the
+        # broadened regex may have matched (e.g. "CIVSB 2600093" → "CIVSB2600093").
+        if doc.case_number:
+            doc.case_number = doc.case_number.replace(" ", "")
+        all_nums = doc.extra.get("all_case_numbers")
+        if all_nums:
+            doc.extra["all_case_numbers"] = [n.replace(" ", "") for n in all_nums]
+
+        if doc.ruling_text and not doc.judge_name:
+            doc.judge_name = _sb_judge_from_pdf_text(doc.ruling_text)
+
+        # Extract hearing date from link text (filename) stored in extra
+        link_text = doc.extra.get("link_text", "")
+        if link_text and not doc.hearing_date:
+            doc.hearing_date = _sb_hearing_date_from_filename(link_text)
+
+        # Fallback: extract hearing date from PDF text header
+        # (covers reingest where link_text is unavailable)
+        if doc.ruling_text and not doc.hearing_date:
+            from ingestion.extract import extract_hearing_date
+
+            hd = extract_hearing_date(doc.ruling_text)
+            if hd:
+                doc.hearing_date = datetime(hd.year, hd.month, hd.day)
+
+        return doc
+
+
+def default_config(s3_bucket: str = "") -> ScraperConfig:
+    from datetime import time as dtime
+
+    return ScraperConfig(
+        scraper_id="ca-sb-tentatives-civil",
+        state="CA",
+        county="San Bernardino",
+        court="Superior Court",
+        target_urls=[INDEX_URL],
+        poll_interval_seconds=43200,  # twice daily
+        schedule_windows=[
+            ScheduleWindow(start=dtime(15, 0), end=dtime(16, 0)),  # 3 PM sweep
+            ScheduleWindow(start=dtime(21, 0), end=dtime(22, 0)),  # 9 PM catch-up
+        ],
+        request_delay_seconds=1.0,
+        request_timeout_seconds=30.0,
+        max_retries=3,
+        s3_bucket=s3_bucket,
+    )

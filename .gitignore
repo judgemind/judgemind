@@ -1,0 +1,87 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+.venv-scripts/
+venv/
+
+# Build outputs
+dist/
+build/
+.next/
+*.egg-info/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment & secrets
+.claude/settings.local.json
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+infra/terraform/modules/**/placeholder.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test & coverage
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+lcov.info
+.pytest_cache/
+.testmondata
+.testmondata-journal
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+
+# Agent worker temp files
+tmp/
+
+# Eval script results (run-specific, not committed)
+scripts/eval/results/
+
+# Scraped data (never commit raw court data)
+data/
+*.html.raw
+*.pdf.raw
+
+# Agent temp files (per-worktree scratch space)
+tmp/
+
+# Agent worktrees (isolated git worktrees, never committed)
+worktrees/
+
+# Agent lock files (per-worktree, ephemeral)
+.agent-lock
+.claude/scheduled_tasks.lock
+
+# Vite cache
+.vite/
+
+# Task-claim agent_id sidecar (pre-#2927 — kept to ignore any
+# historical files lingering on dev machines; the current
+# label-only /task flow no longer writes this file).
+.task-agent-id

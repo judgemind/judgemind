@@ -1,0 +1,263 @@
+name: Deploy Scraper
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/scraper-framework/**"
+      - ".github/workflows/deploy-scraper.yml"
+      - ".github/actions/ecs-deploy/**"
+      # scripts/wait-for-rollout.sh is invoked by the ecs-deploy composite
+      # action. Changes to the shared script must trigger this deploy so the
+      # fix is exercised against a real rollout on its own PR (see #2592).
+      - "scripts/wait-for-rollout.sh"
+      # scripts/ecs-post-deploy-healthcheck.sh is invoked by the
+      # post-deploy-health-check job below. Same paths-filter contract as
+      # wait-for-rollout.sh — changes to the shared health-check script
+      # must trigger this deploy so regressions surface on the PR that
+      # introduces them, not on the next unrelated deploy (see #2608/#2592).
+      - "scripts/ecs-post-deploy-healthcheck.sh"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-scraper-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/scraper
+  ECS_CLUSTER: judgemind-dev
+  TASK_FAMILY: judgemind-scraper-dev
+  SCHEDULER_NAME: judgemind-scraper-dev
+  CONTAINER_NAME: scraper
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          docker build "${TAGS[@]}" -f packages/scraper-framework/Dockerfile .
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy-staging:
+    name: Deploy to Staging (dev)
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v6
+
+      - name: Set pending deployment status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Deploying scraper to staging...",
+              "context": "deploy/staging"
+            }'
+
+      - name: Deploy to ECS
+        id: deploy
+        uses: ./.github/actions/ecs-deploy
+        with:
+          task-family: ${{ env.TASK_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          deploy-mode: scheduler
+          scheduler-name: ${{ env.SCHEDULER_NAME }}
+
+      - name: Set deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'Scraper deployed to staging' || 'Staging deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/staging\"
+            }"
+
+  deploy-ingestion-worker:
+    name: Deploy Ingestion Worker to Dev
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    env:
+      INGESTION_TASK_FAMILY: judgemind-ingestion-worker-dev
+      INGESTION_SERVICE: judgemind-ingestion-worker-dev
+      INGESTION_CONTAINER: ingestion-worker
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v6
+
+      - name: Set pending deployment status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Deploying ingestion worker to dev...",
+              "context": "deploy/ingestion-worker-dev"
+            }'
+
+      - name: Deploy to ECS
+        id: deploy
+        uses: ./.github/actions/ecs-deploy
+        with:
+          task-family: ${{ env.INGESTION_TASK_FAMILY }}
+          container-name: ${{ env.INGESTION_CONTAINER }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          deploy-mode: service
+          ecs-cluster: ${{ env.ECS_CLUSTER }}
+          ecs-service: ${{ env.INGESTION_SERVICE }}
+
+      - name: Set deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'Ingestion worker deployed to dev' || 'Ingestion worker dev deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/ingestion-worker-dev\"
+            }"
+
+  post-deploy-health-check:
+    name: Post-Deploy Ingestion Worker Health Check
+    needs: deploy-ingestion-worker
+    if: always() && needs.deploy-ingestion-worker.result == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      INGESTION_SERVICE: judgemind-ingestion-worker-dev
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout (for post-deploy-healthcheck script)
+        uses: actions/checkout@v6
+
+      - name: Wait for new tasks to start
+        run: |
+          echo "Waiting 60 seconds for new ingestion worker task to fully start..."
+          sleep 60
+
+      # Post-deploy health check — delegates to the extracted, unit-tested
+      # script at scripts/ecs-post-deploy-healthcheck.sh. The extraction
+      # keeps the scale-to-zero rule (running==desired==0 treated as
+      # healthy) codified in one place so drift like #2605 cannot recur.
+      - name: Post-deploy ingestion worker health check
+        id: healthcheck
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          INGESTION_SERVICE: ${{ env.INGESTION_SERVICE }}
+          LOG_GROUP: /ecs/judgemind-ingestion-worker-dev
+        run: bash scripts/ecs-post-deploy-healthcheck.sh
+
+      - name: Set health check status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEALTH_STATUS: ${{ steps.healthcheck.outcome == 'success' && 'success' || 'failure' }}
+          HEALTH_DESC: ${{ steps.healthcheck.outcome == 'success' && 'Ingestion worker health check passed' || 'Ingestion worker health check failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$HEALTH_STATUS\",
+              \"description\": \"$HEALTH_DESC\",
+              \"context\": \"deploy/ingestion-worker-dev-health\"
+            }"

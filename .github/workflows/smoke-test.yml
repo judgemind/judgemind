@@ -1,0 +1,350 @@
+name: Smoke Test
+
+on:
+  schedule:
+    # Every 15 minutes
+    - cron: '*/15 * * * *'
+  # Also run on deployment_status from Vercel
+  deployment_status:
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+# Only one smoke test at a time
+concurrency:
+  group: smoke-test
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  smoke-test:
+    name: Check major pages
+    runs-on: ubuntu-latest
+    # For deployment_status, only run when the deploy succeeded
+    if: >-
+      github.event_name != 'deployment_status' ||
+      github.event.deployment_status.state == 'success'
+
+    env:
+      BASE_URL: https://dev.judgemind.org
+      API_URL: https://dev.api.judgemind.org/graphql
+      API_BASE_URL: https://dev.api.judgemind.org
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Fetch sample IDs from API
+        id: ids
+        run: |
+          # Get a sample case ID
+          CASE_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ cases(first: 1) { edges { node { id } } } }"}' || true)
+
+          CASE_ID=$(echo "$CASE_RESP" | jq -r '.data.cases.edges[0].node.id // empty' 2>/dev/null || true)
+
+          if [ -n "$CASE_ID" ]; then
+            echo "case_id=$CASE_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample case ID: $CASE_ID"
+          else
+            echo "case_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample case ID from the API"
+          fi
+
+          # Get a sample judge ID
+          JUDGE_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ judges(first: 1) { edges { node { id } } } }"}' || true)
+
+          JUDGE_ID=$(echo "$JUDGE_RESP" | jq -r '.data.judges.edges[0].node.id // empty' 2>/dev/null || true)
+
+          if [ -n "$JUDGE_ID" ]; then
+            echo "judge_id=$JUDGE_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample judge ID: $JUDGE_ID"
+          else
+            echo "judge_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample judge ID from the API"
+          fi
+
+          # Get a sample ruling ID
+          RULING_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 1) { edges { node { id } } } }"}' || true)
+
+          RULING_ID=$(echo "$RULING_RESP" | jq -r '.data.rulings.edges[0].node.id // empty' 2>/dev/null || true)
+
+          if [ -n "$RULING_ID" ]; then
+            echo "ruling_id=$RULING_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample ruling ID: $RULING_ID"
+          else
+            echo "ruling_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample ruling ID from the API"
+          fi
+
+          # Get a sample document ID (for download endpoint testing)
+          DOC_RESP=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 10) { edges { node { documentId } } } }"}' || true)
+
+          # Pick the first non-null documentId from up to 10 rulings
+          DOC_ID=$(echo "$DOC_RESP" | jq -r '[.data.rulings.edges[].node.documentId // empty] | map(select(. != "")) | first // empty' 2>/dev/null || true)
+
+          if [ -n "$DOC_ID" ]; then
+            echo "document_id=$DOC_ID" >> "$GITHUB_OUTPUT"
+            echo "Found sample document ID: $DOC_ID"
+          else
+            echo "document_id=" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Could not fetch a sample document ID from the API"
+          fi
+
+      - name: Smoke test major pages
+        id: smoke
+        env:
+          CASE_ID: ${{ steps.ids.outputs.case_id }}
+          JUDGE_ID: ${{ steps.ids.outputs.judge_id }}
+          RULING_ID: ${{ steps.ids.outputs.ruling_id }}
+        run: |
+          FAILED_PAGES=""
+          TOTAL=0
+          PASSED=0
+
+          # Static pages that should always return 200
+          PAGES=(
+            "/"
+            "/rulings"
+            "/search"
+          )
+
+          # Add dynamic pages if we have sample IDs
+          if [ -n "$CASE_ID" ]; then
+            PAGES+=("/cases/${CASE_ID}")
+          fi
+          if [ -n "$JUDGE_ID" ]; then
+            PAGES+=("/judges/${JUDGE_ID}")
+          fi
+          if [ -n "$RULING_ID" ]; then
+            PAGES+=("/rulings/${RULING_ID}")
+          fi
+
+          for page in "${PAGES[@]}"; do
+            TOTAL=$((TOTAL + 1))
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              --max-time 30 \
+              --retry 2 \
+              --retry-delay 5 \
+              "${BASE_URL}${page}" || echo "000")
+
+            if [ "$HTTP_CODE" -ge 500 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ]; then
+              echo "FAIL: ${page} returned ${HTTP_CODE}"
+              FAILED_PAGES="${FAILED_PAGES}| \`${page}\` | ${HTTP_CODE} |\n"
+            else
+              echo "OK:   ${page} returned ${HTTP_CODE}"
+              PASSED=$((PASSED + 1))
+            fi
+          done
+
+          echo "Results: ${PASSED}/${TOTAL} pages OK"
+
+          if [ -n "$FAILED_PAGES" ]; then
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+            {
+              echo 'failed_pages<<GHEOF'
+              echo -e "$FAILED_PAGES"
+              echo 'GHEOF'
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # REST API endpoint checks — add new REST endpoints here as they are created.
+      - name: Smoke test REST API endpoints
+        id: rest-smoke
+        if: always()
+        env:
+          DOCUMENT_ID: ${{ steps.ids.outputs.document_id }}
+        run: |
+          FAILED_ENDPOINTS=""
+          TOTAL=0
+          PASSED=0
+
+          # 1. API health endpoint — should return 200
+          TOTAL=$((TOTAL + 1))
+          HEALTH_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            --max-time 15 \
+            --retry 2 \
+            --retry-delay 5 \
+            "${API_BASE_URL}/health" || echo "000")
+
+          if [ "$HEALTH_CODE" -ge 200 ] 2>/dev/null && [ "$HEALTH_CODE" -lt 300 ] 2>/dev/null; then
+            echo "OK:   /health returned ${HEALTH_CODE}"
+            PASSED=$((PASSED + 1))
+          else
+            echo "FAIL: /health returned ${HEALTH_CODE}"
+            FAILED_ENDPOINTS="${FAILED_ENDPOINTS}| \`/health\` | ${HEALTH_CODE} | Expected 2xx |\n"
+          fi
+
+          # 2. Document download endpoint — should return 302 redirect
+          if [ -n "$DOCUMENT_ID" ]; then
+            TOTAL=$((TOTAL + 1))
+            # Do not use -L — we want the raw 302, not the followed redirect
+            DOWNLOAD_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              --max-time 15 \
+              --retry 2 \
+              --retry-delay 5 \
+              "${API_BASE_URL}/api/documents/${DOCUMENT_ID}/download" || echo "000")
+
+            if [ "$DOWNLOAD_CODE" -ge 300 ] 2>/dev/null && [ "$DOWNLOAD_CODE" -lt 400 ] 2>/dev/null; then
+              echo "OK:   /api/documents/:id/download returned ${DOWNLOAD_CODE} (redirect)"
+              PASSED=$((PASSED + 1))
+            elif [ "$DOWNLOAD_CODE" -ge 500 ] 2>/dev/null || [ "$DOWNLOAD_CODE" = "000" ]; then
+              echo "FAIL: /api/documents/:id/download returned ${DOWNLOAD_CODE}"
+              FAILED_ENDPOINTS="${FAILED_ENDPOINTS}| \`/api/documents/:id/download\` | ${DOWNLOAD_CODE} | Expected 3xx redirect |\n"
+            else
+              # 4xx might mean the document was deleted; warn but don't fail
+              echo "WARN: /api/documents/:id/download returned ${DOWNLOAD_CODE} (may be expected if document was removed)"
+            fi
+          else
+            echo "SKIP: /api/documents/:id/download — no sample document ID available"
+          fi
+
+          echo "REST endpoint results: ${PASSED}/${TOTAL} OK"
+
+          if [ -n "$FAILED_ENDPOINTS" ]; then
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+            {
+              echo 'failed_endpoints<<GHEOF'
+              echo -e "$FAILED_ENDPOINTS"
+              echo 'GHEOF'
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for existing open issue
+        if: >-
+          failure() &&
+          (steps.smoke.outputs.has_failures == 'true' ||
+           steps.rest-smoke.outputs.has_failures == 'true')
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "smoke-test-failure" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open smoke-test issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        if: >-
+          failure() &&
+          (steps.smoke.outputs.has_failures == 'true' ||
+           steps.rest-smoke.outputs.has_failures == 'true') &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_PAGES: ${{ steps.smoke.outputs.failed_pages }}
+          FAILED_ENDPOINTS: ${{ steps.rest-smoke.outputs.failed_endpoints }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## Smoke Test Failure"
+            echo ""
+            echo "The scheduled smoke test detected failures on \`dev.judgemind.org\`."
+            echo ""
+
+            if [ -n "$FAILED_PAGES" ]; then
+              echo "### Failed Pages"
+              echo ""
+              echo "| Page | HTTP Status |"
+              echo "|------|-------------|"
+              echo -e "$FAILED_PAGES"
+              echo ""
+            fi
+
+            if [ -n "$FAILED_ENDPOINTS" ]; then
+              echo "### Failed REST API Endpoints"
+              echo ""
+              echo "| Endpoint | HTTP Status | Expected |"
+              echo "|----------|-------------|----------|"
+              echo -e "$FAILED_ENDPOINTS"
+              echo ""
+            fi
+
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Triggered by:** ${TRIGGER}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Check the Vercel deployment dashboard for recent deploy failures"
+            echo "2. Check the API health at \`https://dev.api.judgemind.org/health\`"
+            echo "3. Check the API GraphQL endpoint at \`https://dev.api.judgemind.org/graphql\`"
+            echo "4. Review recent commits to \`main\` for breaking changes"
+            echo ""
+            echo "This issue was created automatically by the smoke test workflow. It will not create duplicates while this issue is open."
+          } > /tmp/issue_body.md
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Smoke test failure: dev.judgemind.org health check failures" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/frontend,smoke-test-failure,agent/ready"
+
+      - name: Auto-close resolved smoke test issues
+        if: >-
+          steps.smoke.outputs.has_failures == 'false' &&
+          steps.rest-smoke.outputs.has_failures == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Find all open issues with the smoke-test-failure label
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "smoke-test-failure" \
+            --json number \
+            -q '.[].number')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open smoke-test-failure issues to close."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing smoke-test issue #${ISSUE_NUM} — all pages are passing."
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body "All smoke-tested pages are now returning healthy responses. Auto-closing this issue. Passing workflow run: ${RUN_URL}"
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done

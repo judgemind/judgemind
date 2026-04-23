@@ -1,0 +1,322 @@
+name: Scraper Zero-Record Streak Check
+
+on:
+  schedule:
+    # Daily at 14:30 UTC (07:30 PT) — after California tentative-ruling
+    # scrapers have had the overnight window to produce data. Offset from
+    # data-quality (:15) and api-error (:45) so schedules do not collide.
+    - cron: '30 14 * * *'
+  # Allow manual trigger for debugging / issue verification.
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Breach threshold for frequent scrapers (default: 3)"
+        required: false
+        type: string
+      daily_threshold:
+        description: "Breach threshold for daily scrapers (default: 2)"
+        required: false
+        type: string
+      scraper:
+        description: "Limit the check to a single scraper ID"
+        required: false
+        type: string
+
+# Only one streak check at a time.
+concurrency:
+  group: scraper-zero-record-check
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  zero-record-streak-check:
+    name: Detect scrapers with N consecutive zero-record runs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/check-scraper-zero-record-streak.py
+            scripts/ecs-run-task.sh
+            scripts/ecs-logs.sh
+            scripts/notify-telegram.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build script arguments
+        id: args
+        run: |
+          ARGS="--json"
+          if [ -n "${{ inputs.threshold }}" ]; then
+            ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+          fi
+          if [ -n "${{ inputs.daily_threshold }}" ]; then
+            ARGS="$ARGS --daily-threshold ${{ inputs.daily_threshold }}"
+          fi
+          if [ -n "${{ inputs.scraper }}" ]; then
+            ARGS="$ARGS --scraper ${{ inputs.scraper }}"
+          fi
+          echo "script_args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Run zero-record streak check on ECS
+        id: check
+        env:
+          SCRIPT_ARGS: ${{ steps.args.outputs.script_args }}
+        run: |
+          # Run on ECS so the script has DATABASE_URL injected from Secrets
+          # Manager and can reach the private VPC. Use --cpu 256/--memory 512
+          # since this is a lightweight SQL-only check.
+          set +e
+          scripts/ecs-run-task.sh \
+            --cpu 256 --memory 512 \
+            --timeout 300 \
+            --latest-image \
+            scripts/check-scraper-zero-record-streak.py -- $SCRIPT_ARGS 2>&1 \
+            | tee /tmp/check_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          # Extract the JSON portion from the mixed ECS log output. The
+          # script prints a single JSON blob to stdout; ECS task wrapper
+          # adds surrounding logs. We grep the first line that starts with
+          # "{" and read until the matching closing brace at column 0.
+          python3 - <<'PY'
+          import json, re, sys
+          text = open("/tmp/check_output.txt").read()
+          # Extract JSON blocks (greedy, starting with "{" at col 0, ending
+          # with "}" at col 0). Take the last matching block — the script
+          # output is the last JSON the ECS wrapper printed.
+          matches = re.findall(r"(?ms)^\{\n.*?^\}", text)
+          if not matches:
+              print("Could not find JSON block in output; assuming healthy.")
+              open("/tmp/check_json.txt", "w").write(
+                  '{"healthy": true, "breaches": [], "insufficient_history": [], "checked_count": 0, "excluded_count": 0}'
+              )
+              sys.exit(0)
+          blob = matches[-1]
+          try:
+              json.loads(blob)
+          except Exception as exc:
+              print(f"Parsed JSON block failed to load: {exc}; assuming healthy.")
+              blob = '{"healthy": true, "breaches": [], "insufficient_history": [], "checked_count": 0, "excluded_count": 0}'
+          open("/tmp/check_json.txt", "w").write(blob)
+          PY
+
+          HEALTHY=$(python3 -c "import json; print(json.load(open('/tmp/check_json.txt'))['healthy'])")
+          if [ "$HEALTHY" = "True" ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "No zero-record streak breaches detected."
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "Zero-record streak breaches detected (exit code $EXIT_CODE)."
+          fi
+
+      - name: Extract alert summary
+        if: steps.check.outputs.healthy == 'false'
+        id: summary
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          data = json.load(open("/tmp/check_json.txt"))
+          breaches = data.get("breaches", [])
+          lines = [
+              "| Scraper | Consecutive zeros | Threshold | First zero at | Last nonzero at |",
+              "| --- | --- | --- | --- | --- |",
+          ]
+          for b in breaches:
+              lines.append(
+                  "| {sid} | {streak} | {threshold} | {first} | {last_nonzero} |".format(
+                      sid=b["scraper_id"],
+                      streak=b["streak"],
+                      threshold=b["threshold"],
+                      first=b["first_zero_at"],
+                      last_nonzero=b.get("last_nonzero_at") or "(none in window)",
+                  )
+              )
+          open("/tmp/alert_summary.md", "w").write("\n".join(lines))
+
+          # Telegram one-liner
+          parts = [
+              f'{b["scraper_id"]} ({b["streak"]} consecutive zero-record runs)'
+              for b in breaches
+          ]
+          open("/tmp/alert_telegram.txt", "w").write(
+              "; ".join(parts) if parts else "Unknown alert"
+          )
+          PY
+
+          echo "Alert summary:"
+          cat /tmp/alert_summary.md
+
+      - name: Check for existing open issue
+        if: steps.check.outputs.healthy == 'false'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "scraper-zero-record-alert" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open scraper-zero-record-alert issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        id: create-issue
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## Scraper Zero-Record Streak Alert"
+            echo ""
+            echo "One or more scrapers have returned \`records_captured = 0\` for"
+            echo "multiple consecutive runs. This is the silent-outage failure"
+            echo "mode described by #2620 / #2666 — the scraper may technically"
+            echo "report success but is not producing data."
+            echo ""
+            echo "### Breaches"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo "- **Check script:** \`scripts/check-scraper-zero-record-streak.py\`"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Review the affected scraper's ECS logs:"
+            echo "   \`scripts/ecs-logs.sh /ecs/judgemind-scraper-<id>-dev --lines 200\`"
+            echo "2. Visit the source website manually — a zero-record streak"
+            echo "   caused by a court actually having no rulings is still rare"
+            echo "   but possible during extended closures."
+            echo "3. If the source has data but the scraper missed it, file a"
+            echo "   \`priority/p1\` bug against the scraper."
+            echo "4. If the streak is an expected calm period, add the scraper"
+            echo "   to the \`EXCLUSIONS\` set in the check script and re-run"
+            echo "   the workflow."
+            echo ""
+            echo "This issue was created automatically by the zero-record"
+            echo "streak workflow. It will not create duplicates while this"
+            echo "issue is open."
+          } > /tmp/issue_body.md
+
+          ISSUE_URL=$(gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Scraper zero-record streak: silent outage detected" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/scraping,scraper-zero-record-alert,agent/ready")
+
+          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        if: steps.create-issue.outputs.created == 'true'
+        continue-on-error: true
+        run: |
+          ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
+          ISSUE_NUM="${ISSUE_URL##*/}"
+          TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
+
+          {
+            echo "<b>Scraper Zero-Record Alert</b>"
+            echo ""
+            echo "${TG_SUMMARY}"
+            echo ""
+            echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
+          } > /tmp/tg_message.txt
+
+          scripts/notify-telegram.sh --message-file /tmp/tg_message.txt
+
+      - name: Update existing issue with new failures
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.existing.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "### Update: still in breach at ${TIMESTAMP}"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "**Workflow run:** ${RUN_URL}"
+          } > /tmp/comment_body.md
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/comment_body.md
+
+      - name: Auto-close resolved zero-record issues
+        if: steps.check.outputs.healthy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "scraper-zero-record-alert" \
+            --json number \
+            -q '.[].number')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open scraper-zero-record-alert issues to close."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing issue #${ISSUE_NUM} — no active streak breach."
+
+            {
+              echo "No scrapers are currently in a zero-record streak breach. Auto-closing."
+              echo ""
+              echo "**Passing workflow run:** ${RUN_URL}"
+            } > /tmp/close_comment.md
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/close_comment.md
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done

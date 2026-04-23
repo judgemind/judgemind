@@ -1,0 +1,21 @@
+{
+  "_fixture": "oc_apkarian_c25.pdf",
+  "_description": "OC Central Justice Center — Dept C25 (Judge Gassia Apkarian). 36-page PDF with 14 civil cases.",
+  "_link_text": "APKARIAN, Gassia - Dept C25",
+  "_captured": "2026-03-02",
+  "courthouse": "Central Justice Center",
+  "department": "C25",
+  "judge_name": "Gassia Apkarian",
+  "page_count": 36,
+  "case_count": 14,
+  "primary_case_number": "25-01455183",
+  "case_number_format": "DD-DDDDDDDD",
+  "hearing_date": "February 24, 2026",
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS",
+    "LAW & MOTION",
+    "DEPT C25",
+    "Judge Gassia Apkarian"
+  ],
+  "_notes": "Standard Central Justice Center format. Case numbers: two-digit year prefix + 8-digit sequence."
+}

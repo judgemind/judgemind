@@ -1,0 +1,8 @@
+{
+  "_comment": "Coverage floor ratchet. Values are minimum overall line coverage percentages. Updated automatically by scripts/update-coverage-baselines.py when coverage increases. Do not lower these values manually.",
+  "packages/scraper-framework": 80.0,
+  "packages/scraper-framework:framework-only": 50.0,
+  "packages/nlp-pipeline": 100.0,
+  "packages/api": 57.7,
+  "packages/web": 29.0
+}

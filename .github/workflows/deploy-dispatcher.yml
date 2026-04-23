@@ -1,0 +1,259 @@
+name: Deploy Dispatcher
+
+# Builds and pushes the dispatcher v2 daemon image to ECR on merge to
+# main, then rolls the running dispatcher ECS service onto the new
+# image via `--force-new-deployment`. The service's task definition
+# references the `:latest` tag (see dispatcher-daemon module), and the
+# service has `lifecycle.ignore_changes = [task_definition]` so CI can
+# redeploy without rewriting the task-def ARN each time — matching the
+# house pattern used by deploy-api.yml and deploy-scraper.yml.
+#
+# Phase 2 (#2768) scaled the service from desired_count=0 to 1. Before
+# this workflow had `deploy-to-dev`, every post-Phase-2 merge required
+# a manual `aws ecs update-service --force-new-deployment` — see #2772
+# for the full gap diagnosis.
+#
+# Per `docs/specs/dispatcher-v2-spec.md` §14 and issues #2729, #2772.
+#
+# Build outputs:
+#   ECR image  `<acct>.dkr.ecr.us-west-2.amazonaws.com/judgemind/dispatcher:<sha7>`
+#   Tags: `<sha7>`, `latest`, `<branch>`, and optional `image_tag` input.
+#
+# Triggers:
+#   push to main when anything that affects the image content OR the
+#   deploy workflow / rollout script changes, plus workflow_dispatch
+#   for a manual rebuild without a code change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.dispatcher"
+      - "scripts/dispatcher/**"
+      - "scripts/check-issue-author.sh"
+      - ".github/workflows/deploy-dispatcher.yml"
+      # scripts/wait-for-rollout.sh is invoked by the deploy-to-dev job
+      # below. Changes to the shared script must trigger this deploy so
+      # the fix is exercised against a real rollout on its own PR (see
+      # the paths-filter contract documented in wait-for-rollout.sh).
+      - "scripts/wait-for-rollout.sh"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: deploy-dispatcher-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/dispatcher
+  ECS_CLUSTER: judgemind-dev
+  ECS_SERVICE: judgemind-dispatcher-dev
+  LOG_GROUP: /ecs/judgemind-dispatcher-dev
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          # `GIT_SHA` is baked into the image as an env var so the running
+          # daemon can self-report its build SHA into `dispatcher.runs.version_sha`.
+          docker build \
+              --build-arg "GIT_SHA=$SHA_TAG" \
+              -f Dockerfile.dispatcher \
+              "${TAGS[@]}" .
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy-to-dev:
+    name: Deploy to Dev
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Generous upper bound — image pull + Fargate cold start + 5min
+    # wait-for-rollout default is comfortably under this ceiling, and
+    # the CloudWatch log tail adds only a few seconds.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout (for wait-for-rollout.sh)
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set pending deployment status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Deploying dispatcher to dev...",
+              "context": "deploy/dispatcher-dev"
+            }'
+
+      - name: Force new deployment on dispatcher service
+        id: update-service
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ env.ECS_SERVICE }}
+        run: |
+          # `--force-new-deployment` keeps the task-def ARN pinned by
+          # terraform (the service has `lifecycle.ignore_changes =
+          # [task_definition]`) and just re-pulls the image — which now
+          # carries the `:latest` tag from build-and-push. Capture the
+          # new deployment's id so wait-for-rollout.sh can target it.
+          NEW_DEPLOYMENT_ID=$(aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$ECS_SERVICE" \
+            --force-new-deployment \
+            --no-cli-pager \
+            --output text \
+            --query 'service.deployments[0].id')
+
+          if [ -z "$NEW_DEPLOYMENT_ID" ] || [ "$NEW_DEPLOYMENT_ID" = "None" ]; then
+            echo "ERROR: could not determine new deployment ID from update-service response" >&2
+            exit 1
+          fi
+
+          echo "New deployment id: $NEW_DEPLOYMENT_ID"
+          echo "deployment_id=$NEW_DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for rollout to stabilize
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ env.ECS_SERVICE }}
+          NEW_DEPLOYMENT_ID: ${{ steps.update-service.outputs.deployment_id }}
+          # Match deploy-api.yml's implicit ceiling (900s default in
+          # wait-for-rollout.sh). Explicit here so a dispatcher-specific
+          # bump is a one-liner if Fargate cold-start regresses.
+          ROLLOUT_TIMEOUT_SECS: "900"
+        run: |
+          "${GITHUB_WORKSPACE}/scripts/wait-for-rollout.sh"
+
+      - name: Health check — confirm daemon booted with new SHA
+        id: health-check
+        env:
+          LOG_GROUP: ${{ env.LOG_GROUP }}
+          SHA_TAG: ${{ needs.build-and-push.outputs.sha_tag }}
+        run: |
+          # The daemon logs `event=startup` with its `version_sha` (baked
+          # from the GIT_SHA build arg — same short SHA as the image tag)
+          # within a second or two of booting. Grepping the log group for
+          # that version_sha is cheaper than an ECS Exec psql query and
+          # doesn't require the session-manager plugin or the
+          # ingestion-worker service (which `scripts/dev-db-query.sh`
+          # otherwise depends on).
+          #
+          # Give the new task up to 2 minutes after services-stable to
+          # flush its startup log line to CloudWatch — matches the 2-min
+          # verification window in the issue's acceptance criteria.
+          DEADLINE=$(( $(date +%s) + 120 ))
+          # 5 minutes back covers ECS Exec container-init + our own wait.
+          START_MS=$(( ( $(date +%s) - 300 ) * 1000 ))
+
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            FOUND=$(aws logs filter-log-events \
+              --log-group-name "$LOG_GROUP" \
+              --start-time "$START_MS" \
+              --filter-pattern "\"$SHA_TAG\"" \
+              --max-items 1 \
+              --no-cli-pager \
+              --output text \
+              --query 'events[0].message' || true)
+
+            if [ -n "$FOUND" ] && [ "$FOUND" != "None" ]; then
+              echo "Found dispatcher startup log with version_sha=$SHA_TAG:"
+              echo "$FOUND"
+              exit 0
+            fi
+
+            echo "version_sha=$SHA_TAG not yet visible in $LOG_GROUP — retrying in 10s..."
+            sleep 10
+          done
+
+          echo "ERROR: did not observe a dispatcher log line referencing version_sha=$SHA_TAG within 2 min of rollout completion." >&2
+          echo "Recent events in $LOG_GROUP (last 10):" >&2
+          aws logs filter-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --start-time "$START_MS" \
+            --max-items 10 \
+            --no-cli-pager \
+            --output json \
+            --query 'events[*].{ts:timestamp,msg:message}' >&2 || true
+          exit 1
+
+      - name: Set deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'Dispatcher deployed to dev' || 'Dispatcher dev deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/dispatcher-dev\"
+            }"

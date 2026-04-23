@@ -1,0 +1,590 @@
+"""Contra Costa County Superior Court — Tentative Rulings Portal Scraper (Phase 1).
+
+This scraper targets the new Drupal-based portal at contracosta.courts.ca.gov,
+running in parallel with the legacy ``cc_tentatives.py`` scraper (which targets
+the retired ASP.NET site at retired.cc-courts.org).
+
+It is **NOT a replacement** for ``cc_tentatives.py`` — both scrapers run
+simultaneously during the dual-run phase (Phase 2 of migration plan #2601).
+Cutover (Phase 3) and department-reassignment cleanup (Phase 4) are tracked
+as separate follow-up issues under the parent #2601.
+
+Portal discovery and migration plan: docs/investigations/contra-costa-portal-migration-2026-04.md
+
+HTML structure (new portal):
+  Form page at /test-page-tentative-rulings exposes a
+  <select name="field_judge_target_id"> dropdown with known judge IDs.
+  For each judge, GET /tentative-rulings?field_judge_target_id=<id> returns
+  a Drupal Views table of rulings. Each row links to a detail page at
+  /tentative-ruling/<slug>.
+
+Listing table row format:
+  <tr>
+    <td><time datetime="2025-01-29T16:31:00">...</time></td>
+    <td>
+      <a href="/tentative-ruling/l24-04564">L24-04564</a>
+      <p>SCOTT FUGERE VS. THE COUNTY OF CONTRA COSTA</p>
+      Civil<p>CASE MANAGEMENT CONFERENCE</p>
+    </td>
+  </tr>
+
+Detail page format:
+  <article role="article" about="/tentative-ruling/l24-04564">
+    ... h2 sections for Case Number, Case Type, Hearing Date, Nature of Proceedings ...
+    <div class="field--name-body">
+      <a href="/system/files/general/16_012925.pdf">Tentative Ruling PDF</a>
+      <p>Before the Court are ...</p>
+    </div>
+    <aside class="jcc-body__aside">
+      <h4>BENJAMIN REYES</h4>
+    </aside>
+  </article>
+
+Case number formats (matches the retired scraper):
+  Civil:    C + 2-digit year + hyphen + 5 digits  (C24-02490)
+  Limited:  L + 2-digit year + hyphen + 5 digits  (L23-06679)
+  Probate:  N or P + 2-digit year + hyphen + 4-5 digits (N25-2307)
+  Misc:     MSN + 2-digit year + hyphen + 4-5 digits (MSN23-2201)
+
+Investigation: #2601
+Phase 1 implementation: #2609
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from datetime import UTC, datetime
+from urllib.parse import urljoin
+
+import httpx
+import structlog
+from bs4 import BeautifulSoup
+
+from framework import BaseScraper, CapturedDocument, ContentFormat, ScheduleWindow, ScraperConfig
+
+logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://contracosta.courts.ca.gov"
+FORM_URL = f"{BASE_URL}/test-page-tentative-rulings"
+LISTING_URL = f"{BASE_URL}/tentative-rulings"
+
+# Case number pattern — matches civil, limited, probate, and misc formats.
+# Anchored with ^ and $ so partial matches are rejected (e.g. "badnumber").
+_CASE_NUMBER_RE = re.compile(r"^[CLNP]\d{2}-\d{4,5}$|^MSN\d{2}-\d{4,5}$")
+
+# Test entry detection: slugs starting with "test" (case-insensitive).
+_TEST_SLUG_RE = re.compile(r"^test", re.IGNORECASE)
+
+# Extract department number from PDF filename pattern: "/16_012925.pdf" -> "16".
+# Matches the retired-site filename convention preserved on the new portal.
+_PDF_FILENAME_DEPT_RE = re.compile(r"/(\d{2})_\d{6}\.pdf$")
+
+
+# ---------------------------------------------------------------------------
+# Pure parsing helpers (module-level, testable without HTTP)
+# ---------------------------------------------------------------------------
+
+
+def _parse_judge_dropdown(html: str) -> list[tuple[str, str]]:
+    """Parse the <select name="field_judge_target_id"> dropdown into (id, name) tuples.
+
+    Args:
+        html: Raw HTML of the form page.
+
+    Returns:
+        List of (value, text) tuples for each non-"All" option.
+        Returns [] if the select element is missing.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    select = soup.find("select", {"name": "field_judge_target_id"})
+    if not select:
+        return []
+
+    results: list[tuple[str, str]] = []
+    for option in select.find_all("option"):
+        value = option.get("value", "")
+        if not value or value.lower() == "all":
+            continue
+        text = option.get_text(strip=True)
+        results.append((value, text))
+
+    return results
+
+
+def _parse_listing_table(html: str) -> list[dict]:
+    """Parse the Drupal Views result table into a list of row dicts.
+
+    Each dict has keys:
+        slug (str): The slug from the detail-page href, e.g. "l24-04564".
+        detail_url (str): Full absolute URL to the detail page.
+        case_number (str | None): The case number text (link text).
+        case_title (str | None): The case title from the first <p>.
+        case_type (str | None): The case type text (between title and motion type).
+        motion_type (str | None): The nature of proceedings from the second <p>.
+        hearing_date (datetime | None): Parsed from <time datetime="...">.
+
+    Returns:
+        List of row dicts. Returns [] when the table is absent or empty.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table")
+    if not table:
+        return []
+
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+
+    rows_data: list[dict] = []
+    for tr in tbody.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+
+        # --- Column 0: hearing date ---
+        time_tag = tds[0].find("time")
+        hearing_date: datetime | None = None
+        if time_tag:
+            dt_str = time_tag.get("datetime", "")
+            if dt_str:
+                try:
+                    # Parse ISO 8601 — strip trailing Z or timezone offset
+                    dt_str_clean = dt_str.rstrip("Z")
+                    # Handle with or without timezone suffix
+                    for fmt in (
+                        "%Y-%m-%dT%H:%M:%S",
+                        "%Y-%m-%dT%H:%M",
+                    ):
+                        try:
+                            hearing_date = datetime.strptime(dt_str_clean, fmt).replace(tzinfo=UTC)
+                            break
+                        except ValueError:
+                            continue
+                except Exception:
+                    pass
+
+        # --- Column 1: case info ---
+        case_td = tds[1]
+
+        # Slug and case number from link
+        link = case_td.find("a")
+        slug: str | None = None
+        case_number: str | None = None
+        detail_url: str = ""
+        if link:
+            href = link.get("href", "")
+            if href:
+                # Extract slug from href like "/tentative-ruling/l24-04564"
+                slug = href.rstrip("/").rsplit("/", 1)[-1]
+                detail_url = urljoin(BASE_URL, href)
+            case_number = link.get_text(strip=True) or None
+
+        if not slug:
+            continue
+
+        # Case title and motion type from <p> tags
+        paragraphs = case_td.find_all("p")
+        case_title: str | None = None
+        motion_type: str | None = None
+        if len(paragraphs) >= 1:
+            case_title = paragraphs[0].get_text(strip=True) or None
+        if len(paragraphs) >= 2:
+            motion_type = paragraphs[1].get_text(strip=True) or None
+
+        # Case type: text node(s) between the link and the first <p>
+        # The structure is: <a>...</a><p>title</p>CaseType<p>motion</p>
+        # We extract the text nodes directly from the td that are not inside
+        # child elements, then find the type from text after the <p> for title.
+        case_type: str | None = None
+        # Walk td children to find text between paragraphs
+        children_texts: list[str] = []
+        found_first_p = False
+        for child in case_td.children:
+            tag_name = getattr(child, "name", None)
+            if tag_name == "p":
+                if not found_first_p:
+                    found_first_p = True
+                    continue
+                else:
+                    # This is the second <p> — stop
+                    break
+            elif found_first_p:
+                # Text between first <p> and second <p>
+                text = str(child).strip()
+                if text:
+                    children_texts.append(text)
+
+        if children_texts:
+            case_type = " ".join(children_texts).strip() or None
+
+        rows_data.append(
+            {
+                "slug": slug,
+                "detail_url": detail_url,
+                "case_number": case_number,
+                "case_title": case_title,
+                "case_type": case_type,
+                "motion_type": motion_type,
+                "hearing_date": hearing_date,
+            }
+        )
+
+    return rows_data
+
+
+def _parse_detail_page(html: str) -> dict:
+    """Extract structured fields from a detail page.
+
+    Returns a dict with keys:
+        ruling_text (str | None): Plain text of the ruling body.
+        ruling_text_html (str | None): Raw HTML of the ruling body.
+        pdf_url (str | None): Absolute URL to the linked PDF.
+        judge_name (str | None): Judge name from the aside element.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # --- PDF URL and ruling text from the body field ---
+    # The body field div contains a PDF link and ruling text paragraphs.
+    ruling_text: str | None = None
+    ruling_text_html: str | None = None
+    pdf_url: str | None = None
+
+    # Look for the field--name-body div
+    body_field = soup.find("div", class_=lambda c: c and "field--name-body" in c)
+    if body_field:
+        # Find PDF link
+        for a in body_field.find_all("a"):
+            href = a.get("href", "")
+            if href and ".pdf" in href.lower():
+                pdf_url = urljoin(BASE_URL, href)
+                break
+
+        # Extract ruling text from paragraphs (excluding the PDF link paragraph)
+        text_parts: list[str] = []
+        html_parts: list[str] = []
+        for p in body_field.find_all("p"):
+            # Skip paragraphs that only contain the PDF link
+            anchors = p.find_all("a")
+            if anchors and all(".pdf" in a.get("href", "").lower() for a in anchors):
+                continue
+            text = p.get_text(separator=" ", strip=True)
+            if text:
+                text_parts.append(text)
+                html_parts.append(str(p))
+
+        if text_parts:
+            ruling_text = "\n\n".join(text_parts)
+        if html_parts:
+            ruling_text_html = "\n".join(html_parts)
+
+    # --- Judge name from aside ---
+    judge_name: str | None = None
+    aside = soup.find("aside", class_=lambda c: c and "jcc-body__aside" in c)
+    if aside:
+        h4 = aside.find("h4")
+        if h4:
+            judge_name = h4.get_text(strip=True) or None
+
+    return {
+        "ruling_text": ruling_text,
+        "ruling_text_html": ruling_text_html,
+        "pdf_url": pdf_url,
+        "judge_name": judge_name,
+    }
+
+
+def _cc_dept_from_filename(pdf_url: str | None) -> str | None:
+    """Extract department number from a PDF URL using the CC filename convention.
+
+    The pattern is: /<dept>_<date>.pdf, e.g. "/system/files/general/16_012925.pdf"
+    returns "16".
+
+    Args:
+        pdf_url: The PDF URL, or None.
+
+    Returns:
+        The department number string (e.g. "16"), or None if not parseable.
+    """
+    if not pdf_url:
+        return None
+    m = _PDF_FILENAME_DEPT_RE.search(pdf_url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _is_test_entry(slug: str, case_number: str | None) -> bool:
+    """Return True if this listing row should be filtered out as a test entry.
+
+    A row is a test entry if:
+    - The slug matches ``^test`` (case-insensitive), OR
+    - The case_number is None or does not match the valid CC case number regex.
+
+    Args:
+        slug: The slug extracted from the detail-page href.
+        case_number: The case number text from the listing row link.
+
+    Returns:
+        True if the row should be skipped; False if it's a real case.
+    """
+    if _TEST_SLUG_RE.match(slug):
+        return True
+    if not case_number:
+        return True
+    if not _CASE_NUMBER_RE.match(case_number):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Scraper class
+# ---------------------------------------------------------------------------
+
+
+class CCTentativesPortalScraper(BaseScraper):
+    """Contra Costa County tentative rulings — new Drupal portal scraper (Phase 1).
+
+    Runs in parallel with the legacy ``CCTentativeRulingsScraper`` (cc_tentatives.py)
+    until Phase 3 cutover. See module docstring for the full migration plan.
+
+    Fetch strategy:
+    1. Fetch the form page to discover current judge IDs from the dropdown.
+    2. For each judge, fetch the listing page (filtered by judge ID).
+    3. For each listing row, fetch the detail page and download the linked PDF.
+    4. Filter test entries (slug matches ^test, or case number invalid).
+    5. Construct one CapturedDocument per valid ruling, with PDF as raw content.
+    """
+
+    def fetch_documents(self) -> list[CapturedDocument]:
+        """Fetch ruling documents from the new Contra Costa portal.
+
+        Returns:
+            List of CapturedDocument objects, one per valid ruling found.
+            Returns [] on empty listings or missing dropdown; per-row
+            exceptions are caught, logged, and skipped.
+        """
+        docs: list[CapturedDocument] = []
+
+        with httpx.Client(
+            headers={"User-Agent": "Judgemind/1.0 (+https://judgemind.org/scraper)"},
+            follow_redirects=True,
+            timeout=self.config.request_timeout_seconds,
+        ) as client:
+            # Step 1: Fetch the form page and parse judge IDs
+            self._log.info("cc_portal.fetching_form", url=FORM_URL)
+            try:
+                form_response = client.get(FORM_URL)
+                form_response.raise_for_status()
+            except Exception as exc:
+                self._log.error("cc_portal.form_fetch_failed", error=str(exc))
+                return []
+
+            judges = _parse_judge_dropdown(form_response.text)
+            if not judges:
+                self._log.warning("cc_portal.no_judges_found", url=FORM_URL)
+                return []
+
+            self._log.info("cc_portal.judges_found", count=len(judges))
+
+            # Step 2: Iterate each judge
+            for judge_id, judge_name_dropdown in judges:
+                time.sleep(self.config.request_delay_seconds)
+
+                self._log.info(
+                    "cc_portal.fetching_listing",
+                    judge_id=judge_id,
+                    judge_name=judge_name_dropdown,
+                )
+                try:
+                    listing_response = client.get(
+                        LISTING_URL,
+                        params={"field_judge_target_id": judge_id},
+                    )
+                    listing_response.raise_for_status()
+                except Exception as exc:
+                    self._log.error(
+                        "cc_portal.listing_fetch_failed",
+                        judge_id=judge_id,
+                        error=str(exc),
+                    )
+                    continue
+
+                rows = _parse_listing_table(listing_response.text)
+                if not rows:
+                    self._log.info(
+                        "cc_portal.empty_listing",
+                        judge_id=judge_id,
+                        judge_name=judge_name_dropdown,
+                    )
+                    continue
+
+                self._log.info(
+                    "cc_portal.listing_rows",
+                    judge_id=judge_id,
+                    count=len(rows),
+                )
+
+                # Step 3: Process each row
+                for row in rows:
+                    slug = row["slug"]
+                    case_number = row["case_number"]
+
+                    # Step 4: Filter test entries
+                    if _is_test_entry(slug, case_number):
+                        self._log.info(
+                            "scraper.test_entry_skipped",
+                            slug=slug,
+                            case_number=case_number,
+                            judge_id=judge_id,
+                        )
+                        continue
+
+                    detail_url = row["detail_url"]
+                    time.sleep(self.config.request_delay_seconds)
+
+                    try:
+                        doc = self._fetch_single_ruling(
+                            client=client,
+                            row=row,
+                            judge_id=judge_id,
+                            judge_name_dropdown=judge_name_dropdown,
+                        )
+                        if doc is not None:
+                            docs.append(doc)
+                    except Exception as exc:
+                        self._log.error(
+                            "cc_portal.row_fetch_failed",
+                            slug=slug,
+                            detail_url=detail_url,
+                            error=str(exc),
+                        )
+
+        return docs
+
+    def _fetch_single_ruling(
+        self,
+        client: httpx.Client,
+        row: dict,
+        judge_id: str,
+        judge_name_dropdown: str,
+    ) -> CapturedDocument | None:
+        """Fetch the detail page and PDF for a single listing row.
+
+        Args:
+            client: The shared httpx client.
+            row: Parsed row dict from _parse_listing_table.
+            judge_id: The judge's field_judge_target_id value.
+            judge_name_dropdown: The judge's display name from the dropdown.
+
+        Returns:
+            A populated CapturedDocument, or None if fetching fails.
+        """
+        detail_url = row["detail_url"]
+        slug = row["slug"]
+
+        # Fetch detail page
+        detail_response = client.get(detail_url)
+        detail_response.raise_for_status()
+        detail_html_bytes = detail_response.content
+
+        detail = _parse_detail_page(detail_response.text)
+
+        pdf_url = detail.get("pdf_url")
+        if not pdf_url:
+            self._log.warning("cc_portal.no_pdf_url", slug=slug, detail_url=detail_url)
+            return None
+
+        # Download PDF
+        time.sleep(self.config.request_delay_seconds)
+        pdf_response = client.get(pdf_url)
+        pdf_response.raise_for_status()
+        pdf_bytes = pdf_response.content
+
+        # Build document (PDF as primary raw content, per CC pipeline pattern)
+        doc = self._make_base_doc(
+            source_url=detail_url,
+            raw_content=pdf_bytes,
+            content_format=ContentFormat.PDF,
+        )
+
+        # Populate scraper-provided fields
+        doc.case_number = row.get("case_number")
+        doc.case_title = row.get("case_title")
+        doc.hearing_date = row.get("hearing_date")
+        doc.motion_type = row.get("motion_type")
+        doc.ruling_text = detail.get("ruling_text")
+        doc.ruling_text_html = detail.get("ruling_text_html")
+
+        # Judge name: prefer the aside (more specific), fall back to dropdown name
+        judge_name_aside = detail.get("judge_name")
+        doc.judge_name = judge_name_aside or judge_name_dropdown
+
+        # Department from PDF filename (derivable, not from a structured field)
+        pdf_filename = pdf_url.rsplit("/", 1)[-1] if "/" in pdf_url else pdf_url
+        dept = _cc_dept_from_filename(pdf_url)
+        if dept:
+            doc.department = dept
+            from courts.ca.cc_tentatives import _cc_courthouse
+
+            courthouse = _cc_courthouse(dept)
+            if courthouse:
+                doc.courthouse = courthouse
+
+        # Store secondary artifacts and metadata in extra
+        doc.extra["detail_html"] = detail_html_bytes
+        doc.extra["detail_url"] = detail_url
+        doc.extra["pdf_url"] = pdf_url
+        doc.extra["pdf_filename"] = pdf_filename
+        doc.extra["slug"] = slug
+        doc.extra["case_type"] = row.get("case_type")
+        doc.extra["judge_id"] = judge_id
+
+        return doc
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        """No-op — all fields are populated during fetch_documents.
+
+        The portal detail page provides structured HTML ruling text directly,
+        so no PDF text extraction or LLM parsing is needed. This mirrors the
+        SF civil tentatives pattern where extraction happens during fetch.
+
+        Args:
+            doc: The document to parse.
+
+        Returns:
+            The document unchanged.
+        """
+        return doc
+
+
+# ---------------------------------------------------------------------------
+# Config factory
+# ---------------------------------------------------------------------------
+
+
+def default_config(s3_bucket: str = "") -> ScraperConfig:
+    """Factory for the default Contra Costa portal scraper configuration."""
+    from datetime import time as dtime
+
+    return ScraperConfig(
+        scraper_id="ca-cc-tentatives-portal",
+        state="CA",
+        county="Contra Costa",
+        court="Superior Court",
+        target_urls=[LISTING_URL],
+        poll_interval_seconds=43200,  # twice daily (matches retired scraper)
+        schedule_windows=[
+            # Civil rulings posted by 1:30 PM day before hearing
+            ScheduleWindow(start=dtime(14, 0), end=dtime(15, 0)),  # 2 PM sweep
+            ScheduleWindow(start=dtime(21, 0), end=dtime(22, 0)),  # 9 PM catch-up
+        ],
+        request_delay_seconds=1.0,
+        request_timeout_seconds=30.0,
+        max_retries=3,
+        s3_bucket=s3_bucket,
+    )

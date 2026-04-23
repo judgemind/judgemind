@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Rocio Cota v. Frontier Trans Inc.\n\nTentative Ruling:\n\nTo grant the petition. Order Signed. No appearances necessary.\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure\nsection 1019.5, subdivision (a), no further written order is necessary. The minute order\nadopting this tentative ruling will serve as the order of the court and service by the clerk\nwill constitute notice of the order.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "petition",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/8cc0f6de-d5b2-5332-9e6b-74b164a35932.pdf",
+  "notes": ""
+}

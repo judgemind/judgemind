@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Doe 1 v. Hoefs\n\nDefendant’s HOAG Memorial Hospital Presbyterian Motion for\nJudgment on the Pleadings\nDefendant’s HOAG Memorial Hospital Presbyterian Motion for\nJudgment on the Pleadings\nOff Calendar",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "off_calendar",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/20/bfa6ed86-bac6-5d93-985a-d6f8b772c2ca.pdf",
+  "notes": ""
+}

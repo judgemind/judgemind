@@ -1,0 +1,18 @@
+{
+  "_fixture": "la_main_page.html",
+  "_description": "GET response for LA civil tentative rulings main page. Contains ASP.NET dropdown with all courthouse/dept/date combinations.",
+  "_captured": "2026-03-02",
+  "dropdown_option_count": 97,
+  "first_option": {
+    "value": "ALH,3,03/02/2026",
+    "courthouse_code": "ALH",
+    "courthouse": "Alhambra Courthouse",
+    "department": "3",
+    "hearing_date": "2026-03-02"
+  },
+  "viewstate_generator": "65B48B29",
+  "has_aspnet_tokens": true,
+  "stanley_mosk_dept_count": ">=30",
+  "pomona_h_future_dates": true,
+  "_notes": "97 options captured on 2026-03-02. Daily count varies. Stanley Mosk dominates (~35 depts). Pomona South posts weeks in advance."
+}

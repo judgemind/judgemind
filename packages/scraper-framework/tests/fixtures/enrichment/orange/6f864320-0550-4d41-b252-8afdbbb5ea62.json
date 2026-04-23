@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Sirott – Conservatorship\n\nMOTION TO BIFURCATE TRIAL\nNotice of Withdrawal filed 03/10/2026.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": null,
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/24/a0c1796e-0773-56c0-9bd1-8930347caac8.pdf",
+  "notes": "Non-adversarial case - no plaintiff/defendant parties; Very short ruling text"
+}

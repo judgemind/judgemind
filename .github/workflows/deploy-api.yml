@@ -1,0 +1,346 @@
+name: Deploy API
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/api/**"
+      - ".github/workflows/deploy-api.yml"
+      - ".github/actions/ecs-deploy/**"
+      - ".github/actions/ecs-oneshot/**"
+      # scripts/wait-for-rollout.sh is invoked by the ecs-deploy composite
+      # action. Changes to the shared script must trigger this deploy so the
+      # fix is exercised against a real rollout on its own PR (see #2592).
+      - "scripts/wait-for-rollout.sh"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: deploy-api-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/api
+  ECS_CLUSTER: judgemind-dev
+  ECS_SERVICE: judgemind-api-dev
+  TASK_FAMILY: judgemind-api-dev
+  CONTAINER_NAME: api
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          docker build "${TAGS[@]}" packages/api/
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: [build-and-push, run-migrations]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout (for composite action)
+        uses: actions/checkout@v6
+
+      - name: Set pending deployment status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Deploying API to dev...",
+              "context": "deploy/api-dev"
+            }'
+
+      - name: Deploy to ECS
+        id: deploy
+        uses: ./.github/actions/ecs-deploy
+        with:
+          task-family: ${{ env.TASK_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          deploy-mode: service
+          ecs-cluster: ${{ env.ECS_CLUSTER }}
+          ecs-service: ${{ env.ECS_SERVICE }}
+
+      - name: Set deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
+          DEPLOY_DESC: ${{ job.status == 'success' && 'API deployed to dev' || 'Dev deployment failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$DEPLOY_STATUS\",
+              \"description\": \"$DEPLOY_DESC\",
+              \"context\": \"deploy/api-dev\"
+            }"
+
+  run-migrations:
+    name: Run Database Migrations (Dev)
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set pending migration status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d '{
+              "state": "pending",
+              "description": "Running database migrations on dev...",
+              "context": "deploy/api-dev-migrations"
+            }'
+
+      - name: Run migrations via ECS oneshot task
+        id: run-migrations
+        uses: ./.github/actions/ecs-oneshot
+        with:
+          source-task-family: ${{ env.TASK_FAMILY }}
+          ecs-cluster: ${{ env.ECS_CLUSTER }}
+          ecs-service: ${{ env.ECS_SERVICE }}
+          image-uri: ${{ needs.build-and-push.outputs.image_uri }}
+          container-name: api-migrate
+          command: '["node", "scripts/seed-and-migrate.mjs"]'
+          oneshot-family: judgemind-api-migrate-dev
+          log-stream-prefix: migrate
+          task-role-fallback: judgemind-api-task-dev
+          extra-env: '[]'
+
+      - name: Set migration status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIGRATE_STATUS: ${{ steps.run-migrations.outcome == 'success' && 'success' || 'failure' }}
+          MIGRATE_DESC: ${{ steps.run-migrations.outcome == 'success' && 'Dev migrations applied (no pending)' || 'Dev migration failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$MIGRATE_STATUS\",
+              \"description\": \"$MIGRATE_DESC\",
+              \"context\": \"deploy/api-dev-migrations\"
+            }"
+
+  post-deploy-health-check:
+    name: Post-Deploy Health Check
+    needs: [deploy-dev, run-migrations]
+    if: always() && needs.deploy-dev.result == 'success'
+    runs-on: ubuntu-latest
+
+    env:
+      API_URL: https://dev.api.judgemind.org/graphql
+      API_BASE_URL: https://dev.api.judgemind.org
+
+    steps:
+      - name: Wait for service to stabilize
+        run: |
+          echo "Waiting 30 seconds for new tasks to fully start..."
+          sleep 30
+
+      - name: Health check — GraphQL introspection
+        id: introspection
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/response.json -w '%{http_code}' \
+            --max-time 15 \
+            --retry 3 \
+            --retry-delay 10 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ __typename }"}')
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "GraphQL endpoint is responding."
+            cat /tmp/response.json | head -c 500
+            echo ""
+          else
+            echo "ERROR: GraphQL endpoint returned HTTP $HTTP_CODE"
+            cat /tmp/response.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Health check — sample query
+        id: sample-query
+        run: |
+          HTTP_CODE=$(curl -s -o /tmp/sample_response.json -w '%{http_code}' \
+            --max-time 15 \
+            --retry 2 \
+            --retry-delay 5 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 1) { edges { node { id } } } }"}')
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            # Check for GraphQL errors in the response
+            ERRORS=$(cat /tmp/sample_response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('errors',[])))") 2>/dev/null || echo "parse_error"
+
+            if [ "$ERRORS" = "0" ]; then
+              echo "Sample query succeeded without errors."
+            elif [ "$ERRORS" = "parse_error" ]; then
+              echo "WARNING: Could not parse response, but HTTP status was OK."
+            else
+              echo "ERROR: GraphQL returned errors in response."
+              cat /tmp/sample_response.json | head -c 1000
+              exit 1
+            fi
+          else
+            echo "ERROR: Sample query returned HTTP $HTTP_CODE"
+            cat /tmp/sample_response.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Health check — document download
+        id: document-download
+        run: |
+          echo "Querying API for a ruling with a document ID to test download endpoint..."
+
+          # Fetch a documentId from a ruling via the GraphQL API
+          DOC_RESPONSE=$(curl -s --max-time 15 \
+            -X POST "$API_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"{ rulings(first: 5) { edges { node { documentId } } } }"}')
+
+          DOC_ID=$(echo "$DOC_RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          edges = data.get('data', {}).get('rulings', {}).get('edges', [])
+          for edge in edges:
+              doc_id = edge.get('node', {}).get('documentId')
+              if doc_id:
+                  print(doc_id)
+                  sys.exit(0)
+          print('')
+          " 2>/dev/null) || DOC_ID=""
+
+          if [ -z "$DOC_ID" ]; then
+            echo "WARNING: No rulings with documents found in dev — skipping download smoke test."
+            echo "This is not a failure; the dev environment may not have documents yet."
+            exit 0
+          fi
+
+          echo "Testing download endpoint for document: $DOC_ID"
+
+          # Hit the download endpoint — expect 302 redirect
+          HTTP_CODE=$(curl -s -o /tmp/download_response.txt -w '%{http_code}' \
+            --max-time 15 \
+            --retry 2 \
+            --retry-delay 5 \
+            -X GET "$API_BASE_URL/api/documents/$DOC_ID/download")
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "302" ]; then
+            echo "Document download endpoint returned 302 redirect as expected."
+          elif [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+            echo "WARNING: Expected 302 but got $HTTP_CODE — endpoint is responding but behavior may differ."
+          else
+            echo "ERROR: Document download endpoint returned HTTP $HTTP_CODE"
+            cat /tmp/download_response.txt 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Set health check status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEALTH_STATUS: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success' && steps.document-download.outcome == 'success') && 'success' || 'failure' }}
+          HEALTH_DESC: ${{ (steps.introspection.outcome == 'success' && steps.sample-query.outcome == 'success' && steps.document-download.outcome == 'success') && 'API health check passed' || 'API health check failed' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -d "{
+              \"state\": \"$HEALTH_STATUS\",
+              \"description\": \"$HEALTH_DESC\",
+              \"context\": \"deploy/api-dev-health\"
+            }"

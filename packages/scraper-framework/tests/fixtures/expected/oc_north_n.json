@@ -1,0 +1,19 @@
+{
+  "_fixture": "oc_north_n.pdf",
+  "_description": "OC North Justice Center — Dept N6 (Judge Julianne S. Bancroft). 26-page PDF, 0 case numbers — PDF omits case numbers entirely.",
+  "_link_text": "BANCROFT, Julianne S. - Dept. N6",
+  "_captured": "2026-03-02",
+  "courthouse": "North Justice Center",
+  "department": "N6",
+  "judge_name": "Julianne S. Bancroft",
+  "page_count": 26,
+  "case_count": 12,
+  "case_count_note": "0 case numbers found, but 12 cases listed by line number",
+  "hearing_date": "March 2, 2026",
+  "ruling_text_contains": [
+    "Civility",
+    "zealous representation"
+  ],
+  "_edge_case": "link_text_document_mismatch",
+  "_notes": "North Justice Center PDFs do not include case numbers anywhere in the text. Cases are listed by line number (101, 102, ...) and case name only. This is a format limitation of this courthouse's PDF generation, not a regex issue. Link text says 'BANCROFT, Julianne S. - Dept. N6' but PDF content is from Dept N14 / Judge Richard J. Oberholzer. Expected values match the link text — the link text is the authoritative source for which department this PDF belongs to, even if the PDF was mislabeled by the court."
+}

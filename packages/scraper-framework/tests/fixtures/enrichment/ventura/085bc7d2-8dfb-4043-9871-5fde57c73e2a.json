@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Dulce Sofia Gonzalez Flores v. Diversified Restaurant Group, LLC, et al.\n\nThis motion is DENIED as moot based on the parties' stipulated order that resulted from informal discovery conference held on February 27, 2026 as follows:\n1. The third-party administrator will be provided class list information for the entirety of the putative class as defined by Plaintiff.\n2. Defendant will turn over, by March 20, 2026, a representative and randomized sample of data to include payroll, time and attendance records, and work schedules, for the following: 1. 20% of the PAGA class 2. 20% of the Putative Class\n3. Defendant's motion under CRC 3.676 will remain on calendar for hearing on May 21, 2026, 8:20 a.m., briefing per code.\n4. Plaintiff's motion for class certification reservation for hearing date is continued from May 21, 2026 to August 27, 2026 at 8:20 a.m. The moving papers are due on or before July 23, 2026, the opposition is due on or before August 6, 2026, and the reply papers are due on or before August 13, 2027.\n5. These agreements obviate the need for the two ex parte hearings that have been scheduled on Monday March 2, 2026, and those hearing are off calendar.\n6. Plaintiff's motion to compel will remain on calendar for March 26, 2026, and the parties have agreed to meet and confer to potentially obviate the need for hearing, and plaintiff's withdrawal of the motion.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "motion_to_compel",
+    "outcome": "moot",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/26/6c4190f7-7d5a-5d17-9041-04cd309e4315.pdf",
+  "notes": ""
+}

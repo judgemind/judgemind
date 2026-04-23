@@ -1,0 +1,17 @@
+{
+  "_fixture": "oc_family_law_page.html",
+  "_description": "OC Family Law tentative rulings index page. Lists judges with PDF links.",
+  "_captured": "2026-03-07",
+  "pdf_link_count": 2,
+  "courthouse_distribution": {
+    "Central Justice Center (C)": 1,
+    "Lamoreaux Justice Center (L)": 1
+  },
+  "first_link": {
+    "link_text": "CLAUSTRO, Israel - Dept C22",
+    "href_contains": "iclaustro",
+    "courthouse": "Central Justice Center"
+  },
+  "link_text_format": "LASTNAME, Firstname [M.] - Dept CODE",
+  "_notes": "2 links on 2026-03-07. Same link text format as civil. Mix of PDF hosts: occourts.org and Pantheon CDN."
+}

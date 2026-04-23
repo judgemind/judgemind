@@ -1,0 +1,41 @@
+{
+  "_fixture": "fresno_502_20260311_eef66c41.pdf",
+  "_description": "Fresno Dept 502, 10 pages, 4 rulings. Initials: KCK. Includes consolidation motion and demurrer.",
+  "_captured": "2026-03-11",
+  "courthouse": "Fresno County Superior Court",
+  "department": "502",
+  "judge_name": null,
+  "judge_initials": "KCK",
+  "page_count": 10,
+  "case_count": 4,
+  "primary_case_number": "24CECG03236",
+  "case_number_format": "{YY}CEC{TYPE}{NNNNN}",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "24CECG03236",
+      "case_title": "Garcia v. Fresno Plumbing & Heating, Inc.",
+      "motion_type": "Plaintiff's Motion to Certify Class",
+      "outcome": "continued"
+    },
+    {
+      "case_number": "25CECG00536",
+      "case_title": "Kourtney Westfall v. Fresno Unified School District",
+      "motion_type": "Plaintiffs' Motion to Consolidate Actions",
+      "outcome": "granted"
+    },
+    {
+      "case_number": "25CECG03285",
+      "case_title": "Alyssa Lopez v. Kings View Behavioral Health Center",
+      "motion_type": "Defendant Kings View Behavioral Health Center's Demurrer to Plaintiff Alyssa Lopez's Complaint",
+      "outcome": "granted_in_part"
+    },
+    {
+      "case_number": "25CECG03846",
+      "case_title": "Alexandra Seifert v. Paul Michaelides",
+      "motion_type": "Plaintiff's Motion to Set Aside the Court's December 11, 2025 Ex Parte Order; Plaintiff's Motion for Default Judgment",
+      "outcome": "denied"
+    }
+  ],
+  "_notes": "Ruling (41) Westfall consolidation involves 3 case numbers: 25CECG00536, 25CECG03018, 25CECG04480 — count as 1 ruling. Ruling (47) Lopez demurrer sustained for 2nd COA, overruled for 3rd-5th. Ruling (47) Seifert has two motions (set aside + default judgment), both denied."
+}

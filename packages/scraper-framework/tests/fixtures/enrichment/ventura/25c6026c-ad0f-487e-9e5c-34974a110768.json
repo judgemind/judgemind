@@ -1,0 +1,16 @@
+{
+  "ruling_text": "Wells Fargo Bank, N.A. v. Noemi A Alvarez\n\nThe Court grants Plaintiff Wells Fargo Bank, N.A.'s request for judicial notice in its entirety. The Court grants, without leave to amend, Plaintiff's unopposed request for judgment on the pleadings on its Complaint against Defendant, on the grounds that (a) Plaintiff's Complaint states a sufficient claim for breach of a credit card agreement against Defendant; and (b) by way of her deemed admissions, Alvarez admits that she presently owes Plaintiff $15,105.38 under the credit card agreement, and that her affirmative defenses to the Complaint lack merit, and therefore the Answer fails to state any sufficient defense to the breach of contract claim. Plaintiff is entitled to judgment against Defendant in the principal amount of $15,105.38.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Wells Fargo Bank, N.A."
+      ],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/23/f0e2a233-ba9a-5050-a5a9-839ae09ed9ae.pdf",
+  "notes": ""
+}

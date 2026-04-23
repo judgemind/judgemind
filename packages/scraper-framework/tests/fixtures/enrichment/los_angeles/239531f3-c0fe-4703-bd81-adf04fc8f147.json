@@ -1,0 +1,24 @@
+{
+  "ruling_text": "Defendant 1032 N. Sycamore Owner (LA) LLC (\"1032\") has filed an ex parte application to stay proceedings in this action pending a remand from the federal district court to which 1032 removed the action and to vacate the motion for summary judgment that Plaintiff Plaintiff Zeus Realty Group (\"Zeus\") filed, quash subpoenas that Zeus issued to third parties, and to invalidate Zeus's discovery requests propounded on 1032. The Court is granting 1032's ex parte application in all respects. The Court agrees with 1032 that proceedings in this Court are suspended in light of the removal to federal court and the lack at this time of a remand order.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Zeus Realty Group"
+      ],
+      "defendants": [
+        "1032 N. Sycamore Owner (LA) LLC"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/26/97ed4715-a12e-571c-b543-6b1667737462.html",
+  "notes": "Motion type ambiguity: DB='ex_parte_application', text='msj'",
+  "acceptable_alternatives": {
+    "motion_type": [
+      "ex_parte_application",
+      "msj"
+    ]
+  }
+}

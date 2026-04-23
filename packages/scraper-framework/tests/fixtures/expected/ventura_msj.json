@@ -1,0 +1,24 @@
+{
+  "_fixture": "ventura_ruling_html_msj.html",
+  "_description": "Ventura Dept 42 — Motion for Summary Judgment denied. Single-case HTML ruling. Medical malpractice case.",
+  "_captured": "2026-03-11",
+  "_format": "html",
+  "department": "42",
+  "case_count": 1,
+  "case_number": "2025CUBC041789",
+  "motion_type": "Motion for Summary Judgment",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "2025CUBC041789",
+      "case_title": "Nguyen v. Pacific Coast Medical Group, Inc.",
+      "outcome": "denied",
+      "parties": [
+        {"name": "Tran Nguyen", "role": "plaintiff"},
+        {"name": "Pacific Coast Medical Group, Inc.", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["DENIED", "triable issue of material fact", "standard of care"]
+    }
+  ],
+  "_notes": "MSJ denied. Competing expert declarations created triable issue of material fact."
+}

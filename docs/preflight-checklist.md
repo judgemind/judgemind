@@ -1,0 +1,86 @@
+# Agent Preflight Checklist
+
+Machine-readable checklist of rules extracted from CLAUDE.md. Agents should validate proposed actions against this checklist before execution.
+
+## Enforced Rules (hook + scripts/preflight.sh)
+
+| ID | Rule | Enforcement | Script Function |
+|----|------|-------------|-----------------|
+| E-01 | No `$()`, heredocs, or backtick expansion | PreToolUse hook blocks | `preflight_no_forbidden_syntax` |
+| E-02 | Fetch/rebase before analyzing code | Manual / script check | `preflight_branch_fresh --fetch` |
+| E-03 | Must be in a worktree during task work | Manual / script check | `preflight_in_worktree` |
+| E-04 | Venv must be local to worktree | Manual / script check | `preflight_venv_local` |
+| E-05 | Never push to main/master | PreToolUse hook blocks | `preflight_not_on_main` |
+| E-06 | No `git worktree add` inside worktrees | PreToolUse hook blocks | — |
+| E-07 | No bare `git stash pop` / `git stash apply` (#2749) | PreToolUse hook blocks | — |
+
+## Shell Command Rules
+
+| ID | Rule | Pattern to Reject | Fix |
+|----|------|-------------------|-----|
+| SH-01 | No `$()` command substitution | `$(` in command | Run the inner command as a separate tool call; use the literal result in the next command |
+| SH-02 | No heredocs | `<<EOF`, `<<'EOF'`, `<<-EOF` | Write content to `{worktree}/tmp/file.txt` with Write tool, then pass via `--body-file` or `-F` |
+| SH-03 | No inline python `-c` | `python3 -c` or `python -c` | Write to `{worktree}/tmp/script.py`, then run the file |
+| SH-04 | No quoted strings with `&&` or `;` | `"..."` or `'...'` combined with `&&` or `;` | Split into separate tool calls, one command per call |
+| SH-05 | No `bash` prefix for scripts | `bash scripts/...` | Run directly: `scripts/cleanup_worktree.sh` |
+| SH-06 | Use `git -C` for remote paths | `cd /path && git ...` | `git -C /absolute/path <subcommand>` |
+| SH-07 | Temp files in worktree only | `/tmp/` in file paths | Use `{worktree}/tmp/` instead |
+| SH-08 | No Edit/Write to `.claude/` | Edit or Write tool targeting `.claude/` paths | Write to `{worktree}/tmp/`, then `scripts/write-claude-file.sh` to copy into `.claude/` |
+| SH-09 | No bare `git stash pop` / `git stash apply` | `git stash pop` or `git stash apply` without an explicit `stash@{N}` ref | `git stash list` first; confirm subject matches current branch; then `git stash pop stash@{N}`. Or use a throwaway commit (`git commit -am WIP` / `git reset --soft HEAD~1`). Stash refs are shared per-clone, so bare pops can apply another worktree's stash (#2749). |
+
+## File Operation Rules
+
+| ID | Rule | Check |
+|----|------|-------|
+| FO-01 | Read before Write | If the file might already exist, Read it first — Write will fail otherwise |
+| FO-02 | Prefer Edit over Write | For modifying existing files, use Edit (sends only the diff) |
+| FO-03 | Use dedicated tools | Never use Bash for `cat`, `ls`, `grep`, `find` — use Read, Glob, Grep |
+
+## Git Rules
+
+| ID | Rule | Check |
+|----|------|-------|
+| GI-01 | Never commit to `main` directly | All work on worktree branches; changes go through PRs |
+| GI-02 | Commit messages use conventional format | `feat(area): description (#N)` |
+| GI-03 | Commit message via file | Write to `{worktree}/tmp/commit_msg.txt`, commit with `-F` |
+| GI-04 | May merge own PRs after diff review + green CI | `gh pr merge <N> --squash --delete-branch` |
+| GI-05 | PR body must include `Closes #N` | Required for the unblock workflow |
+| GI-06 | Push always followed by PR creation | Never push without immediately creating a PR |
+
+## Pre-PR Check Rules
+
+| ID | Rule | Commands |
+|----|------|----------|
+| PR-01 | Python lint | `.venv/bin/ruff check src/ tests/` |
+| PR-02 | Python format | `.venv/bin/ruff format --check src/ tests/` |
+| PR-03 | Python tests | `.venv/bin/pytest tests/ -v --tb=short` |
+| PR-03b | Python diff coverage | `scripts/check-diff-coverage.sh <package> --skip-tests` (after PR-03) |
+| PR-04 | TypeScript lint | `npm run lint` |
+| PR-05 | TypeScript typecheck | `npm run typecheck` |
+| PR-06 | TypeScript tests | `npm test` |
+| PR-06b | TypeScript diff coverage | `scripts/check-diff-coverage.sh <package> --skip-tests` (after PR-06) |
+| PR-07 | TypeScript build (web) | `npm run build` (for `packages/web/` only) |
+| PR-08 | Terraform format | `terraform fmt -check -recursive` |
+| PR-09 | Terraform validate | `terraform init -backend=false -lockfile=readonly && terraform validate` (readonly flag prevents `.terraform.lock.hcl` churn, see #2582) |
+| PR-10 | Check import sites when removing/renaming exports | Grep for removed/renamed symbol names across `src/` and `tests/`; update or remove every import site |
+
+## Task Workflow Rules
+
+| ID | Rule | Check |
+|----|------|-------|
+| TW-01 | Single issue per PR | Do not combine unrelated changes |
+| TW-02 | Sync before implementing | `git fetch origin main && git rebase origin/main` |
+| TW-03 | Watch CI to completion | `gh run watch` must exit before doing anything else |
+| TW-04 | Clean up worktree when done | Worktree cleanup is automatic for `isolation: "worktree"` agents |
+| TW-05 | Never deploy to production | Production deploys are human-only |
+| TW-06 | Venv isolation per worktree | Never share venvs between worktrees |
+| TW-07 | Never exit after ralph without completing A.3-A.9 | Ralph = halfway done. Must commit, push, PR, CI, merge, deploy, retrospective. Verify with `git status` and `gh pr list` (#721) |
+| TW-08 | Never create child worktrees from inside a worktree | Use `git checkout -- .` or `git clean -fd` to fix a dirty worktree instead of creating a new one |
+
+## Security Rules
+
+| ID | Rule | Check |
+|----|------|-------|
+| SE-01 | No hardcoded secrets | Use environment variables for API keys, credentials, URLs |
+| SE-02 | No large binaries in git | Use `.gitignore` |
+| SE-03 | No production scraping in dev | Only fetch pages for fixture creation |

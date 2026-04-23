@@ -1,0 +1,183 @@
+{
+  "model": "opus",
+  "permissions": {
+    "deny": ["NotebookEdit", "Task(Bash)"],
+    "allow": [
+      "WebFetch(domain:dev.api.judgemind.org)",
+      "WebFetch(domain:dev.judgemind.org)",
+      "WebFetch(domain:api.judgemind.org)",
+      "WebFetch(domain:judgemind.org)",
+      "WebFetch(domain:www.fresno.courts.ca.gov)",
+      "WebFetch(domain:www.sfsuperiorcourt.org)",
+      "WebFetch(domain:sf.courts.ca.gov)",
+      "WebFetch(domain:webapps.sftc.org)",
+      "WebFetch(domain:www.sdcourt.ca.gov)",
+      "WebFetch(domain:odyroa.sdcourt.ca.gov)",
+      "WebFetch(domain:www.cc-courts.org)",
+      "WebFetch(domain:contracosta.courts.ca.gov)",
+      "WebFetch(domain:www.tentativerulings.org)",
+      "WebFetch(domain:www.courts.ca.gov)",
+      "WebFetch(domain:www.gov.ca.gov)",
+      "WebFetch(domain:trellis.law)",
+      "WebFetch(domain:web.archive.org)",
+      "WebFetch(domain:ballotpedia.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:support.claude.com)",
+      "WebSearch",
+      "Edit(**)",
+      "Write(**)",
+      "Write(/tmp/*)",
+      "Glob",
+      "Grep",
+      "Skill",
+      "Bash(git *)",
+      "Bash(gh issue*)",
+      "Bash(gh pr*)",
+      "Bash(gh api*)",
+      "Bash(gh secret*)",
+      "Bash(gh label*)",
+      "Bash(gh project*)",
+      "Bash(gh auth*)",
+      "Bash(gh run*)",
+      "Bash(gh workflow*)",
+      "Bash(gh search*)",
+      "Bash(claude mcp list)",
+      "Bash(claude mcp get *)",
+      "Bash(.venv/bin/*)",
+      "Bash(**/.venv/bin/*)",
+      "Bash(scripts/*)",
+      "Bash(**/scripts/*)",
+      "Bash(. scripts/*)",
+      "Bash(. **/scripts/*)",
+      "Bash(source scripts/*)",
+      "Bash(source **/scripts/*)",
+      "Bash(source *)",
+      "Bash(chmod +x *)",
+      "Bash(python*)",
+      "Bash(brew *)",
+      "Bash(terraform *)",
+      "Bash(vercel *)",
+      "Bash(aws *)",
+      "Bash(curl *)",
+      "Bash(dig *)",
+      "Bash(docker *)",
+      "Bash(psql:*)",
+      "Bash(actionlint *)",
+      "Bash(date *)",
+      "Bash(printf:*)",
+      "Bash(ps *)",
+      "Bash(tar *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm -rf */worktrees/*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(find *)",
+      "Bash(echo *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(node *)",
+      "Bash(cd *)",
+      "Bash(pwd *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(which *)",
+      "Bash(realpath *)",
+      "Bash(dirname *)",
+      "Bash(basename *)",
+      "Bash(tee *)",
+      "Bash(mkdir *)",
+      "Bash(yarn *)",
+      "mcp__github__*",
+      "mcp__awslabs_cloudwatch-mcp-server__*",
+      "mcp__awslabs_ecs-mcp-server__*"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/preflight-bash.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/dispatcher-guard.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/worktree-write-guard.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/agent-worktree-guard.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/check-inbox.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/agent-cwd-guard.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-start.sh",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-end.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+# Shared dependencies for standalone scripts in scripts/.
+#
+# These packages are needed by scripts that run outside a package venv
+# (e.g. eval scripts, gemini review). Most scripts declare a `# venv:`
+# header and are run via `scripts/run-py.sh` which activates the correct
+# venv automatically.
+#
+# Install into the active venv or system Python:
+#   pip install -r scripts/requirements.txt
+#
+# Note: these are also available via the scraper-framework package
+# (packages/scraper-framework), so if you already have that venv active
+# you don't need to install separately.
+
+google-genai>=1.0
+anthropic>=0.40

@@ -1,0 +1,364 @@
+# Dispatcher v2 daemon container image.
+#
+# Phase 1 scaffolding (issue #2729 / docs/specs/dispatcher-v2-spec.md §14).
+# Packages the long-running dispatcher daemon (`scripts/dispatcher/daemon.py`)
+# together with the `@anthropic-ai/claude-code` CLI so that Phase 2+ can
+# spawn per-phase `/task-v2-*` subprocesses. Phase 1 itself does not spawn
+# anything — the image just has to boot, tick, heartbeat, and exit cleanly
+# on SIGTERM.
+#
+# Base image choice — `python:3.12-slim`:
+# - The dispatcher is Python 3.12. More importantly, every ralph subagent
+#   that spawns inside this container runs pre-push checks that invoke
+#   `pytest` against per-package venvs — and those venvs are built against
+#   the codebase's canonical 3.12 interpreter (see #2491's
+#   `scripts/install-package-venv.sh`). Packages in this repo use PEP 695
+#   generic syntax (e.g. `def retry_sync[T](...)` at
+#   `packages/scraper-framework/src/framework/retry.py:13`), which fails
+#   to parse on 3.11 — meaning a 3.11-based dispatcher would see every
+#   ralph pre-push that touches scraper-framework fail at
+#   pytest-collection time with a SyntaxError, not a real test result
+#   (#2968).
+# - The Claude Code CLI is a Node binary published as
+#   `@anthropic-ai/claude-code`. Node 20+ is installed on top via the
+#   NodeSource apt repository so both languages coexist in one image —
+#   avoids a second-language multi-stage build.
+# - We do NOT layer this on top of `packages/scraper-framework/Dockerfile`
+#   (which is also `python:3.12-slim`) because the scraper image carries
+#   Playwright + Chromium — ~400 MB of browser binaries the daemon has no
+#   use for.
+# - Historical note: Phase 1 originally used `node:20-slim` (validated by
+#   spike 0.1 at docs/investigations/dispatcher-v2-spike-0.1.md). That
+#   was fine when the daemon ran nothing but itself. Once Phase 2+ ralph
+#   subagents started running pytest in-container, the 3.11 default of
+#   Debian bookworm became a hard blocker — the swap to `python:3.12-slim`
+#   is the direct fix.
+#
+# $HOME policy:
+# - The base image lands at `/root`; we override to `/home/dispatcher` so
+#   a future non-root switch is a one-line `USER` change without rewriting
+#   every path that depends on `$HOME`. Per-subprocess isolation (spec
+#   §14) happens via `HOME=/tmp/agents/<agent_id>` env overrides on the
+#   daemon's per-phase spawn — NOT by mutating this container-level
+#   `$HOME`. The container-level value is only used by the daemon process
+#   itself, which does not touch `~/.claude/` since it does not run
+#   `claude -p` at Phase 1.
+#
+# Build (from repo root):
+#     docker build -f Dockerfile.dispatcher -t judgemind-dispatcher-local \
+#         --build-arg GIT_SHA=$(git rev-parse --short HEAD) .
+#
+# Run locally (requires DATABASE_URL reachable from the container):
+#     docker run --rm \
+#         -e DATABASE_URL="postgres://..." \
+#         judgemind-dispatcher-local \
+#         --tick-scheduler-seconds 5 --tick-supervisor-seconds 10
+
+FROM python:3.12-slim
+
+# ---------------------------------------------------------------------------
+# System deps: we install on top of the official Python 3.12 slim base
+# (Debian bookworm + `python` / `python3` / `pip` already wired up —
+# `python --version` → `Python 3.12.x`). Python 3.12 is required because
+# packages in this repo use PEP 695 generic syntax (e.g.
+# `def retry_sync[T](...)` at
+# `packages/scraper-framework/src/framework/retry.py:13`), which fails to
+# parse on 3.11. A 3.11-based dispatcher blocked every pytest-gated ralph
+# pre-push that touched scraper-framework — see #2968 for the incident.
+#
+# Node 20+ is installed below (separate RUN) via the NodeSource apt
+# repository — the `@anthropic-ai/claude-code` CLI is a Node binary and
+# requires Node 20+.
+#
+# git + gh CLI are needed by future /task-v2-* phases (spike 0.7 wired
+# these into the spike image and confirmed `gh auth setup-git` +
+# `git push` work with the scoped PAT secret). ca-certificates, curl,
+# and gnupg cover the claude-code install path, the NodeSource + GitHub
+# CLI keyring installs, and any outbound HTTPS (GitHub API, Anthropic
+# API, ECR, Telegram, Secrets Manager).
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Node.js 20 via NodeSource
+#
+# The official python:3.12-slim base doesn't ship Node. Debian bookworm's
+# default apt `nodejs` package is 18.x, which is below the
+# `@anthropic-ai/claude-code` Node 20+ floor. NodeSource publishes
+# first-party apt repositories pinned to a specific major version; the
+# one-liner install script below adds the node_20.x repo and installs
+# the matching nodejs package (npm is bundled).
+#
+# See https://github.com/nodesource/distributions for the canonical
+# install script (MIT-licensed, maintained by the Node.js foundation).
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the GitHub CLI from the official apt repository. The
+# `cli.github.com` keyring + source pattern is the same one spike 0.7
+# used and is the path `gh auth setup-git` depends on for its
+# `credential.https://github.com.helper = !gh auth git-credential`
+# configuration.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+#
+# - psycopg[binary]>=3.1 — Postgres driver for the dispatcher DB. Canonical
+#   interface is `import psycopg` with the `[binary]` extra for the bundled
+#   libpq (spike 0.2 / emit_failure.py), so no separate `libpq-dev` apt
+#   install is needed.
+# - boto3>=1.34 — AWS SDK, required by Phase 2's CloudWatch HeartbeatAge
+#   metric emission in `scripts/dispatcher/daemon.py` (#2773, scope miss
+#   from #2768 / PR #2771). The version floor matches the rest of the repo
+#   (`packages/scraper-framework/pyproject.toml`, `packages/nlp-pipeline/
+#   pyproject.toml`) so the daemon's boto3 stays in sync with the services
+#   the broader codebase targets.
+#
+# Both are pinned separately rather than combined into a requirements.txt
+# because Phase 1 deliberately keeps the dependency list tight — adding a
+# new layer only for a pip install step means future Phase 2+ changes bust
+# only the COPY layers below, not the Python install.
+# ---------------------------------------------------------------------------
+# The official `python:3.12-slim` base uses its own interpreter (not
+# Debian's system Python), so pip does NOT enforce the PEP 668
+# "externally-managed-environment" marker here. We can `pip install`
+# directly into the base interpreter without `--break-system-packages`
+# or an explicit venv (there is only one Python process in the container
+# and it is the daemon itself).
+RUN pip install --no-cache-dir \
+    "psycopg[binary]>=3.1,<4" \
+    "boto3>=1.34,<2"
+
+# ---------------------------------------------------------------------------
+# Claude Code CLI
+#
+# Pinned to 2.1.114 — the version spike 0.1 validated end-to-end on
+# Fargate. Phase 2+ bumps this whenever we re-spike a newer CLI.
+# ---------------------------------------------------------------------------
+RUN npm install -g @anthropic-ai/claude-code@2.1.114
+
+# ---------------------------------------------------------------------------
+# Dispatcher user + HOME
+#
+# We run the daemon as a non-root user. Phase 1 originally deferred this
+# ("Fargate isolates the task at the kernel level; non-root adds
+# complexity for no additional security benefit against the attacker the
+# daemon actually faces"). Phase 2+ forced our hand: the Claude Code CLI
+# refuses to run with ``--dangerously-skip-permissions`` when UID=0
+# ("cannot be used with root/sudo privileges for security reasons"), and
+# #2982's narrowed preflight hook + ``--dangerously-skip-permissions``
+# is how ralph's Step 2.5 pre-push gate actually runs. See the root-UID
+# crash trace in #2986 — six consecutive agents crashed at plan-spawn
+# time before the killswitch flip.
+#
+# Setting HOME explicitly so:
+#   (a) the daemon's `socket.gethostname()` + env lookups are predictable;
+#   (b) Node/NPM global caches from `claude-code` live at
+#       /home/dispatcher, not /root, which dispatcher can actually read.
+# Per-subprocess HOME isolation for the `/task-v2-*` workers happens on
+# spawn (spec §14) — the daemon sets HOME=/tmp/agents/<agent_id> on each
+# child process so ~/.claude/ state cannot leak across agents.
+#
+# UID/GID 1000 is conventional and matches most development environments;
+# ECS Fargate doesn't care what UID we pick as long as it's consistent.
+# ---------------------------------------------------------------------------
+ENV HOME=/home/dispatcher
+RUN groupadd --gid 1000 dispatcher \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --home-dir "$HOME" dispatcher \
+    && mkdir -p "$HOME" \
+    && chown -R dispatcher:dispatcher "$HOME"
+
+# ---------------------------------------------------------------------------
+# Baseline git checkout (issue #2804)
+#
+# Phase 3A (#2783) assumed the daemon's CWD has a `.git` parent so
+# `git -C <cwd> worktree add ...` could carve off per-agent worktrees.
+# The container image does NOT bake in a checkout — adding one here
+# would pin the image to a build-time commit, which breaks the "daemon
+# re-deploys across many merges and wants the latest origin/main for
+# every new worktree" property we actually want.
+#
+# Instead the daemon clones judgemind/judgemind into
+# DISPATCHER_BASELINE_REPO_ROOT at boot (via
+# `DispatcherDaemon.ensure_baseline_clone`), and carves worktrees off
+# that clone at `git -C <baseline> worktree add <abs_path>`. Worktrees
+# live in the sibling `/var/lib/dispatcher/worktrees/` directory so the
+# baseline clone itself is never mixed with per-agent state.
+#
+# We only pre-create the parent directory here; the daemon itself is
+# responsible for the clone (so a restart on already-populated
+# ephemeral storage just does a `git fetch origin main` instead of
+# re-cloning).
+#
+# Fargate ephemeral storage is 50 GiB (spike 0.6), baseline shallow
+# clone is ~100 MB, worktrees are ~700 MB each — easily fits even at
+# concurrency_cap=5.
+#
+# Ownership: the dispatcher user needs to create /var/lib/dispatcher/repo
+# (clone target) and /var/lib/dispatcher/worktrees/<agent_id> (per-agent
+# worktree dirs) at runtime. Chown the whole tree to dispatcher:dispatcher
+# after creating it so both paths are writable by the non-root daemon.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /var/lib/dispatcher/worktrees \
+    && chown -R dispatcher:dispatcher /var/lib/dispatcher
+ENV DISPATCHER_BASELINE_REPO_ROOT=/var/lib/dispatcher/repo
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Application code
+#
+# COPY scripts/dispatcher/ (the daemon + emit_failure hook + tests)
+# plus scripts/check-issue-author.sh (used by Phase 2 before spawning
+# /task-v2-plan on an issue per §Step 1b of the /task skill).
+#
+# We deliberately do not COPY the whole `scripts/` directory — those
+# scripts are laptop-side helpers that don't need to ship in the daemon
+# image. Keeping the COPY list tight reduces layer churn from unrelated
+# scripts/*.py edits.
+# ---------------------------------------------------------------------------
+COPY scripts/dispatcher/ /app/scripts/dispatcher/
+COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
+RUN chmod +x /app/scripts/check-issue-author.sh \
+    && chown -R dispatcher:dispatcher /app
+
+# ---------------------------------------------------------------------------
+# Narrowed preflight hook for in-container subagents (issue #2982).
+#
+# The operator-local ``.claude/hooks/preflight-bash.sh`` blocks 12+ patterns
+# whose purpose is to prevent the *interactive* Claude CLI from stalling on
+# permission prompts (`$(...)`, heredocs, inline `python -c`, quoted
+# strings + `&&`/`;`, etc.). Inside the Fargate dispatcher container the
+# subagents (plan, ralph, summary, push_and_pr, verify, retro, fix-ci) run
+# non-interactively with ``--dangerously-skip-permissions`` — there are no
+# prompts, and those rules become pure drag. Concretely they blocked
+# ralph's Step 2.5 pre-push gate from executing at all on #2960, causing
+# four consecutive identical failures.
+#
+# We file-swap the hook at *worktree creation* time rather than (a) adding
+# an env-var branch inside the operator-local hook or (b) overwriting the
+# hook file inside the container image.
+#
+# Why not an env-var branch inside the operator-local hook?
+#   - every operator-side Bash tool call would pay for an env-var probe
+#   - one file diverges into two behaviors — easier to drift / hit bugs
+#   - the operator-local file would no longer be a pure audit trail of
+#     what blocks on laptops
+#
+# Why not overwrite in the image?
+#   - the subagent's cwd is the *worktree*, not ``/app``; hook paths in
+#     ``.claude/settings.json`` resolve relative to cwd, so the worktree's
+#     tracked hook file wins regardless of what ``/app`` contains
+#   - git-worktree tracked files are fresh copies from ``origin/main`` —
+#     the baseline clone's working tree doesn't feed into them either
+#
+# So we stage the Fargate hook at a stable in-image path and have the
+# daemon's :meth:`DispatcherDaemon._create_worktree` copy it over the
+# worktree's tracked hook file, then mark the file ``--skip-worktree`` so
+# git ignores the divergence (the ralph Step 2.5 pre-push gate would
+# otherwise see ``.claude/hooks/preflight-bash.sh`` as "modified" on
+# every worktree and potentially sweep it into the PR diff).
+#
+# Rationale for file-swap-on-worktree-create over the alternatives:
+#   - operator-local file is never touched — zero regression risk on laptops
+#   - no conditional inside the hook — easier to reason about what's enforced
+#   - ``--skip-worktree`` keeps the divergence invisible to git status /
+#     pre-push / PR diff
+#   - scope stays local to the Fargate path (baseline_repo_root is set)
+# The trade-off (a few lines of hook-swap code in the daemon) is worth it
+# for the clean separation.
+#
+# The narrower ``scripts/preflight-bash-fargate.sh`` only enforces the 4
+# safety-critical rules (git push to main, git worktree add inside a
+# worktree, cross-worktree writes, bare git stash pop/apply). See the
+# hook's header comment for the rationale per rule.
+#
+# We also COPY the ``.claude/hooks/preflight_cross_worktree.py`` helper
+# because the Fargate hook's cross-worktree-write check delegates to it
+# (same as the operator-local hook). The helper is staged next to the
+# hook in ``/app/fargate-hooks/`` so a single stage-dir COPY pattern
+# keeps the daemon code simple.
+# ---------------------------------------------------------------------------
+COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
+COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+RUN chmod +x /app/fargate-hooks/preflight-bash.sh \
+    && chown -R dispatcher:dispatcher /app/fargate-hooks
+ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
+
+# ---------------------------------------------------------------------------
+# Image provenance — GIT_SHA from build-args (CI sets it to the merge
+# commit SHA). The daemon reads GIT_SHA from the environment at startup
+# and persists it to `dispatcher.runs.version_sha` so post-hoc crash
+# forensics can map a run to a specific image.
+# ---------------------------------------------------------------------------
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
+# ---------------------------------------------------------------------------
+# Git committer identity
+#
+# The daemon's ``_push_and_open_pr`` runs ``git commit --amend -F
+# <file>`` to rewrite Ralph's placeholder commit with Summary's
+# conventional-commits message. Git refuses to commit (exit 128,
+# "Committer identity unknown") unless ``user.name`` + ``user.email``
+# are set somewhere in the config chain. The non-root dispatcher
+# user has no ``~/.gitconfig`` by default.
+#
+# Observed on agent 44c031ee (#2565) at 2026-04-21 18:14 UTC: Ralph
+# shipped SHIP + Summary completed + daemon hit the amend step and
+# died with "empty ident name". Two hours of Ralph work lost.
+#
+# Set ``--system`` so every process in the image (daemon + spawned
+# subagents) inherits the identity via ``/etc/gitconfig`` without
+# needing per-user setup. Values are cosmetic — GitHub attributes
+# the merged commit to the PR author via the squash-merge flow, not
+# this identity. ``noreply@`` by convention is non-deliverable.
+# ---------------------------------------------------------------------------
+RUN git config --system user.email "noreply@judgemind.org" \
+    && git config --system user.name "Judgemind Dispatcher"
+
+# ---------------------------------------------------------------------------
+# Drop privileges before the entrypoint.
+#
+# The Claude Code CLI refuses ``--dangerously-skip-permissions`` when UID=0,
+# and #2982's preflight narrowing relies on that flag. Switching to the
+# dispatcher user (UID 1000) here satisfies the CLI check without losing
+# access to any path the daemon needs — /app, /home/dispatcher, and
+# /var/lib/dispatcher/* were all chown'd above, and system binaries
+# (python, node, npm, git, gh, claude) are world-readable at /usr/local
+# and /usr/bin.
+# ---------------------------------------------------------------------------
+USER dispatcher
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+#
+# `python -m scripts.dispatcher.daemon` so the module path resolves with
+# `/app` on sys.path (the default CWD). Any CLI flags passed via ECS
+# `command` override just follow through as argv. Tick-scheduler and
+# tick-supervisor default to the spec's 30s / 120s.
+#
+# NOTE: the `python:3.12-slim` base image has no inherited entrypoint
+# (its default CMD is an interactive `python3` REPL). Setting ENTRYPOINT
+# explicitly makes `docker run <img> --flag` route the flag to the
+# daemon's argv instead of python's.
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["python", "-m", "scripts.dispatcher.daemon"]
+CMD []

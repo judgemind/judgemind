@@ -1,0 +1,20 @@
+{
+  "ruling_text": "Negley Law APC vs. Cherisa Brahmer\n\nJudgment Debtor's Motion for Order to Show Cause re Sanctions and Request for Sanctions is DENIED. The Court does not find evidence of bad faith, frivolous or harassing actions or tactics. (Childs v. PaineWebber Incorporated (1994) 29 Cal.App.4th 982, 995-996.) Nor has Ms. Brahmer established she complied with the 21 day safe harbor provision of Code of Civil Procedure section 128.7. (See Broadcast Music, Inc. v. Structured Asset Sales, LLC (2022) 75 Cal.App.5th 596, 605.)",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/ventura/superior_court/raw/2026/03/24/bf1fbef5-fbf3-5860-a4d4-ad0206dbc4c7.pdf",
+  "notes": "Motion type ambiguity: DB='motion_for_sanctions', text='osc'",
+  "acceptable_alternatives": {
+    "motion_type": [
+      "motion_for_sanctions",
+      "osc"
+    ]
+  }
+}

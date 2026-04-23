@@ -1,0 +1,278 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+let mockAuthResult: {
+  user: { id: string; email: string; emailVerified: boolean; displayName: string | null; role: string; createdAt: string } | null;
+  loading: boolean;
+  setUser: ReturnType<typeof vi.fn>;
+  logout: ReturnType<typeof vi.fn>;
+};
+
+let mockOverviewQueryResult: {
+  data: unknown;
+  loading: boolean;
+  error: Error | undefined;
+};
+
+let mockMetricsQueryResult: {
+  data: unknown;
+  loading: boolean;
+  error: Error | undefined;
+};
+
+vi.mock('@/providers/AuthProvider', () => ({
+  useAuth: () => mockAuthResult,
+}));
+
+// Track which query is being called and capture variables
+let queryCallCount = 0;
+let lastMetricsVariables: Record<string, unknown> | undefined;
+vi.mock('@apollo/client', async () => {
+  const actual = await vi.importActual<typeof import('@apollo/client')>(
+    '@apollo/client',
+  );
+  return {
+    ...actual,
+    useQuery: (_query: unknown, options?: { variables?: Record<string, unknown> }) => {
+      queryCallCount++;
+      // First useQuery call is overview, second is metrics
+      if (queryCallCount % 2 === 1) return mockOverviewQueryResult;
+      lastMetricsVariables = options?.variables;
+      return mockMetricsQueryResult;
+    },
+  };
+});
+
+// Mock recharts to avoid SVG rendering in tests
+vi.mock('recharts', () => ({
+  LineChart: ({ children }: { children: React.ReactNode }) => <div data-testid="line-chart">{children}</div>,
+  Line: () => <div />,
+  XAxis: () => <div />,
+  YAxis: () => <div />,
+  CartesianGrid: () => <div />,
+  Tooltip: () => <div />,
+  ResponsiveContainer: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  Legend: () => <div />,
+}));
+
+import { DataQualityDashboard } from '../src/app/(main)/admin/data-quality/DataQualityDashboard';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeAdminUser() {
+  return {
+    id: 'user-1',
+    email: 'admin@example.com',
+    emailVerified: true,
+    displayName: 'Admin',
+    role: 'admin',
+    createdAt: '2026-01-01',
+  };
+}
+
+function makeOverviewData() {
+  return {
+    dataQualityOverview: [
+      {
+        county: 'Los Angeles',
+        healthStatus: 'green',
+        rulingCount24h: 42,
+        fieldCompletenessPct: 95.5,
+        scraperLastSuccessAgeHours: 1.2,
+        lastUpdated: '2026-03-11T10:00:00Z',
+      },
+      {
+        county: 'Orange',
+        healthStatus: 'yellow',
+        rulingCount24h: 10,
+        fieldCompletenessPct: 82.0,
+        scraperLastSuccessAgeHours: 8.5,
+        lastUpdated: '2026-03-11T09:00:00Z',
+      },
+      {
+        county: 'San Diego',
+        healthStatus: 'red',
+        rulingCount24h: 0,
+        fieldCompletenessPct: 45.0,
+        scraperLastSuccessAgeHours: 30.0,
+        lastUpdated: '2026-03-10T12:00:00Z',
+      },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('DataQualityDashboard', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryCallCount = 0;
+    lastMetricsVariables = undefined;
+    mockAuthResult = {
+      user: makeAdminUser(),
+      loading: false,
+      setUser: vi.fn(),
+      logout: vi.fn(),
+    };
+    mockOverviewQueryResult = {
+      data: undefined,
+      loading: false,
+      error: undefined,
+    };
+    mockMetricsQueryResult = {
+      data: undefined,
+      loading: false,
+      error: undefined,
+    };
+  });
+
+  it('shows skeleton while auth is loading', () => {
+    mockAuthResult.loading = true;
+    const { container } = render(<DataQualityDashboard />);
+    const skeletons = container.querySelectorAll('.animate-pulse');
+    expect(skeletons.length).toBeGreaterThan(0);
+  });
+
+  it('shows access denied for non-admin users', () => {
+    mockAuthResult.user = { ...makeAdminUser(), role: 'user' };
+    render(<DataQualityDashboard />);
+    expect(screen.getByText('Access Denied')).toBeInTheDocument();
+    expect(screen.getByText(/restricted to admin users/)).toBeInTheDocument();
+  });
+
+  it('shows access denied when not authenticated', () => {
+    mockAuthResult.user = null;
+    render(<DataQualityDashboard />);
+    expect(screen.getByText('Access Denied')).toBeInTheDocument();
+  });
+
+  it('shows skeleton while overview is loading', () => {
+    mockOverviewQueryResult.loading = true;
+    const { container } = render(<DataQualityDashboard />);
+    const skeletons = container.querySelectorAll('.animate-pulse');
+    expect(skeletons.length).toBeGreaterThan(0);
+  });
+
+  it('shows error message when overview query fails', () => {
+    mockOverviewQueryResult.error = new Error('Network error');
+    render(<DataQualityDashboard />);
+    expect(
+      screen.getByText('Failed to load data quality metrics.'),
+    ).toBeInTheDocument();
+  });
+
+  it('renders overview grid with county data', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.getByText('Los Angeles')).toBeInTheDocument();
+    expect(screen.getByText('Orange')).toBeInTheDocument();
+    expect(screen.getByText('San Diego')).toBeInTheDocument();
+  });
+
+  it('renders system health score', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    // 1 of 3 counties is green = 33%
+    expect(screen.getByText('33%')).toBeInTheDocument();
+    expect(screen.getByText(/1 of 3 counties healthy/)).toBeInTheDocument();
+  });
+
+  it('renders active alerts count', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    // 1 county in red status
+    expect(screen.getByText('1')).toBeInTheDocument();
+    expect(screen.getByText(/counties in red status/)).toBeInTheDocument();
+  });
+
+  it('renders chart titles when metrics data is loaded', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.getByText('Ruling Ingest Rate (7 days)')).toBeInTheDocument();
+    expect(screen.getByText('Field Completeness Trends (7 days)')).toBeInTheDocument();
+    expect(screen.getByText('Scraper Uptime (7 days)')).toBeInTheDocument();
+  });
+
+  it('passes resolution: four_hour and first: 5000 for metrics query', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: { edges: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    };
+    render(<DataQualityDashboard />);
+    expect(lastMetricsVariables).toBeDefined();
+    expect(lastMetricsVariables!.resolution).toBe('four_hour');
+    expect(lastMetricsVariables!.first).toBe(5000);
+    expect(lastMetricsVariables!.startDate).toBeDefined();
+    expect(lastMetricsVariables!.endDate).toBeDefined();
+  });
+
+  it('shows truncation warning when hasNextPage is true', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: {
+        edges: [
+          {
+            cursor: 'c1',
+            node: {
+              id: '1',
+              recordedAt: '2026-03-11T10:00:00Z',
+              county: 'Los Angeles',
+              metricName: 'ruling_count_24h',
+              metricValue: 42,
+              metadata: null,
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: true, endCursor: 'c1' },
+      },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+    expect(screen.getByText(/Some data may be truncated/)).toBeInTheDocument();
+  });
+
+  it('does not show truncation warning when hasNextPage is false', () => {
+    mockOverviewQueryResult.data = makeOverviewData();
+    mockMetricsQueryResult.data = {
+      dataQualityMetrics: {
+        edges: [
+          {
+            cursor: 'c1',
+            node: {
+              id: '1',
+              recordedAt: '2026-03-11T10:00:00Z',
+              county: 'Los Angeles',
+              metricName: 'ruling_count_24h',
+              metricValue: 42,
+              metadata: null,
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    };
+    render(<DataQualityDashboard />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Some data may be truncated/)).not.toBeInTheDocument();
+  });
+});

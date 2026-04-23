@@ -1,0 +1,29 @@
+{
+  "_fixture": "fresno_501_20260310_10fe3c7f.pdf",
+  "_description": "Fresno Dept 501, 4 pages, 2 rulings. Initials: DTT. Both motions taken off calendar.",
+  "_captured": "2026-03-10",
+  "courthouse": "Fresno County Superior Court",
+  "department": "501",
+  "judge_name": null,
+  "judge_initials": "DTT",
+  "page_count": 4,
+  "case_count": 2,
+  "primary_case_number": "23CECG05097",
+  "case_number_format": "{YY}CEC{TYPE}{NNNNN}",
+  "hearing_date": "March 10, 2026",
+  "expected_cases": [
+    {
+      "case_number": "23CECG05097",
+      "case_title": "Godines v. MVED, Inc.",
+      "motion_type": "by Plaintiff to Compel Further Responses to Form Interrogatories, Special Interrogatories, Requests for Production of Documents, and Requests for Admissions, Set One, and for Sanctions",
+      "outcome": "moot"
+    },
+    {
+      "case_number": "25CECG04177",
+      "case_title": "Timothy Blevens v. Cheryl Medrano",
+      "motion_type": "by Defendant Cheryl A. Medrano to Set Aside Default",
+      "outcome": "off_calendar"
+    }
+  ],
+  "_notes": "Page 1 header mentions continued case 25CECG01177 (Miguel Gonzalez-Ibarra v. Pacific Ag Rentals LLC). Both rulings taken off calendar/moot. Initials: DTT."
+}

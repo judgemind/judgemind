@@ -1,0 +1,20 @@
+{
+  "_fixture": "oc_west_w.pdf",
+  "_description": "OC West Justice Center — Dept W15 (Judge Richard Y. Lee). 38-page PDF with 10 case numbers.",
+  "_link_text": "LEE, Richard - Dept W15",
+  "_captured": "2026-03-02",
+  "courthouse": "West Justice Center",
+  "department": "W15",
+  "judge_name": "Richard Y. Lee",
+  "page_count": 38,
+  "case_count": 10,
+  "primary_case_number": "23-01314563",
+  "case_number_format": "DD-DDDDDDDD",
+  "hearing_date": "February 26, 2026",
+  "ruling_text_contains": [
+    "TENTATIVE RULINGS",
+    "DEPT W15",
+    "JUDGE RICHARD Y. LEE"
+  ],
+  "_notes": "West Justice Center format. 38 pages, 10 cases. Standard case number format."
+}

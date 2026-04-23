@@ -1,0 +1,18 @@
+{
+  "ruling_text": "Case Number:\n25STCV13037\nHearing Date:\n\nMarch 20, 2026\nDept:\n\nNo.\n7 – Camila Escobar v. Michael Deitch, et al.\nPetition\nto Approve Compromise of Claim or Action for Minor Claimant Camila Escobar\nPetitioner\nJose Escobar petitions to approve the compromise of this action on behalf of\nminor Camila Escobar. The Court cannot approve the minor’s compromise because\nthe petition has several defects and appears to be missing necessary pages.\nFirst,\nwhile Petitioner seeks to deposit the settlement funds into an insured bank\naccount, Petitioner did not submit\nOrder to Deposit Funds in Blocked Account\non Judicial Council MC-355, nor identify the name, branch, and address of\nthe bank as required under § 18(b)(2).\nSecond,\nPetitioner did not submit a retainer agreement or an attorney declaration to support\nthe attorney fee request. These documents should be included under §§ 13(a) and\n17(a). Also, Petitioner lists $1,000 in attorney fees in § 13(a), but later\nlists $5,625 in § 16(c).\nThird,\nPetitioner claims that the total gross settlement amount is $22,500 but lists\neach of the seven Defendants as contributing $4,000 each in § 10(b). This is\ninaccurate and should be corrected in the future petition.\nLastly,\nPetitioner did not sign the petition.\nThe\npetition to approve compromise of claim or action for minor is\ndenied\nwithout prejudice.",
+  "expected": {
+    "case_title": "Camila Escobar v. Michael Deitch, et al.",
+    "motion_type": "petition",
+    "outcome": "denied_in_part",
+    "parties": {
+      "plaintiffs": [
+        "Camila Escobar"
+      ],
+      "defendants": [
+        "Michael Deitch"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/20/736dff37-ef07-53e3-aa5c-05e25972d662.html",
+  "notes": ""
+}

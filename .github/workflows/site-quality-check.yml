@@ -1,0 +1,178 @@
+name: Site Quality Check
+
+on:
+  schedule:
+    # Every hour at minute 30 (offset from smoke test at :00/:15/:30/:45)
+    - cron: '30 * * * *'
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+# Only one quality check at a time
+concurrency:
+  group: site-quality-check
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  quality-check:
+    name: Validate site content and API
+    runs-on: ubuntu-latest
+
+    env:
+      BASE_URL: https://dev.judgemind.org
+      API_URL: https://dev.api.judgemind.org/graphql
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github
+            site-quality-baselines.json
+            scripts/site-quality-check.py
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run site quality checks
+        id: quality
+        env:
+          BASELINES_FILE: site-quality-baselines.json
+        run: python scripts/site-quality-check.py
+
+      - name: Check for existing open issue
+        if: failure() && steps.quality.outputs.has_failures == 'true'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "site-quality-failure" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open site-quality issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        if: >-
+          failure() &&
+          steps.quality.outputs.has_failures == 'true' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILURE_DETAILS: ${{ steps.quality.outputs.failure_details }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## Site Quality Check Failure"
+            echo ""
+            echo "The hourly site quality check detected content or API regressions on \`dev.judgemind.org\`."
+            echo ""
+            echo "### Failed Checks"
+            echo ""
+            echo "| Check | Category | Details |"
+            echo "|-------|----------|---------|"
+            echo "$FAILURE_DETAILS"
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo ""
+            echo "### Difference from Smoke Test"
+            echo ""
+            echo "This is a **content quality** check, not just an HTTP status check. Pages may return 200 but with broken content, empty data, or missing expected elements. The basic smoke test only checks for 5xx errors."
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Check the specific failed checks above for details"
+            echo "2. Review the GraphQL API responses at \`https://dev.api.judgemind.org/graphql\`"
+            echo "3. Check the Vercel deployment dashboard for recent deploy issues"
+            echo "4. Review recent commits to \`main\` for breaking changes"
+            echo ""
+            echo "This issue was created automatically by the site quality check workflow. It will not create duplicates while this issue is open."
+          } > /tmp/issue_body.md
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Site quality regression: content/API checks failing on dev.judgemind.org" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/api,site-quality-failure,agent/ready"
+
+      - name: Update existing issue with new failures
+        if: >-
+          failure() &&
+          steps.quality.outputs.has_failures == 'true' &&
+          steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.existing.outputs.number }}
+          FAILURE_DETAILS: ${{ steps.quality.outputs.failure_details }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "### Update: Still failing at ${TIMESTAMP}"
+            echo ""
+            echo "| Check | Category | Details |"
+            echo "|-------|----------|---------|"
+            echo "$FAILURE_DETAILS"
+            echo ""
+            echo "**Workflow run:** ${RUN_URL}"
+          } > /tmp/comment_body.md
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/comment_body.md
+
+      - name: Auto-close resolved quality issues
+        if: success() && steps.quality.outputs.has_failures == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Find all open issues with the site-quality-failure label
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "site-quality-failure" \
+            --json number \
+            -q '.[].number')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open site-quality-failure issues to close."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing site-quality issue #${ISSUE_NUM} — all checks are passing."
+
+            {
+              echo "All site quality checks are now passing. Auto-closing this issue."
+              echo ""
+              echo "**Passing workflow run:** ${RUN_URL}"
+            } > /tmp/close_comment.md
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/close_comment.md
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done

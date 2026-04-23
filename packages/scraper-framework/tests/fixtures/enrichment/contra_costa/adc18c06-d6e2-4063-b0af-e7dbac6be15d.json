@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Conservatorship of: Josephine Gifford\n\nDrop.\n\nNote: Request for Dismissal entered 3-4-2026.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "petition",
+    "outcome": "off_calendar",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/contra_costa/superior_court/raw/2026/03/28/d5ae729f-1501-5fc0-835f-d6a9d507cf16.pdf",
+  "notes": "Non-adversarial case - no plaintiff/defendant parties; Very short ruling text"
+}

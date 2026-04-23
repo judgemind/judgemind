@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/classification", "src/embedding", "src/entity_extraction", "src/summarization", "src/version_diff"]
+
+[project]
+name = "judgemind-nlp-pipeline"
+version = "0.1.0"
+description = "NLP processing pipeline for Judgemind court documents"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "anthropic>=0.21",
+    "openai>=1.12",
+    "redis>=5.0",
+    "boto3>=1.34",
+    "pydantic>=2.6",
+    "structlog>=24.1",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "sentence-transformers>=2.5",
+    "qdrant-client>=1.8",
+    "judgemind-config",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=7.1.0",
+    "pytest-testmon>=2.1",
+    "pytest-xdist>=3.5",
+    "ruff>=0.3",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN"]
+ignore = ["ANN401"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "--cov=classification --cov=embedding --cov=entity_extraction --cov=summarization --cov=version_diff --cov-report=term --cov-report=html:htmlcov --cov-report=xml:coverage.xml"

@@ -1,0 +1,24 @@
+{
+  "_fixture": "ventura_ruling_html_compel.html",
+  "_description": "Ventura Dept 20 — Motion to compel further responses, granted in part. Single-case HTML ruling.",
+  "_captured": "2026-03-11",
+  "_format": "html",
+  "department": "20",
+  "case_count": 1,
+  "case_number": "2024CUBC038456",
+  "motion_type": "Motion to Compel Further Responses",
+  "hearing_date": "March 11, 2026",
+  "expected_cases": [
+    {
+      "case_number": "2024CUBC038456",
+      "case_title": "Thompson v. Anderson Financial Services, Inc.",
+      "outcome": "granted_in_part",
+      "parties": [
+        {"name": "Robert Thompson", "role": "plaintiff"},
+        {"name": "Anderson Financial Services, Inc.", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["GRANTED IN PART AND DENIED IN PART", "special interrogatories", "sanctions"]
+    }
+  ],
+  "_notes": "Discovery motion granted as to 4 interrogatories, denied as to 1. Sanctions awarded. Outcome is granted_in_part."
+}

@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Deepak Moorjani v. Robby Datta\n\nThe court will hear any motions related a Civil Harassment Restraining Order on the day\nthat the hearing for the restraining order is scheduled.\nThis motion will be scheduled concurrently with the hearing on 4/7/26, at 9am.\nMoving party to provide notice to opposing party.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "other",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/contra_costa/superior_court/raw/2026/03/28/1b026a16-7bc8-51eb-8ea4-2406b9b28d48.pdf",
+  "notes": ""
+}

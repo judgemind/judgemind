@@ -1,0 +1,140 @@
+name: Data Quality Check
+
+on:
+  schedule:
+    # Every hour at minute 15 (offset from other scheduled workflows)
+    - cron: '15 * * * *'
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+    inputs:
+      county:
+        description: "Optional county name to check (default: all)"
+        required: false
+        type: string
+      text_output:
+        description: "Use human-readable text output instead of JSON"
+        required: false
+        type: boolean
+        default: false
+
+# Only one quality check at a time
+concurrency:
+  group: data-quality-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  data-quality-check:
+    name: Run data quality checks via ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/data-quality-check.py
+            scripts/ecs-run-task.sh
+            scripts/ecs-logs.sh
+            scripts/notify-telegram.sh
+            scripts/format-dq-summary.py
+            data-quality-baselines.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build script arguments
+        id: args
+        run: |
+          ARGS="--persist-metrics --check-ecs"
+          if [ "${{ inputs.text_output }}" = "true" ]; then
+            ARGS="$ARGS --text"
+          fi
+          if [ -n "${{ inputs.county }}" ]; then
+            ARGS="$ARGS --county ${{ inputs.county }}"
+          fi
+          # Pass baselines as base64 so they are available on ECS oneshot
+          # (only the script file is uploaded, not the baselines JSON file).
+          # Base64 encoding avoids shell quoting issues with JSON content.
+          if [ -f "data-quality-baselines.json" ]; then
+            BASELINES_B64=$(base64 -w0 < data-quality-baselines.json)
+            ARGS="$ARGS --baselines-base64 ${BASELINES_B64}"
+          fi
+          echo "script_args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Run data quality check on ECS
+        id: check
+        env:
+          SCRIPT_ARGS: ${{ steps.args.outputs.script_args }}
+        run: |
+          # Run the data quality check script on ECS via ecs-run-task.sh.
+          # The ECS task has DATABASE_URL injected from Secrets Manager.
+          # Use --cpu 256 --memory 512 since this is a lightweight SQL-only task.
+          set +e
+          scripts/ecs-run-task.sh \
+            --cpu 256 --memory 512 \
+            --timeout 300 \
+            --latest-image \
+            scripts/data-quality-check.py -- $SCRIPT_ARGS 2>&1 | tee /tmp/check_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "Data quality check passed: all counties healthy."
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "Data quality check found alerts (exit code $EXIT_CODE)."
+          fi
+
+      # Alerts are dashboard-only. No GitHub issues are filed.
+      # Telegram notification is sent only for persistent, unresolvable
+      # conditions (scraper stale >24h on a business day). Transient
+      # conditions (zero rulings, field completeness drops, ingest rate
+      # drops) historically auto-resolve within hours and are visible
+      # on the /admin/data-quality dashboard.
+      - name: Extract alert summary for Telegram
+        if: steps.check.outputs.healthy == 'false'
+        id: summary
+        run: |
+          TELEGRAM=$(python3 scripts/format-dq-summary.py --telegram /tmp/check_output.txt 2>/dev/null || echo "Alert details unavailable.")
+          echo "$TELEGRAM" > /tmp/alert_telegram.txt
+
+          # Check if any P1 alerts are for persistent conditions (scraper_stale,
+          # ecs_service_health). Transient P1 alerts (zero_rulings) are
+          # dashboard-only and do not trigger Telegram notifications.
+          HAS_PERSISTENT=$(python3 scripts/format-dq-summary.py --has-persistent-alerts /tmp/check_output.txt 2>/dev/null || echo "false")
+          echo "has_persistent_alerts=$HAS_PERSISTENT" >> "$GITHUB_OUTPUT"
+
+          echo "Alert summary (persistent alerts: $HAS_PERSISTENT): $TELEGRAM"
+
+      - name: Send Telegram notification for persistent P1 alerts
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.summary.outputs.has_persistent_alerts == 'true'
+        continue-on-error: true
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
+
+          {
+            echo "<b>Data Quality Alert (P1)</b>"
+            echo ""
+            echo "${TG_SUMMARY}"
+            echo ""
+            echo "Dashboard: https://dev.judgemind.org/admin/data-quality"
+            echo "Workflow: ${RUN_URL}"
+          } > /tmp/tg_message.txt
+
+          scripts/notify-telegram.sh --message-file /tmp/tg_message.txt

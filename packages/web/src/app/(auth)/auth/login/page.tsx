@@ -1,0 +1,91 @@
+'use client';
+
+import { useState } from 'react';
+import { useMutation } from '@apollo/client';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { LOGIN_MUTATION } from '@/lib/auth-mutations';
+import type { AuthPayload } from '@/lib/auth-mutations';
+import { setAccessToken } from '@/lib/auth-tokens';
+import { useAuth } from '@/providers/AuthProvider';
+import {
+  AuthCard,
+  FormField,
+  SubmitButton,
+  ErrorAlert,
+} from '@/components/auth/AuthCard';
+
+export default function LoginPage() {
+  const router = useRouter();
+  const { setUser } = useAuth();
+
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const [loginMutation, { loading }] = useMutation<{ login: AuthPayload }>(
+    LOGIN_MUTATION,
+  );
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+
+    try {
+      const { data } = await loginMutation({
+        variables: { email, password },
+      });
+      if (data?.login.user) {
+        setAccessToken(data.login.accessToken);
+        setUser(data.login.user);
+        router.push('/');
+      }
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Login failed. Please try again.';
+      setError(message);
+    }
+  }
+
+  return (
+    <AuthCard title="Log in to your account">
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <ErrorAlert message={error} />
+
+        <FormField
+          id="email"
+          label="Email"
+          type="email"
+          value={email}
+          onChange={setEmail}
+          placeholder="you@example.com"
+          autoComplete="email"
+        />
+
+        <FormField
+          id="password"
+          label="Password"
+          type="password"
+          value={password}
+          onChange={setPassword}
+          placeholder="Enter your password"
+          autoComplete="current-password"
+        />
+
+        <SubmitButton loading={loading}>Log in</SubmitButton>
+      </form>
+
+      <div className="mt-6 text-center text-sm">
+        <p className="text-muted-foreground">
+          Don&apos;t have an account?{' '}
+          <Link
+            href="/auth/register"
+            className="font-medium text-brand-accent hover:text-brand-accent-hover dark:text-brand-accent-light dark:hover:text-brand-accent-lighter"
+          >
+            Register
+          </Link>
+        </p>
+      </div>
+    </AuthCard>
+  );
+}

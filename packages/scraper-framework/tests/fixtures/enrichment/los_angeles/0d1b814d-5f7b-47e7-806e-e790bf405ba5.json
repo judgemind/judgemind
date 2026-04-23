@@ -1,0 +1,24 @@
+{
+  "ruling_text": "Case Number:\n24AHCV00006\nHearing Date:\nMarch 9, 2026\nDept:\nX\n#19 -\nMARGARITO RAMIREZ GUERRERO vs GEORGE L. THROOP COMPANY\nPlaintiff’s Motion for Preliminary Approval of Class Action\nand PAGA Settlement is GRANTED. The Settlement Agreement is preliminarily\napproved as fair, reasonable, and adequate, and within the range of possible\nfinal approval.\nThe parties and the Settlement Administrator shall adhere to\nthe following schedule:\nNotice to Class Members:\nThe Administrator shall mail\nthe Notice Packet to all Class Members no later than 14 calendar days after\nreceiving the Class Data from Defendant.\nExclusion/Objection Deadline:\nRequests for exclusion\nand written objections must be postmarked or submitted to the Administrator no\nlater than 45 calendar days after the initial mailing of the Notice Packet.\nMotion for Final Approval and Motion for Attorney’s Fees,\nCosts, and Service Award:\nPlaintiff shall file these motions no later than 16\ncourt days before the Final Approval Hearing.\nFailure to file the Parties’\nMotion for Final Approval of Class Action Settlement by this deadline will\nresult in a continuance of the final approval hearing to the Court’s first\navailable hearing date, which could be months after the hearing date noted below.\nThe Parties’ Motion for Final Approval of Class Action\nSettlement must include a concurrently lodged single document that constitutes\na [Proposed] Order and Judgment containing among other things, the class\ndefinition, full release language, and names of the any class members who opted\nout.\nFinal Approval Hearing:\nA Final Approval Hearing\nshall be held on\nJuly 1, 2026 at 8:30 a.m.\nin Department X of Alhambra\nCourthouse, to determine whether the settlement should be finally approved as\nfair, reasonable, and adequate.\nUpon final approval, the Court shall enter a Judgment that\ndismisses the Action with prejudice.  The\nJudgment will be binding on all Participating Class Members who do not timely\nand validly opt out and on all Aggrieved Employees as to the PAGA claims.  The Judgment will incorporate the release of\nclaims as set forth in the Settlement Agreement and will bar any future\nlitigation on the Released Class Claims and Released PAGA Claims.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Margarito Ramirez Guerrero"
+      ],
+      "defendants": [
+        "George L. Throop Company"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/los_angeles/superior_court/raw/2026/03/09/eecc02b6-bd55-5cf6-9a11-a540b35b266d.html",
+  "notes": "Motion type ambiguity: DB='class_action_settlement', text='motion_for_attorney_fees'",
+  "acceptable_alternatives": {
+    "motion_type": [
+      "class_action_settlement",
+      "motion_for_attorney_fees"
+    ]
+  }
+}

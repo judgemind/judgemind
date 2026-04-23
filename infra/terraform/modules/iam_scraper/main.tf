@@ -1,0 +1,68 @@
+# IAM role and policy for the scraper process.
+#
+# The scraper role grants read/write access to the document archive bucket.
+# s3:PutObject for archiving captured documents, s3:GetObject for the
+# reingest workflow (re-processing existing documents).
+# No s3:DeleteObject or bucket-level permissions are granted.
+#
+# Trust policy allows both EC2 (legacy/local) and ECS tasks to assume this
+# role. ECS Fargate tasks assume it via the task role configuration.
+
+resource "aws_iam_role" "scraper" {
+  name        = "judgemind-scraper-${var.environment}"
+  description = "Assumed by the scraper process to write captured documents to S3"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      },
+      {
+        Effect    = "Allow"
+        Principal = { Service = "ecs-tasks.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+# Read/write policy: s3:PutObject + s3:GetObject on archive objects.
+# GetObject is needed for the reingest workflow (re-processing existing
+# documents through improved extraction logic).
+resource "aws_iam_policy" "scraper_s3_write" {
+  name        = "judgemind-scraper-s3-write-${var.environment}"
+  description = "Allows the scraper to read and write objects in the document archive bucket"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowObjectOps"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:GetObject", "s3:HeadObject"]
+        Resource = "${var.document_archive_bucket_arn}/*"
+      },
+      {
+        Sid      = "AllowListBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = var.document_archive_bucket_arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "scraper_s3_write" {
+  role       = aws_iam_role.scraper.name
+  policy_arn = aws_iam_policy.scraper_s3_write.arn
+}
+
+# EC2 instance profile wrapping the role so EC2 instances can assume it.
+# Not required for ECS/Lambda/OIDC — update when compute is finalised.
+resource "aws_iam_instance_profile" "scraper" {
+  name = "judgemind-scraper-${var.environment}"
+  role = aws_iam_role.scraper.name
+}

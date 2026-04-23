@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Combs v. Insomnia Cookies, LLC et al.\n\nAccordingly, the motion for approval of PAGA settlement is GRANTED. The Case Management Conference set for 2:30 p.m. on March 18, 2026 is VACATED, and the Court sets a compliance hearing for December 2, 2026 at 2:30 p.m. in Department 19. Plaintiff shall prepare the order.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/santa_clara/superior_court/raw/2026/03/24/d995b5d0-28da-5b85-a967-c0371c4406ae.pdf",
+  "notes": ""
+}

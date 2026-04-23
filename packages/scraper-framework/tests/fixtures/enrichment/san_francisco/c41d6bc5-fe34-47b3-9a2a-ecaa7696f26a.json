@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Jelise Baires v. Christopher Walsh\n\nHaving read and considered the pleadings, declarations, and other evidence submitted in this matter, the Court makes the following findings and orders: Mother's unopposed request to suspend Father's visitation is granted. Given the uncontradicted allegations of physical and verbal abuse by Father directed towards the two minor children, the court finds it is in the children's best interests to suspend Father's visitation until he has completed an anger management class and engaged in individual therapy. Father's visitation with the children is suspended immediately and will not resume until Father presents proof that he has completed at least eight sessions of an anger management class and has engaged in individual therapy at a frequency of at least once a week. The parties shall return for a review hearing on March 3, 2026, at 9:00 a.m. in Department 404, at which time the court will determine whether Father's visitation should be reinstated. Both parties are ordered to submit updated declarations at least ten court days prior to the hearing. The Court will prepare the Findings and Order After Hearing.",
+  "expected": {
+    "case_title": null,
+    "motion_type": null,
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/san_francisco/superior_court/raw/2026/03/24/c5670f6f-cb09-5b9f-b545-58c05f8a8a10.pdf",
+  "notes": ""
+}

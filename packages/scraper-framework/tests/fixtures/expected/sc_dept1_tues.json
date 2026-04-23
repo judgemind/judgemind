@@ -1,0 +1,34 @@
+{
+  "_fixture": "sc_dept1_tues.pdf",
+  "_description": "Santa Clara Dept 1 (Judge Eunice Lee). 7-page PDF with 3 rulings: 2 off calendar, 1 writ of attachment granted.",
+  "_captured": "2026-03-03",
+  "courthouse": "Downtown Superior Court",
+  "department": "1",
+  "judge_name": "Eunice Lee",
+  "page_count": 7,
+  "case_count": 3,
+  "primary_case_number": "26CV484360",
+  "case_number_format": "{YY}{CV|PR}{NNNNNN}",
+  "hearing_date": "March 3, 2026",
+  "expected_cases": [
+    {
+      "case_number": "26CV484360",
+      "case_title": "Mohammad Khokhar vs Gene Kristul et al",
+      "motion_type": "Temporary Restraining Order/ Preliminary Injunction",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "25CV460197",
+      "case_title": "Kimco Reality Op, LLC vs. Michael Hong",
+      "motion_type": "Writ of Attachment",
+      "outcome": "off_calendar"
+    },
+    {
+      "case_number": "25CV480596",
+      "case_title": "Richard Howell vs SpeedTech Motorsports, LLC et al",
+      "motion_type": "Writ of Attachment",
+      "outcome": "granted"
+    }
+  ],
+  "_notes": "Dept 1 uses LINE N format. Lines 3-4 are the same case (combined). Detailed ruling spans pages 3-7."
+}

@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Daniels v. Ranchwood Homeowners Association\n\nTentative Ruling:\n\nTo deny without prejudice.\n\nExplanation:\n\nA complaint to quiet title must be verified and must include: (i) a description of the\nproperty including both its legal description and its street address or common\ndesignation; (ii) plaintiff's title and the basis upon which it is asserted;1 (iii) the adverse\nclaims as against which a determination is sought; (iv) the date as of which a\ndetermination is sought and, if other than the date the complaint is filed, a statement\nwhy the determination is sought as of that date; and (v) a prayer for determination of\nplaintiff's title against the adverse claims. (Code Civ. Proc., § 761.020.) A plaintiff\ncommencing a quiet title action must also immediately record a lis pendens with the\ncounty recorder of the county in which the subject property is located. (Code Civ. Proc.,\n§ 761.010, subd. (b).) Plaintiff does little to comply with these procedural requirements\nother than to provide the common designation of the property and to indicate that her\nownership in 50% of the property is in fee. (Compl., ¶¶4-5.)\nAdditionally, “[t]he plaintiff has the burden of establishing his claim to the property, and he must prove his title by ‘clear and convincing proof. . .” (Murray v. Murray (1994)\n26 Cal.App.4th 1062, 1067.) “ ‘The owner of the legal title to property is presumed to be\nthe owner of the full beneficial title. This presumption may be rebutted only by clear and\nconvincing proof.’ ” (Id. at pp. 1066-67, citing Evid. Code, § 662.) Here, however, plaintiff\nconcedes in the Complaint that she deeded 50% of the subject property to defendant.\n(Compl., ¶6.) The Complaint is devoid of any allegations rebutting defendant’s 50%\ninterest. Nor does plaintiff provide any evidence for the same. Therefore, plaintiff fails to\nprovide any basis for a determination of quiet title on the property against defendant.\nAccordingly, the application for default judgment is denied without prejudice.\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure\nsection 1019.5, subdivision (a), no further written order is necessary. The minute order\nadopting this tentative ruling will serve as the order of the court and service by the clerk\nwill constitute notice of the order.\n\nTentative Ruling",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "denied",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/0970f9a8-1cf7-5d21-8a2e-d0708f1e3c04.pdf",
+  "notes": ""
+}

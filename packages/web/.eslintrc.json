@@ -1,0 +1,33 @@
+{
+  "extends": "next/core-web-vitals",
+  "plugins": ["local"],
+  "rules": {
+    "local/no-client-utility-import": "warn"
+  },
+  "overrides": [
+    {
+      "files": ["src/app/**/*.{ts,tsx}", "src/components/**/*.{ts,tsx}"],
+      "rules": {
+        "local/no-ssr-incompatible-import": "error"
+      }
+    },
+    {
+      "files": ["src/app/**/*.{ts,tsx}"],
+      "rules": {
+        "local/prefer-path-alias": "error"
+      }
+    },
+    {
+      "files": ["src/app/**/*.{ts,tsx}", "src/components/**/*.{ts,tsx}"],
+      "rules": {
+        "local/clickable-table-row": "error"
+      }
+    },
+    {
+      "files": ["**/__tests__/**", "**/*.test.ts", "**/*.test.tsx", "tests/**"],
+      "rules": {
+        "local/no-client-utility-import": "off"
+      }
+    }
+  ]
+}

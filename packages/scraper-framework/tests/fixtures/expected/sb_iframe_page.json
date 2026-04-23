@@ -1,0 +1,17 @@
+{
+  "_fixture": "sb_iframe_page.html",
+  "_description": "SB tentative rulings index page from old.sb-court.org (iframe content). ASP.NET HTML table listing all available tentative ruling PDFs.",
+  "_captured": "2026-03-02",
+  "pdf_link_count": 52,
+  "courthouse_distribution": {
+    "San Bernardino (S)": 42,
+    "Rancho Cucamonga (R)": 10
+  },
+  "link_text_format": "CV{LOC}{DEPT}{MMDDYY}.pdf",
+  "first_link_example": {
+    "text": "CVS24030426.pdf",
+    "href": "https://old.sb-court.org/DesktopModules/TentativeRulings/TentativeRulings/CVS24030426.pdf"
+  },
+  "observed_departments": ["S14", "S17", "S22", "S24", "S29", "S33", "S36", "S37", "R12", "R14", "R17"],
+  "_notes": "The SB new site (sanbernardino.courts.ca.gov) returns 'Access denied' to automated requests. This fixture is from the legacy site at old.sb-court.org which responds to plain httpx requests with no auth, JS, or cookies. Link text contains only the PDF filename — judge name and department are extracted from the filename pattern and PDF text respectively."
+}

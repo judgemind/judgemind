@@ -1,0 +1,14 @@
+{
+  "ruling_text": "Cocola Broadcasting Companies, LLC v. My Central Valley, LLC\n\nTentative Ruling:\n\nTo grant. If oral argument is timely requested, such argument will be entertained on Friday, March 27, 2026, at 9:00 a.m., in Department 501.\nExplanation:\n\nThe application of Pennsylvania attorney Leona McFadden appears to comply with the requirements set forth by the State Bar of California and rule 9.40 of the California Rules of Court. In addition, from the court’s record it appears no opposition has been filed. Therefore, the application is granted.\nPursuant to California Rules of Court, rule 3.1312(a), and Code of Civil Procedure section 1019.5, subdivision (a), no further written order is necessary. The minute order adopting this tentative ruling will serve as the order of the court and service by the clerk will constitute notice of the order.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "motion_pro_hac_vice",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [],
+      "defendants": []
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/fresno/superior_court/raw/2026/03/28/cb7f0278-cf3e-5e30-86ad-b6efa107febc.pdf",
+  "notes": ""
+}

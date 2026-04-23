@@ -1,0 +1,27 @@
+{
+  "_fixture": "sd_roa_demurrer.html",
+  "_description": "San Diego Dept C-65 -- Demurrer to Complaint. Single-case ROA HTML. Demurrer overruled as to 2nd COA, sustained with leave to amend as to 3rd COA.",
+  "_captured": "2026-03-12",
+  "_format": "html",
+  "department": "C-65",
+  "case_count": 1,
+  "case_number": "25CU003887C",
+  "motion_type": "Demurrer",
+  "hearing_date": "March 13, 2026",
+  "judge_name": "Karen S. Hewitt",
+  "expected_cases": [
+    {
+      "case_number": "25CU003887C",
+      "case_title": "Garcia v. Pacific Property Management LLC",
+      "outcome": "granted_in_part",
+      "motion_type": "Demurrer to Complaint",
+      "parties": [
+        {"name": "Maria Garcia", "role": "plaintiff"},
+        {"name": "Pacific Property Management LLC", "role": "defendant"},
+        {"name": "John Doe", "role": "defendant"}
+      ],
+      "ruling_text_contains": ["OVERRULED", "SUSTAINED WITH LEAVE TO AMEND", "Negligence", "Breach of Contract", "20 days"]
+    }
+  ],
+  "_notes": "Demurrer overruled as to 2nd COA (Negligence), sustained with leave to amend as to 3rd COA (Breach of Contract). Maps to granted_in_part since the demurrer partially succeeded."
+}

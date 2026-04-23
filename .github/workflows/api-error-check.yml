@@ -1,0 +1,349 @@
+name: API Error Check
+
+on:
+  schedule:
+    # Every hour at minute 45 (offset from data-quality at :15)
+    - cron: '45 * * * *'
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+    inputs:
+      period_minutes:
+        description: "Check window in minutes (default: 60)"
+        required: false
+        type: number
+        default: 60
+      text_output:
+        description: "Use human-readable text output instead of JSON"
+        required: false
+        type: boolean
+        default: false
+
+# Only one error check at a time
+concurrency:
+  group: api-error-check
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  # ALB and target group ARN suffixes for the dev API service.
+  # These are stable identifiers derived from the Terraform-managed ALB.
+  # Update if the ALB is recreated.
+  ALB_ARN_SUFFIX: app/judgemind-api-dev/PLACEHOLDER
+  TG_ARN_SUFFIX: targetgroup/judgemind-api-dev/PLACEHOLDER
+
+jobs:
+  api-error-check:
+    name: Check API error metrics via CloudWatch
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/api-error-check.py
+            scripts/notify-telegram.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve ALB ARN suffixes from Terraform outputs
+        id: resolve
+        run: |
+          # Query Terraform state for the actual ALB ARN suffixes.
+          # This avoids hardcoding values that change if the ALB is recreated.
+          # Fall back to env vars if state query fails.
+          ALB_SUFFIX=$(aws elbv2 describe-load-balancers \
+            --names judgemind-api-dev \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null | sed 's|.*:loadbalancer/||' || true)
+
+          if [ -n "$ALB_SUFFIX" ] && [ "$ALB_SUFFIX" != "None" ]; then
+            echo "alb_arn_suffix=$ALB_SUFFIX" >> "$GITHUB_OUTPUT"
+
+            # Get target group ARN suffix
+            ALB_ARN=$(aws elbv2 describe-load-balancers \
+              --names judgemind-api-dev \
+              --query 'LoadBalancers[0].LoadBalancerArn' \
+              --output text)
+            TG_SUFFIX=$(aws elbv2 describe-target-groups \
+              --load-balancer-arn "$ALB_ARN" \
+              --query 'TargetGroups[0].TargetGroupArn' \
+              --output text 2>/dev/null | sed 's|.*:||' || true)
+
+            if [ -n "$TG_SUFFIX" ] && [ "$TG_SUFFIX" != "None" ]; then
+              echo "tg_arn_suffix=$TG_SUFFIX" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Could not resolve target group ARN suffix"
+              echo "tg_arn_suffix=${{ env.TG_ARN_SUFFIX }}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::Could not resolve ALB ARN suffix, using fallback"
+            echo "alb_arn_suffix=${{ env.ALB_ARN_SUFFIX }}" >> "$GITHUB_OUTPUT"
+            echo "tg_arn_suffix=${{ env.TG_ARN_SUFFIX }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build script arguments
+        id: args
+        run: |
+          PERIOD="${{ inputs.period_minutes }}"
+          if [ -z "$PERIOD" ] || [ "$PERIOD" = "0" ]; then
+            PERIOD=60
+          fi
+          echo "period=$PERIOD" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.text_output }}" = "true" ]; then
+            echo "format=--text" >> "$GITHUB_OUTPUT"
+          else
+            echo "format=--json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run API error check
+        id: check
+        run: |
+          set +e
+          python3 scripts/api-error-check.py \
+            --alb-arn-suffix "${{ steps.resolve.outputs.alb_arn_suffix }}" \
+            --target-group-arn-suffix "${{ steps.resolve.outputs.tg_arn_suffix }}" \
+            --period-minutes ${{ steps.args.outputs.period }} \
+            ${{ steps.args.outputs.format }} 2>&1 | tee /tmp/check_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "API error check passed: all metrics within thresholds."
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "API error check found threshold breaches (exit code $EXIT_CODE)."
+          fi
+
+      - name: Extract alert summary
+        if: steps.check.outputs.healthy == 'false'
+        id: summary
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Parse the JSON output and produce a markdown summary
+          python3 -c "
+          import json, os, sys
+          try:
+              data = json.load(open('/tmp/check_output.txt'))
+          except Exception:
+              run_url = os.environ.get('RUN_URL', '')
+              print('**Warning:** Could not parse check output.')
+              print('')
+              print('Inspect the workflow run logs manually for alert details:')
+              print(run_url)
+              sys.exit(0)
+
+          lines = ['| Metric | Value | Threshold | Status |', '| --- | --- | --- | --- |']
+          metrics = data.get('metrics', {})
+          alerts_by_metric = {a['metric']: a for a in data.get('alerts', [])}
+
+          for label, key, metric_key in [
+              ('5xx errors', '5xx_count', '5xx_errors'),
+              ('4xx errors', '4xx_count', '4xx_errors'),
+              ('P99 latency', 'p99_latency_seconds', 'p99_latency'),
+          ]:
+              val = metrics.get(key, 'N/A')
+              if key == 'p99_latency_seconds' and val is not None:
+                  val = f'{val}s'
+              alert = alerts_by_metric.get(metric_key)
+              threshold = alert['threshold'] if alert else '-'
+              status = 'ALERT' if alert else 'OK'
+              lines.append(f'| {label} | {val} | {threshold} | {status} |')
+
+          print('\n'.join(lines))
+          " > /tmp/alert_summary.md 2>/dev/null || echo "**Warning:** Could not extract alert details. See workflow run: ${RUN_URL}" > /tmp/alert_summary.md
+
+          # Telegram one-liner
+          python3 -c "
+          import json, os, sys
+          try:
+              data = json.load(open('/tmp/check_output.txt'))
+          except Exception:
+              run_url = os.environ.get('RUN_URL', '')
+              print(f'Alert details unavailable — see workflow run: {run_url}')
+              sys.exit(0)
+          alerts = data.get('alerts', [])
+          parts = [a['message'] for a in alerts]
+          print('; '.join(parts) if parts else 'Unknown alert')
+          " > /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable — see workflow run: ${RUN_URL}" > /tmp/alert_telegram.txt
+
+          echo "Alert summary:"
+          cat /tmp/alert_summary.md
+
+      - name: Check for existing open issue
+        if: steps.check.outputs.healthy == 'false'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "api-error-alert" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open api-error-alert issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        id: create-issue
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## API Error Alert"
+            echo ""
+            echo "The hourly API error check detected threshold breaches in CloudWatch metrics."
+            echo ""
+            echo "### Alert Summary"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo "- **Check script:** \`scripts/api-error-check.py\`"
+            echo "- **Check window:** ${{ steps.args.outputs.period }} minutes"
+            echo ""
+            echo "### Possible Causes"
+            echo ""
+            echo "- Application bug causing 5xx responses"
+            echo "- Deployment failure or misconfiguration"
+            echo "- Downstream dependency failure (database, Redis, OpenSearch)"
+            echo "- Spike in malformed requests (4xx)"
+            echo "- Performance regression (high latency)"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Review the alert details above"
+            echo "2. Check API logs: \`scripts/ecs-logs.sh /ecs/judgemind-api-dev --lines 100\`"
+            echo "3. Check recent API deployments"
+            echo "4. Run manually: \`python3 scripts/api-error-check.py --alb-arn-suffix <suffix> --target-group-arn-suffix <suffix> --text\`"
+            echo ""
+            echo "This issue was created automatically by the API error check workflow."
+            echo "It will not create duplicates while this issue is open."
+          } > /tmp/issue_body.md
+
+          ISSUE_URL=$(gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "API error alert: HTTP error thresholds breached on dev" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/api,api-error-alert,agent/ready")
+
+          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        if: steps.create-issue.outputs.created == 'true'
+        continue-on-error: true
+        run: |
+          ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
+          ISSUE_NUM="${ISSUE_URL##*/}"
+          TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
+
+          {
+            echo "<b>API Error Alert</b>"
+            echo ""
+            echo "${TG_SUMMARY}"
+            echo ""
+            echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
+          } > /tmp/tg_message.txt
+
+          scripts/notify-telegram.sh --message-file /tmp/tg_message.txt
+
+      - name: Update existing issue with new failures
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.existing.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "### Update: Still failing at ${TIMESTAMP}"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "**Workflow run:** ${RUN_URL}"
+          } > /tmp/comment_body.md
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/comment_body.md
+
+      - name: Auto-close resolved error issues
+        if: steps.check.outputs.healthy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Find all open issues with the api-error-alert label
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "api-error-alert" \
+            --json number \
+            -q '.[].number')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open api-error-alert issues to close."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing api-error-alert issue #${ISSUE_NUM} — all metrics within thresholds."
+
+            {
+              echo "All API error metrics are now within thresholds. Auto-closing this issue."
+              echo ""
+              echo "**Passing workflow run:** ${RUN_URL}"
+            } > /tmp/close_comment.md
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/close_comment.md
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done

@@ -1,0 +1,22 @@
+{
+  "_fixture": "sb_s36_20260303_a6da3fb7.pdf",
+  "_description": "San Bernardino Dept S36 (Judge Joseph Widman). 6-page PDF with 1 case: preliminary injunction denied.",
+  "_captured": "2026-03-03",
+  "courthouse": "San Bernardino Justice Center",
+  "department": "S36",
+  "judge_name": "Joseph Widman",
+  "page_count": 6,
+  "case_count": 1,
+  "primary_case_number": "CIVSB2600093",
+  "case_number_format": "CIV{LOCATION}{YYNNNNN}",
+  "hearing_date": "March 3, 2026",
+  "expected_cases": [
+    {
+      "case_number": "CIVSB2600093",
+      "case_title": "Carmen Iris Perez v. San Bernardino Municipal Water Department",
+      "motion_type": "preliminary injunction",
+      "outcome": "denied"
+    }
+  ],
+  "_notes": "Single-case PDF. Uses 'BEFORE THE HONORABLE JOSEPH WIDMAN' format (all caps). Case number has space: 'CIVSB 2600093'. 'Page N of M' footers."
+}

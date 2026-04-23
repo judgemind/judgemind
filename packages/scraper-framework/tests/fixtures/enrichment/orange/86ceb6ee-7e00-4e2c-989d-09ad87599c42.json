@@ -1,0 +1,18 @@
+{
+  "ruling_text": "The motion of defendant Xian Li for an order requiring plaintiff Jun Li\nto furnish security under Corp. Code § 17709.02 is OFF CALENDAR\nfor improper electronic service on the self-represented plaintiff.\nThe motion of plaintiff Rafael Arroyo for a terminating sanction that\nstrikes the answer of defendants 888Bottles LLC, Super 8, Inc., and\n888Infinity LLC, and enters the defaults of these defendants is\nGRANTED to the extent that it asks for an order striking the answer\nof the defendants. Plaintiff can then seek default against the\ndefendants as well as default judgment.",
+  "expected": {
+    "case_title": null,
+    "motion_type": "other",
+    "outcome": "granted",
+    "parties": {
+      "plaintiffs": [
+        "Arroyo"
+      ],
+      "defendants": [
+        "888 Bottles LLC"
+      ]
+    }
+  },
+  "source_doc": "s3://judgemind-document-archive-dev/ca/orange/superior_court/raw/2026/03/19/1760db4d-8434-5d1d-bc3f-2383c15ccb3f.pdf",
+  "notes": ""
+}
