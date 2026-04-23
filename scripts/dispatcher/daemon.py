@@ -1202,11 +1202,22 @@ OVERNIGHT_CB_GOOD_OUTCOME_STATUSES: frozenset[str] = frozenset({"succeeded"})
 CAP_FLIPPED_BY_CIRCUIT_BREAKER = "circuit_breaker"
 
 #: Path to the Telegram notification helper. Invoked as a subprocess
-#: with ``--message-file <tmp>``. The helper exits 0 when Telegram is
-#: unconfigured (no-op), 2 when all sends fail — see
-#: ``scripts/notify-telegram.sh``. The daemon treats any non-zero exit
-#: as a warning, not a failure: the circuit-breaker flip has already
-#: happened regardless of whether the alert reaches the operator.
+#: with ``--message-file <tmp>``. Exit-code contract (see
+#: ``scripts/notify-telegram.sh``):
+#:
+#:   0 — at least one recipient received the message (HTTP 200).
+#:   1 — usage error (bad argv).
+#:   2 — all sends failed (every recipient got a non-200).
+#:   3 — secret fetch failed (e.g. InvalidRequestException, AccessDenied).
+#:   4 — bot_token empty in secret.
+#:   5 — allowed_user_ids empty in secret.
+#:
+#: The daemon treats any non-zero exit as a warning, not a failure: the
+#: circuit-breaker flip has already happened regardless of whether the
+#: alert reaches the operator. Issue #3061 — exit codes 3/4/5 were added
+#: so callers keying off ``returncode == 0`` no longer emit "sent" events
+#: for no-op / misconfigured paths (the prior script exited 0 on all
+#: three).
 NOTIFY_TELEGRAM_SCRIPT_RELPATH = "scripts/notify-telegram.sh"
 
 #: Hard timeout on the ``notify-telegram.sh`` subprocess. Short enough
@@ -1214,6 +1225,44 @@ NOTIFY_TELEGRAM_SCRIPT_RELPATH = "scripts/notify-telegram.sh"
 #: enough that AWS Secrets Manager + curl to the Bot API always fits
 #: on a healthy network.
 NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS = 30
+
+#: Per-exit-code mapping for ``scripts/notify-telegram.sh``. Values are
+#: ``(event_suffix, reason)`` tuples. Callers prepend a domain prefix
+#: (e.g. ``circuit_breaker_telegram_``) to build the full event name and
+#: include ``reason`` in the log extras when non-None (issue #3061).
+#:
+#: The dict is intentionally exhaustive for the known codes. An
+#: ``returncode`` not present here falls back to the caller's generic
+#: "nonzero_exit" event so we never silently swallow a new exit code.
+#:
+#: This helper exists as a module-level table so additional daemon
+#: callers (e.g. escalate-action wiring — the "Related" section of
+#: issue #3061) can reuse the mapping without duplicating the
+#: switch logic.
+NOTIFY_TELEGRAM_EXIT_CODE_MAPPING: dict[int, tuple[str, str | None]] = {
+    0: ("sent", None),
+    1: ("usage_error", None),
+    2: ("all_send_failed", None),
+    3: ("config_missing", "secret_fetch_failed"),
+    4: ("config_missing", "empty_bot_token"),
+    5: ("config_missing", "empty_user_ids"),
+}
+
+
+def _map_notify_telegram_exit_code(returncode: int) -> tuple[str, str | None]:
+    """Return ``(event_suffix, reason)`` for a ``notify-telegram.sh`` exit code.
+
+    ``event_suffix`` is the trailing portion of the structured log event
+    name (the caller prepends a domain prefix such as
+    ``circuit_breaker_telegram_``). ``reason`` is a free-text
+    discriminator for the ``config_missing`` bucket (which groups exit
+    codes 3/4/5 into one event) and is ``None`` for all other codes.
+
+    Unknown exit codes return ``("nonzero_exit", None)`` so a future
+    code added to the script without updating this mapping falls back
+    to the generic warning path — never silently treated as success.
+    """
+    return NOTIFY_TELEGRAM_EXIT_CODE_MAPPING.get(returncode, ("nonzero_exit", None))
 
 
 # --------------------------------------------------------------------------
@@ -14295,12 +14344,19 @@ class DispatcherDaemon:
     ) -> None:
         """Fire a Telegram alert via ``scripts/notify-telegram.sh``.
 
-        Best-effort — the helper script exits 0 when Telegram is
-        unconfigured (secret missing, no allowed user IDs) so the
-        daemon never depends on Telegram being wired up in a given
-        environment. A non-zero exit is logged as a warning and the
-        breaker is still considered "opened" (the cap flip is the
-        safety action; the alert is operator-UX).
+        Best-effort — a non-zero exit from the helper is logged as a
+        warning and the breaker is still considered "opened" (the cap
+        flip is the safety action; the alert is operator-UX).
+
+        Exit-code handling is delegated to
+        :func:`_map_notify_telegram_exit_code` so new daemon callers can
+        reuse the mapping. Issue #3061: prior to this change the helper
+        script exited 0 on three "misconfigured" paths (secret fetch
+        fail, empty bot_token, empty user_ids), so this method logged
+        ``circuit_breaker_telegram_sent`` for deliveries that never
+        actually happened. The helper now exits 3/4/5 on those paths
+        and this method maps them to ``circuit_breaker_telegram_config_missing``
+        with a ``reason`` field so the false-success events are gone.
         """
         repo_root = self._repo_root_for_notify_script()
         notify_script = repo_root / NOTIFY_TELEGRAM_SCRIPT_RELPATH
@@ -14348,24 +14404,22 @@ class DispatcherDaemon:
             )
             return
 
+        event_suffix, reason = _map_notify_telegram_exit_code(result.returncode)
+        event_name = f"circuit_breaker_telegram_{event_suffix}"
+        log_extra: dict[str, Any] = {
+            "event": event_name,
+            "run_id": self._run_id,
+            "exit_code": result.returncode,
+        }
+        if reason is not None:
+            log_extra["reason"] = reason
+        if result.returncode != 0:
+            log_extra["stderr_tail"] = (result.stderr or "")[-500:]
+
         if result.returncode == 0:
-            self._log.info(
-                "daemon.circuit_breaker_telegram_sent",
-                extra={
-                    "event": "circuit_breaker_telegram_sent",
-                    "run_id": self._run_id,
-                },
-            )
+            self._log.info(f"daemon.{event_name}", extra=log_extra)
         else:
-            self._log.warning(
-                "daemon.circuit_breaker_telegram_nonzero_exit",
-                extra={
-                    "event": "circuit_breaker_telegram_nonzero_exit",
-                    "run_id": self._run_id,
-                    "exit_code": result.returncode,
-                    "stderr_tail": (result.stderr or "")[-500:],
-                },
-            )
+            self._log.warning(f"daemon.{event_name}", extra=log_extra)
 
     def _render_circuit_breaker_telegram_message(
         self,
