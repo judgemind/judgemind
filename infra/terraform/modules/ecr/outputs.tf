@@ -27,3 +27,13 @@ output "dispatcher_repository_arn" {
   description = "ARN of the dispatcher v2 ECR repository"
   value       = aws_ecr_repository.dispatcher.arn
 }
+
+output "dispatcher_agent_runner_repository_url" {
+  description = "ECR repository URL for the dispatcher agent-runner image (#3090 Stage 1b)"
+  value       = aws_ecr_repository.dispatcher_agent_runner.repository_url
+}
+
+output "dispatcher_agent_runner_repository_arn" {
+  description = "ARN of the dispatcher agent-runner ECR repository"
+  value       = aws_ecr_repository.dispatcher_agent_runner.arn
+}

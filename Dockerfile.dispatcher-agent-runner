@@ -1,0 +1,187 @@
+# Dispatcher v2 agent-runner container image (issue #3090 — Stage 1b of
+# #3086's per-agent ECS migration; design in #3078).
+#
+# One instance of this image runs per agent on ECS Fargate, executing
+# the full phase pipeline (plan → ralph → summary → push_and_pr →
+# awaiting_ci → merge → awaiting_deploy → verify → retro → done)
+# inside a single task. The daemon (once Stage 2 lands) spawns one of
+# these per agent via `ecs:RunTask`; the daemon does not spawn any
+# claude subprocesses itself in the ecs execution_mode.
+#
+# Why this image is distinct from Dockerfile.dispatcher
+# -----------------------------------------------------
+# The daemon image boots `python -m scripts.dispatcher.daemon`; the
+# agent-runner image boots `scripts/dispatcher/agent-runner-entrypoint.sh`.
+# Both need the same tooling — claude CLI, git, gh, psycopg, boto3,
+# preflight hooks — so the layer contents are nearly identical; only
+# the ENTRYPOINT + CMD differ.
+#
+# Keeping them as two sibling Dockerfiles (rather than a multi-stage
+# single file with --target flags) is the house pattern the operator
+# wanted per the #3090 issue scope note: "Dockerfile.dispatcher-agent-runner
+# (or --target agent-runner variant of the existing Dockerfile)". Two
+# files reads cleaner for a reader trying to diff "what does the
+# agent-runner have that the daemon doesn't" without scrolling through
+# 400 lines of shared setup.
+#
+# Build (from repo root):
+#     docker build -f Dockerfile.dispatcher-agent-runner \
+#         -t judgemind-dispatcher-agent-runner-local \
+#         --build-arg GIT_SHA=$(git rev-parse --short HEAD) .
+#
+# Run locally (requires DATABASE_URL + a real GitHub PAT):
+#     docker run --rm \
+#         -e AGENT_ID=test-$(uuidgen) \
+#         -e DATABASE_URL="postgres://..." \
+#         -e GITHUB_TOKEN="..." \
+#         judgemind-dispatcher-agent-runner-local
+#
+# See `scripts/dispatcher/agent-runner-entrypoint.sh` for the
+# environment contract the container consumes.
+
+FROM python:3.12-slim
+
+# ---------------------------------------------------------------------------
+# System deps — identical to Dockerfile.dispatcher. See that file for the
+# rationale behind the base-image choice and each apt package.
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        git \
+        jq \
+        postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Node.js 20 via NodeSource — Claude Code CLI requires Node 20+. Same
+# rationale as Dockerfile.dispatcher.
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI — the agent-runner uses `gh pr create`, `gh pr checks`,
+# `gh pr merge` etc. during the push_and_pr / awaiting_ci / merge phases.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+#
+# - psycopg[binary]: the agent-runner entrypoint shells out to `psql`
+#   for most DB interactions, but the imported `phase_transitions` is
+#   pure-Python and doesn't need psycopg at runtime. We still install
+#   psycopg because Stage 2 Python-side orchestration helpers (if any
+#   land on this image in a followup) will need it.
+# - boto3: not strictly required today (the entrypoint uses the `aws`
+#   CLI, which ships below) but kept for parity with the daemon image
+#   so future Python helpers don't force a rebuild.
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    "psycopg[binary]>=3.1,<4" \
+    "boto3>=1.34,<2"
+
+# AWS CLI — the entrypoint uses `aws secretsmanager get-secret-value` +
+# `aws ecs describe-task` when polling task metadata. Installed via pip
+# rather than the bundled installer so the image stays slim.
+RUN pip install --no-cache-dir "awscli>=1.33,<2"
+
+# ---------------------------------------------------------------------------
+# Claude Code CLI — pinned to the same version as Dockerfile.dispatcher
+# so the daemon and agent-runner produce identical phase outputs for
+# skills they both happen to invoke. Bump in lockstep with the daemon
+# image.
+# ---------------------------------------------------------------------------
+RUN npm install -g @anthropic-ai/claude-code@2.1.114
+
+# Canary — verify the platform-native binary actually installed. See
+# Dockerfile.dispatcher for the #3040 incident rationale.
+RUN claude --version
+
+# ---------------------------------------------------------------------------
+# Dispatcher user + HOME — same pattern as Dockerfile.dispatcher. The
+# Claude Code CLI refuses `--dangerously-skip-permissions` when UID=0.
+# ---------------------------------------------------------------------------
+ENV HOME=/home/dispatcher
+RUN groupadd --gid 1000 dispatcher \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --home-dir "$HOME" dispatcher \
+    && mkdir -p "$HOME" \
+    && chown -R dispatcher:dispatcher "$HOME"
+
+# ---------------------------------------------------------------------------
+# Per-agent workspace root. The entrypoint clones the repo into
+# `${AGENT_WORKSPACE}/repo` at boot and uses it as the agent's cwd for
+# every phase. Kept under /var/lib so it doesn't collide with the
+# daemon image's /app.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /var/lib/agent-runner \
+    && chown -R dispatcher:dispatcher /var/lib/agent-runner
+ENV AGENT_WORKSPACE=/var/lib/agent-runner
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Application code
+#
+# The agent-runner needs:
+#   1. The shared `scripts/dispatcher/` Python modules (primarily
+#      `phase_transitions.py` for the state machine, plus `phases.py`
+#      and `iteration_feedback.py` that `phase_transitions` imports).
+#   2. The entrypoint shell script (the agent-runner's init=0).
+#   3. `scripts/check-issue-author.sh` — the trust gate the entrypoint
+#      runs before spawning `claude -p /task-v2-plan`.
+#   4. `scripts/preflight.sh` + `scripts/preflight-bash-fargate.sh` —
+#      in-container ralph pre-push gate (matches Dockerfile.dispatcher's
+#      #2982 narrowing).
+# ---------------------------------------------------------------------------
+COPY scripts/dispatcher/ /app/scripts/dispatcher/
+COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
+COPY scripts/preflight.sh /app/scripts/preflight.sh
+COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
+COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+RUN chmod +x /app/scripts/check-issue-author.sh \
+    && chmod +x /app/fargate-hooks/preflight-bash.sh \
+    && chmod +x /app/scripts/dispatcher/agent-runner-entrypoint.sh \
+    && chown -R dispatcher:dispatcher /app
+ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
+
+# ---------------------------------------------------------------------------
+# Git committer identity — same values as Dockerfile.dispatcher so
+# commits produced by the agent-runner have the same author line as
+# the daemon's commit-amend step would have produced.
+# ---------------------------------------------------------------------------
+RUN git config --system user.email "noreply@judgemind.org" \
+    && git config --system user.name "Judgemind Dispatcher"
+
+# ---------------------------------------------------------------------------
+# Image provenance — CI sets GIT_SHA to the merge commit SHA. The
+# entrypoint writes it to `dispatcher.agents.runner_image_sha` (Stage 2
+# adds that column) so post-hoc forensics can pin an agent to a
+# specific image.
+# ---------------------------------------------------------------------------
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
+# Drop privileges before the entrypoint — same as Dockerfile.dispatcher.
+USER dispatcher
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+#
+# The agent-runner boots the shell orchestration script. ENTRYPOINT as
+# an exec-form array so argv from `aws ecs run-task --overrides` passes
+# through to the script untouched. CMD is empty — all inputs come from
+# environment variables (AGENT_ID, ISSUE_NUMBER, etc.), not argv.
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["/app/scripts/dispatcher/agent-runner-entrypoint.sh"]
+CMD []
