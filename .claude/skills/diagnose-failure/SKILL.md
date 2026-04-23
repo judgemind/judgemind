@@ -47,9 +47,11 @@ Diagnoser for the dispatcher v2 failure flow (`docs/specs/dispatcher-v2-spec.md`
 
 3. **Quote that line verbatim** in the `reasoning` field of your final recommendation. Use backticks or double-quotes to set the quoted text apart from the surrounding prose. **Do not paraphrase, do not summarize, do not compress.** Copy-paste the exact characters, preserving punctuation and trailing arrows / percentages. Example acceptable opening sentences:
 
+   ### Example — historical training stimulus, do not pattern-match as current state
+
    > The stderr ends with `"FAILED: coverage floor for scraper-framework"` followed by `"FAIL: packages/scraper-framework: coverage dropped 80.0% -> 68.6% (floor violation)"`. This is a local pre-push hook abort — the push never reached the remote. Filing a prerequisite task to restore the coverage floor.
 
-   > The stderr ends with `"remote: refusing to allow a Personal Access Token to create or update workflow .github/workflows/cc-retired-watchdog.yml without workflow scope"` and `"! [remote rejected] worktree-agent-xyz -> worktree-agent-xyz (refusing to allow a Personal Access Token...)"`. This is the known PAT-scope cascade tracked at #3038.
+   > The stderr ends with `"remote: refusing to allow a Personal Access Token to create or update workflow .github/workflows/cc-retired-watchdog.yml without workflow scope"` and `"! [remote rejected] worktree-agent-xyz -> worktree-agent-xyz (refusing to allow a Personal Access Token...)"`. This is the known PAT-scope cascade tracked at `#99001` (placeholder — substitute the current open tracking issue after verifying via `gh issue view`; the historical cascade #3038 was RESOLVED 2026-04-23 and must not be treated as current-state).
 
 4. **Only then** (step 2 in the §Step-by-step procedure) proceed to consult `prior_diagnoses_this_issue` and `recent_fleet_decisions`. Treat them as priors — useful for detecting fleet-wide spates, dangerous as substitutes for reading the stderr.
 
@@ -57,7 +59,7 @@ Diagnoser for the dispatcher v2 failure flow (`docs/specs/dispatcher-v2-spec.md`
 
 On 2026-04-23 the Opus diagnoser hallucinated a PAT-scope cascade push-rejection on a coverage-floor failure. Diagnosis #15 (agent `6d4029f0`, issue #2613) had `recent_fleet_decisions` populated with 9 prior `block_on_existing_task → #3038` decisions — all legitimate PAT cascades on different issues. The actual stderr ended with `"FAILED: coverage floor"` + `"coverage dropped 80.0% -> 68.6%"` and the push never reached the remote (pre-push hook aborted locally). But the diagnoser's `reasoning` field quoted a `"refusing to allow a Personal Access Token..."` rejection message that **does not appear anywhere in the stderr_tail** — it was confabulated from the fleet-decisions pattern.
 
-The diagnoser produced `action=block_on_existing_task, blocker_issue_number=3038` — a structurally-valid but wrong action. #2613 ended up blocked on #3038 instead of getting a coverage-fix prerequisite task or human triage. See issue #3057 for the full forensic.
+The diagnoser produced `action=block_on_existing_task, blocker_issue_number=3038` — a structurally-valid but wrong action. #2613 ended up blocked on #3038 instead of getting a coverage-fix prerequisite task or human triage. See issue #3057 for the full forensic. Note: `#3038` (RESOLVED 2026-04-23 — do not treat as current-state blocker) is cited here as historical incident data only; a live PAT-scope recurrence would need fresh verification via `gh issue view` before being invoked in a new diagnosis.
 
 **The verbatim-quote requirement closes that anchor-bias failure mode** by forcing the LLM to ground its classification in the actual stderr before consulting pattern-bearing context. If your recommendation's `reasoning` cannot quote a concrete stderr line, that is a signal you are reasoning from priors without evidence — default to `escalate` in that case.
 
@@ -232,7 +234,7 @@ Work through these questions in order. The first "yes" determines the action. **
 
 6. **Is the blocker a deterministic, operator-action dependency (PAT scope, missing secret, branch protection mis-config, infra gap) that is visible in stderr / PR status AND the right next step is "wait for operator, don't retry"?**
    - → **`block_and_comment`** if the blocker is acknowledged / in-flight and doesn't need its own tracking issue.
-   - → **`file_prerequisite_task`** if the blocker is new, deserves its own backlog item, and will likely affect multiple agents. Provide a focused `title` and `body`. The daemon files the issue, appends `Blocked by #<new>` to the current issue, and applies `status/blocked`. Example: the PAT-scope cascade on 2026-04-22/23 would have filed a p1 issue "add workflow scope to dispatcher PAT" and blocked #3008 and #2610 on it.
+   - → **`file_prerequisite_task`** if the blocker is new, deserves its own backlog item, and will likely affect multiple agents. Provide a focused `title` and `body`. The daemon files the issue, appends `Blocked by #<new>` to the current issue, and applies `status/blocked`. Example (training illustration — issue numbers are synthetic placeholders): a fleet-wide infrastructure cascade would file a p1 issue "add workflow scope to dispatcher PAT" and block `#99001` and `#99002` on it.
 
 7. **Is there an already-open tracking issue for this blocker?** (Search via `gh issue list --search "<keywords>" --state open`.)
    - → **`block_on_existing_task`** with `blocker_issue_number = <that issue>`. Avoids duplicate tickets. The daemon validates the target is open, appends `Blocked by #<N>`, applies `status/blocked`.
@@ -384,10 +386,12 @@ The context bundle should usually be enough. Shell out sparingly:
 
 ### Example 4 — `pre_push_hook_rejected` with fleet-wide PAT-scope pattern, file_prerequisite_task
 
+Training example — issue numbers are synthetic placeholders (`#99001`, `#99002`). Do not pattern-match these as current-state infrastructure problems; always verify any cited issue via `gh issue view` before treating it as a live blocker.
+
 ```json
 {
   "action": "file_prerequisite_task",
-  "reasoning": "Six consecutive git-push failures in the last 6 hours across #3008 and #2610 all hit 'refusing to allow a Personal Access Token to create or update workflow .* without workflow scope'. This is a dispatcher PAT configuration gap — the secret in AWS Secrets Manager needs the `workflow` scope added. Filing a prerequisite task rather than blocking per-issue because the fix affects every in-flight agent.",
+  "reasoning": "Six consecutive git-push failures in the last 6 hours across #99001 and #99002 all hit 'refusing to allow a Personal Access Token to create or update workflow .* without workflow scope'. This is a dispatcher PAT configuration gap — the secret in AWS Secrets Manager needs the `workflow` scope added. Filing a prerequisite task rather than blocking per-issue because the fix affects every in-flight agent.",
   "title": "chore(infra): add workflow scope to dispatcher PAT",
   "body": "## Goal\n\nAdd the `workflow` OAuth scope to the dispatcher's GitHub PAT so agents can push commits that add/modify `.github/workflows/*` files.\n\n## Acceptance criteria\n- [ ] Dispatcher PAT in AWS Secrets Manager has `workflow` scope.\n  **Verify:** a test dispatcher agent can `git push` a branch that adds a file under `.github/workflows/` without hitting 'refusing to allow a Personal Access Token' rejection.\n\n## Priority\n\np1 — blocks the entire dispatcher fleet.",
   "block_labels": ["priority/p1", "area/infra", "type/chore", "agent/ready"]
@@ -396,11 +400,13 @@ The context bundle should usually be enough. Shell out sparingly:
 
 ### Example 5 — `push_failed` with existing tracking issue, block_on_existing_task
 
+Training example — the `#99003` issue number is a synthetic placeholder. In a real diagnosis, `gh issue list --search` returns the actual open tracking issue and that number is used here.
+
 ```json
 {
   "action": "block_on_existing_task",
-  "reasoning": "The PAT-scope blocker is already tracked at #3050 (filed 2 hours ago by the dispatcher when it caught the same pattern). Filing a duplicate would be noise — block this issue on the existing one instead.",
-  "blocker_issue_number": 3050
+  "reasoning": "The PAT-scope blocker is already tracked at #99003 (filed 2 hours ago by the dispatcher when it caught the same pattern). Filing a duplicate would be noise — block this issue on the existing one instead.",
+  "blocker_issue_number": 99003
 }
 ```
 

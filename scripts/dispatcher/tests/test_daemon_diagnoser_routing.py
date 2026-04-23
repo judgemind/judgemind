@@ -22,6 +22,13 @@ Fakes + psycopg MagicMock stub follow the pattern from
 ``test_daemon_push_failed.py`` / ``test_daemon_failure_summary.py``.
 """
 
+# Issue numbers in fixtures (e.g. ``99001``, ``99002``, ``99003``, ``99004``) are
+# synthetic. Do not pattern-match these as current-state infrastructure problems
+# — they are placeholders used only to exercise the code paths. See issue #3126
+# for the de-reification rationale: prior real-number fixtures (``#3008``,
+# ``#2610``, ``#2613``, ``#3038``) became repo-grep signals that downstream
+# agents confabulated as live blockers after the incidents had been resolved.
+
 from __future__ import annotations
 
 import logging
@@ -233,7 +240,7 @@ class TestHandleAgentFailure:
                 stderr_tail="refusing to allow a Personal Access Token",
                 exit_code=1,
                 details={"branch": "agent/abc123"},
-                issue_number=3008,
+                issue_number=99001,
             )
 
         # _write_failure was called with the right shape.
@@ -255,7 +262,7 @@ class TestHandleAgentFailure:
         assert kwargs["status"] == "failed"
         assert kwargs["phase"] == "push_and_pr"
         assert kwargs["exit_code"] == 1
-        assert kwargs["issue_number"] == 3008
+        assert kwargs["issue_number"] == 99001
 
     def test_details_defaults_to_empty_dict(self) -> None:
         d = _make_daemon()
@@ -296,14 +303,14 @@ class TestContextBundleExtensions:
             "agent_id": "agent-ctx",
             "category": FAILURE_CATEGORY_PUSH_FAILED,
             "tier": 2,
-            "issue_number": 3008,
+            "issue_number": 99001,
             "details": {"branch": "agent/abc"},
             "failure_ts": None,
         }
 
         cursor = _FakeCursor()
         # 1st fetchone: agents row — (issue_number, worktree_path, pr_number).
-        cursor.fetch_queue.append((3008, "", None))
+        cursor.fetch_queue.append((99001, "", None))
         # fetchall queue — phase transitions, prior failures, prior
         # diagnoses, recent fleet decisions. (Some sub-queries in the
         # builder call fetchone; others fetchall. Pre-seed both.)
@@ -335,13 +342,13 @@ class TestContextBundleExtensions:
             "agent_id": "agent-xyz",
             "category": FAILURE_CATEGORY_PUSH_FAILED,
             "tier": 2,
-            "issue_number": 3008,
+            "issue_number": 99001,
             "details": {},
             "failure_ts": None,
         }
         cursor = _FakeCursor()
         # agents row
-        cursor.fetch_queue.append((3008, "", None))
+        cursor.fetch_queue.append((99001, "", None))
         # Phase transitions, prior failures, prior diagnoses, recent fleet decisions.
         # prior_diagnoses_this_issue returns one row.
         from datetime import datetime, timezone
@@ -381,12 +388,12 @@ class TestContextBundleExtensions:
             "agent_id": "agent-xyz",
             "category": FAILURE_CATEGORY_PUSH_FAILED,
             "tier": 2,
-            "issue_number": 3008,
+            "issue_number": 99001,
             "details": {},
             "failure_ts": None,
         }
         cursor = _FakeCursor()
-        cursor.fetch_queue.append((3008, "", None))
+        cursor.fetch_queue.append((99001, "", None))
         from datetime import datetime, timezone
 
         t = datetime(2026, 4, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -399,7 +406,7 @@ class TestContextBundleExtensions:
                     (
                         200,
                         "agent-a",
-                        2610,
+                        99002,
                         "pre_push_hook_rejected",
                         {
                             "action": "block_and_comment",
@@ -410,7 +417,7 @@ class TestContextBundleExtensions:
                     (
                         201,
                         "agent-b",
-                        3008,
+                        99001,
                         "pre_push_hook_rejected",
                         {
                             "action": "file_prerequisite_task",
@@ -430,9 +437,9 @@ class TestContextBundleExtensions:
         assert len(decisions) == 2
         assert decisions[0]["action"] == "block_and_comment"
         assert decisions[0]["failure_category"] == "pre_push_hook_rejected"
-        assert decisions[0]["issue_number"] == 2610
+        assert decisions[0]["issue_number"] == 99002
         assert decisions[1]["action"] == "file_prerequisite_task"
-        assert decisions[1]["issue_number"] == 3008
+        assert decisions[1]["issue_number"] == 99001
 
 
 # --------------------------------------------------------------------------
@@ -447,7 +454,7 @@ class TestFleetDecisionsCapConfigurable:
 
     The anchor-bias failure: on 2026-04-23 the Opus diagnoser hallucinated
     a PAT-scope cascade push-rejection on a coverage-floor failure after
-    9 identical ``block_on_existing_task → #3038`` decisions populated the
+    9 identical ``block_on_existing_task → #99003`` decisions populated the
     fleet-decisions bundle. Reducing to 3 preserves the fleet-wide signal
     without letting any single pattern dominate.
     """
@@ -458,7 +465,7 @@ class TestFleetDecisionsCapConfigurable:
             "agent_id": "agent-cap",
             "category": FAILURE_CATEGORY_PUSH_FAILED,
             "tier": 2,
-            "issue_number": 3008,
+            "issue_number": 99001,
             "details": {},
             "failure_ts": None,
         }
@@ -468,7 +475,7 @@ class TestFleetDecisionsCapConfigurable:
         passed to the SQL is 3 (the default)."""
         cursor = _FakeCursor()
         # agents row
-        cursor.fetch_queue.append((3008, "", None))
+        cursor.fetch_queue.append((99001, "", None))
         # _cb_config_int fetchone — no row means default (3).
         cursor.fetch_queue.append(None)
         # Phase transitions, prior failures, prior diagnoses, recent fleet decisions.
@@ -506,7 +513,7 @@ class TestFleetDecisionsCapConfigurable:
         """When ``dispatcher.config.diagnoser_fleet_decisions_cap`` is set
         to a different positive integer, the LIMIT parameter reflects it."""
         cursor = _FakeCursor()
-        cursor.fetch_queue.append((3008, "", None))  # agents row
+        cursor.fetch_queue.append((99001, "", None))  # agents row
         # _cb_config_int fetchone — returns a row with the override value.
         # Shape: (value,) where value is the JSON-serializable cap.
         cursor.fetch_queue.append((5,))
@@ -542,7 +549,7 @@ class TestFleetDecisionsCapConfigurable:
         for LIMIT, not a hardcoded literal like ``LIMIT 20`` (which was
         the pre-#3057 behavior that produced the anchor-bias failure)."""
         cursor = _FakeCursor()
-        cursor.fetch_queue.append((3008, "", None))
+        cursor.fetch_queue.append((99001, "", None))
         cursor.fetch_queue.append(None)  # _cb_config_int → default
         cursor.fetchall_queue.extend([[], [], [], []])
         d = _make_daemon(cursor)
@@ -577,7 +584,7 @@ class TestFleetDecisionsCapConfigurable:
         Simulates the exact failure context from 2026-04-23: a failure
         with a ``FAILED: coverage floor`` stderr arrives while the
         fleet-decisions queue is dominated by ``block_on_existing_task →
-        #3038`` PAT-cascade decisions. The daemon-side context bundler
+        #99003`` PAT-cascade decisions. The daemon-side context bundler
         should now cap at 3 entries (down from 20) — limiting the LLM's
         exposure to the PAT pattern.
 
@@ -592,7 +599,7 @@ class TestFleetDecisionsCapConfigurable:
         from datetime import datetime, timezone
 
         cursor = _FakeCursor()
-        cursor.fetch_queue.append((2613, "", None))  # agents row for #2613
+        cursor.fetch_queue.append((99004, "", None))  # agents row for #99004
         cursor.fetch_queue.append(None)  # _cb_config_int → default 3
         t = datetime(2026, 4, 23, 6, 59, 0, tzinfo=timezone.utc)
 
@@ -603,7 +610,7 @@ class TestFleetDecisionsCapConfigurable:
             (
                 300 + i,
                 f"agent-{i:02d}",
-                3008 + i,
+                99001 + i,
                 "pre_push_hook_rejected",
                 {
                     "action": "block_on_existing_task",
@@ -611,9 +618,9 @@ class TestFleetDecisionsCapConfigurable:
                         "PAT-scope cascade — refusing to allow a Personal "
                         "Access Token to create or update workflow "
                         ".github/workflows/.* without workflow scope. "
-                        "Tracked at #3038."
+                        "Tracked at #99003."
                     ),
-                    "blocker_issue_number": 3038,
+                    "blocker_issue_number": 99003,
                 },
                 t,
             )
@@ -634,7 +641,7 @@ class TestFleetDecisionsCapConfigurable:
             # category (the pre-push hook is what aborted).
             "category": FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED,
             "tier": 2,
-            "issue_number": 2613,
+            "issue_number": 99004,
             "details": {
                 "stderr_tail": (
                     "pre-push: checking coverage floor for 'scraper-framework'...\n"
@@ -682,15 +689,15 @@ class TestBlockAndCommentHandler:
         ):
             d._consume_action_block_and_comment(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 reasoning="PAT scope missing — operator must update Secrets Manager.",
             )
         mock_comment.assert_called_once()
         body = mock_comment.call_args.args[1]
         assert "PAT scope missing" in body
         assert "3D block" in body
-        mock_add.assert_called_once_with(3008, ["status/blocked"])
-        mock_remove.assert_called_once_with(3008, ["agent/ready"])
+        mock_add.assert_called_once_with(99001, ["status/blocked"])
+        mock_remove.assert_called_once_with(99001, ["agent/ready"])
         mock_mark.assert_called_once()
 
     def test_no_issue_number_still_marks_terminal(self) -> None:
@@ -721,7 +728,7 @@ class TestFilePrerequisiteTaskHandler:
         ):
             d._consume_action_file_prerequisite_task(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 title="chore(infra): add workflow scope to dispatcher PAT",
                 body="## Goal\nAdd scope.\n",
                 block_labels=["priority/p1"],
@@ -734,9 +741,9 @@ class TestFilePrerequisiteTaskHandler:
         assert kwargs["labels"] == ["priority/p1"]
         mock_comment.assert_called_once()
         assert "#3050" in mock_comment.call_args.args[1]
-        mock_append.assert_called_once_with(3008, "\n\nBlocked by #3050")
-        mock_add.assert_called_once_with(3008, ["status/blocked"])
-        mock_remove.assert_called_once_with(3008, ["agent/ready"])
+        mock_append.assert_called_once_with(99001, "\n\nBlocked by #3050")
+        mock_add.assert_called_once_with(99001, ["status/blocked"])
+        mock_remove.assert_called_once_with(99001, ["agent/ready"])
         mock_mark.assert_called_once()
 
     def test_create_failure_falls_back_to_escalate(self) -> None:
@@ -748,7 +755,7 @@ class TestFilePrerequisiteTaskHandler:
         ):
             d._consume_action_file_prerequisite_task(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 title="x",
                 body="y",
                 block_labels=None,
@@ -776,15 +783,15 @@ class TestBlockOnExistingTaskHandler:
         ):
             d._consume_action_block_on_existing_task(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 blocker_issue_number=3050,
                 reasoning="Existing issue tracks this.",
             )
         mock_comment.assert_called_once()
         assert "#3050" in mock_comment.call_args.args[1]
-        mock_append.assert_called_once_with(3008, "\n\nBlocked by #3050")
-        mock_add.assert_called_once_with(3008, ["status/blocked"])
-        mock_remove.assert_called_once_with(3008, ["agent/ready"])
+        mock_append.assert_called_once_with(99001, "\n\nBlocked by #3050")
+        mock_add.assert_called_once_with(99001, ["status/blocked"])
+        mock_remove.assert_called_once_with(99001, ["agent/ready"])
         mock_mark.assert_called_once()
 
     def test_invalid_blocker_falls_back_to_escalate(self) -> None:
@@ -803,7 +810,7 @@ class TestBlockOnExistingTaskHandler:
         ):
             d._consume_action_block_on_existing_task(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 blocker_issue_number=9999,
                 reasoning="missing blocker",
             )
@@ -830,7 +837,7 @@ class TestBlockOnExistingTaskHandler:
         ):
             d._consume_action_block_on_existing_task(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 blocker_issue_number=9999,
                 reasoning="blocker probe timed out",
             )
@@ -844,7 +851,7 @@ class TestBlockOnExistingTaskHandler:
         assert len(validation_records) == 1
         rec = validation_records[0]
         assert rec.levelno == logging.WARNING
-        assert rec.issue_number == 3008
+        assert rec.issue_number == 99001
         assert rec.blocker_issue_number == 9999
         assert rec.attempts == 3
         assert rec.reason == "timeout"
@@ -873,7 +880,7 @@ class TestBlockOnExistingTaskHandler:
         ):
             d._consume_action_block_on_existing_task(
                 agent_id="agent-1",
-                issue_number=3008,
+                issue_number=99001,
                 blocker_issue_number=9999,
                 reasoning="blocker probe failed",
             )
@@ -907,7 +914,7 @@ class TestHardenedParse:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         with (
@@ -926,7 +933,7 @@ class TestHardenedParse:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         with (
@@ -943,7 +950,7 @@ class TestHardenedParse:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {"action": "split_task", "reasoning": "LLM got creative"}
@@ -967,7 +974,7 @@ class TestHardenedParse:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {"action": "retry_with_hint", "reasoning": "x"}  # hint missing
@@ -985,7 +992,7 @@ class TestHardenedParse:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {
@@ -1005,7 +1012,7 @@ class TestHardenedParse:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {"action": "block_on_existing_task", "reasoning": "y"}
@@ -1028,7 +1035,7 @@ class TestRawOutputLogging:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {"action": "weird_thing", "reasoning": "?"}
@@ -1056,7 +1063,7 @@ class TestRawOutputLogging:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         with (
@@ -1120,7 +1127,7 @@ class TestConsumeDiagnosisDispatchesNewActions:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {"action": "block_and_comment", "reasoning": "need operator"}
@@ -1131,14 +1138,14 @@ class TestConsumeDiagnosisDispatchesNewActions:
             action = d._consume_diagnosis(diagnosis_id=20, candidate=candidate)
         assert action == "block_and_comment"
         mock_handler.assert_called_once_with(
-            agent_id="agent-1", issue_number=3008, reasoning="need operator"
+            agent_id="agent-1", issue_number=99001, reasoning="need operator"
         )
 
     def test_file_prerequisite_task_dispatch(self) -> None:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {
@@ -1164,7 +1171,7 @@ class TestConsumeDiagnosisDispatchesNewActions:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_PUSH_FAILED,
         }
         rec = {
@@ -1193,7 +1200,7 @@ class TestRegressionExistingActions:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_SUBPROCESS_CRASH,
         }
         rec = {"action": "retry", "reasoning": "transient"}
@@ -1209,7 +1216,7 @@ class TestRegressionExistingActions:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
         }
         rec = {
@@ -1229,7 +1236,7 @@ class TestRegressionExistingActions:
         d = _make_daemon()
         candidate = {
             "agent_id": "agent-1",
-            "issue_number": 3008,
+            "issue_number": 99001,
             "category": FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
         }
         rec = {"action": "escalate", "reasoning": "needs human"}
