@@ -532,7 +532,11 @@ class TestBlockOnExistingTaskHandler:
     def test_validates_blocker_and_appends_body(self) -> None:
         d = _make_daemon()
         with (
-            patch.object(d, "_gh_issue_is_open", return_value=True),
+            patch.object(
+                d,
+                "_gh_issue_is_open_with_detail",
+                return_value=(True, {"attempts": 1, "reason": None, "stderr_tail": ""}),
+            ),
             patch.object(d, "_gh_issue_comment") as mock_comment,
             patch.object(d, "_gh_issue_append_body") as mock_append,
             patch.object(d, "_gh_issue_add_labels") as mock_add,
@@ -555,7 +559,14 @@ class TestBlockOnExistingTaskHandler:
     def test_invalid_blocker_falls_back_to_escalate(self) -> None:
         d = _make_daemon()
         with (
-            patch.object(d, "_gh_issue_is_open", return_value=False),
+            patch.object(
+                d,
+                "_gh_issue_is_open_with_detail",
+                return_value=(
+                    False,
+                    {"attempts": 3, "reason": "timeout", "stderr_tail": ""},
+                ),
+            ),
             patch.object(d, "_consume_action_escalate") as mock_esc,
             patch.object(d, "_gh_issue_append_body") as mock_append,
         ):
@@ -567,6 +578,80 @@ class TestBlockOnExistingTaskHandler:
             )
         mock_esc.assert_called_once()
         mock_append.assert_not_called()
+
+    def test_invalid_blocker_emits_validation_failed_warning(self, caplog: Any) -> None:
+        """Issue #3053 — the silent fallback to escalate is now visible
+        via a distinct WARNING event carrying the blocker number,
+        current issue number, and the is-open probe's attempt count.
+        """
+        d = _make_daemon()
+        caplog.set_level(logging.WARNING, logger="test.daemon")
+        with (
+            patch.object(
+                d,
+                "_gh_issue_is_open_with_detail",
+                return_value=(
+                    False,
+                    {"attempts": 3, "reason": "timeout", "stderr_tail": ""},
+                ),
+            ),
+            patch.object(d, "_consume_action_escalate") as mock_esc,
+        ):
+            d._consume_action_block_on_existing_task(
+                agent_id="agent-1",
+                issue_number=3008,
+                blocker_issue_number=9999,
+                reasoning="blocker probe timed out",
+            )
+        mock_esc.assert_called_once()
+        # The new WARNING event fires exactly once on the fallback path.
+        validation_records = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "block_on_existing_task_validation_failed"
+        ]
+        assert len(validation_records) == 1
+        rec = validation_records[0]
+        assert rec.levelno == logging.WARNING
+        assert rec.issue_number == 3008
+        assert rec.blocker_issue_number == 9999
+        assert rec.attempts == 3
+        assert rec.reason == "timeout"
+
+    def test_agent_terminates_as_escalate_when_validation_fails(self) -> None:
+        """Issue #3053 — the fallback path must still terminate the
+        agent via ``_consume_action_escalate`` (which marks the agent
+        ``diagnoser_escalate``). The new WARNING is additive; it does
+        not change the control flow.
+        """
+        d = _make_daemon()
+        with (
+            patch.object(
+                d,
+                "_gh_issue_is_open_with_detail",
+                return_value=(
+                    False,
+                    {"attempts": 3, "reason": "timeout", "stderr_tail": ""},
+                ),
+            ),
+            patch.object(d, "_consume_action_escalate") as mock_esc,
+            patch.object(d, "_gh_issue_comment") as mock_comment,
+            patch.object(d, "_gh_issue_append_body") as mock_append,
+            patch.object(d, "_gh_issue_add_labels") as mock_add,
+            patch.object(d, "_gh_issue_remove_labels") as mock_remove,
+        ):
+            d._consume_action_block_on_existing_task(
+                agent_id="agent-1",
+                issue_number=3008,
+                blocker_issue_number=9999,
+                reasoning="blocker probe failed",
+            )
+        mock_esc.assert_called_once()
+        # The "happy path" side effects must NOT fire on the fallback.
+        mock_comment.assert_not_called()
+        mock_append.assert_not_called()
+        mock_add.assert_not_called()
+        mock_remove.assert_not_called()
 
     def test_no_current_issue_falls_back_to_escalate(self) -> None:
         d = _make_daemon()
