@@ -83,6 +83,44 @@ describe('OutcomePill', () => {
     expect(pill.textContent).toBe('\u2713');
   });
 
+  // Regression guard for the no-op terminal (#3039 / #3040).
+  //
+  // `phase='no_op'` is a daemon-side terminal introduced in #3040 / #3039 for
+  // the case where the dispatcher picked up an issue but determined there was
+  // nothing to do (e.g. duplicate claim, stale assignment, etc.). The daemon
+  // records `status='succeeded'` with `mergedAt=null` and no PR number —
+  // there is nothing to merge, so the milestone-completeness branch in
+  // `ui-primitives.tsx` (around lines 459–487) does NOT apply. Instead the
+  // component falls through to the final `if (!info) / info` branch, which
+  // renders green ✓ for `status='succeeded'`.
+  //
+  // `OutcomePill` does not currently accept a `phase` prop (see the
+  // component signature at line 320–357) — the correct rendering of a no-op
+  // terminal relies entirely on `mergedAt` being null and `status` being
+  // 'succeeded'. If a future refactor adds a `null mergedAt + null pr_number
+  // → amber ⚠` branch, it would silently regress no-op rendering to the
+  // amber "shipped_incomplete" chip. This test pins the current green ✓
+  // behavior so that regression is caught immediately.
+  it('renders green check for no-op terminal (no mergedAt)', () => {
+    render(
+      <OutcomePill
+        status="succeeded"
+        mergedAt={null}
+        verifiedAt={null}
+        verifySkipReason={null}
+        retroedAt={null}
+      />,
+    );
+    const pill = screen.getByTestId('outcome-pill-succeeded');
+    expect(pill.textContent).toBe('\u2713');
+    // Confirms we landed on the green chip (fully-complete succeeded),
+    // not the amber 'shipped_incomplete' chip.
+    expect(pill.className).toContain('bg-green');
+    // Defensive: would catch a future regression that routes no-op
+    // through the shipped_incomplete branch.
+    expect(pill.className).not.toMatch(/bg-amber/);
+  });
+
   it('renders failed with an X glyph', () => {
     render(<OutcomePill status="failed" />);
     const pill = screen.getByTestId('outcome-pill-failed');
