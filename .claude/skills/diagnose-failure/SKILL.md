@@ -1,5 +1,5 @@
 ---
-description: Diagnose a tier 2/3 dispatcher failure. Reads context from dispatcher.diagnoses.context, returns a structured recommendation that the daemon consumes deterministically.
+description: Diagnose a dispatcher agent-terminal failure. Reads context from dispatcher.diagnoses.context, returns a structured recommendation that the daemon consumes deterministically.
 argument-hint: "<diagnosis_id>"
 maxTurns: 30
 model: opus
@@ -7,11 +7,13 @@ model: opus
 
 # /diagnose-failure skill
 
-Diagnoser for the dispatcher v2 tier-2/3 failure flow (`docs/specs/dispatcher-v2-spec.md` §8). Invoked as `claude -p '/diagnose-failure <diagnosis_id>'` by the daemon when a tier-2 failure recurs after its mechanical retry, or when a tier-3 failure fires on first occurrence (`ci_red_after_retries`). Reads the context bundle the daemon wrote to `dispatcher.diagnoses.context`, proposes one of five deterministic actions (`retry`, `retry_with_hint`, `reissue`, `escalate`, `close`), and writes a structured recommendation back to the same row. The daemon executes the chosen action — this skill does not write to GitHub directly.
+Diagnoser for the dispatcher v2 failure flow (`docs/specs/dispatcher-v2-spec.md` §8). Invoked as `claude -p '/diagnose-failure <diagnosis_id>'` by the daemon for every agent-terminal failure the unified `_handle_agent_failure` path routes here — including `git_push_failed` / `pr_create_failed` / `phase_output_missing` (first occurrence, issue #3032) and the original tier-2 recurrences / tier-3 first-occurrence categories (`ci_red_after_retries`, `ralph_ac_infeasible`, `summary_ac_infeasible`, `subprocess_turn_limit`). Reads the context bundle the daemon wrote to `dispatcher.diagnoses.context`, proposes one of eight known actions (or, if none fit, a novel action string the daemon will log for operator review), and writes a structured recommendation back to the same row. The daemon executes the chosen action — this skill does not write to GitHub directly.
+
+**Known actions (eight).** The daemon's deterministic consumer handles these exactly: `retry`, `retry_with_hint`, `reissue`, `escalate`, `close`, `block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`. Any other action string is logged to `dispatcher.unrecognized_diagnoser_actions` and falls back to `escalate` so the failure still surfaces. See §Action selection below for the decision tree.
 
 **Prerequisites:** The daemon has already (a) written a `dispatcher.diagnoses` row with `status='pending'` and a serialized context bundle, (b) spawned this skill with the `diagnosis_id` as the argument.
 
-**Goal:** Update `dispatcher.diagnoses.recommendation` (JSONB) with `{action, reasoning, hint?, new_scope?}` and set `status='completed'`, `completed_at=now()`. Additionally, UPDATE `dispatcher.agents.failure_summary` with the first 1-3 sentences of the recommendation's `reasoning` (truncated to 240 chars) so the admin cockpit's "Recently completed" panel shows an LLM-authored summary on hover instead of the daemon's terminal-time template (issue #2900). The daemon's next supervisor tick consumes the recommendation.
+**Goal:** Update `dispatcher.diagnoses.recommendation` (JSONB) with `{action, reasoning, ...payload fields}` and set `status='completed'`, `completed_at=now()`. Additionally, UPDATE `dispatcher.agents.failure_summary` with the first 1-3 sentences of the recommendation's `reasoning` (truncated to 240 chars) so the admin cockpit's "Recently completed" panel shows an LLM-authored summary on hover instead of the daemon's terminal-time template (issue #2900). The daemon's next supervisor tick consumes the recommendation.
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation. This subprocess is already a dispatcher-spawned background task.
 
@@ -54,13 +56,15 @@ The `context` JSONB contains (schema stable — the daemon serializes this):
 
 - `agent_id` (str) — the failing agent's UUID. **Required for the `failure_summary` upgrade write (#2900).**
 - `failure_id` (int) — `dispatcher.failures.failure_id` for the triggering failure.
-- `failure_category` (str) — one of `subprocess_turn_limit`, `stuck_timeout`, `gh_rate_exhausted`, `subprocess_crash`, `ci_red_after_retries`, or any other §8 category the daemon has routed here.
+- `failure_category` (str) — one of `subprocess_turn_limit`, `stuck_timeout`, `gh_rate_exhausted`, `subprocess_crash`, `ci_red_after_retries`, `push_failed`, `pre_push_hook_rejected`, `git_push_network`, `pr_create_failed`, `phase_output_missing`, `ralph_ac_infeasible`, `summary_ac_infeasible`, or any other §8 category the daemon has routed here.
 - `tier` (int) — `2` or `3`.
 - `issue_number` (int).
 - `issue_title` (str).
 - `issue_body` (str).
 - `recent_phase_transitions` (list of `{phase, ts}`) — last ~10 transitions for this agent, newest first.
 - `prior_failures` (list of `{failure_id, category, ts, details}`) — prior `dispatcher.failures` rows on the same issue across all agents (not just this one).
+- `prior_diagnoses_this_issue` (list of `{diagnosis_id, failure_category, recommendation, completed_at}`) — prior completed diagnoses on the same `issue_number`. **Use this to avoid repeating a decision that already failed** — e.g. if `retry` was recommended twice and the failure recurred twice, escalate or change strategy. (Added in #3032.)
+- `recent_fleet_decisions` (list of `{diagnosis_id, agent_id, issue_number, failure_category, action, reasoning, completed_at}`) — the diagnoser's last ~20 decisions across ALL issues in the past 6 hours. **Use this to detect fleet-wide spates** — if 5 different issues hit the same failure class today, the right action may be `file_prerequisite_task` or `escalate`, not patch-per-issue. (Added in #3032. The PAT-scope cascade on 2026-04-22/23 is the canonical example.)
 - `ralph_done_content` (str | null) — contents of `{worktree}/tmp/ralph/ralph-done.txt` if present, else null.
 - `pr_url` (str | null) — if a PR was opened.
 - `pr_number` (int | null).
@@ -104,7 +108,7 @@ def _summary_from_reasoning(reasoning: str, cap: int = 240) -> str:
     sentences = re.split(r"(?<=[.!?])\s+", text)
     head = " ".join(sentences[:3]).strip()
     if len(head) > cap:
-        head = head[: cap - 1].rstrip() + "\u2026"
+        head = head[: cap - 1].rstrip() + "…"
     return head
 
 summary = _summary_from_reasoning(recommendation.get("reasoning", ""))
@@ -132,19 +136,26 @@ The recommendation JSON has this shape:
 
 ```json
 {
-  "action": "retry" | "retry_with_hint" | "reissue" | "escalate" | "close",
+  "action": "retry" | "retry_with_hint" | "reissue" | "escalate" | "close" | "block_and_comment" | "file_prerequisite_task" | "block_on_existing_task" | "<novel-action-string>",
   "reasoning": "<one paragraph — why this action fits>",
-  "hint": "<optional — comment text to post on the issue before retry>",
-  "new_scope": "<optional — rewritten issue body for action='reissue'>"
+  "hint": "<conditional — retry_with_hint only>",
+  "new_scope": "<conditional — reissue only>",
+  "title": "<conditional — file_prerequisite_task only>",
+  "body": "<conditional — file_prerequisite_task only>",
+  "block_labels": ["<conditional — file_prerequisite_task only>"],
+  "blocker_issue_number": 42
 }
 ```
 
 Field rules:
 
-- `action` (required) — exactly one of the five strings above.
+- `action` (required) — one of the eight known strings above, OR a novel action string if none fit. Novel actions persist to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` — use only when genuinely needed and the `reasoning` paragraph makes the intended behavior unambiguous.
 - `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. This gets surfaced in operator dashboards and the §8 weekly report. The first 1-3 sentences are also written to `dispatcher.agents.failure_summary` (issue #2900) so the admin cockpit can show an LLM-authored tooltip on hover over the outcome glyph — keep the opening sentences self-contained ("what happened + why this action"), not mid-argument.
 - `hint` (conditional) — required when `action='retry_with_hint'`; the daemon posts it verbatim as an issue comment before enqueueing the retry marker. Ignored for other actions.
 - `new_scope` (conditional) — required when `action='reissue'`. **The daemon replaces the issue body wholesale** via `gh issue edit --body-file` (no splicing, no patching — Python writes the string to a file and `gh` edits the body). MUST be a complete, well-formed issue body with `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References` sections and any `Parent: #N` / `Blocked by #N` lines. A diff, patch, or partial body will truncate the issue. Issue #3010.
+- `title` + `body` (conditional) — required when `action='file_prerequisite_task'`. Daemon runs `gh issue create --title <title> --body-file <body>`. The title must be conventional-commits style (e.g. `chore(dispatcher): add workflow scope to dispatcher PAT`); the body must be a well-formed issue body with acceptance criteria and verify lines.
+- `block_labels` (optional) — applies to `file_prerequisite_task`. List of label names to apply to the newly-created issue (e.g. `["priority/p1", "area/infra", "agent/ready"]`).
+- `blocker_issue_number` (conditional) — required when `action='block_on_existing_task'`. Positive integer issue number that the daemon will validate is open + append to the current issue body as `Blocked by #<N>`.
 
 Exit 0 regardless of recommendation. If the recommendation cannot be written (DB down, malformed JSON, subprocess error), exit non-zero so the daemon marks the diagnosis `status='failed'` and falls back to the fixed mechanical escalation policy.
 
@@ -154,7 +165,7 @@ Exit 0 regardless of recommendation. If the recommendation cannot be written (DB
 
 Work through these questions in order. The first "yes" determines the action.
 
-1. **Is this failure caused by an external dependency outage or a transient GitHub/Anthropic/AWS hiccup?** (Signs: `subprocess_crash` category, stderr mentions 5xx / timeouts / DNS / network errors, prior failures on unrelated issues in the same window.)
+1. **Is this failure caused by an external dependency outage or a transient GitHub/Anthropic/AWS hiccup?** (Signs: `subprocess_crash` category, stderr mentions 5xx / timeouts / DNS / network errors, prior failures on unrelated issues in the same window but NOT a fleet-wide spate on the same category.)
    - → **`retry`**. The mechanical retry already ran once (tier 2), but if the root cause was a transient that has since cleared, a second attempt may succeed. No comment needed.
 
 2. **Is the failure caused by a scope ambiguity or a missing piece of context the agent needed?** (Signs: `subprocess_turn_limit` with ralph spinning on the same scope item; `ci_red_after_retries` where the fix-CI phase kept trying to fix symptoms of a larger design issue.)
@@ -165,13 +176,25 @@ Work through these questions in order. The first "yes" determines the action.
 3. **Is the issue's scope wrong — i.e. the agent correctly implemented what was asked, but the acceptance criteria no longer match reality?** (Signs: ralph completed with SHIP but CI caught a drift; the issue was filed against an older codebase state; the AC uses a field/endpoint that has been renamed/removed.)
    - → **`reissue`**. Write a `new_scope` issue body with corrected acceptance criteria. Include `Parent: #<parent>` if the original had one. Keep the `Verify:` lines concrete.
 
-4. **Does the failure require a human decision that the agent cannot make safely?** (Signs: `subprocess_auth_fail`, missing secret, security question, architectural decision, vendor billing concern, any issue label with `type/decision`.)
+4. **Does the failure require a human decision that the agent cannot make safely AND you cannot easily file a specific tracking issue?** (Signs: `subprocess_auth_fail`, missing secret, security question, architectural decision, vendor billing concern, any issue label with `type/decision`.)
    - → **`escalate`**. The daemon will add `status/needs-human` + `priority/p1` and post the reasoning as a comment. No retry.
 
 5. **Is the issue itself invalid — duplicate, already-completed, out-of-date, or not actually reproducible?** (Signs: a PR already merged that Closes this issue; the behavior described is the current behavior; the issue is a duplicate of another open issue.)
    - → **`close`**. The daemon will close with `status/invalid` and post the reasoning as the close comment.
 
-**When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context.
+6. **Is the blocker a deterministic, operator-action dependency (PAT scope, missing secret, branch protection mis-config, infra gap) that is visible in stderr / PR status AND the right next step is "wait for operator, don't retry"?**
+   - → **`block_and_comment`** if the blocker is acknowledged / in-flight and doesn't need its own tracking issue.
+   - → **`file_prerequisite_task`** if the blocker is new, deserves its own backlog item, and will likely affect multiple agents. Provide a focused `title` and `body`. The daemon files the issue, appends `Blocked by #<new>` to the current issue, and applies `status/blocked`. Example: the PAT-scope cascade on 2026-04-22/23 would have filed a p1 issue "add workflow scope to dispatcher PAT" and blocked #3008 and #2610 on it.
+
+7. **Is there an already-open tracking issue for this blocker?** (Search via `gh issue list --search "<keywords>" --state open`.)
+   - → **`block_on_existing_task`** with `blocker_issue_number = <that issue>`. Avoids duplicate tickets. The daemon validates the target is open, appends `Blocked by #<N>`, applies `status/blocked`.
+
+8. **Does `recent_fleet_decisions` show this same failure class hitting 3+ different issues in the last 6 hours?** (Regardless of which single action category above fits.)
+   - → **`file_prerequisite_task`** or **`escalate`** — the pattern is fleet-wide, a per-issue patch won't fix it. Prefer `file_prerequisite_task` if the root cause is trackable; `escalate` if it needs a human to even diagnose.
+
+**When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context, and a wrong `block_*` may leave the issue stuck until an operator notices.
+
+**Novel actions.** If none of the eight fit — for example, you want "split_task" because the issue's acceptance criteria are actually two independent issues — you MAY emit a novel action string. The daemon will persist `{action_name, payload}` to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` so operators can review. Use novel actions sparingly; the reasoning paragraph MUST make the intended behavior unambiguous.
 
 ---
 
@@ -224,6 +247,7 @@ The context bundle should usually be enough. Shell out sparingly:
 - `gh issue view <N> --repo judgemind/judgemind --json number,title,body,state,labels,comments` — when the context is stale and the issue may have been edited or commented on since the daemon fetched it.
 - `gh pr view <PR> --repo judgemind/judgemind --json statusCheckRollup,files,commits,mergeable,mergeStateStatus` — for tier-3 `ci_red_after_retries` where the failing checks tell you the fix approach.
 - `gh run view <run_id> --repo judgemind/judgemind --log-failed` — to read the specific failing CI log. Cap at ~200 lines; the relevant signal is usually at the start or end.
+- `gh issue list --search "<keywords>" --state open --repo judgemind/judgemind` — before emitting `file_prerequisite_task`, check whether an open tracking issue already exists; if so, prefer `block_on_existing_task` with that number.
 - `git -C {worktree} log --oneline -20` — to see the commit history of the failing agent's branch.
 - `git -C {worktree} diff origin/main...HEAD` — the full PR diff. Only needed when deciding between `retry_with_hint` and `reissue`.
 
@@ -238,7 +262,7 @@ The context bundle should usually be enough. Shell out sparingly:
 
 1. **Set up.** Write `{worktree}/tmp/dispatcher-diagnoser/read_context.py` and `{worktree}/tmp/dispatcher-diagnoser/write_recommendation.py` helpers (code above). Run the reader with the `diagnosis_id` argument to pull the JSONB context into memory.
 
-2. **Classify.** Identify `failure_category` and `tier` from the context. Read `prior_mechanical_fix` (tier 2) or `ci_log_url` (tier 3) to understand what already failed.
+2. **Classify.** Identify `failure_category` and `tier` from the context. Read `prior_mechanical_fix` (tier 2) or `ci_log_url` (tier 3) to understand what already failed. Scan `prior_diagnoses_this_issue` + `recent_fleet_decisions` for patterns.
 
 3. **Decide.** Walk the decision tree above. Do not fetch anything you don't need — context bundle first, GitHub reads only when a specific question remains.
 
@@ -280,6 +304,37 @@ The context bundle should usually be enough. Shell out sparingly:
 }
 ```
 
+### Example 4 — `pre_push_hook_rejected` with fleet-wide PAT-scope pattern, file_prerequisite_task
+
+```json
+{
+  "action": "file_prerequisite_task",
+  "reasoning": "Six consecutive git-push failures in the last 6 hours across #3008 and #2610 all hit 'refusing to allow a Personal Access Token to create or update workflow .* without workflow scope'. This is a dispatcher PAT configuration gap — the secret in AWS Secrets Manager needs the `workflow` scope added. Filing a prerequisite task rather than blocking per-issue because the fix affects every in-flight agent.",
+  "title": "chore(infra): add workflow scope to dispatcher PAT",
+  "body": "## Goal\n\nAdd the `workflow` OAuth scope to the dispatcher's GitHub PAT so agents can push commits that add/modify `.github/workflows/*` files.\n\n## Acceptance criteria\n- [ ] Dispatcher PAT in AWS Secrets Manager has `workflow` scope.\n  **Verify:** a test dispatcher agent can `git push` a branch that adds a file under `.github/workflows/` without hitting 'refusing to allow a Personal Access Token' rejection.\n\n## Priority\n\np1 — blocks the entire dispatcher fleet.",
+  "block_labels": ["priority/p1", "area/infra", "type/chore", "agent/ready"]
+}
+```
+
+### Example 5 — `push_failed` with existing tracking issue, block_on_existing_task
+
+```json
+{
+  "action": "block_on_existing_task",
+  "reasoning": "The PAT-scope blocker is already tracked at #3050 (filed 2 hours ago by the dispatcher when it caught the same pattern). Filing a duplicate would be noise — block this issue on the existing one instead.",
+  "blocker_issue_number": 3050
+}
+```
+
+### Example 6 — `phase_output_missing` on ralph, block_and_comment
+
+```json
+{
+  "action": "block_and_comment",
+  "reasoning": "Ralph's subprocess exited 0 but `{worktree}/tmp/dispatcher-output/ralph.json` is missing. The last 200 lines of the phase log show Claude Code's internal harness dumped a JSON parse error before the skill could write. This is a dispatcher-image bug that needs a Claude Code version bump — not something a fresh retry will fix. Marking blocked so no other agent picks this up while the operator investigates."
+}
+```
+
 ---
 
 ## Reminders
@@ -287,5 +342,5 @@ The context bundle should usually be enough. Shell out sparingly:
 - No `$()`, no heredocs, no `python -c`. See `CLAUDE.md` Critical Rules. Write helper scripts to `{worktree}/tmp/dispatcher-diagnoser/` first, then invoke them.
 - All temp files go under `{worktree}/tmp/`, never `/tmp/`.
 - This skill is Opus-tier per spec §18 — but the task is narrow. Do NOT over-investigate. The decision tree is intentionally short.
-- **The five actions are exhaustive.** Do not invent a sixth (`defer`, `split`, `merge`, etc.) — the daemon's consumer has five deterministic branches and will fall back to escalation on any other string.
+- **Known actions (the daemon recognizes these eight):** `retry`, `retry_with_hint`, `reissue`, `escalate`, `close`, `block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`. You MAY propose a novel action string when none of the known set fits the situation — the daemon will log the action name and payload to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` so an operator can review it. Novel actions are an explicit escape hatch; prefer a known action when one fits.
 - Exit 0 means "recommendation written". Exit non-zero means "I could not diagnose" — the daemon falls back to fixed mechanical escalation.
