@@ -8,10 +8,10 @@
 # for routine "why did the cap flip / reset it / kill a wedged agent" ops.
 #
 # Usage:
-#   scripts/dispatcher/breaker.sh status
-#   scripts/dispatcher/breaker.sh reset
-#   scripts/dispatcher/breaker.sh pause
-#   scripts/dispatcher/breaker.sh force-stop <agent-id-or-prefix>
+#   scripts/dispatcher/helpers/breaker.sh status
+#   scripts/dispatcher/helpers/breaker.sh reset
+#   scripts/dispatcher/helpers/breaker.sh pause
+#   scripts/dispatcher/helpers/breaker.sh force-stop <agent-id-or-prefix>
 #
 # Subcommands:
 #   status            Show cap, flipped_by, recent-outcomes window, bad_count
@@ -35,7 +35,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-dev_db="$script_dir/../dev-db-query.sh"
+dev_db="$script_dir/../../dev-db-query.sh"
 
 if [[ ! -x "$dev_db" ]]; then
     echo "Error: $dev_db not found or not executable" >&2

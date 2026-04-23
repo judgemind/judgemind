@@ -11,10 +11,10 @@
 # each (see feedback memory `feedback_timezone_in_communication.md`).
 #
 # Usage:
-#   scripts/dispatcher/agent-timeline.sh <agent-id-or-prefix>
+#   scripts/dispatcher/helpers/agent-timeline.sh <agent-id-or-prefix>
 #
 # Example:
-#   scripts/dispatcher/agent-timeline.sh 4b86287b
+#   scripts/dispatcher/helpers/agent-timeline.sh 4b86287b
 #
 # The prefix only needs to be unique among the most recent agents; if it
 # matches multiple rows the script prints candidates and exits non-zero so
@@ -28,8 +28,8 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: scripts/dispatcher/agent-timeline.sh <agent-id-or-prefix>" >&2
-    echo "Example: scripts/dispatcher/agent-timeline.sh 4b86287b" >&2
+    echo "Usage: scripts/dispatcher/helpers/agent-timeline.sh <agent-id-or-prefix>" >&2
+    echo "Example: scripts/dispatcher/helpers/agent-timeline.sh 4b86287b" >&2
 }
 
 if [[ $# -ne 1 || "$1" == "-h" || "$1" == "--help" ]]; then
@@ -46,7 +46,7 @@ if ! [[ "$prefix" =~ ^[0-9a-fA-F-]{4,36}$ ]]; then
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-dev_db="$script_dir/../dev-db-query.sh"
+dev_db="$script_dir/../../dev-db-query.sh"
 
 if [[ ! -x "$dev_db" ]]; then
     echo "Error: $dev_db not found or not executable" >&2

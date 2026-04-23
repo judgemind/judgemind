@@ -13,11 +13,11 @@
 # issue, agent, or recency.
 #
 # Usage:
-#   scripts/dispatcher/diagnoses.sh                   # last 20 diagnoses
-#   scripts/dispatcher/diagnoses.sh --recent 5        # last 5
-#   scripts/dispatcher/diagnoses.sh --issue 3008      # all for #3008
-#   scripts/dispatcher/diagnoses.sh --agent 7c8269af  # all for agent prefix
-#   scripts/dispatcher/diagnoses.sh --json            # raw JSON (pipe to jq)
+#   scripts/dispatcher/helpers/diagnoses.sh                   # last 20 diagnoses
+#   scripts/dispatcher/helpers/diagnoses.sh --recent 5        # last 5
+#   scripts/dispatcher/helpers/diagnoses.sh --issue 3008      # all for #3008
+#   scripts/dispatcher/helpers/diagnoses.sh --agent 7c8269af  # all for agent prefix
+#   scripts/dispatcher/helpers/diagnoses.sh --json            # raw JSON (pipe to jq)
 #
 # Options can be combined; --json applies on top of any filter.
 #
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-dev_db="$script_dir/../dev-db-query.sh"
+dev_db="$script_dir/../../dev-db-query.sh"
 
 if [[ ! -x "$dev_db" ]]; then
     echo "Error: $dev_db not found or not executable" >&2

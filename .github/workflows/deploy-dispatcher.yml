@@ -30,6 +30,12 @@ on:
     paths:
       - "Dockerfile.dispatcher"
       - "scripts/dispatcher/**"
+      # scripts/dispatcher/helpers/ is operator-only tooling (run from
+      # a laptop against dev-db-query.sh). Nothing in there is invoked
+      # by the daemon at runtime, so changes there should not trigger
+      # a rollout. Excluded so new helpers can be added without a
+      # gratuitous redeploy or a workflow-yml edit each time.
+      - "!scripts/dispatcher/helpers/**"
       - "scripts/check-issue-author.sh"
       - ".github/workflows/deploy-dispatcher.yml"
       # scripts/wait-for-rollout.sh is invoked by the deploy-to-dev job

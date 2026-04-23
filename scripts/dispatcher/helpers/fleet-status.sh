@@ -15,10 +15,10 @@
 # the full window breakdown.
 #
 # Usage:
-#   scripts/dispatcher/fleet-status.sh                # defaults below
-#   scripts/dispatcher/fleet-status.sh --since 2h     # time-window for terminals / greens / diagnoses
-#   scripts/dispatcher/fleet-status.sh --terminals 20 # cap on recent terminals
-#   scripts/dispatcher/fleet-status.sh --greens 10    # cap on daemon-shipped greens
+#   scripts/dispatcher/helpers/fleet-status.sh                # defaults below
+#   scripts/dispatcher/helpers/fleet-status.sh --since 2h     # time-window for terminals / greens / diagnoses
+#   scripts/dispatcher/helpers/fleet-status.sh --terminals 20 # cap on recent terminals
+#   scripts/dispatcher/helpers/fleet-status.sh --greens 10    # cap on daemon-shipped greens
 #
 # Defaults: --since 1h, --terminals 10, --greens 5.
 #
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-dev_db="$script_dir/../dev-db-query.sh"
+dev_db="$script_dir/../../dev-db-query.sh"
 
 if [[ ! -x "$dev_db" ]]; then
     echo "Error: $dev_db not found or not executable" >&2
