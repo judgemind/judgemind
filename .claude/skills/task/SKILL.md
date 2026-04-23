@@ -237,6 +237,51 @@ Include non-bot comments (filter out comments from `github-actions[bot]`, `judge
 
 If the issue requires a maintainer decision before you can proceed: comment on it, block it with `scripts/block-issue.sh <issue> <blocker>` (if a specific blocking issue exists) or just add `status/blocked` manually, and stop. Do not guess on ambiguous requirements.
 
+### Step 4a — Duplicate-PR check (adoption pivot, MANDATORY before dependency install / ralph)
+
+**Why this runs before A.1 / Path-B setup:** If a prior agent already shipped (or partially shipped) this issue as an open PR, running ralph from scratch wastes the full implement + review compute cycle. The check is cheap (one `gh pr list` call) and lets the agent pivot immediately — either *adopt* the existing PR and drive it to merge, or bail with a comment. A.3 keeps a second invocation as defense-in-depth against concurrent-agent races that opened a PR between this check and our own push (see #3098).
+
+Run the check as a single tool call:
+
+```
+{worktree}/scripts/check-duplicate-pr.sh <N>
+```
+
+Exit codes (pass-through from `preflight_no_duplicate_pr`; see `scripts/preflight.sh`):
+
+- **Exit 1 (`ok:` line on stdout) — no duplicate.** Continue to the path branches below (Path A → A.1, Path B → B.1). This is the common case.
+- **Exit 0 (`duplicate:` line on stdout with PR number) — an open PR already addresses this issue.** Do NOT proceed to A.1 / dependency install / ralph. Pivot to the adoption decision below.
+- **Exit 2 (`error:` line on stderr) — check failed (gh unavailable, API error, etc.).** Fail-open: continue to the path branches, and let A.3's second check catch any duplicate we missed.
+
+#### 4a.1 — Adoption decision (only runs on exit 0)
+
+Fetch the existing PR's state via MCP:
+
+```
+mcp__github__get_pull_request owner=judgemind repo=judgemind pull_number=<existing-PR>
+mcp__github__get_pull_request_status owner=judgemind repo=judgemind pull_number=<existing-PR>
+```
+
+Evaluate:
+
+- **`state: OPEN`, `mergeable: MERGEABLE` / `mergeable_state: clean`, `statusCheckRollup` all SUCCESS/SKIPPED, and an AC-mapping process-summary comment already exists on the issue:** the prior agent got us to the merge line and stopped. **Adopt-to-merge.** Skip A.1 (no code changes needed), skip A.2 (ralph), skip A.2b (summary already posted). Jump to A.7 (`gh pr merge --squash --delete-branch`), then A.8 (deploy verification + evidence), then A.9 (retro). Release the `status/in-progress` label as usual.
+- **`state: OPEN`, CI red or `mergeable_state: dirty`/`unstable`, or the PR body shows an obviously incomplete implementation (missing ACs, unchecked Automated-checks boxes, reviewer REVISE):** the prior agent stalled mid-flight. **Adopt-to-iterate.** Check out the existing PR's branch into this worktree, continue from the step that makes sense (A.4 for merge conflicts, A.5 for CI failures, or A.2 to finish ralph on top of the existing diff), and drive it through to merge. To re-bind the worktree to the existing branch:
+  ```
+  git -C {worktree} fetch origin pull/<existing-PR>/head:adopt-<existing-PR>
+  git -C {worktree} checkout adopt-<existing-PR>
+  git -C {worktree} branch --set-upstream-to=origin/<existing-PR-branch>
+  ```
+  (Use the PR's `headRefName` from `mcp__github__get_pull_request` for `<existing-PR-branch>`.) If the existing branch name conflicts with the auto-created worktree branch, a throwaway `adopt-<N>` tracking branch is fine — the push target is the original PR's head ref, not this worktree's branch name.
+- **`state: CLOSED` (merged or declined):** MCP returned a stale hit for a PR that has since closed. Treat as no duplicate and continue to Path A / Path B normally.
+- **Ambiguous case** (e.g. the existing PR addresses a *different* sub-scope of the issue and the current task is a legitimate follow-up, or the existing PR is stalled with no clear path forward): post a comment on the issue explaining the adoption decision and exit terminal. Write the comment to `{worktree}/tmp/adoption_bail_comment.txt`, then:
+  ```
+  gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/adoption_bail_comment.txt
+  gh issue edit <N> --repo judgemind/judgemind --remove-label status/in-progress
+  ```
+  The comment should name the existing PR, explain why the current agent can't adopt it (stalled, scope mismatch, author disagreement), and either re-add `agent/ready` or leave the label off for human review. Then stop — worktree cleanup is automatic.
+
+The adoption-to-merge path should be the common case when this check fires — if a prior agent got far enough to open a PR, they almost always got far enough to need someone to push the merge button.
+
 ---
 
 ### Path A: Implementation task (feature, bug fix, refactor)
@@ -394,7 +439,7 @@ git -C {worktree} push -u origin <branch>
 ```
 Commit message format: `feat(area): description (#N)` (conventional commits).
 
-Immediately open a PR after the first push — never push without creating one. **Before creating, check for duplicate PRs** to avoid wasting CI minutes on conflicting duplicates:
+Immediately open a PR after the first push — never push without creating one. **Before creating, re-run the duplicate-PR check** as a cheap second guard — the primary check already ran in Step 4a (see #3098). This second invocation catches the narrow race where a concurrent agent (dispatcher double-claim, operator re-dispatch) opened a PR between our Step 4a check and our push:
 
 ```
 {worktree}/scripts/check-duplicate-pr.sh <N>
@@ -402,7 +447,7 @@ Immediately open a PR after the first push — never push without creating one. 
 
 (`check-duplicate-pr.sh` is a thin wrapper around `preflight_no_duplicate_pr` in `scripts/preflight.sh`. The wrapper lets the check run in a single Bash tool call — `source scripts/preflight.sh && preflight_no_duplicate_pr <N>` trips the preflight hook's "quoted strings combined with &&" check. See #2706.)
 
-- If it returns **0** (duplicate found), a `duplicate:` line is printed to stdout containing the existing PR number. **Adopt that PR** instead of creating a new one — push to the existing branch and use `gh pr edit` to update the body if needed.
+- If it returns **0** (duplicate found), a `duplicate:` line is printed to stdout containing the existing PR number. This is the concurrent-race case — our Step 4a check saw no duplicate, but one appeared while we were running ralph. **Adopt that PR** instead of creating a new one — push your local changes to the existing branch and use `gh pr edit` to update the body if needed. (The full adoption decision tree lives in Step 4a.1 — apply the same logic here.)
 - If it returns **1** (no duplicate), an `ok:` line is printed to stdout. Proceed to create the PR normally.
 - If it returns **2** (error), an `error:` line is printed to stderr. Proceed to create the PR (fail-open).
 
