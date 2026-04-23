@@ -414,21 +414,29 @@ def _process_one_document(
         }
 
 
-def _available_memory_mb() -> int:
-    """Return the memory available to this process in MB.
+def _available_memory_mb() -> tuple[int, str]:
+    """Return the memory available to this process in MB plus a detection source label.
 
     Reads the Linux cgroup memory limit (Fargate sets this) when available,
     then falls back to ``psutil.virtual_memory()`` or the host total.  Returns
-    0 when no reliable value can be resolved — the caller treats 0 as "skip
-    autoscaling."  Never raises — failure returns 0.  See #2495.
+    ``(0, "unresolved")`` when no reliable value can be resolved — the caller
+    treats 0 as "skip autoscaling."  Never raises — failure returns
+    ``(0, "unresolved")``.  See #2495, #2635.
+
+    Source labels:
+    - ``"cgroup_v2"``    — read from ``/sys/fs/cgroup/memory.max``
+    - ``"cgroup_v1"``    — read from ``/sys/fs/cgroup/memory/memory.limit_in_bytes``
+    - ``"psutil_host"``  — read from ``psutil.virtual_memory()`` (host total, not container)
+    - ``"unresolved"``   — could not determine any value
     """
     # Prefer cgroup v2, then v1, then psutil.  Fargate containers expose
     # their memory limit via the memory cgroup — the host's psutil value
     # would overcount on a shared host.
-    for cgroup_path in (
-        "/sys/fs/cgroup/memory.max",  # cgroup v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-    ):
+    cgroup_sources = (
+        ("/sys/fs/cgroup/memory.max", "cgroup_v2"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "cgroup_v1"),
+    )
+    for cgroup_path, source in cgroup_sources:
         try:
             with open(cgroup_path) as f:
                 raw = f.read().strip()
@@ -438,41 +446,113 @@ def _available_memory_mb() -> int:
             # Kernel sentinel for "no limit" — huge value ≈ 2^63.  Fall through.
             if limit_bytes <= 0 or limit_bytes > (1 << 60):
                 continue
-            return limit_bytes // (1024 * 1024)
+            return limit_bytes // (1024 * 1024), source
         except (OSError, ValueError):
             continue
 
     try:
         import psutil
 
-        return int(psutil.virtual_memory().total) // (1024 * 1024)
+        return int(psutil.virtual_memory().total) // (1024 * 1024), "psutil_host"
     except Exception:
-        return 0
+        return 0, "unresolved"
+
+
+class AutoscaleDecision:
+    """Result of ``_autoscale_concurrency()``.
+
+    Attributes:
+        effective:          Worker count to actually use.
+        source:             Memory detection source (see ``_available_memory_mb``).
+        available_mb:       Resolved available memory in MiB.
+        reason:             Human-readable label for the decision path taken.
+                            ``"fargate_fallback"`` means cgroup detection failed
+                            and the safety cap of 4 was applied.
+    """
+
+    __slots__ = ("effective", "source", "available_mb", "reason")
+
+    def __init__(
+        self, effective: int, source: str, available_mb: int, reason: str
+    ) -> None:
+        self.effective = effective
+        self.source = source
+        self.available_mb = available_mb
+        self.reason = reason
+
+
+# Memory threshold above which a psutil_host reading is almost certainly the
+# Docker/Fargate *host* total rather than the container limit.  30 GiB is well
+# above the largest Fargate task size (30720 MiB) so any value > this when
+# sourced from psutil is a strong signal we are reading host memory.
+_FARGATE_HOST_MEMORY_THRESHOLD_MB = 30_720
 
 
 def _autoscale_concurrency(
     requested: int,
     max_worker_memory_mb: int,
     available_memory_mb: int | None = None,
-) -> int:
+    source: str | None = None,
+) -> AutoscaleDecision:
     """Compute the effective worker count given a per-worker memory budget.
 
-    When ``max_worker_memory_mb`` is 0 or negative, returns ``requested``
-    unchanged (autoscaling disabled).  Otherwise returns
+    When ``max_worker_memory_mb`` is 0 or negative, autoscaling is disabled and
+    ``requested`` is returned unchanged.  Otherwise returns
     ``min(requested, available_memory_mb // max_worker_memory_mb)`` with a
     floor of 1 so the rebuild always makes forward progress, even on tiny
-    allocations.  Exposed as a separate function so tests can stub available
-    memory without touching /sys or psutil.  See #2495.
+    allocations.
+
+    If the memory detection source indicates the cgroup limit was unreadable
+    (``"psutil_host"`` with a suspiciously large value, or ``"unresolved"``),
+    the result is capped at ``min(requested, 4)`` with reason ``"fargate_fallback"``
+    to avoid OOM-killing workers on a Fargate task that reported the *host*
+    memory instead of its own container limit.
+
+    Exposed as a separate function so tests can stub available memory without
+    touching /sys or psutil.  See #2495, #2635.
     """
+    if available_memory_mb is None or source is None:
+        available_memory_mb, source = _available_memory_mb()
+
     if max_worker_memory_mb <= 0:
-        return requested
-    if available_memory_mb is None:
-        available_memory_mb = _available_memory_mb()
+        return AutoscaleDecision(
+            effective=requested,
+            source=source,
+            available_mb=available_memory_mb,
+            reason="autoscaling_disabled",
+        )
+
+    # Detect Fargate host-memory fallback: cgroup unreadable and we are seeing
+    # either the psutil host total or a zero/unresolved value.
+    is_host_memory_leak = (
+        source == "psutil_host"
+        and available_memory_mb > _FARGATE_HOST_MEMORY_THRESHOLD_MB
+    )
+    is_unresolved = source == "unresolved"
+    if is_unresolved or is_host_memory_leak:
+        return AutoscaleDecision(
+            effective=min(requested, 4),
+            source=source,
+            available_mb=available_memory_mb,
+            reason="fargate_fallback",
+        )
+
     if available_memory_mb <= 0:
         # Could not resolve — fall back to requested, don't silently drop to 1.
-        return requested
+        return AutoscaleDecision(
+            effective=requested,
+            source=source,
+            available_mb=available_memory_mb,
+            reason="memory_unknown",
+        )
+
     capped = available_memory_mb // max_worker_memory_mb
-    return max(1, min(requested, capped))
+    return AutoscaleDecision(
+        effective=max(1, min(requested, capped)),
+        source=source,
+        available_mb=available_memory_mb,
+        reason="memory_budget",
+    )
 
 
 def _should_abort_retry_pass(
@@ -1278,16 +1358,27 @@ def main() -> None:
         from concurrent.futures.process import BrokenProcessPool
 
         concurrency_requested = args.concurrency
-        concurrency = _autoscale_concurrency(
+        decision = _autoscale_concurrency(
             concurrency_requested, args.max_worker_memory_mb
         )
-        if concurrency != concurrency_requested:
-            logger.info(
-                "Autoscaled concurrency to fit memory budget",
-                requested=concurrency_requested,
-                effective=concurrency,
-                max_worker_memory_mb=args.max_worker_memory_mb,
-                available_memory_mb=_available_memory_mb(),
+        concurrency = decision.effective
+        logger.info(
+            "Autoscale decision",
+            cgroup_memory_limit_mb=decision.available_mb,
+            max_worker_memory_mb=args.max_worker_memory_mb,
+            requested_concurrency=concurrency_requested,
+            effective_concurrency=concurrency,
+            source=decision.source,
+            reason=decision.reason,
+        )
+        if decision.reason == "fargate_fallback":
+            logger.warning(
+                "cgroup limit unreadable — likely Fargate host-memory fallback; "
+                "capping effective concurrency to 4",
+                source=decision.source,
+                available_mb=decision.available_mb,
+                requested_concurrency=concurrency_requested,
+                effective_concurrency=concurrency,
             )
         logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
