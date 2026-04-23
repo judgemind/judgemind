@@ -80,3 +80,91 @@ jobs:
           done
           echo "::error::Terraform plan failed after 3 attempts"
           exit 1
+
+  # Auto-apply for the dev environment after infra changes merge to main.
+  # Runs only on push:main (skipped for pull_request events) and depends on
+  # the `terraform` job above, so apply only fires if validate + plan both
+  # succeeded on the merge commit. Production applies remain human-only
+  # (#3104).
+  dev-apply:
+    name: Apply dev
+    needs: terraform
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-west-2
+      TF_IN_AUTOMATION: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.5"
+
+      - name: Skip if AWS credentials are missing
+        if: ${{ env.AWS_ACCESS_KEY_ID == '' }}
+        run: |
+          echo "::warning::AWS credentials are not configured; skipping dev apply."
+          echo "Skipped: AWS credentials not configured." >> "$GITHUB_STEP_SUMMARY"
+
+      # Fresh init on the runner: no -lockfile=readonly so the provider cache
+      # can be populated. Backend access requires the repo's AWS creds.
+      - name: Terraform Init (dev)
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: terraform -chdir=infra/terraform/environments/dev init -input=false
+
+      # Apply mirrors the plan job's 3-attempt retry pattern so transient
+      # state-lock timeouts don't fail the merge commit's apply.
+      - name: Terraform Apply (dev)
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        id: apply
+        run: |
+          set -o pipefail
+          apply_log="${RUNNER_TEMP}/terraform-apply-dev.log"
+          : > "$apply_log"
+          for attempt in 1 2 3; do
+            echo "::group::Apply attempt $attempt"
+            if terraform -chdir=infra/terraform/environments/dev apply \
+                -auto-approve -input=false -lock-timeout=120s -no-color \
+                2>&1 | tee -a "$apply_log"; then
+              echo "::endgroup::"
+              echo "apply_log=$apply_log" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            ec=$?
+            echo "::endgroup::"
+            if [ "$attempt" -lt 3 ]; then
+              echo "Apply attempt $attempt failed (exit $ec), retrying in 10s..."
+              sleep 10
+            fi
+          done
+          echo "::error::Terraform apply failed after 3 attempts"
+          echo "apply_log=$apply_log" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      # Inline audit trail: paste the last section of the apply output
+      # (which includes the "Apply complete! N added, M changed, K destroyed"
+      # summary line) into the workflow run's step summary.
+      - name: Publish apply summary
+        if: ${{ always() && env.AWS_ACCESS_KEY_ID != '' && steps.apply.outputs.apply_log != '' }}
+        run: |
+          apply_log="${{ steps.apply.outputs.apply_log }}"
+          {
+            echo "## Terraform apply (dev)"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "### Tail of apply output"
+            echo
+            echo '```'
+            tail -n 200 "$apply_log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
