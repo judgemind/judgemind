@@ -126,6 +126,51 @@ DEFAULT_SUPERVISOR_TICK_SECONDS = 120
 #: heartbeat. Issue #2778 (closes the TODO in migration 24).
 DEFAULT_HOUSEKEEPING_TICK_SECONDS = 3600
 
+#: Scheduler-tick stall watchdog thresholds (#3097). The supervisor
+#: watchdog thread (:meth:`DispatcherDaemon._watchdog_loop`) observes
+#: ``self._last_scheduler_tick_at`` and fires two tiers of alarm when
+#: the main scheduler loop goes silent:
+#:
+#: * ``DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS`` (300 = 5 min) —
+#:   WARNING ``scheduler_tick_stalled`` with a bounded thread dump.
+#:   This is ~10× the default scheduler cadence, so a transient GitHub
+#:   or DB slowdown does not trigger a false positive while a real
+#:   wedge (30+ min observed silence on #3097 reproductions) is
+#:   caught well before the exit threshold.
+#: * ``DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS`` (3000 = 50 min) —
+#:   ERROR ``scheduler_tick_stalled_exiting`` with a final thread dump
+#:   followed by ``os._exit(137)``. ECS restarts the task. 50 min is
+#:   the MTTR ceiling the issue targets (vs. ~30 min of operator-
+#:   notice + ~5 min of manual ``update-service --force-new-deployment``
+#:   today). Exit code 137 mirrors the kernel's 128+SIGKILL convention
+#:   for operator-legible logs.
+#:
+#: Both thresholds are operator-tunable via
+#: ``dispatcher.config.scheduler_tick_stall_warn_seconds`` /
+#: ``scheduler_tick_stall_exit_seconds`` (read through
+#: :meth:`DispatcherDaemon._cb_config_int`, which fails closed to the
+#: default on any DB / parse error).
+DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS = 300
+DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS = 3000
+
+#: Watchdog poll cadence. The watchdog thread wakes every 30s to check
+#: the elapsed-since-last-tick gap against the thresholds above. Small
+#: enough to catch the exit threshold within one poll cycle; large
+#: enough that the watchdog overhead is negligible (~one wakeup per
+#: scheduler tick). Not operator-tunable — changing this is a code
+#: change, not a config flip.
+WATCHDOG_POLL_INTERVAL_SECONDS = 30
+
+#: Max stack frames per thread emitted in the stall thread dump. Each
+#: frame renders as ``file:line (function)`` — ~60-120 chars per frame.
+#: With ~10 threads (main + scheduler + ralph head-watcher + CloudWatch
+#: boto connections) and 20 frames per thread, the dump stays under
+#: ~24KB total which is well below CloudWatch's 256KB log-event limit.
+#: Deep-stack frames are the least useful for diagnosis anyway (they
+#: tend to be generic library internals); the top of the stack is where
+#: the wedge lives.
+WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD = 20
+
 #: Default retention window for ``dispatcher.queue_snapshots``. Matches
 #: the ``dispatcher_daemon`` CloudWatch log group default retention and
 #: covers the longest plausible multi-week post-mortem window. Overridable
@@ -1828,6 +1873,30 @@ class DispatcherDaemon:
         # for CloudWatch review.
         self._last_cap_observed: int | None = None
         self._last_cap_observed_monotonic: float | None = None
+        # Scheduler-tick stall watchdog (#3097). ``_last_scheduler_tick_at``
+        # is the shared atomic (single-writer from the scheduler thread at
+        # the top of every :meth:`scheduler_tick`, single-reader from the
+        # watchdog loop) that records the most recent tick's monotonic
+        # timestamp. Initialized to boot-time so the watchdog's first
+        # observation has a valid reference — run_forever fires the first
+        # tick within milliseconds of boot, so the initial value is only
+        # in play during the brief startup window before the first tick
+        # overwrites it.
+        #
+        # ``_watchdog_thread`` is the supervisor thread that polls the
+        # gap every :data:`WATCHDOG_POLL_INTERVAL_SECONDS` and fires
+        # WARN / EXIT tiers per :data:`DEFAULT_SCHEDULER_TICK_STALL_*`.
+        # ``_watchdog_stop`` is set during shutdown so the thread exits
+        # promptly instead of sleeping through its next poll.
+        # ``_watchdog_warn_emitted_for_gap`` is the debounce: once a
+        # WARNING has fired for a stall, don't spam CloudWatch with
+        # duplicate warnings every poll cycle until either (a) the tick
+        # recovers (gap returns below warn threshold) or (b) the EXIT
+        # threshold is hit and we call ``os._exit``.
+        self._last_scheduler_tick_at: float = time.monotonic()
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop: threading.Event = threading.Event()
+        self._watchdog_warn_emitted_for_gap: bool = False
 
     # ------------------------------------------------------------------
     # Thread-aware connection accessor (#2847).
@@ -2037,6 +2106,19 @@ class DispatcherDaemon:
               agent was reclaimed ahead of any fresh queue claim.
         """
         assert self._conn is not None, "connect() must run before ticks"
+
+        # Stall-watchdog heartbeat (#3097). Record the monotonic
+        # timestamp of this tick's entry. The watchdog thread reads
+        # this value to detect main-loop wedges — see
+        # :meth:`_watchdog_loop`. No lock needed: single writer (the
+        # scheduler thread), single reader (the watchdog thread),
+        # Python's atomic attribute assignment guarantees torn-read
+        # safety on CPython for a plain float. Placed BEFORE any other
+        # tick work so a DB hiccup in step 1 below still counts as
+        # "scheduler is alive and executing" — the only way this line
+        # fails to fire is a genuine tick-entry-level wedge, which is
+        # exactly what the watchdog exists to catch.
+        self._last_scheduler_tick_at = time.monotonic()
 
         # 1. Consume any pending commands. Each command is dispatched to
         # its handler; consumed_at is set AFTER the handler returns so
@@ -17564,6 +17646,270 @@ class DispatcherDaemon:
         self._housekeeping_ticks += 1
         return per_table
 
+    # ── scheduler-tick stall watchdog (#3097) ──────────────────────────
+
+    @staticmethod
+    def _format_thread_dump(
+        max_frames_per_thread: int = WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded dump of every live Python thread's stack.
+
+        Used by :meth:`_watchdog_loop` when the scheduler tick stalls.
+        Each entry is a dict with the thread name, ident, daemon flag,
+        alive flag, and a list of ``{file, line, function}`` stack
+        frames from innermost out to at most ``max_frames_per_thread``.
+        Bounded so a deep stack does not blow past CloudWatch's 256KB
+        log-event cap (see :data:`WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD`).
+
+        Safe to call from any thread — uses only introspection APIs
+        (:func:`sys._current_frames`, :func:`threading.enumerate`) that
+        don't acquire the GIL beyond a normal Python attribute read.
+        """
+        frames_by_ident = sys._current_frames()  # noqa: SLF001 — public API
+        dump: list[dict[str, Any]] = []
+        for thread in threading.enumerate():
+            frame = frames_by_ident.get(thread.ident)
+            stack: list[dict[str, Any]] = []
+            # ``traceback.extract_stack`` walks innermost → outermost. We
+            # want the top of the stack (innermost) for wedge diagnosis
+            # because deep library frames are low-signal. Cap at
+            # ``max_frames_per_thread`` to bound row size.
+            cur = frame
+            while cur is not None and len(stack) < max_frames_per_thread:
+                code = cur.f_code
+                stack.append(
+                    {
+                        "file": code.co_filename,
+                        "line": cur.f_lineno,
+                        "function": code.co_name,
+                    }
+                )
+                cur = cur.f_back
+            dump.append(
+                {
+                    "name": thread.name,
+                    "ident": thread.ident,
+                    "daemon": thread.daemon,
+                    "alive": thread.is_alive(),
+                    "frames": stack,
+                }
+            )
+        return dump
+
+    def _emit_scheduler_stall_warning(self, elapsed_seconds: float) -> None:
+        """Log a WARNING ``scheduler_tick_stalled`` with a thread dump.
+
+        Fired once per stall episode — debounced via
+        ``_watchdog_warn_emitted_for_gap`` to avoid spamming CloudWatch
+        while the wedge persists. Cleared when the tick recovers OR the
+        EXIT threshold hits.
+        """
+        thread_dump = self._format_thread_dump()
+        self._log.warning(
+            "daemon.scheduler_tick_stalled",
+            extra={
+                "event": "scheduler_tick_stalled",
+                "run_id": self._run_id,
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "warn_threshold_seconds": self._watchdog_warn_threshold(),
+                "exit_threshold_seconds": self._watchdog_exit_threshold(),
+                "thread_count": len(thread_dump),
+                "thread_dump": thread_dump,
+            },
+        )
+
+    def _emit_scheduler_stall_exit(self, elapsed_seconds: float) -> None:
+        """Log a critical ERROR + call ``os._exit(137)`` so ECS restarts.
+
+        ``os._exit`` (not ``sys.exit``) is deliberate: ``sys.exit`` runs
+        atexit handlers and flushes buffers, which can themselves block
+        if the wedged thread is holding a lock those handlers need. The
+        watchdog's job is to guarantee the process dies so ECS can
+        restart it; a clean shutdown is nice-to-have, not mandatory.
+        137 = 128 + SIGKILL; ECS interprets this as "killed by kernel"
+        in the console, matching the operator-legible convention used
+        elsewhere in the dispatcher logs.
+        """
+        thread_dump = self._format_thread_dump()
+        self._log.error(
+            "daemon.scheduler_tick_stalled_exiting",
+            extra={
+                "event": "scheduler_tick_stalled_exiting",
+                "run_id": self._run_id,
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "exit_threshold_seconds": self._watchdog_exit_threshold(),
+                "exit_code": 137,
+                "thread_count": len(thread_dump),
+                "thread_dump": thread_dump,
+            },
+        )
+        # Flush handlers before os._exit — the JSON log formatter writes
+        # to stdout via the root logger; CloudWatch won't see the final
+        # event otherwise. Wrap in try/except because we are committed
+        # to exiting regardless.
+        try:
+            for handler in list(self._log.handlers) + list(
+                logging.getLogger().handlers
+            ):
+                try:
+                    handler.flush()
+                except Exception:  # pragma: no cover — best-effort
+                    pass
+        except Exception:  # pragma: no cover — best-effort
+            pass
+        os._exit(137)
+
+    def _watchdog_warn_threshold(self) -> int:
+        """Read WARN threshold from ``dispatcher.config``; default 300s.
+
+        Reads through the existing :meth:`_cb_config_int` helper which
+        fails closed to the default on missing row / parse error / DB
+        exception. The watchdog thread's psycopg connection lives on
+        ``self._thread_state.conn`` (see :meth:`_watchdog_loop`) so
+        ``self._conn`` resolves correctly there.
+        """
+        return self._cb_config_int(
+            "scheduler_tick_stall_warn_seconds",
+            DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS,
+        )
+
+    def _watchdog_exit_threshold(self) -> int:
+        """Read EXIT threshold from ``dispatcher.config``; default 3000s."""
+        return self._cb_config_int(
+            "scheduler_tick_stall_exit_seconds",
+            DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS,
+        )
+
+    def _watchdog_loop(self) -> None:
+        """Run the supervisor watchdog thread (#3097).
+
+        Wakes every :data:`WATCHDOG_POLL_INTERVAL_SECONDS`. If the gap
+        between ``time.monotonic()`` and
+        ``self._last_scheduler_tick_at`` exceeds the WARN threshold,
+        emit a one-shot WARNING with a bounded thread dump. If the gap
+        exceeds the EXIT threshold, emit an ERROR with a final thread
+        dump and call ``os._exit(137)``.
+
+        Opens its own psycopg connection so the thresholds can be read
+        via ``_cb_config_int`` without contending with the main
+        thread's connection (psycopg3 Connections are not thread-safe).
+        A connection failure is tolerated — the thread falls back to the
+        defaults and keeps watching; losing the DB must not disable the
+        reliability net.
+
+        Runs until ``_watchdog_stop`` is set (normally in ``run_forever``
+        shutdown, or during tests). Exits cleanly on stop — no join
+        timeout needed because the loop sleeps on the event, not on a
+        bare ``time.sleep``.
+        """
+        import psycopg  # noqa: PLC0415 — lazy, matches sibling watchers
+
+        watcher_conn: Connection[Any] | None = None
+        try:
+            watcher_conn = psycopg.connect(self._cfg.database_url, connect_timeout=10)
+            watcher_conn.autocommit = False
+            self._thread_state.conn = watcher_conn
+        except Exception as exc:
+            # No DB → thresholds fall back to defaults via _cb_config_int's
+            # exception path. Keep watching; the reliability net is more
+            # valuable than config tunability.
+            self._log.warning(
+                "daemon.watchdog_no_db",
+                extra={
+                    "event": "watchdog_no_db",
+                    "run_id": self._run_id,
+                    "detail": _stderr_tail(str(exc)),
+                },
+            )
+
+        self._log.info(
+            "daemon.watchdog_started",
+            extra={
+                "event": "watchdog_started",
+                "run_id": self._run_id,
+                "poll_interval_seconds": WATCHDOG_POLL_INTERVAL_SECONDS,
+                "warn_threshold_seconds": self._watchdog_warn_threshold(),
+                "exit_threshold_seconds": self._watchdog_exit_threshold(),
+            },
+        )
+
+        try:
+            while not self._watchdog_stop.is_set():
+                try:
+                    now = time.monotonic()
+                    elapsed = now - self._last_scheduler_tick_at
+                    warn_threshold = self._watchdog_warn_threshold()
+                    exit_threshold = self._watchdog_exit_threshold()
+
+                    if elapsed >= exit_threshold:
+                        # Terminal path — emit + os._exit. Does not return.
+                        self._emit_scheduler_stall_exit(elapsed)
+                        return  # pragma: no cover — _exit never returns
+
+                    if elapsed >= warn_threshold:
+                        if not self._watchdog_warn_emitted_for_gap:
+                            self._emit_scheduler_stall_warning(elapsed)
+                            self._watchdog_warn_emitted_for_gap = True
+                    else:
+                        # Gap recovered below the warn threshold. Clear
+                        # the debounce so a future stall re-fires.
+                        if self._watchdog_warn_emitted_for_gap:
+                            self._log.info(
+                                "daemon.watchdog_tick_recovered",
+                                extra={
+                                    "event": "watchdog_tick_recovered",
+                                    "run_id": self._run_id,
+                                    "elapsed_seconds": round(elapsed, 1),
+                                },
+                            )
+                        self._watchdog_warn_emitted_for_gap = False
+                except Exception:  # pragma: no cover — defensive
+                    # Any watchdog exception is logged and the loop
+                    # continues — a bug in the watchdog must not disable
+                    # the reliability net for subsequent polls.
+                    self._log.exception(
+                        "daemon.watchdog_poll_failed",
+                        extra={
+                            "event": "watchdog_poll_failed",
+                            "run_id": self._run_id,
+                        },
+                    )
+
+                # Sleep on the event so shutdown is prompt.
+                if self._watchdog_stop.wait(WATCHDOG_POLL_INTERVAL_SECONDS):
+                    break
+        finally:
+            self._log.info(
+                "daemon.watchdog_stopped",
+                extra={
+                    "event": "watchdog_stopped",
+                    "run_id": self._run_id,
+                },
+            )
+            self._thread_state.conn = None
+            if watcher_conn is not None:
+                try:
+                    watcher_conn.close()
+                except Exception:  # pragma: no cover — best-effort
+                    pass
+
+    def _start_watchdog(self) -> None:
+        """Spawn the supervisor watchdog thread (#3097).
+
+        Idempotent — a second call while the thread is alive is a no-op.
+        Called from :meth:`run_forever` after the initial tick so the
+        watchdog starts only when the daemon is fully up.
+        """
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="dispatcher-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
     # ── signal handling ────────────────────────────────────────────────
 
     def request_stop(self, signum: int | None = None, _frame: Any = None) -> None:
@@ -17605,6 +17951,11 @@ class DispatcherDaemon:
             self._log.exception("daemon.initial_tick_failed")
             return 1
 
+        # #3097: spawn the stall-watchdog thread after the initial tick
+        # so it begins observing from a known-fresh baseline. See
+        # :meth:`_watchdog_loop` for the WARN/EXIT tier semantics.
+        self._start_watchdog()
+
         # Poll the stop flag in 1-second slices so SIGTERM lands promptly.
         while not self._stop.is_set():
             now = time.monotonic()
@@ -17632,6 +17983,14 @@ class DispatcherDaemon:
             self._stop.wait(1.0)
 
         self._log.info("daemon.shutdown_begin", extra={"event": "shutdown_begin"})
+        # #3097: stop the stall watchdog first so it doesn't race us
+        # into ``os._exit(137)`` during a clean shutdown (e.g. a slow
+        # orchestration-join + CloudWatch flush that takes longer than
+        # the watchdog exit threshold — unlikely but not impossible).
+        # Daemon=True so a missing join doesn't leak; setting the stop
+        # event unblocks the next poll sleep within
+        # :data:`WATCHDOG_POLL_INTERVAL_SECONDS`.
+        self._watchdog_stop.set()
         # #2847: signal the orchestration worker thread (if any) to
         # abort at its next phase boundary, then give it a short
         # window to exit cleanly. The thread is daemon=True so a
