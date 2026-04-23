@@ -3969,6 +3969,13 @@ class DispatcherDaemon:
                         "new_run_id": self._run_id,
                     },
                 )
+                # ROUTING (#3062): failure row written above; mechanical
+                # retry marker enqueued below. NOT routed through
+                # ``_handle_agent_failure`` — ``daemon_restart_abandoned``
+                # is in :data:`_INFRA_PREEMPTION_CATEGORIES` and
+                # intentionally bypasses the diagnoser (agent was
+                # preempted by an infra event, not a failure in its
+                # code or runtime — see #2936 + #3032).
                 self._mark_agent_terminal(
                     agent_id,
                     status="crashed",
@@ -7342,6 +7349,16 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
+            # ROUTING (#3062): NOT routed through
+            # ``_handle_agent_failure`` — worktree-create failures are
+            # host-level infra problems (disk full, git binary missing,
+            # fork-bomb from concurrent worktree attempts). Repeated
+            # attempts on the same host surface via the overnight
+            # circuit breaker (see :meth:`_evaluate_circuit_breaker`)
+            # rather than the per-agent diagnoser. Tracked as
+            # an audit follow-up in #3062 — if we see this class of
+            # terminal on the admin page without a diagnosis hint,
+            # the fix shape is the same as #3059 for ralph_not_ship.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -7482,6 +7499,14 @@ class DispatcherDaemon:
                 ),
             },
         )
+        # ROUTING (#3062): intentionally NOT routed through
+        # ``_handle_agent_failure`` — ``paused_by_killswitch`` /
+        # ``force_stopped`` are in :data:`_INFRA_PREEMPTION_CATEGORIES`
+        # (the phase name IS the category string, see
+        # :data:`FAILURE_CATEGORY_PAUSED_BY_KILLSWITCH`). Operator-
+        # engaged pauses must not burn diagnoser budget on a terminal
+        # the operator explicitly caused; no failure row is written for
+        # the same reason.
         self._mark_agent_terminal(
             agent_id,
             status="failed",
@@ -7642,6 +7667,12 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
+            # ROUTING (#3062): NOT routed through
+            # ``_handle_agent_failure`` — same reasoning as the fresh-
+            # claim ``worktree_create_failed`` site above: host-level
+            # infra problems aren't diagnoser-actionable. Tracked in
+            # #3062; if this class recurs persistently the fix shape
+            # mirrors #3059 (add a dedicated category + tier-3 route).
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="claiming", exit_code=None
             )
@@ -8674,6 +8705,16 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
+            # ROUTING (#3062): NOT routed through
+            # ``_handle_agent_failure``. An ``issue_fetch_failed`` from
+            # ``_fetch_issue_bundle`` is a ``gh`` subprocess failure —
+            # either GitHub is down / rate-limited (the supervisor's
+            # tier-1 ``gh_rate_exhausted`` path handles recurring cases)
+            # or the issue was deleted mid-claim. The diagnoser has no
+            # useful action here — retry is unlikely to help if the
+            # issue is gone, and a fresh tick will re-claim naturally
+            # if GitHub recovers. Audit follow-up in #3062 if this
+            # class recurs.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -8802,6 +8843,10 @@ class DispatcherDaemon:
                 # work. Each side-effect is individually wrapped so a
                 # failure of one does not prevent the others.
                 self._handle_plan_blocked(agent_id, issue_number, reason, worktree)
+            # ROUTING (#3062): correct-outcome terminals (``succeeded``
+            # for "no work needed" / ``plan_blocked`` for "plan declined
+            # to proceed"). Not failure paths — ``_handle_agent_failure``
+            # is not applicable.
             self._mark_agent_terminal(
                 agent_id,
                 status=status,
@@ -8983,6 +9028,15 @@ class DispatcherDaemon:
                     "issue_number": issue_number,
                 },
             )
+            # ROUTING (#3062): failure row written above with a
+            # tier-3 category → diagnoser picks it up on the next
+            # supervisor tick. Inline ``_write_failure`` +
+            # ``_mark_agent_terminal`` pattern (not
+            # ``_handle_agent_failure``) is intentional here — the
+            # ``infeasible_acs`` shape pre-dates the unified helper
+            # and the ac-infeasible-specific ``detected_by`` marker
+            # is preserved. Effect is identical to routing through
+            # ``_handle_agent_failure``.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -9239,6 +9293,10 @@ class DispatcherDaemon:
                     "issue_number": issue_number,
                 },
             )
+            # ROUTING (#3062): failure row written above with a tier-3
+            # category → diagnoser picks it up. Same inline pattern
+            # as the ralph_ac_infeasible path above (matching
+            # ``detected_by="summary_output_parse"`` marker preserved).
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -9359,6 +9417,16 @@ class DispatcherDaemon:
                     "reason": "claude_not_on_path",
                 },
             )
+            # ROUTING (#3062): failure row written above with
+            # ``subprocess_crash`` (in :data:`TIER_2_RECURRENCE_CATEGORIES`).
+            # First occurrence is NOT diagnosed — the diagnoser only
+            # picks up tier-2 recurrence after a prior same-category
+            # failure for the same agent. Deliberate per the comment
+            # above: ``claude_not_on_path`` is a dispatcher-image
+            # problem, not an agent problem, so a retry would hit the
+            # same missing binary. Audit note in #3062: if this
+            # recurs across agents, the overnight circuit breaker
+            # catches the cascading fail-rate.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -9379,6 +9447,14 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
+            # ROUTING (#3062): defensive catch — not routed through
+            # ``_handle_agent_failure`` because this code path is
+            # ``pragma: no cover``. Any real unhandled exception in
+            # the subprocess-spawn machinery that reaches here is a
+            # dispatcher-image problem operators must triage from
+            # CloudWatch; the diagnoser has no actionable remedy.
+            # Audit note in #3062: if this ever fires, file a
+            # priority/p1 issue to classify + route.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -9521,6 +9597,13 @@ class DispatcherDaemon:
         # ``failed`` temporarily; the retry marker processor flips the
         # agent back to ``retrying`` when the backoff elapses. Tier-2/3
         # categories stay in ``failed`` for 3D.
+        #
+        # ROUTING (#3062): this is the per-phase-subprocess sibling of
+        # ``_handle_agent_failure``. Failure row was written above at
+        # ``_write_failure``; tier-2 recurrences + tier-3 first-
+        # occurrence categories (e.g. ``subprocess_turn_limit``) are
+        # picked up by the diagnoser on the next supervisor tick.
+        # Tier-1 (``subprocess_crash``) enqueues a retry marker below.
         self._mark_agent_terminal(
             agent_id,
             status="failed",
@@ -9602,6 +9685,12 @@ class DispatcherDaemon:
             detected_by="scheduler",
             details=failure_details,
         )
+        # ROUTING (#3062): this IS the unified failure path — failure
+        # row written above, terminal below. Diagnoser consumes on
+        # the next supervisor tick when ``category`` is in
+        # :data:`TIER_2_FIRST_OCCURRENCE_CATEGORIES`,
+        # :data:`TIER_2_RECURRENCE_CATEGORIES`, or
+        # :data:`TIER_3_CATEGORIES`.
         self._mark_agent_terminal(
             agent_id,
             status="failed",
@@ -9781,6 +9870,8 @@ class DispatcherDaemon:
                     ),
                 },
             )
+            # ROUTING (#3062): correct-outcome terminal (``succeeded``
+            # for a clean no-op SHIP). Not a failure path.
             self._mark_agent_terminal(
                 agent_id,
                 status="succeeded",
@@ -9822,11 +9913,29 @@ class DispatcherDaemon:
                     "has_pr_body": bool(pr_body_md),
                 },
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3062 — summary phase exited 0 but returned an output
+            # envelope missing ``commit_message`` / ``pr_title`` /
+            # ``pr_body_md``. Qualitatively identical to the
+            # ``phase_output_missing`` case (subprocess exited 0 but the
+            # JSON is unusable), so reuse the same tier-2 first-occurrence
+            # category — the diagnoser's ``retry`` /
+            # ``retry_with_hint`` / ``escalate`` set covers both.
+            # Pre-#3062 this path only wrote ``status='failed'`` with no
+            # failure row, so the diagnoser never picked it up and
+            # operators had to read CloudWatch to know what broke.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail="",
                 exit_code=None,
+                details={
+                    "missing_phase_output": "summary",
+                    "has_commit": bool(commit_message),
+                    "has_pr_title": bool(pr_title),
+                    "has_pr_body": bool(pr_body_md),
+                    "issue_number": issue_number,
+                },
                 issue_number=issue_number,
             )
             return
@@ -9885,6 +9994,14 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
+            # ROUTING (#3062): NOT routed through
+            # ``_handle_agent_failure`` — pre-push ``git commit
+            # --amend`` exception. Filed as a follow-up in #3062
+            # because this is ralph_not_ship-adjacent: ralph SHIPped
+            # but the mechanical commit step crashed, so the
+            # diagnoser could usefully ``retry`` (worktree still
+            # holds ralph's changes). See follow-up for a
+            # ``FAILURE_CATEGORY_GIT_COMMIT_FAILED`` route.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -9904,6 +10021,11 @@ class DispatcherDaemon:
                     "stderr_tail": _stderr_tail(commit_result.stderr),
                 },
             )
+            # ROUTING (#3062): NOT routed — see the exception branch
+            # above for the same rationale. Non-zero ``git commit
+            # --amend`` exit commonly indicates ralph's reset didn't
+            # produce a diff (the pre-#2971 bug class). Follow-up in
+            # #3062.
             self._mark_agent_terminal(
                 agent_id,
                 status="failed",
@@ -10194,6 +10316,12 @@ class DispatcherDaemon:
                 unmet_criteria=unmet_criteria,
                 worktree=worktree,
             )
+            # ROUTING (#3062): correct-outcome terminal
+            # (``needs_review`` — ralph produced code but summary
+            # flagged unmet ACs, draft PR opened for operator review).
+            # Not a failure path — :meth:`_build_failure_summary`
+            # skips ``needs_review`` and
+            # ``_find_diagnoser_candidates`` never sees this terminal.
             self._mark_agent_terminal(
                 agent_id,
                 status="needs_review",
@@ -10205,6 +10333,10 @@ class DispatcherDaemon:
             return
 
         # Final state: keep status=running so Phase 3B picks it up.
+        # ROUTING (#3062): non-terminal phase transition (``status``
+        # stays ``running`` while the PR awaits CI). Not a failure
+        # path — the ``_mark_agent_terminal`` helper just happens
+        # to be the column-writer for the ``phase`` transition too.
         self._mark_agent_terminal(
             agent_id,
             status="running",
@@ -10443,6 +10575,19 @@ class DispatcherDaemon:
                     elif phase in (PHASE_RETRO_DONE, PHASE_RETRO_FAILED):
                         self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
                 else:
+                    # ROUTING (#3062): supervisor-loop catch-all for an
+                    # unhandled exception from a per-phase advancer
+                    # (``_advance_awaiting_ci`` /
+                    # ``_advance_awaiting_deploy`` /
+                    # ``_advance_verify`` /
+                    # ``_advance_retro``). No failure row written
+                    # because the original failure (whatever the
+                    # per-phase advancer hit) already has its own
+                    # routing path above. This is the "agent got stuck
+                    # in a phase we couldn't advance" safety net —
+                    # operators triage from the exception log. Not
+                    # diagnoser-actionable (the exception cause is
+                    # in CloudWatch, not in the failure row).
                     self._mark_agent_terminal(
                         agent_id,
                         status="crashed",
@@ -10484,6 +10629,11 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                 },
             )
+            # ROUTING (#3062): NOT routed — defensive invariant
+            # violation ("3A bug" per comment above). A real recurrence
+            # would mean the push_and_pr phase is producing rows in
+            # an impossible state, which is a dispatcher bug to patch,
+            # not a per-agent failure to diagnose.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_ci", exit_code=None
             )
@@ -10837,6 +10987,11 @@ class DispatcherDaemon:
                     "retries_used": retries_used,
                 },
             )
+            # ROUTING (#3062): failure row written above with a tier-3
+            # category → diagnoser picks it up. Inline pattern (not
+            # ``_handle_agent_failure``) preserves the existing
+            # ``detected_by="scheduler"`` marker and ``details`` shape
+            # that the diagnoser-context bundler expects.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_ci", exit_code=None
             )
@@ -10939,6 +11094,15 @@ class DispatcherDaemon:
                 "block_reason": fix_ci_output.get("block_reason"),
             },
         )
+        # ROUTING (#3062): NOT currently routed. This is an exact
+        # analog of the ralph_not_ship bug #3054 fixed — fix-ci
+        # returned a BLOCKED verdict with a ``block_reason``, no
+        # mechanical retry will help, and the diagnoser's
+        # ``block_on_existing_task`` / ``file_prerequisite_task`` /
+        # ``block_and_comment`` actions are exactly the right
+        # responses. Audit follow-up filed — should introduce
+        # ``FAILURE_CATEGORY_FIX_CI_BLOCKED`` as a tier-3 category
+        # and route via ``_handle_agent_failure``.
         self._mark_agent_terminal(
             agent_id, status="failed", phase="awaiting_ci", exit_code=exit_code
         )
@@ -11019,6 +11183,17 @@ class DispatcherDaemon:
         ``git commit -F <msg-file>``, and ``git push``. On success,
         increment ``retries_used`` and leave the agent in
         ``awaiting_ci`` so the next supervisor tick re-polls.
+
+        ROUTING (#3062): the eight ``_mark_agent_terminal(status="failed")``
+        call sites inside this method are NOT routed through
+        ``_handle_agent_failure``. They cover
+        ``fix_ci_missing_commit_message`` + every git-add / git-commit
+        / git-push failure mode for the fix-ci patch. Audit follow-up
+        in #3062 proposes routing the whole cluster under a new
+        ``FAILURE_CATEGORY_FIX_CI_APPLY_FAILED`` tier-2 first-
+        occurrence category so the Opus diagnoser can distinguish a
+        flaky push (retry) from a deterministic worktree / permissions
+        break (escalate) — mirrors the #3032 push+PR refactor shape.
         """
         agent_id = agent["agent_id"]
         worktree = Path(agent["worktree_path"])
@@ -11250,6 +11425,9 @@ class DispatcherDaemon:
                     "agent_id": agent_id,
                 },
             )
+            # ROUTING (#3062): NOT routed — defensive invariant
+            # violation, same shape as the ``awaiting_ci_missing_pr``
+            # case above. Not diagnoser-actionable.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_deploy", exit_code=None
             )
@@ -11301,6 +11479,14 @@ class DispatcherDaemon:
                     "deploy_runs": deploy_runs,
                 },
             )
+            # ROUTING (#3062): NOT currently routed. A deploy workflow
+            # failure post-merge IS diagnoser-actionable — the
+            # diagnoser could ``file_prerequisite_task`` (e.g.
+            # "infra broken, fix deploy role") or
+            # ``block_and_comment`` on the issue. Audit follow-up
+            # proposes ``FAILURE_CATEGORY_DEPLOY_FAILED`` as a tier-2
+            # first-occurrence category. For now, operators triage
+            # from the ``daemon.deploy_failed`` event in CloudWatch.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_deploy", exit_code=None
             )
@@ -11689,6 +11875,15 @@ class DispatcherDaemon:
             # cockpit renders red. ``merged_at`` stays populated so the
             # tooltip can read "merged X · verify failed" instead of
             # hiding the shipment entirely.
+            #
+            # ROUTING (#3062): NOT currently routed. A post-merge
+            # verify failure is genuine regression signal and
+            # diagnoser-actionable (file a priority/p1 regression
+            # issue via ``file_prerequisite_task``; or
+            # ``block_and_comment`` with repro steps). Audit follow-
+            # up proposes ``FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE``
+            # so the diagnoser gets the merged PR + verify evidence
+            # bundle and can pick the right escalation shape.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="done", exit_code=exit_code
             )
@@ -12930,6 +13125,13 @@ class DispatcherDaemon:
                         "issue_number": issue_number,
                     },
                 )
+                # ROUTING (#3062): failure row written above;
+                # ``stuck_timeout`` is in
+                # :data:`TIER_2_RECURRENCE_CATEGORIES` AND
+                # :data:`AUTO_RETRY_CATEGORIES`. First occurrence
+                # enqueues a retry marker below (mechanical retry).
+                # Recurrences (a second stuck_timeout for the same
+                # agent within 24h) are picked up by the diagnoser.
                 self._mark_agent_terminal(
                     agent_id,
                     status="crashed",
@@ -13241,6 +13443,16 @@ class DispatcherDaemon:
             # Flip to 'failed' so 3D's diagnoser picks it up. Preserve
             # the existing phase so operators can see where it got
             # stuck.
+            #
+            # ROUTING (#3062): NO new failure row written here — by
+            # definition max-retries escalation means N prior
+            # ``dispatcher.failures`` rows already exist for the same
+            # (agent, category). The diagnoser's candidate scan picks
+            # up the most recent row via tier-2 recurrence (same-
+            # category prior-failure check in
+            # :meth:`_has_prior_same_category_failure`). Writing a
+            # fresh "retry_exhausted" row would duplicate the signal
+            # without new information.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="retry_exhausted", exit_code=None
             )
@@ -13562,6 +13774,16 @@ class DispatcherDaemon:
                     # Skip the ``phase_transitions('retry_reset')`` insert —
                     # the row is terminal and no future stuck_timeout clock
                     # reset is needed.
+                    #
+                    # ROUTING (#3062): intentionally NOT routed —
+                    # ``reason`` is in
+                    # :data:`_INFRA_PREEMPTION_CATEGORIES` (the
+                    # ``retry_counted`` branch guarantees it). These
+                    # are operator-initiated or daemon-restart
+                    # preemptions that must not burn diagnoser budget.
+                    # The prior failure row from the preempt already
+                    # exists; a fresh diagnoser pass would not have
+                    # anything actionable to do.
                     self._mark_agent_terminal(
                         agent_id,
                         status="failed",
@@ -15513,7 +15735,22 @@ class DispatcherDaemon:
         issue_number: int | None,
         reasoning: str,
     ) -> None:
-        """Add needs-human + p1 labels, post diagnosis, mark agent failed."""
+        """Add needs-human + p1 labels, post diagnosis, mark agent failed.
+
+        ROUTING (#3062): the five diagnoser-consumer action methods
+        (``_consume_action_escalate`` / ``_consume_action_close`` /
+        ``_consume_action_block_and_comment`` /
+        ``_consume_action_file_prerequisite_task`` /
+        ``_consume_action_block_on_existing_task``) each mark the
+        agent terminal as the FINAL step of consuming a diagnoser
+        recommendation. Intentionally NOT routed through
+        ``_handle_agent_failure`` — the upstream failure row that
+        TRIGGERED this diagnoser pass already exists, and a second
+        row would just cause the candidate scan to pick the same
+        agent again next tick (infinite diagnoser loop). These five
+        sites are the close-out of an already-routed failure, not
+        a fresh one.
+        """
         if issue_number is not None:
             summary = (
                 "## Diagnosis (3D escalation)\n\n"
