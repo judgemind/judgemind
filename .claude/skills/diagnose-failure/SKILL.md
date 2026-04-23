@@ -288,6 +288,34 @@ Two categories land in this skill via the post-exit parse path added for #3010:
 
 ---
 
+## Per-category guidance — post-merge verify failure (issue #3071)
+
+### `verify_failed_post_merge` — post-merge regression signal
+
+**This category is fundamentally different from pre-merge failures.** The PR is already merged; the code is on `main`; the dispatcher has already posted "merged" state to the cockpit. `/task-v2-verify` then ran against the deployed service and returned `verdict='FAILED'` — which means the deployed behavior did not match the issue's acceptance criteria. Your diagnosis is about a live regression, not a blocked implementation.
+
+**Context bundle extras.** In addition to the shared bundle shape, the daemon populates:
+
+- `pr_number` + `merge_sha` — the merged PR and its merge commit.
+- `failure_reason` (str) — the one-line summary from `/task-v2-verify`'s output.
+- `evidence_md` (str) — the verify phase's per-AC evidence markdown that was ALSO posted as an issue comment. Usually has "PASS:" / "FAIL:" lines per criterion.
+
+**Default action selection:**
+
+| Situation | Action | Why |
+|---|---|---|
+| The deployed behavior is clearly broken (a specific AC shows a concrete failure — wrong output, 500 response, missing field), the regression is visible to users, and the root cause is not obvious from the diff alone | `file_prerequisite_task` with `priority/p1` | Open a focused regression issue so a fresh agent (or a human) can investigate on a clean baseline. Title should be conventional-commits style; body should paste the verify `evidence_md` verbatim so the new agent has a reproducer. The daemon applies `Blocked by #<new>` to the current issue — but note that the current issue is already closed-via-merge, so the block is a tracking breadcrumb, not an active gate. |
+| The verify failure is ambiguous (intermittent, flaky external dep, unclear whether deployed code or test infra) | `block_and_comment` | Post the verify evidence as a comment and mark `status/needs-human`. A human decides whether to re-run verify, roll back, or file a fresh regression ticket. Do NOT auto-rollback — the daemon never touches `main`. |
+| The verify reason is "the deploy workflow succeeded but the service isn't healthy yet" / "DNS cached" / "ECS task still draining" — i.e. it's the verify phase racing the deployment | `escalate` | `retry` is a no-op in this flow (the daemon doesn't re-run verify post-done); `escalate` at least surfaces the race to a human. A future follow-up could add a verify-phase retry loop, but that's not this skill's decision. |
+
+**Do NOT pick `retry` or `retry_with_hint` for this category.** `retry` is a no-op in the post-merge flow (the daemon does not re-run `/task-v2-verify` from the retry-marker path; `phase='done'` is terminal in the post-merge pipeline). Recommending `retry` here will cause the daemon to enqueue a marker that never runs, and the agent will sit forever in `phase='done' status='failed'`. If the failure genuinely looks transient, prefer `escalate` and let a human manually re-invoke verify.
+
+**Do NOT pick `reissue` for this category.** The issue is already closed via merge; editing its body with a new scope will not re-open the PR or revert the merge. `reissue` is a pre-merge remedy.
+
+**Do NOT pick `close` for this category.** The issue is already closed. Re-closing is a no-op that destroys context.
+
+---
+
 ## Investigation steps — only as needed
 
 The context bundle should usually be enough. Shell out sparingly:
