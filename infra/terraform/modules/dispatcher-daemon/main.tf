@@ -526,6 +526,15 @@ locals {
     ? "arn:aws:ecs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task-definition/${var.agent_runner_task_definition_family}:*"
     : ""
   )
+  # `ecs:TagResource` authorisation for RunTask-with-tags is evaluated
+  # against the task-instance ARN (task/CLUSTER/*), not the task-def ARN.
+  # Cluster name is the last path segment of the cluster ARN (split index
+  # 1 of `.../cluster/NAME`).
+  agent_runner_task_instance_arn_pattern = (
+    local.agent_runner_launch_enabled
+    ? "arn:aws:ecs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task/${split("/", var.ecs_cluster_arn)[1]}/*"
+    : ""
+  )
   agent_runner_pass_role_arns = compact([
     var.agent_runner_execution_role_arn,
     var.agent_runner_task_role_arn,
@@ -557,6 +566,23 @@ resource "aws_iam_role_policy" "task_launch_agent_runner" {
         Effect   = "Allow"
         Action   = "ecs:StopTask"
         Resource = local.agent_runner_family_arn_pattern
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.ecs_cluster_arn
+          }
+        }
+      },
+      {
+        # ecs:TagResource is invoked implicitly by RunTask when the call
+        # includes a `tags` list. AWS evaluates authorization against the
+        # task-instance ARN (task/CLUSTER/*), not the task-definition ARN —
+        # the Stage 2 daemon tags every agent-runner task with `agent_id`
+        # and `issue_number`, so without this statement every ECS-mode
+        # claim fails with AccessDeniedException (#3129).
+        Sid      = "AllowTagAgentRunnerTask"
+        Effect   = "Allow"
+        Action   = "ecs:TagResource"
+        Resource = local.agent_runner_task_instance_arn_pattern
         Condition = {
           ArnEquals = {
             "ecs:cluster" = var.ecs_cluster_arn
