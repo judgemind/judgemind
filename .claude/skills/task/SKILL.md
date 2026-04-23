@@ -267,6 +267,37 @@ Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the w
 
 **Why this section exists:** Two confirmed incidents (#2500, #2502) showed /task agents emitting `end_turn` after autocompact with `phase=ralph-worker (1)` in the status file — i.e. still mid-implementation, with uncommitted changes, no PR, and no merge. The agents read their own "iteration 1 COMPLETE" artifact as a done-signal and stopped. The recovery script is the mechanical self-check that prevents this failure mode.
 
+#### A.1a — Refresh worktree base onto origin/main (MANDATORY)
+
+**First action after worktree verification.** When Claude Code creates a worktree with `isolation: "worktree"`, the branch is cut from whatever `origin/main` was at the *moment of worktree creation* — which can be many merged PRs stale by the time the agent actually begins editing. Refresh the base before touching any files so the ralph loop and subsequent push don't hit surprise merge-bases (see #3075).
+
+The step runs `git fetch origin main` + `git rebase origin/main` under the hood, wrapped behind the `preflight_branch_fresh --fetch` helper (already defined in `scripts/preflight.sh`). Use the standalone wrapper — prevent stale-worktree-base merge-base surprises — see #3075:
+
+```
+{worktree}/scripts/preflight-branch-fresh.sh --fetch
+```
+
+`preflight-branch-fresh.sh` is a thin wrapper around `preflight_branch_fresh` in `scripts/preflight.sh`. The wrapper lets the check run in a single Bash tool call — `source scripts/preflight.sh && preflight_branch_fresh --fetch` trips the preflight hook's "quoted strings combined with &&" check. Same pattern as `check-duplicate-pr.sh` (see #2706).
+
+- **Exit 0 (fresh):** the worktree branch is at or ahead of `origin/main`. No rebase needed — continue to A.1.
+- **Exit 1 (behind origin/main):** a `PREFLIGHT FAIL: Branch is N commit(s) behind origin/main.` message was printed to stderr. Run the rebase as a separate tool call (CLAUDE.md §ALWAYS requires fetch-then-rebase; the wrapper already fetched, so only the rebase is left):
+  ```
+  git -C {worktree} rebase origin/main
+  ```
+  - **Rebase succeeds (clean fast-forward):** re-run `scripts/preflight-branch-fresh.sh` (no `--fetch` — we just fetched) to confirm the gap is closed, then continue to A.1.
+  - **Rebase fails with conflicts — STOP, do NOT auto-resolve.** This is the #3075 case where another PR landed that changed a file we would be editing. The agent has not yet started work, so there is no reasonable way to resolve conflicts against intent that has not yet been captured in code. Abort the rebase, post a block on the issue, release the `status/in-progress` label, and stop:
+    ```
+    git -C {worktree} rebase --abort
+    ```
+    Write a short block comment to `{worktree}/tmp/rebase_block.txt` naming the conflicting files and the competing origin/main commit(s), then (writes — stay on `gh`):
+    ```
+    gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/rebase_block.txt
+    gh issue edit <N> --repo judgemind/judgemind --add-label status/blocked --remove-label status/in-progress
+    ```
+    Stop — do not proceed to A.1. Worktree cleanup is automatic. A follow-up agent (or a human) can pick the issue up after the conflicting PR has been triaged.
+
+The daemon-side path (Fargate, `_create_worktree` in `scripts/dispatcher/daemon.py`) already runs `_baseline_fetch_origin_main` before `git worktree add` — see `scripts/dispatcher/tests/test_daemon_baseline_clone.py::TestCreateWorktreeBaselineMode`. A.1a exists because Claude Code's local `isolation: "worktree"` mode has no equivalent hook: the platform cuts the branch from whatever `origin/main` happens to be at worktree-creation time, which is minutes-to-hours before the agent actually starts editing.
+
 #### A.1 — Set up dependencies
 Write status: `phase: setup`, `summary: Installing dependencies for <packages>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} setup`
