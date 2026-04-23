@@ -406,8 +406,11 @@ DEPLOY_WORKFLOW_NAMES = frozenset(
 #: / ``gh pr merge`` / ``gh issue comment`` subprocess calls used by
 #: ``_advance_running_agents``. Short enough to avoid leaking a
 #: supervisor tick (120s default) if GitHub is slow, long enough that
-#: a normal call (<3s) always finishes.
-GH_POLL_SUBPROCESS_TIMEOUT_SECONDS = 15
+#: a normal call (<3s) always finishes. Bumped from 15s → 30s (#3053)
+#: after observing ``_gh_issue_is_open`` timing out at 15s during the
+#: dispatcher's background gh traffic spikes and silently falling
+#: back to escalate in ``_consume_action_block_on_existing_task``.
+GH_POLL_SUBPROCESS_TIMEOUT_SECONDS = 30
 
 #: Cap on how many ``failing_jobs`` entries we hand the fix-ci skill.
 #: Ten is already an unusually bad CI day and keeps the JSON payload
@@ -15400,7 +15403,32 @@ class DispatcherDaemon:
                 reasoning=reasoning,
             )
             return
-        if not self._gh_issue_is_open(blocker_issue_number):
+        is_open, is_open_detail = self._gh_issue_is_open_with_detail(
+            blocker_issue_number
+        )
+        if not is_open:
+            # Issue #3053 — emit a distinct WARNING so the silent
+            # fallback to escalate is visible in CloudWatch. Without
+            # this, a transient ``gh`` flake on the blocker probe is
+            # indistinguishable from the diagnoser choosing escalate
+            # and burns a ralph budget on every re-pick.
+            self._log.warning(
+                "block_on_existing_task validation failed for issue #%s "
+                "(blocker=#%s, attempts=%d, reason=%s) — falling back to escalate",
+                issue_number,
+                blocker_issue_number,
+                is_open_detail.get("attempts"),
+                is_open_detail.get("reason"),
+                extra={
+                    "event": "block_on_existing_task_validation_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "blocker_issue_number": blocker_issue_number,
+                    "attempts": is_open_detail.get("attempts"),
+                    "reason": is_open_detail.get("reason"),
+                    "stderr_tail": is_open_detail.get("stderr_tail"),
+                },
+            )
             fallback_reasoning = (
                 f"{reasoning}\n\n"
                 f"_Diagnoser proposed `block_on_existing_task` "
@@ -15884,6 +15912,119 @@ class DispatcherDaemon:
         validate the diagnoser-proposed blocker before wiring up the
         dependency. Any read failure (not-found, transient gh error)
         returns False — the caller will fall back to escalate.
+
+        Thin wrapper over :meth:`_gh_issue_is_open_with_detail` that
+        discards the attempt count / failure reason. Prefer the detail
+        variant in call sites that need to emit a fallback WARNING
+        with the probe's final outcome (see
+        ``_consume_action_block_on_existing_task``). See issue #3053
+        for the retry-logic rationale.
+        """
+        is_open, _detail = self._gh_issue_is_open_with_detail(issue_number)
+        return is_open
+
+    def _gh_issue_is_open_with_detail(
+        self, issue_number: int
+    ) -> tuple[bool, dict[str, Any]]:
+        """Return ``(is_open, detail)`` with retry + flake logging.
+
+        Issue #3053 — retry on transient ``gh`` failures
+        (``TimeoutExpired`` or non-zero exit) up to 3 attempts total
+        with 1s + 2s backoff. The fallback path in
+        :meth:`_consume_action_block_on_existing_task` is destructive
+        (the agent terminates as ``diagnoser_escalate`` and
+        ``agent/ready`` gets re-added, so the daemon re-picks the
+        issue on the next cooldown tick). A single flaky ``gh`` call
+        should not tip a correct-by-diagnoser decision into a wrong-
+        action no-op. Emits a WARNING per failed attempt so operators
+        can see the flake pattern, and a final WARNING if all three
+        attempts exhaust. A genuine not-found (``returncode != 0``
+        with stderr indicating the issue doesn't exist) still pays
+        the 3-attempt cost — we can't distinguish "issue doesn't
+        exist" from "API is flaky" at the ``gh`` level, but the
+        block-on-existing-task path runs at most once per diagnosis
+        and the extra ~3s is negligible against the alternative
+        (burning a full ralph budget on a wrong action).
+
+        ``detail`` is a dict with ``attempts`` (int, always 1..3),
+        ``reason`` (str or None — None on success, token like
+        ``"timeout"`` / ``"nonzero_exit"`` / ``"json_parse"`` /
+        ``"gh_missing"`` on failure), and ``stderr_tail`` (str, last
+        ~200 chars of the final attempt's stderr or empty).
+        """
+        backoffs_seconds: tuple[float, ...] = (1.0, 2.0)
+        max_attempts = 1 + len(backoffs_seconds)  # 3
+        last_outcome: dict[str, Any] = {}
+        for attempt in range(1, max_attempts + 1):
+            outcome = self._gh_issue_is_open_once(issue_number)
+            last_outcome = outcome
+            if outcome.get("ok"):
+                # Terminal success (state determined, OPEN or CLOSED).
+                return (
+                    bool(outcome.get("is_open")),
+                    {
+                        "attempts": attempt,
+                        "reason": None,
+                        "stderr_tail": "",
+                    },
+                )
+            # Transient failure — log and (if attempts remain) back off.
+            self._log.warning(
+                "gh issue is-open probe failed (attempt %d/%d) for issue #%s: %s",
+                attempt,
+                max_attempts,
+                issue_number,
+                outcome.get("reason"),
+                extra={
+                    "event": "gh_issue_is_open_flake",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
+                },
+            )
+            if attempt < max_attempts:
+                time.sleep(backoffs_seconds[attempt - 1])
+        # All attempts exhausted — emit a final WARNING and return False.
+        self._log.warning(
+            "gh issue is-open probe exhausted %d attempts for issue #%s — "
+            "returning False (will fall back to escalate)",
+            max_attempts,
+            issue_number,
+            extra={
+                "event": "gh_issue_is_open_exhausted",
+                "run_id": self._run_id,
+                "issue_number": issue_number,
+                "attempts": max_attempts,
+                "reason": last_outcome.get("reason"),
+                "stderr_tail": last_outcome.get("stderr_tail"),
+            },
+        )
+        return (
+            False,
+            {
+                "attempts": max_attempts,
+                "reason": last_outcome.get("reason"),
+                "stderr_tail": last_outcome.get("stderr_tail") or "",
+            },
+        )
+
+    def _gh_issue_is_open_once(self, issue_number: int) -> dict[str, Any]:
+        """Single ``gh issue view`` probe — return structured outcome.
+
+        Helper for :meth:`_gh_issue_is_open`'s retry loop. Never raises.
+        Return shape:
+
+        - ``{"ok": True, "is_open": bool}`` — ``gh`` returned cleanly;
+          ``is_open`` reflects the parsed state.
+        - ``{"ok": False, "reason": str, "stderr_tail": str}`` —
+          transient failure worth retrying (timeout, non-zero exit,
+          JSON parse error). ``reason`` is a short token
+          (``"timeout"`` / ``"nonzero_exit"`` / ``"json_parse"`` /
+          ``"gh_missing"``). ``stderr_tail`` is the last ~200 chars
+          of stderr when applicable, for operator-visible context.
         """
         try:
             result = subprocess.run(
@@ -15902,17 +16043,29 @@ class DispatcherDaemon:
                 timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
                 check=False,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
+        except FileNotFoundError:
+            return {"ok": False, "reason": "gh_missing", "stderr_tail": ""}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "reason": "timeout", "stderr_tail": ""}
         if result.returncode != 0:
-            return False
+            stderr_tail = (result.stderr or "")[-200:]
+            return {
+                "ok": False,
+                "reason": "nonzero_exit",
+                "stderr_tail": stderr_tail,
+            }
         try:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
-            return False
+            stdout_tail = (result.stdout or "")[-200:]
+            return {
+                "ok": False,
+                "reason": "json_parse",
+                "stderr_tail": stdout_tail,
+            }
         # gh reports state as "OPEN" / "CLOSED".
         state = str(payload.get("state") or "").upper()
-        return state == "OPEN"
+        return {"ok": True, "is_open": state == "OPEN"}
 
     def _run_diagnoser_pass(self) -> int:
         """Find tier-2/3 candidates, spawn diagnosers, consume recommendations.
