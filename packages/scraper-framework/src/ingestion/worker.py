@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 import psycopg
 import psycopg.errors
 
+from courts.ca.cc_dept_reassignments import apply_cc_dept_reassignment
 from courts.ca.la_dept_judges import (
     fetch_department_judge_mapping,
     lookup_judge_for_department,
@@ -1697,6 +1698,18 @@ class IngestionWorker:
         # writes (#2141).  Placed here so the dept-to-judge lookup below
         # sees the canonical department name.
         department = normalize_department(county, department)
+
+        # Apply Contra Costa department reassignment mapping (#2612).
+        # Runs after normalization so both sides of the comparison are in
+        # canonical form, and before the dept-to-judge roster lookup so
+        # that the lookup uses the post-reassignment department.
+        if state == "CA" and county == "Contra Costa":
+            department = apply_cc_dept_reassignment(
+                department,
+                hearing_date=hearing_dt,
+                case_number=case_number,
+                courthouse=event_data.get("courthouse"),
+            )
 
         # ------------------------------------------------------------------
         # Universal dept-to-judge fallback via court directory snapshots (#2269).
