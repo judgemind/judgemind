@@ -1557,57 +1557,83 @@ class TestAutoscaleConcurrency:
 
     def test_disabled_when_max_memory_zero(self) -> None:
         """max_worker_memory_mb=0 returns requested concurrency unchanged."""
-        assert (
-            rebuild_db._autoscale_concurrency(
-                requested=64, max_worker_memory_mb=0, available_memory_mb=8192
-            )
-            == 64
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=0, available_memory_mb=8192, source="cgroup_v2"
         )
+        assert decision.effective == 64
+        assert decision.reason == "autoscaling_disabled"
 
     def test_disabled_when_max_memory_negative(self) -> None:
         """Negative values also disable autoscaling."""
-        assert (
-            rebuild_db._autoscale_concurrency(
-                requested=64, max_worker_memory_mb=-1, available_memory_mb=8192
-            )
-            == 64
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=-1, available_memory_mb=8192, source="cgroup_v2"
         )
+        assert decision.effective == 64
+        assert decision.reason == "autoscaling_disabled"
 
     def test_caps_when_memory_tight(self) -> None:
         """With 8 GB RAM and 1 GB per worker, 64 requested → 8 effective."""
-        assert (
-            rebuild_db._autoscale_concurrency(
-                requested=64, max_worker_memory_mb=1024, available_memory_mb=8192
-            )
-            == 8
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=1024, available_memory_mb=8192, source="cgroup_v2"
         )
+        assert decision.effective == 8
+        assert decision.reason == "memory_budget"
 
     def test_returns_requested_when_memory_plentiful(self) -> None:
         """With more than enough RAM, requested concurrency wins."""
-        assert (
-            rebuild_db._autoscale_concurrency(
-                requested=4, max_worker_memory_mb=1024, available_memory_mb=32768
-            )
-            == 4
+        decision = rebuild_db._autoscale_concurrency(
+            requested=4, max_worker_memory_mb=1024, available_memory_mb=32768, source="cgroup_v2"
         )
+        assert decision.effective == 4
+        assert decision.reason == "memory_budget"
 
     def test_floor_of_one(self) -> None:
         """Even with tiny RAM, at least one worker must run (no-zero floor)."""
-        assert (
-            rebuild_db._autoscale_concurrency(
-                requested=64, max_worker_memory_mb=2048, available_memory_mb=512
-            )
-            == 1
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=2048, available_memory_mb=512, source="cgroup_v2"
         )
+        assert decision.effective == 1
+        assert decision.reason == "memory_budget"
 
     def test_falls_back_to_requested_when_memory_unknown(self) -> None:
-        """available_memory_mb=0 means we couldn't resolve — don't throttle."""
-        assert (
-            rebuild_db._autoscale_concurrency(
-                requested=32, max_worker_memory_mb=1024, available_memory_mb=0
-            )
-            == 32
+        """available_memory_mb=0 with cgroup_v2 source — memory_unknown path."""
+        decision = rebuild_db._autoscale_concurrency(
+            requested=32, max_worker_memory_mb=1024, available_memory_mb=0, source="cgroup_v2"
         )
+        assert decision.effective == 32
+        assert decision.reason == "memory_unknown"
+
+    def test_fargate_host_memory_fallback_clamps_to_4(self) -> None:
+        """source="psutil_host" with 64 GB host memory → fargate_fallback caps at 4."""
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=1024, available_memory_mb=65536, source="psutil_host"
+        )
+        assert decision.effective == 4
+        assert decision.reason == "fargate_fallback"
+
+    def test_unresolved_memory_falls_back_to_4(self) -> None:
+        """source="unresolved" always triggers fargate_fallback cap at min(requested, 4)."""
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=1024, available_memory_mb=0, source="unresolved"
+        )
+        assert decision.effective == 4
+        assert decision.reason == "fargate_fallback"
+
+    def test_cgroup_v2_small_task_clamps_normally(self) -> None:
+        """source="cgroup_v2", 4 GB available, 1 GB per worker, 64 requested → 4 effective."""
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64, max_worker_memory_mb=1024, available_memory_mb=4096, source="cgroup_v2"
+        )
+        assert decision.effective == 4
+        assert decision.reason == "memory_budget"
+
+    def test_cgroup_v2_large_task_respects_requested(self) -> None:
+        """source="cgroup_v2", 32 GB available, 1 GB per worker, 4 requested → 4 effective."""
+        decision = rebuild_db._autoscale_concurrency(
+            requested=4, max_worker_memory_mb=1024, available_memory_mb=32768, source="cgroup_v2"
+        )
+        assert decision.effective == 4
+        assert decision.reason == "memory_budget"
 
 
 class TestAvailableMemoryMb:
@@ -1620,9 +1646,150 @@ class TestAvailableMemoryMb:
     """
 
     def test_returns_non_negative_int(self) -> None:
-        value = rebuild_db._available_memory_mb()
+        value, source = rebuild_db._available_memory_mb()
         assert isinstance(value, int)
         assert value >= 0
+
+    def test_returns_source_label(self) -> None:
+        """_available_memory_mb() returns a (int, str) tuple with a known source label."""
+        result = rebuild_db._available_memory_mb()
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        value, source = result
+        assert isinstance(value, int)
+        assert value >= 0
+        assert source in {"cgroup_v2", "cgroup_v1", "psutil_host", "unresolved"}
+
+
+class TestAutoscaleLogging:
+    """Integration tests: autoscale decision logging in main().
+
+    Verify that main() always emits an INFO "Autoscale decision" log with the
+    four required fields, and that a WARNING fires when the Fargate fallback
+    path is triggered.
+    """
+
+    def _run_main_with_memory(
+        self,
+        tmp_path: Any,
+        memory_return_value: tuple,
+        concurrency: str = "64",
+        max_worker_memory_mb: str = "1024",
+    ) -> MagicMock:
+        """Run main() with a patched _available_memory_mb and return the mock logger."""
+        keys = ["ca/orange/superior_court/raw/abc123.html"]
+        cache_dir = str(tmp_path / "cache")
+        full = tmp_path / "cache" / keys[0]
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(b"<html>x</html>")
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": False,
+            "hash_mismatch": False,
+        }
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        def _pool_factory(*args: Any, **kwargs: Any) -> MagicMock:
+            return mock_pool
+
+        mock_logger = MagicMock()
+
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db.list_local_keys", return_value=keys),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch("rebuild_db._available_memory_mb", return_value=memory_return_value),
+            patch("concurrent.futures.ProcessPoolExecutor", side_effect=_pool_factory),
+            patch("concurrent.futures.as_completed", return_value=iter([mock_future])),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ),
+            patch(
+                "sys.argv",
+                [
+                    "rebuild_db.py",
+                    "--concurrency",
+                    concurrency,
+                    "--max-worker-memory-mb",
+                    max_worker_memory_mb,
+                ],
+            ),
+            patch.object(rebuild_db, "logger", mock_logger),
+        ):
+            rebuild_db.main()
+
+        return mock_logger
+
+    def test_info_log_carries_required_fields(self, tmp_path: Any) -> None:
+        """INFO "Autoscale decision" log must include the four required fields.
+
+        These fields are consumed by log-based alerting and the ops dashboard.
+        """
+        mock_logger = self._run_main_with_memory(
+            tmp_path, memory_return_value=(4096, "cgroup_v2"), concurrency="64"
+        )
+
+        info_calls = mock_logger.info.call_args_list
+        autoscale_calls = [
+            call for call in info_calls if call.args and call.args[0] == "Autoscale decision"
+        ]
+        assert len(autoscale_calls) == 1, (
+            f"Expected exactly 1 'Autoscale decision' INFO log; got {autoscale_calls!r}"
+        )
+        kwargs = autoscale_calls[0].kwargs
+        assert "cgroup_memory_limit_mb" in kwargs, f"Missing cgroup_memory_limit_mb in {kwargs!r}"
+        assert "max_worker_memory_mb" in kwargs, f"Missing max_worker_memory_mb in {kwargs!r}"
+        assert "requested_concurrency" in kwargs, f"Missing requested_concurrency in {kwargs!r}"
+        assert "effective_concurrency" in kwargs, f"Missing effective_concurrency in {kwargs!r}"
+
+    def test_fargate_fallback_emits_warning(self, tmp_path: Any) -> None:
+        """When cgroup detection fails (psutil_host + large value), a WARNING fires.
+
+        Simulates a Fargate task where cgroup memory.max is unreadable so
+        _available_memory_mb() falls back to psutil and returns the 64 GB host total.
+        """
+        # 65536 MiB = 64 GB host memory — well above the Fargate container limit.
+        mock_logger = self._run_main_with_memory(
+            tmp_path, memory_return_value=(65536, "psutil_host"), concurrency="64"
+        )
+
+        # WARNING must fire
+        warning_calls = mock_logger.warning.call_args_list
+        fallback_warnings = [
+            call
+            for call in warning_calls
+            if call.args and "cgroup limit unreadable" in call.args[0]
+        ]
+        assert len(fallback_warnings) >= 1, (
+            f"Expected Fargate-fallback WARNING; got warning calls: {warning_calls!r}"
+        )
+
+        # The INFO log must also carry the four required fields
+        info_calls = mock_logger.info.call_args_list
+        autoscale_calls = [
+            call for call in info_calls if call.args and call.args[0] == "Autoscale decision"
+        ]
+        assert len(autoscale_calls) == 1
+        kwargs = autoscale_calls[0].kwargs
+        assert "cgroup_memory_limit_mb" in kwargs
+        assert "max_worker_memory_mb" in kwargs
+        assert "requested_concurrency" in kwargs
+        assert "effective_concurrency" in kwargs
+        # Effective concurrency must be capped at 4
+        assert kwargs["effective_concurrency"] == 4
 
 
 class TestRetryCrashedKeysSerially:
@@ -2001,7 +2168,7 @@ class TestMaxWorkerMemoryCLI:
             patch("rebuild_db._fetch_rosters"),
             patch(
                 "rebuild_db._available_memory_mb",
-                return_value=2048,
+                return_value=(2048, "cgroup_v2"),
             ),
             patch(
                 "concurrent.futures.ProcessPoolExecutor",
@@ -2077,7 +2244,7 @@ class TestMaxWorkerMemoryCLI:
             patch("rebuild_db._fetch_rosters"),
             patch(
                 "rebuild_db._available_memory_mb",
-                return_value=16384,
+                return_value=(16384, "cgroup_v2"),
             ),
             patch(
                 "concurrent.futures.ProcessPoolExecutor",
@@ -2150,7 +2317,7 @@ class TestMaxWorkerMemoryCLI:
             patch("rebuild_db._fetch_rosters"),
             patch(
                 "rebuild_db._available_memory_mb",
-                return_value=4096,
+                return_value=(4096, "cgroup_v2"),
             ),
             patch(
                 "concurrent.futures.ProcessPoolExecutor",
