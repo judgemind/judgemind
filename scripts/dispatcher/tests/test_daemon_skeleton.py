@@ -27,14 +27,6 @@ _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-# Ensure a `psycopg` module exists in sys.modules before importing the
-# daemon. The daemon lazily imports psycopg inside connect(); tests that
-# patch `dispatcher.daemon.psycopg` via the real module path can still
-# inject a mock through sys.modules, which is the pattern used for
-# other scripts/ daemons (test_dev_db_query_runner.py et al.).
-if "psycopg" not in sys.modules:  # pragma: no cover — exercised in fresh venvs only
-    sys.modules["psycopg"] = MagicMock()
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 

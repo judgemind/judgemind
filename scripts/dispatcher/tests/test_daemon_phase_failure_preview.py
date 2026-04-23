@@ -35,19 +35,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-# Provide a stub ``psycopg`` module so the daemon imports cleanly in
-# the test environment — matches the pattern used by the other phase3*
-# test modules.
-class _UniqueViolation(Exception):
-    """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-
-_psycopg_stub = MagicMock()
-_psycopg_errors = MagicMock()
-_psycopg_errors.UniqueViolation = _UniqueViolation
-_psycopg_stub.errors = _psycopg_errors
-sys.modules.setdefault("psycopg", _psycopg_stub)
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 

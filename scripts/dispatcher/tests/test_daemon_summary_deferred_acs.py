@@ -24,19 +24,6 @@ _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-if "psycopg" not in sys.modules or not isinstance(
-    getattr(sys.modules["psycopg"].errors, "UniqueViolation", None), type
-):
-
-    class _UniqueViolation(Exception):
-        """Test sentinel."""
-
-    _psycopg_stub = MagicMock()
-    _psycopg_errors = MagicMock()
-    _psycopg_errors.UniqueViolation = _UniqueViolation
-    _psycopg_stub.errors = _psycopg_errors
-    sys.modules["psycopg"] = _psycopg_stub
-
 from dispatcher import daemon  # noqa: E402
 
 

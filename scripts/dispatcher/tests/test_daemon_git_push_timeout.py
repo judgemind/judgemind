@@ -28,15 +28,11 @@ from __future__ import annotations
 import ast
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-
-if "psycopg" not in sys.modules:  # pragma: no cover — fresh-venv only
-    sys.modules["psycopg"] = MagicMock()
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
@@ -79,7 +75,9 @@ def _list_literals_have_git_push(cmd_arg: ast.expr) -> bool:
     return bool(literals) and literals[0] == "git" and "push" in literals
 
 
-def _resolve_name_to_list(name: str, tree: ast.Module, call_line: int) -> ast.List | None:
+def _resolve_name_to_list(
+    name: str, tree: ast.Module, call_line: int
+) -> ast.List | None:
     """Find the nearest preceding ``<name> = [...]`` assignment before call_line."""
     best: ast.List | None = None
     best_line = -1

@@ -47,16 +47,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-class _UniqueViolation(Exception):
-    """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-
-_psycopg_stub = MagicMock()
-_psycopg_errors = MagicMock()
-_psycopg_errors.UniqueViolation = _UniqueViolation
-_psycopg_stub.errors = _psycopg_errors
-sys.modules.setdefault("psycopg", _psycopg_stub)
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 
@@ -424,7 +414,7 @@ class TestWatchdogLoopBehaviour:
         return None
 
     def test_warning_fires_when_elapsed_exceeds_warn_threshold(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
         """AC #2 — a mocked monotonic that simulates a 301s stall
         against a 300s threshold triggers exactly one WARNING."""
@@ -449,7 +439,7 @@ class TestWatchdogLoopBehaviour:
         )
 
         # Stub psycopg.connect so the watchdog's DB setup path is inert.
-        sys.modules["psycopg"].connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         clock.advance(301.0)
         t = self._run_loop_in_thread(d)
@@ -465,7 +455,7 @@ class TestWatchdogLoopBehaviour:
 
     @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
     def test_exit_fires_when_elapsed_exceeds_exit_threshold(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
         """AC #3 — a 3001s stall against a 3000s threshold triggers
         ``os._exit(137)`` with an ERROR log.
@@ -488,7 +478,7 @@ class TestWatchdogLoopBehaviour:
             "_cb_config_int",
             lambda self, key, default: default,
         )
-        sys.modules["psycopg"].connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         exit_calls: list[int] = []
 
@@ -514,7 +504,9 @@ class TestWatchdogLoopBehaviour:
             d._watchdog_stop.set()
             t.join(timeout=2.0)
 
-    def test_no_warning_below_threshold(self, tmp_path: Path, monkeypatch: Any) -> None:
+    def test_no_warning_below_threshold(
+        self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
+    ) -> None:
         """A healthy tick cadence produces no WARN / EXIT events."""
         d, conn, handler = _make_daemon(tmp_path)
         monkeypatch.setattr(daemon, "WATCHDOG_POLL_INTERVAL_SECONDS", 0)
@@ -527,7 +519,7 @@ class TestWatchdogLoopBehaviour:
             "_cb_config_int",
             lambda self, key, default: default,
         )
-        sys.modules["psycopg"].connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         # Only advance 30s — well below the 300s WARN threshold.
         clock.advance(30.0)
@@ -542,7 +534,7 @@ class TestWatchdogLoopBehaviour:
             t.join(timeout=2.0)
 
     def test_warning_debounces_while_stall_persists(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
         """AC #6 — a persistent stall fires WARNING exactly once, not
         once per poll cycle."""
@@ -557,7 +549,7 @@ class TestWatchdogLoopBehaviour:
             "_cb_config_int",
             lambda self, key, default: default,
         )
-        sys.modules["psycopg"].connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         # Advance into the WARN zone but not the EXIT zone.
         clock.advance(500.0)
@@ -574,7 +566,7 @@ class TestWatchdogLoopBehaviour:
             t.join(timeout=2.0)
 
     def test_warning_rearms_after_recovery(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
         """AC #6 — after the tick recovers (gap drops below WARN),
         a subsequent stall fires a fresh WARNING."""
@@ -589,7 +581,7 @@ class TestWatchdogLoopBehaviour:
             "_cb_config_int",
             lambda self, key, default: default,
         )
-        sys.modules["psycopg"].connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         # Step 1: stall → WARN.
         clock.advance(500.0)
@@ -622,7 +614,7 @@ class TestWatchdogLoopBehaviour:
             t.join(timeout=2.0)
 
     def test_watchdog_exits_cleanly_on_stop(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
         """AC #7 — setting ``_watchdog_stop`` terminates the loop."""
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -632,7 +624,7 @@ class TestWatchdogLoopBehaviour:
             "_cb_config_int",
             lambda self, key, default: default,
         )
-        sys.modules["psycopg"].connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         # A future-tick time so the loop sees no stall.
         d._last_scheduler_tick_at = time.monotonic() + 10_000.0

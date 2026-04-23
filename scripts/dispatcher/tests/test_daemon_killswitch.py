@@ -40,26 +40,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-# Provide a stub ``psycopg`` module before importing the daemon. Same
-# pattern as test_daemon_phase3a.py — the daemon's ``_atomic_claim``
-# catches ``psycopg.errors.UniqueViolation`` so that must be a real
-# Exception subclass. We also need ``psycopg.connect`` to return a
-# controllable mock so the worker thread entry can be exercised without
-# opening a real DB connection.
-
-
-class _UniqueViolation(Exception):
-    """Stand-in for real psycopg.errors.UniqueViolation."""
-
-
-_psycopg_stub = MagicMock()
-_psycopg_errors = MagicMock()
-_psycopg_errors.UniqueViolation = _UniqueViolation
-_psycopg_stub.errors = _psycopg_errors
-sys.modules["psycopg"] = _psycopg_stub
-
-import psycopg  # noqa: E402,F401  — re-import after stub install
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 
@@ -342,25 +322,20 @@ class TestSchedulerCadenceDecoupling:
 class TestOrchestrationWorkerThread:
     """``_orchestration_worker_entry`` wraps the claim with proper plumbing.
 
-    Note on the psycopg stub: other test files in this directory
-    (e.g. test_daemon_phase3a.py) install their own psycopg MagicMock
-    into ``sys.modules["psycopg"]`` at module import time. Because the
-    daemon imports psycopg lazily inside each path, the stub that is
-    actually called is whichever one is currently in
-    ``sys.modules["psycopg"]`` — not necessarily the one this file
-    installed. These tests therefore read ``sys.modules["psycopg"]``
-    at runtime and install a fresh controllable stub for each test.
+    The psycopg stub is installed by conftest.py before any test module
+    is imported and is available via the ``psycopg_stub`` fixture.
     """
 
-    def test_worker_opens_and_closes_its_own_conn(self, tmp_path: Path) -> None:
+    def test_worker_opens_and_closes_its_own_conn(
+        self, tmp_path: Path, psycopg_stub: Any
+    ) -> None:
         """The worker thread must not share ``self._conn`` with the main thread."""
         d, _conn, _handler = _make_daemon(tmp_path)
 
         thread_conn = MagicMock()
         thread_conn.close = MagicMock()
-        live_stub = sys.modules["psycopg"]
-        live_stub.connect.reset_mock()  # type: ignore[union-attr]
-        live_stub.connect.return_value = thread_conn  # type: ignore[union-attr]
+        psycopg_stub.connect.reset_mock()
+        psycopg_stub.connect.return_value = thread_conn
 
         observed_thread_conn: list[Any] = []
 
@@ -375,7 +350,7 @@ class TestOrchestrationWorkerThread:
         d._orchestration_worker_entry()
 
         # The worker opened + closed its own connection exactly once.
-        assert live_stub.connect.call_count == 1  # type: ignore[union-attr]
+        assert psycopg_stub.connect.call_count == 1
         thread_conn.close.assert_called_once()
         # The worker saw its own conn inside ``_claim_and_orchestrate_one``.
         assert len(observed_thread_conn) == 1
@@ -384,14 +359,15 @@ class TestOrchestrationWorkerThread:
         # again — no leak across the thread-local.
         assert d._conn is not thread_conn
 
-    def test_worker_exception_is_logged_and_does_not_leak(self, tmp_path: Path) -> None:
+    def test_worker_exception_is_logged_and_does_not_leak(
+        self, tmp_path: Path, psycopg_stub: Any
+    ) -> None:
         d, _conn, handler = _make_daemon(tmp_path)
 
         thread_conn = MagicMock()
         thread_conn.close = MagicMock()
-        live_stub = sys.modules["psycopg"]
-        live_stub.connect.reset_mock()  # type: ignore[union-attr]
-        live_stub.connect.return_value = thread_conn  # type: ignore[union-attr]
+        psycopg_stub.connect.reset_mock()
+        psycopg_stub.connect.return_value = thread_conn
 
         d._claim_and_orchestrate_one = MagicMock(  # type: ignore[method-assign]
             side_effect=RuntimeError("boom in claim")
