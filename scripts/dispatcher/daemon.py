@@ -348,6 +348,38 @@ PHASE_MODELS = {
     "retro": "haiku",
 }
 
+#: Phases that run *after* the PR has merged and the per-agent worktree
+#: may have been wiped from ephemeral storage. These phases must be
+#: spawned with ``cwd=baseline_repo_root`` (the stable clone re-populated
+#: at daemon boot by :meth:`DispatcherDaemon.ensure_baseline_clone`) so
+#: ``claude -p /task-v2-<phase>`` can resolve the matching
+#: ``.claude/skills/task-v2-<phase>/`` tree even when the worktree is
+#: empty.
+#:
+#: **Why this matters.** Fargate ``force-new-deployment`` (the daemon's
+#: restart mechanism) wipes the container's ephemeral storage under
+#: ``/var/lib/dispatcher/worktrees/``. Any phase that runs after that
+#: wipe — typically verify and retro, which sit past the ``merge`` step
+#: where the worktree has no further role — would otherwise inherit
+#: ``cwd=<wiped-worktree>`` and fail with ``Unknown command: /task-v2-<phase>``
+#: within ~50ms. Pre-merge phases (``plan``, ``ralph``, ``summary``,
+#: ``fix-ci``) keep ``cwd=worktree`` because (a) the worktree is
+#: guaranteed live while the agent is pre-merge, and (b) they run git
+#: operations that depend on the worktree's working tree.
+#:
+#: **Grep-able trail.** Each instance of this class of bug was first
+#: fixed per-phase, then generalized here:
+#:
+#: - #3034 — diagnoser subprocess cwd (``_spawn_diagnoser_subprocess``)
+#:   was the first instance; fixed by setting ``cwd=baseline_repo_root``
+#:   unconditionally.
+#: - #3060 (and #3055) — verify phase was the second; fixed by a
+#:   one-phase-name branch ``if phase == "verify"``.
+#: - #3065 — this generalization: every post-merge phase lives in this
+#:   set, so future additions (e.g. a post-retro bookkeeping phase)
+#:   inherit the correct cwd policy automatically.
+POST_MERGE_PHASES_USING_BASELINE_CWD: frozenset[str] = frozenset({"verify", "retro"})
+
 
 def _ralph_model_for_attempt(attempt_n: int) -> str:
     """Return the ``--model`` value for a ralph attempt (#2955).
@@ -6990,33 +7022,42 @@ class DispatcherDaemon:
         ``cwd=`` is the correct knob for "start the child process in
         this directory".
 
-        **Cwd for verify must be the baseline clone (#3055).** Verify is
-        a post-merge phase that runs on the recovery path after a
-        force-new-deployment (the prior daemon died mid-verify; the new
-        daemon picks up an ``awaiting_deploy/succeeded`` agent whose
-        worktree was wiped along with the prior container's ephemeral
-        storage). In that state, the per-agent worktree directory does
-        not exist on disk, and the ``.claude/skills/task-v2-verify/``
-        tree — which ``claude -p /task-v2-verify`` resolves relative to
-        ``cwd`` — is therefore not discoverable. The ``_write_phase_input``
-        call above happens to ``mkdir(parents=True)`` the worktree path
-        so ``Popen`` itself does not raise ``FileNotFoundError``, but the
-        re-created directory is empty of ``.claude/skills/`` so the
-        ``claude`` CLI exits ~50ms with ``result="Unknown command:
-        /task-v2-verify"``. The fix, paralleling #3034 for the diagnoser,
-        is to set ``cwd=baseline_repo_root`` on the verify spawn: the
-        baseline clone is re-populated at daemon boot by
-        :meth:`ensure_baseline_clone` and contains the full
-        ``.claude/skills/`` tree. The verify skill reads its own
-        ``worktree_path`` from the input JSON so it does not need to
-        start inside the worktree itself.
+        **Pre-merge vs post-merge cwd policy.** The subprocess ``cwd``
+        selection depends on whether the phase runs before or after the
+        PR has merged:
 
-        The other phases (plan, ralph, summary, fix-ci, retro) keep
-        ``cwd=str(worktree)`` because they run inside an active worktree
-        that is guaranteed to exist (they only execute while the agent
-        is pre-merge, so the worktree has not been wiped by a restart)
-        and they need the worktree's working tree available for git
-        operations (``git status``, ``git add``, ``git commit``).
+        - **Pre-merge phases** (``plan``, ``ralph``, ``summary``,
+          ``fix-ci``) use ``cwd=str(worktree)`` because they run inside
+          an active worktree that is guaranteed to exist (agent is still
+          pre-merge, so the worktree has not been wiped by a restart)
+          and they need the worktree's working tree available for git
+          operations (``git status``, ``git add``, ``git commit``).
+        - **Post-merge phases** (the members of
+          :data:`POST_MERGE_PHASES_USING_BASELINE_CWD`: currently
+          ``verify`` and ``retro``) use ``cwd=baseline_repo_root`` when
+          Fargate mode is active, because the per-agent worktree may
+          have been wiped by a ``force-new-deployment`` between merge
+          and the phase's first spawn. In that state the re-created
+          worktree directory (``_write_phase_input`` ``mkdir`` s it) is
+          empty of ``.claude/skills/``, so ``claude -p /task-v2-<phase>``
+          would exit ~50ms with ``result="Unknown command:
+          /task-v2-<phase>"``. The baseline clone is re-populated at
+          daemon boot by :meth:`ensure_baseline_clone` and contains the
+          full ``.claude/skills/`` tree. Post-merge skills read
+          ``worktree_path`` from their input JSON so they don't need to
+          start inside the worktree itself.
+
+        This policy was generalized in #3065. Prior incarnations fixed
+        the same class of bug per-phase:
+
+        - #3034 — diagnoser subprocess cwd (``_spawn_diagnoser_subprocess``).
+        - #3060 (and #3055) — verify phase cwd (``if phase == "verify"``
+          branch, now absorbed into the frozenset lookup below).
+
+        Adding a future post-merge phase (e.g. a bookkeeping ``close``
+        phase) requires only adding its name to
+        :data:`POST_MERGE_PHASES_USING_BASELINE_CWD`; the spawn code
+        below inherits the correct cwd automatically.
         """
         max_turns = PHASE_MAX_TURNS[phase]
         model = self._model_for_phase(phase, agent_id)
@@ -7026,14 +7067,20 @@ class DispatcherDaemon:
         jsonl_path = worktree / ".dispatcher" / f"{phase}-{agent_id}.jsonl"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # #3055 — verify phase must resolve the ``task-v2-verify`` skill
-        # from the baseline clone when running on the recovery path
-        # (post-restart, worktree wiped). Fall back to the worktree only
-        # when ``baseline_repo_root`` is unset (local-dev / unit-test
-        # mode), mirroring :meth:`_spawn_diagnoser_subprocess`. See the
-        # docstring rationale above.
+        # #3065 — post-merge phases must resolve their ``task-v2-<phase>``
+        # skill from the baseline clone when running on the recovery
+        # path (post-restart, worktree wiped). Generalizes the
+        # phase-specific fix from #3055 (verify) by looking up the
+        # phase name in :data:`POST_MERGE_PHASES_USING_BASELINE_CWD`.
+        # Falls back to the worktree only when ``baseline_repo_root``
+        # is unset (local-dev / unit-test mode), mirroring
+        # :meth:`_spawn_diagnoser_subprocess`. See the docstring
+        # rationale above for the pre- vs post-merge split.
         popen_cwd: Path = worktree
-        if phase == "verify" and self._cfg.baseline_repo_root is not None:
+        if (
+            phase in POST_MERGE_PHASES_USING_BASELINE_CWD
+            and self._cfg.baseline_repo_root is not None
+        ):
             popen_cwd = self._cfg.baseline_repo_root
 
         cmd = [
