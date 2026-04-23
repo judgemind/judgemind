@@ -83,6 +83,33 @@ describe('OutcomePill', () => {
     expect(pill.textContent).toBe('\u2713');
   });
 
+  it('renders green check for no-op terminal (no mergedAt)', () => {
+    // #3041: `phase='no_op'` is a dispatcher daemon-side terminal phase
+    // (introduced in #3040, part of #3039) written when ralph's §2.5d
+    // no-op guardrail fires — working tree clean on SHIP. These rows
+    // have `status='succeeded'`, `mergedAt=null`, `verifiedAt=null`,
+    // `verifySkipReason=null`, and `retroedAt=null` — `OutcomePill`
+    // does not (yet) accept `phase` as a prop, so the row currently
+    // renders through the null-`mergedAt` fallback branch that maps
+    // `status='succeeded'` → green ✓. This test pins that rendering so
+    // a future cockpit refactor (e.g. adding a `no mergedAt + no
+    // pr_number → amber ⚠` branch) can't silently regress the no-op
+    // case.
+    render(
+      <OutcomePill
+        status="succeeded"
+        mergedAt={null}
+        verifiedAt={null}
+        verifySkipReason={null}
+        retroedAt={null}
+      />,
+    );
+    const pill = screen.getByTestId('outcome-pill-succeeded');
+    expect(pill.textContent).toBe('\u2713');
+    expect(pill.className).toContain('bg-green');
+    expect(pill.getAttribute('aria-label')).toBe('succeeded');
+  });
+
   it('renders failed with an X glyph', () => {
     render(<OutcomePill status="failed" />);
     const pill = screen.getByTestId('outcome-pill-failed');
