@@ -2954,31 +2954,35 @@ class DispatcherDaemon:
             "--limit",
             str(QUEUE_SCAN_PAGE_LIMIT),
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"gh CLI not on PATH: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"gh issue list timed out after "
-                f"{QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS}s"
-            ) from exc
-
-        if result.returncode != 0:
+        # Issue #3089: hot-path queue scan — route through the shared
+        # 3-attempt 1s+2s retry helper so a single transient ``gh``
+        # flake doesn't convert an otherwise-healthy tick into a -1
+        # queue-depth snapshot.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="queue_scan",
+            timeout=QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            stderr_tail = outcome.get("stderr_tail") or ""
+            if reason == "gh_missing":
+                raise RuntimeError(f"gh CLI not on PATH: {stderr_tail}")
+            if reason == "timeout":
+                raise RuntimeError(
+                    f"gh issue list timed out after "
+                    f"{QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS}s"
+                )
             # Never include stderr verbatim in the daemon's structured log
             # at info level — it may echo the PAT on auth errors. A short
             # prefix is safe and sufficient for triage.
-            stderr_preview = (result.stderr or "").strip().splitlines()[:1]
+            stderr_preview = stderr_tail.strip().splitlines()[:1]
+            exit_code = outcome.get("exit_code")
             raise RuntimeError(
-                f"gh issue list exit={result.returncode}: "
+                f"gh issue list exit={exit_code}: "
                 f"{stderr_preview[0] if stderr_preview else '<no stderr>'}"
             )
+        result = outcome["result"]
 
         try:
             issues = json.loads(result.stdout or "[]")
@@ -3131,28 +3135,31 @@ class DispatcherDaemon:
             "--limit",
             str(BLOCKED_SCAN_PAGE_LIMIT),
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"gh CLI not on PATH: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
+        # Issue #3089: hot-path blocked scan — route through the shared
+        # 3-attempt 1s+2s retry helper so a single transient ``gh``
+        # flake doesn't produce a -1 blocked-depth snapshot.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="blocked_scan",
+            timeout=QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            stderr_tail = outcome.get("stderr_tail") or ""
+            if reason == "gh_missing":
+                raise RuntimeError(f"gh CLI not on PATH: {stderr_tail}")
+            if reason == "timeout":
+                raise RuntimeError(
+                    f"gh issue list (blocked) timed out after "
+                    f"{QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS}s"
+                )
+            stderr_preview = stderr_tail.strip().splitlines()[:1]
+            exit_code = outcome.get("exit_code")
             raise RuntimeError(
-                f"gh issue list (blocked) timed out after "
-                f"{QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS}s"
-            ) from exc
-
-        if result.returncode != 0:
-            stderr_preview = (result.stderr or "").strip().splitlines()[:1]
-            raise RuntimeError(
-                f"gh issue list (blocked) exit={result.returncode}: "
+                f"gh issue list (blocked) exit={exit_code}: "
                 f"{stderr_preview[0] if stderr_preview else '<no stderr>'}"
             )
+        result = outcome["result"]
 
         try:
             issues = json.loads(result.stdout or "[]")
@@ -3978,6 +3985,9 @@ class DispatcherDaemon:
         startup error.
         """
         cmd = ["gh", "auth", "setup-git"]
+        # cold-path (#3089): boot-time one-shot; a failure is logged and
+        # startup continues. The ECS task restart loop re-runs this on
+        # the next boot if credentials genuinely are broken.
         try:
             result = subprocess.run(
                 cmd,
@@ -4054,6 +4064,9 @@ class DispatcherDaemon:
         ]
         attempted = 0
         for name, colour, description in required:
+            # cold-path (#3089): boot-time one-shot; failures are logged
+            # and startup continues. The diagnoser path still works
+            # without the GitHub-visible label hint.
             try:
                 subprocess.run(
                     [
@@ -4321,6 +4334,10 @@ class DispatcherDaemon:
             BASELINE_CLONE_URL,
             str(baseline),
         ]
+        # cold-path (#3089): boot-time one-shot clone. A fatal error
+        # here is the right terminal signal — ECS restarts the task,
+        # re-clones from a clean slate. Mechanical retry inside the
+        # same task adds no value (pre-#3089 status quo).
         try:
             result = subprocess.run(
                 cmd,
@@ -4349,6 +4366,181 @@ class DispatcherDaemon:
                 "action": "clone",
             },
         )
+
+    # ------------------------------------------------------------------
+    # Shared subprocess retry helper (#3089).
+    #
+    # Every network-bound ``git`` or ``gh`` call in the hot path should
+    # route through ``_subprocess_with_retry`` — 3 attempts with 1s +
+    # 2s backoff, ``<event_name>_flake`` WARNING per failed attempt,
+    # ``<event_name>_exhausted`` WARNING on full exhaustion. Mirrors the
+    # shape established by :meth:`_baseline_fetch_origin_main` (#3085)
+    # and :meth:`_gh_issue_is_open_with_detail` (#3053) and folds their
+    # boilerplate into a single helper.
+    #
+    # The helper is transient-failure agnostic: ``TimeoutExpired``,
+    # ``FileNotFoundError`` (CLI missing), and non-zero exit codes all
+    # count as retryable. JSON parse failures are the caller's
+    # responsibility (same split as the pre-#3089 helpers) — a zero-exit
+    # ``subprocess.run`` whose stdout is malformed JSON should not
+    # trigger an extra network round-trip.
+    #
+    # Cold-path sites (local filesystem ops, boot-time one-shots,
+    # already-tier-routed failures) do NOT use this helper — they
+    # carry a ``# cold-path (#3089): ...`` comment explaining why a
+    # single-failure outcome is acceptable. The
+    # ``scripts/check-git-gh-retries.sh`` hygiene check enforces the
+    # routing.
+    # ------------------------------------------------------------------
+
+    def _subprocess_with_retry(
+        self,
+        cmd: list[str],
+        *,
+        event_name: str,
+        timeout: float,
+        extra_log_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run ``cmd`` with 3-attempt 1s+2s backoff retry. Never raises.
+
+        Issue #3089. Generalises the retry envelopes from #3053
+        (``_gh_issue_is_open_with_detail``) and #3085
+        (``_baseline_fetch_origin_main``) into a single shared helper
+        so every network-bound ``git`` / ``gh`` call in the daemon hot
+        path can opt in with one line. The retry budget (3 attempts,
+        1s + 2s backoff) and the flake/exhausted logging convention
+        are deliberately identical to #3053 / #3085 so operators see
+        one consistent event shape in CloudWatch.
+
+        Return shape (never raises):
+
+        * ``{"ok": True, "result": CompletedProcess, "attempts": int}``
+          — subprocess exited 0 on attempt ``attempts``. Caller
+          inspects ``result.stdout`` / ``result.returncode`` normally.
+        * ``{"ok": False, "reason": str, "stderr_tail": str,
+              "exit_code": int|None, "attempts": int}`` — all 3
+          attempts failed with the same or mixed transient reasons.
+          ``reason`` is one of ``"timeout"`` / ``"nonzero_exit"`` /
+          ``"gh_missing"``; ``exit_code`` is populated when the final
+          attempt was a non-zero exit. Callers emit their site-
+          specific fallback (return None, raise, route via
+          ``_handle_agent_failure``, etc.).
+
+        Log events:
+
+        * Happy-path first-attempt success: silent — preserves the
+          pre-retry log cadence so the common case doesn't flood
+          CloudWatch.
+        * Each failed attempt: WARNING with ``event=<name>_flake``,
+          carrying ``attempt`` / ``max_attempts`` / ``reason`` /
+          ``stderr_tail`` plus any ``extra_log_fields`` the caller
+          passes (e.g. ``issue_number``, ``pr_number``).
+        * Full exhaustion: WARNING with ``event=<name>_exhausted``,
+          carrying ``attempts`` / ``reason`` / ``stderr_tail`` plus
+          the same ``extra_log_fields``.
+
+        ``cmd`` must be a list (``subprocess.run`` with ``shell=False``
+        by default). ``timeout`` is passed verbatim to each
+        ``subprocess.run`` attempt — NOT the total budget, since the
+        retry loop adds at most 3s of sleep between attempts. Callers
+        that care about wall-clock can halve their per-attempt
+        ``timeout`` to keep the worst-case in line with the pre-retry
+        budget, but most callers will be fine with the full per-attempt
+        budget since transient GitHub flakes return quickly.
+
+        This helper is hot-path only. Cold-path local-only git
+        operations (``git rev-parse``, ``git format-patch``, ``git am``,
+        ``git worktree add``) and boot-time one-shots (``git clone``,
+        ``gh auth setup-git``, ``ensure_required_labels``) carry a
+        ``# cold-path (#3089): <reason>`` comment at the call site
+        rather than routing through here — a retry on a local-only
+        failure just burns 3s to re-hit the same deterministic error.
+        See ``scripts/check-git-gh-retries.sh`` for the hygiene check.
+        """
+        backoffs_seconds: tuple[float, ...] = (1.0, 2.0)
+        max_attempts = 1 + len(backoffs_seconds)  # 3
+        last_reason: str | None = None
+        last_stderr_tail = ""
+        last_stderr_full = ""
+        last_exit_code: int | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                last_reason = "gh_missing"
+                last_stderr_tail = str(exc)
+                last_stderr_full = str(exc)
+                last_exit_code = None
+            except subprocess.TimeoutExpired:
+                last_reason = "timeout"
+                last_stderr_tail = ""
+                last_stderr_full = ""
+                last_exit_code = None
+            else:
+                if result.returncode == 0:
+                    return {
+                        "ok": True,
+                        "result": result,
+                        "attempts": attempt,
+                    }
+                last_reason = "nonzero_exit"
+                last_stderr_tail = _stderr_tail(result.stderr)
+                last_stderr_full = result.stderr or ""
+                last_exit_code = result.returncode
+            # Transient failure — emit flake WARNING and (if attempts
+            # remain) back off.
+            flake_extra: dict[str, Any] = {
+                "event": f"{event_name}_flake",
+                "run_id": self._run_id,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "reason": last_reason,
+                "stderr_tail": last_stderr_tail,
+            }
+            if extra_log_fields:
+                flake_extra.update(extra_log_fields)
+            self._log.warning(
+                "daemon.%s_flake (attempt %d/%d): %s",
+                event_name,
+                attempt,
+                max_attempts,
+                last_reason,
+                extra=flake_extra,
+            )
+            if attempt < max_attempts:
+                time.sleep(backoffs_seconds[attempt - 1])
+        # All attempts exhausted — emit final WARNING and return
+        # structured outcome so callers can take their site-specific
+        # fallback.
+        exhausted_extra: dict[str, Any] = {
+            "event": f"{event_name}_exhausted",
+            "run_id": self._run_id,
+            "attempts": max_attempts,
+            "reason": last_reason,
+            "stderr_tail": last_stderr_tail,
+        }
+        if extra_log_fields:
+            exhausted_extra.update(extra_log_fields)
+        self._log.warning(
+            "daemon.%s_exhausted %d attempts — surfacing outcome",
+            event_name,
+            max_attempts,
+            extra=exhausted_extra,
+        )
+        return {
+            "ok": False,
+            "reason": last_reason,
+            "stderr_tail": last_stderr_tail,
+            "stderr_full": last_stderr_full,
+            "exit_code": last_exit_code,
+            "attempts": max_attempts,
+        }
 
     def _baseline_fetch_origin_main(self) -> None:
         """Run ``git -C <baseline> fetch origin main``. Raise on failure.
@@ -4457,6 +4649,9 @@ class DispatcherDaemon:
           ``exit=<code>`` shape.
         """
         cmd = ["git", "-C", str(baseline), "fetch", "origin", "main"]
+        # cold-path (#3089): the ``_once`` probe itself is wrapped in a
+        # 3-attempt 1s+2s retry loop by the parent
+        # ``_baseline_fetch_origin_main`` (#3085).
         try:
             result = subprocess.run(
                 cmd,
@@ -4512,6 +4707,9 @@ class DispatcherDaemon:
             "rev-parse",
             "--is-shallow-repository",
         ]
+        # cold-path (#3089): local rev-parse probe, best-effort at
+        # boot. The subsequent ``_baseline_fetch_origin_main`` retry
+        # still runs and will surface any actual connectivity problem.
         try:
             probe = subprocess.run(
                 is_shallow_cmd,
@@ -4559,6 +4757,9 @@ class DispatcherDaemon:
             "origin",
             "main",
         ]
+        # cold-path (#3089): boot-time one-shot upgrade of a legacy
+        # shallow clone. A failure is logged and the daemon continues;
+        # the next boot re-probes and retries.
         try:
             result = subprocess.run(
                 unshallow_cmd,
@@ -4641,6 +4842,8 @@ class DispatcherDaemon:
         # branch -D`` returns 1 when the branch doesn't exist, which is
         # the happy case on first attempt. The 10s timeout guards
         # against a wedged git process without blocking normal flow.
+        # cold-path (#3089): local fs operation, no network; exit code
+        # is intentionally ignored.
         subprocess.run(
             [
                 "git",
@@ -4667,6 +4870,10 @@ class DispatcherDaemon:
             branch,
             "origin/main",
         ]
+        # cold-path (#3089): local fs operation (``git worktree add``
+        # consults the already-fetched baseline clone — no network).
+        # Failures are deterministic (disk full, permission bit,
+        # conflicting worktree dir); retry adds cost without value.
         try:
             result = subprocess.run(
                 cmd,
@@ -4793,6 +5000,10 @@ class DispatcherDaemon:
         for target in (target_hook, target_helper):
             # Repo-relative path for the update-index call.
             rel = target.relative_to(worktree_path)
+            # cold-path (#3089): local fs ``git update-index``,
+            # best-effort. Failure means the ``git status`` / pre-push /
+            # PR diff carries the hook swap as a noise change; the hook
+            # file itself is still swapped.
             try:
                 subprocess.run(
                     [
@@ -4854,24 +5065,25 @@ class DispatcherDaemon:
             "--json",
             "number,title,body,labels,comments,updatedAt",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"gh CLI not on PATH: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("gh issue view timed out after 30s") from exc
-
-        if result.returncode != 0:
-            stderr_preview = _stderr_tail(result.stderr)
-            raise RuntimeError(
-                f"gh issue view exit={result.returncode}: {stderr_preview}"
-            )
+        # Issue #3089: hot-path issue-bundle fetch for plan phase —
+        # retry transient ``gh`` flakes so a single timeout doesn't
+        # tank the agent's whole plan pipeline.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="issue_bundle_fetch",
+            timeout=30,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            stderr_tail = outcome.get("stderr_tail") or ""
+            if reason == "gh_missing":
+                raise RuntimeError(f"gh CLI not on PATH: {stderr_tail}")
+            if reason == "timeout":
+                raise RuntimeError("gh issue view timed out after 30s")
+            exit_code = outcome.get("exit_code")
+            raise RuntimeError(f"gh issue view exit={exit_code}: {stderr_tail}")
+        result = outcome["result"]
 
         try:
             payload = json.loads(result.stdout or "{}")
@@ -5180,6 +5392,7 @@ class DispatcherDaemon:
         # Capture the patch via git format-patch -1 HEAD --stdout.
         # A 60s timeout is generous — format-patch is local-only and
         # typically finishes in <1s even on large worktrees.
+        # cold-path (#3089): local fs operation, no network.
         try:
             patch_result = subprocess.run(
                 [
@@ -5228,6 +5441,7 @@ class DispatcherDaemon:
         patch_content = patch_result.stdout
 
         # Best-effort HEAD SHA — informational only, NULL on failure.
+        # cold-path (#3089): local rev-parse, no network.
         commit_sha: str | None = None
         try:
             sha_result = subprocess.run(
@@ -5497,6 +5711,9 @@ class DispatcherDaemon:
         # Try ``git am --3way <patchfile>``. --3way gives a better
         # chance of success when base has moved; without it, any drift
         # produces an apply failure even for non-overlapping hunks.
+        # cold-path (#3089): local fs operation; failures are real
+        # merge conflicts (not transient), so retrying the same patch
+        # won't change the outcome.
         try:
             am_result = subprocess.run(
                 [
@@ -5620,6 +5837,7 @@ class DispatcherDaemon:
         (e.g. if there's no in-progress am), and we've already logged
         the underlying apply failure.
         """
+        # cold-path (#3089): local fs am --abort; best-effort teardown.
         try:
             subprocess.run(
                 ["git", "-C", str(worktree), "am", "--abort"],
@@ -5645,6 +5863,7 @@ class DispatcherDaemon:
         block (it tells ralph how much work it's inheriting); a wrong
         count does not affect correctness.
         """
+        # cold-path (#3089): local fs ``git diff``.
         try:
             result = subprocess.run(
                 [
@@ -5917,6 +6136,8 @@ class DispatcherDaemon:
         SHA sequence without faking ``subprocess.run`` for every call
         in :meth:`_ralph_head_watcher_loop`.
         """
+        # cold-path (#3089): local rev-parse, no network; a missed read
+        # is handled by the caller polling again on the next tick.
         try:
             result = subprocess.run(
                 ["git", "-C", str(worktree), "rev-parse", "HEAD"],
@@ -6012,6 +6233,7 @@ class DispatcherDaemon:
         # additional commit beyond the placeholder. Ralph amends
         # in-place per #2971 so there's typically one commit, but the
         # range form is safe regardless.
+        # cold-path (#3089): local fs format-patch, no network.
         try:
             patch_result = subprocess.run(
                 [
@@ -6059,6 +6281,7 @@ class DispatcherDaemon:
         patch_content = patch_result.stdout
 
         # Best-effort HEAD SHA — same pattern as _capture_and_persist_ralph_patch.
+        # cold-path (#3089): local rev-parse, no network.
         commit_sha: str | None = None
         try:
             sha_result = subprocess.run(
@@ -6600,6 +6823,7 @@ class DispatcherDaemon:
             "--count",
             "origin/main..HEAD",
         ]
+        # cold-path (#3089): local rev-list, no network.
         try:
             result = subprocess.run(
                 cmd,
@@ -6638,6 +6862,7 @@ class DispatcherDaemon:
             "--pretty=format:",
             "HEAD",
         ]
+        # cold-path (#3089): local git show, no network.
         try:
             result = subprocess.run(
                 cmd,
@@ -8062,38 +8287,28 @@ class DispatcherDaemon:
             "--json",
             "comments",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        # Issue #3089: hot-path sentinel check in the plan-blocked
+        # handler — route through the shared retry helper so a single
+        # transient flake does not double-post the plan-blocked comment.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="plan_blocked_sentinel_check",
+            timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.plan_blocked_sentinel_check_failed",
                 extra={
                     "event": "plan_blocked_sentinel_check_failed",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "error": str(exc),
+                    "error": outcome.get("reason"),
+                    "stderr_preview": outcome.get("stderr_tail"),
                 },
             )
             return None
-
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.plan_blocked_sentinel_check_failed",
-                extra={
-                    "event": "plan_blocked_sentinel_check_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_preview": _stderr_tail(result.stderr),
-                },
-            )
-            return None
+        result = outcome["result"]
 
         try:
             payload = json.loads(result.stdout or "{}")
@@ -8216,28 +8431,16 @@ class DispatcherDaemon:
             "--body-file",
             str(body_path),
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.exception(
-                "daemon.plan_blocked_comment_failed",
-                extra={
-                    "event": "plan_blocked_comment_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "error": str(exc),
-                },
-            )
-            return False
-
-        if result.returncode != 0:
+        # Issue #3089: hot-path plan-blocked comment post — retry
+        # transient flakes so operators see the block reason even
+        # through a GitHub hiccup.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="plan_blocked_comment_post",
+            timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"agent_id": agent_id, "issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.plan_blocked_comment_failed",
                 extra={
@@ -8245,8 +8448,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_preview": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "error": outcome.get("reason"),
+                    "stderr_preview": outcome.get("stderr_tail"),
                 },
             )
             return False
@@ -8283,28 +8487,16 @@ class DispatcherDaemon:
             "--add-label",
             "status/triage",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.exception(
-                "daemon.plan_blocked_labels_failed",
-                extra={
-                    "event": "plan_blocked_labels_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "error": str(exc),
-                },
-            )
-            return False
-
-        if result.returncode != 0:
+        # Issue #3089: hot-path label mutation — retry transient flakes
+        # so the claim interlock swap completes even through a GitHub
+        # hiccup.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="plan_blocked_labels",
+            timeout=PLAN_BLOCKED_GH_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"agent_id": agent_id, "issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.plan_blocked_labels_failed",
                 extra={
@@ -8312,8 +8504,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_preview": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "error": outcome.get("reason"),
+                    "stderr_preview": outcome.get("stderr_tail"),
                 },
             )
             return False
@@ -8500,38 +8693,29 @@ class DispatcherDaemon:
             "--json",
             "comments",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        # Issue #3089: hot-path sentinel check in the needs-review
+        # handler — retry transient flakes so operators see the draft
+        # PR link even through a GitHub hiccup.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="needs_review_sentinel_check",
+            timeout=NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.needs_review_sentinel_check_failed",
                 extra={
                     "event": "needs_review_sentinel_check_failed",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "error": str(exc),
+                    "exit_code": outcome.get("exit_code"),
+                    "error": outcome.get("reason"),
+                    "stderr_preview": outcome.get("stderr_tail"),
                 },
             )
             return None
-
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.needs_review_sentinel_check_failed",
-                extra={
-                    "event": "needs_review_sentinel_check_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_preview": _stderr_tail(result.stderr),
-                },
-            )
-            return None
+        result = outcome["result"]
 
         try:
             payload = json.loads(result.stdout or "{}")
@@ -8617,28 +8801,15 @@ class DispatcherDaemon:
             "--body-file",
             str(body_path),
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.exception(
-                "daemon.needs_review_comment_failed",
-                extra={
-                    "event": "needs_review_comment_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "error": str(exc),
-                },
-            )
-            return False
-
-        if result.returncode != 0:
+        # Issue #3089: hot-path needs-review comment post — retry
+        # transient flakes.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="needs_review_comment_post",
+            timeout=NEEDS_REVIEW_GH_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"agent_id": agent_id, "issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.needs_review_comment_failed",
                 extra={
@@ -8646,8 +8817,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_preview": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "error": outcome.get("reason"),
+                    "stderr_preview": outcome.get("stderr_tail"),
                 },
             )
             return False
@@ -9456,6 +9628,9 @@ class DispatcherDaemon:
         # summary phase to map back to AC. The diff is against
         # ``origin/main`` since the agent branch was just created from
         # it in ``_create_worktree``.
+        # cold-path (#3089): local fs ``git diff`` on the worktree, no
+        # network; failure falls back to an empty diff and the summary
+        # skill tolerates it.
         try:
             diff_result = subprocess.run(
                 [
@@ -9479,6 +9654,7 @@ class DispatcherDaemon:
         # Fall back to a git-state read if ralph didn't populate
         # changed_files (non-testable short-circuit path).
         if not changed_files:
+            # cold-path (#3089): local fs ``git diff --name-only``.
             try:
                 status_result = subprocess.run(
                     [
@@ -10313,6 +10489,10 @@ class DispatcherDaemon:
         commit_msg_path.parent.mkdir(parents=True, exist_ok=True)
         commit_msg_path.write_text(commit_message)
 
+        # cold-path (#3089): local fs ``git commit --amend``; failures
+        # are deterministic (pre-push hook, empty diff) and route
+        # through ``_handle_agent_failure`` → diagnoser, which reads
+        # stderr and decides retry/escalate.
         try:
             commit_result = subprocess.run(
                 [
@@ -10434,84 +10614,90 @@ class DispatcherDaemon:
         # git push -u origin <branch>
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         branch = f"agent/{short_id}"
-        try:
-            push_result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(worktree),
-                    "push",
-                    "-u",
-                    "origin",
-                    branch,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GIT_PUSH_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            tail = _stderr_tail(getattr(exc, "stderr", None))
-            self._log.exception(
-                "daemon.git_push_timeout",
-                extra={
-                    "event": "git_push_timeout",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
-                    "stderr_tail": tail,
-                    "detail": str(exc),
-                },
-            )
-            self._persist_phase_output(
-                agent_id,
-                phase="push_and_pr",
-                output_json={"event": "git_push_timeout", "branch": branch},
-                log_text=tail,
-            )
-            # Issue #3032: route through the unified failure handler so
-            # the diagnoser picks this up on the next supervisor tick.
-            # ``git_push_network`` is now a TIER_2_FIRST_OCCURRENCE
-            # category.
-            self._handle_agent_failure(
-                agent_id=agent_id,
-                phase="push_and_pr",
-                category=FAILURE_CATEGORY_GIT_PUSH_NETWORK,
-                stderr_tail=tail,
-                exit_code=None,
-                details={"branch": branch, "reason": "timeout"},
-                issue_number=issue_number,
-            )
-            return
-        except Exception as exc:
-            self._log.exception(
-                "daemon.git_push_failed",
-                extra={
-                    "event": "git_push_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "detail": str(exc),
-                },
-            )
-            self._persist_phase_output(
-                agent_id,
-                phase="push_and_pr",
-                output_json={"event": "git_push_failed", "branch": branch},
-                log_text=str(exc),
-            )
-            # Issue #3032: route through the unified failure handler.
-            self._handle_agent_failure(
-                agent_id=agent_id,
-                phase="push_and_pr",
-                category=FAILURE_CATEGORY_PUSH_FAILED,
-                stderr_tail=str(exc),
-                exit_code=None,
-                details={"branch": branch},
-                issue_number=issue_number,
-            )
-            return
-        if push_result.returncode != 0:
-            tail = _stderr_tail(push_result.stderr)
+        push_cmd = [
+            "git",
+            "-C",
+            str(worktree),
+            "push",
+            "-u",
+            "origin",
+            branch,
+        ]
+        # Issue #3089: hot-path ``git push`` — retry transient flakes
+        # (network blips, GitHub 5xx) before falling through to the
+        # existing ``_handle_agent_failure`` routing that kicks the
+        # diagnoser on persistent failure. Retries save the diagnoser
+        # cycle on true flakes; deterministic failures (hook rejection,
+        # PAT scope) still route through the same classification path.
+        push_outcome = self._subprocess_with_retry(
+            push_cmd,
+            event_name="git_push",
+            timeout=GIT_PUSH_TIMEOUT_SECONDS,
+            extra_log_fields={
+                "agent_id": agent_id,
+                "branch": branch,
+                "issue_number": issue_number,
+            },
+        )
+        if not push_outcome["ok"]:
+            reason = push_outcome.get("reason")
+            tail = push_outcome.get("stderr_tail") or ""
+            stderr_full = push_outcome.get("stderr_full") or ""
+            if reason == "timeout":
+                self._log.exception(
+                    "daemon.git_push_timeout",
+                    extra={
+                        "event": "git_push_timeout",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
+                        "stderr_tail": tail,
+                    },
+                )
+                self._persist_phase_output(
+                    agent_id,
+                    phase="push_and_pr",
+                    output_json={"event": "git_push_timeout", "branch": branch},
+                    log_text=tail,
+                )
+                self._handle_agent_failure(
+                    agent_id=agent_id,
+                    phase="push_and_pr",
+                    category=FAILURE_CATEGORY_GIT_PUSH_NETWORK,
+                    stderr_tail=tail,
+                    exit_code=None,
+                    details={"branch": branch, "reason": "timeout"},
+                    issue_number=issue_number,
+                )
+                return
+            if reason == "gh_missing":
+                self._log.exception(
+                    "daemon.git_push_failed",
+                    extra={
+                        "event": "git_push_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "detail": tail,
+                    },
+                )
+                self._persist_phase_output(
+                    agent_id,
+                    phase="push_and_pr",
+                    output_json={"event": "git_push_failed", "branch": branch},
+                    log_text=tail,
+                )
+                self._handle_agent_failure(
+                    agent_id=agent_id,
+                    phase="push_and_pr",
+                    category=FAILURE_CATEGORY_PUSH_FAILED,
+                    stderr_tail=tail,
+                    exit_code=None,
+                    details={"branch": branch},
+                    issue_number=issue_number,
+                )
+                return
+            # nonzero_exit — classify + route
+            exit_code = push_outcome.get("exit_code")
             category = _classify_push_failure(tail)
             self._log.warning(
                 "daemon.git_push_failed",
@@ -10519,7 +10705,7 @@ class DispatcherDaemon:
                     "event": "git_push_failed",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
-                    "exit_code": push_result.returncode,
+                    "exit_code": exit_code,
                     "stderr_tail": tail,
                     "category": category,
                     "branch": branch,
@@ -10530,24 +10716,25 @@ class DispatcherDaemon:
                 phase="push_and_pr",
                 output_json={
                     "event": "git_push_failed",
-                    "exit_code": push_result.returncode,
+                    "exit_code": exit_code,
                     "branch": branch,
                 },
-                log_text=(push_result.stderr or ""),
+                # Preserve the pre-#3089 contract: ``log_text`` is the
+                # FULL stderr (not the 4000-char tail) so operators
+                # reading ``phase_outputs`` see the whole diagnostic.
+                log_text=stderr_full or tail,
             )
-            # Issue #3032: route through the unified failure handler.
-            # The classifier's pre_push_hook_rejected / git_push_network
-            # / push_failed categories are all tier-2 first-occurrence.
             self._handle_agent_failure(
                 agent_id=agent_id,
                 phase="push_and_pr",
                 category=category,
                 stderr_tail=tail,
-                exit_code=push_result.returncode,
+                exit_code=exit_code,
                 details={"branch": branch},
                 issue_number=issue_number,
             )
             return
+        push_result = push_outcome["result"]  # noqa: F841 — preserved for parity with pre-#3089 flow
 
         # gh pr create with --body-file pointing to a scratch file in
         # the worktree's tmp/. ``--draft`` is added on the needs_review
@@ -10572,60 +10759,67 @@ class DispatcherDaemon:
         ]
         if is_needs_review:
             pr_create_cmd.append("--draft")
-        try:
-            pr_result = subprocess.run(
-                pr_create_cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-        except Exception as exc:
-            self._log.exception(
-                "daemon.pr_create_failed",
-                extra={
-                    "event": "pr_create_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "detail": str(exc),
-                },
-            )
-            # Issue #3032: route through the unified failure handler so
-            # the Opus diagnoser can tell a duplicate-PR hit from a
-            # genuine gh-CLI break from a transient GitHub API wobble.
-            self._handle_agent_failure(
-                agent_id=agent_id,
-                phase="push_and_pr",
-                category=FAILURE_CATEGORY_PR_CREATE_FAILED,
-                stderr_tail=str(exc),
-                exit_code=None,
-                details={"branch": branch, "reason": "exception"},
-                issue_number=issue_number,
-            )
-            return
-        if pr_result.returncode != 0:
-            pr_stderr_tail = _stderr_tail(pr_result.stderr)
+        # Issue #3089: hot-path ``gh pr create`` — retry transient
+        # flakes before routing through the diagnoser. A duplicate-PR
+        # stderr is deterministic (retry is wasteful but harmless);
+        # a 502/timeout is the common transient failure mode that
+        # benefits from retry.
+        pr_outcome = self._subprocess_with_retry(
+            pr_create_cmd,
+            event_name="pr_create",
+            timeout=120,
+            extra_log_fields={
+                "agent_id": agent_id,
+                "branch": branch,
+                "issue_number": issue_number,
+            },
+        )
+        if not pr_outcome["ok"]:
+            reason = pr_outcome.get("reason")
+            pr_stderr_tail = pr_outcome.get("stderr_tail") or ""
+            exit_code = pr_outcome.get("exit_code")
+            if reason in ("timeout", "gh_missing"):
+                self._log.exception(
+                    "daemon.pr_create_failed",
+                    extra={
+                        "event": "pr_create_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "detail": pr_stderr_tail or reason,
+                    },
+                )
+                self._handle_agent_failure(
+                    agent_id=agent_id,
+                    phase="push_and_pr",
+                    category=FAILURE_CATEGORY_PR_CREATE_FAILED,
+                    stderr_tail=pr_stderr_tail or str(reason),
+                    exit_code=None,
+                    details={"branch": branch, "reason": reason},
+                    issue_number=issue_number,
+                )
+                return
+            # nonzero_exit
             self._log.warning(
                 "daemon.pr_create_failed",
                 extra={
                     "event": "pr_create_failed",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
-                    "exit_code": pr_result.returncode,
+                    "exit_code": exit_code,
                     "stderr_tail": pr_stderr_tail,
                 },
             )
-            # Issue #3032: route through the unified failure handler.
             self._handle_agent_failure(
                 agent_id=agent_id,
                 phase="push_and_pr",
                 category=FAILURE_CATEGORY_PR_CREATE_FAILED,
                 stderr_tail=pr_stderr_tail,
-                exit_code=pr_result.returncode,
+                exit_code=exit_code,
                 details={"branch": branch},
                 issue_number=issue_number,
             )
             return
+        pr_result = pr_outcome["result"]
 
         pr_number = self._parse_pr_number(pr_result.stdout or "")
         pr_url = (
@@ -11043,47 +11237,47 @@ class DispatcherDaemon:
             "--json",
             "statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except FileNotFoundError:
-            self._log.warning(
-                "daemon.gh_missing",
-                extra={
-                    "event": "gh_missing",
-                    "run_id": self._run_id,
-                    "pr_number": pr_number,
-                },
-            )
+        # Issue #3089: hot-path PR status poll — retry transient flakes
+        # so a single GitHub 502 doesn't waste a supervisor tick.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="pr_view",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"pr_number": pr_number},
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            if reason == "gh_missing":
+                self._log.warning(
+                    "daemon.gh_missing",
+                    extra={
+                        "event": "gh_missing",
+                        "run_id": self._run_id,
+                        "pr_number": pr_number,
+                    },
+                )
+            elif reason == "timeout":
+                self._log.warning(
+                    "daemon.pr_view_timeout",
+                    extra={
+                        "event": "pr_view_timeout",
+                        "run_id": self._run_id,
+                        "pr_number": pr_number,
+                    },
+                )
+            else:
+                self._log.warning(
+                    "daemon.pr_view_failed",
+                    extra={
+                        "event": "pr_view_failed",
+                        "run_id": self._run_id,
+                        "pr_number": pr_number,
+                        "exit_code": outcome.get("exit_code"),
+                        "stderr_tail": outcome.get("stderr_tail"),
+                    },
+                )
             return None
-        except subprocess.TimeoutExpired:
-            self._log.warning(
-                "daemon.pr_view_timeout",
-                extra={
-                    "event": "pr_view_timeout",
-                    "run_id": self._run_id,
-                    "pr_number": pr_number,
-                },
-            )
-            return None
-
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.pr_view_failed",
-                extra={
-                    "event": "pr_view_failed",
-                    "run_id": self._run_id,
-                    "pr_number": pr_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
-                },
-            )
-            return None
+        result = outcome["result"]
 
         try:
             return json.loads(result.stdout or "{}")
@@ -11195,48 +11389,47 @@ class DispatcherDaemon:
             "--squash",
             "--delete-branch",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS * 2,
-                check=False,
-            )
-        except FileNotFoundError:
-            self._log.warning(
-                "daemon.gh_missing",
-                extra={
-                    "event": "gh_missing",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                },
-            )
-            return
-        except subprocess.TimeoutExpired:
-            self._log.warning(
-                "daemon.pr_merge_timeout",
-                extra={
-                    "event": "pr_merge_timeout",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "pr_number": pr_number,
-                },
-            )
-            return
-
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.pr_merge_failed",
-                extra={
-                    "event": "pr_merge_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "pr_number": pr_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
-                },
-            )
+        # Issue #3089: hot-path PR merge — retry transient flakes so a
+        # single GitHub 502 doesn't waste a supervisor tick.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="pr_merge",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS * 2,
+            extra_log_fields={"agent_id": agent_id, "pr_number": pr_number},
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            if reason == "gh_missing":
+                self._log.warning(
+                    "daemon.gh_missing",
+                    extra={
+                        "event": "gh_missing",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                    },
+                )
+            elif reason == "timeout":
+                self._log.warning(
+                    "daemon.pr_merge_timeout",
+                    extra={
+                        "event": "pr_merge_timeout",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                    },
+                )
+            else:
+                self._log.warning(
+                    "daemon.pr_merge_failed",
+                    extra={
+                        "event": "pr_merge_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                        "exit_code": outcome.get("exit_code"),
+                        "stderr_tail": outcome.get("stderr_tail"),
+                    },
+                )
             return
 
         # Extract the merge commit SHA from the PR status if available;
@@ -11520,19 +11713,18 @@ class DispatcherDaemon:
             "--repo",
             self._cfg.github_repo,
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Issue #3089: hot-path PR diff fetch for fix-CI input — retry
+        # transient flakes so the fix-CI skill gets real diff context
+        # instead of falling back to an empty input.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="pr_diff_fetch",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"pr_number": pr_number},
+        )
+        if not outcome["ok"]:
             return ""
-        if result.returncode != 0:
-            return ""
-        return result.stdout or ""
+        return outcome["result"].stdout or ""
 
     def _branch_for_agent(self, agent_id: str) -> str:
         """Return the agent's branch name derived from agent_id."""
@@ -11635,6 +11827,9 @@ class DispatcherDaemon:
             return
 
         # git add -A
+        # cold-path (#3089): local fs ``git add``; failures are
+        # deterministic and route via ``_handle_fix_ci_apply_failure``
+        # → diagnoser.
         try:
             add_result = subprocess.run(
                 ["git", "-C", str(worktree), "add", "-A"],
@@ -11691,6 +11886,9 @@ class DispatcherDaemon:
         commit_msg_path.parent.mkdir(parents=True, exist_ok=True)
         commit_msg_path.write_text(commit_message)
 
+        # cold-path (#3089): local fs ``git commit``; failures are
+        # deterministic (nothing staged, pre-push hook) and route via
+        # ``_handle_fix_ci_apply_failure`` → diagnoser.
         try:
             commit_result = subprocess.run(
                 [
@@ -11753,70 +11951,77 @@ class DispatcherDaemon:
             return
 
         # git push
-        try:
-            push_result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(worktree),
-                    "push",
-                    "origin",
-                    branch,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GIT_PUSH_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            self._log.exception(
-                "daemon.fix_ci_git_push_timeout",
-                extra={
-                    "event": "fix_ci_git_push_timeout",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
-                    "detail": str(exc),
-                },
-            )
-            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
-            self._handle_fix_ci_apply_failure(
-                agent_id=agent_id,
-                sub_reason="git_push_timeout",
-                pr_number=pr_number,
-                issue_number=issue_number,
-                retries_used=retries_used,
-                detail=str(exc),
-            )
-            return
-        except Exception as exc:
-            self._log.exception(
-                "daemon.fix_ci_git_push_failed",
-                extra={
-                    "event": "fix_ci_git_push_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                },
-            )
-            # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
-            self._handle_fix_ci_apply_failure(
-                agent_id=agent_id,
-                sub_reason="git_push_exception",
-                pr_number=pr_number,
-                issue_number=issue_number,
-                retries_used=retries_used,
-                detail=str(exc),
-            )
-            return
-        if push_result.returncode != 0:
-            tail = _stderr_tail(push_result.stderr)
+        # Issue #3089: hot-path ``git push`` in fix-CI — retry
+        # transient flakes before routing to the diagnoser. Same
+        # rationale as ``_push_and_open_pr``'s push retry.
+        push_cmd = [
+            "git",
+            "-C",
+            str(worktree),
+            "push",
+            "origin",
+            branch,
+        ]
+        push_outcome = self._subprocess_with_retry(
+            push_cmd,
+            event_name="fix_ci_git_push",
+            timeout=GIT_PUSH_TIMEOUT_SECONDS,
+            extra_log_fields={
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+            },
+        )
+        if not push_outcome["ok"]:
+            reason = push_outcome.get("reason")
+            tail = push_outcome.get("stderr_tail") or ""
+            if reason == "timeout":
+                self._log.exception(
+                    "daemon.fix_ci_git_push_timeout",
+                    extra={
+                        "event": "fix_ci_git_push_timeout",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "timeout_seconds": GIT_PUSH_TIMEOUT_SECONDS,
+                    },
+                )
+                # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+                self._handle_fix_ci_apply_failure(
+                    agent_id=agent_id,
+                    sub_reason="git_push_timeout",
+                    pr_number=pr_number,
+                    issue_number=issue_number,
+                    retries_used=retries_used,
+                    detail=tail,
+                )
+                return
+            if reason == "gh_missing":
+                self._log.exception(
+                    "daemon.fix_ci_git_push_failed",
+                    extra={
+                        "event": "fix_ci_git_push_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                    },
+                )
+                # ROUTING (#3062 #3069): ROUTED via ``_handle_agent_failure``.
+                self._handle_fix_ci_apply_failure(
+                    agent_id=agent_id,
+                    sub_reason="git_push_exception",
+                    pr_number=pr_number,
+                    issue_number=issue_number,
+                    retries_used=retries_used,
+                    detail=tail,
+                )
+                return
+            # nonzero_exit
             self._log.warning(
                 "daemon.fix_ci_git_push_failed",
                 extra={
                     "event": "fix_ci_git_push_failed",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
-                    "exit_code": push_result.returncode,
+                    "exit_code": push_outcome.get("exit_code"),
                     "stderr_tail": tail,
                 },
             )
@@ -11825,7 +12030,7 @@ class DispatcherDaemon:
                 agent_id=agent_id,
                 sub_reason="git_push_nonzero_exit",
                 stderr_tail=tail,
-                exit_code=push_result.returncode,
+                exit_code=push_outcome.get("exit_code"),
                 pr_number=pr_number,
                 issue_number=issue_number,
                 retries_used=retries_used,
@@ -11996,28 +12201,30 @@ class DispatcherDaemon:
             "--limit",
             "20",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Issue #3089: hot-path deploy-run lookup — retry transient
+        # flakes so a single GitHub 502 doesn't send the supervisor
+        # back into "waiting for deploy" limbo for an extra tick.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="deploy_run_list",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"merge_sha": merge_sha},
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            if reason not in ("timeout", "gh_missing"):
+                self._log.warning(
+                    "daemon.run_list_failed",
+                    extra={
+                        "event": "run_list_failed",
+                        "run_id": self._run_id,
+                        "merge_sha": merge_sha,
+                        "exit_code": outcome.get("exit_code"),
+                        "stderr_tail": outcome.get("stderr_tail"),
+                    },
+                )
             return []
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.run_list_failed",
-                extra={
-                    "event": "run_list_failed",
-                    "run_id": self._run_id,
-                    "merge_sha": merge_sha,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
-                },
-            )
-            return []
+        result = outcome["result"]
         try:
             payload = json.loads(result.stdout or "[]")
         except json.JSONDecodeError:
@@ -12523,15 +12730,16 @@ class DispatcherDaemon:
             "--body-file",
             str(evidence_path),
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Issue #3089: hot-path verification-evidence comment — retry
+        # transient flakes so operators see the evidence even through
+        # a GitHub hiccup.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="evidence_comment",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"agent_id": agent_id, "issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.evidence_comment_failed",
                 extra={
@@ -12539,20 +12747,9 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "issue_number": issue_number,
-                    "reason": "subprocess",
-                },
-            )
-            return
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.evidence_comment_failed",
-                extra={
-                    "event": "evidence_comment_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "reason": outcome.get("reason"),
+                    "exit_code": outcome.get("exit_code"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
             return
@@ -13104,40 +13301,41 @@ class DispatcherDaemon:
         for label in labels:
             cmd.extend(["--label", label])
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=RETRO_GH_ISSUE_CREATE_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.retro_issue_create_subprocess_error",
-                extra={
-                    "event": "retro_issue_create_subprocess_error",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "title": title,
-                    "detail": str(exc),
-                },
-            )
+        # Issue #3089: hot-path retro issue create — retry transient
+        # flakes so the retrospective finding lands on a real issue.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="retro_issue_create",
+            timeout=RETRO_GH_ISSUE_CREATE_TIMEOUT_SECONDS,
+            extra_log_fields={"agent_id": agent_id, "title": title},
+        )
+        if not outcome["ok"]:
+            reason = outcome.get("reason")
+            if reason in ("timeout", "gh_missing"):
+                self._log.warning(
+                    "daemon.retro_issue_create_subprocess_error",
+                    extra={
+                        "event": "retro_issue_create_subprocess_error",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "title": title,
+                        "detail": outcome.get("stderr_tail") or reason,
+                    },
+                )
+            else:
+                self._log.warning(
+                    "daemon.retro_issue_create_failed",
+                    extra={
+                        "event": "retro_issue_create_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "title": title,
+                        "exit_code": outcome.get("exit_code"),
+                        "stderr_tail": outcome.get("stderr_tail"),
+                    },
+                )
             return None
-
-        if result.returncode != 0:
-            self._log.warning(
-                "daemon.retro_issue_create_failed",
-                extra={
-                    "event": "retro_issue_create_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "title": title,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
-                },
-            )
-            return None
+        result = outcome["result"]
 
         # ``gh issue create`` prints the issue URL on stdout. Parse the
         # trailing ``/issues/<N>`` segment for logging.
@@ -13733,6 +13931,10 @@ class DispatcherDaemon:
             "--jq",
             ".resources.core",
         ]
+        # cold-path (#3089): per-tick advisory probe; a failed probe
+        # means this tick proceeds without rate-limit gating and the
+        # next tick re-probes. Tick-level cadence already provides the
+        # equivalent of a retry.
         try:
             result = subprocess.run(
                 cmd,
@@ -14100,6 +14302,8 @@ class DispatcherDaemon:
         # whether we leave an orphan entry in ``git worktree list``.
         # ``-C <git_parent>`` anchors the command to the baseline clone's
         # ``.git`` rather than the daemon's CWD — see docstring.
+        # cold-path (#3089): local fs housekeeping; an orphan entry is
+        # swept by subsequent housekeeping sweeps.
         try:
             result = subprocess.run(
                 [
@@ -15456,36 +15660,35 @@ class DispatcherDaemon:
         # Issue title + body — fetch lazily via gh so the daemon does
         # not duplicate the ``_fetch_issue_bundle`` MCP path. The skill
         # can always re-fetch if the context is stale.
+        # Issue #3089: hot-path diagnoser-context fetch — retry
+        # transient flakes so a single ``gh`` hiccup doesn't degrade
+        # the diagnoser's input quality.
         issue_title = ""
         issue_body = ""
         if issue_number is not None:
-            try:
-                result = subprocess.run(
-                    [
-                        "gh",
-                        "issue",
-                        "view",
-                        str(issue_number),
-                        "--repo",
-                        self._cfg.github_repo,
-                        "--json",
-                        "title,body",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                    check=False,
-                )
-                if result.returncode == 0 and result.stdout:
-                    payload = json.loads(result.stdout)
+            diag_cmd = [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                self._cfg.github_repo,
+                "--json",
+                "title,body",
+            ]
+            diag_outcome = self._subprocess_with_retry(
+                diag_cmd,
+                event_name="diagnoser_context_fetch",
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                extra_log_fields={"issue_number": issue_number},
+            )
+            if diag_outcome["ok"]:
+                try:
+                    payload = json.loads(diag_outcome["result"].stdout or "{}")
                     issue_title = str(payload.get("title") or "")
                     issue_body = str(payload.get("body") or "")
-            except (
-                FileNotFoundError,
-                subprocess.TimeoutExpired,
-                json.JSONDecodeError,
-            ):
-                pass
+                except json.JSONDecodeError:
+                    pass
 
         # prior_mechanical_fix — tier 2 only, describes what was tried.
         prior_mechanical_fix: dict[str, Any] | None = None
@@ -16528,43 +16731,35 @@ class DispatcherDaemon:
         tmp_file = self._write_gh_tmp_body(body, prefix="diagnoser-comment")
         if tmp_file is None:
             return
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "issue",
-                    "comment",
-                    str(issue_number),
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--body-file",
-                    str(tmp_file),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.diagnoser_gh_comment_failed",
-                extra={
-                    "event": "diagnoser_gh_comment_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "detail": str(exc),
-                },
-            )
-            return
-        if result.returncode != 0:
+        # Issue #3089: hot-path diagnoser comment — retry transient
+        # flakes so the operator-visible decision doesn't silently
+        # drop.
+        cmd = [
+            "gh",
+            "issue",
+            "comment",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--body-file",
+            str(tmp_file),
+        ]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="diagnoser_gh_comment",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.diagnoser_gh_comment_nonzero",
                 extra={
                     "event": "diagnoser_gh_comment_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
 
@@ -16573,43 +16768,34 @@ class DispatcherDaemon:
         tmp_file = self._write_gh_tmp_body(new_body, prefix="diagnoser-body")
         if tmp_file is None:
             return
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "issue",
-                    "edit",
-                    str(issue_number),
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--body-file",
-                    str(tmp_file),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.diagnoser_gh_body_failed",
-                extra={
-                    "event": "diagnoser_gh_body_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "detail": str(exc),
-                },
-            )
-            return
-        if result.returncode != 0:
+        # Issue #3089: hot-path diagnoser body edit — retry transient
+        # flakes.
+        cmd = [
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--body-file",
+            str(tmp_file),
+        ]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="diagnoser_gh_body",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.diagnoser_gh_body_nonzero",
                 extra={
                     "event": "diagnoser_gh_body_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
 
@@ -16622,43 +16808,34 @@ class DispatcherDaemon:
         if not labels:
             return
         label_csv = ",".join(labels)
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "issue",
-                    "edit",
-                    str(issue_number),
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--add-label",
-                    label_csv,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.diagnoser_gh_label_failed",
-                extra={
-                    "event": "diagnoser_gh_label_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "detail": str(exc),
-                },
-            )
-            return
-        if result.returncode != 0:
+        # Issue #3089: hot-path label-add mutation — retry transient
+        # flakes so the claim interlock + status labels land reliably.
+        cmd = [
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--add-label",
+            label_csv,
+        ]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="diagnoser_gh_label",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.diagnoser_gh_label_nonzero",
                 extra={
                     "event": "diagnoser_gh_label_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
 
@@ -16674,43 +16851,36 @@ class DispatcherDaemon:
         if not labels:
             return
         label_csv = ",".join(labels)
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "issue",
-                    "edit",
-                    str(issue_number),
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--remove-label",
-                    label_csv,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.label_remove_failed",
-                extra={
-                    "event": "label_remove_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "detail": str(exc),
-                },
-            )
-            return
-        if result.returncode != 0:
+        # Issue #3089: hot-path label-remove mutation — retry transient
+        # flakes so the claim interlock releases reliably (a stuck
+        # ``status/in-progress`` label hides the issue from the queue
+        # scan indefinitely — #2927).
+        cmd = [
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--remove-label",
+            label_csv,
+        ]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="label_remove",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.label_remove_nonzero",
                 extra={
                     "event": "label_remove_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
 
@@ -16719,45 +16889,36 @@ class DispatcherDaemon:
         tmp_file = self._write_gh_tmp_body(comment, prefix="diagnoser-close")
         if tmp_file is None:
             return
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "issue",
-                    "close",
-                    str(issue_number),
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--reason",
-                    reason,
-                    "--comment",
-                    comment,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.diagnoser_gh_close_failed",
-                extra={
-                    "event": "diagnoser_gh_close_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "detail": str(exc),
-                },
-            )
-            return
-        if result.returncode != 0:
+        # Issue #3089: hot-path diagnoser close — retry transient
+        # flakes.
+        cmd = [
+            "gh",
+            "issue",
+            "close",
+            str(issue_number),
+            "--repo",
+            self._cfg.github_repo,
+            "--reason",
+            reason,
+            "--comment",
+            comment,
+        ]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="diagnoser_gh_close",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.diagnoser_gh_close_nonzero",
                 extra={
                     "event": "diagnoser_gh_close_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
 
@@ -16815,37 +16976,29 @@ class DispatcherDaemon:
         ]
         if labels:
             cmd.extend(["--label", ",".join(labels)])
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.diagnoser_gh_create_failed",
-                extra={
-                    "event": "diagnoser_gh_create_failed",
-                    "run_id": self._run_id,
-                    "title": title,
-                    "detail": str(exc),
-                },
-            )
-            return None
-        if result.returncode != 0:
+        # Issue #3089: hot-path diagnoser prereq-issue create — retry
+        # transient flakes so the file_prerequisite_task diagnoser
+        # action lands reliably.
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="diagnoser_gh_create",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"title": title},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.diagnoser_gh_create_nonzero",
                 extra={
                     "event": "diagnoser_gh_create_nonzero",
                     "run_id": self._run_id,
                     "title": title,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
             return None
+        result = outcome["result"]
         # gh issue create prints the URL on stdout: last non-empty line.
         stdout = (result.stdout or "").strip()
         if not stdout:
@@ -16878,46 +17031,37 @@ class DispatcherDaemon:
         Best-effort — a read or write failure is logged and swallowed
         so the diagnoser's recommendation still lands.
         """
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "issue",
-                    "view",
-                    str(issue_number),
-                    "--repo",
-                    self._cfg.github_repo,
-                    "--json",
-                    "body",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self._log.warning(
-                "daemon.diagnoser_gh_append_failed",
-                extra={
-                    "event": "diagnoser_gh_append_failed",
-                    "run_id": self._run_id,
-                    "issue_number": issue_number,
-                    "detail": str(exc),
-                },
-            )
-            return
-        if result.returncode != 0:
+        # Issue #3089: hot-path diagnoser body-append read — retry
+        # transient flakes before falling back.
+        outcome = self._subprocess_with_retry(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                self._cfg.github_repo,
+                "--json",
+                "body",
+            ],
+            event_name="diagnoser_gh_append",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+            extra_log_fields={"issue_number": issue_number},
+        )
+        if not outcome["ok"]:
             self._log.warning(
                 "daemon.diagnoser_gh_append_nonzero",
                 extra={
                     "event": "diagnoser_gh_append_nonzero",
                     "run_id": self._run_id,
                     "issue_number": issue_number,
-                    "exit_code": result.returncode,
-                    "stderr_tail": _stderr_tail(result.stderr),
+                    "exit_code": outcome.get("exit_code"),
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
                 },
             )
             return
+        result = outcome["result"]
         try:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
@@ -17055,6 +17199,9 @@ class DispatcherDaemon:
           ``"gh_missing"``). ``stderr_tail`` is the last ~200 chars
           of stderr when applicable, for operator-visible context.
         """
+        # cold-path (#3089): the ``_once`` probe is wrapped in a
+        # 3-attempt 1s+2s retry loop by the parent
+        # ``_gh_issue_is_open_with_detail`` (#3053).
         try:
             result = subprocess.run(
                 [
