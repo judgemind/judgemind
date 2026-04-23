@@ -613,10 +613,18 @@ PHASE_NO_OP = "no_op"
 #: supervisor advances apply.
 PHASE_CLEANUP_DONE = "cleanup_done"
 
-#: Phase value written when ``scripts/cleanup_worktree.sh`` refuses to
-#: remove the worktree (locked, no session log, etc.). The daemon does
-#: NOT bypass the safety check with ``--force`` — an operator sweep can
-#: clean up the worktree manually. This is also a terminal phase.
+#: Phase value written when ``scripts/cleanup_worktree.sh`` exists but
+#: refuses to remove the worktree (locked, no session log, etc.). The
+#: daemon does NOT bypass the safety check with ``--force`` — an
+#: operator sweep can clean up the worktree manually. This is also a
+#: terminal phase.
+#:
+#: Note: when the script is absent entirely (the normal Fargate case —
+#: ``Dockerfile.dispatcher`` does not COPY ``scripts/cleanup_worktree.sh``
+#: because its safety checks assume laptop-dispatcher state that doesn't
+#: exist in Fargate), the daemon falls back to ``git worktree remove
+#: --force`` via :meth:`_drop_worktree_best_effort` rather than marking
+#: this phase. See #3056.
 PHASE_CLEANUP_BLOCKED = "cleanup_blocked"
 
 #: Hard wall-clock timeout for the ``scripts/cleanup_worktree.sh``
@@ -12524,16 +12532,40 @@ class DispatcherDaemon:
         cleanup_script = repo_root / "scripts" / "cleanup_worktree.sh"
 
         if not cleanup_script.exists():
-            self._log.warning(
-                "daemon.cleanup_script_missing",
+            # This is the normal Fargate path. ``Dockerfile.dispatcher``
+            # deliberately does NOT COPY ``scripts/cleanup_worktree.sh``
+            # into the image — the script's safety checks depend on
+            # laptop-only state ($HOME/.claude/projects JSONL logs and
+            # the ``.claude/worktrees/agent-*`` path convention) that
+            # doesn't apply in Fargate, so shipping it would only make
+            # every safety check fail. Fall through to ``git worktree
+            # remove --force`` via :meth:`_drop_worktree_best_effort`
+            # (which is already the fallback wired up for the retry-
+            # marker path) so Fargate cleanup actually completes
+            # instead of stalling at ``cleanup_blocked`` forever. #3056.
+            self._log.info(
+                "daemon.cleanup_script_absent_using_git",
                 extra={
-                    "event": "cleanup_script_missing",
+                    "event": "cleanup_script_absent_using_git",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "expected_path": str(cleanup_script),
+                    "worktree_path": worktree_path,
                 },
             )
-            self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
+            if self._drop_worktree_best_effort(worktree_path):
+                self._update_agent_phase(agent_id, PHASE_CLEANUP_DONE)
+                self._log.info(
+                    "daemon.cleanup_done",
+                    extra={
+                        "event": "cleanup_done",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "worktree_path": worktree_path,
+                    },
+                )
+            else:
+                self._update_agent_phase(agent_id, PHASE_CLEANUP_BLOCKED)
             return
 
         try:

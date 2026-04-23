@@ -969,16 +969,69 @@ class TestCleanupAgentWorktree:
         assert cleanup_done_updates
         assert handler.events("cleanup_already_gone")
 
-    def test_missing_cleanup_script_marks_blocked(
+    def test_missing_cleanup_script_falls_back_to_git_remove_success(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """Fargate case: script is intentionally not shipped in the
+        container. Instead of emitting a WARNING and stalling at
+        ``cleanup_blocked`` forever, the daemon falls back to
+        ``git worktree remove --force`` via
+        :meth:`_drop_worktree_best_effort`. See #3056."""
         d, conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path, phase=daemon.PHASE_RETRO_DONE)
         # Repo root with no cleanup script present.
         empty_repo = tmp_path / "empty-repo"
         empty_repo.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(d, "_repo_root", lambda: empty_repo)
+        # Fake ``_drop_worktree_best_effort`` to report success.
+        drop_calls: list[str] = []
+
+        def fake_drop(worktree_path: str) -> bool:
+            drop_calls.append(worktree_path)
+            return True
+
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", fake_drop)
         d._cleanup_agent_worktree(agent)
+
+        # Delegated to the best-effort drop with the agent's worktree path.
+        assert drop_calls == [agent["worktree_path"]]
+
+        # Phase flipped to cleanup_done (not cleanup_blocked).
+        done_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and daemon.PHASE_CLEANUP_DONE in str(e[1])
+        ]
+        assert done_updates
+
+        # Must NOT have emitted the noisy WARNING from #3056. The new
+        # event name is INFO-level and explicitly narrates the fallback.
+        assert not handler.events("cleanup_script_missing"), (
+            "missing script is the expected Fargate condition; must not WARN"
+        )
+        assert handler.events("cleanup_script_absent_using_git")
+        assert handler.events("cleanup_done")
+
+    def test_missing_cleanup_script_falls_back_to_git_remove_failure(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """If the git fallback itself fails (e.g. worktree is locked),
+        the agent lands at ``cleanup_blocked`` — an operator sweep can
+        clean up manually. Still no ``cleanup_script_missing`` WARNING."""
+        d, conn, handler = _make_daemon(tmp_path)
+        agent = _succeeded_agent(tmp_path, phase=daemon.PHASE_RETRO_DONE)
+        empty_repo = tmp_path / "empty-repo"
+        empty_repo.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(d, "_repo_root", lambda: empty_repo)
+
+        def fake_drop(worktree_path: str) -> bool:
+            return False
+
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", fake_drop)
+        d._cleanup_agent_worktree(agent)
+
         blocked_updates = [
             e
             for e in conn.cursor_instance.executed
@@ -987,7 +1040,8 @@ class TestCleanupAgentWorktree:
             and daemon.PHASE_CLEANUP_BLOCKED in str(e[1])
         ]
         assert blocked_updates
-        assert handler.events("cleanup_script_missing")
+        assert not handler.events("cleanup_script_missing")
+        assert handler.events("cleanup_script_absent_using_git")
 
 
 # --------------------------------------------------------------------------
