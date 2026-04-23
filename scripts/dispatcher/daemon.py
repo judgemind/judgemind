@@ -4274,11 +4274,106 @@ class DispatcherDaemon:
         Called by :meth:`ensure_baseline_clone` on reboot and by
         :meth:`_create_worktree` before each ``git worktree add`` so
         the new worktree branches from up-to-date ``origin/main``.
+
+        Issue #3085 — retry on transient ``git fetch`` failures
+        (``TimeoutExpired`` or non-zero exit) up to 3 attempts total
+        with 1s + 2s backoff. A single transient GitHub 500 or
+        network blip used to terminate the agent claim via
+        ``_create_worktree`` → ``_handle_agent_failure``. The fallback
+        path is destructive: the daemon moves on to the next candidate
+        and the failed claim ticks the per-issue cooldown. Retries
+        convert ~30s of GitHub flake into at most ~3s of extra wall
+        clock for a genuine outage. Emits a WARNING per failed attempt
+        (``event='baseline_fetch_flake'``) so the flake pattern is
+        visible in CloudWatch, plus a final WARNING
+        (``event='baseline_fetch_exhausted'``) when all three attempts
+        fail before the caller still sees the ``RuntimeError``. The
+        happy path (first-attempt success) stays silent by design —
+        same cadence as pre-#3085 — so the common case doesn't flood
+        the log. Follows the retry shape established by #3053 for
+        :meth:`_gh_issue_is_open`.
         """
         baseline = self._cfg.baseline_repo_root
         if baseline is None:  # pragma: no cover — guarded by callers
             return
 
+        backoffs_seconds: tuple[float, ...] = (1.0, 2.0)
+        max_attempts = 1 + len(backoffs_seconds)  # 3
+        last_outcome: dict[str, Any] = {}
+        for attempt in range(1, max_attempts + 1):
+            outcome = self._baseline_fetch_origin_main_once(baseline)
+            last_outcome = outcome
+            if outcome.get("ok"):
+                # Terminal success — return silently to preserve the
+                # pre-#3085 log cadence for the happy path.
+                return
+            # Transient failure — log a flake WARNING with stderr tail
+            # and (if attempts remain) back off.
+            self._log.warning(
+                "git baseline fetch failed (attempt %d/%d): %s",
+                attempt,
+                max_attempts,
+                outcome.get("reason"),
+                extra={
+                    "event": "baseline_fetch_flake",
+                    "run_id": self._run_id,
+                    "baseline_repo_root": str(baseline),
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "reason": outcome.get("reason"),
+                    "stderr_tail": outcome.get("stderr_tail"),
+                },
+            )
+            if attempt < max_attempts:
+                time.sleep(backoffs_seconds[attempt - 1])
+        # All attempts exhausted — emit a final WARNING and raise so
+        # the caller (``_create_worktree`` / ``ensure_baseline_clone``)
+        # still surfaces the outage via its existing failure path.
+        self._log.warning(
+            "git baseline fetch exhausted %d attempts — raising",
+            max_attempts,
+            extra={
+                "event": "baseline_fetch_exhausted",
+                "run_id": self._run_id,
+                "baseline_repo_root": str(baseline),
+                "attempts": max_attempts,
+                "reason": last_outcome.get("reason"),
+                "stderr_tail": last_outcome.get("stderr_tail"),
+            },
+        )
+        reason = last_outcome.get("reason")
+        stderr_tail = last_outcome.get("stderr_tail") or ""
+        if reason == "gh_missing":
+            raise RuntimeError(f"git CLI not on PATH: {stderr_tail}")
+        if reason == "timeout":
+            raise RuntimeError(
+                f"git fetch timed out after {BASELINE_FETCH_TIMEOUT_SECONDS}s "
+                f"(attempts={max_attempts})"
+            )
+        # reason == "nonzero_exit" (or any other transient) — preserve
+        # the original exit-code-in-message shape so existing callers /
+        # log scrapers that key on "git fetch exit=" still match.
+        exit_code = last_outcome.get("exit_code")
+        if exit_code is not None:
+            raise RuntimeError(f"git fetch exit={exit_code}: {stderr_tail}")
+        raise RuntimeError(f"git fetch failed: {stderr_tail}")
+
+    def _baseline_fetch_origin_main_once(self, baseline: Path) -> dict[str, Any]:
+        """Single ``git fetch origin main`` probe — return structured outcome.
+
+        Helper for :meth:`_baseline_fetch_origin_main`'s retry loop.
+        Never raises. Return shape:
+
+        - ``{"ok": True}`` — ``git fetch`` returned cleanly.
+        - ``{"ok": False, "reason": str, "stderr_tail": str, ...}`` —
+          transient failure worth retrying. ``reason`` is a short
+          token (``"timeout"`` / ``"nonzero_exit"`` / ``"gh_missing"``).
+          ``stderr_tail`` is the last ~200 chars of stderr when
+          applicable, for operator-visible context. For
+          ``"nonzero_exit"`` the outcome also carries ``"exit_code"``
+          so the final ``RuntimeError`` can preserve the pre-#3085
+          ``exit=<code>`` shape.
+        """
         cmd = ["git", "-C", str(baseline), "fetch", "origin", "main"]
         try:
             result = subprocess.run(
@@ -4289,15 +4384,21 @@ class DispatcherDaemon:
                 check=False,
             )
         except FileNotFoundError as exc:
-            raise RuntimeError(f"git CLI not on PATH: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"git fetch timed out after {BASELINE_FETCH_TIMEOUT_SECONDS}s"
-            ) from exc
-
+            return {
+                "ok": False,
+                "reason": "gh_missing",
+                "stderr_tail": str(exc),
+            }
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "reason": "timeout", "stderr_tail": ""}
         if result.returncode != 0:
-            stderr_preview = _stderr_tail(result.stderr)
-            raise RuntimeError(f"git fetch exit={result.returncode}: {stderr_preview}")
+            return {
+                "ok": False,
+                "reason": "nonzero_exit",
+                "exit_code": result.returncode,
+                "stderr_tail": _stderr_tail(result.stderr),
+            }
+        return {"ok": True}
 
     def _unshallow_baseline_if_needed(self) -> None:
         """Upgrade a pre-existing shallow baseline to a full clone.
