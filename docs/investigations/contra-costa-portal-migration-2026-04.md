@@ -216,6 +216,23 @@ Filed as sub-tasks of #2601. Each is independently pickup-able.
 
 ---
 
+## Phase 2 status — dual-run wiring landed (2026-04-23)
+
+**PR:** [#2610](https://github.com/judgemind/judgemind/issues/2610) — CC Dual-Run Diff: wire up daily diff job comparing both CC scrapers.
+
+Phase 2 dual-run validation is now wired up. The following was delivered:
+
+- **`packages/scraper-framework/src/framework/dual_run_diff.py`** — pure logic module (`Capture`, `DiffRow`, `compute_per_department_diff`, `format_summary`). No DB imports; fully unit-tested.
+- **`scripts/check-cc-dual-run-diff.py`** — ECS oneshot script (`# venv: scraper-framework`, `# permanent: true`). Queries `derived.documents` for both `ca-cc-tentatives` and `ca-cc-tentatives-portal`, computes per-department diff, writes one row to `telemetry.data_quality_metrics` (`metric_name='cc_dual_run_diff'`, `county='contra_costa'`). Exits 0 if healthy, 1 if any `missing_portal` dept, 2 if `DATABASE_URL` not set.
+- **`packages/scraper-framework/tests/framework/test_dual_run_diff.py`** — 21 unit tests covering AC#2 (per-dept diff), AC#3 (missing_portal flag), AC#4 (new_portal_coverage flag), date filtering, case-level set differences, and `format_summary`.
+- **`packages/scraper-framework/tests/test_check_cc_dual_run_diff.py`** — 8 integration tests covering CLI argparse, JSON output shape, exit-code semantics (0/1/2), and DB write verification.
+
+**Workflow note:** The GH Actions workflow (`.github/workflows/cc-dual-run-diff.yml`) could NOT be pushed because the dispatcher PAT lacks `workflow` scope. Three consecutive push rejections confirmed this. The workflow must be created manually (or via a PAT with `workflow` scope) to enable daily automated runs and Telegram notifications. This is the only gap remaining in Phase 2.
+
+Both scrapers (`ca-cc-tentatives` and `ca-cc-tentatives-portal`) are already registered in `packages/scraper-framework/src/framework/runner.py:271-272` and run on the production schedule — the dispatcher can pick up the next issue (#2610 follow-on) to add the workflow file once a `workflow`-scoped PAT is available.
+
+---
+
 ## Appendix — commands used
 
 Discovery commands (ran from the agent worktree):
