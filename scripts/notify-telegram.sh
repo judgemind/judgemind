@@ -15,9 +15,17 @@
 #   AWS_REGION defaults to us-west-2 if not set.
 #
 # Exit codes:
-#   0  — message sent successfully to at least one recipient (or no recipients configured)
-#   1  — usage error or secret retrieval failure
+#   0  — message sent successfully to at least one recipient
+#   1  — usage error
 #   2  — all sends failed (logged to stderr)
+#   3  — secret fetch failed (e.g. InvalidRequestException, AccessDenied)
+#   4  — bot_token is empty in the fetched secret
+#   5  — allowed_user_ids is empty in the fetched secret
+#
+# Exit codes 3/4/5 distinguish "misconfigured — can't actually send" from
+# success (exit 0). Prior to issue #3061 these paths exited 0 with a
+# stderr message, which caused daemon callers keying off the exit status
+# to log false "sent" events for deliveries that never happened.
 
 set -euo pipefail
 
@@ -56,8 +64,8 @@ SECRET_JSON="$(aws secretsmanager get-secret-value \
     --region "$AWS_REGION" \
     --query SecretString \
     --output text 2>/dev/null)" || {
-    echo "$SCRIPT_NAME: failed to fetch Telegram secret — skipping notification" >&2
-    exit 0
+    echo "$SCRIPT_NAME: failed to fetch Telegram secret — Telegram notification NOT sent" >&2
+    exit 3
 }
 
 # Extract bot token and user IDs using Python (available on all GHA runners)
@@ -65,13 +73,13 @@ BOT_TOKEN="$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(
 USER_IDS="$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(' '.join(str(x) for x in json.load(sys.stdin).get('allowed_user_ids',[])))")"
 
 if [ -z "$BOT_TOKEN" ]; then
-    echo "$SCRIPT_NAME: bot token is empty — Telegram not configured, skipping" >&2
-    exit 0
+    echo "$SCRIPT_NAME: bot_token is empty in secret — Telegram notification NOT sent" >&2
+    exit 4
 fi
 
 if [ -z "$USER_IDS" ]; then
-    echo "$SCRIPT_NAME: no allowed_user_ids configured — skipping" >&2
-    exit 0
+    echo "$SCRIPT_NAME: allowed_user_ids is empty in secret — Telegram notification NOT sent" >&2
+    exit 5
 fi
 
 # JSON-escape the message text for the Telegram API payload.
