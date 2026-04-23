@@ -436,6 +436,237 @@ class TestContextBundleExtensions:
 
 
 # --------------------------------------------------------------------------
+# Issue #3057 — recent_fleet_decisions cap is configurable (anchor-bias defense)
+# --------------------------------------------------------------------------
+
+
+class TestFleetDecisionsCapConfigurable:
+    """Issue #3057 — ``recent_fleet_decisions`` defaults to LIMIT 3 instead
+    of the prior LIMIT 20, and the cap is tunable via
+    ``dispatcher.config.diagnoser_fleet_decisions_cap``.
+
+    The anchor-bias failure: on 2026-04-23 the Opus diagnoser hallucinated
+    a PAT-scope cascade push-rejection on a coverage-floor failure after
+    9 identical ``block_on_existing_task → #3038`` decisions populated the
+    fleet-decisions bundle. Reducing to 3 preserves the fleet-wide signal
+    without letting any single pattern dominate.
+    """
+
+    def _build_candidate(self) -> dict[str, Any]:
+        return {
+            "failure_id": 42,
+            "agent_id": "agent-cap",
+            "category": FAILURE_CATEGORY_PUSH_FAILED,
+            "tier": 2,
+            "issue_number": 3008,
+            "details": {},
+            "failure_ts": None,
+        }
+
+    def test_default_cap_is_three(self) -> None:
+        """With no ``diagnoser_fleet_decisions_cap`` row, the LIMIT parameter
+        passed to the SQL is 3 (the default)."""
+        cursor = _FakeCursor()
+        # agents row
+        cursor.fetch_queue.append((3008, "", None))
+        # _cb_config_int fetchone — no row means default (3).
+        cursor.fetch_queue.append(None)
+        # Phase transitions, prior failures, prior diagnoses, recent fleet decisions.
+        cursor.fetchall_queue.extend(
+            [
+                [],  # phase_transitions
+                [],  # prior_failures
+                [],  # prior_diagnoses_this_issue
+                [],  # recent_fleet_decisions
+            ]
+        )
+        d = _make_daemon(cursor)
+        with patch("dispatcher.daemon.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            d._build_diagnoser_context(self._build_candidate())
+
+        # Find the SELECT that builds recent_fleet_decisions — the one
+        # joining dispatcher.diagnoses / agents / failures with the 6-hour
+        # window. Its params tuple should be ``(3,)`` — the default cap.
+        fleet_selects = [
+            (sql, params)
+            for (sql, params) in cursor.executed
+            if "FROM dispatcher.diagnoses d" in sql
+            and "JOIN dispatcher.agents" in sql
+            and "JOIN dispatcher.failures" in sql
+            and "interval '6 hours'" in sql
+        ]
+        assert len(fleet_selects) == 1, (
+            f"expected exactly one fleet-decisions SELECT, got {len(fleet_selects)}"
+        )
+        _sql, params = fleet_selects[0]
+        assert params == (3,), f"default cap should be 3; got {params!r}. SQL: {_sql!r}"
+
+    def test_cap_honors_dispatcher_config_override(self) -> None:
+        """When ``dispatcher.config.diagnoser_fleet_decisions_cap`` is set
+        to a different positive integer, the LIMIT parameter reflects it."""
+        cursor = _FakeCursor()
+        cursor.fetch_queue.append((3008, "", None))  # agents row
+        # _cb_config_int fetchone — returns a row with the override value.
+        # Shape: (value,) where value is the JSON-serializable cap.
+        cursor.fetch_queue.append((5,))
+        cursor.fetchall_queue.extend(
+            [
+                [],  # phase_transitions
+                [],  # prior_failures
+                [],  # prior_diagnoses_this_issue
+                [],  # recent_fleet_decisions
+            ]
+        )
+        d = _make_daemon(cursor)
+        with patch("dispatcher.daemon.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            d._build_diagnoser_context(self._build_candidate())
+
+        fleet_selects = [
+            (sql, params)
+            for (sql, params) in cursor.executed
+            if "FROM dispatcher.diagnoses d" in sql
+            and "JOIN dispatcher.agents" in sql
+            and "JOIN dispatcher.failures" in sql
+            and "interval '6 hours'" in sql
+        ]
+        assert len(fleet_selects) == 1
+        _sql, params = fleet_selects[0]
+        assert params == (5,), (
+            f"override cap should be 5; got {params!r}. SQL: {_sql!r}"
+        )
+
+    def test_cap_uses_limit_parameter_not_hardcoded_literal(self) -> None:
+        """Regression guard: the SELECT must use a bound ``%s`` parameter
+        for LIMIT, not a hardcoded literal like ``LIMIT 20`` (which was
+        the pre-#3057 behavior that produced the anchor-bias failure)."""
+        cursor = _FakeCursor()
+        cursor.fetch_queue.append((3008, "", None))
+        cursor.fetch_queue.append(None)  # _cb_config_int → default
+        cursor.fetchall_queue.extend([[], [], [], []])
+        d = _make_daemon(cursor)
+        with patch("dispatcher.daemon.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            d._build_diagnoser_context(self._build_candidate())
+
+        fleet_selects = [
+            sql
+            for (sql, _params) in cursor.executed
+            if "FROM dispatcher.diagnoses d" in sql
+            and "JOIN dispatcher.agents" in sql
+            and "interval '6 hours'" in sql
+        ]
+        assert len(fleet_selects) == 1
+        sql = fleet_selects[0]
+        # The old behavior baked 20 into the SQL string. The new behavior
+        # must parameterize the cap.
+        assert "LIMIT 20" not in sql, (
+            "LIMIT 20 literal still present — the #3057 fix should use "
+            "``LIMIT %s`` with the configurable cap"
+        )
+        assert "LIMIT %s" in sql, (
+            "expected ``LIMIT %s`` in fleet-decisions SELECT (issue #3057)"
+        )
+
+    def test_simulated_pat_cascade_context_does_not_crash_with_new_cap(
+        self,
+    ) -> None:
+        """Golden regression test for the anchor-bias bug (issue #3057).
+
+        Simulates the exact failure context from 2026-04-23: a failure
+        with a ``FAILED: coverage floor`` stderr arrives while the
+        fleet-decisions queue is dominated by ``block_on_existing_task →
+        #3038`` PAT-cascade decisions. The daemon-side context bundler
+        should now cap at 3 entries (down from 20) — limiting the LLM's
+        exposure to the PAT pattern.
+
+        The full anti-hallucination behavior is LLM-side (skill §Step 1
+        mandates a verbatim stderr quote before consulting priors), so
+        this test locks the structural half: the context bundle the
+        daemon hands the skill contains at most 3 fleet decisions, even
+        when the DB has more. The SQL ``LIMIT 3`` enforces the cap
+        server-side; this test asserts the Python-side bundle respects
+        it when the DB honors the LIMIT.
+        """
+        from datetime import datetime, timezone
+
+        cursor = _FakeCursor()
+        cursor.fetch_queue.append((2613, "", None))  # agents row for #2613
+        cursor.fetch_queue.append(None)  # _cb_config_int → default 3
+        t = datetime(2026, 4, 23, 6, 59, 0, tzinfo=timezone.utc)
+
+        # Simulate the DB-respected LIMIT 3 — three PAT-cascade decisions.
+        # (In real life, 9+ existed in the diagnoses table; the SQL
+        # LIMIT 3 means only the 3 most-recent come back.)
+        pat_decisions = [
+            (
+                300 + i,
+                f"agent-{i:02d}",
+                3008 + i,
+                "pre_push_hook_rejected",
+                {
+                    "action": "block_on_existing_task",
+                    "reasoning": (
+                        "PAT-scope cascade — refusing to allow a Personal "
+                        "Access Token to create or update workflow "
+                        ".github/workflows/.* without workflow scope. "
+                        "Tracked at #3038."
+                    ),
+                    "blocker_issue_number": 3038,
+                },
+                t,
+            )
+            for i in range(3)
+        ]
+        cursor.fetchall_queue.extend(
+            [
+                [],  # phase_transitions
+                [],  # prior_failures
+                [],  # prior_diagnoses_this_issue
+                pat_decisions,  # recent_fleet_decisions (capped at 3)
+            ]
+        )
+        candidate = {
+            "failure_id": 99,
+            "agent_id": "6d4029f0",
+            # A coverage-floor failure comes in as pre_push_hook_rejected
+            # category (the pre-push hook is what aborted).
+            "category": FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED,
+            "tier": 2,
+            "issue_number": 2613,
+            "details": {
+                "stderr_tail": (
+                    "pre-push: checking coverage floor for 'scraper-framework'...\n"
+                    "  FAILED: coverage floor for scraper-framework\n"
+                    "  Last 20 lines of output:\n"
+                    "    FAIL: packages/scraper-framework: coverage dropped "
+                    "80.0% -> 68.6% (floor violation)\n"
+                    "pre-push: 1 check(s) failed. Push aborted."
+                )
+            },
+            "failure_ts": None,
+        }
+        d = _make_daemon(cursor)
+        with patch("dispatcher.daemon.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            bundle = d._build_diagnoser_context(candidate)
+
+        # Structural assertion: the bundle's recent_fleet_decisions has
+        # at most 3 entries (SQL LIMIT 3 with default cap).
+        assert len(bundle["recent_fleet_decisions"]) <= 3
+        assert len(bundle["recent_fleet_decisions"]) == 3
+
+        # The fleet-decisions SELECT was called with LIMIT 3 bound param.
+        fleet_selects = [
+            (sql, params)
+            for (sql, params) in cursor.executed
+            if "FROM dispatcher.diagnoses d" in sql and "interval '6 hours'" in sql
+        ]
+        assert fleet_selects[0][1] == (3,)
+
+
+# --------------------------------------------------------------------------
 # AC#5 — new action handlers
 # --------------------------------------------------------------------------
 

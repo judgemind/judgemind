@@ -14901,6 +14901,16 @@ class DispatcherDaemon:
                 except Exception:  # pragma: no cover
                     pass
 
+        # Issue #3057 — cap the fleet-decisions bundle at N (default 3)
+        # to defuse anchor-bias on the Opus diagnoser. Prior behavior
+        # (LIMIT 20) let 9+ identical ``block_on_existing_task`` rows
+        # dominate the LLM's reasoning; on 2026-04-23 the diagnoser
+        # hallucinated a PAT-cascade push-rejection on a coverage-floor
+        # failure because of that pattern. With 3 most-recent entries
+        # the fleet-wide signal is still visible but cannot drown out
+        # the actual stderr. Operators can tune via
+        # ``dispatcher.config.diagnoser_fleet_decisions_cap``.
+        fleet_cap = self._cb_config_int("diagnoser_fleet_decisions_cap", 3)
         recent_fleet_decisions: list[dict[str, Any]] = []
         try:
             with self._conn.cursor() as cur:
@@ -14912,7 +14922,8 @@ class DispatcherDaemon:
                     "JOIN dispatcher.failures f ON f.failure_id = d.failure_id "
                     "WHERE d.status = 'completed' "
                     "  AND d.completed_at > now() - interval '6 hours' "
-                    "ORDER BY d.completed_at DESC LIMIT 20",
+                    "ORDER BY d.completed_at DESC LIMIT %s",
+                    (fleet_cap,),
                 )
                 rows = cur.fetchall()
             self._conn.commit()
