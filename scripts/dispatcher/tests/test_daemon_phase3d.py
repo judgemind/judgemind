@@ -558,6 +558,51 @@ class TestSpawnDiagnoserSubprocess:
         d._spawn_diagnoser_subprocess(42)
         assert "--dangerously-skip-permissions" in captured["cmd"], captured["cmd"]
 
+    def test_popen_cwd_is_baseline_repo_root(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issue #3033 — ``_spawn_diagnoser_subprocess`` must launch the
+        ``claude`` CLI with ``cwd=str(baseline_repo_root)`` so the
+        ``/diagnose-failure`` skill is discoverable.
+
+        The Fargate dispatcher image's ``WORKDIR`` is ``/app``; only
+        ``scripts/dispatcher/`` and a few hook files are ``COPY``ed
+        into it. ``.claude/skills/diagnose-failure/`` lives exclusively
+        in the baseline git clone at ``self._cfg.baseline_repo_root``
+        (e.g. ``/var/lib/dispatcher/repo``). Without ``cwd=`` set on
+        the Popen call, the child inherits ``/app`` as cwd and the
+        skill isn't found — ``claude`` exits in <11s with a NULL
+        recommendation. Five consecutive production failures with
+        sub-11s durations and NULL recommendation (see #3033 evidence
+        table) confirmed the bug before this fix landed.
+
+        Phase spawns (``_spawn_phase_subprocess``) already set
+        ``cwd=str(worktree)`` correctly because each worktree is a
+        ``git-worktree`` off the baseline clone and so contains the
+        full ``.claude/skills/`` tree. The diagnoser has no worktree —
+        it runs at the baseline clone root directly."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        # Point the daemon at a concrete baseline-repo-root path so the
+        # assertion compares to a known value. Production sets this via
+        # ``DaemonConfig.baseline_repo_root = Path("/var/lib/dispatcher/repo")``.
+        d._cfg.baseline_repo_root = tmp_path
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], kwargs: dict[str, Any]) -> None:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
+        d._spawn_diagnoser_subprocess(42)
+        assert "cwd" in captured["kwargs"], (
+            "Popen must be invoked with cwd= so the /diagnose-failure skill is "
+            f"discoverable (got kwargs={sorted(captured['kwargs'])})"
+        )
+        assert captured["kwargs"]["cwd"] == str(tmp_path), (
+            f"Popen cwd must be the baseline_repo_root path. "
+            f"Expected {tmp_path!s}, got {captured['kwargs']['cwd']!r}"
+        )
+
 
 # --------------------------------------------------------------------------
 # _read_recommendation — JSONB round-trip + validation
