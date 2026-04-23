@@ -454,7 +454,11 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
                 extra_kwargs["dept_judge_map"] = sf_dept_judge_map
 
             scraper = scraper_cls(
-                config=config, archiver=archiver, event_bus=event_bus, **extra_kwargs
+                config=config,
+                archiver=archiver,
+                event_bus=event_bus,
+                db_conn=db_conn,
+                **extra_kwargs,
             )
 
             run_start = time.monotonic()

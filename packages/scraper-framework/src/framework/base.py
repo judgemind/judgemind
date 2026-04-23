@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import structlog
 
+from .capture_dedup import content_hash_seen_at, record_capture_dedup_skipped
 from .css_inliner import inline_css
 from .events import EventBus
 from .hashing import sha256_hex
@@ -66,10 +67,12 @@ class BaseScraper(abc.ABC):
         config: ScraperConfig,
         archiver: S3Archiver | None = None,
         event_bus: EventBus | None = None,
+        db_conn: object = None,
     ) -> None:
         self.config = config
         self._archiver = archiver
         self._event_bus = event_bus
+        self._db_conn = db_conn
         self._log = structlog.get_logger(__name__).bind(scraper_id=config.scraper_id)
 
     # ------------------------------------------------------------------
@@ -119,8 +122,9 @@ class BaseScraper(abc.ABC):
 
             for doc in docs:
                 try:
-                    self._process_document(doc)
-                    records_captured += 1
+                    captured = self._process_document(doc)
+                    if captured:
+                        records_captured += 1
                 except Exception as exc:
                     self._log.error(
                         "Failed to process document",
@@ -181,8 +185,11 @@ class BaseScraper(abc.ABC):
         if not cond:
             raise ScraperPreconditionFailure(msg)
 
-    def _process_document(self, doc: CapturedDocument) -> None:
+    def _process_document(self, doc: CapturedDocument) -> bool:
         """Inline CSS → hash → derive deterministic ID → parse → archive → emit.
+
+        Returns ``True`` if the document was fully processed (archive + emit),
+        or ``False`` if it was skipped due to capture-path content-hash dedup.
 
         For HTML-format documents, external CSS is inlined into the HTML before
         hashing so that archived documents are self-contained and render
@@ -216,6 +223,33 @@ class BaseScraper(abc.ABC):
                 )
 
         doc.content_hash = sha256_hex(doc.raw_content)
+
+        # Capture-path content-hash dedup (#2655): if an identical document
+        # was already captured within the look-back window, skip re-archival
+        # and re-emission.  The check is best-effort — any error returns None
+        # and the scraper continues normally.
+        winner_id = content_hash_seen_at(self._db_conn, self.config.county, doc.content_hash)
+        if winner_id is not None:
+            self._log.warning(
+                "capture-path content-hash dedup — skipping re-capture",
+                extra={
+                    "event": "capture_content_hash_dedup_skipped",
+                    "winner_document_id": winner_id,
+                    "new_source_url": doc.source_url,
+                    "county": self.config.county,
+                    "scraper_id": self.config.scraper_id,
+                },
+            )
+            record_capture_dedup_skipped(
+                self._db_conn,
+                county=self.config.county,
+                content_hash=doc.content_hash,
+                winner_document_id=winner_id,
+                new_source_url=doc.source_url,
+                scraper_id=self.config.scraper_id,
+            )
+            return False
+
         # Deterministic document_id: same content → same UUID → dedup works.
         # uuid5 with NAMESPACE_URL is a standard way to derive reproducible
         # UUIDs from a string key (here, the SHA-256 hex digest).
@@ -250,6 +284,8 @@ class BaseScraper(abc.ABC):
 
         if self._event_bus:
             self._event_bus.emit_document_captured(doc, producer_id=self.config.scraper_id)
+
+        return True
 
     def _make_base_doc(
         self, source_url: str, raw_content: bytes, content_format: object

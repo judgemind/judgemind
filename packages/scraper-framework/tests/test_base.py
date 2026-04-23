@@ -415,3 +415,79 @@ def test_require_precondition_surfaces_as_run_failure() -> None:
     assert health.records_captured == 0
     assert health.error_message is not None
     assert "missing" in health.error_message
+
+
+# ---------------------------------------------------------------------------
+# Capture-path content-hash dedup (#2655)
+# ---------------------------------------------------------------------------
+
+
+def test_capture_dedup_skips_archive_and_emit() -> None:
+    """When content_hash_seen_at returns a winner id, archive and emit are NOT called
+    and the log contains event=capture_content_hash_dedup_skipped.
+    """
+    from unittest.mock import patch
+
+    config = _make_config()
+    doc = _make_doc(config)
+    mock_archiver = MagicMock()
+    mock_bus = MagicMock()
+    winner_id = "winner-document-uuid"
+
+    with (
+        patch("framework.base.content_hash_seen_at", return_value=winner_id),
+        structlog.testing.capture_logs() as cap_logs,
+    ):
+        scraper = DummyScraper(
+            docs=[doc],
+            config=config,
+            archiver=mock_archiver,
+            event_bus=mock_bus,
+            db_conn=MagicMock(),
+        )
+        health = scraper.run()
+
+    # Archive and emit must be skipped when dedup fires
+    mock_archiver.archive.assert_not_called()
+    mock_bus.emit_document_captured.assert_not_called()
+
+    # Health still reports zero captured (dedup = not a new capture)
+    assert health.records_captured == 0
+
+    # The structured log should contain the dedup warning
+    dedup_logs = [
+        e
+        for e in cap_logs
+        if e.get("log_level") == "warning" and "dedup" in e.get("event", "").lower()
+    ]
+    assert dedup_logs, f"Expected dedup warning log event, got: {cap_logs!r}"
+    # The extra dict should carry the event key for downstream log processors
+    extra = dedup_logs[0].get("extra", {})
+    assert extra.get("event") == "capture_content_hash_dedup_skipped"
+
+
+def test_capture_dedup_miss_allows_archive_and_emit() -> None:
+    """When content_hash_seen_at returns None (miss), archive and emit still run
+    (regression guard — dedup must not affect the happy path).
+    """
+    from unittest.mock import patch
+
+    config = _make_config()
+    doc = _make_doc(config)
+    mock_archiver = MagicMock()
+    mock_archiver.archive.return_value = "ca/test/key.html"
+    mock_bus = MagicMock()
+
+    with patch("framework.base.content_hash_seen_at", return_value=None):
+        scraper = DummyScraper(
+            docs=[doc],
+            config=config,
+            archiver=mock_archiver,
+            event_bus=mock_bus,
+            db_conn=MagicMock(),
+        )
+        health = scraper.run()
+
+    mock_archiver.archive.assert_called_once()
+    mock_bus.emit_document_captured.assert_called_once()
+    assert health.records_captured == 1
