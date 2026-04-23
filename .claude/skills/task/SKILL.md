@@ -498,9 +498,10 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 The PR has passed the ralph loop review (A.2) and CI is green. **Before merging, confirm the merge gate is green.** The gate is:
 
 1. `mergeable == MERGEABLE` (GitHub can compute a merge commit — no conflicts), AND
-2. Every *latest* check run on the PR's head SHA has `conclusion` of `SUCCESS` or `SKIPPED` (no `FAILURE`, `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED`, or `STARTUP_FAILURE`).
+2. The required status check `ci-passed` has `conclusion: SUCCESS` on its latest run, AND
+3. No *latest* check has `conclusion: FAILURE`.
 
-`mergeStateStatus == UNSTABLE` is **not** a blocker when gate (2) passes — see `docs/agent/code-standards.md` §Interpreting mergeStateStatus (UNSTABLE-but-green) for why. Use the one-line recipe:
+`SKIPPED` is fine, and `CANCELLED` on a non-required check (typically Vercel / Smoke Test concurrency cancellation) is fine. `mergeStateStatus == UNSTABLE` is **not** a blocker when the three gates above pass — see `docs/agent/code-standards.md` §Interpreting mergeStateStatus (UNSTABLE-but-green) for why. Use the one-line recipe:
 
 ```
 gh pr view <PR-N> --repo judgemind/judgemind \
@@ -508,7 +509,7 @@ gh pr view <PR-N> --repo judgemind/judgemind \
   --jq '{mergeable, rollup: [.statusCheckRollup[] | {name, conclusion}]}'
 ```
 
-If `mergeable` is `MERGEABLE` and no `conclusion` is a failure state, merge (stays on `gh` — MCP's `merge_pull_request` has no `--delete-branch` flag):
+If `mergeable` is `MERGEABLE`, `ci-passed` is `SUCCESS`, and nothing is `FAILURE`, merge (stays on `gh` — MCP's `merge_pull_request` has no `--delete-branch` flag):
 ```
 gh pr merge <PR-N> --repo judgemind/judgemind --squash --delete-branch
 ```
