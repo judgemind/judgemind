@@ -173,6 +173,31 @@ Then commit the updated `schema.sql` alongside the migration. `schema.sql` is au
 
 The same check runs in CI as the `schema-drift-check` job. The pre-push hook runs it whenever a `packages/api/migrations/*.sql` file is in the push (requires Docker + a running daemon; emits a WARNING and skips if Docker is unavailable), so migration-vs-schema drift is caught locally before the ~10 minute CI round trip. See #2702.
 
+### macOS bash 3.2 compatibility
+
+Operator laptops run macOS, which ships with bash 3.2.57 (Apple has frozen the OS bash at 3.2 since 2007 for GPLv3 licensing reasons). Shell scripts in this repo — especially `scripts/check-*.sh` hygiene guards and `scripts/tests/*.sh` unit tests — are run both from CI (ubuntu-latest, bash 5+) and from operator shells. A script that uses a bash 4+ feature passes CI but fails locally with a cryptic message such as `mapfile: command not found` (exit 127) or `bad substitution`.
+
+**`scripts/check-bash-compat.sh` enforces this**, scanning every `scripts/**/*.sh` file for the forbidden constructs below and exiting non-zero on a match. It is wired into the `scripts-tests` CI job (same path filter as the other hygiene checks). Comment lines are exempted, so prose referencing a forbidden token (e.g., "we avoid `mapfile` because...") is fine.
+
+**Forbidden constructs** (each has a bash 3.2-compatible rewrite):
+
+| Construct | Bash 3.2 behaviour | Use instead |
+|-----------|-------------------|-------------|
+| `mapfile` / `readarray` (bash 4+ builtin) | `command not found` → exit 127 | `while IFS= read -r line; do arr+=("$line"); done < <(cmd)` |
+| `declare -A` / `typeset -A` (bash 4+ associative arrays) | `declare: -A: invalid option` | Parallel indexed arrays, or namespaced variables (`var_foo`, `var_bar`) |
+| `declare -g` (bash 4.2+ global from function) | `declare: -g: invalid option` | Plain assignment at global scope, or `VAR=$(fn)` at caller |
+| `${var,,}` / `${var,}` / `${var^^}` / `${var^}` (bash 4+ case conversion) | `bad substitution` | `tr '[:upper:]' '[:lower:]'` (or the reverse) |
+| `local -n` / `declare -n` / `typeset -n` (bash 4.3+ namerefs) | `local: -n: invalid option` | Pass by value and return via stdout: `r=$(fn "$x")` |
+| `;;&` in `case` (bash 4+ fall-through) | `syntax error near unexpected token &` | Separate `if` arms, or repeat the body |
+| `\|&` pipe shorthand (bash 4+ pipe-both-streams) | `syntax error near unexpected token &` | `2>&1 \|` (more explicit and bash 3.2+ compatible) |
+
+**Not forbidden** (these work on bash 3.2):
+- `echo -e` — bash 3.2's `echo` builtin supports `-e`.
+- Process substitution `< <(...)` — bash 3.2 supports it.
+- `[[ ... ]]` conditionals, `$(...)` command substitution, indexed arrays — all bash 2+.
+
+**Historical context.** Two earlier check scripts (`scripts/check-admin-dispatcher-brand-accent.sh`, `scripts/check-no-inline-ecs-healthcheck.sh`) and the `scripts/check-terminal-routing-comments.sh` guard each carry inline comments explaining why they avoid `mapfile` — the convention existed as tribal knowledge for months. PR #3081's first draft still used `mapfile -t` and silently exited 127 on the operator's laptop; the author found the precedent only by grepping peer check scripts. Issue #3082 codified the convention into `check-bash-compat.sh` + this docs section.
+
 ### Hygiene-check CI steps
 
 When wiring a `scripts/check-no-*.sh`, `scripts/check-forbidden-*.sh`, or `scripts/check-deprecated-*.sh` guard into `.github/workflows/ci.yml`, **do not quote the forbidden string in the step's `name:` field** — the quoted pattern itself will trip the guard on the next CI run (see #2541/#2542 for the specific incident). Name the step after what the check *does* instead of what it *forbids* (e.g., name it after the replacement tool or the category of misuse, not the literal string).
