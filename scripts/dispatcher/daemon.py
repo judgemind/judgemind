@@ -822,6 +822,21 @@ FAILURE_CATEGORY_CI_RED_AFTER_RETRIES = "ci_red_after_retries"
 FAILURE_CATEGORY_RALPH_AC_INFEASIBLE = "ralph_ac_infeasible"
 FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE = "summary_ac_infeasible"
 
+#: Tier-3 failure category from issue #3054 — ralph terminated cleanly
+#: with a non-SHIP verdict (REVISE-exhausted or worker-STUCK twice, any
+#: verdict that is not ``SHIP`` or ``AC_INFEASIBLE``). Pre-#3054 this
+#: path emitted a ``ralph_not_ship`` log event and called
+#: :meth:`_mark_agent_terminal` directly, skipping the failure-row +
+#: diagnoser routing that #3032 unified for other agent-terminal
+#: failures. The consequence was invisible failures for operators and
+#: a daemon re-pick bleed on the same issue (observed on #2629, #2630,
+#: #2633 on 2026-04-23). Routing through ``_handle_agent_failure``
+#: writes a ``dispatcher.failures`` row the diagnoser picks up on the
+#: next supervisor tick — ``block_on_existing_task`` /
+#: ``file_prerequisite_task`` / ``block_and_comment`` all apply
+#: depending on the ``block_reason`` text ralph surfaced.
+FAILURE_CATEGORY_RALPH_NOT_SHIP = "ralph_not_ship"
+
 #: Git-push failure categories for the ``push_and_pr`` phase (issue #2902).
 #: ``push_failed`` is the generic catch-all; the two sub-kinds are
 #: classifier-derived from stderr content via ``_classify_push_failure``.
@@ -1050,11 +1065,18 @@ TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
 #: impossible (non-existent symbol, self-contradiction, out-of-scope
 #: dependency); no mechanical retry fixes a malformed AC, so the
 #: diagnoser picks ``reissue`` / ``escalate`` / ``close`` immediately.
+#: ``ralph_not_ship`` (issue #3054) — ralph terminated cleanly with a
+#: non-SHIP verdict (REVISE-exhausted or worker-STUCK twice). Mirrors
+#: the AC-infeasible category qualitatively: "implementation blocked"
+#: with no mechanical retry that reliably fixes it; the diagnoser
+#: picks ``block_on_existing_task`` / ``file_prerequisite_task`` /
+#: ``block_and_comment`` based on ralph's ``block_reason`` text.
 TIER_3_CATEGORIES: frozenset[str] = frozenset(
     {
         FAILURE_CATEGORY_CI_RED_AFTER_RETRIES,
         FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
         FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
+        FAILURE_CATEGORY_RALPH_NOT_SHIP,
     }
 )
 
@@ -8837,6 +8859,19 @@ class DispatcherDaemon:
             return False
 
         if verdict != "SHIP":
+            # Issue #3054 — ralph terminated cleanly with a non-SHIP
+            # verdict (REVISE-exhausted or worker-STUCK twice). Route
+            # through the unified failure handler so the diagnoser
+            # picks this up on the next supervisor tick (see #3032 for
+            # the general policy and the ``FAILURE_CATEGORY_RALPH_NOT_SHIP``
+            # docstring for the motivation). Pre-#3054 this path
+            # emitted only the ``ralph_not_ship`` log event and called
+            # ``_mark_agent_terminal`` directly, which meant no
+            # ``dispatcher.failures`` row was written and the diagnoser
+            # never ran — leaving operators to read ralph-done.txt +
+            # CloudWatch to know why an agent stalled.
+            block_reason = ralph_output.get("block_reason")
+            iterations_used = ralph_output.get("iterations_used")
             self._log.info(
                 "daemon.ralph_not_ship",
                 extra={
@@ -8844,14 +8879,23 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "verdict": verdict,
-                    "block_reason": ralph_output.get("block_reason"),
+                    "block_reason": block_reason,
+                    "iterations_used": iterations_used,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="ralph",
+                category=FAILURE_CATEGORY_RALPH_NOT_SHIP,
+                stderr_tail="",
                 exit_code=exit_code,
+                details={
+                    "verdict": verdict,
+                    "block_reason": block_reason,
+                    "iterations_used": iterations_used,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
                 issue_number=issue_number,
             )
             return False
