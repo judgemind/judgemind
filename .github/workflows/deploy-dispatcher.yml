@@ -36,6 +36,15 @@ on:
       # a rollout. Excluded so new helpers can be added without a
       # gratuitous redeploy or a workflow-yml edit each time.
       - "!scripts/dispatcher/helpers/**"
+      # scripts/dispatcher/tests/ is pytest-only — never imported by
+      # daemon.py at runtime, so changes there do not affect the built
+      # image's behavior. Excluded so test-only PRs don't trigger a
+      # full daemon redeploy that kills in-flight agents (see #3112).
+      - "!scripts/dispatcher/tests/**"
+      # Markdown docs scattered throughout the dispatcher tree are
+      # operator-facing only and have no runtime effect. Excluded so
+      # doc-only tweaks don't force a rollout.
+      - "!scripts/dispatcher/**/*.md"
       # scripts/dispatcher/agent-runner-entrypoint.sh is the entrypoint
       # for the separate `judgemind/dispatcher-agent-runner` image
       # (#3090, Stage 1b of #3086). It is NOT baked into the daemon
