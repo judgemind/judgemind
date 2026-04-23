@@ -23,6 +23,54 @@ Diagnoser for the dispatcher v2 failure flow (`docs/specs/dispatcher-v2-spec.md`
 
 ---
 
+## Step 1 — Parse the failure signature FIRST (anchor-bias defense — issue #3057)
+
+**This is a mandatory first step.** Before you read `prior_diagnoses_this_issue`, `recent_fleet_decisions`, or any other pattern-bearing field in the context bundle, find the **actual failure signature in the raw stderr** and quote it verbatim.
+
+**The rule: the stderr is ground truth; prior decisions are priors, not evidence.**
+
+### Procedure
+
+1. From the context bundle, locate the raw stderr text. Depending on the category, it lives in one of:
+   - `context.prior_failures[0].details.stderr_tail` (the most recent failure on this issue, when it matches the triggering failure_id)
+   - `context.details.stderr_tail` (when the daemon inlined the triggering failure's details at the top level — category-dependent)
+   - The `ralph_done_content` string (for ralph-phase failures)
+   - The `ci_log_url` / `gh run view --log-failed` output (for `ci_red_after_retries`)
+
+2. Scan the stderr from the **bottom up** and extract the **last** concrete failure line. "Concrete" means one of:
+   - A line starting with `FAILED:` (pre-push hook convention)
+   - A line containing `[remote rejected]` or `! [rejected]` (git push output)
+   - A line starting with `error:` or `fatal:` (git / ruff / pytest conventions)
+   - An explicit banner like `Push aborted.`, `check(s) failed.`, `tests failed`, `coverage dropped`, `floor violation`
+   - For pytest: the last `FAILED packages/... ::test_name` line from the summary
+   - For CI log: the last `##[error]` line or the last non-zero-exit line
+
+3. **Quote that line verbatim** in the `reasoning` field of your final recommendation. Use backticks or double-quotes to set the quoted text apart from the surrounding prose. **Do not paraphrase, do not summarize, do not compress.** Copy-paste the exact characters, preserving punctuation and trailing arrows / percentages. Example acceptable opening sentences:
+
+   > The stderr ends with `"FAILED: coverage floor for scraper-framework"` followed by `"FAIL: packages/scraper-framework: coverage dropped 80.0% -> 68.6% (floor violation)"`. This is a local pre-push hook abort — the push never reached the remote. Filing a prerequisite task to restore the coverage floor.
+
+   > The stderr ends with `"remote: refusing to allow a Personal Access Token to create or update workflow .github/workflows/cc-retired-watchdog.yml without workflow scope"` and `"! [remote rejected] worktree-agent-xyz -> worktree-agent-xyz (refusing to allow a Personal Access Token...)"`. This is the known PAT-scope cascade tracked at #3038.
+
+4. **Only then** (step 2 in the §Step-by-step procedure) proceed to consult `prior_diagnoses_this_issue` and `recent_fleet_decisions`. Treat them as priors — useful for detecting fleet-wide spates, dangerous as substitutes for reading the stderr.
+
+### Why this step exists
+
+On 2026-04-23 the Opus diagnoser hallucinated a PAT-scope cascade push-rejection on a coverage-floor failure. Diagnosis #15 (agent `6d4029f0`, issue #2613) had `recent_fleet_decisions` populated with 9 prior `block_on_existing_task → #3038` decisions — all legitimate PAT cascades on different issues. The actual stderr ended with `"FAILED: coverage floor"` + `"coverage dropped 80.0% -> 68.6%"` and the push never reached the remote (pre-push hook aborted locally). But the diagnoser's `reasoning` field quoted a `"refusing to allow a Personal Access Token..."` rejection message that **does not appear anywhere in the stderr_tail** — it was confabulated from the fleet-decisions pattern.
+
+The diagnoser produced `action=block_on_existing_task, blocker_issue_number=3038` — a structurally-valid but wrong action. #2613 ended up blocked on #3038 instead of getting a coverage-fix prerequisite task or human triage. See issue #3057 for the full forensic.
+
+**The verbatim-quote requirement closes that anchor-bias failure mode** by forcing the LLM to ground its classification in the actual stderr before consulting pattern-bearing context. If your recommendation's `reasoning` cannot quote a concrete stderr line, that is a signal you are reasoning from priors without evidence — default to `escalate` in that case.
+
+### When the stderr has no identifiable failure line
+
+If the stderr is truly empty, or contains only progress output with no `FAILED:` / `error:` / `[remote rejected]` / banner, say so verbatim in the reasoning:
+
+> `stderr_tail` contains no FAILED: / [remote rejected] / error: line — only progress output from the phase.
+
+Then proceed to step 3 (§Step-by-step procedure) with `escalate` as the strong default. Do not invent a failure line from priors.
+
+---
+
 ## Input contract
 
 The argument is a single integer `diagnosis_id` (from `dispatcher.diagnoses.diagnosis_id`).
@@ -64,7 +112,7 @@ The `context` JSONB contains (schema stable — the daemon serializes this):
 - `recent_phase_transitions` (list of `{phase, ts}`) — last ~10 transitions for this agent, newest first.
 - `prior_failures` (list of `{failure_id, category, ts, details}`) — prior `dispatcher.failures` rows on the same issue across all agents (not just this one).
 - `prior_diagnoses_this_issue` (list of `{diagnosis_id, failure_category, recommendation, completed_at}`) — prior completed diagnoses on the same `issue_number`. **Use this to avoid repeating a decision that already failed** — e.g. if `retry` was recommended twice and the failure recurred twice, escalate or change strategy. (Added in #3032.)
-- `recent_fleet_decisions` (list of `{diagnosis_id, agent_id, issue_number, failure_category, action, reasoning, completed_at}`) — the diagnoser's last ~20 decisions across ALL issues in the past 6 hours. **Use this to detect fleet-wide spates** — if 5 different issues hit the same failure class today, the right action may be `file_prerequisite_task` or `escalate`, not patch-per-issue. (Added in #3032. The PAT-scope cascade on 2026-04-22/23 is the canonical example.)
+- `recent_fleet_decisions` (list of `{diagnosis_id, agent_id, issue_number, failure_category, action, reasoning, completed_at}`) — the diagnoser's most-recent decisions across ALL issues in the past 6 hours. Capped at 3 entries by default (tunable via `dispatcher.config.diagnoser_fleet_decisions_cap`; see issue #3057). **Use this to detect fleet-wide spates** — if several different issues hit the same failure class today, the right action may be `file_prerequisite_task` or `escalate`, not patch-per-issue. **But treat these as priors, not evidence** — always cross-check against the verbatim stderr quote from §Step 1. (Added in #3032. The PAT-scope cascade on 2026-04-22/23 is the canonical example; the cap reduction from 20 → 3 is the anchor-bias defense for #3057.)
 - `ralph_done_content` (str | null) — contents of `{worktree}/tmp/ralph/ralph-done.txt` if present, else null.
 - `pr_url` (str | null) — if a PR was opened.
 - `pr_number` (int | null).
@@ -150,7 +198,7 @@ The recommendation JSON has this shape:
 Field rules:
 
 - `action` (required) — one of the eight known strings above, OR a novel action string if none fit. Novel actions persist to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` — use only when genuinely needed and the `reasoning` paragraph makes the intended behavior unambiguous.
-- `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. This gets surfaced in operator dashboards and the §8 weekly report. The first 1-3 sentences are also written to `dispatcher.agents.failure_summary` (issue #2900) so the admin cockpit can show an LLM-authored tooltip on hover over the outcome glyph — keep the opening sentences self-contained ("what happened + why this action"), not mid-argument.
+- `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. **The first sentence MUST include the verbatim stderr failure line you identified in §Step 1** (in backticks or double-quotes), unless the stderr genuinely had no failure line — in which case the first sentence must say so explicitly. This gets surfaced in operator dashboards and the §8 weekly report. The first 1-3 sentences are also written to `dispatcher.agents.failure_summary` (issue #2900) so the admin cockpit can show an LLM-authored tooltip on hover over the outcome glyph — keep the opening sentences self-contained ("what happened + why this action"), not mid-argument.
 - `hint` (conditional) — required when `action='retry_with_hint'`; the daemon posts it verbatim as an issue comment before enqueueing the retry marker. Ignored for other actions.
 - `new_scope` (conditional) — required when `action='reissue'`. **The daemon replaces the issue body wholesale** via `gh issue edit --body-file` (no splicing, no patching — Python writes the string to a file and `gh` edits the body). MUST be a complete, well-formed issue body with `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References` sections and any `Parent: #N` / `Blocked by #N` lines. A diff, patch, or partial body will truncate the issue. Issue #3010.
 - `title` + `body` (conditional) — required when `action='file_prerequisite_task'`. Daemon runs `gh issue create --title <title> --body-file <body>`. The title must be conventional-commits style (e.g. `chore(dispatcher): add workflow scope to dispatcher PAT`); the body must be a well-formed issue body with acceptance criteria and verify lines.
@@ -163,7 +211,7 @@ Exit 0 regardless of recommendation. If the recommendation cannot be written (DB
 
 ## Action selection — decision tree
 
-Work through these questions in order. The first "yes" determines the action.
+Work through these questions in order. The first "yes" determines the action. **Remember §Step 1: every answer must be consistent with the verbatim stderr signature you already quoted. If a prior-decisions pattern suggests one category but your stderr quote contradicts it, trust the quote.**
 
 1. **Is this failure caused by an external dependency outage or a transient GitHub/Anthropic/AWS hiccup?** (Signs: `subprocess_crash` category, stderr mentions 5xx / timeouts / DNS / network errors, prior failures on unrelated issues in the same window but NOT a fleet-wide spate on the same category.)
    - → **`retry`**. The mechanical retry already ran once (tier 2), but if the root cause was a transient that has since cleared, a second attempt may succeed. No comment needed.
@@ -189,7 +237,7 @@ Work through these questions in order. The first "yes" determines the action.
 7. **Is there an already-open tracking issue for this blocker?** (Search via `gh issue list --search "<keywords>" --state open`.)
    - → **`block_on_existing_task`** with `blocker_issue_number = <that issue>`. Avoids duplicate tickets. The daemon validates the target is open, appends `Blocked by #<N>`, applies `status/blocked`.
 
-8. **Does `recent_fleet_decisions` show this same failure class hitting 3+ different issues in the last 6 hours?** (Regardless of which single action category above fits.)
+8. **Does `recent_fleet_decisions` show this same failure class hitting 3+ different issues in the last 6 hours?** (Regardless of which single action category above fits. **Cross-check: does your verbatim stderr quote match the failure class the fleet decisions describe?** If not, the pattern is a coincidence — do not anchor on it. See §Step 1.)
    - → **`file_prerequisite_task`** or **`escalate`** — the pattern is fleet-wide, a per-issue patch won't fix it. Prefer `file_prerequisite_task` if the root cause is trackable; `escalate` if it needs a human to even diagnose.
 
 **When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context, and a wrong `block_*` may leave the issue stuck until an operator notices.
@@ -262,13 +310,15 @@ The context bundle should usually be enough. Shell out sparingly:
 
 1. **Set up.** Write `{worktree}/tmp/dispatcher-diagnoser/read_context.py` and `{worktree}/tmp/dispatcher-diagnoser/write_recommendation.py` helpers (code above). Run the reader with the `diagnosis_id` argument to pull the JSONB context into memory.
 
-2. **Classify.** Identify `failure_category` and `tier` from the context. Read `prior_mechanical_fix` (tier 2) or `ci_log_url` (tier 3) to understand what already failed. Scan `prior_diagnoses_this_issue` + `recent_fleet_decisions` for patterns.
+2. **Parse the failure signature FIRST (§Step 1 above, issue #3057).** Locate the raw `stderr_tail` in the context bundle, find the last concrete failure line (`FAILED:` / `[remote rejected]` / `error:` / banner), and write it verbatim into the `reasoning` field you will build. **Do this before reading any pattern-bearing field.** The stderr is ground truth; prior decisions are priors, not evidence.
 
-3. **Decide.** Walk the decision tree above. Do not fetch anything you don't need — context bundle first, GitHub reads only when a specific question remains.
+3. **Classify.** Identify `failure_category` and `tier` from the context. Read `prior_mechanical_fix` (tier 2) or `ci_log_url` (tier 3) to understand what already failed. Now — and only now — scan `prior_diagnoses_this_issue` + `recent_fleet_decisions` for patterns. If a pattern suggests a category that conflicts with your verbatim quote from step 2, trust the quote; the pattern is noise.
 
-4. **Write recommendation.** Serialize the recommendation dict to `{worktree}/tmp/dispatcher-diagnoser/recommendation.json`, then run the writer helper with the `diagnosis_id`, the `agent_id` (from `context.agent_id`), and the JSON file path. The helper writes both the diagnosis row AND the `dispatcher.agents.failure_summary` upgrade in one transaction — issue #2900.
+4. **Decide.** Walk the decision tree above. Do not fetch anything you don't need — context bundle first, GitHub reads only when a specific question remains.
 
-5. **Exit 0.** Done. The daemon picks up the recommendation on the next supervisor tick.
+5. **Write recommendation.** Serialize the recommendation dict to `{worktree}/tmp/dispatcher-diagnoser/recommendation.json`, then run the writer helper with the `diagnosis_id`, the `agent_id` (from `context.agent_id`), and the JSON file path. The helper writes both the diagnosis row AND the `dispatcher.agents.failure_summary` upgrade in one transaction — issue #2900.
+
+6. **Exit 0.** Done. The daemon picks up the recommendation on the next supervisor tick.
 
 ---
 
@@ -335,6 +385,18 @@ The context bundle should usually be enough. Shell out sparingly:
 }
 ```
 
+### Example 7 — coverage-floor pre-push abort, `file_prerequisite_task` (anchor-bias regression, #3057)
+
+```json
+{
+  "action": "file_prerequisite_task",
+  "reasoning": "The stderr ends with `\"FAILED: coverage floor for scraper-framework\"` followed by `\"FAIL: packages/scraper-framework: coverage dropped 80.0% -> 68.6% (floor violation)\"` and `\"1 check(s) failed. Push aborted.\"`. This is a local pre-push hook abort — the push never reached the remote. Despite several PAT-cascade decisions in recent_fleet_decisions, the verbatim stderr signature is coverage regression, not PAT scope. Filing a prerequisite task to restore the coverage floor before retrying.",
+  "title": "chore(scraper-framework): restore coverage floor after watchdog expansion",
+  "body": "## Goal\n\nRestore the `packages/scraper-framework` coverage floor to 80.0% (currently 68.6%) after the cc-retired watchdog expansion added uncovered branches.\n\n## Acceptance criteria\n- [ ] `scripts/update-coverage-baselines.py --package packages/scraper-framework` exits 0 at 80.0%+.\n  **Verify:** run pre-push hook against a no-op push on the worktree; the coverage-floor check passes.\n\n## Priority\n\np1 — blocks merge of the cc-retired watchdog work.",
+  "block_labels": ["priority/p1", "area/scraping", "agent/ready"]
+}
+```
+
 ---
 
 ## Reminders
@@ -344,3 +406,4 @@ The context bundle should usually be enough. Shell out sparingly:
 - This skill is Opus-tier per spec §18 — but the task is narrow. Do NOT over-investigate. The decision tree is intentionally short.
 - **Known actions (the daemon recognizes these eight):** `retry`, `retry_with_hint`, `reissue`, `escalate`, `close`, `block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`. You MAY propose a novel action string when none of the known set fits the situation — the daemon will log the action name and payload to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` so an operator can review it. Novel actions are an explicit escape hatch; prefer a known action when one fits.
 - Exit 0 means "recommendation written". Exit non-zero means "I could not diagnose" — the daemon falls back to fixed mechanical escalation.
+- **§Step 1 is mandatory — always quote the verbatim stderr failure line before consulting priors (issue #3057).**

@@ -354,6 +354,74 @@ class TestDiagnoseFailureContracts:
             "requirement for new_scope (issue #3010)"
         )
 
+    # ------------------------------------------------------------------
+    # Issue #3057 — anchor-bias defense contracts
+    # ------------------------------------------------------------------
+
+    def test_step_1_parse_failure_signature_section(self) -> None:
+        """SKILL.md must have a "parse the failure signature" step that
+        runs BEFORE consulting prior decisions (issue #3057)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        # The step heading. Allow either "Step 1" or "parse the failure
+        # signature" in a heading — the contract is that the first
+        # procedural step is to parse the signature, not consult priors.
+        lower = content.lower()
+        assert "parse the failure signature" in lower, (
+            "diagnose-failure/SKILL.md must have a "
+            "'parse the failure signature' step (issue #3057)"
+        )
+
+    def test_ground_truth_vs_priors_framing(self) -> None:
+        """SKILL.md must frame stderr as ground truth and prior decisions
+        as priors (not evidence). This is the core framing that defuses
+        the anchor-bias failure mode."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        lower = content.lower()
+        assert "stderr is ground truth" in lower, (
+            "diagnose-failure/SKILL.md must frame the stderr as "
+            "'ground truth' (issue #3057)"
+        )
+        assert "priors, not evidence" in lower, (
+            "diagnose-failure/SKILL.md must frame prior decisions as "
+            "'priors, not evidence' (issue #3057)"
+        )
+
+    def test_verbatim_quote_requirement(self) -> None:
+        """SKILL.md must require the diagnoser to quote the actual stderr
+        failure line verbatim in the ``reasoning`` field."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        lower = content.lower()
+        # The verbatim-quote language: must mention both "verbatim" and
+        # "reasoning" (the field where the quote lands).
+        assert "verbatim" in lower, (
+            "diagnose-failure/SKILL.md must mention 'verbatim' quoting "
+            "of the stderr failure line (issue #3057)"
+        )
+        assert "reasoning" in lower, (
+            "diagnose-failure/SKILL.md must describe where the verbatim "
+            "stderr quote lands (the ``reasoning`` field — issue #3057)"
+        )
+
+    def test_3057_issue_reference(self) -> None:
+        """SKILL.md must reference issue #3057 so future readers can
+        find the anchor-bias forensic."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "#3057" in content, (
+            "diagnose-failure/SKILL.md must reference issue #3057 "
+            "(the anchor-bias forensic that motivated §Step 1)"
+        )
+
+    def test_fleet_decisions_cap_documented(self) -> None:
+        """SKILL.md must document the configurable cap on
+        ``recent_fleet_decisions`` (issue #3057 — default 3, tunable
+        via ``dispatcher.config.diagnoser_fleet_decisions_cap``)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "diagnoser_fleet_decisions_cap" in content, (
+            "diagnose-failure/SKILL.md must document the tunable cap "
+            "``dispatcher.config.diagnoser_fleet_decisions_cap`` "
+            "(issue #3057)"
+        )
+
 
 # ------------------------------------------------------------------
 # Issue #3017 — Per-skill heartbeat lines contract coverage.
