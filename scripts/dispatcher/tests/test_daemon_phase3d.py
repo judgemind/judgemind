@@ -1253,11 +1253,24 @@ class TestConstants:
         assert daemon.FAILURE_CATEGORY_CI_RED_AFTER_RETRIES == "ci_red_after_retries"
 
     def test_diagnoser_actions_exhaustive(self) -> None:
-        # Spec §8 lists exactly 5 actions. Lock it in so a sixth cannot
-        # be added without also updating the daemon's deterministic
-        # consumer (`_consume_diagnosis` has explicit branches).
+        # Issue #3032 expanded the known action set from 5 to 8. The
+        # daemon's consumer still has an explicit switch so any
+        # addition here must also land in ``_consume_diagnosis``. The
+        # closed-enum guardrail in the diagnoser skill itself is
+        # REMOVED — novel LLM-proposed actions persist to the
+        # ``dispatcher.unrecognized_diagnoser_actions`` table and fall
+        # back to ``escalate``.
         assert daemon.DIAGNOSER_ACTIONS == frozenset(
-            {"retry", "retry_with_hint", "reissue", "escalate", "close"}
+            {
+                "retry",
+                "retry_with_hint",
+                "reissue",
+                "escalate",
+                "close",
+                "block_and_comment",
+                "file_prerequisite_task",
+                "block_on_existing_task",
+            }
         )
 
     def test_tier_sets_are_disjoint(self) -> None:

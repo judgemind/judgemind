@@ -202,16 +202,39 @@ class TestClassifyPushFailure:
 
 
 class TestAutoRetryCategories:
-    """AC#2 — all three push failure categories are in AUTO_RETRY_CATEGORIES."""
+    """Issue #3032 moved push failure categories out of AUTO_RETRY_CATEGORIES.
 
-    def test_auto_retry_categories_include_push_failed(self) -> None:
-        assert FAILURE_CATEGORY_PUSH_FAILED in AUTO_RETRY_CATEGORIES
+    Before #3032 all three push sub-kinds (``push_failed``,
+    ``pre_push_hook_rejected``, ``git_push_network``) were tier-1
+    auto-retry. The 6-failure PAT-scope cascade on #3008 / #2610
+    showed that blind retry on a deterministic operator-action
+    blocker (e.g. GitHub PAT missing workflow scope) burns CI time
+    without progress. The diagnoser now owns the retry-vs-escalate
+    decision for all three — the unified ``_handle_agent_failure``
+    exit path writes the failure row, the next supervisor tick
+    picks it up via ``_find_diagnoser_candidates``, and Opus
+    decides.
+    """
 
-    def test_auto_retry_categories_include_pre_push_hook_rejected(self) -> None:
-        assert FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED in AUTO_RETRY_CATEGORIES
+    def test_auto_retry_categories_excludes_push_failed(self) -> None:
+        assert FAILURE_CATEGORY_PUSH_FAILED not in AUTO_RETRY_CATEGORIES
 
-    def test_auto_retry_categories_include_git_push_network(self) -> None:
-        assert FAILURE_CATEGORY_GIT_PUSH_NETWORK in AUTO_RETRY_CATEGORIES
+    def test_auto_retry_categories_excludes_pre_push_hook_rejected(self) -> None:
+        assert FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED not in AUTO_RETRY_CATEGORIES
+
+    def test_auto_retry_categories_excludes_git_push_network(self) -> None:
+        assert FAILURE_CATEGORY_GIT_PUSH_NETWORK not in AUTO_RETRY_CATEGORIES
+
+    def test_push_categories_now_in_tier_2_first_occurrence(self) -> None:
+        # Issue #3032: push failures now diagnose on first occurrence.
+        from dispatcher.daemon import TIER_2_FIRST_OCCURRENCE_CATEGORIES
+
+        assert FAILURE_CATEGORY_PUSH_FAILED in TIER_2_FIRST_OCCURRENCE_CATEGORIES
+        assert (
+            FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED
+            in TIER_2_FIRST_OCCURRENCE_CATEGORIES
+        )
+        assert FAILURE_CATEGORY_GIT_PUSH_NETWORK in TIER_2_FIRST_OCCURRENCE_CATEGORIES
 
 
 # --------------------------------------------------------------------------

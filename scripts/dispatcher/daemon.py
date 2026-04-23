@@ -795,29 +795,40 @@ FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE = "summary_ac_infeasible"
 #: Git-push failure categories for the ``push_and_pr`` phase (issue #2902).
 #: ``push_failed`` is the generic catch-all; the two sub-kinds are
 #: classifier-derived from stderr content via ``_classify_push_failure``.
-#: All three are tier-1 auto-retry — a transient network or pre-push hook
-#: failure on the first attempt is commonly self-healing.
+#: Issue #3032 moved these from the tier-1 auto-retry set to the
+#: tier-2 first-occurrence diagnoser set — the LLM now owns the
+#: retry/escalate decision on push failures (remote rejections like
+#: PAT scope need operator action, not blind retry).
 FAILURE_CATEGORY_PUSH_FAILED = "push_failed"
 FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED = "pre_push_hook_rejected"
 FAILURE_CATEGORY_GIT_PUSH_NETWORK = "git_push_network"
+
+#: Additional terminal-failure categories routed through the diagnoser
+#: by the unified ``_handle_agent_failure`` path (issue #3032).
+#: ``pr_create_failed`` — ``gh pr create`` non-zero exit or exception;
+#: commonly caused by a duplicate PR from a prior crashed agent, bad
+#: base ref, or a GitHub API hiccup — all benefit from Opus judgment.
+#: ``phase_output_missing`` — a per-phase subprocess exited 0 but the
+#: expected structured output JSON is missing (indicates prompt drift
+#: or skill bug); hardcoded retry does not help.
+FAILURE_CATEGORY_PR_CREATE_FAILED = "pr_create_failed"
+FAILURE_CATEGORY_PHASE_OUTPUT_MISSING = "phase_output_missing"
 
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
 #: ``subprocess_auth_fail`` (halt — no retry) are intentionally
 #: excluded; 3D's diagnoser owns the escalation path for both.
-#: ``stuck_timeout``, ``gh_rate_exhausted``, and ``subprocess_crash``
-#: are the three that retry mechanically. The three push-failure
-#: sub-kinds (#2902) are also tier-1 — transient network and pre-push
-#: hook failures are self-healing on a fresh retry.
+#: ``stuck_timeout``, ``gh_rate_exhausted``, ``subprocess_crash``, and
+#: ``daemon_restart_abandoned`` are the infra-preemption / crash
+#: categories that retry mechanically. Push and PR-create failures
+#: (formerly tier-1 auto-retry) were moved to the diagnoser path by
+#: issue #3032 — see :data:`TIER_2_FIRST_OCCURRENCE_CATEGORIES`.
 AUTO_RETRY_CATEGORIES = frozenset(
     {
         FAILURE_CATEGORY_STUCK_TIMEOUT,
         FAILURE_CATEGORY_GH_RATE_EXHAUSTED,
         FAILURE_CATEGORY_SUBPROCESS_CRASH,
         FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
-        FAILURE_CATEGORY_PUSH_FAILED,
-        FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED,
-        FAILURE_CATEGORY_GIT_PUSH_NETWORK,
     }
 )
 
@@ -980,9 +991,24 @@ TIER_2_RECURRENCE_CATEGORIES: frozenset[str] = frozenset(
 #: tier 2 with mechanical hint = "retry once with narrower scope"; we
 #: delegate that retry-vs-escalate choice to the diagnoser immediately
 #: rather than hard-coding one mechanical retry.
+#:
+#: Issue #3032 extended this set: ``push_failed`` /
+#: ``pre_push_hook_rejected`` / ``git_push_network`` /
+#: ``pr_create_failed`` / ``phase_output_missing`` now diagnose on
+#: first occurrence (they used to tier-1 auto-retry or skip the
+#: failure-row write entirely). The cascade of 6 consecutive
+#: ``git_push_failed`` events in 2026-04-22/23 on #3008 and #2610 —
+#: all with a deterministic PAT-scope stderr that blind retry could
+#: not resolve — made the case for routing every agent-terminal
+#: failure through the LLM, not just tier-2 recurrences.
 TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
     {
         FAILURE_CATEGORY_SUBPROCESS_TURN_LIMIT,
+        FAILURE_CATEGORY_PUSH_FAILED,
+        FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED,
+        FAILURE_CATEGORY_GIT_PUSH_NETWORK,
+        FAILURE_CATEGORY_PR_CREATE_FAILED,
+        FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
     }
 )
 
@@ -1031,10 +1057,36 @@ DIAGNOSER_MODEL = "opus"
 
 #: Valid ``action`` strings a diagnoser recommendation may set. The
 #: daemon's deterministic consumer switches on these; any other value
-#: falls through to ``escalate`` as a safe default (logged as
-#: ``daemon.diagnosis_action_unknown``).
+#: falls through to ``escalate`` as a safe default and persists a row
+#: to ``dispatcher.unrecognized_diagnoser_actions`` (logged as
+#: ``daemon.diagnosis_action_unknown``) so operators can notice
+#: patterns. Issue #3032 removed the closed-enum guardrail in the
+#: diagnoser skill — the LLM may propose a novel action when none of
+#: these fit, and the unrecognized-actions table is the review path.
+#:
+#: The first five (``retry`` through ``close``) are the original set
+#: from issue #2795. The last three are added in #3032:
+#:   - ``block_and_comment`` — apply ``status/blocked`` + remove
+#:     ``agent/ready`` + post comment. For operator-action blockers
+#:     (PAT scope, missing secret, infra gap) that do not warrant a
+#:     tracking issue yet.
+#:   - ``file_prerequisite_task`` — create a new issue via
+#:     ``gh issue create`` with diagnoser-provided ``title`` + ``body``,
+#:     then block the current issue on the new one.
+#:   - ``block_on_existing_task`` — append ``Blocked by #<N>`` to the
+#:     current issue body when the diagnoser identifies an already-open
+#:     tracking issue for the root cause. Avoids duplicate tickets.
 DIAGNOSER_ACTIONS: frozenset[str] = frozenset(
-    {"retry", "retry_with_hint", "reissue", "escalate", "close"}
+    {
+        "retry",
+        "retry_with_hint",
+        "reissue",
+        "escalate",
+        "close",
+        "block_and_comment",
+        "file_prerequisite_task",
+        "block_on_existing_task",
+    }
 )
 
 #: Circuit-breaker bounds (spec §8 "Budget & safety"). When the
@@ -7993,11 +8045,16 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler
+            # so the diagnoser can pick up the missing-output failure
+            # on the next supervisor tick.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="planning",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail=preview or "",
                 exit_code=exit_code,
+                details={"missing_phase_output": "plan"},
                 issue_number=issue_number,
             )
             return False
@@ -8150,11 +8207,14 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="ralph",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail=preview or "",
                 exit_code=exit_code,
+                details={"missing_phase_output": "ralph"},
                 issue_number=issue_number,
             )
             return False
@@ -8381,11 +8441,14 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="summary",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail=preview or "",
                 exit_code=exit_code,
+                details={"missing_phase_output": "summary"},
                 issue_number=issue_number,
             )
             return False
@@ -8750,6 +8813,84 @@ class DispatcherDaemon:
         if category in AUTO_RETRY_CATEGORIES:
             self._create_retry_marker(agent_id=agent_id, reason=category)
 
+    def _handle_agent_failure(
+        self,
+        *,
+        agent_id: str,
+        phase: str,
+        category: str,
+        stderr_tail: str,
+        exit_code: int | None,
+        details: dict[str, Any] | None = None,
+        issue_number: int | None = None,
+    ) -> None:
+        """Unified agent-terminal failure exit path (issue #3032).
+
+        Writes a ``dispatcher.failures`` row AND marks the agent
+        terminal, so the next ``_run_diagnoser_pass`` (supervisor tick)
+        picks it up via :meth:`_find_diagnoser_candidates` and routes
+        it through Opus.
+
+        Categories in :data:`TIER_2_FIRST_OCCURRENCE_CATEGORIES`,
+        :data:`TIER_2_RECURRENCE_CATEGORIES`, or
+        :data:`TIER_3_CATEGORIES` will be diagnosed; others fall back
+        to the existing mechanical-retry policy (e.g.
+        ``daemon_restart_abandoned`` stays on the infra-preemption
+        path).
+
+        Before #3032, ``git_push_failed``, ``pr_create_failed``, and
+        ``phase_output_missing`` either wrote no failure row at all
+        (pr_create_failed, phase_output_missing) or landed in the
+        tier-1 auto-retry set (push categories). Neither route gave
+        the Opus diagnoser a chance to differentiate a self-healing
+        transient from a deterministic operator-action blocker like
+        the PAT-scope cascade on 2026-04-22/23. This method
+        standardizes the exit: write the row, mark terminal, let the
+        supervisor tick pick it up on the next pass.
+
+        Not used for the per-phase subprocess failures —
+        :meth:`_handle_subprocess_failure` already handles the
+        classifier, secondary-log-dump event, and tier-1 auto-retry
+        semantics for those.
+        """
+        failure_details: dict[str, Any] = {
+            "phase": phase,
+            "stderr_tail": stderr_tail,
+            "exit_code": int(exit_code) if exit_code is not None else None,
+        }
+        if details:
+            # Caller-supplied fields take precedence but still layer
+            # over the standard envelope above so downstream readers
+            # always have the canonical three keys.
+            failure_details.update(details)
+
+        self._log.warning(
+            "daemon.agent_failure_routed",
+            extra={
+                "event": "agent_failure_routed",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": phase,
+                "category": category,
+                "exit_code": failure_details.get("exit_code"),
+                "issue_number": issue_number,
+            },
+        )
+
+        self._write_failure(
+            agent_id=agent_id,
+            category=category,
+            detected_by="scheduler",
+            details=failure_details,
+        )
+        self._mark_agent_terminal(
+            agent_id,
+            status="failed",
+            phase=phase,
+            exit_code=exit_code,
+            issue_number=issue_number,
+        )
+
     def _log_tail(self, worktree: Path, phase: str, max_chars: int = 500) -> str:
         """Return the last ``max_chars`` of the phase log, or an empty string."""
         log_path = worktree / "tmp" / f"claude-p-{phase}.log"
@@ -9078,29 +9219,23 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
-            self._write_failure(
-                agent_id=agent_id,
-                category=FAILURE_CATEGORY_GIT_PUSH_NETWORK,
-                detected_by="scheduler",
-                details={
-                    "phase": "push_and_pr",
-                    "branch": branch,
-                    "stderr_tail": tail,
-                    "exit_code": None,
-                    "reason": "timeout",
-                },
-            )
             self._persist_phase_output(
                 agent_id,
                 phase="push_and_pr",
                 output_json={"event": "git_push_timeout", "branch": branch},
                 log_text=tail,
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler so
+            # the diagnoser picks this up on the next supervisor tick.
+            # ``git_push_network`` is now a TIER_2_FIRST_OCCURRENCE
+            # category.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
+                category=FAILURE_CATEGORY_GIT_PUSH_NETWORK,
+                stderr_tail=tail,
                 exit_code=None,
+                details={"branch": branch, "reason": "timeout"},
                 issue_number=issue_number,
             )
             return
@@ -9114,28 +9249,20 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
-            self._write_failure(
-                agent_id=agent_id,
-                category=FAILURE_CATEGORY_PUSH_FAILED,
-                detected_by="scheduler",
-                details={
-                    "phase": "push_and_pr",
-                    "branch": branch,
-                    "stderr_tail": str(exc),
-                    "exit_code": None,
-                },
-            )
             self._persist_phase_output(
                 agent_id,
                 phase="push_and_pr",
                 output_json={"event": "git_push_failed", "branch": branch},
                 log_text=str(exc),
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
+                category=FAILURE_CATEGORY_PUSH_FAILED,
+                stderr_tail=str(exc),
                 exit_code=None,
+                details={"branch": branch},
                 issue_number=issue_number,
             )
             return
@@ -9154,17 +9281,6 @@ class DispatcherDaemon:
                     "branch": branch,
                 },
             )
-            self._write_failure(
-                agent_id=agent_id,
-                category=category,
-                detected_by="scheduler",
-                details={
-                    "phase": "push_and_pr",
-                    "branch": branch,
-                    "stderr_tail": tail,
-                    "exit_code": push_result.returncode,
-                },
-            )
             self._persist_phase_output(
                 agent_id,
                 phase="push_and_pr",
@@ -9175,11 +9291,16 @@ class DispatcherDaemon:
                 },
                 log_text=(push_result.stderr or ""),
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler.
+            # The classifier's pre_push_hook_rejected / git_push_network
+            # / push_failed categories are all tier-2 first-occurrence.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
-                exit_code=None,
+                category=category,
+                stderr_tail=tail,
+                exit_code=push_result.returncode,
+                details={"branch": branch},
                 issue_number=issue_number,
             )
             return
@@ -9225,15 +9346,21 @@ class DispatcherDaemon:
                     "detail": str(exc),
                 },
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler so
+            # the Opus diagnoser can tell a duplicate-PR hit from a
+            # genuine gh-CLI break from a transient GitHub API wobble.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
+                category=FAILURE_CATEGORY_PR_CREATE_FAILED,
+                stderr_tail=str(exc),
                 exit_code=None,
+                details={"branch": branch, "reason": "exception"},
                 issue_number=issue_number,
             )
             return
         if pr_result.returncode != 0:
+            pr_stderr_tail = _stderr_tail(pr_result.stderr)
             self._log.warning(
                 "daemon.pr_create_failed",
                 extra={
@@ -9241,14 +9368,17 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "exit_code": pr_result.returncode,
-                    "stderr_tail": _stderr_tail(pr_result.stderr),
+                    "stderr_tail": pr_stderr_tail,
                 },
             )
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
+            # Issue #3032: route through the unified failure handler.
+            self._handle_agent_failure(
+                agent_id=agent_id,
                 phase="push_and_pr",
-                exit_code=None,
+                category=FAILURE_CATEGORY_PR_CREATE_FAILED,
+                stderr_tail=pr_stderr_tail,
+                exit_code=pr_result.returncode,
+                details={"branch": branch},
                 issue_number=issue_number,
             )
             return
@@ -9994,8 +10124,14 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_ci", exit_code=exit_code
+            # Issue #3032: route through the unified failure handler.
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail=preview or "",
+                exit_code=exit_code,
+                details={"missing_phase_output": "fix-ci"},
             )
             return
 
@@ -10655,8 +10791,14 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
-            self._mark_agent_terminal(
-                agent_id, status="failed", phase="awaiting_deploy", exit_code=exit_code
+            # Issue #3032: route through the unified failure handler.
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_deploy",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail=preview or "",
+                exit_code=exit_code,
+                details={"missing_phase_output": "verify"},
             )
             return
 
@@ -13830,6 +13972,104 @@ class DispatcherDaemon:
                     if isinstance(raw_map, list):
                         summary_ac_mapping = [e for e in raw_map if isinstance(e, dict)]
 
+        # Issue #3032 — expanded context bundle for the open-menu
+        # diagnoser. ``prior_diagnoses_this_issue`` lets the LLM see
+        # "I recommended retry twice and it failed twice — try
+        # something else" without re-deriving from the failure log.
+        # ``recent_fleet_decisions`` lets it detect fleet-wide spates
+        # ("5 different issues hit the same PAT-scope failure today —
+        # the right action is to file a prerequisite task, not patch
+        # per issue"). Both are best-effort; empty list on any DB
+        # error — the skill's decision tree tolerates sparse context.
+        prior_diagnoses_this_issue: list[dict[str, Any]] = []
+        if issue_number is not None:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT d.diagnosis_id, f.category, d.recommendation, "
+                        "       d.completed_at "
+                        "FROM dispatcher.diagnoses d "
+                        "JOIN dispatcher.agents a ON a.agent_id = d.agent_id "
+                        "JOIN dispatcher.failures f ON f.failure_id = d.failure_id "
+                        "WHERE a.issue_number = %s "
+                        "  AND d.status = 'completed' "
+                        "  AND d.failure_id <> %s "
+                        "ORDER BY d.completed_at DESC LIMIT 10",
+                        (issue_number, failure_id),
+                    )
+                    rows = cur.fetchall()
+                self._conn.commit()
+                for r in rows:
+                    rec = r[2]
+                    if isinstance(rec, str):
+                        try:
+                            rec = json.loads(rec)
+                        except json.JSONDecodeError:
+                            rec = {}
+                    prior_diagnoses_this_issue.append(
+                        {
+                            "diagnosis_id": int(r[0]),
+                            "failure_category": str(r[1]),
+                            "recommendation": rec if isinstance(rec, dict) else {},
+                            "completed_at": r[3].isoformat()
+                            if r[3] is not None
+                            else None,
+                        }
+                    )
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+
+        recent_fleet_decisions: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT d.diagnosis_id, d.agent_id, a.issue_number, "
+                    "       f.category, d.recommendation, d.completed_at "
+                    "FROM dispatcher.diagnoses d "
+                    "JOIN dispatcher.agents a ON a.agent_id = d.agent_id "
+                    "JOIN dispatcher.failures f ON f.failure_id = d.failure_id "
+                    "WHERE d.status = 'completed' "
+                    "  AND d.completed_at > now() - interval '6 hours' "
+                    "ORDER BY d.completed_at DESC LIMIT 20",
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+            for r in rows:
+                rec = r[4]
+                if isinstance(rec, str):
+                    try:
+                        rec = json.loads(rec)
+                    except json.JSONDecodeError:
+                        rec = {}
+                action = ""
+                reasoning = ""
+                if isinstance(rec, dict):
+                    raw_action = rec.get("action")
+                    if isinstance(raw_action, str):
+                        action = raw_action
+                    raw_reasoning = rec.get("reasoning")
+                    if isinstance(raw_reasoning, str):
+                        reasoning = raw_reasoning
+                recent_fleet_decisions.append(
+                    {
+                        "diagnosis_id": int(r[0]),
+                        "agent_id": str(r[1]) if r[1] is not None else None,
+                        "issue_number": int(r[2]) if r[2] is not None else None,
+                        "failure_category": str(r[3]),
+                        "action": action,
+                        "reasoning": reasoning,
+                        "completed_at": r[5].isoformat() if r[5] is not None else None,
+                    }
+                )
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
         bundle: dict[str, Any] = {
             "agent_id": agent_id,
             "failure_id": failure_id,
@@ -13840,6 +14080,8 @@ class DispatcherDaemon:
             "issue_body": issue_body,
             "recent_phase_transitions": phase_transitions,
             "prior_failures": prior_failures,
+            "prior_diagnoses_this_issue": prior_diagnoses_this_issue,
+            "recent_fleet_decisions": recent_fleet_decisions,
             "ralph_done_content": ralph_done_content,
             "pr_url": pr_url,
             "pr_number": pr_number,
@@ -14081,9 +14323,20 @@ class DispatcherDaemon:
         """Return the action string if valid, None otherwise.
 
         Shape check: ``action`` must be in :data:`DIAGNOSER_ACTIONS`.
-        ``retry_with_hint`` requires a non-empty string ``hint``;
-        ``reissue`` requires a non-empty string ``new_scope``. All
-        other fields are advisory.
+        Per-action required-payload checks:
+          - ``retry_with_hint`` — non-empty string ``hint``.
+          - ``reissue`` — non-empty string ``new_scope``.
+          - ``file_prerequisite_task`` — non-empty string ``title`` and
+            ``body``.
+          - ``block_on_existing_task`` — positive integer
+            ``blocker_issue_number``.
+        All other fields are advisory.
+
+        Returns None when the action is missing, not in the known set,
+        or when a required payload field for the action is missing or
+        malformed. Callers treat None as "escalate fallback" per the
+        hardened parse path added in issue #3032 — never silently
+        retrying on malformed input.
         """
         action = recommendation.get("action")
         if not isinstance(action, str) or action not in DIAGNOSER_ACTIONS:
@@ -14096,6 +14349,21 @@ class DispatcherDaemon:
             new_scope = recommendation.get("new_scope")
             if not isinstance(new_scope, str) or not new_scope.strip():
                 return None
+        if action == "file_prerequisite_task":
+            title = recommendation.get("title")
+            body = recommendation.get("body")
+            if not isinstance(title, str) or not title.strip():
+                return None
+            if not isinstance(body, str) or not body.strip():
+                return None
+        if action == "block_on_existing_task":
+            blocker = recommendation.get("blocker_issue_number")
+            if (
+                not isinstance(blocker, int)
+                or isinstance(blocker, bool)
+                or blocker <= 0
+            ):
+                return None
         return action
 
     def _consume_diagnosis(self, diagnosis_id: int, candidate: dict[str, Any]) -> str:
@@ -14104,9 +14372,31 @@ class DispatcherDaemon:
         Returns the action string that was consumed (one of
         :data:`DIAGNOSER_ACTIONS`, or ``"escalate_fallback"`` when the
         recommendation was malformed and we escalated mechanically).
+
+        Issue #3032 hardens the parse path:
+          - Missing recommendation (row absent or JSONB NULL) → escalate
+            with reason ``recommendation_missing_or_malformed_json``.
+          - Valid dict but unknown ``action`` string → escalate AND
+            persist a row to ``dispatcher.unrecognized_diagnoser_actions``
+            so operators can review.
+          - Valid dict + known action but required payload missing
+            (e.g. ``retry_with_hint`` without ``hint``) → escalate.
+          - Every branch now logs the raw LLM output via
+            ``daemon.diagnoser_parse_failed`` so prompt tuning has a
+            signal trail. Never silently retries.
         """
         recommendation = self._read_recommendation(diagnosis_id)
         if recommendation is None:
+            self._log.warning(
+                "daemon.diagnoser_parse_failed",
+                extra={
+                    "event": "diagnoser_parse_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "reason": "recommendation_missing_or_malformed_json",
+                    "raw_output": None,
+                },
+            )
             self._mark_diagnosis_failed(
                 diagnosis_id, reason="recommendation_missing_or_malformed_json"
             )
@@ -14115,18 +14405,49 @@ class DispatcherDaemon:
 
         action = self._validate_recommendation(recommendation)
         if action is None:
+            # Distinguish unrecognized action strings (a novel LLM
+            # proposal — persist for operator review) from missing /
+            # malformed required payload fields.
+            raw_action = recommendation.get("action")
+            raw_output = self._serialize_raw_output(recommendation)
+            if (
+                isinstance(raw_action, str)
+                and raw_action.strip()
+                and raw_action not in DIAGNOSER_ACTIONS
+            ):
+                self._persist_unrecognized_action(
+                    diagnosis_id=diagnosis_id,
+                    action_name=raw_action,
+                    payload=recommendation,
+                )
+                reason = "unrecognized_action"
+            elif not isinstance(raw_action, str) or not raw_action.strip():
+                reason = "action_field_missing_or_non_string"
+            else:
+                reason = "missing_required_payload"
+            self._log.warning(
+                "daemon.diagnoser_parse_failed",
+                extra={
+                    "event": "diagnoser_parse_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "reason": reason,
+                    "raw_output": raw_output,
+                },
+            )
+            # Keep the legacy ``diagnosis_action_unknown`` event so
+            # existing CloudWatch dashboards do not regress.
             self._log.warning(
                 "daemon.diagnosis_action_unknown",
                 extra={
                     "event": "diagnosis_action_unknown",
                     "run_id": self._run_id,
                     "diagnosis_id": diagnosis_id,
+                    "reason": reason,
                     "raw_recommendation": recommendation,
                 },
             )
-            self._mark_diagnosis_failed(
-                diagnosis_id, reason="recommendation_failed_validation"
-            )
+            self._mark_diagnosis_failed(diagnosis_id, reason=reason)
             self._apply_mechanical_escalation(candidate)
             return "escalate_fallback"
 
@@ -14175,8 +14496,102 @@ class DispatcherDaemon:
                 issue_number=issue_number,
                 reasoning=reasoning,
             )
+        elif action == "block_and_comment":
+            self._consume_action_block_and_comment(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=reasoning,
+            )
+        elif action == "file_prerequisite_task":
+            self._consume_action_file_prerequisite_task(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                title=str(recommendation.get("title") or ""),
+                body=str(recommendation.get("body") or ""),
+                block_labels=self._coerce_str_list(recommendation.get("block_labels")),
+                reasoning=reasoning,
+            )
+        elif action == "block_on_existing_task":
+            blocker_issue_number = recommendation.get("blocker_issue_number")
+            self._consume_action_block_on_existing_task(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                blocker_issue_number=int(blocker_issue_number)
+                if isinstance(blocker_issue_number, int)
+                and not isinstance(blocker_issue_number, bool)
+                else 0,
+                reasoning=reasoning,
+            )
 
         return action
+
+    @staticmethod
+    def _coerce_str_list(value: Any) -> list[str]:
+        """Return ``value`` as a list of strings, dropping non-string items."""
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str) and item.strip()]
+
+    @staticmethod
+    def _serialize_raw_output(recommendation: Any) -> str:
+        """Serialize the raw LLM recommendation for the parse-fail log.
+
+        Always returns a bounded JSON string so CloudWatch Insights
+        queries do not blow out memory on a pathological LLM output.
+        Failures fall back to ``str(...)`` truncated at 4 KiB — we'd
+        rather log a partial representation than drop the field
+        entirely.
+        """
+        try:
+            text = json.dumps(recommendation, default=str, sort_keys=True)
+        except Exception:  # pragma: no cover — defensive
+            text = str(recommendation)
+        return text[:4096]
+
+    def _persist_unrecognized_action(
+        self, *, diagnosis_id: int, action_name: str, payload: Any
+    ) -> None:
+        """Insert a row into ``dispatcher.unrecognized_diagnoser_actions``.
+
+        Issue #3032 opens the diagnoser action menu — the LLM may
+        propose a novel action the daemon does not recognize. Rather
+        than silently drop it, persist the action name + the full
+        recommendation payload so operators can review and decide
+        whether to implement a handler. The caller still falls through
+        to ``escalate`` so the current failure is not stuck.
+
+        Row-insert failures here are logged and swallowed — the
+        escalate fallback is the authoritative recovery path, and a
+        broken log row must not block it.
+        """
+        assert self._conn is not None, "connect() must run before action persist"
+        try:
+            payload_json = json.dumps(payload, default=str)
+        except Exception:  # pragma: no cover — defensive
+            payload_json = "{}"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.unrecognized_diagnoser_actions "
+                    "    (diagnosis_id, action_name, payload) "
+                    "VALUES (%s, %s, %s)",
+                    (diagnosis_id, action_name, payload_json),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.unrecognized_action_persist_failed",
+                extra={
+                    "event": "unrecognized_action_persist_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "action_name": action_name,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
 
     def _consume_action_retry(self, *, agent_id: str) -> None:
         """Create a tier-1-shaped retry marker via the existing machinery.
@@ -14267,6 +14682,155 @@ class DispatcherDaemon:
             self._gh_issue_close(issue_number, comment=summary, reason="not planned")
         self._mark_agent_terminal(
             agent_id, status="failed", phase="diagnoser_close", exit_code=None
+        )
+
+    def _consume_action_block_and_comment(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        reasoning: str,
+    ) -> None:
+        """Apply ``status/blocked``, remove ``agent/ready``, post a comment.
+
+        Issue #3032. Used when the diagnoser identifies a deterministic
+        operator-action blocker (PAT scope, missing secret, branch
+        protection, infra gap) that does not yet deserve a tracking
+        issue of its own. The current issue is marked blocked so no
+        other agent picks it up, the ``agent/ready`` label is stripped
+        so the dispatcher queue-scan skips it, and the reasoning is
+        posted as a comment so the operator sees the context.
+        """
+        if issue_number is not None:
+            summary = (
+                "## Diagnosis (3D block)\n\n"
+                f"{reasoning}\n\n"
+                "_Blocked — operator action required before work resumes._"
+            )
+            self._gh_issue_comment(issue_number, summary)
+            self._gh_issue_add_labels(issue_number, ["status/blocked"])
+            self._gh_issue_remove_labels(issue_number, ["agent/ready"])
+        self._mark_agent_terminal(
+            agent_id,
+            status="failed",
+            phase="diagnoser_block_and_comment",
+            exit_code=None,
+        )
+
+    def _consume_action_file_prerequisite_task(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        title: str,
+        body: str,
+        block_labels: list[str] | None,
+        reasoning: str,
+    ) -> None:
+        """Create a new tracking issue and block the current issue on it.
+
+        Issue #3032. Used when the diagnoser identifies a root cause
+        that deserves its own tracking issue (e.g. "add workflow scope
+        to dispatcher PAT"). Runs ``gh issue create`` with the
+        diagnoser-supplied title + body, captures the new issue
+        number, then appends ``Blocked by #<new>`` to the current
+        issue body and applies ``status/blocked``. If the new-issue
+        create fails, falls back to :meth:`_consume_action_escalate`
+        so the current failure still surfaces to the operator.
+        """
+        new_issue_number = self._gh_issue_create(
+            title=title, body=body, labels=block_labels or None
+        )
+        if new_issue_number is None or issue_number is None:
+            # Fall back to escalate — record the intended action in the
+            # reasoning so the operator sees what the diagnoser wanted.
+            fallback_reasoning = (
+                f"{reasoning}\n\n"
+                "_Diagnoser proposed `file_prerequisite_task` "
+                f"(title={title!r}) but the new-issue create failed "
+                "or the current issue has no number. Escalating instead._"
+            )
+            self._consume_action_escalate(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=fallback_reasoning,
+            )
+            return
+
+        summary = (
+            "## Diagnosis (3D block-on-prerequisite)\n\n"
+            f"{reasoning}\n\n"
+            f"Filed a prerequisite tracking issue: #{new_issue_number}. "
+            "This issue is blocked until that lands.\n\n"
+            "_Blocked via `file_prerequisite_task`._"
+        )
+        self._gh_issue_comment(issue_number, summary)
+        self._gh_issue_append_body(issue_number, f"\n\nBlocked by #{new_issue_number}")
+        self._gh_issue_add_labels(issue_number, ["status/blocked"])
+        self._gh_issue_remove_labels(issue_number, ["agent/ready"])
+        self._mark_agent_terminal(
+            agent_id,
+            status="failed",
+            phase="diagnoser_file_prerequisite_task",
+            exit_code=None,
+        )
+
+    def _consume_action_block_on_existing_task(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        blocker_issue_number: int,
+        reasoning: str,
+    ) -> None:
+        """Block the current issue on an already-open tracking issue.
+
+        Issue #3032. Used when the diagnoser identifies an existing
+        open issue that tracks the blocker (avoids duplicate tickets).
+        Validates the blocker exists and is open via ``gh issue view``;
+        if validation fails, falls back to escalate.
+        """
+        if issue_number is None:
+            # No current issue to update — escalate.
+            self._consume_action_escalate(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=reasoning,
+            )
+            return
+        if not self._gh_issue_is_open(blocker_issue_number):
+            fallback_reasoning = (
+                f"{reasoning}\n\n"
+                f"_Diagnoser proposed `block_on_existing_task` "
+                f"(blocker=#{blocker_issue_number}) but the target "
+                "issue is not open (not found, closed, or validation "
+                "error). Escalating instead._"
+            )
+            self._consume_action_escalate(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=fallback_reasoning,
+            )
+            return
+
+        summary = (
+            "## Diagnosis (3D block-on-existing)\n\n"
+            f"{reasoning}\n\n"
+            f"This issue is blocked on existing tracking issue "
+            f"#{blocker_issue_number}.\n\n"
+            "_Blocked via `block_on_existing_task`._"
+        )
+        self._gh_issue_comment(issue_number, summary)
+        self._gh_issue_append_body(
+            issue_number, f"\n\nBlocked by #{blocker_issue_number}"
+        )
+        self._gh_issue_add_labels(issue_number, ["status/blocked"])
+        self._gh_issue_remove_labels(issue_number, ["agent/ready"])
+        self._mark_agent_terminal(
+            agent_id,
+            status="failed",
+            phase="diagnoser_block_on_existing_task",
+            exit_code=None,
         )
 
     def _apply_mechanical_escalation(self, candidate: dict[str, Any]) -> None:
@@ -14565,6 +15129,188 @@ class DispatcherDaemon:
                 },
             )
             return None
+
+    def _gh_issue_create(
+        self, *, title: str, body: str, labels: list[str] | None
+    ) -> int | None:
+        """Create a new GitHub issue via ``gh issue create``.
+
+        Returns the integer issue number of the created issue, or None
+        on any failure (logged). Added by issue #3032 for the
+        ``file_prerequisite_task`` diagnoser action: the daemon needs
+        to synthesize a tracking issue from LLM-provided title + body.
+        """
+        tmp_file = self._write_gh_tmp_body(body, prefix="diagnoser-prereq-body")
+        if tmp_file is None:
+            return None
+        cmd = [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            self._cfg.github_repo,
+            "--title",
+            title,
+            "--body-file",
+            str(tmp_file),
+        ]
+        if labels:
+            cmd.extend(["--label", ",".join(labels)])
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.diagnoser_gh_create_failed",
+                extra={
+                    "event": "diagnoser_gh_create_failed",
+                    "run_id": self._run_id,
+                    "title": title,
+                    "detail": str(exc),
+                },
+            )
+            return None
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.diagnoser_gh_create_nonzero",
+                extra={
+                    "event": "diagnoser_gh_create_nonzero",
+                    "run_id": self._run_id,
+                    "title": title,
+                    "exit_code": result.returncode,
+                    "stderr_tail": _stderr_tail(result.stderr),
+                },
+            )
+            return None
+        # gh issue create prints the URL on stdout: last non-empty line.
+        stdout = (result.stdout or "").strip()
+        if not stdout:
+            return None
+        last_line = stdout.splitlines()[-1].strip()
+        import re  # noqa: PLC0415 — local import matches _parse_pr_number pattern
+
+        match = re.search(r"/issues/(\d+)", last_line)
+        if not match:
+            self._log.warning(
+                "daemon.diagnoser_gh_create_parse_failed",
+                extra={
+                    "event": "diagnoser_gh_create_parse_failed",
+                    "run_id": self._run_id,
+                    "title": title,
+                    "stdout_tail": last_line[-200:],
+                },
+            )
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):  # pragma: no cover — regex already gated
+            return None
+
+    def _gh_issue_append_body(self, issue_number: int, addition: str) -> None:
+        """Append ``addition`` to the issue's body via gh.
+
+        Reads the current body via ``gh issue view --json body``,
+        concatenates, then writes back via :meth:`_gh_issue_set_body`.
+        Best-effort — a read or write failure is logged and swallowed
+        so the diagnoser's recommendation still lands.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--json",
+                    "body",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._log.warning(
+                "daemon.diagnoser_gh_append_failed",
+                extra={
+                    "event": "diagnoser_gh_append_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            return
+        if result.returncode != 0:
+            self._log.warning(
+                "daemon.diagnoser_gh_append_nonzero",
+                extra={
+                    "event": "diagnoser_gh_append_nonzero",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "exit_code": result.returncode,
+                    "stderr_tail": _stderr_tail(result.stderr),
+                },
+            )
+            return
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            self._log.warning(
+                "daemon.diagnoser_gh_append_parse_failed",
+                extra={
+                    "event": "diagnoser_gh_append_parse_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            return
+        current_body = str(payload.get("body") or "")
+        new_body = current_body + addition
+        self._gh_issue_set_body(issue_number, new_body)
+
+    def _gh_issue_is_open(self, issue_number: int) -> bool:
+        """Return True if the issue exists and is in ``state=OPEN``.
+
+        Used by :meth:`_consume_action_block_on_existing_task` to
+        validate the diagnoser-proposed blocker before wiring up the
+        dependency. Any read failure (not-found, transient gh error)
+        returns False — the caller will fall back to escalate.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    str(issue_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--json",
+                    "state",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode != 0:
+            return False
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return False
+        # gh reports state as "OPEN" / "CLOSED".
+        state = str(payload.get("state") or "").upper()
+        return state == "OPEN"
 
     def _run_diagnoser_pass(self) -> int:
         """Find tier-2/3 candidates, spawn diagnosers, consume recommendations.

@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 39 migrations.
+-- Generated from 40 migrations.
 
 
 
@@ -720,6 +720,35 @@ CREATE SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq
 ALTER SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq OWNED BY dispatcher.terminal_outcomes.outcome_id;
 
 
+CREATE TABLE dispatcher.unrecognized_diagnoser_actions (
+    id bigint NOT NULL,
+    diagnosis_id bigint NOT NULL,
+    action_name text NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+COMMENT ON TABLE dispatcher.unrecognized_diagnoser_actions IS 'Diagnoser actions the daemon did not recognize. Operator reviews periodically; 5+ instances of a new action is signal to implement a handler. See issue #3032.';
+
+
+COMMENT ON COLUMN dispatcher.unrecognized_diagnoser_actions.action_name IS 'The action string as emitted by the diagnoser (e.g. "split_task"). Not constrained — anything the LLM proposed that was not in the known set lands here.';
+
+
+COMMENT ON COLUMN dispatcher.unrecognized_diagnoser_actions.payload IS 'The full recommendation dict (action + reasoning + any payload fields the LLM proposed) serialized as JSONB. Lets a future handler implementer see the proposed shape without replaying the diagnosis.';
+
+
+CREATE SEQUENCE dispatcher.unrecognized_diagnoser_actions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE dispatcher.unrecognized_diagnoser_actions_id_seq OWNED BY dispatcher.unrecognized_diagnoser_actions.id;
+
+
 CREATE TABLE public.alert_events (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     subscription_id uuid NOT NULL,
@@ -903,6 +932,9 @@ ALTER TABLE ONLY dispatcher.retry_markers ALTER COLUMN marker_id SET DEFAULT nex
 ALTER TABLE ONLY dispatcher.terminal_outcomes ALTER COLUMN outcome_id SET DEFAULT nextval('dispatcher.terminal_outcomes_outcome_id_seq'::regclass);
 
 
+ALTER TABLE ONLY dispatcher.unrecognized_diagnoser_actions ALTER COLUMN id SET DEFAULT nextval('dispatcher.unrecognized_diagnoser_actions_id_seq'::regclass);
+
+
 ALTER TABLE ONLY telemetry.data_quality_metrics ALTER COLUMN id SET DEFAULT nextval('telemetry.data_quality_metrics_id_seq'::regclass);
 
 
@@ -1040,6 +1072,10 @@ ALTER TABLE ONLY dispatcher.runs
 
 ALTER TABLE ONLY dispatcher.terminal_outcomes
     ADD CONSTRAINT terminal_outcomes_pkey PRIMARY KEY (outcome_id);
+
+
+ALTER TABLE ONLY dispatcher.unrecognized_diagnoser_actions
+    ADD CONSTRAINT unrecognized_diagnoser_actions_pkey PRIMARY KEY (id);
 
 
 ALTER TABLE ONLY public.alert_events
@@ -1250,6 +1286,9 @@ CREATE INDEX idx_dispatcher_retry_markers_pending ON dispatcher.retry_markers US
 CREATE INDEX idx_dispatcher_terminal_outcomes_ended_at ON dispatcher.terminal_outcomes USING btree (ended_at DESC);
 
 
+CREATE INDEX idx_dispatcher_unrec_actions_action ON dispatcher.unrecognized_diagnoser_actions USING btree (action_name, observed_at DESC);
+
+
 CREATE INDEX ralph_patches_created_at_idx ON dispatcher.ralph_patches USING btree (created_at);
 
 
@@ -1434,6 +1473,10 @@ ALTER TABLE ONLY dispatcher.ralph_patches
 
 ALTER TABLE ONLY dispatcher.retry_markers
     ADD CONSTRAINT retry_markers_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.unrecognized_diagnoser_actions
+    ADD CONSTRAINT unrecognized_diagnoser_actions_diagnosis_id_fkey FOREIGN KEY (diagnosis_id) REFERENCES dispatcher.diagnoses(diagnosis_id);
 
 
 ALTER TABLE ONLY public.alert_events
