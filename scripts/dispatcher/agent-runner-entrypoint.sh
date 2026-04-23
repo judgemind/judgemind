@@ -383,9 +383,12 @@ run_claude_phase() {
 persist_phase_output() {
     # $1 = phase, $2 = output JSON.
     # Stage 1b writes a minimal row shape matching the daemon's
-    # phase_outputs schema: agent_id, phase, status, output_json. The
-    # daemon's `log_text` field is populated in Stage 2 when we wire
-    # the CloudWatch log capture.
+    # phase_outputs schema: (agent_id, phase, output_json) — NOT a
+    # `status` column, which does not exist on `dispatcher.phase_outputs`
+    # (#3115). The daemon's subprocess-mode persist writes the same
+    # three columns. The `log_text` / `attempt` / token + cost columns
+    # stay NULL here; Stage 2 wiring populates them once the daemon-
+    # side log-capture path is in place.
     #
     # Default-substitute to an empty-object string if $2 is absent.
     # We spell the default in two stages rather than
@@ -399,8 +402,8 @@ persist_phase_output() {
         _output_json="{}"
     fi
     _escaped=$(printf '%s' "$_output_json" | sed "s/'/''/g")
-    db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, status, output_json)
-             VALUES ('$AGENT_ID', '$_phase', 'succeeded', '$_escaped'::jsonb);"
+    db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
+             VALUES ('$AGENT_ID', '$_phase', '$_escaped'::jsonb);"
     log "phase_output_persisted" "phase=$_phase"
 }
 
