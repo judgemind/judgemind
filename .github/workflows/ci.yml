@@ -611,6 +611,16 @@ jobs:
       # time.
       - name: Verify every daemon terminal site has a ROUTING comment
         run: scripts/check-terminal-routing-comments.sh
+      # Issue #3082: operator laptops run macOS's stock bash 3.2.
+      # Shell scripts under scripts/**/*.sh must stick to the bash 3.2
+      # subset — no mapfile, readarray, associative arrays, nameref,
+      # case-conversion parameter expansions, ;;& case fall-through,
+      # or |& pipe shorthand. Retro of #3081's near-miss: the first
+      # draft of check-terminal-routing-comments.sh used mapfile and
+      # silently exited 127 on the operator's laptop. See
+      # docs/agent/code-standards.md §macOS bash 3.2 compatibility.
+      - name: Verify scripts stay within the bash 3.2 feature subset
+        run: scripts/check-bash-compat.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
       # that adding a new shell test is just `touch + chmod +x` — no
