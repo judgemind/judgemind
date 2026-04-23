@@ -54,19 +54,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-if "psycopg" not in sys.modules or not isinstance(
-    getattr(sys.modules["psycopg"].errors, "UniqueViolation", None), type
-):
-
-    class _UniqueViolation(Exception):
-        """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-    _psycopg_stub = MagicMock()
-    _psycopg_errors = MagicMock()
-    _psycopg_errors.UniqueViolation = _UniqueViolation
-    _psycopg_stub.errors = _psycopg_errors
-    sys.modules["psycopg"] = _psycopg_stub
-
 from dispatcher import daemon  # noqa: E402 — sys.path mutation above
 
 
@@ -918,8 +905,7 @@ class TestProcessRetryMarkersInfraPreemption:
         retrying_resets = [
             e
             for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.agents" in e[0]
-            and "status = 'retrying'" in e[0]
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
         ]
         assert retrying_resets == [], (
             f"infra-preemption path must not emit retrying reset; got {retrying_resets}"
@@ -941,8 +927,7 @@ class TestProcessRetryMarkersInfraPreemption:
         resolves = [
             e
             for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.retry_markers" in e[0]
-            and "resolved_at" in e[0]
+            if "UPDATE dispatcher.retry_markers" in e[0] and "resolved_at" in e[0]
         ]
         assert resolves, "retry marker must be resolved"
 
@@ -966,7 +951,9 @@ class TestProcessRetryMarkersInfraPreemption:
         monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
 
         gh_calls: list[tuple[int, list[str]]] = []
-        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, labels: gh_calls.append((n, labels)))
+        monkeypatch.setattr(
+            d, "_gh_issue_add_labels", lambda n, labels: gh_calls.append((n, labels))
+        )
 
         processed = d._process_retry_markers()
         assert processed == 1
@@ -976,8 +963,7 @@ class TestProcessRetryMarkersInfraPreemption:
         retrying_resets = [
             e
             for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.agents" in e[0]
-            and "status = 'retrying'" in e[0]
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
         ]
         assert retrying_resets == []
 

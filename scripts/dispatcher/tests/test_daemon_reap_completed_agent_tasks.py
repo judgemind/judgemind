@@ -32,22 +32,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-# Only install a psycopg stub if one isn't already present — avoids
-# clobbering sibling test files' UniqueViolation sentinel. See
-# ``test_daemon_baseline_fetch_retry.py`` for the pattern.
-if "psycopg" not in sys.modules or not isinstance(
-    getattr(sys.modules["psycopg"].errors, "UniqueViolation", None), type
-):
-
-    class _UniqueViolation(Exception):
-        pass
-
-    _psycopg_stub = MagicMock()
-    _psycopg_errors = MagicMock()
-    _psycopg_errors.UniqueViolation = _UniqueViolation
-    _psycopg_stub.errors = _psycopg_errors
-    sys.modules["psycopg"] = _psycopg_stub
-
 from dispatcher import daemon  # noqa: E402
 
 

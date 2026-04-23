@@ -35,27 +35,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-# Provide a stub ``psycopg`` module before importing the daemon — same
-# pattern as test_daemon_phase3a.py. Reuse phase3a's stub when possible
-# so the ``except psycopg.errors.UniqueViolation`` path in the daemon
-# still resolves to the *same* Exception class both test files reference
-# (otherwise test-collection order makes one file's raise fall through
-# the other file's except and the unique-violation tests break — observed
-# while developing #2787).
-
-if "psycopg" not in sys.modules or not isinstance(
-    getattr(sys.modules["psycopg"].errors, "UniqueViolation", None), type
-):
-
-    class _UniqueViolation(Exception):
-        """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-    _psycopg_stub = MagicMock()
-    _psycopg_errors = MagicMock()
-    _psycopg_errors.UniqueViolation = _UniqueViolation
-    _psycopg_stub.errors = _psycopg_errors
-    sys.modules["psycopg"] = _psycopg_stub
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 

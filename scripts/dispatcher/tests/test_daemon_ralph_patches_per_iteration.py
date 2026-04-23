@@ -30,7 +30,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -38,19 +38,6 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-
-if "psycopg" not in sys.modules or not isinstance(
-    getattr(sys.modules["psycopg"].errors, "UniqueViolation", None), type
-):
-
-    class _UniqueViolation(Exception):
-        pass
-
-    _psycopg_stub = MagicMock()
-    _psycopg_errors = MagicMock()
-    _psycopg_errors.UniqueViolation = _UniqueViolation
-    _psycopg_stub.errors = _psycopg_errors
-    sys.modules["psycopg"] = _psycopg_stub
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 

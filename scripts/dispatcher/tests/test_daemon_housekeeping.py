@@ -28,19 +28,12 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
-
 import pytest
 
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-
-# Ensure a ``psycopg`` module exists in sys.modules before importing
-# the daemon. Mirrors the pattern used in test_daemon_phase2.py.
-if "psycopg" not in sys.modules:  # pragma: no cover — fresh-venv guard
-    sys.modules["psycopg"] = MagicMock()
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 

@@ -35,10 +35,6 @@ _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-# Ensure a `psycopg` module exists in sys.modules before importing the daemon.
-if "psycopg" not in sys.modules:  # pragma: no cover — fresh-venv guard
-    sys.modules["psycopg"] = MagicMock()
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 

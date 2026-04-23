@@ -41,22 +41,6 @@ _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-# Provide a real-Exception psycopg stub for the daemon's lazy import.
-# Other test files install a pure MagicMock stub whose
-# ``errors.UniqueViolation`` is itself a Mock — that trips Python's
-# "catching classes that do not inherit from BaseException" rule.
-
-
-class _UniqueViolation(Exception):
-    """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-
-_psycopg_stub = MagicMock()
-_psycopg_errors = MagicMock()
-_psycopg_errors.UniqueViolation = _UniqueViolation
-_psycopg_stub.errors = _psycopg_errors
-sys.modules["psycopg"] = _psycopg_stub
-
 from dispatcher import daemon  # noqa: E402
 
 

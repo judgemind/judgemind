@@ -44,28 +44,7 @@ _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-# Provide a stub ``psycopg`` module before importing the daemon. The
-# daemon's ``_atomic_claim`` catches ``psycopg.errors.UniqueViolation``,
-# so that class must be a real Exception subclass. Other tests install
-# a pure ``MagicMock()`` stub (see test_daemon_phase2.py) whose
-# ``errors.UniqueViolation`` is itself a Mock — that trips Python's
-# "catching classes that do not inherit from BaseException" rule when
-# the daemon's ``except psycopg.errors.UniqueViolation`` clause runs.
-# Always overwrite the stub here so our exception class is installed
-# regardless of test-collection order.
-
-
-class _UniqueViolation(Exception):
-    """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-
-_psycopg_stub = MagicMock()
-_psycopg_errors = MagicMock()
-_psycopg_errors.UniqueViolation = _UniqueViolation
-_psycopg_stub.errors = _psycopg_errors
-sys.modules["psycopg"] = _psycopg_stub
-
-import psycopg  # noqa: E402  — re-import after stub install
+import psycopg  # noqa: E402  — stub installed by conftest.py
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 from dispatcher.tests._popen_fake import make_popen_factory  # noqa: E402

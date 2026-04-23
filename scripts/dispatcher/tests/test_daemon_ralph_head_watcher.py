@@ -44,16 +44,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-class _UniqueViolation(Exception):
-    """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-
-_psycopg_stub = MagicMock()
-_psycopg_errors = MagicMock()
-_psycopg_errors.UniqueViolation = _UniqueViolation
-_psycopg_stub.errors = _psycopg_errors
-sys.modules.setdefault("psycopg", _psycopg_stub)
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 # --------------------------------------------------------------------------
@@ -273,6 +263,7 @@ class TestWatcherLoopBehaviour:
         worktree: Path,
         shas: list[str | None],
         iteration_contents: str | None = None,
+        psycopg_stub: Any = None,
     ) -> list[dict[str, Any]]:
         """Return the list of kwargs recorded per persist call."""
         worktree.mkdir(parents=True, exist_ok=True)
@@ -288,8 +279,8 @@ class TestWatcherLoopBehaviour:
 
         # Stub psycopg.connect — the watcher opens its own connection.
         fake_watcher_conn = _FakeConnection()
-        fake_psycopg = sys.modules["psycopg"]
-        fake_psycopg.connect = MagicMock(return_value=fake_watcher_conn)
+        assert psycopg_stub is not None, "psycopg_stub fixture must be provided"
+        psycopg_stub.connect = MagicMock(return_value=fake_watcher_conn)
 
         # Stub the SHA read.
         seq = _ShaSequence(shas)
@@ -357,7 +348,7 @@ class TestWatcherLoopBehaviour:
         return persist_calls
 
     def test_sha_change_triggers_persist_with_loop_verdict(
-        self, monkeypatch: Any, tmp_path: Path
+        self, monkeypatch: Any, tmp_path: Path, psycopg_stub: Any
     ) -> None:
         """AC #1 happy path — one SHA change → one persist call with
         verdict='LOOP' and iteration_n from iteration.txt."""
@@ -369,6 +360,7 @@ class TestWatcherLoopBehaviour:
             worktree,
             shas=["sha-baseline", "sha-iter-2"],
             iteration_contents="2\n",
+            psycopg_stub=psycopg_stub,
         )
         assert len(calls) == 1
         assert calls[0]["verdict"] == "LOOP"
@@ -377,7 +369,7 @@ class TestWatcherLoopBehaviour:
         assert calls[0]["issue_number"] == 42
 
     def test_baseline_sha_does_not_persist(
-        self, monkeypatch: Any, tmp_path: Path
+        self, monkeypatch: Any, tmp_path: Path, psycopg_stub: Any
     ) -> None:
         """The first observed SHA is the baseline — no persist. Only
         SHA *changes* after the baseline trigger writes."""
@@ -389,11 +381,12 @@ class TestWatcherLoopBehaviour:
             worktree,
             shas=["sha-steady", "sha-steady", "sha-steady"],
             iteration_contents="1\n",
+            psycopg_stub=psycopg_stub,
         )
         assert calls == []
 
     def test_multiple_sha_changes_each_persist(
-        self, monkeypatch: Any, tmp_path: Path
+        self, monkeypatch: Any, tmp_path: Path, psycopg_stub: Any
     ) -> None:
         """Two sequential SHA changes → two persist calls."""
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -404,12 +397,13 @@ class TestWatcherLoopBehaviour:
             worktree,
             shas=["sha-1", "sha-2", "sha-3"],
             iteration_contents="2\n",
+            psycopg_stub=psycopg_stub,
         )
         assert len(calls) == 2
         assert all(c["verdict"] == "LOOP" for c in calls)
 
     def test_unchanged_sha_does_not_persist(
-        self, monkeypatch: Any, tmp_path: Path
+        self, monkeypatch: Any, tmp_path: Path, psycopg_stub: Any
     ) -> None:
         """AC #1 negative path — no SHA change across 4 polls, no row."""
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -420,10 +414,13 @@ class TestWatcherLoopBehaviour:
             worktree,
             shas=["same-sha", "same-sha", "same-sha", "same-sha"],
             iteration_contents="1\n",
+            psycopg_stub=psycopg_stub,
         )
         assert calls == []
 
-    def test_stop_event_exits_cleanly(self, monkeypatch: Any, tmp_path: Path) -> None:
+    def test_stop_event_exits_cleanly(
+        self, monkeypatch: Any, tmp_path: Path, psycopg_stub: Any
+    ) -> None:
         """AC #2 — stop_event set → thread exits, no leak."""
         d, _conn, _handler = _make_daemon(tmp_path)
         worktree = tmp_path / "wt"
@@ -437,10 +434,11 @@ class TestWatcherLoopBehaviour:
             worktree,
             shas=["sha-a", "sha-a"],
             iteration_contents="1\n",
+            psycopg_stub=psycopg_stub,
         )
 
     def test_iteration_file_missing_falls_back_to_zero(
-        self, monkeypatch: Any, tmp_path: Path
+        self, monkeypatch: Any, tmp_path: Path, psycopg_stub: Any
     ) -> None:
         """iteration_n inference failure does not crash — falls back to 0."""
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -451,6 +449,7 @@ class TestWatcherLoopBehaviour:
             worktree,
             shas=["sha-a", "sha-b"],
             iteration_contents=None,  # do not create iteration.txt
+            psycopg_stub=psycopg_stub,
         )
         assert len(calls) == 1
         assert calls[0]["iteration_n"] == 0
@@ -620,7 +619,9 @@ class TestWatcherGatedByRalphPhase:
         assert result is None
         assert handler.events("ralph_head_watcher_skip")
 
-    def test_start_ralph_head_watcher_emits_started_event(self, tmp_path: Path) -> None:
+    def test_start_ralph_head_watcher_emits_started_event(
+        self, tmp_path: Path, psycopg_stub: Any
+    ) -> None:
         """The watcher start helper emits a structured event so
         CloudWatch can confirm live activity per-agent."""
         d, _conn, handler = _make_daemon(tmp_path)
@@ -628,8 +629,7 @@ class TestWatcherGatedByRalphPhase:
         worktree.mkdir()
         # Patch psycopg.connect so the watcher thread does not try to
         # talk to a real DB.
-        fake_psycopg = sys.modules["psycopg"]
-        fake_psycopg.connect = MagicMock(return_value=_FakeConnection())
+        psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
         result = d._start_ralph_head_watcher(
             agent_id="agent-id",

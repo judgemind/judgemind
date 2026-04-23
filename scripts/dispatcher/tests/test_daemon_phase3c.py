@@ -41,23 +41,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-# Install a psycopg stub whose ``errors.UniqueViolation`` is a real
-# Exception subclass — matches the pattern in test_daemon_phase3a.py /
-# phase3b.py so the daemon's ``except psycopg.errors.UniqueViolation``
-# resolves consistently regardless of test-collection order.
-if "psycopg" not in sys.modules or not isinstance(
-    getattr(sys.modules["psycopg"].errors, "UniqueViolation", None), type
-):
-
-    class _UniqueViolation(Exception):
-        """Test sentinel — stands in for real psycopg.errors.UniqueViolation."""
-
-    _psycopg_stub = MagicMock()
-    _psycopg_errors = MagicMock()
-    _psycopg_errors.UniqueViolation = _UniqueViolation
-    _psycopg_stub.errors = _psycopg_errors
-    sys.modules["psycopg"] = _psycopg_stub
-
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 
 
@@ -775,8 +758,7 @@ class TestProcessRetryMarkers:
         retrying_resets = [
             e
             for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.agents" in e[0]
-            and "status = 'retrying'" in e[0]
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
         ]
         assert retrying_resets == [], (
             "infra-preemption path must not emit retrying reset after #2925"
@@ -824,15 +806,12 @@ class TestProcessRetryMarkers:
             if "UPDATE dispatcher.agents" in e[0]
             and "retries_used = retries_used + 1" in e[0]
         ]
-        assert incremented == [], (
-            "paused_by_killswitch must not increment retries_used"
-        )
+        assert incremented == [], "paused_by_killswitch must not increment retries_used"
 
         retrying_resets = [
             e
             for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.agents" in e[0]
-            and "status = 'retrying'" in e[0]
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
         ]
         assert retrying_resets == []
 
