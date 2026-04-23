@@ -169,23 +169,39 @@ set -u
 INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 . "$(dirname "$0")/_record_invocation.sh" claude "$@"
 
-# Determine phase from /task-v2-<phase> in argv.
-phase=""
+# Determine skill-suffix from /task-v2-<skill> in argv. Note that
+# post-#3117 the caller passes the SKILL NAME (plan, ralph, summary,
+# fix-ci, verify, retro) not the phase name — this stub looks up
+# verdicts by skill name for that reason. Tests that want to assert
+# the entrypoint sent the right /task-v2-<skill> literal grep the
+# claude.log directly.
+skill=""
 for arg in "$@"; do
     case "$arg" in
         /task-v2-*)
-            # Strip "/task-v2-" prefix and trailing agent id.
             stripped="${arg#/task-v2-}"
-            phase="${stripped%% *}"
+            skill="${stripped%% *}"
             break
             ;;
     esac
 done
 
-# Look up verdict for this phase from CLAUDE_VERDICT_FIXTURE (TSV).
+# Allow tests to inject a non-object `.result` (e.g. a plain string
+# "Unknown command: /task-v2-foo") to exercise the defensive shim.
+# Set CLAUDE_RESULT_OVERRIDE to the exact JSON payload to emit. Set
+# CLAUDE_RESULT_OVERRIDE_SKILL to scope the override to one skill
+# only; leave unset to apply it to every skill invocation.
+if [[ -n "${CLAUDE_RESULT_OVERRIDE:-}" ]]; then
+    if [[ -z "${CLAUDE_RESULT_OVERRIDE_SKILL:-}" || "${CLAUDE_RESULT_OVERRIDE_SKILL}" == "$skill" ]]; then
+        printf '%s\n' "$CLAUDE_RESULT_OVERRIDE"
+        exit 0
+    fi
+fi
+
+# Look up verdict for this skill from CLAUDE_VERDICT_FIXTURE (TSV).
 verdict="SHIP"
-if [[ -f "${CLAUDE_VERDICT_FIXTURE:-}" && -n "$phase" ]]; then
-    match=$(grep -E "^${phase}	" "$CLAUDE_VERDICT_FIXTURE" 2>/dev/null || true)
+if [[ -f "${CLAUDE_VERDICT_FIXTURE:-}" && -n "$skill" ]]; then
+    match=$(grep -E "^${skill}	" "$CLAUDE_VERDICT_FIXTURE" 2>/dev/null || true)
     if [[ -n "$match" ]]; then
         verdict=$(printf '%s' "$match" | cut -f2)
     fi
@@ -243,12 +259,24 @@ case "$subcommand" in
         printf 'deadbeefcafe\n'
         exit 0
         ;;
+    rev-list)
+        # `git rev-list --count origin/main..HEAD` — tests that want
+        # to exercise push_and_pr's push-and-PR path set
+        # GIT_REV_LIST_COUNT=1 (or higher); tests that want the no-op
+        # branch leave it unset (defaults to 0).
+        printf '%s\n' "${GIT_REV_LIST_COUNT:-0}"
+        exit 0
+        ;;
     format-patch)
         printf 'From deadbeefcafe Mon Sep 17 00:00:00 2001\nfake patch content\n'
         exit 0
         ;;
     am)
         exit 0
+        ;;
+    push)
+        # Honor GIT_PUSH_EXIT to simulate push failures.
+        exit "${GIT_PUSH_EXIT:-0}"
         ;;
     *)
         exit 0
@@ -264,6 +292,22 @@ cat > "$STUB_BIN/gh" <<'GHEOF'
 set -u
 INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 . "$(dirname "$0")/_record_invocation.sh" gh "$@"
+
+# Simulate `gh pr create` outcomes based on GH_PR_CREATE_EXIT.
+sub=""
+for arg in "$@"; do
+    if [[ "$sub" == "" && "$arg" != --* && "$arg" != -* ]]; then
+        sub="$arg"
+        continue
+    fi
+    if [[ -n "$sub" && "$sub" == "pr" && "$arg" != --* && "$arg" != -* ]]; then
+        if [[ "$arg" == "create" ]]; then
+            printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+            exit "${GH_PR_CREATE_EXIT:-0}"
+        fi
+    fi
+done
+
 exit 0
 GHEOF
 chmod +x "$STUB_BIN/gh"
@@ -362,12 +406,13 @@ PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t2.txt"
 printf 'planning\n' > "$PHASE_FIXTURE_FILE"
 
 CLAUDE_VERDICT_FIXTURE="$TEST_TMP/verdicts-t2.tsv"
+# Verdicts keyed by SKILL NAME (post-#3117), not phase name. The
+# entrypoint maps `planning → plan`, `fix_ci → fix-ci`, etc.
 cat > "$CLAUDE_VERDICT_FIXTURE" <<'EOF'
-planning	OK
+plan	OK
 ralph	SHIP
 summary	OK
-push_and_pr	OK
-fix_ci	PATCHED
+fix-ci	PATCHED
 verify	VERIFIED
 EOF
 
@@ -391,6 +436,7 @@ out=$(AGENT_ID="11111111-2222-3333-4444-555555555555" \
       PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
+      GIT_REV_LIST_COUNT=1 \
       bash "$ENTRYPOINT" 2>&1)
 rc=$?
 set -e
@@ -459,12 +505,57 @@ else
     fail "phase advances through the happy-path sequence" "expected ≥7 phase updates, got $update_count"
 fi
 
-# Verify claude was invoked for each claude-driven phase.
+# Verify claude was invoked for each claude-driven phase. Post-#3117
+# the happy path calls claude for planning, ralph, summary, verify
+# (4 calls) — push_and_pr is mechanical, and fix_ci only runs when
+# CI goes red (which the stub doesn't simulate).
 claude_calls=$(wc -l < "$INVOCATIONS_DIR/claude.log" | tr -d ' ')
-if [[ "$claude_calls" -ge 5 ]]; then
+if [[ "$claude_calls" -ge 4 ]]; then
     pass "claude invoked for each claude-driven phase (calls=$claude_calls)"
 else
-    fail "claude invoked for each claude-driven phase" "expected ≥5 claude calls, got $claude_calls"
+    fail "claude invoked for each claude-driven phase" "expected ≥4 claude calls, got $claude_calls"
+fi
+
+# Verify the entrypoint invoked claude with the real SKILL names, not
+# the raw phase names (#3117 bug #1). This is the regression guard
+# against the `planning → plan` and `fix_ci → fix-ci` drift that
+# caused every Stage 3 smoke agent to die at the first phase with
+# "Unknown command: /task-v2-planning".
+# The `-p` flag quotes its argument as a single token: `/task-v2-plan
+# <agent_id>`. printf '%q' escapes the embedded space as `\ ` in the
+# invocations log, so the literal `/task-v2-plan\ ` appears in the
+# log when (and only when) the skill suffix is exactly `plan`. A
+# phase-name-drift bug would produce `/task-v2-planning\ ` which we
+# rule out with the negative grep below.
+if grep -F "/task-v2-plan\\ " "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    pass "entrypoint invokes /task-v2-plan skill (not /task-v2-planning)"
+else
+    fail "entrypoint invokes /task-v2-plan skill (not /task-v2-planning)" \
+         "claude log: $(head -c 300 "$INVOCATIONS_DIR/claude.log")"
+fi
+
+# Negative: /task-v2-planning must NOT appear anywhere in the log.
+if grep -F "/task-v2-planning" "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    fail "entrypoint does not invoke /task-v2-planning (phase-name drift)" \
+         "Found /task-v2-planning in claude log."
+else
+    pass "entrypoint does not invoke /task-v2-planning (phase-name drift)"
+fi
+
+# Negative: /task-v2-claiming and /task-v2-push_and_pr skills do not
+# exist and must never be invoked.
+if grep -F "/task-v2-claiming" "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    fail "entrypoint does not invoke /task-v2-claiming (mechanical pseudo-phase)" \
+         "Found /task-v2-claiming in claude log."
+else
+    pass "entrypoint does not invoke /task-v2-claiming (mechanical pseudo-phase)"
+fi
+
+if grep -F "/task-v2-push_and_pr" "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    fail "entrypoint does not invoke /task-v2-push_and_pr (mechanical phase)" \
+         "Found /task-v2-push_and_pr in claude log."
+else
+    pass "entrypoint does not invoke /task-v2-push_and_pr (mechanical phase)"
 fi
 
 # Verify final phase is done.
@@ -588,6 +679,369 @@ if printf '%s' "$out" | grep -q "DATABASE_URL_unset"; then
     pass "reports DATABASE_URL_unset in fatal log"
 else
     fail "reports DATABASE_URL_unset in fatal log" "output: $out"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 6: #3117 bug #2 — `claiming` advances to `planning` without
+# invoking a nonexistent `/task-v2-claiming` skill.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t6.txt"
+printf 'claiming\n' > "$PHASE_FIXTURE_FILE"
+
+CLAUDE_VERDICT_FIXTURE="$TEST_TMP/verdicts-t6.tsv"
+cat > "$CLAUDE_VERDICT_FIXTURE" <<'EOF'
+plan	OK
+ralph	SHIP
+summary	OK
+verify	VERIFIED
+EOF
+PRIOR_PATCH_FIXTURE=""
+
+t6_workspace="$TEST_TMP/t6-workspace"
+mkdir -p "$t6_workspace"
+
+set +e
+out=$(AGENT_ID="66666666-7777-8888-9999-aaaaaaaaaaaa" \
+      ISSUE_NUMBER="3117" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t6_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+if [[ $rc -eq 0 ]]; then
+    pass "claiming no-op: pipeline advances to done cleanly (rc=0)"
+else
+    fail "claiming no-op: pipeline advances to done cleanly" \
+         "rc=$rc, final phase: $(cat "$PHASE_FIXTURE_FILE" 2>/dev/null), output tail: $(printf '%s\n' "$out" | tail -20)"
+fi
+
+# The `claiming` branch must persist a no-op row rather than crashing
+# on a nonexistent skill.
+if grep -q "claiming_no_op_advance_to_planning" <<<"$out"; then
+    pass "claiming branch emits claiming_no_op_advance_to_planning event"
+else
+    fail "claiming branch emits claiming_no_op_advance_to_planning event" "output: $out"
+fi
+
+# `planning` UPDATE must follow `claiming`: the FIRST phase-advance
+# UPDATE in psql.log should point at 'planning'. `printf '%q'` (used
+# by the stub's invocation recorder) emits the multi-line SQL as a
+# `$'...'` token with `\'planning\'` for the quoted phase literal.
+# Extract the phase name from the first such UPDATE.
+first_phase_name=$(grep -oE "SET phase = \\\\'[a-z_]+\\\\'" "$INVOCATIONS_DIR/psql.log" 2>/dev/null \
+                   | head -n 1 \
+                   | sed -E "s/.*\\\\'([a-z_]+)\\\\'.*/\\1/" \
+                   || true)
+if [[ "$first_phase_name" == "planning" ]]; then
+    pass "claiming advances first to planning"
+else
+    fail "claiming advances first to planning" \
+         "first phase name extracted: [$first_phase_name] log head: $(head -c 400 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 7: #3117 bug #3 — non-object `.result` from claude is coerced
+# to {} rather than crashing the shim.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t7.txt"
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t7_workspace="$TEST_TMP/t7-workspace"
+mkdir -p "$t7_workspace"
+
+# Force the claude stub to emit a plain-string .result for every call —
+# e.g. the actual "Unknown command" shape that hit the Stage 3 smoke.
+set +e
+out=$(AGENT_ID="77777777-8888-9999-aaaa-bbbbbbbbbbbb" \
+      ISSUE_NUMBER="3117" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t7_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "Unknown command: /task-v2-plan"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="plan" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# The script must NOT crash with a python AttributeError on the shim.
+# The transition for plan with an empty output dict is "advance to
+# ralph" (plan has no SHIP/AC_INFEASIBLE gate — any non-BLOCKED
+# output treats plan as done). The next phase must be `ralph` or
+# further along; the important property is "no python traceback".
+if printf '%s' "$out" | grep -q "AttributeError\|Traceback"; then
+    fail "non-dict .result does not crash the shim with Python traceback" \
+         "output: $(printf '%s' "$out" | grep -E 'Traceback|AttributeError' | head -5)"
+else
+    pass "non-dict .result does not crash the shim with Python traceback"
+fi
+
+# Entrypoint must have logged claude_result_non_object for the bad payload.
+if printf '%s' "$out" | grep -q "claude_result_non_object"; then
+    pass "entrypoint logs claude_result_non_object on non-object .result"
+else
+    fail "entrypoint logs claude_result_non_object on non-object .result" \
+         "output: $out"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 8: #3117 bug #4 — push_and_pr is mechanical; it invokes
+# git push + gh pr create and does NOT invoke claude for a
+# `/task-v2-push_and_pr` skill.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t8.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t8_workspace="$TEST_TMP/t8-workspace"
+mkdir -p "$t8_workspace"
+
+set +e
+out=$(AGENT_ID="88888888-9999-aaaa-bbbb-cccccccccccc" \
+      ISSUE_NUMBER="3117" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t8_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# push_and_pr must NOT invoke claude — that was the original bug.
+if grep -F "/task-v2-push_and_pr" "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    fail "push_and_pr does not invoke claude (mechanical phase)" \
+         "Found /task-v2-push_and_pr in claude log."
+else
+    pass "push_and_pr does not invoke claude (mechanical phase)"
+fi
+
+# git push must have been invoked with `-u origin <branch>`.
+if grep -F "push" "$INVOCATIONS_DIR/git.log" | grep -F "origin" >/dev/null 2>&1; then
+    pass "push_and_pr invokes git push -u origin <branch>"
+else
+    fail "push_and_pr invokes git push -u origin <branch>" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+fi
+
+# gh pr create must have been invoked.
+if grep -F "pr" "$INVOCATIONS_DIR/gh.log" | grep -F "create" >/dev/null 2>&1; then
+    pass "push_and_pr invokes gh pr create"
+else
+    fail "push_and_pr invokes gh pr create" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+fi
+
+# push_and_pr advances to awaiting_ci on success. The stub's %q-escaped
+# log has `SET phase = \'awaiting_ci\'` for the phase literal.
+if grep -q "SET phase = \\\\'awaiting_ci\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "push_and_pr advances to awaiting_ci"
+else
+    fail "push_and_pr advances to awaiting_ci" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 9: #3117 bug #4 — push_and_pr no-op branch (#3039). A ralph
+# SHIP with clean worktree (rev-list count 0) terminates as no_op
+# without pushing or opening a PR.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t9.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t9_workspace="$TEST_TMP/t9-workspace"
+mkdir -p "$t9_workspace"
+
+set +e
+out=$(AGENT_ID="99999999-aaaa-bbbb-cccc-dddddddddddd" \
+      ISSUE_NUMBER="3117" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t9_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      GIT_REV_LIST_COUNT=0 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+if [[ $rc -eq 0 ]]; then
+    pass "push_and_pr no-op (#3039) terminates cleanly (rc=0)"
+else
+    fail "push_and_pr no-op (#3039) terminates cleanly" \
+         "rc=$rc, final phase: $(cat "$PHASE_FIXTURE_FILE" 2>/dev/null)"
+fi
+
+if printf '%s' "$out" | grep -q "push_and_pr_no_op"; then
+    pass "push_and_pr no-op logs push_and_pr_no_op event"
+else
+    fail "push_and_pr no-op logs push_and_pr_no_op event" "output: $out"
+fi
+
+# No-op must NOT have pushed or opened a PR.
+if grep -F "push" "$INVOCATIONS_DIR/git.log" | grep -F "origin" >/dev/null 2>&1; then
+    fail "push_and_pr no-op does not invoke git push" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+else
+    pass "push_and_pr no-op does not invoke git push"
+fi
+
+if [[ -s "$INVOCATIONS_DIR/gh.log" ]] && grep -F "pr" "$INVOCATIONS_DIR/gh.log" | grep -F "create" >/dev/null 2>&1; then
+    fail "push_and_pr no-op does not invoke gh pr create" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+else
+    pass "push_and_pr no-op does not invoke gh pr create"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 10: #3117 bug #1 — the fix_ci phase maps to the `fix-ci` skill
+# (hyphen), not `fix_ci` (underscore).
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t10.txt"
+printf 'fix_ci\n' > "$PHASE_FIXTURE_FILE"
+
+CLAUDE_VERDICT_FIXTURE="$TEST_TMP/verdicts-t10.tsv"
+cat > "$CLAUDE_VERDICT_FIXTURE" <<'EOF'
+fix-ci	PATCHED
+EOF
+PRIOR_PATCH_FIXTURE=""
+
+t10_workspace="$TEST_TMP/t10-workspace"
+mkdir -p "$t10_workspace"
+
+set +e
+out=$(AGENT_ID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" \
+      ISSUE_NUMBER="3117" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t10_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# The entrypoint must pass /task-v2-fix-ci to claude (hyphen), never
+# /task-v2-fix_ci (underscore). This is the regression guard against
+# #3117 bug #1's second drift. `printf '%q'` escapes the space between
+# the skill suffix and the agent id as `\ `, so the literal
+# `/task-v2-fix-ci\ ` is the expected token in the log.
+if grep -F "/task-v2-fix-ci\\ " "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    pass "fix_ci phase invokes /task-v2-fix-ci skill (hyphen)"
+else
+    fail "fix_ci phase invokes /task-v2-fix-ci skill (hyphen)" \
+         "claude log: $(cat "$INVOCATIONS_DIR/claude.log")"
+fi
+
+if grep -F "/task-v2-fix_ci" "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1; then
+    fail "fix_ci phase does not invoke /task-v2-fix_ci (underscore drift)" \
+         "Found /task-v2-fix_ci in claude log."
+else
+    pass "fix_ci phase does not invoke /task-v2-fix_ci (underscore drift)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 11: #3117 bug #5 — malformed JSON from claude does not crash
+# the runner; it surfaces via claude_result_non_object and the
+# entrypoint continues to advance.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t11.txt"
+printf 'planning\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t11_workspace="$TEST_TMP/t11-workspace"
+mkdir -p "$t11_workspace"
+
+set +e
+out=$(AGENT_ID="bbbbbbbb-cccc-dddd-eeee-ffffffffffff" \
+      ISSUE_NUMBER="3117" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t11_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='this is not json at all' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="plan" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# Runner must not crash with a Python traceback on malformed JSON.
+if printf '%s' "$out" | grep -q "AttributeError\|Traceback"; then
+    fail "malformed JSON output does not crash shim with Python traceback" \
+         "output: $(printf '%s' "$out" | head -c 500)"
+else
+    pass "malformed JSON output does not crash shim with Python traceback"
+fi
+
+if printf '%s' "$out" | grep -q "claude_result_non_object"; then
+    pass "malformed JSON output surfaces via claude_result_non_object"
+else
+    fail "malformed JSON output surfaces via claude_result_non_object" \
+         "output: $out"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
