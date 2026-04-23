@@ -311,6 +311,19 @@ module "dispatcher_daemon" {
   # notBreaching` on the alarm keeps it from paging while desired_count=0.
   enable_alerts       = true
   alert_sns_topic_arn = module.compute.alerts_topic_arn
+
+  # #3091 Stage 2 — per-agent ECS launcher wiring. Threads the
+  # agent-runner module's task-def family + security group + role ARNs
+  # through to the daemon's task role (for ecs:RunTask / DescribeTasks
+  # / StopTask / iam:PassRole) and to the daemon's container env vars
+  # (so _launch_agent_ecs_task knows what to run and where). Default
+  # ``dispatcher.config.agent_execution_mode`` stays at ``'subprocess'``
+  # — this wiring is inert until Stage 4 (#3093) flips the default.
+  agent_runner_task_definition_family = module.dispatcher_agent_runner.task_definition_family
+  agent_runner_execution_role_arn     = module.dispatcher_agent_runner.execution_role_arn
+  agent_runner_task_role_arn          = module.dispatcher_agent_runner.task_role_arn
+  agent_runner_subnet_ids             = module.networking.private_subnet_ids
+  agent_runner_security_group_id      = module.dispatcher_agent_runner.security_group_id
 }
 
 # ─── Dispatcher agent-runner task def (Stage 1b, #3090) ─────────────────────

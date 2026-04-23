@@ -181,3 +181,46 @@ variable "oneshot_ecr_scraper_repository_arn" {
   type        = string
   default     = ""
 }
+
+# ─── Per-agent ECS task launcher (#3091 Stage 2) ────────────────────────────
+# Wiring the daemon to `ecs:RunTask` the agent-runner task definition
+# (shipped in Stage 1b, #3090) per-agent. When both ARNs below are
+# wired, the daemon's task role gains `ecs:RunTask` /
+# `ecs:DescribeTasks` / `ecs:StopTask` (scoped to the agent-runner
+# task-def family + this cluster) AND `iam:PassRole` (scoped to the
+# agent-runner's execution + task roles).
+#
+# Leave empty to skip the policy entirely — the daemon's self-
+# invocation policy (`task_run_task_self`) and oneshot policy
+# (`task_run_oneshot`) are untouched. Useful while Stage 2 is still
+# inert behind the `agent_execution_mode='subprocess'` default.
+
+variable "agent_runner_task_definition_family" {
+  description = "Family name of the dispatcher-agent-runner task definition (e.g. `judgemind-dispatcher-agent-runner-<env>`). Wired from the dispatcher-agent-runner module's `task_definition_family` output. When set alongside the two role ARNs below, the daemon's task role gains ecs:RunTask / ecs:DescribeTasks / ecs:StopTask scoped to this family. Empty disables — Stage 2 launcher falls back to the subprocess path."
+  type        = string
+  default     = ""
+}
+
+variable "agent_runner_execution_role_arn" {
+  description = "ARN of the agent-runner execution role (exported by the dispatcher-agent-runner module as `execution_role_arn`). Passed to the agent-runner task on RunTask, so the daemon's PassRole scope must include it. Empty disables the Stage 2 policy."
+  type        = string
+  default     = ""
+}
+
+variable "agent_runner_task_role_arn" {
+  description = "ARN of the agent-runner task role (exported by the dispatcher-agent-runner module as `task_role_arn`). Passed to the agent-runner task on RunTask, so the daemon's PassRole scope must include it. Empty disables the Stage 2 policy."
+  type        = string
+  default     = ""
+}
+
+variable "agent_runner_subnet_ids" {
+  description = "Private subnet IDs the agent-runner tasks launch into. Typically the same list as the daemon's `private_subnet_ids`. Threaded into the dispatcher container as AGENT_RUNNER_SUBNET_IDS (comma-separated) for the Stage 2 launcher's network_configuration. Empty list disables the env var — daemon falls back to subprocess mode."
+  type        = list(string)
+  default     = []
+}
+
+variable "agent_runner_security_group_id" {
+  description = "Security group ID attached to agent-runner tasks (exported by the dispatcher-agent-runner module as `security_group_id`). Threaded into the dispatcher container as AGENT_RUNNER_SECURITY_GROUP_ID. Empty disables the env var."
+  type        = string
+  default     = ""
+}

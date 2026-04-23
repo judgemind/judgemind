@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 40 migrations.
+-- Generated from 41 migrations.
 
 
 
@@ -363,7 +363,9 @@ CREATE TABLE dispatcher.agents (
     merged_at timestamp with time zone,
     verified_at timestamp with time zone,
     verify_skip_reason text,
-    retroed_at timestamp with time zone
+    retroed_at timestamp with time zone,
+    agent_task_arn text,
+    execution_mode text DEFAULT 'subprocess'::text NOT NULL
 );
 
 
@@ -395,6 +397,12 @@ COMMENT ON COLUMN dispatcher.agents.verify_skip_reason IS 'Non-null when verify 
 
 
 COMMENT ON COLUMN dispatcher.agents.retroed_at IS 'Timestamp the retro phase reached PHASE_RETRO_DONE. NULL when retro crashed, when the worktree was already gone at retro time (fast-path to cleanup_done), or for pre-migration-35 rows. A merged row with ``verified_at`` set but ``retroed_at`` NULL renders as amber ✓ — "shipped + verified but retro bookkeeping did not complete". Issue #2953.';
+
+
+COMMENT ON COLUMN dispatcher.agents.agent_task_arn IS 'ECS task ARN of the per-agent agent-runner task (#3091). NULL for legacy subprocess-mode agents and between claim + ecs:RunTask in ecs-mode agents. Partial-indexed so the daemon reap pass scans only live ECS agents.';
+
+
+COMMENT ON COLUMN dispatcher.agents.execution_mode IS 'One of ''subprocess'' (legacy, default) | ''ecs'' (per-agent Fargate task via ecs:RunTask). Set once at claim time from dispatcher.config.agent_execution_mode and held immutable across the agent''s lifetime. See #3091 / #3086 / #3078.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (
@@ -1233,6 +1241,9 @@ CREATE INDEX idx_rulings_posted_at ON derived.rulings USING btree (posted_at DES
 
 
 CREATE UNIQUE INDEX uq_rulings_case_text_hash ON derived.rulings USING btree (case_id, ruling_text_hash) WHERE (ruling_text_hash IS NOT NULL);
+
+
+CREATE INDEX dispatcher_agents_task_arn_idx ON dispatcher.agents USING btree (agent_task_arn) WHERE (agent_task_arn IS NOT NULL);
 
 
 CREATE UNIQUE INDEX idx_dispatcher_agents_active_issue ON dispatcher.agents USING btree (issue_number) WHERE (status = ANY (ARRAY['running'::text, 'retrying'::text]));
