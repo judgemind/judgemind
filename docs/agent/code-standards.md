@@ -161,6 +161,34 @@ scripts/check-ci-job-skipped.sh
 
 This detects the #2410 / #2505 footgun: a PR modifies a job body whose `if: needs.detect-changes.outputs.X == 'true'` gate's paths-filter does not match anything in the diff, so the job will be SKIPPED on that PR's own CI run and the modification is never actually exercised. The same check runs in CI as the `ci-job-skipped-check` job; the pre-push hook runs it whenever `ci.yml` is in the push. If it fails, either add `.github/workflows/ci.yml` to the offending filter (so the job always runs when ci.yml itself changes) or modify a file that already matches the filter.
 
+### Interpreting mergeStateStatus (UNSTABLE-but-green)
+
+GitHub's `mergeStateStatus` field — exposed by `gh pr view --json mergeStateStatus` and `mcp__github__get_pull_request` — is derived from the *entire history* of check runs on the PR's head SHA, not just the latest attempt per workflow. One stale failed run from a previous CI attempt is enough to keep a PR flagged `UNSTABLE` even after a successful rerun on the same SHA flips the latest rollup green.
+
+**Symptom:** `gh pr view <N> --json mergeable,mergeStateStatus` returns `{"mergeable": "MERGEABLE", "mergeStateStatus": "UNSTABLE"}` yet every currently-displayed check on the PR page is green. Common trigger: the first run on the SHA hit a transient GitHub Actions flake (e.g. `detect-changes` timeout), you reran that workflow on the same SHA, and the rerun succeeded. Both runs' check runs are attached to the SHA; GitHub surfaces the old failed run in the mergeStateStatus calculation forever.
+
+**Correct merge gate** (use this, not `mergeStateStatus == CLEAN`):
+
+1. `mergeable == MERGEABLE` (GitHub can compute a merge commit — no conflicts), AND
+2. The **required** status check — `ci-passed` on this repo — has `conclusion: SUCCESS` on its latest run, AND
+3. No *latest* non-required check has `conclusion: FAILURE` (a failed required-ish check on the current SHA — distinct from a stale failed run already addressed by a rerun).
+
+`SKIPPED` is fine. `CANCELLED` on a non-required check is usually fine — it frequently comes from a Vercel / smoke-test concurrency guard superseding an older deploy (`Canceling since a higher priority waiting request exists`) and doesn't reflect a real failure. `UNSTABLE` with gates (1)-(3) satisfied is safe to merge.
+
+**One-line recipe:**
+
+```
+gh pr view <N> --repo judgemind/judgemind \
+  --json mergeable,statusCheckRollup \
+  --jq '{mergeable, rollup: [.statusCheckRollup[] | {name, conclusion}]}'
+```
+
+Scan the output: `mergeable` should be `MERGEABLE`, `ci-passed` should be `SUCCESS`, and nothing should be `FAILURE`. `CANCELLED` on Vercel/Smoke-Test-style checks can be ignored if the current SHA has no corresponding failure from the same workflow. If so, merge — regardless of `mergeStateStatus`.
+
+**Incident example (#3099):** PR #3095's first CI attempt (run `24847629910`) failed on the `detect-changes` job — a transient GitHub Actions flake. The rerun on the same SHA (run `24847660775`) succeeded with every job green. `mergeable` was `MERGEABLE`, `ci-passed` was `SUCCESS`, no latest rollup conclusion was `FAILURE`, but `mergeStateStatus` stayed `UNSTABLE` because the old failed `detect-changes` check run was still attached to the SHA. The PR was safe to merge under the gate above.
+
+The `/task` skill's §A.7 merge step uses this gate — see `.claude/skills/task/SKILL.md`.
+
 ### Database migrations — schema drift
 
 When any file under `packages/api/migrations/` changes, regenerate `packages/api/src/data-access/schema.sql`:
