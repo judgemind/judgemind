@@ -308,6 +308,21 @@ PHASE_MAX_TURNS = {
     "retro": 300,
 }
 
+#: Polling cadence for the ralph per-iteration HEAD-SHA watcher (#3042).
+#: The watcher runs alongside the ``/task-v2-ralph`` subprocess and
+#: calls :meth:`DispatcherDaemon._persist_ralph_iteration_patch` every
+#: time ``git rev-parse HEAD`` observes a new SHA — each iteration's
+#: ``git commit --amend --no-edit`` (ralph's per-#2971 idiom) rewrites
+#: HEAD, so a SHA change is a reliable iteration boundary. 30 seconds
+#: is wide enough to keep DB write volume negligible (a 90-minute ralph
+#: produces ≤ 180 poll attempts, and at most one INSERT per iteration —
+#: typically 1-5 rows per phase) and narrow enough to catch any
+#: iteration shorter than the slowest believable worker-then-reviewer
+#: cycle. The interval is intentionally fixed — issue #3042 picks one
+#: defensible value and sticks with it rather than exposing a tunable
+#: that operators would have to reason about.
+RALPH_HEAD_POLL_INTERVAL_SECONDS = 30
+
 #: Per-phase ``--model`` values. Matches ``dispatcher.config.model_by_phase``
 #: seeded in migration 21. Fix-ci uses Sonnet — the CI-fixing skill's
 #: own frontmatter selects it. Verify uses Haiku — it only reads the
@@ -5291,6 +5306,291 @@ class DispatcherDaemon:
             line.strip() for line in (result.stdout or "").splitlines() if line.strip()
         ]
 
+    # ------------------------------------------------------------------
+    # Ralph per-iteration HEAD-SHA watcher (#3042).
+    #
+    # Historically (pre-#3042) the ralph skill was supposed to invoke
+    # :meth:`_persist_ralph_iteration_patch` at the end of every
+    # iteration via a CLI helper. That layer is LLM-driven and the
+    # instruction was silently skipped — see issue #3042 for the
+    # CloudWatch evidence (13 SHIPs, 3 multi-iteration, zero rows with
+    # ``iteration_n IS NOT NULL``, zero helper stdout lines over the
+    # entire window).
+    #
+    # The daemon now owns the iteration-boundary signal directly. When
+    # :meth:`_spawn_phase_subprocess` runs the ``ralph`` phase it
+    # launches a sibling thread (``_start_ralph_head_watcher``) that
+    # polls ``git -C <worktree> rev-parse HEAD`` every
+    # :data:`RALPH_HEAD_POLL_INTERVAL_SECONDS`. Because ralph amends
+    # in-place per #2971, each iteration rewrites HEAD; a new SHA is a
+    # reliable iteration boundary. On SHA change the watcher reads
+    # ``{worktree}/tmp/ralph/iteration.txt`` (maintained by the inner
+    # ``/ralph`` skill Step 2a) to infer ``iteration_n`` and calls
+    # :meth:`_persist_ralph_iteration_patch` with
+    # ``verdict='LOOP'``. The SHIP-terminal DELETE-by-issue_number
+    # supersede in :meth:`_capture_and_persist_ralph_patch` still wipes
+    # these intermediate rows on a successful SHIP, so the authoritative
+    # SHIP row stays the single per-issue state post-ralph.
+    # ------------------------------------------------------------------
+
+    def _start_ralph_head_watcher(
+        self,
+        agent_id: str,
+        issue_number: int | None,
+        worktree: Path,
+    ) -> tuple[threading.Thread, threading.Event] | None:
+        """Start the ralph per-iteration watcher thread (#3042).
+
+        Returns ``(thread, stop_event)`` on success, ``None`` when we
+        cannot start the watcher at all (missing worktree — a defensive
+        guard; the watcher is best-effort and should never fault the
+        happy path). The caller signals the watcher to exit by setting
+        ``stop_event`` and joining the thread.
+
+        The watcher opens its own psycopg connection on thread entry —
+        the daemon's thread-local connection accessor means the watcher
+        thread would otherwise inherit no connection at all (and
+        :meth:`_persist_ralph_iteration_patch` asserts ``self._conn is
+        not None``). Mirrors the pattern
+        :meth:`_orchestration_worker_entry` uses for the main
+        orchestration thread.
+        """
+        if not worktree.exists():
+            self._log.warning(
+                "daemon.ralph_head_watcher_skip",
+                extra={
+                    "event": "ralph_head_watcher_skip",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "reason": "worktree_missing",
+                    "worktree": str(worktree),
+                },
+            )
+            return None
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._ralph_head_watcher_loop,
+            args=(agent_id, issue_number, worktree, stop_event),
+            name=f"ralph-head-watcher-{agent_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        self._log.info(
+            "daemon.ralph_head_watcher_started",
+            extra={
+                "event": "ralph_head_watcher_started",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "poll_interval_seconds": RALPH_HEAD_POLL_INTERVAL_SECONDS,
+            },
+        )
+        return thread, stop_event
+
+    def _ralph_head_watcher_loop(
+        self,
+        agent_id: str,
+        issue_number: int | None,
+        worktree: Path,
+        stop_event: threading.Event,
+    ) -> None:
+        """Polling loop for the ralph per-iteration HEAD watcher (#3042).
+
+        Runs in a dedicated daemon thread. Opens a psycopg connection,
+        stashes it on ``self._thread_state.conn`` so
+        :meth:`_persist_ralph_iteration_patch`'s ``self._conn`` accessor
+        resolves to this thread's connection, then loops until
+        ``stop_event`` fires.
+
+        Each tick:
+
+        1. ``git rev-parse HEAD`` in the worktree.
+        2. Compare to the previous observed SHA. No change → sleep.
+        3. New SHA → read ``iteration.txt``, call
+           :meth:`_persist_ralph_iteration_patch` with ``verdict='LOOP'``.
+        4. On any exception during persist, swallow + log; never let a
+           watcher crash surface to the main phase subprocess. The
+           persist helper is itself best-effort per #3026.
+
+        The first observed SHA is treated as the baseline and does NOT
+        trigger a persist — the patch captured at iteration N's end is
+        also captured at iteration N+1's start (same HEAD) so we skip
+        the redundant baseline write. Only SHA *changes* fire a persist.
+        """
+        import psycopg  # noqa: PLC0415 — lazy, matches ``_orchestration_worker_entry``
+
+        watcher_conn: Connection[Any] | None = None
+        last_sha: str | None = None
+        persisted_count = 0
+        poll_count = 0
+        try:
+            try:
+                watcher_conn = psycopg.connect(
+                    self._cfg.database_url, connect_timeout=10
+                )
+                watcher_conn.autocommit = False
+            except Exception as exc:
+                # No DB → nothing useful to do. Log and exit cleanly;
+                # the thread still respects stop_event so the caller's
+                # join() returns promptly.
+                self._log.warning(
+                    "daemon.ralph_head_watcher_no_db",
+                    extra={
+                        "event": "ralph_head_watcher_no_db",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "detail": _stderr_tail(str(exc)),
+                    },
+                )
+                stop_event.wait()
+                return
+
+            self._thread_state.conn = watcher_conn
+
+            while not stop_event.is_set():
+                poll_count += 1
+                current_sha = self._read_head_sha(worktree)
+                if current_sha is None:
+                    # Git call failed (worktree torn down, git bug,
+                    # transient lock). Tolerate and try again next
+                    # tick — a ralph worker running ``git commit`` can
+                    # race with rev-parse for a sub-second window.
+                    if stop_event.wait(RALPH_HEAD_POLL_INTERVAL_SECONDS):
+                        break
+                    continue
+
+                if last_sha is None:
+                    # Baseline. Do not persist — this is the HEAD we
+                    # would already have captured at the previous
+                    # iteration's terminal write (or at phase entry).
+                    last_sha = current_sha
+                    if stop_event.wait(RALPH_HEAD_POLL_INTERVAL_SECONDS):
+                        break
+                    continue
+
+                if current_sha != last_sha:
+                    iteration_n = self._read_ralph_iteration_file(worktree)
+                    try:
+                        patch_id = self._persist_ralph_iteration_patch(
+                            agent_id=agent_id,
+                            issue_number=int(issue_number)
+                            if issue_number is not None
+                            else 0,
+                            iteration_n=iteration_n,
+                            verdict="LOOP",
+                            worktree=worktree,
+                        )
+                        if patch_id is not None:
+                            persisted_count += 1
+                            self._log.info(
+                                "daemon.ralph_head_watcher_persisted",
+                                extra={
+                                    "event": "ralph_head_watcher_persisted",
+                                    "run_id": self._run_id,
+                                    "agent_id": agent_id,
+                                    "issue_number": issue_number,
+                                    "iteration_n": iteration_n,
+                                    "patch_id": patch_id,
+                                    "prev_sha": last_sha,
+                                    "new_sha": current_sha,
+                                },
+                            )
+                    except Exception as exc:  # pragma: no cover — defensive
+                        # Already logged by the persist helper. Catch
+                        # here so a DB blip cannot kill the watcher;
+                        # ralph's phase subprocess is independent of
+                        # this thread.
+                        self._log.warning(
+                            "daemon.ralph_head_watcher_persist_error",
+                            extra={
+                                "event": "ralph_head_watcher_persist_error",
+                                "run_id": self._run_id,
+                                "agent_id": agent_id,
+                                "issue_number": issue_number,
+                                "iteration_n": iteration_n,
+                                "detail": _stderr_tail(str(exc)),
+                            },
+                        )
+                    last_sha = current_sha
+
+                if stop_event.wait(RALPH_HEAD_POLL_INTERVAL_SECONDS):
+                    break
+        except Exception:  # pragma: no cover — defensive catch
+            self._log.exception(
+                "daemon.ralph_head_watcher_failed",
+                extra={
+                    "event": "ralph_head_watcher_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+        finally:
+            self._log.info(
+                "daemon.ralph_head_watcher_stopped",
+                extra={
+                    "event": "ralph_head_watcher_stopped",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "poll_count": poll_count,
+                    "persisted_count": persisted_count,
+                },
+            )
+            self._thread_state.conn = None
+            if watcher_conn is not None:
+                try:
+                    watcher_conn.close()
+                except Exception:  # pragma: no cover — best-effort close
+                    pass
+
+    @staticmethod
+    def _read_head_sha(worktree: Path) -> str | None:
+        """Return the current HEAD SHA for ``worktree``. ``None`` on error.
+
+        Separate helper so tests can monkeypatch a deterministic
+        SHA sequence without faking ``subprocess.run`` for every call
+        in :meth:`_ralph_head_watcher_loop`.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        sha = (result.stdout or "").strip()
+        return sha or None
+
+    @staticmethod
+    def _read_ralph_iteration_file(worktree: Path) -> int:
+        """Read ``{worktree}/tmp/ralph/iteration.txt``; fall back to 0.
+
+        The inner ``/ralph`` skill writes the current iteration number
+        to this file at the top of Step 2a (per SKILL.md). When the
+        file is missing, malformed, or unreadable, return 0 — the
+        persist helper will still insert a row, and ``iteration_n=0``
+        is a conventional "unknown iteration" marker distinct from the
+        SHIP row's ``iteration_n=NULL``. Never raise.
+        """
+        path = worktree / "tmp" / "ralph" / "iteration.txt"
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
     def _persist_ralph_iteration_patch(
         self,
         agent_id: str,
@@ -5299,13 +5599,16 @@ class DispatcherDaemon:
         verdict: str,
         worktree: Path,
     ) -> str | None:
-        """Persist a per-iteration ralph patch snapshot (#3026).
+        """Persist a per-iteration ralph patch snapshot (#3026, #3042).
 
-        Called by the daemon at end-of-iteration (via a ralph-invoked
-        helper CLI, see ``scripts/dispatcher/persist_ralph_iteration.py``)
-        after ralph has committed the iteration's work with the
-        placeholder ``WIP: ralph output`` message (see
-        ``.claude/skills/task-v2-ralph/SKILL.md`` §2.5a).
+        Invoked by :meth:`_ralph_head_watcher_loop` whenever the
+        daemon-owned HEAD-SHA watcher observes a new commit in the
+        worktree during the ralph phase. Ralph's per-iteration
+        ``git commit --amend --no-edit`` (#2971 idiom) rewrites HEAD, so
+        each SHA change is a reliable iteration boundary signal — no
+        LLM-level bookkeeping required. See the historical
+        ``scripts/dispatcher/persist_ralph_iteration.py`` CLI helper
+        (deleted in #3042 once daemon-side polling took over).
 
         Unlike :meth:`_capture_and_persist_ralph_patch` — which runs
         only on the SHIP verdict and supersedes prior rows via DELETE-
@@ -6553,6 +6856,22 @@ class DispatcherDaemon:
 
         proc: subprocess.Popen[str] | None = None
         returncode = -1
+
+        # Start the ralph per-iteration HEAD watcher (#3042). The
+        # watcher runs alongside the claude -p subprocess, polls HEAD
+        # every :data:`RALPH_HEAD_POLL_INTERVAL_SECONDS`, and persists
+        # an intermediate ``dispatcher.ralph_patches`` row on each
+        # observed SHA change. Non-ralph phases do not start it — the
+        # SHA signal is only a reliable iteration boundary for ralph's
+        # amend-in-place commit model (#2971).
+        watcher_handle: tuple[threading.Thread, threading.Event] | None = None
+        if phase == "ralph":
+            watcher_handle = self._start_ralph_head_watcher(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                worktree=worktree,
+            )
+
         try:
             with (
                 stdout_path.open("w", encoding="utf-8") as stdout_file,
@@ -6609,6 +6928,26 @@ class DispatcherDaemon:
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
             )
+            # Signal the ralph HEAD watcher to exit and join it. Always
+            # runs — success, failure, timeout, or any mid-flight
+            # exception — so the watcher thread never leaks. #3042.
+            if watcher_handle is not None:
+                watcher_thread, stop_event = watcher_handle
+                stop_event.set()
+                watcher_thread.join(timeout=RALPH_HEAD_POLL_INTERVAL_SECONDS + 5)
+                if watcher_thread.is_alive():  # pragma: no cover — defensive
+                    # The watcher is a daemon thread, so even if join
+                    # times out it will not keep the process alive past
+                    # main-thread exit. Log the anomaly for triage.
+                    self._log.warning(
+                        "daemon.ralph_head_watcher_join_timeout",
+                        extra={
+                            "event": "ralph_head_watcher_join_timeout",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                        },
+                    )
         return returncode, duration
 
     def _agent_issue_number(self, agent_id: str) -> int | None:
