@@ -13965,6 +13965,22 @@ class DispatcherDaemon:
 
         The diagnoser runs at the repo root (no per-agent worktree) so
         the JSONL mirror goes under ``{repo_root}/tmp/.dispatcher/``.
+
+        **Cwd must be the baseline clone (#3033).** The dispatcher
+        Fargate image's ``WORKDIR`` is ``/app``, which does NOT contain
+        ``.claude/skills/diagnose-failure/`` — only
+        ``scripts/dispatcher/`` and a few hook/preflight files are
+        ``COPY``ed into the image. The full ``.claude/skills/`` tree
+        lives in the baseline git clone at
+        ``self._cfg.baseline_repo_root`` (e.g.
+        ``/var/lib/dispatcher/repo``). Without ``cwd=`` set, the
+        ``claude`` CLI inherits ``/app`` as cwd and exits in <11s with
+        a NULL recommendation because the ``/diagnose-failure`` skill
+        isn't discoverable — the exact symptom documented on #3033
+        (five consecutive failures with sub-11s durations and NULL
+        recommendation). The same cwd anchor is applied to the JSONL
+        mirror path so the triage trail lands alongside the phase
+        spawns' own ``tmp/.dispatcher/`` files.
         """
         cmd = [
             "claude",
@@ -13984,7 +14000,7 @@ class DispatcherDaemon:
             "--dangerously-skip-permissions",
         ]
 
-        repo_root = Path.cwd()
+        repo_root = self._repo_root_for_notify_script()
         jsonl_path = (
             repo_root / "tmp" / ".dispatcher" / f"diagnose-{diagnosis_id}.jsonl"
         )
@@ -14011,6 +14027,7 @@ class DispatcherDaemon:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                cwd=str(repo_root),
             )
         except FileNotFoundError:
             return None, "claude binary not found"
