@@ -490,6 +490,109 @@ resource "aws_iam_role_policy" "task_put_metric" {
   })
 }
 
+# ─── Per-agent ECS task launcher (#3091 Stage 2) ────────────────────────────
+#
+# Grants the daemon's task role the narrow permissions required to
+# launch + observe + stop the per-agent agent-runner task
+# (`judgemind-dispatcher-agent-runner-<env>` family, shipped in Stage
+# 1b, #3090).
+#
+# Scope invariants:
+#   - ecs:RunTask / ecs:StopTask pinned to the agent-runner task-def
+#     family on this cluster — the daemon cannot spawn other workloads.
+#   - ecs:DescribeTasks uses Resource="*" (the AWS API does not accept
+#     ARN scoping on this action — same quirk as the oneshot policy)
+#     with a cluster-ARN condition.
+#   - iam:PassRole pinned to the agent-runner's execution + task role
+#     ARNs only. Without this, RunTask fails with `AccessDeniedException:
+#     User ... is not authorized to pass role ... because no identity-
+#     based policy allows the iam:PassRole action`.
+#
+# Disabled (count=0) when any of the three required variables is
+# empty. That state keeps the Stage 2 daemon code falling back to the
+# subprocess path regardless of what `dispatcher.config
+# .agent_execution_mode` says, preserving zero-change-on-deploy for
+# environments that haven't wired the agent-runner module yet (e.g.
+# staging / throwaway test stacks).
+
+locals {
+  agent_runner_launch_enabled = (
+    var.agent_runner_task_definition_family != "" &&
+    var.agent_runner_execution_role_arn != "" &&
+    var.agent_runner_task_role_arn != ""
+  )
+  agent_runner_family_arn_pattern = (
+    local.agent_runner_launch_enabled
+    ? "arn:aws:ecs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task-definition/${var.agent_runner_task_definition_family}:*"
+    : ""
+  )
+  agent_runner_pass_role_arns = compact([
+    var.agent_runner_execution_role_arn,
+    var.agent_runner_task_role_arn,
+  ])
+}
+
+resource "aws_iam_role_policy" "task_launch_agent_runner" {
+  count = local.agent_runner_launch_enabled ? 1 : 0
+
+  name = "${local.service_name}-task-launch-agent-runner"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowRunAgentRunnerTask"
+        Effect   = "Allow"
+        Action   = "ecs:RunTask"
+        Resource = local.agent_runner_family_arn_pattern
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.ecs_cluster_arn
+          }
+        }
+      },
+      {
+        Sid      = "AllowStopAgentRunnerTask"
+        Effect   = "Allow"
+        Action   = "ecs:StopTask"
+        Resource = local.agent_runner_family_arn_pattern
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.ecs_cluster_arn
+          }
+        }
+      },
+      {
+        # DescribeTasks is the per-tick observer call. AWS requires
+        # Resource="*" on this action; the cluster-ARN condition is the
+        # defence-in-depth control (same pattern used by the oneshot
+        # policy above).
+        Sid      = "AllowDescribeAgentRunnerTasks"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeTasks"
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.ecs_cluster_arn
+          }
+        }
+      },
+      {
+        Sid      = "AllowPassAgentRunnerRoles"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = local.agent_runner_pass_role_arns
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+          }
+        }
+      },
+    ]
+  })
+}
+
 # ─── ECS Task Definition ────────────────────────────────────────────────────
 # 1 vCPU / 2 GB RAM matches §14 of the spec. Ephemeral storage is pinned to
 # 50 GB per spike 0.6 (realistic mixed peak is ~10 GB across 5 concurrent
@@ -527,6 +630,20 @@ resource "aws_ecs_task_definition" "dispatcher" {
           { name = "HEARTBEAT_METRIC_NAMESPACE", value = "Judgemind/Dispatcher" },
         ],
         var.github_repo != "" ? [{ name = "GITHUB_REPO", value = var.github_repo }] : [],
+        # #3091 Stage 2 — per-agent ECS launcher wiring. All three env
+        # vars are optional; an empty value means the launcher falls
+        # back to the subprocess path. When the agent-runner module is
+        # wired (see environments/dev/main.tf), the caller threads
+        # these values through from the module outputs.
+        var.agent_runner_task_definition_family != "" ? [
+          { name = "AGENT_RUNNER_TASK_DEFINITION_FAMILY", value = var.agent_runner_task_definition_family }
+        ] : [],
+        length(var.agent_runner_subnet_ids) > 0 ? [
+          { name = "AGENT_RUNNER_SUBNET_IDS", value = join(",", var.agent_runner_subnet_ids) }
+        ] : [],
+        var.agent_runner_security_group_id != "" ? [
+          { name = "AGENT_RUNNER_SECURITY_GROUP_ID", value = var.agent_runner_security_group_id }
+        ] : [],
       )
 
       secrets = concat(

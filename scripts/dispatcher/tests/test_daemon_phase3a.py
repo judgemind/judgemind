@@ -748,9 +748,10 @@ class TestAtomicClaim:
             for e in conn.cursor_instance.executed
             if "INSERT INTO dispatcher.agents" in e[0]
         ]
-        # Last bound parameter is the priority value.
+        # Priority is the second-to-last bound parameter; the last is
+        # the execution_mode (migration 41, issue #3091).
         _sql, params = inserts[0]
-        assert params[-1] == "p0"
+        assert params[-2] == "p0"
 
     def test_priority_default_none_passes_null(self, tmp_path: Path) -> None:
         """Priority is optional; omitting it stores NULL (pre-migration-33
@@ -765,7 +766,10 @@ class TestAtomicClaim:
             if "INSERT INTO dispatcher.agents" in e[0]
         ]
         _sql, params = inserts[0]
-        assert params[-1] is None
+        # Priority = NULL (second-to-last); execution_mode = 'subprocess'
+        # (last, migration 41 / #3091 default).
+        assert params[-2] is None
+        assert params[-1] == "subprocess"
 
     def test_unique_violation_returns_false(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)

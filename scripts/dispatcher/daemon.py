@@ -240,6 +240,51 @@ DEFAULT_HEARTBEAT_METRIC_NAMESPACE = "Judgemind/Dispatcher"
 #: (us-west-2).
 DEFAULT_AWS_REGION = "us-west-2"
 
+#: Default value for ``dispatcher.config.agent_execution_mode`` when the
+#: row is missing or malformed. ``'subprocess'`` keeps the pre-#3091
+#: behaviour — the daemon spawns per-phase ``claude -p`` subprocesses
+#: inside its own container — and is the safe default until Stage 3
+#: smoke (#3092) confirms the ECS path end-to-end and Stage 4 (#3093)
+#: flips this default.
+DEFAULT_AGENT_EXECUTION_MODE = "subprocess"
+
+#: Valid values for ``dispatcher.config.agent_execution_mode``. Anything
+#: outside this set falls back to :data:`DEFAULT_AGENT_EXECUTION_MODE`
+#: with a warning so a typo in the config row cannot route agents into
+#: an unknown launch lane.
+AGENT_EXECUTION_MODES: frozenset[str] = frozenset({"subprocess", "ecs"})
+
+#: Number of ``ecs:RunTask`` attempts per agent launch. Three attempts
+#: with 1s + 2s backoff mirrors the retry shape used by
+#: :meth:`DispatcherDaemon._baseline_fetch_origin_main` (issue #3085)
+#: and the ``gh`` retry path from #3053. Tested by
+#: ``test_daemon_launch_agent_ecs_task.py``.
+AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS = 3
+
+#: Backoff schedule (seconds) between ``ecs:RunTask`` retries. Length is
+#: ``AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS - 1`` so there's one backoff
+#: between each pair of attempts. ``1s + 2s`` matches #3053 / #3085.
+AGENT_RUNNER_RUN_TASK_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0)
+
+#: botocore error codes treated as transient for ``ecs:RunTask``
+#: purposes (retry). Anything outside this set fails immediately —
+#: retrying a throttle or capacity blip is cheap; retrying an
+#: AccessDenied or ValidationException will never recover on its own.
+AGENT_RUNNER_RUN_TASK_RETRYABLE_CODES: frozenset[str] = frozenset(
+    {
+        "ThrottlingException",
+        "Throttling",
+        "RequestLimitExceeded",
+        "ServiceUnavailable",
+        "InternalFailure",
+        "InternalServerError",
+        # ECS returns these when the cluster / capacity provider is
+        # under load — transient by nature.
+        "Server",
+        "Capacity",
+    }
+)
+
 #: Phase 2 spawn-safety invariant: this value must be 0. The daemon
 #: asserts this on every scheduler tick and logs a warning if the live
 #: ``dispatcher.config.concurrency_cap`` is anything else. The actual
@@ -1088,6 +1133,32 @@ def _stderr_tail(stderr: str | bytes | None) -> str:
     return stderr[-STRUCTURED_LOG_STDERR_MAX:]
 
 
+def _extract_botocore_error_code(exc: Exception) -> str:
+    """Return the botocore ``Error.Code`` string from a ClientError-like exception.
+
+    Used by :meth:`DispatcherDaemon._launch_agent_ecs_task` (issue
+    #3091) to decide whether an ``ecs:RunTask`` failure is transient
+    (retry) or deterministic (fail fast). Returns an empty string
+    when the exception is not a botocore ``ClientError`` or the
+    ``response`` structure is missing the expected fields. Defensive
+    enough that a random ``Exception`` raised by a test mock also
+    resolves to "" without crashing.
+
+    The real ``botocore.exceptions.ClientError`` exposes
+    ``exc.response['Error']['Code']``. We duck-type through
+    ``getattr`` so the daemon doesn't have to import botocore just
+    to classify errors in the retry wrapper.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return ""
+    error = response.get("Error")
+    if not isinstance(error, dict):
+        return ""
+    code = error.get("Code")
+    return str(code) if code else ""
+
+
 def _format_age_ago(seconds: float) -> str:
     """Render a compact human-readable age like ``2h 15m ago`` (#3026).
 
@@ -1520,6 +1591,27 @@ class DaemonConfig:
     #: and places per-agent worktrees at ``baseline_repo_root.parent /
     #: "worktrees" / agent-<uuid>`` (see :data:`DEFAULT_BASELINE_REPO_ROOT`).
     baseline_repo_root: Path | None = None
+    # ── Per-agent ECS task wiring (#3091 Stage 2) ────────────────────
+    #: ECS cluster ARN the agent-runner tasks launch into. Populated
+    #: from ``ECS_CLUSTER_ARN`` (shared with the RunTask-self policy
+    #: the daemon already consumes). Empty when the daemon runs
+    #: locally / in unit tests — :meth:`DispatcherDaemon._launch_agent_ecs_task`
+    #: fails closed with a structured log event in that case.
+    ecs_cluster_arn: str = ""
+    #: ECS task definition family for the per-agent runner. Populated
+    #: from ``AGENT_RUNNER_TASK_DEFINITION_FAMILY`` (wired from the
+    #: ``dispatcher-agent-runner`` Terraform module's
+    #: ``task_definition_family`` output). Empty in local/test mode.
+    agent_runner_task_definition_family: str = ""
+    #: Comma-separated private subnet IDs the agent-runner tasks run in.
+    #: Populated from ``AGENT_RUNNER_SUBNET_IDS``. Parsed to a tuple
+    #: by :func:`_build_config` for convenient consumption.
+    agent_runner_subnet_ids: tuple[str, ...] = ()
+    #: Security group ID attached to agent-runner tasks. Populated from
+    #: ``AGENT_RUNNER_SECURITY_GROUP_ID`` (wired from the
+    #: ``dispatcher-agent-runner`` Terraform module's
+    #: ``security_group_id`` output).
+    agent_runner_security_group_id: str = ""
     # Optional override used by tests to avoid os.environ mutation.
     config_override: dict[str, Any] = field(default_factory=dict)
 
@@ -1806,6 +1898,12 @@ class DispatcherDaemon:
         # ticks — boto3 clients are thread-safe and reusing one avoids
         # repeated credential lookups.
         self._cloudwatch_client: Any | None = None
+        # ECS client for the #3091 Stage 2 per-agent task launcher +
+        # reap loop. Same lazy-creation pattern as CloudWatch above so
+        # tests can stub ``_make_ecs_client`` without installing boto3.
+        # boto3 clients are thread-safe; reuse across scheduler + reap
+        # paths avoids redundant credential lookups.
+        self._ecs_client: Any | None = None
         # Phase 3A: within-tick handoff between phase helpers. Reset at
         # the start of each orchestration run so a previous failure's
         # partial state cannot leak into the next attempt.
@@ -2296,6 +2394,36 @@ class DispatcherDaemon:
                 },
             )
 
+        # #3091 Stage 2 reap pass. Observe any in-flight per-agent ECS
+        # tasks (``dispatcher.agents.agent_task_arn IS NOT NULL``) and
+        # act on STOPPED transitions. No-op on the subprocess path
+        # (no rows have ``agent_task_arn`` populated) and no-op when
+        # ``ecs_cluster_arn`` is unset (local dev / unit tests). This
+        # is the #3078 Option A payoff: a fresh daemon after a redeploy
+        # simply resumes observing the existing ARNs — every in-flight
+        # agent survives the redeploy without the pre-#3091 daemon-
+        # restart-abandoned cascade.
+        #
+        # Exceptions here are caught + logged but not re-raised — the
+        # scheduler tick must survive any reap failure so the downstream
+        # queue scan + claim gate still fire this tick.
+        reap_summary = {
+            "active": 0,
+            "reaped_success": 0,
+            "reaped_failure": 0,
+            "still_running": 0,
+        }
+        try:
+            reap_summary = self._reap_completed_agent_tasks()
+        except Exception:
+            self._log.exception(
+                "daemon.reap_agent_tasks_unhandled",
+                extra={
+                    "event": "reap_agent_tasks_unhandled",
+                    "run_id": self._run_id,
+                },
+            )
+
         # 3. Scan the ``agent/ready`` queue and persist a snapshot.
         #
         # Failures here (rate limit, network, auth) log + return -1 but
@@ -2393,6 +2521,11 @@ class DispatcherDaemon:
                 # before the queue scan this tick. Non-zero means an
                 # interrupted agent was reclaimed ahead of fresh work.
                 "retry_markers_prioritized": retry_markers_prioritized,
+                # #3091: per-agent ECS reap-pass observability.
+                "reap_active": reap_summary["active"],
+                "reap_success": reap_summary["reaped_success"],
+                "reap_failure": reap_summary["reaped_failure"],
+                "reap_still_running": reap_summary["still_running"],
             },
         )
         return {
@@ -2407,6 +2540,11 @@ class DispatcherDaemon:
             # #2949 observability — count of infra-preemption retry
             # markers drained before the queue scan.
             "retry_markers_prioritized": retry_markers_prioritized,
+            # #3091 observability — per-agent ECS reap-pass counters.
+            "reap_active": reap_summary["active"],
+            "reap_success": reap_summary["reaped_success"],
+            "reap_failure": reap_summary["reaped_failure"],
+            "reap_still_running": reap_summary["still_running"],
         }
 
     # ── command consumption (#2801) ────────────────────────────────────
@@ -3743,6 +3881,7 @@ class DispatcherDaemon:
         worktree_path: str,
         issue_title: str | None = None,
         priority: str | None = None,
+        execution_mode: str = DEFAULT_AGENT_EXECUTION_MODE,
     ) -> bool:
         """INSERT a new agent row; return True on success, False on race.
 
@@ -3766,6 +3905,14 @@ class DispatcherDaemon:
         admin cockpit's Active-agents and Recently-completed panels
         render this as a coloured badge; pre-migration-33 rows render
         an em-dash placeholder.
+
+        ``execution_mode`` is ``'subprocess'`` (default, legacy
+        in-container phase subprocesses) or ``'ecs'`` (per-agent
+        Fargate task via ``ecs:RunTask`` — issue #3091, migration 41).
+        Written once at claim time so an agent's execution lane is
+        immutable across its lifetime — a mid-flight flip of
+        ``dispatcher.config.agent_execution_mode`` does not produce
+        a hybrid agent.
         """
         assert self._conn is not None, "connect() must run before claiming"
 
@@ -3779,9 +3926,9 @@ class DispatcherDaemon:
                     "INSERT INTO dispatcher.agents "
                     "    (agent_id, parent_run_id, kind, issue_number, "
                     "     issue_title, worktree_path, phase, status, "
-                    "     priority) "
+                    "     priority, execution_mode) "
                     "VALUES (%s, %s, 'task', %s, %s, %s, 'claiming', "
-                    "        'running', %s)",
+                    "        'running', %s, %s)",
                     (
                         agent_id,
                         self._run_id,
@@ -3789,6 +3936,7 @@ class DispatcherDaemon:
                         issue_title,
                         worktree_path,
                         priority,
+                        execution_mode,
                     ),
                 )
             self._conn.commit()
@@ -7881,6 +8029,16 @@ class DispatcherDaemon:
         # blocks the claim.
         issue_priority = self._latest_queue_snapshot_priority_for(issue_number)
 
+        # Read the execution-mode flag once at claim time (#3091). The
+        # chosen mode is stored on the agent row and held immutable
+        # across the agent's lifetime — a mid-flight flip of
+        # ``dispatcher.config.agent_execution_mode`` does not produce
+        # a hybrid agent that launched as an ECS task but advanced
+        # its phases via the subprocess path. Defaults to
+        # ``'subprocess'`` (legacy in-container) until Stage 4 (#3093)
+        # flips the default.
+        execution_mode = self._read_agent_execution_mode()
+
         self._log.info(
             "daemon.candidate_picked",
             extra={
@@ -7890,6 +8048,7 @@ class DispatcherDaemon:
                 "issue_number": issue_number,
                 "issue_title_captured": issue_title is not None,
                 "issue_priority": issue_priority,
+                "execution_mode": execution_mode,
             },
         )
 
@@ -7899,9 +8058,40 @@ class DispatcherDaemon:
             str(worktree_path),
             issue_title=issue_title,
             priority=issue_priority,
+            execution_mode=execution_mode,
         ):
             # Race lost. Don't try the next candidate on this tick —
             # the next tick will re-scan the queue.
+            return
+
+        # #3091 Stage 2 claim-time dispatch. When the agent's
+        # execution_mode is ``'ecs'`` we launch a per-agent ECS task
+        # via :meth:`_launch_agent_ecs_task` and return. The per-agent
+        # agent-runner container runs the full phase pipeline
+        # internally (via the entrypoint shipped in Stage 1b, #3090)
+        # and persists its own ``dispatcher.agents`` updates; the
+        # daemon observes the lifecycle via
+        # :meth:`_reap_completed_agent_tasks` on every scheduler_tick.
+        # DO NOT call ``_create_worktree`` + ``_run_orchestration_phases``
+        # in this branch — that would double-dispatch the work.
+        if execution_mode == "ecs":
+            task_arn = self._launch_agent_ecs_task(agent_id, issue_number)
+            if task_arn is None:
+                # Launch failed after retries. Route through the
+                # unified failure path so the diagnoser can classify.
+                self._handle_agent_failure(
+                    agent_id=agent_id,
+                    phase="claiming",
+                    category="agent_task_launch_failed",
+                    stderr_tail="",
+                    exit_code=None,
+                    details={
+                        "task_definition_family": (
+                            self._cfg.agent_runner_task_definition_family
+                        ),
+                    },
+                    issue_number=issue_number,
+                )
             return
 
         # From here on, any failure must move the agent to status=failed
@@ -17622,6 +17812,678 @@ class DispatcherDaemon:
         )
         return True
 
+    # ── per-agent ECS launcher + reaper (#3091 Stage 2) ─────────────────
+    #
+    # These methods wire the daemon to the ``judgemind-dispatcher-agent-
+    # runner-<env>`` Fargate task definition shipped in Stage 1b (#3090).
+    # Gated behind ``dispatcher.config.agent_execution_mode == 'ecs'``
+    # which defaults to ``'subprocess'`` — until Stage 4 (#3093) flips
+    # the default the methods below are cold in production.
+    #
+    # Why this matters for #3078 Option A
+    # -----------------------------------
+    # In the pre-#3091 model the daemon runs every phase as a child
+    # subprocess (``claude -p /task-v2-<phase> <agent_id>``) inside its
+    # own container. A daemon redeploy SIGKILLs every in-flight child,
+    # abandoning every in-flight agent. Option A moves the long-running
+    # phase work into a per-agent ECS task: the daemon becomes a pure
+    # scheduler, and a daemon restart simply resumes observing the
+    # existing ``agent_task_arn`` ARNs via ``ecs:DescribeTasks`` — no
+    # abandonment, no retry cost, no operator-visible hiccup.
+
+    def _make_ecs_client(self) -> Any:
+        """Build a boto3 ECS client. Isolated so tests can mock it.
+
+        Mirrors :meth:`_make_cloudwatch_client` — lazy boto3 import so
+        tests that don't exercise the ECS launcher path do not have to
+        install boto3. Region comes from :attr:`DaemonConfig.aws_region`
+        which is already wired from ``AWS_REGION`` / ``AWS_DEFAULT_REGION``.
+        """
+        import boto3  # noqa: PLC0415 — lazy import
+
+        return boto3.client("ecs", region_name=self._cfg.aws_region)
+
+    def _cb_config_str(self, key: str, default: str) -> str:
+        """Read a string key from ``dispatcher.config`` with a fallback.
+
+        Sibling of :meth:`_cb_config_int`. Returns ``default`` on
+        missing row, malformed JSON, non-string value, or DB error —
+        config reads must never crash the claim or reap paths. Empty
+        strings are also treated as "not set" and fall back to
+        ``default`` so a ``NULL``-then-overwritten row doesn't accidentally
+        route agents into an empty execution mode.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    (key,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return default
+        if row is None or row[0] is None:
+            return default
+        raw = row[0]
+        # psycopg decodes JSONB strings natively to Python strings. Test
+        # fixtures sometimes feed raw JSON bytes (``'"ecs"'``) via a
+        # fake cursor, so re-parse strings through ``json.loads`` — if
+        # that fails, keep the raw string (a plain legacy TEXT value).
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, str):
+                    raw = parsed
+            except (json.JSONDecodeError, ValueError):
+                # Already a bare string — use verbatim.
+                pass
+        if not isinstance(raw, str) or not raw:
+            return default
+        return raw
+
+    def _read_agent_execution_mode(self) -> str:
+        """Return the configured agent execution mode.
+
+        Reads ``dispatcher.config.agent_execution_mode`` via
+        :meth:`_cb_config_str`. Validates against
+        :data:`AGENT_EXECUTION_MODES`; an unrecognized value (typo,
+        operator copy-paste slip) falls back to
+        :data:`DEFAULT_AGENT_EXECUTION_MODE` with a warning so the
+        daemon never routes agents into an unknown launch lane.
+        """
+        raw = self._cb_config_str("agent_execution_mode", DEFAULT_AGENT_EXECUTION_MODE)
+        if raw not in AGENT_EXECUTION_MODES:
+            self._log.warning(
+                "daemon.agent_execution_mode_unrecognized",
+                extra={
+                    "event": "agent_execution_mode_unrecognized",
+                    "run_id": self._run_id,
+                    "raw": raw,
+                    "fallback": DEFAULT_AGENT_EXECUTION_MODE,
+                },
+            )
+            return DEFAULT_AGENT_EXECUTION_MODE
+        return raw
+
+    def _agent_runner_wiring_ready(self) -> bool:
+        """Return True iff the ECS task-launch config is fully populated.
+
+        Guards :meth:`_launch_agent_ecs_task` — if the operator enabled
+        ``agent_execution_mode='ecs'`` but the terraform-wired env vars
+        are still empty (dev deploy out-of-order, test env, local dev),
+        the daemon must NOT call ``ecs:RunTask`` with missing required
+        fields. This check returns False in that state and the caller
+        falls back to the subprocess path for safety.
+        """
+        return bool(
+            self._cfg.ecs_cluster_arn
+            and self._cfg.agent_runner_task_definition_family
+            and self._cfg.agent_runner_subnet_ids
+            and self._cfg.agent_runner_security_group_id
+        )
+
+    def _launch_agent_ecs_task(
+        self, agent_id: str, issue_number: int | None
+    ) -> str | None:
+        """``ecs:RunTask`` the agent-runner task def for one agent.
+
+        Returns the launched task ARN on success or ``None`` on
+        failure. On success, UPDATEs ``dispatcher.agents`` with
+        ``agent_task_arn = <arn>`` and ``execution_mode = 'ecs'``.
+        On failure the caller is expected to terminate the agent via
+        :meth:`_handle_agent_failure` (``launch_failed`` category).
+
+        Retries up to :data:`AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS` times
+        on transient botocore errors (throttling, capacity, 5xx) with
+        :data:`AGENT_RUNNER_RUN_TASK_BACKOFF_SECONDS` backoffs. Mirrors
+        the retry pattern in
+        :meth:`_baseline_fetch_origin_main` (#3085) and the gh rate-
+        limit retry path from #3053.
+
+        Non-transient errors (AccessDenied, ValidationException) fail
+        immediately — retrying those will never succeed and burns
+        scheduler-tick time.
+        """
+        if not self._agent_runner_wiring_ready():
+            self._log.error(
+                "daemon.agent_runner_wiring_missing",
+                extra={
+                    "event": "agent_runner_wiring_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": (
+                        "agent_execution_mode=ecs but ECS_CLUSTER_ARN / "
+                        "AGENT_RUNNER_TASK_DEFINITION_FAMILY / "
+                        "AGENT_RUNNER_SUBNET_IDS / "
+                        "AGENT_RUNNER_SECURITY_GROUP_ID not fully wired"
+                    ),
+                },
+            )
+            return None
+
+        overrides = {
+            "containerOverrides": [
+                {
+                    "name": "agent-runner",
+                    "environment": [
+                        {"name": "AGENT_ID", "value": agent_id},
+                        {
+                            "name": "ISSUE_NUMBER",
+                            "value": str(issue_number)
+                            if issue_number is not None
+                            else "",
+                        },
+                    ],
+                }
+            ],
+        }
+        network_configuration = {
+            "awsvpcConfiguration": {
+                "subnets": list(self._cfg.agent_runner_subnet_ids),
+                "securityGroups": [self._cfg.agent_runner_security_group_id],
+                "assignPublicIp": "DISABLED",
+            }
+        }
+        tags = [
+            {"key": "agent_id", "value": agent_id},
+            {
+                "key": "issue_number",
+                "value": str(issue_number) if issue_number is not None else "",
+            },
+            {"key": "dispatcher_run_id", "value": self._run_id or ""},
+        ]
+
+        last_exc: Exception | None = None
+        for attempt in range(1, AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS + 1):
+            try:
+                if self._ecs_client is None:
+                    self._ecs_client = self._make_ecs_client()
+                response = self._ecs_client.run_task(
+                    cluster=self._cfg.ecs_cluster_arn,
+                    taskDefinition=self._cfg.agent_runner_task_definition_family,
+                    launchType="FARGATE",
+                    count=1,
+                    overrides=overrides,
+                    networkConfiguration=network_configuration,
+                    tags=tags,
+                    propagateTags="TASK_DEFINITION",
+                )
+            except Exception as exc:  # noqa: BLE001 — classified below
+                last_exc = exc
+                code = _extract_botocore_error_code(exc)
+                retryable = code in AGENT_RUNNER_RUN_TASK_RETRYABLE_CODES
+                self._log.warning(
+                    "daemon.agent_runner_run_task_attempt_failed",
+                    extra={
+                        "event": "agent_runner_run_task_attempt_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "attempt": attempt,
+                        "max_attempts": AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS,
+                        "error_code": code,
+                        "retryable": retryable,
+                        "detail": str(exc),
+                    },
+                )
+                # Reset the client on error so the next attempt picks
+                # up fresh credentials / a rebound endpoint.
+                self._ecs_client = None
+                if not retryable:
+                    break
+                if attempt < AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS:
+                    backoff = AGENT_RUNNER_RUN_TASK_BACKOFF_SECONDS[attempt - 1]
+                    time.sleep(backoff)
+                    continue
+                break
+            # Success path: parse the response, persist the ARN.
+            failures = response.get("failures") or []
+            if failures:
+                # ``failures[]`` is how ECS surfaces per-task capacity
+                # reasons even when the HTTP call itself succeeded (200).
+                # Treat as a transient retryable signal — retrying
+                # in a few seconds commonly recovers when capacity
+                # briefly thins.
+                self._log.warning(
+                    "daemon.agent_runner_run_task_response_failure",
+                    extra={
+                        "event": "agent_runner_run_task_response_failure",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "attempt": attempt,
+                        "failures": failures,
+                    },
+                )
+                if attempt < AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS:
+                    backoff = AGENT_RUNNER_RUN_TASK_BACKOFF_SECONDS[attempt - 1]
+                    time.sleep(backoff)
+                    continue
+                return None
+            tasks = response.get("tasks") or []
+            if not tasks:
+                # No failures, no tasks — defensive. Treat as a hard
+                # error because retrying an empty-response state
+                # without ``failures[]`` is not well-defined by the API.
+                self._log.error(
+                    "daemon.agent_runner_run_task_no_task",
+                    extra={
+                        "event": "agent_runner_run_task_no_task",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                    },
+                )
+                return None
+            task_arn = tasks[0].get("taskArn")
+            if not task_arn:
+                self._log.error(
+                    "daemon.agent_runner_run_task_missing_arn",
+                    extra={
+                        "event": "agent_runner_run_task_missing_arn",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "response_task": tasks[0],
+                    },
+                )
+                return None
+            self._persist_agent_task_arn(agent_id, task_arn)
+            self._log.info(
+                "daemon.agent_runner_run_task_succeeded",
+                extra={
+                    "event": "agent_runner_run_task_succeeded",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "attempt": attempt,
+                    "task_arn": task_arn,
+                },
+            )
+            return task_arn
+
+        # All attempts exhausted.
+        self._log.error(
+            "daemon.agent_runner_run_task_exhausted",
+            extra={
+                "event": "agent_runner_run_task_exhausted",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "attempts": AGENT_RUNNER_RUN_TASK_MAX_ATTEMPTS,
+                "detail": str(last_exc) if last_exc is not None else "",
+            },
+        )
+        return None
+
+    def _persist_agent_task_arn(self, agent_id: str, task_arn: str) -> None:
+        """UPDATE ``dispatcher.agents`` with the launched ECS task ARN.
+
+        Also flips ``execution_mode`` to ``'ecs'`` so reads across a
+        daemon restart observe the authoritative-mode signal — an
+        agent whose row carries a non-NULL ``agent_task_arn`` must be
+        observed via ``ecs:DescribeTasks`` rather than re-claimed
+        into the subprocess lane. Idempotent on re-run (the UPDATE is
+        a simple SET).
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET agent_task_arn = %s, execution_mode = 'ecs' "
+                    "WHERE agent_id = %s",
+                    (task_arn, agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            self._log.exception(
+                "daemon.persist_agent_task_arn_failed",
+                extra={
+                    "event": "persist_agent_task_arn_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "task_arn": task_arn,
+                },
+            )
+
+    def _reap_completed_agent_tasks(self) -> dict[str, int]:
+        """Observe lifecycle of active per-agent ECS tasks (#3091).
+
+        Runs on every :meth:`scheduler_tick`. Fetches every
+        ``dispatcher.agents`` row where ``agent_task_arn IS NOT NULL``
+        and ``status IN ('running', 'retrying')``, calls
+        ``ecs:DescribeTasks`` once for up to 100 ARNs (the ECS
+        page-size cap — more than we'll ever reap in one tick on a
+        concurrency_cap<=5 cluster), and acts on the returned
+        ``lastStatus``:
+
+        * ``STOPPED`` — terminal. The agent-runner itself updates
+          ``dispatcher.agents.status`` / ``phase`` before exit, so
+          the daemon's job is just to confirm the observation and log
+          the terminal reap. If the task stopped non-zero and the
+          agent row is NOT already terminal, route the failure via
+          :meth:`_handle_agent_failure` (category
+          ``agent_task_stopped_unexpectedly``).
+        * ``RUNNING``, ``PROVISIONING``, ``PENDING``, ``ACTIVATING``
+          — no-op; the agent-runner is still alive, re-check next tick.
+
+        **Fresh-daemon resume semantics (#3078 Option A payoff).** A
+        fresh daemon after a redeploy runs ``scheduler_tick`` → calls
+        this method → ``ecs:DescribeTasks`` returns the in-flight
+        tasks with ``lastStatus='RUNNING'`` and we take no action.
+        The pre-#3091 model marked every in-flight agent as
+        ``daemon_restart_abandoned`` on every redeploy — see
+        :meth:`_abandon_in_flight_agents_on_boot` for the legacy
+        path. The ECS path drops that bug entirely because the ECS
+        task outlives the daemon.
+
+        Returns a small summary dict for logging + tests:
+            * ``active``: int, count of ``agent_task_arn IS NOT NULL``
+              rows observed this tick.
+            * ``reaped_success``: int, count of STOPPED-success
+              transitions logged this tick.
+            * ``reaped_failure``: int, count of STOPPED-failure
+              transitions routed through ``_handle_agent_failure``.
+            * ``still_running``: int, count of non-terminal tasks
+              observed (no-op).
+        """
+        assert self._conn is not None, "connect() must run before reap"
+
+        # Fetch active agents with a launched ECS task ARN. Limit 100
+        # matches the ECS ``DescribeTasks`` page-size cap. For
+        # concurrency_cap<=5 dev this is always one call; a future
+        # production cap>5 would need pagination here.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, issue_number, agent_task_arn, "
+                    "       phase, status "
+                    "FROM dispatcher.agents "
+                    "WHERE agent_task_arn IS NOT NULL "
+                    "  AND status IN ('running', 'retrying') "
+                    "LIMIT 100"
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            self._log.exception(
+                "daemon.reap_agent_tasks_select_failed",
+                extra={
+                    "event": "reap_agent_tasks_select_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            return {
+                "active": 0,
+                "reaped_success": 0,
+                "reaped_failure": 0,
+                "still_running": 0,
+            }
+
+        if not rows:
+            return {
+                "active": 0,
+                "reaped_success": 0,
+                "reaped_failure": 0,
+                "still_running": 0,
+            }
+
+        # Can't reap without cluster + ECS client. The wiring may be
+        # absent in local dev; log once per tick if we see active
+        # rows but no cluster wired.
+        if not self._cfg.ecs_cluster_arn:
+            self._log.warning(
+                "daemon.reap_agent_tasks_no_cluster",
+                extra={
+                    "event": "reap_agent_tasks_no_cluster",
+                    "run_id": self._run_id,
+                    "active_rows": len(rows),
+                },
+            )
+            return {
+                "active": len(rows),
+                "reaped_success": 0,
+                "reaped_failure": 0,
+                "still_running": 0,
+            }
+
+        arns = [row[2] for row in rows if row[2]]
+        arn_to_row = {row[2]: row for row in rows if row[2]}
+
+        try:
+            if self._ecs_client is None:
+                self._ecs_client = self._make_ecs_client()
+            response = self._ecs_client.describe_tasks(
+                cluster=self._cfg.ecs_cluster_arn,
+                tasks=arns,
+            )
+        except Exception as exc:
+            self._log.warning(
+                "daemon.reap_agent_tasks_describe_failed",
+                extra={
+                    "event": "reap_agent_tasks_describe_failed",
+                    "run_id": self._run_id,
+                    "detail": str(exc),
+                    "active_rows": len(rows),
+                },
+            )
+            # Reset the client so the next tick gets a fresh one.
+            self._ecs_client = None
+            return {
+                "active": len(rows),
+                "reaped_success": 0,
+                "reaped_failure": 0,
+                "still_running": 0,
+            }
+
+        tasks = response.get("tasks") or []
+        reaped_success = 0
+        reaped_failure = 0
+        still_running = 0
+
+        for task in tasks:
+            task_arn = task.get("taskArn", "")
+            last_status = (task.get("lastStatus") or "").upper()
+            stop_code = task.get("stopCode")
+            exit_codes = [
+                c.get("exitCode")
+                for c in task.get("containers") or []
+                if c.get("exitCode") is not None
+            ]
+            row = arn_to_row.get(task_arn)
+            if row is None:
+                continue
+            agent_id, issue_number, _arn, phase, status = row
+
+            if last_status != "STOPPED":
+                # Still running, pending, provisioning — re-check next
+                # tick. The agent-runner is alive; the daemon's role
+                # is passive observation.
+                still_running += 1
+                continue
+
+            # STOPPED path. Success = every container exit_code == 0
+            # AND stop_code is ``EssentialContainerExited`` (normal
+            # exit) OR unset. If stop_code is ``TaskFailedToStart``,
+            # ``ContainerRuntimeError``, etc., treat as failure even
+            # if exit_code happens to be 0.
+            task_success = (
+                bool(exit_codes)
+                and all(c == 0 for c in exit_codes)
+                and stop_code in (None, "", "EssentialContainerExited")
+            )
+
+            # Re-read the agent row post-STOPPED so we can tell
+            # "agent-runner wrote its own terminal status before exit"
+            # from "the container died before the entrypoint could
+            # update the row". Cheap — one SELECT per reaped agent
+            # per tick.
+            current_status, current_phase = self._read_agent_status_phase(agent_id)
+
+            if task_success:
+                # The agent-runner's own SQL writes should have set
+                # status=succeeded / failed / needs_review AND
+                # ended_at. If the row is NOT already terminal, it's
+                # a gap we need to log (the entrypoint crashed after
+                # phase work but before writing terminal). Still
+                # advance the phase via the shared module's
+                # terminal-check.
+                if current_status in TERMINAL_AGENT_STATUSES:
+                    self._log.info(
+                        "daemon.agent_runner_reaped_success",
+                        extra={
+                            "event": "agent_runner_reaped_success",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "task_arn": task_arn,
+                            "final_status": current_status,
+                            "final_phase": current_phase,
+                        },
+                    )
+                    reaped_success += 1
+                else:
+                    # Container exited 0 but agent row wasn't marked
+                    # terminal by the entrypoint. Mark it succeeded
+                    # via _mark_agent_terminal so the admin cockpit
+                    # doesn't render a stale ``running`` row.
+                    self._log.warning(
+                        "daemon.agent_runner_reaped_success_row_gap",
+                        extra={
+                            "event": "agent_runner_reaped_success_row_gap",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "task_arn": task_arn,
+                            "observed_status": current_status,
+                            "observed_phase": current_phase,
+                        },
+                    )
+                    # ROUTING (#3062): NOT routed via
+                    # ``_handle_agent_failure`` — container exit 0
+                    # means the agent-runner (#3091) completed
+                    # successfully; the row gap is a bookkeeping issue
+                    # the daemon can close without a diagnoser
+                    # round-trip.
+                    self._mark_agent_terminal(
+                        agent_id,
+                        status="succeeded",
+                        phase=current_phase or "done",
+                        exit_code=0,
+                        issue_number=issue_number,
+                    )
+                    reaped_success += 1
+            else:
+                # STOPPED with non-zero exit or a non-normal stop_code.
+                # Route via _handle_agent_failure so the diagnoser
+                # picks it up on the next supervisor tick.
+                if current_status in TERMINAL_AGENT_STATUSES:
+                    # Agent-runner already wrote its own failure. Log
+                    # the reap but don't route again (we'd double-insert
+                    # a dispatcher.failures row).
+                    self._log.info(
+                        "daemon.agent_runner_reaped_failure_already_terminal",
+                        extra={
+                            "event": "agent_runner_reaped_failure_already_terminal",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "task_arn": task_arn,
+                            "stop_code": stop_code,
+                            "exit_codes": exit_codes,
+                            "final_status": current_status,
+                            "final_phase": current_phase,
+                        },
+                    )
+                    reaped_failure += 1
+                    continue
+                # Real failure — agent-runner died before it could write
+                # its own terminal row.
+                self._log.warning(
+                    "daemon.agent_runner_reaped_failure",
+                    extra={
+                        "event": "agent_runner_reaped_failure",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "task_arn": task_arn,
+                        "stop_code": stop_code,
+                        "exit_codes": exit_codes,
+                        "observed_status": current_status,
+                        "observed_phase": current_phase,
+                    },
+                )
+                exit_code_for_failure = exit_codes[0] if exit_codes else None
+                # ROUTING (#3062): ROUTED via ``_handle_agent_failure``
+                # so the diagnoser can classify —
+                # ``agent_task_stopped_unexpectedly`` is the
+                # per-agent-ECS (#3091) sibling of the subprocess-mode
+                # ``subprocess_crash`` tier-1 failure.
+                self._handle_agent_failure(
+                    agent_id=agent_id,
+                    phase=current_phase or phase or "unknown",
+                    category="agent_task_stopped_unexpectedly",
+                    stderr_tail="",
+                    exit_code=exit_code_for_failure,
+                    details={
+                        "task_arn": task_arn,
+                        "stop_code": stop_code,
+                        "exit_codes": exit_codes,
+                    },
+                    issue_number=issue_number,
+                )
+                reaped_failure += 1
+
+        return {
+            "active": len(rows),
+            "reaped_success": reaped_success,
+            "reaped_failure": reaped_failure,
+            "still_running": still_running,
+        }
+
+    def _read_agent_status_phase(self, agent_id: str) -> tuple[str | None, str | None]:
+        """Fetch the current (status, phase) for an agent. Best-effort.
+
+        Used by :meth:`_reap_completed_agent_tasks` to distinguish
+        "agent-runner already wrote terminal" from "container died
+        before entrypoint finished". Returns ``(None, None)`` on DB
+        error — the caller treats that as "assume non-terminal".
+        """
+        assert self._conn is not None, "connect() must run before read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, phase FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return (None, None)
+        if row is None:
+            return (None, None)
+        return (row[0], row[1])
+
     # ── housekeeping tick (every ``tick_housekeeping_seconds``) ─────────
 
     #: Retention targets the housekeeping tick prunes. Each entry is a
@@ -18244,6 +19106,23 @@ def _build_config(
     raw_baseline = env.get("DISPATCHER_BASELINE_REPO_ROOT", "").strip()
     baseline_repo_root = Path(raw_baseline) if raw_baseline else None
 
+    # Per-agent ECS task wiring (#3091 Stage 2). All four env vars are
+    # optional — when unset, the daemon falls back to the subprocess
+    # execution mode regardless of what ``dispatcher.config
+    # .agent_execution_mode`` says, because :meth:`_launch_agent_ecs_task`
+    # cannot run a task without a cluster + task-def + network config.
+    ecs_cluster_arn = env.get("ECS_CLUSTER_ARN", "").strip()
+    agent_runner_task_definition_family = env.get(
+        "AGENT_RUNNER_TASK_DEFINITION_FAMILY", ""
+    ).strip()
+    raw_subnets = env.get("AGENT_RUNNER_SUBNET_IDS", "").strip()
+    agent_runner_subnet_ids: tuple[str, ...] = tuple(
+        part.strip() for part in raw_subnets.split(",") if part.strip()
+    )
+    agent_runner_security_group_id = env.get(
+        "AGENT_RUNNER_SECURITY_GROUP_ID", ""
+    ).strip()
+
     override: dict[str, Any] = {}
     if args.config_override:
         try:
@@ -18269,6 +19148,10 @@ def _build_config(
         heartbeat_metric_namespace=heartbeat_namespace,
         aws_region=aws_region,
         baseline_repo_root=baseline_repo_root,
+        ecs_cluster_arn=ecs_cluster_arn,
+        agent_runner_task_definition_family=agent_runner_task_definition_family,
+        agent_runner_subnet_ids=agent_runner_subnet_ids,
+        agent_runner_security_group_id=agent_runner_security_group_id,
         config_override=override,
     )
 
@@ -18321,6 +19204,17 @@ def main(argv: list[str] | None = None) -> int:
             "tick_scheduler_seconds": cfg.tick_scheduler_seconds,
             "tick_supervisor_seconds": cfg.tick_supervisor_seconds,
             "tick_housekeeping_seconds": cfg.tick_housekeeping_seconds,
+            # #3091 Stage 2 — surface the per-agent ECS wiring at boot
+            # so CloudWatch verification can confirm the deploy picked
+            # up the correct task-def + cluster + network config. An
+            # empty value means the env var wasn't set (local dev /
+            # unit test); the daemon falls back to the subprocess path.
+            "ecs_cluster_arn_set": bool(cfg.ecs_cluster_arn),
+            "agent_runner_task_definition_family": (
+                cfg.agent_runner_task_definition_family or ""
+            ),
+            "agent_runner_subnet_count": len(cfg.agent_runner_subnet_ids),
+            "agent_runner_security_group_set": bool(cfg.agent_runner_security_group_id),
         },
     )
 
