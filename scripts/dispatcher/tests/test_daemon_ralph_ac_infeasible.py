@@ -277,9 +277,11 @@ class TestRunRalphPhaseAcInfeasible:
         self, tmp_path: Path
     ) -> None:
         """BLOCKED is a different failure mode — not AC_INFEASIBLE.
-        Existing routing (tier-2/3 via subprocess classifier) owns it.
-        This test locks down that the AC_INFEASIBLE branch doesn't
-        accidentally swallow BLOCKED verdicts."""
+        The ``ralph_not_ship`` routing (issue #3054) owns it. This test
+        locks down that the AC_INFEASIBLE branch doesn't accidentally
+        swallow BLOCKED verdicts — the failure row, if any, must carry
+        ``category='ralph_not_ship'``, never ``'ralph_ac_infeasible'``.
+        """
         d, _conn, _handler = _make_daemon(tmp_path)
         worktree = tmp_path / "wt"
         worktree.mkdir()
@@ -298,9 +300,18 @@ class TestRunRalphPhaseAcInfeasible:
         ok = d._run_ralph_phase("agent-blocked", 3010, worktree)
 
         assert ok is False
-        # BLOCKED path does NOT write a ralph_ac_infeasible failure row.
-        d._write_failure.assert_not_called()  # type: ignore[union-attr]
-        # Agent still marked failed (the not-SHIP path).
+        # BLOCKED flows through the unified _handle_agent_failure path
+        # with category='ralph_not_ship' (#3054). Under the hood that
+        # calls _write_failure, but with a DIFFERENT category than the
+        # AC_INFEASIBLE path — assert category, not call-count.
+        assert d._write_failure.call_count <= 1  # type: ignore[union-attr]
+        for call in d._write_failure.call_args_list:  # type: ignore[union-attr]
+            assert (
+                call.kwargs.get("category")
+                != daemon.FAILURE_CATEGORY_RALPH_AC_INFEASIBLE
+            )
+        # Agent still marked failed (the not-SHIP path) — _handle_agent_failure
+        # calls _mark_agent_terminal internally.
         d._mark_agent_terminal.assert_called_once()  # type: ignore[union-attr]
 
     def test_malformed_infeasible_acs_list_is_sanitized(self, tmp_path: Path) -> None:
