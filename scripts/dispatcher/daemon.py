@@ -6027,6 +6027,102 @@ class DispatcherDaemon:
             except Exception:  # pragma: no cover — defensive
                 pass
 
+    def _read_merged_at_and_verified_at(self, agent_id: str) -> tuple[bool, bool]:
+        """Return ``(merged, verified)`` booleans for an agent.
+
+        Issue #3055. Used by :meth:`_run_verify_and_complete` to
+        short-circuit the recovery path — when the dispatcher daemon
+        restarts mid-``awaiting_deploy`` (force-new-deployment drops the
+        ephemeral container and wipes the per-agent worktree), the new
+        daemon picks up the row on the next supervisor tick and would
+        otherwise re-spawn ``claude -p /task-v2-verify``. A post-merge
+        verify re-run that fails (for any reason — skill not found,
+        worktree missing, transient CloudWatch hiccup) should NOT flip
+        a ``status='succeeded'`` row to ``failed``: the PR already
+        shipped, ``merged_at`` is stamped, and the agent row's success
+        is authoritative.
+
+        Returns ``(False, False)`` on any DB error so the caller falls
+        back to the pre-#3055 behaviour — the short-circuit is purely
+        additive protection. A missing row also returns ``(False,
+        False)``.
+        """
+        assert self._conn is not None, "connect() must run before read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT merged_at IS NOT NULL, verified_at IS NOT NULL "
+                    "FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.read_merged_at_failed",
+                extra={
+                    "event": "read_merged_at_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+            return (False, False)
+        if row is None:
+            return (False, False)
+        merged = bool(row[0])
+        verified = bool(row[1])
+        return (merged, verified)
+
+    def _restore_succeeded_and_advance_done(self, agent_id: str) -> None:
+        """Restore ``status='succeeded'`` + set ``phase='done'`` on an agent.
+
+        Issue #3055. Called from :meth:`_run_verify_and_complete` when a
+        verify subprocess fails on an already-merged agent (``merged_at
+        IS NOT NULL``). :meth:`_run_subprocess_or_fail` already flipped
+        the row to ``status='failed'`` via
+        :meth:`_handle_subprocess_failure` before this method runs — we
+        need the single UPDATE here to re-write both columns atomically
+        so the admin row doesn't briefly flicker green → red → green on
+        the supervisor tick.
+
+        Best-effort: a DB error here is logged but does not raise, so
+        the outer verify flow continues cleanly. The worst case of a
+        failed restore is that the row stays red until the next
+        terminal-outcome sweep — a regression relative to the pre-crash
+        state, but not a correctness bug (``merged_at`` is still set
+        and the retro / cleanup state-machine can still drive the row
+        to completion from there).
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'succeeded', "
+                    "    phase = 'done', "
+                    "    failure_summary = NULL "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.restore_succeeded_failed",
+                extra={
+                    "event": "restore_succeeded_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+
     def _read_verify_skip_reason(self, agent_id: str) -> str | None:
         """Return the current ``verify_skip_reason`` for an agent, or None."""
         assert self._conn is not None, "connect() must run before read"
@@ -6804,6 +6900,34 @@ class DispatcherDaemon:
         ``error: unknown option '--cwd'`` (#2821). Python's stdlib
         ``cwd=`` is the correct knob for "start the child process in
         this directory".
+
+        **Cwd for verify must be the baseline clone (#3055).** Verify is
+        a post-merge phase that runs on the recovery path after a
+        force-new-deployment (the prior daemon died mid-verify; the new
+        daemon picks up an ``awaiting_deploy/succeeded`` agent whose
+        worktree was wiped along with the prior container's ephemeral
+        storage). In that state, the per-agent worktree directory does
+        not exist on disk, and the ``.claude/skills/task-v2-verify/``
+        tree — which ``claude -p /task-v2-verify`` resolves relative to
+        ``cwd`` — is therefore not discoverable. The ``_write_phase_input``
+        call above happens to ``mkdir(parents=True)`` the worktree path
+        so ``Popen`` itself does not raise ``FileNotFoundError``, but the
+        re-created directory is empty of ``.claude/skills/`` so the
+        ``claude`` CLI exits ~50ms with ``result="Unknown command:
+        /task-v2-verify"``. The fix, paralleling #3034 for the diagnoser,
+        is to set ``cwd=baseline_repo_root`` on the verify spawn: the
+        baseline clone is re-populated at daemon boot by
+        :meth:`ensure_baseline_clone` and contains the full
+        ``.claude/skills/`` tree. The verify skill reads its own
+        ``worktree_path`` from the input JSON so it does not need to
+        start inside the worktree itself.
+
+        The other phases (plan, ralph, summary, fix-ci, retro) keep
+        ``cwd=str(worktree)`` because they run inside an active worktree
+        that is guaranteed to exist (they only execute while the agent
+        is pre-merge, so the worktree has not been wiped by a restart)
+        and they need the worktree's working tree available for git
+        operations (``git status``, ``git add``, ``git commit``).
         """
         max_turns = PHASE_MAX_TURNS[phase]
         model = self._model_for_phase(phase, agent_id)
@@ -6812,6 +6936,16 @@ class DispatcherDaemon:
         stderr_path = worktree / "tmp" / f"claude-p-{phase}.stderr.log"
         jsonl_path = worktree / ".dispatcher" / f"{phase}-{agent_id}.jsonl"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # #3055 — verify phase must resolve the ``task-v2-verify`` skill
+        # from the baseline clone when running on the recovery path
+        # (post-restart, worktree wiped). Fall back to the worktree only
+        # when ``baseline_repo_root`` is unset (local-dev / unit-test
+        # mode), mirroring :meth:`_spawn_diagnoser_subprocess`. See the
+        # docstring rationale above.
+        popen_cwd: Path = worktree
+        if phase == "verify" and self._cfg.baseline_repo_root is not None:
+            popen_cwd = self._cfg.baseline_repo_root
 
         cmd = [
             "claude",
@@ -6890,7 +7024,7 @@ class DispatcherDaemon:
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
-                    cwd=str(worktree),
+                    cwd=str(popen_cwd),
                 )
                 threads = stream_subprocess_output_async(
                     proc,
@@ -11280,6 +11414,37 @@ class DispatcherDaemon:
             self._update_agent_phase(agent_id, "done")
             return
 
+        # Issue #3055 — short-circuit when verify has already completed
+        # for this agent. Happens on the recovery path where the prior
+        # daemon ran verify successfully (stamped ``verified_at``) but
+        # died before :meth:`_update_agent_phase` advanced the row from
+        # ``awaiting_deploy`` to ``done``. On restart, the new daemon's
+        # supervisor tick picks the agent up via
+        # :meth:`_list_advanceable_agents` (``status='succeeded' AND
+        # phase='awaiting_deploy'``) and would naively re-enter this
+        # method. Re-running verify on an already-verified agent adds
+        # noise and — in the most common recovery scenario where the
+        # worktree has also been wiped from ephemeral storage — flips
+        # ``succeeded`` to ``failed`` via the ``phase_output_missing``
+        # path, inverting the audit-trail signal.
+        merged_at_set, verified_at_set = self._read_merged_at_and_verified_at(agent_id)
+        if verified_at_set:
+            self._log.info(
+                "daemon.verify_already_completed",
+                extra={
+                    "event": "verify_already_completed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                },
+            )
+            # Just advance phase — retro picks it up on the next tick.
+            # ``verified_at`` is already stamped so the admin cockpit
+            # pill colour stays correct.
+            self._update_agent_phase(agent_id, "done")
+            return
+
         # Fetch the issue bundle for acceptance criteria. Best-effort —
         # the verify skill tolerates an empty AC list with a failure row.
         try:
@@ -11362,7 +11527,31 @@ class DispatcherDaemon:
 
         exit_code = self._run_subprocess_or_fail(agent_id, "verify", worktree)
         if exit_code is None:
-            return  # subprocess failure already marked failed
+            # Issue #3055 — ``_run_subprocess_or_fail`` already flipped
+            # the row to ``status='failed'`` via its internal failure
+            # handlers. On an already-merged agent that is wrong: the
+            # PR shipped, ``merged_at`` is stamped, and a verify
+            # subprocess crash shouldn't retroactively invert the audit
+            # trail. Any post-merge verify infra failure is bookkeeping
+            # noise, not a product regression. Restore the row to
+            # ``status='succeeded'`` and advance phase to ``done`` so
+            # retro runs on the next tick. The distinct
+            # ``verify_infra_failure_post_merge`` event gives operators
+            # the grep hook for "verify-was-broken-but-shipped" cases.
+            if merged_at_set:
+                self._log.warning(
+                    "daemon.verify_infra_failure_post_merge",
+                    extra={
+                        "event": "verify_infra_failure_post_merge",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "detail": "subprocess failed before output parse",
+                    },
+                )
+                self._restore_succeeded_and_advance_done(agent_id)
+            return  # subprocess failure already marked (or restored) by now
 
         verify_output = self._read_phase_output(worktree, "verify")
         if verify_output is None:
@@ -11376,6 +11565,32 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.phase_output_missing", extra=extra)
+            # Issue #3055 — on an already-merged agent, a
+            # ``phase_output_missing`` verdict is bookkeeping noise
+            # (typically the recovery-path case where the prior daemon
+            # died mid-verify and the worktree has since been wiped by
+            # the force-new-deployment). Route through
+            # :meth:`_restore_succeeded_and_advance_done` instead of
+            # :meth:`_handle_agent_failure` so ``status`` stays
+            # ``succeeded`` and the admin cockpit doesn't render an
+            # already-shipped PR red. Pre-#3055 this path flipped the
+            # row to ``failed`` and the Opus diagnoser then escalated
+            # it to ``diagnoser_escalate/failed`` — inverting the
+            # authoritative success signal on an already-shipped PR.
+            if merged_at_set:
+                self._log.warning(
+                    "daemon.verify_infra_failure_post_merge",
+                    extra={
+                        "event": "verify_infra_failure_post_merge",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "detail": "output JSON missing or malformed",
+                    },
+                )
+                self._restore_succeeded_and_advance_done(agent_id)
+                return
             # Issue #3032: route through the unified failure handler.
             self._handle_agent_failure(
                 agent_id=agent_id,
