@@ -4281,13 +4281,33 @@ class DispatcherDaemon:
         - Finds every ``dispatcher.agents`` row with ``status='running'``
           whose ``parent_run_id`` differs from the current run (or is
           NULL). These are the abandoned agents.
-        - For each: write a ``dispatcher.failures`` row with
-          ``category='daemon_restart_abandoned'`` (a new tier-1
-          auto-retry category — see :data:`AUTO_RETRY_CATEGORIES`),
-          flip status to ``crashed``, set
-          ``phase='daemon_restart_abandoned'``, and enqueue a retry
-          marker. The standard retry flow then picks the agent up on
-          the next supervisor tick with a fresh worktree.
+        - **Branches on ``execution_mode`` (#3152).** Subprocess-mode
+          agents get the abandon treatment: write a
+          ``dispatcher.failures`` row with
+          ``category='daemon_restart_abandoned'`` (a tier-1 auto-retry
+          category — see :data:`AUTO_RETRY_CATEGORIES`), flip status
+          to ``crashed``, set ``phase='daemon_restart_abandoned'``,
+          and enqueue a retry marker. The standard retry flow then
+          picks the agent up on the next supervisor tick with a fresh
+          worktree.
+
+          ECS-mode agents (``execution_mode='ecs'``) **skip all of
+          that** — their agent-runner process lives in an independent
+          Fargate task that outlives the daemon redeploy. The new
+          daemon just resumes observing the ARN; the existing
+          :meth:`_reap_completed_agent_tasks` scheduler-tick loop
+          (#3091) notices RUNNING → noop, STOPPED → route
+          ``agent_task_stopped_unexpectedly``. An
+          ``agent_ecs_survived_daemon_restart`` INFO event is emitted
+          per ECS agent for observability. No retry marker, no
+          terminal write, no worktree check (the daemon has no
+          local worktree for an ECS agent — the worktree lives
+          inside the agent-runner container).
+
+        NULL ``execution_mode`` (older rows predating #3091 migration
+        41) defaults to subprocess behavior for backward compat. The
+        migration set ``DEFAULT 'subprocess'`` and NOT NULL, so this
+        is belt-and-suspenders — new rows can't be NULL.
 
         Returns the number of agents reclaimed. On any DB error the
         method logs and returns 0 — startup must not block on a
@@ -4298,15 +4318,23 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before recovery"
         assert self._run_id is not None, "register run before recovery"
 
-        candidates: list[tuple[str, int | None, str | None]] = []
+        candidates: list[tuple[str, int | None, str | None, str, str | None]] = []
         try:
             with self._conn.cursor() as cur:
                 # #2927: /task subagents no longer write to
                 # ``dispatcher.agents`` (label-only coordination), so
                 # every ``status='running'`` row found here is
                 # daemon-owned. No ``kind`` filter needed.
+                #
+                # #3152: SELECT ``execution_mode`` + ``agent_task_arn``
+                # so the reclaim loop below can branch subprocess vs.
+                # ecs. Pre-#3091 migration 41 rows lack the column; the
+                # migration set ``DEFAULT 'subprocess' NOT NULL`` so in
+                # practice every row has a value, but NULL is
+                # defensively coerced to ``'subprocess'`` downstream.
                 cur.execute(
-                    "SELECT agent_id, issue_number, phase "
+                    "SELECT agent_id, issue_number, phase, "
+                    "       execution_mode, agent_task_arn "
                     "FROM dispatcher.agents "
                     "WHERE status = 'running' "
                     "  AND (parent_run_id IS NULL "
@@ -4314,11 +4342,21 @@ class DispatcherDaemon:
                     (self._run_id,),
                 )
                 for row in cur.fetchall():
+                    raw_mode = row[3] if len(row) > 3 else None
+                    mode = (
+                        str(raw_mode).lower()
+                        if raw_mode is not None
+                        else DEFAULT_AGENT_EXECUTION_MODE
+                    )
+                    raw_arn = row[4] if len(row) > 4 else None
+                    task_arn = str(raw_arn) if raw_arn is not None else None
                     candidates.append(
                         (
                             str(row[0]),
                             int(row[1]) if row[1] is not None else None,
                             str(row[2]) if row[2] is not None else None,
+                            mode,
+                            task_arn,
                         )
                     )
             self._conn.commit()
@@ -4347,7 +4385,35 @@ class DispatcherDaemon:
             return 0
 
         reclaimed = 0
-        for agent_id, issue_number, prior_phase in candidates:
+        for agent_id, issue_number, prior_phase, execution_mode, task_arn in candidates:
+            # #3152: ECS-mode agents survive daemon redeploys by
+            # construction — their Fargate task is a peer, not a
+            # child, of the daemon. The spec's Option A promise
+            # (dispatcher-v2-spec.md §6c) is exactly this:
+            # "Fresh daemons after a redeploy just resume observing
+            # the ARNs — no abandonment bookkeeping needed." The
+            # pre-fix code marked every ECS agent
+            # ``daemon_restart_abandoned``, which defeats Option A:
+            # one daemon redeploy killed the first real full-pipeline
+            # ECS agent (6e79fb52 on #2671 at ~2h ralph) even though
+            # ``aws ecs describe-tasks`` confirmed the task was still
+            # RUNNING. The new daemon simply emits an INFO event and
+            # defers to ``_reap_completed_agent_tasks`` for liveness
+            # observation.
+            if execution_mode == "ecs":
+                self._log.info(
+                    "daemon.agent_ecs_survived_daemon_restart",
+                    extra={
+                        "event": "agent_ecs_survived_daemon_restart",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "prior_phase": prior_phase,
+                        "agent_task_arn": task_arn,
+                    },
+                )
+                continue
+
             try:
                 self._write_failure(
                     agent_id=agent_id,

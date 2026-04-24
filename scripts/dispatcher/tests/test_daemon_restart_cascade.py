@@ -299,6 +299,372 @@ class TestRecoverAbandonedAgents:
 
 
 # --------------------------------------------------------------------------
+# Bug #3152 — ECS-mode agents must survive daemon restart
+# --------------------------------------------------------------------------
+
+
+class TestRecoverAbandonedAgentsEcsExecutionMode:
+    """Daemon startup reconciliation branches on ``execution_mode`` (#3152).
+
+    Before the fix, the startup sweep unconditionally marked every
+    ``status='running'`` agent from a prior run as
+    ``daemon_restart_abandoned``. For subprocess-mode agents this is
+    correct — their worker subprocesses died with the old daemon. For
+    ECS-mode agents (#3086/#3091) it is wrong: their agent-runner
+    process runs in an independent Fargate task that outlives the
+    daemon redeploy. The pre-fix behaviour defeated Option A's core
+    promise — one daemon redeploy killed the first full-pipeline ECS
+    agent (agent ``6e79fb52`` on #2671 at ~2h ralph) even though
+    ``aws ecs describe-tasks`` confirmed the task was still RUNNING.
+
+    The fix: branch on ``execution_mode``. Subprocess path is
+    unchanged. ECS path emits an ``agent_ecs_survived_daemon_restart``
+    INFO event, takes no DB action, and defers liveness observation
+    to :meth:`_reap_completed_agent_tasks` on the next scheduler tick.
+    """
+
+    def test_ecs_agent_survives_daemon_restart(self, tmp_path: Path) -> None:
+        """ECS-mode row emits survival event, no retry marker, no terminal."""
+        d, conn, handler = _make_daemon(tmp_path)
+
+        # One ECS-mode agent in-flight at daemon startup.
+        task_arn = (
+            "arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/"
+            "eb57861c531e41359d99e18c95d86e0e"
+        )
+        conn.cursor_instance.fetchall_queue = [
+            [("agent-ecs", 2671, "ralph", "ecs", task_arn)],
+        ]
+        # The ECS branch issues no fetchone calls — no retry-marker
+        # lookup, no backoff config read, no agent-kind lookup. Queue
+        # empty to prove it.
+        conn.cursor_instance.fetch_queue = []
+
+        reclaimed = d.recover_abandoned_agents()
+        # ECS agents are NOT counted in the "reclaimed" return — the
+        # return value reports subprocess-mode reclaims only (agents
+        # whose row we actually touched).
+        assert reclaimed == 0
+
+        # Zero failure rows written.
+        failure_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.failures" in e[0]
+        ]
+        assert failure_inserts == [], (
+            f"ECS agent must not write a failure row — got {failure_inserts}"
+        )
+
+        # Zero retry markers enqueued.
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        assert marker_inserts == [], (
+            f"ECS agent must not enqueue a retry marker — got {marker_inserts}"
+        )
+
+        # Zero ``UPDATE dispatcher.agents SET status='crashed'`` writes.
+        crashed_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and ("crashed" in e[1] or "daemon_restart_abandoned" in e[1])
+        ]
+        assert crashed_updates == [], (
+            f"ECS agent row must stay status='running' — got {crashed_updates}"
+        )
+
+        # No ``agent_recovered_from_restart`` WARNING event.
+        assert handler.events("agent_recovered_from_restart") == []
+
+        # One ``agent_ecs_survived_daemon_restart`` INFO event with
+        # the required observability fields.
+        survived_events = handler.events("agent_ecs_survived_daemon_restart")
+        assert len(survived_events) == 1
+        record = survived_events[0]
+        assert record.levelno == logging.INFO
+        assert getattr(record, "agent_id") == "agent-ecs"
+        assert getattr(record, "issue_number") == 2671
+        assert getattr(record, "prior_phase") == "ralph"
+        assert getattr(record, "agent_task_arn") == task_arn
+
+    def test_subprocess_agent_still_abandoned(self, tmp_path: Path) -> None:
+        """Explicit ``execution_mode='subprocess'`` preserves legacy behavior."""
+        d, conn, handler = _make_daemon(tmp_path)
+
+        conn.cursor_instance.fetchall_queue = [
+            [("agent-sub", 2807, "ralph", "subprocess", None)],
+        ]
+        conn.cursor_instance.fetch_queue = [
+            (0,),  # prior retry marker count
+            ("[60,300,900]",),  # backoff schedule
+        ]
+
+        reclaimed = d.recover_abandoned_agents()
+        assert reclaimed == 1
+
+        # Existing subprocess path: failure row + terminal + retry marker.
+        failure_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.failures" in e[0]
+        ]
+        assert len(failure_inserts) == 1
+
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        assert len(marker_inserts) == 1
+
+        # Warning-level restart-abandoned event fired.
+        assert len(handler.events("agent_recovered_from_restart")) == 1
+        # No ECS survival event.
+        assert handler.events("agent_ecs_survived_daemon_restart") == []
+
+    def test_null_execution_mode_defaults_to_subprocess(self, tmp_path: Path) -> None:
+        """Pre-#3091 rows with NULL ``execution_mode`` keep the legacy path.
+
+        Migration 41 set ``execution_mode TEXT NOT NULL DEFAULT 'subprocess'``
+        so in practice every row has a value, but the reclaim loop
+        defensively coerces NULL to subprocess so a migration hiccup
+        (or a hand-edited row) can't accidentally opt into the
+        ECS-survives branch and leave an orphaned agent.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        conn.cursor_instance.fetchall_queue = [
+            [("agent-old", 2500, "plan", None, None)],
+        ]
+        conn.cursor_instance.fetch_queue = [
+            (0,),  # retry marker count
+            ("[60,300,900]",),  # backoff
+        ]
+
+        reclaimed = d.recover_abandoned_agents()
+        assert reclaimed == 1, (
+            "NULL execution_mode must take the subprocess abandon path"
+        )
+
+        failure_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.failures" in e[0]
+        ]
+        assert len(failure_inserts) == 1
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        assert len(marker_inserts) == 1
+        assert len(handler.events("agent_recovered_from_restart")) == 1
+        assert handler.events("agent_ecs_survived_daemon_restart") == []
+
+    def test_mixed_fleet_only_subprocess_abandoned(self, tmp_path: Path) -> None:
+        """One subprocess + one ECS agent → only subprocess is abandoned."""
+        d, conn, handler = _make_daemon(tmp_path)
+
+        ecs_arn = (
+            "arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/"
+            "abcdef0123456789abcdef0123456789"
+        )
+        conn.cursor_instance.fetchall_queue = [
+            [
+                ("agent-sub", 100, "ralph", "subprocess", None),
+                ("agent-ecs", 200, "plan", "ecs", ecs_arn),
+            ],
+        ]
+        # Only the subprocess agent hits fetch_queue — the ECS branch
+        # is a pure ``continue`` before any write path runs.
+        conn.cursor_instance.fetch_queue = [
+            (0,),  # retry marker count for subprocess
+            ("[60,300,900]",),  # backoff
+        ]
+
+        reclaimed = d.recover_abandoned_agents()
+        assert reclaimed == 1, (
+            "Mixed fleet: subprocess=1 abandoned, ecs=0 (deferred to reap tick)"
+        )
+
+        # Exactly one failure row (for the subprocess agent).
+        failure_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.failures" in e[0]
+        ]
+        assert len(failure_inserts) == 1
+        # The failure is for the subprocess agent, not the ECS one.
+        assert "agent-sub" in str(failure_inserts[0][1])
+
+        # Exactly one retry marker (for the subprocess agent).
+        marker_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.retry_markers" in e[0]
+        ]
+        assert len(marker_inserts) == 1
+        assert "agent-sub" in str(marker_inserts[0][1])
+
+        # One survival event (for the ECS agent).
+        survived_events = handler.events("agent_ecs_survived_daemon_restart")
+        assert len(survived_events) == 1
+        assert getattr(survived_events[0], "agent_id") == "agent-ecs"
+        assert getattr(survived_events[0], "agent_task_arn") == ecs_arn
+
+        # One abandonment event (for the subprocess agent).
+        abandoned_events = handler.events("agent_recovered_from_restart")
+        assert len(abandoned_events) == 1
+        assert getattr(abandoned_events[0], "agent_id") == "agent-sub"
+
+    def test_select_includes_execution_mode_and_task_arn(self, tmp_path: Path) -> None:
+        """The SELECT must include the two new columns used for branching."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [[]]
+        d.recover_abandoned_agents()
+
+        selects = [
+            e
+            for e in conn.cursor_instance.executed
+            if "SELECT" in e[0] and "dispatcher.agents" in e[0]
+        ]
+        assert selects
+        sql, _params = selects[0]
+        assert "execution_mode" in sql, (
+            "SELECT must return execution_mode so the loop can branch — "
+            f"actual: {sql!r}"
+        )
+        assert "agent_task_arn" in sql, (
+            "SELECT must return agent_task_arn for observability logging — "
+            f"actual: {sql!r}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Bug #3152 — _reap_completed_agent_tasks noop on surviving RUNNING ECS task
+# --------------------------------------------------------------------------
+
+
+class TestReapNoopOnSurvivingEcsAgent:
+    """After startup survival, the reap tick must observe RUNNING → noop.
+
+    This is the post-#3152 end-to-end contract: fresh daemon skipped
+    the restart-abandon path for the ECS row in
+    :meth:`recover_abandoned_agents`, and the next scheduler tick
+    picks up the still-alive ARN via ``ecs:DescribeTasks`` and
+    takes no action. Row stays ``status='running'``.
+
+    The reap-path test suite
+    (``test_daemon_reap_completed_agent_tasks.py``) covers the full
+    lifecycle matrix. This test fixes a specific regression: the reap
+    tick must not crash or mark terminal when given an ECS agent
+    whose row is still ``running`` and whose ECS task is still
+    ``RUNNING`` — which is the exact state a survived-restart ECS
+    agent presents to the very next tick.
+    """
+
+    def test_reap_noop_on_running_task(self, tmp_path: Path) -> None:
+        import threading
+        from unittest.mock import MagicMock
+
+        # Build a minimal daemon with the same wiring
+        # ``test_daemon_reap_completed_agent_tasks.py`` uses.
+        d = daemon.DispatcherDaemon.__new__(daemon.DispatcherDaemon)
+        d._thread_state = threading.local()  # type: ignore[attr-defined]
+
+        class _ReapCursor:
+            def __init__(self, rows: list[Any]) -> None:
+                self.executed: list[tuple[str, Any]] = []
+                self._rows = rows
+
+            def __enter__(self) -> _ReapCursor:
+                return self
+
+            def __exit__(self, *_exc: Any) -> None:
+                return None
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                self.executed.append((sql, params))
+
+            def fetchall(self) -> list[Any]:
+                return self._rows
+
+            def fetchone(self) -> Any:
+                return None
+
+        arn = (
+            "arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/"
+            "eb57861c531e41359d99e18c95d86e0e"
+        )
+        cur = _ReapCursor(rows=[("agent-ecs", 2671, arn, "ralph", "running")])
+
+        class _Conn:
+            def __init__(self, c: _ReapCursor) -> None:
+                self._c = c
+                self.committed = 0
+                self.rolled_back = 0
+
+            def cursor(self) -> _ReapCursor:
+                return self._c
+
+            def commit(self) -> None:
+                self.committed += 1
+
+            def rollback(self) -> None:
+                self.rolled_back += 1
+
+        conn = _Conn(cur)
+        d._main_conn = conn  # type: ignore[attr-defined]
+        d._cfg = MagicMock(  # type: ignore[attr-defined]
+            aws_region="us-west-2",
+            ecs_cluster_arn=(
+                "arn:aws:ecs:us-west-2:155326049300:cluster/judgemind-dev"
+            ),
+        )
+        d._log = logging.getLogger(  # type: ignore[attr-defined]
+            f"test.daemon_reap_survive.{id(tmp_path)}"
+        )
+        d._run_id = "new-run-after-restart"  # type: ignore[attr-defined]
+
+        # ECS DescribeTasks returns the still-alive task.
+        ecs_client = MagicMock()
+        ecs_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": arn,
+                    "lastStatus": "RUNNING",
+                }
+            ],
+        }
+        d._ecs_client = ecs_client  # type: ignore[attr-defined]
+
+        summary = d._reap_completed_agent_tasks()
+
+        # RUNNING → noop: increment still_running, nothing else.
+        assert summary["active"] == 1
+        assert summary["still_running"] == 1
+        assert summary["reaped_success"] == 0
+        assert summary["reaped_failure"] == 0
+
+        # No terminal UPDATE was issued against the row.
+        agent_updates = [
+            e
+            for e in cur.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and ("crashed" in str(e[1]) or "succeeded" in str(e[1]))
+        ]
+        assert agent_updates == [], (
+            f"RUNNING ECS task must not be marked terminal by reap — {agent_updates}"
+        )
+
+
+# --------------------------------------------------------------------------
 # Bug B — per-phase stuck_timeout thresholds
 # --------------------------------------------------------------------------
 
