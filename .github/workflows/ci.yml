@@ -920,6 +920,16 @@ jobs:
         run: scripts/check-hardcoded-models.sh
 
   # ---------------------------------------------------------------
+  # Placeholder gates guard: prevent stub security gates
+  # ---------------------------------------------------------------
+  placeholder-gates-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run placeholder gates check
+        run: scripts/check-placeholder-gates.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded color guard: enforce semantic design tokens in TSX
   # ---------------------------------------------------------------
   hardcoded-colors-check:
