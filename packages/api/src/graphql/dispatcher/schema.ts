@@ -456,6 +456,28 @@ export const dispatcherTypeDefs = `#graphql
   }
 
   # ---------------------------------------------------------------------------
+  # Diagnoser effectiveness rollup (issue #2800, spec §8).
+  # One row per (recommended_action × observed_outcome × day) bucket for
+  # diagnoses that completed in the last 7 days.
+  # ---------------------------------------------------------------------------
+
+  """One row in the diagnoser effectiveness 7-day rollup (issue #2800).
+  Aggregates dispatcher.diagnoses rows where outcome IS NOT NULL and
+  completed_at is within the last 7 days.  Groups by
+  recommendation->>'action', outcome->>'retry_outcome', and calendar day.
+  Admin-only — non-admins receive "not found"."""
+  type DiagnoserEffectivenessRow {
+    """The recommended action from diagnosis (e.g. 'retry', 'skip')."""
+    recommendedAction: String!
+    """The observed outcome after the recommendation was applied (e.g. 'succeeded', 'failed')."""
+    observedOutcome: String!
+    """Number of diagnoses in this bucket."""
+    count: Int!
+    """Calendar day (UTC) for this bucket, truncated to day precision."""
+    day: DateTime!
+  }
+
+  # ---------------------------------------------------------------------------
   # Queries + Mutations — merged into the root schema by concatenation.
   # The root Query/Mutation types are open for extension via the
   # \`extend type\` keyword.
@@ -476,6 +498,13 @@ export const dispatcherTypeDefs = `#graphql
     tables as the capped \`DispatcherState\` fields; no GitHub API calls.
     Admin-only; non-admins receive "not found"."""
     dispatcherQueueFull(kind: DispatcherQueueKind!): DispatcherQueueFull!
+
+    """7-day diagnoser effectiveness rollup (issue #2800, spec §8).
+    Returns one row per (recommendedAction × observedOutcome × day) bucket
+    for diagnoses completed in the last 7 days where outcome IS NOT NULL.
+    Returns an empty list when no diagnoses have resolved outcomes.
+    Admin-only; non-admins receive "not found"."""
+    weeklyDiagnoserReport: [DiagnoserEffectivenessRow!]!
   }
 
   extend type Mutation {

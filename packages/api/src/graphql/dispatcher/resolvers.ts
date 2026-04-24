@@ -233,6 +233,43 @@ async function queryRecentFailures(pool: Pool, sinceHours: number): Promise<Row[
   return rows;
 }
 
+// ---------------------------------------------------------------------------
+// Data access — weeklyDiagnoserReport
+// ---------------------------------------------------------------------------
+
+/** Shape returned by the weekly diagnoser SQL query. */
+interface DiagnoserEffectivenessRow {
+  recommended_action: string;
+  observed_outcome: string;
+  count: string; // pg returns bigint count as string
+  day: string;
+}
+
+async function queryWeeklyDiagnoserReport(pool: Pool): Promise<DiagnoserEffectivenessRow[]> {
+  const { rows } = await pool.query<DiagnoserEffectivenessRow>(
+    `SELECT recommendation->>'action'        AS recommended_action,
+            outcome->>'retry_outcome'         AS observed_outcome,
+            count(*)::text                    AS count,
+            date_trunc('day', completed_at)   AS day
+       FROM dispatcher.diagnoses
+      WHERE outcome IS NOT NULL
+        AND completed_at >= now() - interval '7 days'
+      GROUP BY 1, 2, 4
+      ORDER BY 4 DESC, 3 DESC`,
+  );
+  return rows;
+}
+
+/** Convert a dispatcher.diagnoses rollup row into the GraphQL DiagnoserEffectivenessRow shape. */
+function diagnoserRowToGraphQL(row: DiagnoserEffectivenessRow): Record<string, unknown> {
+  return {
+    recommendedAction: row.recommended_action,
+    observedOutcome: row.observed_outcome,
+    count: parseInt(row.count, 10),
+    day: row.day,
+  };
+}
+
 async function querySpawnFrozenUntil(pool: Pool): Promise<string | null> {
   const { rows } = await pool.query<{ value: unknown }>(
     `SELECT value FROM dispatcher.config WHERE key = 'spawn_frozen_until'`,
@@ -1055,6 +1092,16 @@ export const dispatcherResolvers = {
         completions: recentCompletionsToGraphQL(rows),
       };
     },
+
+    weeklyDiagnoserReport: async (
+      _: unknown,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      const rows = await queryWeeklyDiagnoserReport(pool);
+      return rows.map(diagnoserRowToGraphQL);
+    },
   },
 
   Mutation: {
@@ -1434,6 +1481,7 @@ export {
   coerceNullableNumber,
   commandRowToGraphQL,
   configRowToGraphQL,
+  diagnoserRowToGraphQL,
   displayCategoryFor,
   failureRowToGraphQL,
   insertCommandIdempotent,
@@ -1449,4 +1497,4 @@ export {
   updateConfigEntry,
 };
 
-export type { SnapshotIssueRecord };
+export type { DiagnoserEffectivenessRow, SnapshotIssueRecord };

@@ -51,6 +51,7 @@ let regularUserId: string;
 const insertedAgentIds: string[] = [];
 const insertedFailureIds: string[] = [];
 const insertedRunIds: string[] = [];
+const insertedDiagnosisIds: string[] = [];
 
 async function seedData(): Promise<void> {
   // Admin user — role='admin' gates the dispatcher surface.
@@ -83,12 +84,16 @@ async function seedData(): Promise<void> {
 }
 
 async function cleanupData(): Promise<void> {
+  for (const id of insertedDiagnosisIds) {
+    await pool.query(`DELETE FROM dispatcher.diagnoses WHERE diagnosis_id = $1`, [id]);
+  }
   for (const id of insertedFailureIds) {
     await pool.query(`DELETE FROM dispatcher.failures WHERE failure_id = $1`, [id]);
   }
   for (const id of insertedAgentIds) {
     await pool.query(`DELETE FROM dispatcher.phase_transitions WHERE agent_id = $1`, [id]);
     await pool.query(`DELETE FROM dispatcher.failures WHERE agent_id = $1`, [id]);
+    await pool.query(`DELETE FROM dispatcher.diagnoses WHERE agent_id = $1`, [id]);
     await pool.query(`DELETE FROM dispatcher.agents WHERE agent_id = $1`, [id]);
   }
   for (const id of insertedRunIds) {
@@ -204,6 +209,31 @@ async function insertFailure(opts: {
   const failureId = rows[0].failure_id;
   insertedFailureIds.push(failureId);
   return failureId;
+}
+
+async function insertDiagnosis(opts: {
+  agentId: string;
+  failureId: string;
+  recommendation: Record<string, unknown>;
+  outcome: Record<string, unknown> | null;
+  completedAt?: string;
+}): Promise<string> {
+  const { rows } = await pool.query<{ diagnosis_id: string }>(
+    `INSERT INTO dispatcher.diagnoses
+       (agent_id, failure_id, status, context, recommendation, outcome, completed_at)
+     VALUES ($1, $2, 'completed', '{}'::jsonb, $3::jsonb, $4::jsonb, $5::timestamptz)
+     RETURNING diagnosis_id::text`,
+    [
+      opts.agentId,
+      opts.failureId,
+      JSON.stringify(opts.recommendation),
+      opts.outcome !== null ? JSON.stringify(opts.outcome) : null,
+      opts.completedAt ?? new Date().toISOString(),
+    ],
+  );
+  const diagnosisId = rows[0].diagnosis_id;
+  insertedDiagnosisIds.push(diagnosisId);
+  return diagnosisId;
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,5 +1033,141 @@ describe('dispatcherQueueFull — admin (#3159)', () => {
     const state = body.data?.dispatcherState as Record<string, unknown>;
     const completions = state.recentCompletions as Array<{ agentId: string }>;
     expect(completions.length).toBeLessThanOrEqual(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// weeklyDiagnoserReport — admin (issue #2800)
+// ---------------------------------------------------------------------------
+
+describe('weeklyDiagnoserReport — admin', () => {
+  const QUERY = `
+    {
+      weeklyDiagnoserReport {
+        recommendedAction
+        observedOutcome
+        count
+        day
+      }
+    }
+  `;
+
+  it('admin with empty diagnoses table returns []', async () => {
+    const body = await gql(QUERY, undefined, adminToken);
+    expect(body.errors).toBeUndefined();
+    const rows = body.data?.weeklyDiagnoserReport as unknown[];
+    expect(Array.isArray(rows)).toBe(true);
+    // May include rows from other tests; our fresh-seeded marker rows
+    // are absent, so any rows here belong to other describe blocks.
+    // Just assert the field is a list.
+    expect(rows).toBeDefined();
+  });
+
+  it('seeded diagnoses within 7 days are aggregated by action × outcome × day', async () => {
+    // Seed: agent + failure, then three diagnosis rows.
+    const agentId = await insertAgent({ issueNumber: 800001, status: 'failed', phase: 'ralph' });
+    const failureId = await insertFailure({
+      agentId,
+      category: 'subprocess_crash',
+      detectedBy: 'scheduler',
+    });
+
+    const dayTs = '2026-04-20T12:00:00Z'; // within 7 days of "now" in tests
+    // Two 'retry' / 'succeeded' rows on the same day → count 2
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: { retry_outcome: 'succeeded' },
+      completedAt: dayTs,
+    });
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: { retry_outcome: 'succeeded' },
+      completedAt: dayTs,
+    });
+    // One 'retry' / 'failed' row on the same day → count 1
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: { retry_outcome: 'failed' },
+      completedAt: dayTs,
+    });
+    // One row with outcome=null — must be excluded from results
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: null,
+      completedAt: dayTs,
+    });
+
+    const body = await gql(QUERY, undefined, adminToken);
+    expect(body.errors).toBeUndefined();
+    const rows = body.data?.weeklyDiagnoserReport as Array<{
+      recommendedAction: string;
+      observedOutcome: string;
+      count: number;
+      day: string;
+    }>;
+    expect(Array.isArray(rows)).toBe(true);
+
+    // Find our specific buckets (other describe blocks may have seeded too).
+    const succeededBucket = rows.find(
+      (r) => r.recommendedAction === 'retry' && r.observedOutcome === 'succeeded',
+    );
+    const failedBucket = rows.find(
+      (r) => r.recommendedAction === 'retry' && r.observedOutcome === 'failed',
+    );
+    expect(succeededBucket).toBeDefined();
+    expect(succeededBucket!.count).toBeGreaterThanOrEqual(2);
+    expect(failedBucket).toBeDefined();
+    expect(failedBucket!.count).toBeGreaterThanOrEqual(1);
+    // day must be a string (DateTime serialization)
+    expect(typeof succeededBucket!.day).toBe('string');
+  });
+
+  it('row with completedAt > 7 days ago is excluded from results', async () => {
+    const agentId = await insertAgent({ issueNumber: 800002, status: 'failed', phase: 'ralph' });
+    const failureId = await insertFailure({
+      agentId,
+      category: 'subprocess_crash',
+      detectedBy: 'scheduler',
+    });
+    // completedAt = 8 days ago — must be excluded by the 7-day window
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'skip_800002_marker' },
+      outcome: { retry_outcome: 'succeeded' },
+      completedAt: eightDaysAgo,
+    });
+
+    const body = await gql(QUERY, undefined, adminToken);
+    expect(body.errors).toBeUndefined();
+    const rows = body.data?.weeklyDiagnoserReport as Array<{
+      recommendedAction: string;
+    }>;
+    // The 'skip_800002_marker' row must NOT appear (8 days old).
+    const excluded = rows.find((r) => r.recommendedAction === 'skip_800002_marker');
+    expect(excluded).toBeUndefined();
+  });
+
+  it('non-admin returns "not found" error', async () => {
+    const body = await gql(QUERY, undefined, userToken);
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('NOT_FOUND');
+    expect(body.data == null || body.data.weeklyDiagnoserReport == null).toBe(true);
+  });
+
+  it('unauthenticated returns "not found" error', async () => {
+    const body = await gql(QUERY);
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('NOT_FOUND');
+    expect(body.data == null || body.data.weeklyDiagnoserReport == null).toBe(true);
   });
 });

@@ -398,3 +398,27 @@ export interface DispatcherQueueFull {
 export interface DispatcherQueueFullData {
   dispatcherQueueFull: DispatcherQueueFull;
 }
+
+export const WEEKLY_DIAGNOSER_REPORT_QUERY = gql`
+  query WeeklyDiagnoserReport {
+    weeklyDiagnoserReport {
+      recommendedAction
+      observedOutcome
+      count
+      day
+    }
+  }
+`;
+
+/** One bucket in the diagnoser effectiveness rollup (issue #2800). */
+export interface DiagnoserEffectivenessRow {
+  recommendedAction: string;
+  observedOutcome: string;
+  count: number;
+  /** ISO-8601 calendar day string (UTC, day precision). */
+  day: string;
+}
+
+export interface WeeklyDiagnoserReportData {
+  weeklyDiagnoserReport: DiagnoserEffectivenessRow[];
+}
