@@ -17,6 +17,7 @@ import { GraphQLError, GraphQLScalarType, Kind } from 'graphql';
 import type { AuthUser } from '../../auth';
 import { requireDispatcherAdmin } from './auth';
 import { extractPriority, parseBlockedBy, priorityRank } from './parse-labels';
+import { TERMINAL_AGENT_STATUSES } from './constants';
 
 /**
  * Cooldown window in seconds — mirrors `FAILED_AGENT_COOLDOWN_SECONDS` in
@@ -478,11 +479,11 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
            FROM dispatcher.phase_outputs
           GROUP BY agent_id
        ) po ON po.agent_id = a.agent_id
-      WHERE a.status IN ('succeeded', 'failed', 'crashed', 'plan_blocked', 'needs_review')
+      WHERE a.status = ANY($2::text[])
         AND a.ended_at IS NOT NULL
       ORDER BY a.ended_at DESC
       LIMIT $1`,
-    [limit],
+    [limit, [...TERMINAL_AGENT_STATUSES]],
   );
   return rows;
 }
@@ -504,8 +505,9 @@ async function queryRecentCompletionsCount(pool: Pool): Promise<number> {
   const { rows } = await pool.query<{ count: number | string }>(
     `SELECT COUNT(*)::int AS count
        FROM dispatcher.agents
-      WHERE status IN ('succeeded', 'failed', 'crashed', 'plan_blocked', 'needs_review')
+      WHERE status = ANY($1::text[])
         AND ended_at IS NOT NULL`,
+    [[...TERMINAL_AGENT_STATUSES]],
   );
   if (rows.length === 0) return 0;
   const raw = rows[0].count;

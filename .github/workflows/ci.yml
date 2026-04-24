@@ -969,6 +969,18 @@ jobs:
         run: scripts/check-no-api-github-fetch.sh
 
   # ---------------------------------------------------------------
+  # Dispatcher terminal-status sync guard (#2863)
+  # ---------------------------------------------------------------
+  dispatcher-terminal-statuses-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true' || needs.detect-changes.outputs.api == 'true' || needs.detect-changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Assert Python and TypeScript terminal-status lists match
+        run: scripts/check-dispatcher-terminal-statuses.sh
+
+  # ---------------------------------------------------------------
   # Schema drift guard: schema.sql must match applied migrations
   # ---------------------------------------------------------------
   schema-drift-check:

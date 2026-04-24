@@ -204,12 +204,25 @@ export const INFRA_PREEMPTED_CHIP_CLASSES =
 /** Shared ↺ glyph (U+21BA, ANTICLOCKWISE OPEN CIRCLE ARROW). Issue #2947. */
 export const INFRA_PREEMPTED_GLYPH = '\u21BA';
 
-type OutcomeStatus =
-  | 'succeeded'
-  | 'failed'
-  | 'crashed'
-  | 'plan_blocked'
-  | 'needs_review';
+/**
+ * Canonical terminal-status list — mirrors
+ * `packages/api/src/graphql/dispatcher/constants.ts::TERMINAL_AGENT_STATUSES`
+ * and `scripts/dispatcher/daemon.py::TERMINAL_AGENT_STATUSES`.
+ *
+ * Kept as a local const (not a cross-package import) because `packages/web`
+ * does not depend on `packages/api` at runtime. The CI check
+ * `scripts/check-dispatcher-terminal-statuses.sh` asserts that all three
+ * copies stay in sync — update them together when adding a new status.
+ */
+const TERMINAL_AGENT_STATUSES = [
+  'succeeded',
+  'failed',
+  'crashed',
+  'plan_blocked',
+  'needs_review',
+] as const;
+
+type OutcomeStatus = (typeof TERMINAL_AGENT_STATUSES)[number];
 
 /** Amber ✓ chip — shipped but post-merge bookkeeping incomplete.
  *
