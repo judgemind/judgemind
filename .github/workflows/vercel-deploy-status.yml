@@ -1,7 +1,19 @@
 name: Vercel Deploy Status
 
-# Provides a GitHub Actions run that agents can `gh run watch` to track
-# Vercel deployments, instead of polling the Vercel API in a loop.
+# Mirrors Vercel's own `Vercel` commit status onto `deploy/vercel-web` so
+# agents can `gh run watch` this workflow instead of polling the Vercel API.
+#
+# Why this workflow exists as a mirror (not a direct Vercel poll):
+# Prior versions polled the Vercel REST API by commit SHA. On squash-merges
+# the `github.sha` pushed to `main` is the merge-commit SHA, but Vercel
+# tracks the pre-squash branch SHA, so the SHA-filtered query always
+# returned NOT_FOUND and the workflow timed out after 15 minutes even
+# though the deployment itself succeeded in ~30 seconds (see #2837, #2849).
+#
+# Vercel's own GitHub App already posts an accurate `context=Vercel`
+# commit status on every deployed SHA (including merge commits) within
+# ~30 seconds of the push. Mirroring that status is both simpler and
+# reliable — no SHA translation, no Vercel API rate limits, no guessing.
 
 on:
   push:
@@ -54,119 +66,184 @@ jobs:
               "context": "deploy/vercel-web"
             }'
 
-      - name: Wait for Vercel deployment
+      - name: Wait for Vercel commit status
+        id: wait
         env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_API_TOKEN }}
-          VERCEL_PROJECT_ID: prj_tJb9qtGPh8GUPitBb1Y4UpoW31r8
-          VERCEL_TEAM_ID: team_m3MypOYIqhxoQkSHVe8Vkket
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "Waiting for Vercel deployment for commit ${COMMIT_SHA}..."
+          # Poll GitHub's combined commit-status API for the `Vercel`
+          # context posted by Vercel's own GitHub App. States:
+          #   pending  -> keep polling
+          #   success  -> mirror to deploy/vercel-web and exit 0
+          #   failure|error -> mirror to deploy/vercel-web and exit 1
+          #
+          # If the Vercel context never appears (Vercel skipped the build,
+          # GitHub App misconfigured, etc.) we hit MAX_ATTEMPTS and emit
+          # an unambiguous "watcher timed out" signal distinct from a
+          # real Vercel failure — see the final-status step below.
 
           MAX_ATTEMPTS=60
           POLL_INTERVAL=15
           ATTEMPT=0
-          # After this many NOT_FOUND attempts with the exact SHA, fall back
-          # to querying recent deployments without the SHA filter. This handles
-          # squash merges where Vercel stores the original branch SHA, not the
-          # merge commit SHA that github.sha provides.
-          FALLBACK_AFTER=5
-          USING_FALLBACK=false
-          # Record workflow start time (epoch ms) for fallback timestamp check
-          START_TIME_MS=$(date +%s)000
+
+          VERCEL_STATE=""
+          VERCEL_DESC=""
+          VERCEL_URL=""
 
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
             echo "Poll attempt $ATTEMPT / $MAX_ATTEMPTS"
 
-            if [ "$USING_FALLBACK" = "true" ]; then
-              # Fallback: query recent deployments for the project without SHA filter
-              echo "Using fallback query (recent deployments, no SHA filter)"
-              RESPONSE=$(curl -s \
-                -H "Authorization: Bearer $VERCEL_TOKEN" \
-                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_TEAM_ID&target=production&limit=5&since=$START_TIME_MS")
-            else
-              # Primary: query by exact commit SHA
-              RESPONSE=$(curl -s \
-                -H "Authorization: Bearer $VERCEL_TOKEN" \
-                "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_TEAM_ID&meta-githubCommitSha=$COMMIT_SHA&limit=1")
-            fi
+            RESPONSE=$(curl -s \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/commits/$COMMIT_SHA/status")
 
-            # Parse deployment state and URL from the response
-            DEPLOY_STATE=$(echo "$RESPONSE" | python3 -c "
+            VERCEL_STATE=$(echo "$RESPONSE" | python3 -c "
           import sys, json
           try:
               data = json.load(sys.stdin)
-              deployments = data.get('deployments', [])
-              if not deployments:
-                  print('NOT_FOUND')
-              else:
-                  d = deployments[0]
-                  state = d.get('state', d.get('readyState', 'UNKNOWN'))
-                  print(state.upper())
-          except Exception:
-              print('ERROR')
-          " 2>/dev/null) || DEPLOY_STATE="ERROR"
-
-            DEPLOY_URL=$(echo "$RESPONSE" | python3 -c "
-          import sys, json
-          try:
-              data = json.load(sys.stdin)
-              deployments = data.get('deployments', [])
-              if deployments:
-                  print(deployments[0].get('url', ''))
+              statuses = data.get('statuses', [])
+              # Pick the most recent status with context == 'Vercel'.
+              # GitHub returns statuses sorted by updated_at desc.
+              for s in statuses:
+                  if s.get('context') == 'Vercel':
+                      print(s.get('state', ''))
+                      break
               else:
                   print('')
           except Exception:
               print('')
-          " 2>/dev/null) || DEPLOY_URL=""
+          " 2>/dev/null) || VERCEL_STATE=""
 
-            echo "Deployment state: $DEPLOY_STATE"
+            VERCEL_DESC=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              for s in data.get('statuses', []):
+                  if s.get('context') == 'Vercel':
+                      print(s.get('description', ''))
+                      break
+              else:
+                  print('')
+          except Exception:
+              print('')
+          " 2>/dev/null) || VERCEL_DESC=""
 
-            case "$DEPLOY_STATE" in
-              READY)
-                echo "Vercel deployment is READY at https://$DEPLOY_URL"
+            VERCEL_URL=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              for s in data.get('statuses', []):
+                  if s.get('context') == 'Vercel':
+                      print(s.get('target_url', ''))
+                      break
+              else:
+                  print('')
+          except Exception:
+              print('')
+          " 2>/dev/null) || VERCEL_URL=""
+
+            if [ -z "$VERCEL_STATE" ]; then
+              echo "Vercel status not yet posted — waiting ${POLL_INTERVAL}s..."
+              sleep $POLL_INTERVAL
+              continue
+            fi
+
+            echo "Vercel commit status: $VERCEL_STATE"
+
+            case "$VERCEL_STATE" in
+              success)
+                echo "Vercel deployment succeeded: $VERCEL_URL"
+                echo "vercel_state=success" >> "$GITHUB_OUTPUT"
+                echo "vercel_desc=Vercel deployment succeeded" >> "$GITHUB_OUTPUT"
+                echo "vercel_url=$VERCEL_URL" >> "$GITHUB_OUTPUT"
                 exit 0
                 ;;
-              ERROR|CANCELED)
-                echo "ERROR: Vercel deployment failed with state: $DEPLOY_STATE"
+              failure|error)
+                echo "ERROR: Vercel deployment $VERCEL_STATE — $VERCEL_DESC"
+                # Cap the mirrored description length; GitHub truncates at 140
+                # chars but the Vercel-supplied text is usually concise.
+                SHORT_DESC="${VERCEL_DESC:-Vercel deployment failed}"
+                echo "vercel_state=failure" >> "$GITHUB_OUTPUT"
+                echo "vercel_desc=Vercel: $SHORT_DESC" >> "$GITHUB_OUTPUT"
+                echo "vercel_url=$VERCEL_URL" >> "$GITHUB_OUTPUT"
                 exit 1
                 ;;
-              NOT_FOUND|QUEUED|BUILDING|INITIALIZING)
-                # Switch to fallback after several NOT_FOUND attempts with exact SHA
-                if [ "$USING_FALLBACK" = "false" ] && [ "$DEPLOY_STATE" = "NOT_FOUND" ] && [ "$ATTEMPT" -ge "$FALLBACK_AFTER" ]; then
-                  echo "Commit SHA not found after $ATTEMPT attempts — switching to fallback (recent deployments)"
-                  USING_FALLBACK=true
-                fi
-                echo "Deployment in progress ($DEPLOY_STATE), waiting ${POLL_INTERVAL}s..."
+              pending)
+                echo "Vercel deployment in progress — waiting ${POLL_INTERVAL}s..."
                 sleep $POLL_INTERVAL
                 ;;
               *)
-                echo "Unknown state: $DEPLOY_STATE, waiting ${POLL_INTERVAL}s..."
+                echo "Unknown Vercel state: $VERCEL_STATE — waiting ${POLL_INTERVAL}s..."
                 sleep $POLL_INTERVAL
                 ;;
             esac
           done
 
-          echo "ERROR: Timed out waiting for Vercel deployment after $MAX_ATTEMPTS attempts"
+          # Fell through the poll loop without seeing a terminal Vercel
+          # state. This is NOT the same as a Vercel-side failure — the
+          # deploy may have succeeded or still be running. Emit a distinct
+          # signal so the final-status step can describe it accurately.
+          echo "ERROR: Timed out waiting for Vercel commit status after $MAX_ATTEMPTS attempts"
+          echo "vercel_state=timeout" >> "$GITHUB_OUTPUT"
+          echo "vercel_desc=Watcher timed out — check Vercel dashboard" >> "$GITHUB_OUTPUT"
           exit 1
 
       - name: Set final status
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEPLOY_STATUS: ${{ job.status == 'success' && 'success' || 'failure' }}
-          DEPLOY_DESC: ${{ job.status == 'success' && 'Vercel deployment succeeded' || 'Vercel deployment failed' }}
+          # Map the wait step's output into a GitHub Status state + desc.
+          # job.status is 'success' when the wait step exited 0, otherwise
+          # 'failure' / 'cancelled'. Use the wait step's vercel_desc when
+          # present so agents reading the status context can tell
+          # "Vercel: Build failed (error …)" apart from a bare
+          # "Watcher timed out" signal.
+          VERCEL_STATE: ${{ steps.wait.outputs.vercel_state }}
+          VERCEL_DESC: ${{ steps.wait.outputs.vercel_desc }}
+          VERCEL_URL: ${{ steps.wait.outputs.vercel_url }}
+          JOB_STATUS: ${{ job.status }}
         run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            FINAL_STATE="success"
+            FINAL_DESC="${VERCEL_DESC:-Vercel deployment succeeded}"
+          elif [ "$VERCEL_STATE" = "timeout" ]; then
+            FINAL_STATE="failure"
+            FINAL_DESC="${VERCEL_DESC:-Watcher timed out — check Vercel dashboard}"
+          elif [ "$VERCEL_STATE" = "failure" ]; then
+            FINAL_STATE="failure"
+            FINAL_DESC="${VERCEL_DESC:-Vercel deployment failed}"
+          else
+            # Job was cancelled or the wait step errored before writing
+            # its vercel_state output — distinguish from a real Vercel
+            # failure so agents don't chase a ghost.
+            FINAL_STATE="failure"
+            FINAL_DESC="Watcher error — check workflow run"
+          fi
+
+          # Build the JSON body with python so we don't wrestle with
+          # shell-quoting multi-word descriptions or Vercel URLs.
+          BODY=$(VERCEL_URL="$VERCEL_URL" FINAL_STATE="$FINAL_STATE" FINAL_DESC="$FINAL_DESC" python3 -c "
+          import json, os
+          body = {
+              'state': os.environ['FINAL_STATE'],
+              'description': os.environ['FINAL_DESC'][:140],
+              'context': 'deploy/vercel-web',
+          }
+          url = os.environ.get('VERCEL_URL', '')
+          if url:
+              body['target_url'] = url
+          print(json.dumps(body))
+          ")
+
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
-            -d "{
-              \"state\": \"$DEPLOY_STATUS\",
-              \"description\": \"$DEPLOY_DESC\",
-              \"context\": \"deploy/vercel-web\"
-            }"
+            -d "$BODY"
 
   skip-no-web-changes:
     name: Vercel Deploy (skipped)
