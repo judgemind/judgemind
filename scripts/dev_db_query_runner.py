@@ -86,6 +86,17 @@ def run_query(query_b64: str, readonly_flag: str) -> None:
                 if cursor.description is not None:
                     rows = cursor.fetchall()
                     print(format_select_results(list(cursor.description), rows))
+                elif cursor.rowcount == -1:
+                    # No description AND no rowcount means nothing actually
+                    # executed — typically a comment-only or empty query slipped
+                    # past the caller-side guard. Fail loud instead of emitting
+                    # the misleading `{"rowcount": -1}` response (#2862).
+                    print(
+                        "Error: query produced no result set and no affected rows; "
+                        "did you pass an empty or comment-only statement?",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 else:
                     print(format_non_select_result(cursor.rowcount))
 

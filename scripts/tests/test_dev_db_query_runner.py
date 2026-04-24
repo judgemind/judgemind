@@ -192,6 +192,56 @@ class TestRunQuery:
         result = json.loads(captured.out)
         assert result == {"rowcount": 5}
 
+    def test_comment_only_query_fails_loud(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#2862 — psycopg returns description=None and rowcount=-1 for a
+        comment-only or empty query. Runner must fail loud instead of silently
+        printing the misleading ``{"rowcount": -1}`` response."""
+        query = "-- a comment"
+        query_b64 = base64.b64encode(query.encode()).decode()
+
+        mock_psycopg = self._make_mock_psycopg(
+            description=None,
+            rowcount=-1,
+        )
+
+        with patch.dict(sys.modules, {"psycopg": mock_psycopg}):
+            with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+                from dev_db_query_runner import run_query
+
+                with pytest.raises(SystemExit) as exc_info:
+                    run_query(query_b64, "0")
+                assert exc_info.value.code == 1
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "empty or comment-only" in captured.err
+
+    def test_ddl_zero_affected_still_emits_rowcount(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A legitimate DML that affects zero rows (rowcount=0, not -1) should
+        still emit a normal ``{"rowcount": 0}`` response — only rowcount == -1
+        indicates "nothing executed"."""
+        query = "UPDATE rulings SET status = 'active' WHERE id = -999"
+        query_b64 = base64.b64encode(query.encode()).decode()
+
+        mock_psycopg = self._make_mock_psycopg(
+            description=None,
+            rowcount=0,
+        )
+
+        with patch.dict(sys.modules, {"psycopg": mock_psycopg}):
+            with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+                from dev_db_query_runner import run_query
+
+                run_query(query_b64, "0")
+
+        captured = capsys.readouterr()
+        result = json.loads(captured.out)
+        assert result == {"rowcount": 0}
+
     def test_readonly_flag_sets_transaction_readonly(self) -> None:
         query = "SELECT 1"
         query_b64 = base64.b64encode(query.encode()).decode()
