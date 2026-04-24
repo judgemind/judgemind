@@ -135,7 +135,7 @@ npm run typecheck    # tsc --noEmit
 npm test             # Vitest
 ```
 
-For `packages/web/`, also run `npm run build`. The same diff coverage and floor ratchet gates apply to TypeScript packages (CI reads `lcov.info`).
+For `packages/web/`, also run `npm run build`. Also run `npm run check`, which bundles the three frontend guard scripts: `check-hardcoded-colors.sh` (no raw Tailwind color classes), `check-apollo-keyfields.sh` (no Apollo cache key gaps), and `check-graphql-queries.sh` (no malformed query files). The same diff coverage and floor ratchet gates apply to TypeScript packages (CI reads `lcov.info`).
 
 ### Terraform (from `infra/terraform/`)
 
