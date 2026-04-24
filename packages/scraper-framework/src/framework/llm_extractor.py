@@ -267,14 +267,19 @@ PDF_PER_PAGE_PROMPT = (
     "procedural background, legal standard, analysis, discussion, "
     "conclusion, disposition, orders, and any other content the "
     "judge wrote about this case. Do not summarize or omit anything. "
-    "Empty string if not visible.\n\n"
+    "**If the row's tentative-ruling column/cell is visibly empty (the "
+    "column is present but the body cell is blank), return "
+    '`ruling_text=""`. Do NOT substitute the case caption, motion '
+    "label, case number, or any other nearby text. Emit empty string.**\n\n"
     "## How to handle different page layouts\n\n"
     "California courts use many different PDF formats. Identify which "
     "layout this page uses and extract accordingly:\n\n"
     "**Tables** (columns separated by vertical lines): "
     "Return one object per table row. The narrow column(s) have the "
     "entry number and/or case info; the wide column has the ruling "
-    "text.\n\n"
+    "text. **When a row's ruling-text column is empty/blank, emit "
+    '`ruling_text=""` for that row even though entry_number / '
+    "case_number / case_title are filled.**\n\n"
     "**Bordered boxes** (each case in a rectangular border): "
     "Return one object per box. The box header has the item number, "
     "time, case number, and case name. The ruling text is everything "
@@ -299,6 +304,12 @@ PDF_PER_PAGE_PROMPT = (
     "procedures — no actual case rulings): Return an empty rulings "
     "array. Still extract page_header if the department, judge, or "
     "hearing date is visible.\n\n"
+    "**Calendar listings without a ruling column** (rows that show "
+    "only entry number and case name with no dedicated ruling-body "
+    "column — e.g. a pure calendar agenda): Return one object per row "
+    "with entry_number / case_number / case_title populated and "
+    '`ruling_text=""`. Downstream filters will drop these rows; do '
+    "NOT copy the case caption or motion label into ruling_text.\n\n"
     "## Formatting rules\n\n"
     "- Transcribe ruling_text as **Markdown** preserving formatting:\n"
     "  - Use **bold** for bold text and headings\n"
@@ -335,6 +346,18 @@ PDF_PER_PAGE_PROMPT = (
     '      "case_number": "",\n'
     '      "case_title": "",\n'
     '      "ruling_text": "continuation from previous page..."\n'
+    "    },\n"
+    "    {\n"
+    '      "entry_number": "5",\n'
+    '      "case_number": "2025-00912345",\n'
+    '      "case_title": "Malki vs. Acme Corp.",\n'
+    '      "ruling_text": ""\n'
+    "    },\n"
+    "    {\n"
+    '      "entry_number": "6",\n'
+    '      "case_number": "2025-00956789",\n'
+    '      "case_title": "Johnson vs. Smith — Motion to Compel",\n'
+    '      "ruling_text": ""\n'
     "    }\n"
     "  ]\n"
     "}"
