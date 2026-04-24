@@ -635,9 +635,12 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
   });
 });
 
-// #3172: dialog title carries the same {shown} / {total} denominator as
-// the badge that opened it, and labels match the panel headings exactly.
-describe('DispatcherDashboard — #3172 dialog title denominator', () => {
+// #3172 threaded `{shown} / {total}` into the dialog title; #3222
+// reverted the numerator because the dialog renders every row (no
+// 10-cap). These tests assert the bare-total shape while verifying the
+// panel badge keeps its `{shown} / {total}` format (still correct for
+// the 10-row-capped panel context).
+describe('DispatcherDashboard — #3222 dialog title (total only)', () => {
   beforeEach(() => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
@@ -647,7 +650,7 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
     mockQueueFullData.COMPLETED = undefined;
   });
 
-  it('READY dialog title reads `Queue: Agent-ready — {shown} / {total}` matching the badge', async () => {
+  it('READY dialog title reads `Queue: Agent-ready — {total}` (panel badge still shows {shown} / {total})', async () => {
     // Panel renders 10 (capped); the daemon has scanned 50 ready issues.
     const items = Array.from({ length: 10 }, (_, i) => ({
       issueNumber: 8000 + i,
@@ -673,16 +676,18 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
       },
     };
     renderDashboard();
-    // Sanity: badge shows `10 / 50` (existing #2886 behaviour).
+    // Sanity: panel badge still shows `10 / 50` (existing #2886
+    // behaviour — the 10-row cap means the numerator is still
+    // meaningful in the panel context, unlike the dialog).
     expect(screen.getByTestId('queue-ready-count')).toHaveTextContent(
       '10 / 50',
     );
     fireEvent.click(screen.getByTestId('queue-ready-count'));
     const title = await screen.findByTestId('queue-full-dialog-title');
-    expect(title.textContent).toBe('Queue: Agent-ready — 10 / 50');
+    expect(title.textContent).toBe('Queue: Agent-ready — 50');
   });
 
-  it('BLOCKED dialog title reads `Queue: Blocked — {shown} / {total}`', async () => {
+  it('BLOCKED dialog title reads `Queue: Blocked — {total}`', async () => {
     const items = Array.from({ length: 4 }, (_, i) => ({
       issueNumber: 7000 + i,
       title: `blocked ${7000 + i}`,
@@ -712,10 +717,10 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
     );
     fireEvent.click(screen.getByTestId('queue-blocked-count'));
     const title = await screen.findByTestId('queue-full-dialog-title');
-    expect(title.textContent).toBe('Queue: Blocked — 4 / 12');
+    expect(title.textContent).toBe('Queue: Blocked — 12');
   });
 
-  it('COMPLETED dialog title reads `Recently completed — {shown} / {total}`', async () => {
+  it('COMPLETED dialog title reads `Recently completed — {total}`', async () => {
     const completions = Array.from({ length: 10 }, (_, i) => ({
       agentId: `aaaaaaaa-bbbb-cccc-dddd-${String(i).padStart(12, '0')}`,
       issueNumber: 6000 + i,
@@ -753,7 +758,7 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
     );
     fireEvent.click(screen.getByTestId('recent-completions-count'));
     const title = await screen.findByTestId('queue-full-dialog-title');
-    expect(title.textContent).toBe('Recently completed — 10 / 183');
+    expect(title.textContent).toBe('Recently completed — 183');
   });
 });
 

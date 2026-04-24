@@ -318,47 +318,48 @@ describe('QueueFullDialog — close handling', () => {
 
 describe('formatDialogTitle', () => {
   it('returns empty string for kind=null', () => {
-    expect(formatDialogTitle(null, 0, 0, false)).toBe('');
+    expect(formatDialogTitle(null, 0, false)).toBe('');
   });
 
-  // #3172: title labels match panel headings character-for-character
-  // and the count decoration becomes `{shown} / {total}`.
-  it('renders `Queue: Agent-ready — {shown} / {total}` for READY', () => {
-    expect(formatDialogTitle('READY', 10, 50, false)).toBe(
-      'Queue: Agent-ready — 10 / 50',
+  // #3222: title now reads `{label} — {total}` only. The dialog renders
+  // every row (no 10-cap), so a `shown` numerator would be meaningless
+  // and actively misleading — operators would think they were looking
+  // at a 10-row slice when in fact every row is visible.
+  it('renders `Queue: Agent-ready — {total}` for READY', () => {
+    expect(formatDialogTitle('READY', 50, false)).toBe(
+      'Queue: Agent-ready — 50',
     );
   });
 
-  it('renders `Queue: Blocked — {shown} / {total}` for BLOCKED', () => {
-    expect(formatDialogTitle('BLOCKED', 5, 12, false)).toBe(
-      'Queue: Blocked — 5 / 12',
+  it('renders `Queue: Blocked — {total}` for BLOCKED', () => {
+    expect(formatDialogTitle('BLOCKED', 12, false)).toBe(
+      'Queue: Blocked — 12',
     );
   });
 
-  it('renders `Recently completed — {shown} / {total}` for COMPLETED', () => {
-    expect(formatDialogTitle('COMPLETED', 10, 183, false)).toBe(
-      'Recently completed — 10 / 183',
+  it('renders `Recently completed — {total}` for COMPLETED', () => {
+    expect(formatDialogTitle('COMPLETED', 183, false)).toBe(
+      'Recently completed — 183',
     );
   });
 
   it('appends a — loading… marker while loading', () => {
-    expect(formatDialogTitle('READY', 0, 0, true)).toBe(
+    expect(formatDialogTitle('READY', 0, true)).toBe(
       'Queue: Agent-ready — loading…',
     );
   });
 
-  it('drops the count decoration when shown or total is undefined', () => {
-    // Back-compat fallback for callers that don't supply both numbers
-    // (e.g. existing test fixtures, or a future caller that hasn't yet
-    // wired up the depth fields).
-    expect(formatDialogTitle('READY', undefined, 50, false)).toBe(
+  it('drops the count decoration when total is undefined', () => {
+    // Initial-load fallback: before `dispatcherState` has resolved,
+    // `total` is undefined and the title renders as bare `{label}`.
+    expect(formatDialogTitle('READY', undefined, false)).toBe(
       'Queue: Agent-ready',
     );
-    expect(formatDialogTitle('READY', 10, undefined, false)).toBe(
-      'Queue: Agent-ready',
+    expect(formatDialogTitle('BLOCKED', undefined, false)).toBe(
+      'Queue: Blocked',
     );
-    expect(formatDialogTitle('READY', undefined, undefined, false)).toBe(
-      'Queue: Agent-ready',
+    expect(formatDialogTitle('COMPLETED', undefined, false)).toBe(
+      'Recently completed',
     );
   });
 
@@ -367,13 +368,13 @@ describe('formatDialogTitle', () => {
     // ("Agent-ready queue", "Blocked queue") inverted the noun/qualifier
     // order vs. the panel headings ("Queue: Agent-ready", "Queue: Blocked")
     // — operators saw two different strings for the same thing.
-    expect(formatDialogTitle('READY', undefined, undefined, false)).toBe(
+    expect(formatDialogTitle('READY', undefined, false)).toBe(
       'Queue: Agent-ready',
     );
-    expect(formatDialogTitle('BLOCKED', undefined, undefined, false)).toBe(
+    expect(formatDialogTitle('BLOCKED', undefined, false)).toBe(
       'Queue: Blocked',
     );
-    expect(formatDialogTitle('COMPLETED', undefined, undefined, false)).toBe(
+    expect(formatDialogTitle('COMPLETED', undefined, false)).toBe(
       'Recently completed',
     );
   });
