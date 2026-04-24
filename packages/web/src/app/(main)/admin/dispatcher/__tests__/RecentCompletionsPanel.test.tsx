@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
 import {
   RecentCompletionsPanel,
   formatCostFootnote,
@@ -695,5 +695,66 @@ describe('RecentCompletionsPanel — Magic Move view-transition names (#2967)', 
     expect((row2 as HTMLElement).style.viewTransitionName).toBe(
       'agent-11223344-5566-7788-99aa-bbccddeeff00',
     );
+  });
+
+  // --- #3159 — clickable count opens the full-list dialog. The count
+  //             becomes a separate `<button>` badge in the header when
+  //             `onCountClick` is provided; the inline `(N)` parenthesised
+  //             rendering is preserved for back-compat when omitted.
+  describe('#3159 clickable count', () => {
+    it('renders inline `(N)` count and no clickable badge when onCountClick is omitted', () => {
+      render(
+        <RecentCompletionsPanel
+          completions={[completion({ agentId: 'a-1' })]}
+          nowMs={now}
+        />,
+      );
+      // Header text contains "(1)" — the legacy parenthesised count.
+      expect(
+        screen.getByRole('heading', { name: /recently completed \(1\)/i }),
+      ).toBeInTheDocument();
+      // No clickable badge.
+      expect(
+        screen.queryByTestId('recent-completions-count'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('renders clickable count badge when onCountClick is provided and fires the callback on click', () => {
+      const onCountClick = vi.fn();
+      render(
+        <RecentCompletionsPanel
+          completions={[
+            completion({ agentId: 'a-1' }),
+            completion({ agentId: 'a-2' }),
+          ]}
+          nowMs={now}
+          onCountClick={onCountClick}
+        />,
+      );
+      // Heading no longer carries the parenthesised count when the
+      // separate badge is shown — the count moves to the right side
+      // (matching QueuePanel's pattern).
+      expect(
+        screen.getByRole('heading', { name: /^recently completed$/i }),
+      ).toBeInTheDocument();
+      const badge = screen.getByTestId('recent-completions-count');
+      expect(badge.tagName).toBe('BUTTON');
+      expect(badge).toHaveTextContent('2');
+      fireEvent.click(badge);
+      expect(onCountClick).toHaveBeenCalledTimes(1);
+    });
+
+    it('clickable badge has accessible aria-label that names the bucket', () => {
+      const onCountClick = vi.fn();
+      render(
+        <RecentCompletionsPanel
+          completions={[completion({ agentId: 'a-1' })]}
+          nowMs={now}
+          onCountClick={onCountClick}
+        />,
+      );
+      const badge = screen.getByTestId('recent-completions-count');
+      expect(badge.getAttribute('aria-label')).toMatch(/recent-completions/i);
+    });
   });
 });

@@ -721,3 +721,226 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
     expect(rowsA[0].result).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// dispatcherQueueFull — full-list payload for the cockpit's expand-count
+// dialog (issue #3159). Verifies:
+//   - Auth gate (non-admin → NOT_FOUND).
+//   - kind=READY returns every snapshot row (no 10-cap) when the snapshot
+//     has > 10 issues.
+//   - kind=BLOCKED returns every snapshot row when blocked snapshot has > 10.
+//   - kind=COMPLETED returns every recent terminal agent (no 10-cap) when
+//     there are > 10.
+//   - The capped `dispatcherState.queueReady` / `queueBlocked` /
+//     `recentCompletions` paths still cap at 10 — i.e. we did not break
+//     the existing surface.
+// ---------------------------------------------------------------------------
+
+describe('dispatcherQueueFull — admin (#3159)', () => {
+  let queueRunId: string;
+  // Use a sentinel issue-number range outside everything else this file
+  // seeds (so other describe blocks' rows don't bleed in).
+  const READY_BASE = 31590;
+  const BLOCKED_BASE = 31700;
+  const COMPLETED_AGENT_BASE = `dqf-3159-${MARKER}-`;
+
+  beforeAll(async () => {
+    queueRunId = await insertRun();
+
+    // -- Seed a queue snapshot with 25 ready issues — well past the
+    //    server-side 10-cap on `dispatcherState.queueReady`.
+    const readyIssues = Array.from({ length: 25 }, (_, i) => ({
+      number: READY_BASE + i,
+      title: `ready test ${i}`,
+      labels: ['priority/p2', 'agent/ready'],
+      createdAt: '2026-04-01T00:00:00Z',
+    }));
+    await pool.query(
+      `INSERT INTO dispatcher.queue_snapshots
+         (observed_at, queue_depth, issue_numbers, issues_json, run_id)
+       VALUES (now(), $1, $2::int[], $3::jsonb, $4)`,
+      [
+        readyIssues.length,
+        readyIssues.map((i) => i.number),
+        JSON.stringify(readyIssues),
+        queueRunId,
+      ],
+    );
+
+    // -- Seed a blocked snapshot with 12 blocked issues.
+    const blockedIssues = Array.from({ length: 12 }, (_, i) => ({
+      number: BLOCKED_BASE + i,
+      title: `blocked test ${i}`,
+      labels: ['priority/p2', 'status/blocked'],
+      createdAt: '2026-04-01T00:00:00Z',
+      body: '',
+    }));
+    await pool.query(
+      `INSERT INTO dispatcher.blocked_snapshots
+         (observed_at, blocked_depth, issue_numbers, issues_json, run_id)
+       VALUES (now(), $1, $2::int[], $3::jsonb, $4)`,
+      [
+        blockedIssues.length,
+        blockedIssues.map((i) => i.number),
+        JSON.stringify(blockedIssues),
+        queueRunId,
+      ],
+    );
+
+    // -- Seed 15 terminal agents (succeeded). Spread `ended_at` so the
+    //    `ORDER BY ended_at DESC` is deterministic.
+    for (let i = 0; i < 15; i += 1) {
+      const { rows } = await pool.query<{ agent_id: string }>(
+        `INSERT INTO dispatcher.agents
+           (parent_run_id, kind, issue_number, worktree_path, phase, status,
+            started_at, ended_at)
+         VALUES ($1, 'task', $2, $3, 'retro', 'succeeded',
+                 now() - interval '1 hour',
+                 now() - ($4 || ' seconds')::interval)
+         RETURNING agent_id`,
+        [
+          queueRunId,
+          400000 + i,
+          `/tmp/${MARKER}/${COMPLETED_AGENT_BASE}${i}`,
+          String(i * 10),
+        ],
+      );
+      insertedAgentIds.push(rows[0].agent_id);
+    }
+  }, 30_000);
+
+  it('non-admin: dispatcherQueueFull returns "not found"', async () => {
+    const body = await gql(
+      `query($k: DispatcherQueueKind!) {
+        dispatcherQueueFull(kind: $k) { kind }
+      }`,
+      { k: 'READY' },
+      userToken,
+    );
+    expect(body.errors).toBeDefined();
+    expect(body.errors![0].extensions?.code).toBe('NOT_FOUND');
+  });
+
+  it('kind=READY returns ALL snapshot issues (no 10-cap)', async () => {
+    const body = await gql(
+      `query($k: DispatcherQueueKind!) {
+        dispatcherQueueFull(kind: $k) {
+          kind
+          queueItems { issueNumber title }
+          completions { agentId }
+        }
+      }`,
+      { k: 'READY' },
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const payload = (body.data?.dispatcherQueueFull as Record<string, unknown>) ?? {};
+    expect(payload.kind).toBe('READY');
+    const items = payload.queueItems as Array<{ issueNumber: number }>;
+    const completions = payload.completions as Array<unknown>;
+    // Every seeded ready issue must appear (the resolver also filters out
+    // active agents, but we did not seed active agents in this range).
+    const numbers = items.map((i) => i.issueNumber);
+    for (let i = 0; i < 25; i += 1) {
+      expect(numbers).toContain(READY_BASE + i);
+    }
+    // completions must be empty for kind=READY.
+    expect(completions).toEqual([]);
+  });
+
+  it('kind=BLOCKED returns ALL blocked snapshot issues (no 10-cap)', async () => {
+    const body = await gql(
+      `query($k: DispatcherQueueKind!) {
+        dispatcherQueueFull(kind: $k) {
+          kind
+          queueItems { issueNumber }
+          completions { agentId }
+        }
+      }`,
+      { k: 'BLOCKED' },
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const payload = (body.data?.dispatcherQueueFull as Record<string, unknown>) ?? {};
+    expect(payload.kind).toBe('BLOCKED');
+    const items = payload.queueItems as Array<{ issueNumber: number }>;
+    const numbers = items.map((i) => i.issueNumber);
+    for (let i = 0; i < 12; i += 1) {
+      expect(numbers).toContain(BLOCKED_BASE + i);
+    }
+    expect(payload.completions).toEqual([]);
+  });
+
+  it('kind=COMPLETED returns recent terminal agents (no 10-cap)', async () => {
+    const body = await gql(
+      `query($k: DispatcherQueueKind!) {
+        dispatcherQueueFull(kind: $k) {
+          kind
+          queueItems { issueNumber }
+          completions { agentId issueNumber status }
+        }
+      }`,
+      { k: 'COMPLETED' },
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const payload = (body.data?.dispatcherQueueFull as Record<string, unknown>) ?? {};
+    expect(payload.kind).toBe('COMPLETED');
+    expect(payload.queueItems).toEqual([]);
+    const completions = payload.completions as Array<{
+      issueNumber: number;
+      status: string;
+    }>;
+    // We seeded 15 of our own — at least 15 must be present (other
+    // tests' agents may also appear, but the resolver order is by
+    // `ended_at DESC` and our seed used now()-N seconds so they sort
+    // first within their cohort). Spot-check a few of our seeded
+    // numbers are present.
+    const numbers = completions.map((c) => c.issueNumber);
+    for (let i = 0; i < 15; i += 1) {
+      expect(numbers).toContain(400000 + i);
+    }
+  });
+
+  it('regression: dispatcherState.queueReady is STILL capped at 10 (#3159 AC5)', async () => {
+    // The cap was added in resolver `queryQueueReady(pool, 10)`. The
+    // expand-count dialog uses a separate field so the existing capped
+    // surface must not change shape — operators rely on the panel
+    // staying short.
+    const body = await gql(
+      `{ dispatcherState { queueReady { issueNumber } } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    const queueReady = state.queueReady as Array<{ issueNumber: number }>;
+    // Snapshot has 25 ready issues; must surface only 10.
+    expect(queueReady.length).toBeLessThanOrEqual(10);
+  });
+
+  it('regression: dispatcherState.queueBlocked is STILL capped at 10 (#3159 AC5)', async () => {
+    const body = await gql(
+      `{ dispatcherState { queueBlocked { issueNumber } } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    const queueBlocked = state.queueBlocked as Array<{ issueNumber: number }>;
+    // Snapshot has 12 blocked issues; must surface only 10.
+    expect(queueBlocked.length).toBeLessThanOrEqual(10);
+  });
+
+  it('regression: dispatcherState.recentCompletions is STILL capped at 10 (#3159 AC5)', async () => {
+    const body = await gql(
+      `{ dispatcherState { recentCompletions { agentId } } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    const completions = state.recentCompletions as Array<{ agentId: string }>;
+    expect(completions.length).toBeLessThanOrEqual(10);
+  });
+});

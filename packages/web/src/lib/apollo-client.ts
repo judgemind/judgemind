@@ -220,6 +220,14 @@ export function createApolloClient(): ApolloClient<unknown> {
         DispatcherConfigEntry: {
           keyFields: ['key'],
         },
+        // DispatcherQueueFull: full-list payload for the cockpit's
+        // expand-count dialog (issue #3159). One cache entry per kind
+        // bucket — `keyFields: ['kind']` keeps READY / BLOCKED /
+        // COMPLETED separate so opening a dialog after another doesn't
+        // get the previous bucket's cached payload.
+        DispatcherQueueFull: {
+          keyFields: ['kind'],
+        },
 
         // ---------------------------------------------------------------------
         // Types that intentionally do NOT need keyFields:

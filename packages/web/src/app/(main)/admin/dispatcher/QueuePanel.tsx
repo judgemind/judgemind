@@ -96,12 +96,66 @@ function formatCountLabel(shown: number, total: number | undefined): string {
   return `${shown} shown`;
 }
 
+/**
+ * Render the count label as either a static `<span>` (back-compat) or a
+ * clickable `<button>` when `onClick` is provided. The button-mode keeps
+ * the same font-mono micro-typography as the original span — operators
+ * scanning the panel header should not have to relearn the visual
+ * shape of the count. We only add an underline-on-hover affordance and
+ * a pointer cursor so the click target reads as actionable. Issue #3159.
+ */
+function CountLabel({
+  shown,
+  total,
+  testId,
+  onClick,
+  ariaLabel,
+}: {
+  shown: number;
+  total: number | undefined;
+  testId: string;
+  onClick?: () => void;
+  ariaLabel?: string;
+}) {
+  const text = formatCountLabel(shown, total);
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        data-testid={testId}
+        aria-label={ariaLabel ?? `${text} — open full list`}
+        className="font-mono text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm cursor-pointer"
+      >
+        {text}
+      </button>
+    );
+  }
+  return (
+    <span
+      className="font-mono text-xs text-muted-foreground"
+      data-testid={testId}
+    >
+      {text}
+    </span>
+  );
+}
+
 export function QueueReadyPanel({
   items,
   total,
+  onCountClick,
 }: {
   items: readonly QueueItem[];
   total?: number;
+  /**
+   * When provided, the count label becomes a clickable button that
+   * triggers this callback. The cockpit dashboard wires this to open
+   * the full-list dialog (issue #3159). When omitted, the count
+   * renders as a static span — preserves back-compat for tests and any
+   * caller that hasn't wired up the dialog.
+   */
+  onCountClick?: () => void;
 }) {
   return (
     <section aria-labelledby="queue-ready-heading">
@@ -109,12 +163,17 @@ export function QueueReadyPanel({
         <h2 id="queue-ready-heading" className={SECTION_HEADING}>
           Queue: Agent-ready
         </h2>
-        <span
-          className="font-mono text-xs text-muted-foreground"
-          data-testid="queue-ready-count"
-        >
-          {formatCountLabel(items.length, total)}
-        </span>
+        <CountLabel
+          shown={items.length}
+          total={total}
+          testId="queue-ready-count"
+          onClick={onCountClick}
+          ariaLabel={
+            onCountClick
+              ? `Show full agent-ready queue (${formatCountLabel(items.length, total)})`
+              : undefined
+          }
+        />
       </div>
       {items.length === 0 ? (
         <p className="py-2 text-sm text-muted-foreground">
@@ -138,9 +197,12 @@ export function QueueReadyPanel({
 export function QueueBlockedPanel({
   items,
   total,
+  onCountClick,
 }: {
   items: readonly QueueItem[];
   total?: number;
+  /** See `QueueReadyPanel.onCountClick`. Issue #3159. */
+  onCountClick?: () => void;
 }) {
   return (
     <section aria-labelledby="queue-blocked-heading">
@@ -148,12 +210,17 @@ export function QueueBlockedPanel({
         <h2 id="queue-blocked-heading" className={SECTION_HEADING}>
           Queue: Blocked
         </h2>
-        <span
-          className="font-mono text-xs text-muted-foreground"
-          data-testid="queue-blocked-count"
-        >
-          {formatCountLabel(items.length, total)}
-        </span>
+        <CountLabel
+          shown={items.length}
+          total={total}
+          testId="queue-blocked-count"
+          onClick={onCountClick}
+          ariaLabel={
+            onCountClick
+              ? `Show full blocked queue (${formatCountLabel(items.length, total)})`
+              : undefined
+          }
+        />
       </div>
       {items.length === 0 ? (
         <p className="py-2 text-sm text-muted-foreground">
@@ -183,7 +250,12 @@ export function formatCooldown(seconds: number): string {
   return `${Math.floor(seconds / 60)}m`;
 }
 
-function QueueRow({
+/**
+ * One row in the queue panel. Exported so the full-list dialog
+ * (`QueueFullDialog`, issue #3159) can render the same row layout
+ * without duplicating the markup.
+ */
+export function QueueRow({
   item,
   animated = false,
 }: {

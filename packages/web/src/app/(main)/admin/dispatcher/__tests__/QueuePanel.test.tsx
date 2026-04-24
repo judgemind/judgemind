@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/react';
-import { QueuePanel } from '../QueuePanel';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { QueueBlockedPanel, QueuePanel, QueueReadyPanel } from '../QueuePanel';
 import { formatCooldown } from '../QueuePanel';
 import type { QueueItem } from '@/lib/dispatcher-queries';
 
@@ -224,6 +224,72 @@ describe('QueuePanel', () => {
     ];
     render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.queryByTestId('cooldown-badge-3003')).toBeNull();
+  });
+});
+
+// --- #3159 — clickable count opens the full-list dialog. The count
+//             label becomes a `<button>` when `onCountClick` is provided,
+//             and falls back to a static `<span>` otherwise (back-compat).
+describe('QueuePanel — #3159 clickable count', () => {
+  const items = [
+    item({ issueNumber: 2801, title: 'first' }),
+    item({ issueNumber: 2802, title: 'second' }),
+  ];
+
+  it('ready: count renders as a span when onCountClick is omitted (back-compat)', () => {
+    render(<QueueReadyPanel items={items} total={50} />);
+    const count = screen.getByTestId('queue-ready-count');
+    expect(count.tagName).toBe('SPAN');
+  });
+
+  it('ready: count renders as a button and fires onCountClick when provided', () => {
+    const onCountClick = vi.fn();
+    render(
+      <QueueReadyPanel
+        items={items}
+        total={50}
+        onCountClick={onCountClick}
+      />,
+    );
+    const count = screen.getByTestId('queue-ready-count');
+    expect(count.tagName).toBe('BUTTON');
+    expect(count).toHaveTextContent('2 / 50');
+    fireEvent.click(count);
+    expect(onCountClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocked: count renders as a span when onCountClick is omitted (back-compat)', () => {
+    render(<QueueBlockedPanel items={[]} total={5} />);
+    const count = screen.getByTestId('queue-blocked-count');
+    expect(count.tagName).toBe('SPAN');
+  });
+
+  it('blocked: count renders as a button and fires onCountClick when provided', () => {
+    const onCountClick = vi.fn();
+    render(
+      <QueueBlockedPanel
+        items={items}
+        total={50}
+        onCountClick={onCountClick}
+      />,
+    );
+    const count = screen.getByTestId('queue-blocked-count');
+    expect(count.tagName).toBe('BUTTON');
+    fireEvent.click(count);
+    expect(onCountClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('button has accessible aria-label that names the bucket', () => {
+    const onCountClick = vi.fn();
+    render(
+      <QueueReadyPanel
+        items={items}
+        total={50}
+        onCountClick={onCountClick}
+      />,
+    );
+    const count = screen.getByTestId('queue-ready-count');
+    expect(count.getAttribute('aria-label')).toMatch(/agent-ready/i);
   });
 });
 

@@ -360,15 +360,24 @@ export const dispatcherTypeDefs = `#graphql
     render \`{shown} / {total}\` without losing the tail beyond the server-side
     cap of 10 (issue #2886)."""
     blockedDepth: Int!
-    """Top 10 ready-for-pickup issues (#2805 §1.3). Sourced from the most
-    recent \`dispatcher.queue_snapshots\` row, joined with a GitHub API
-    lookup for title/labels. Empty list when the queue is empty OR when
-    the daemon has not yet written a snapshot."""
+    """Top 10 ready-for-pickup issues (#2805 §1.3). Sourced exclusively from
+    the most recent \`dispatcher.queue_snapshots.issues_json\` row — the
+    daemon pre-enriches title/labels/createdAt at scrape time so this
+    resolver makes no GitHub API calls (issue #2820). Issues with an
+    active agent are filtered out; the remaining items are sorted by
+    priority then createdAt ASC and capped at 10. Empty list when the
+    daemon has not yet written a snapshot. Use \`dispatcherQueueFull(kind: READY)\`
+    to fetch the full list (no 10-cap) on demand for the cockpit's
+    expand-count dialog (issue #3159)."""
     queueReady: [QueueItem!]!
-    """Top 10 blocked issues (#2805 §1.3). Fetched live from the GitHub
-    API — \`status/blocked\` issues are not tracked in
-    \`dispatcher.queue_snapshots\`. Empty list when the lookup fails or
-    when nothing is blocked."""
+    """Top 10 blocked issues (#2805 §1.3). Sourced exclusively from the
+    most recent \`dispatcher.blocked_snapshots.issues_json\` row — same
+    snapshot-only data path as \`queueReady\`, no GitHub API calls
+    (issue #2820). Sorted by priority then createdAt ASC and capped at
+    10. Empty list when nothing is blocked or when the daemon has not
+    yet written a blocked snapshot. Use \`dispatcherQueueFull(kind: BLOCKED)\`
+    to fetch the full list (no 10-cap) on demand for the cockpit's
+    expand-count dialog (issue #3159)."""
     queueBlocked: [QueueItem!]!
     """Top 10 recently-completed agents (#2805 §1.5). Rows from
     \`dispatcher.agents\` where status IN
@@ -392,6 +401,49 @@ export const dispatcherTypeDefs = `#graphql
     capFlippedBy: String
   }
 
+  """Which queue bucket a \`dispatcherQueueFull\` lookup is for (issue #3159)."""
+  enum DispatcherQueueKind {
+    """Open \`agent/ready\` issues — fetched from
+    \`dispatcher.queue_snapshots.issues_json\`. Same data path and ordering
+    as \`DispatcherState.queueReady\`, just without the 10-cap."""
+    READY
+    """Open \`status/blocked\` issues — fetched from
+    \`dispatcher.blocked_snapshots.issues_json\`. Same data path and ordering
+    as \`DispatcherState.queueBlocked\`, just without the 10-cap."""
+    BLOCKED
+    """Recently terminal agents (\`succeeded | failed | crashed | plan_blocked | needs_review\`)
+    — fetched from \`dispatcher.agents\`. Same query as
+    \`DispatcherState.recentCompletions\`, just without the 10-cap."""
+    COMPLETED
+  }
+
+  """Full-list payload for the cockpit's expand-count dialogs (issue #3159).
+  Read on dialog open only — NOT in the 2s \`dispatcherState\` poll path.
+  Reads exclusively from \`dispatcher.queue_snapshots.issues_json\` /
+  \`dispatcher.blocked_snapshots.issues_json\` / \`dispatcher.agents\` —
+  no GitHub API calls.
+
+  Exactly one of \`queueItems\` or \`completions\` is populated per
+  request, keyed by \`kind\`:
+    - kind=READY / BLOCKED → \`queueItems\` populated, \`completions\` empty.
+    - kind=COMPLETED → \`completions\` populated, \`queueItems\` empty.
+  """
+  type DispatcherQueueFull {
+    """Echoes the \`kind\` argument so Apollo can normalize cache entries
+    by bucket (\`keyFields: ['kind']\` on the client)."""
+    kind: DispatcherQueueKind!
+    """Every QueueItem in the snapshot for kind=READY / BLOCKED. Sorted by
+    priority then createdAt ASC — same comparator as the capped
+    \`DispatcherState.queueReady\` / \`queueBlocked\` panels. Empty when
+    \`kind=COMPLETED\`."""
+    queueItems: [QueueItem!]!
+    """Every recent terminal agent for kind=COMPLETED. Ordered by
+    \`endedAt\` DESC — same query as the capped
+    \`DispatcherState.recentCompletions\` panel. Empty when
+    \`kind=READY\` or \`kind=BLOCKED\`."""
+    completions: [RecentCompletion!]!
+  }
+
   # ---------------------------------------------------------------------------
   # Queries + Mutations — merged into the root schema by concatenation.
   # The root Query/Mutation types are open for extension via the
@@ -406,6 +458,13 @@ export const dispatcherTypeDefs = `#graphql
     Returns null when the agentId does not exist.
     Admin-only; non-admins receive "not found"."""
     dispatcherAgent(agentId: ID!): DispatcherAgent
+
+    """Full list of one cockpit queue bucket (issue #3159). Used by the
+    expand-count dialog on the dispatcher cockpit. Returns every item the
+    daemon snapshot knows about — no 10-cap. Reads from the same snapshot
+    tables as the capped \`DispatcherState\` fields; no GitHub API calls.
+    Admin-only; non-admins receive "not found"."""
+    dispatcherQueueFull(kind: DispatcherQueueKind!): DispatcherQueueFull!
   }
 
   extend type Mutation {
