@@ -442,6 +442,24 @@ PHASE_MAX_TURNS = {
     "retro": 300,
 }
 
+#: Hyphen-to-underscore alias map for phase names that differ across dicts.
+#:
+#: ``PHASE_MAX_TURNS`` and ``PHASE_MODELS`` use **hyphen** form (``fix-ci``)
+#: because those keys come directly from the ``/task-v2-fix-ci`` skill
+#: invocation path — the Bash line that spawns the subprocess
+#: (``claude -p /task-v2-fix-ci``) uses the exact hyphen-form string.
+#:
+#: ``STUCK_TIMEOUT_SECONDS_BY_PHASE``, ``CONDITIONAL_PHASES``, and
+#: ``phases.PHASE_FLOW_FORWARD`` use **underscore** form (``fix_ci``)
+#: because they were written to match Python-identifier and
+#: ``phase_transitions.phase`` DB column conventions.
+#:
+#: This dict is the single source of truth for that mapping so tests can
+#: assert consistency without hardcoding the alias in multiple places.
+#: See issue #2889 for the intentional-drift rationale and the follow-up
+#: issue for the full rename that unifies the two forms.
+PHASE_NAME_ALIASES: dict[str, str] = {"fix-ci": "fix_ci"}
+
 #: Polling cadence for the ralph per-iteration HEAD-SHA watcher (#3042).
 #: The watcher runs alongside the ``/task-v2-ralph`` subprocess and
 #: calls :meth:`DispatcherDaemon._persist_ralph_iteration_patch` every
@@ -853,6 +871,12 @@ STUCK_TIMEOUT_SECONDS = 30 * 60
 #: Operators can override via ``dispatcher.config.stuck_timeout_s_by_phase``
 #: (JSONB object merged into this default at read time — see
 #: :meth:`_stuck_timeout_for_phase`).
+#:
+#: Keys use the underscore form (``fix_ci``) to match
+#: ``phases.PHASE_FLOW_FORWARD``; the hyphen form (``fix-ci``) used by
+#: ``PHASE_MAX_TURNS`` + ``PHASE_MODELS`` is mapped via
+#: :data:`PHASE_NAME_ALIASES`. See issue #2889 for the intentional-drift
+#: rationale.
 STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     # Issue #2885 bumped every LLM-bearing phase by 10× after an
     # overnight race: agent ``821e96ee`` ran ralph 5834s and finished
