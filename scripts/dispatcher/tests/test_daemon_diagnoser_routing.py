@@ -186,6 +186,16 @@ class TestTierSetsIncludeNewCategories:
         assert FAILURE_CATEGORY_RALPH_AC_INFEASIBLE in TIER_3_CATEGORIES
         assert FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE in TIER_3_CATEGORIES
 
+    def test_conflict_unresolvable_in_tier3(self) -> None:
+        """#3225 — fix_conflict terminal routes through the diagnoser."""
+        assert daemon.FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE in TIER_3_CATEGORIES
+        # Not in tier-1 auto-retry (we don't want the mechanical retry
+        # path to swallow it — diagnoser picks AC_INFEASIBLE /
+        # retry_with_hint based on resolution_notes).
+        assert (
+            daemon.FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE not in AUTO_RETRY_CATEGORIES
+        )
+
     def test_regression_subprocess_crash_still_tier2_recurrence(self) -> None:
         assert FAILURE_CATEGORY_SUBPROCESS_CRASH in TIER_2_RECURRENCE_CATEGORIES
 

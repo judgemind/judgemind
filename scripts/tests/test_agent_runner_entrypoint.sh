@@ -3659,6 +3659,499 @@ else
          "rc=$t40_neg_rc (expected non-zero), output: $t40_neg_out"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test 41: #3225 — handle_fix_conflict happy path (verdict=resolved).
+#
+# Scenario: dispatcher.agents.merge_conflict_attempts is 0, the
+# fix_conflict skill returns verdict=resolved with resolved_files
+# populated. Expected behaviour:
+#   1. The budget gate passes (0 < FIX_CONFLICT_MAX_ATTEMPTS=2).
+#   2. merge_conflict_attempts is incremented (UPDATE on the agent row).
+#   3. The claude skill is invoked with /task-v2-fix-conflict.
+#   4. handle_fix_conflict reads the output, applies resolved_files as
+#      a new commit, and prints the pass-through envelope.
+#   5. The loop advances to push_and_pr.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+
+# Isolate the function definitions needed. Reuse the same awk-based
+# extraction as T40 so the test exercises the REAL entrypoint code.
+t41_funcs="$TEST_TMP/t41-funcs.sh"
+printf 'exec 3>&1\n' > "$t41_funcs"
+
+for fn in db_exec db_query_one log persist_phase_output \
+          read_merge_conflict_attempts \
+          increment_merge_conflict_attempts \
+          apply_resolved_files \
+          run_claude_phase \
+          write_phase_input \
+          phase_to_skill \
+          read_phase_output \
+          handle_fix_conflict; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t41_funcs"
+done
+
+# Sanity: handle_fix_conflict was extracted.
+if grep -q "^handle_fix_conflict()" "$t41_funcs"; then
+    pass "#3225 T41 — extracted handle_fix_conflict from entrypoint"
+else
+    fail "#3225 T41 — extracted handle_fix_conflict from entrypoint" \
+         "fixture head: $(head -c 400 "$t41_funcs")"
+fi
+
+# Build a minimal per-test workspace and stub binaries. The stubs track
+# the key observations: psql read/write, git invocations, and claude
+# output.
+t41_workspace="$TEST_TMP/t41-workspace"
+t41_repo_root="$TEST_TMP/t41-repo"
+t41_state_dir="$TEST_TMP/t41-state"
+t41_stub_bin="$TEST_TMP/t41-bin"
+mkdir -p "$t41_workspace" "$t41_repo_root" "$t41_state_dir" "$t41_stub_bin"
+
+# Pre-create tmp/dispatcher-output/ with the "resolved" skill output.
+mkdir -p "$t41_repo_root/tmp/dispatcher-output"
+cat > "$t41_repo_root/tmp/dispatcher-output/fix-conflict.json" <<'T41OUTJSON'
+{
+  "agent_id": "41414141-dead-beef-cafe-000000000001",
+  "verdict": "resolved",
+  "resolution_notes": "reconciled 1 hunk against main's refactor",
+  "resolved_files": [
+    {"path": "packages/web/a.tsx", "content": "resolved-a\n"}
+  ],
+  "conflict_files": ["packages/web/a.tsx"]
+}
+T41OUTJSON
+
+# Seed the pre-conflict file so apply_resolved_files has a parent
+# dir to write into.
+mkdir -p "$t41_repo_root/packages/web"
+printf 'original-a\n' > "$t41_repo_root/packages/web/a.tsx"
+
+# psql stub — reads merge_conflict_attempts from a state file, and
+# records any UPDATE that touches the column.
+cat > "$t41_stub_bin/psql" <<'T41PSQLEOF'
+#!/usr/bin/env bash
+set -u
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) shift; query="$1" ;;
+    esac
+    shift || true
+done
+state_file="${T41_STATE_DIR}/merge_conflict_attempts.txt"
+if [[ ! -f "$state_file" ]]; then
+    printf '0\n' > "$state_file"
+fi
+if [[ "$query" == *"SELECT COALESCE(merge_conflict_attempts"* ]]; then
+    cat "$state_file"
+    exit 0
+fi
+if [[ "$query" == *"SET merge_conflict_attempts"* ]]; then
+    _cur=$(cat "$state_file")
+    printf '%s\n' "$((_cur + 1))" > "$state_file"
+    printf 'UPDATE_MCA\n' >> "${T41_STATE_DIR}/update-log.txt"
+    exit 0
+fi
+# Everything else — silent success.
+exit 0
+T41PSQLEOF
+chmod +x "$t41_stub_bin/psql"
+
+# claude stub — prints a minimal envelope to stdout (not used by the
+# entrypoint since it reads the dispatcher-output file, but invoked).
+cat > "$t41_stub_bin/claude" <<'T41CLAUDEEOF'
+#!/usr/bin/env bash
+printf '{"result": "claude invoked"}\n'
+printf 'CLAUDE_INVOKED\n' >> "${T41_STATE_DIR}/claude-log.txt"
+exit 0
+T41CLAUDEEOF
+chmod +x "$t41_stub_bin/claude"
+
+# git stub — minimal: we need ``git add`` and ``git commit`` to succeed.
+# Fall through everything else to a no-op success.
+cat > "$t41_stub_bin/git" <<'T41GITEOF'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >> "${T41_STATE_DIR}/git-log.txt"
+exit 0
+T41GITEOF
+chmod +x "$t41_stub_bin/git"
+
+# jq stub: we need the real jq. Symlink it in.
+if command -v jq >/dev/null 2>&1; then
+    ln -sf "$(command -v jq)" "$t41_stub_bin/jq"
+fi
+# python3 too
+if command -v python3 >/dev/null 2>&1; then
+    ln -sf "$(command -v python3)" "$t41_stub_bin/python3"
+fi
+
+# Phase input shim — write an empty fix-conflict.json so
+# write_phase_input succeeds.
+mkdir -p "$t41_repo_root/tmp/dispatcher-input"
+cat > "$t41_repo_root/tmp/dispatcher-input/fix-conflict.json" <<'T41INPUTEOF'
+{"agent_id": "41414141-dead-beef-cafe-000000000001", "conflict_files": []}
+T41INPUTEOF
+
+# Stub phase_input_shim.py — minimal no-op so write_phase_input's
+# python3 invocation succeeds.
+t41_shim="$TEST_TMP/t41-phase-input-shim.py"
+cat > "$t41_shim" <<'T41SHIMEOF'
+import sys
+print(sys.argv)
+sys.exit(0)
+T41SHIMEOF
+
+# Drive handle_fix_conflict. Subshell-isolate with set -euo pipefail
+# mirroring the entrypoint.
+set +e
+t41_out=$(T41_STATE_DIR="$t41_state_dir" \
+    PATH="$t41_stub_bin:$PATH" \
+    AGENT_ID="41414141-dead-beef-cafe-000000000001" \
+    ISSUE_NUMBER="3225" \
+    AGENT_WORKSPACE="$t41_workspace" \
+    REPO_ROOT="$t41_repo_root" \
+    DATABASE_URL="postgres://test" \
+    AGENT_RUNNER_DRY_RUN="0" \
+    AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS="2" \
+    AGENT_RUNNER_PHASE_INPUT_SHIM="$t41_shim" \
+    PHASE_INPUT_SHIM="$t41_shim" \
+    FIX_CONFLICT_MAX_ATTEMPTS="2" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t41_funcs"'"
+        handle_fix_conflict
+    ' 2>&1)
+t41_rc=$?
+set -e
+
+# Expectations:
+# 1. handle_fix_conflict exits 0.
+if [[ "$t41_rc" -eq 0 ]]; then
+    pass "#3225 T41 — handle_fix_conflict exits 0 on resolved"
+else
+    fail "#3225 T41 — handle_fix_conflict exits 0 on resolved" \
+         "rc=$t41_rc, output: $t41_out"
+fi
+
+# 2. Output contains verdict=resolved.
+if printf '%s' "$t41_out" | grep -q '"verdict".*"resolved"'; then
+    pass "#3225 T41 — handle_fix_conflict prints verdict=resolved envelope"
+else
+    fail "#3225 T41 — handle_fix_conflict prints verdict=resolved envelope" \
+         "output: $t41_out"
+fi
+
+# 3. merge_conflict_attempts was incremented (UPDATE log has an entry).
+if [[ -s "$t41_state_dir/update-log.txt" ]]; then
+    pass "#3225 T41 — merge_conflict_attempts was incremented"
+else
+    fail "#3225 T41 — merge_conflict_attempts was incremented" \
+         "update-log.txt empty or missing"
+fi
+
+# 4. claude was invoked.
+if [[ -s "$t41_state_dir/claude-log.txt" ]]; then
+    pass "#3225 T41 — claude -p fix-conflict was invoked"
+else
+    fail "#3225 T41 — claude -p fix-conflict was invoked" \
+         "claude-log.txt empty"
+fi
+
+# 5. git add + git commit were run (apply_resolved_files staged + committed).
+# The git stub logs `git <argv>` (without the binary name); the
+# entrypoint invokes ``git -C <repo> add`` and ``git -C <repo> commit``.
+if grep -q " add " "$t41_state_dir/git-log.txt" 2>/dev/null; then
+    pass "#3225 T41 — apply_resolved_files ran git add"
+else
+    fail "#3225 T41 — apply_resolved_files ran git add" \
+         "git-log.txt: $(cat "$t41_state_dir/git-log.txt" 2>/dev/null)"
+fi
+if grep -q " commit " "$t41_state_dir/git-log.txt" 2>/dev/null; then
+    pass "#3225 T41 — apply_resolved_files ran git commit"
+else
+    fail "#3225 T41 — apply_resolved_files ran git commit" \
+         "git-log.txt: $(cat "$t41_state_dir/git-log.txt" 2>/dev/null)"
+fi
+
+# 6. The resolved file's content matches the skill's output on disk.
+if [[ -f "$t41_repo_root/packages/web/a.tsx" ]] && \
+   grep -q "resolved-a" "$t41_repo_root/packages/web/a.tsx"; then
+    pass "#3225 T41 — resolved_files content written to repo path"
+else
+    fail "#3225 T41 — resolved_files content written to repo path" \
+         "file contents: $(cat "$t41_repo_root/packages/web/a.tsx" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 42: #3225 — handle_fix_conflict unresolvable case.
+#
+# Scenario: budget is fine (0 < 2), but the skill returns
+# verdict=unresolvable. handle_fix_conflict must:
+#   1. Still increment the counter (the skill WAS invoked).
+#   2. NOT apply any resolved_files (none were provided).
+#   3. Emit the unresolvable envelope so the transition shim routes
+#      to conflict_unresolvable.
+# ══════════════════════════════════════════════════════════════════════════
+
+t42_workspace="$TEST_TMP/t42-workspace"
+t42_repo_root="$TEST_TMP/t42-repo"
+t42_state_dir="$TEST_TMP/t42-state"
+t42_stub_bin="$TEST_TMP/t42-bin"
+mkdir -p "$t42_workspace" "$t42_repo_root" "$t42_state_dir" "$t42_stub_bin"
+
+mkdir -p "$t42_repo_root/tmp/dispatcher-output"
+cat > "$t42_repo_root/tmp/dispatcher-output/fix-conflict.json" <<'T42OUTJSON'
+{
+  "agent_id": "42424242-dead-beef-cafe-000000000002",
+  "verdict": "unresolvable",
+  "resolution_notes": "function X was rewritten on main — agent's addition no longer applies",
+  "resolved_files": [],
+  "conflict_files": ["packages/api/src/x.py"]
+}
+T42OUTJSON
+
+mkdir -p "$t42_repo_root/tmp/dispatcher-input"
+printf '{}' > "$t42_repo_root/tmp/dispatcher-input/fix-conflict.json"
+
+# Reuse the same psql/claude/git stub pattern — cheap to duplicate here
+# so each test is independently inspectable.
+cat > "$t42_stub_bin/psql" <<'T42PSQLEOF'
+#!/usr/bin/env bash
+set -u
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) shift; query="$1" ;;
+    esac
+    shift || true
+done
+state_file="${T42_STATE_DIR}/merge_conflict_attempts.txt"
+if [[ ! -f "$state_file" ]]; then
+    printf '0\n' > "$state_file"
+fi
+if [[ "$query" == *"SELECT COALESCE(merge_conflict_attempts"* ]]; then
+    cat "$state_file"
+    exit 0
+fi
+if [[ "$query" == *"SET merge_conflict_attempts"* ]]; then
+    _cur=$(cat "$state_file")
+    printf '%s\n' "$((_cur + 1))" > "$state_file"
+    printf 'UPDATE_MCA\n' >> "${T42_STATE_DIR}/update-log.txt"
+    exit 0
+fi
+exit 0
+T42PSQLEOF
+chmod +x "$t42_stub_bin/psql"
+
+cat > "$t42_stub_bin/claude" <<'T42CLAUDEEOF'
+#!/usr/bin/env bash
+printf '{"result": "claude invoked"}\n'
+printf 'CLAUDE_INVOKED\n' >> "${T42_STATE_DIR}/claude-log.txt"
+exit 0
+T42CLAUDEEOF
+chmod +x "$t42_stub_bin/claude"
+
+cat > "$t42_stub_bin/git" <<'T42GITEOF'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >> "${T42_STATE_DIR}/git-log.txt"
+exit 0
+T42GITEOF
+chmod +x "$t42_stub_bin/git"
+
+if command -v jq >/dev/null 2>&1; then
+    ln -sf "$(command -v jq)" "$t42_stub_bin/jq"
+fi
+if command -v python3 >/dev/null 2>&1; then
+    ln -sf "$(command -v python3)" "$t42_stub_bin/python3"
+fi
+
+t42_shim="$TEST_TMP/t42-phase-input-shim.py"
+cat > "$t42_shim" <<'T42SHIMEOF'
+import sys
+sys.exit(0)
+T42SHIMEOF
+
+set +e
+t42_out=$(T42_STATE_DIR="$t42_state_dir" \
+    PATH="$t42_stub_bin:$PATH" \
+    AGENT_ID="42424242-dead-beef-cafe-000000000002" \
+    ISSUE_NUMBER="3225" \
+    AGENT_WORKSPACE="$t42_workspace" \
+    REPO_ROOT="$t42_repo_root" \
+    DATABASE_URL="postgres://test" \
+    AGENT_RUNNER_DRY_RUN="0" \
+    AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS="2" \
+    AGENT_RUNNER_PHASE_INPUT_SHIM="$t42_shim" \
+    PHASE_INPUT_SHIM="$t42_shim" \
+    FIX_CONFLICT_MAX_ATTEMPTS="2" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t41_funcs"'"
+        handle_fix_conflict
+    ' 2>&1)
+t42_rc=$?
+set -e
+
+if [[ "$t42_rc" -eq 0 ]]; then
+    pass "#3225 T42 — handle_fix_conflict exits 0 on unresolvable"
+else
+    fail "#3225 T42 — handle_fix_conflict exits 0 on unresolvable" \
+         "rc=$t42_rc, output: $t42_out"
+fi
+
+if printf '%s' "$t42_out" | grep -q '"verdict".*"unresolvable"'; then
+    pass "#3225 T42 — handle_fix_conflict prints verdict=unresolvable envelope"
+else
+    fail "#3225 T42 — handle_fix_conflict prints verdict=unresolvable envelope" \
+         "output: $t42_out"
+fi
+
+# merge_conflict_attempts was still incremented (the skill WAS invoked).
+if [[ -s "$t42_state_dir/update-log.txt" ]]; then
+    pass "#3225 T42 — merge_conflict_attempts incremented even on unresolvable"
+else
+    fail "#3225 T42 — merge_conflict_attempts incremented even on unresolvable" \
+         "update-log.txt empty"
+fi
+
+# No git commit was attempted (no resolved_files to apply).
+if ! grep -q " commit " "$t42_state_dir/git-log.txt" 2>/dev/null; then
+    pass "#3225 T42 — no git commit attempted on unresolvable"
+else
+    fail "#3225 T42 — no git commit attempted on unresolvable" \
+         "git-log.txt: $(cat "$t42_state_dir/git-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 43: #3225 — handle_fix_conflict budget-exhausted case.
+#
+# Scenario: merge_conflict_attempts is already 2 (equal to the budget
+# cap FIX_CONFLICT_MAX_ATTEMPTS). handle_fix_conflict must:
+#   1. Skip the claude invocation (budget gate fires first).
+#   2. NOT increment the counter (we didn't run the skill).
+#   3. Emit the synthetic unresolvable + budget_exhausted envelope.
+# ══════════════════════════════════════════════════════════════════════════
+
+t43_workspace="$TEST_TMP/t43-workspace"
+t43_repo_root="$TEST_TMP/t43-repo"
+t43_state_dir="$TEST_TMP/t43-state"
+t43_stub_bin="$TEST_TMP/t43-bin"
+mkdir -p "$t43_workspace" "$t43_repo_root" "$t43_state_dir" "$t43_stub_bin"
+
+# Seed the state file with 2 (at the budget cap).
+printf '2\n' > "$t43_state_dir/merge_conflict_attempts.txt"
+
+# Same psql stub shape, different state dir.
+cat > "$t43_stub_bin/psql" <<'T43PSQLEOF'
+#!/usr/bin/env bash
+set -u
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) shift; query="$1" ;;
+    esac
+    shift || true
+done
+state_file="${T43_STATE_DIR}/merge_conflict_attempts.txt"
+if [[ ! -f "$state_file" ]]; then
+    printf '0\n' > "$state_file"
+fi
+if [[ "$query" == *"SELECT COALESCE(merge_conflict_attempts"* ]]; then
+    cat "$state_file"
+    exit 0
+fi
+if [[ "$query" == *"SET merge_conflict_attempts"* ]]; then
+    _cur=$(cat "$state_file")
+    printf '%s\n' "$((_cur + 1))" > "$state_file"
+    printf 'UPDATE_MCA\n' >> "${T43_STATE_DIR}/update-log.txt"
+    exit 0
+fi
+exit 0
+T43PSQLEOF
+chmod +x "$t43_stub_bin/psql"
+
+# claude stub that records ANY invocation — if it runs, T43 has failed.
+cat > "$t43_stub_bin/claude" <<'T43CLAUDEEOF'
+#!/usr/bin/env bash
+printf 'CLAUDE_INVOKED\n' >> "${T43_STATE_DIR}/claude-log.txt"
+printf '{"result": "should-not-happen"}\n'
+exit 0
+T43CLAUDEEOF
+chmod +x "$t43_stub_bin/claude"
+
+cat > "$t43_stub_bin/git" <<'T43GITEOF'
+#!/usr/bin/env bash
+printf 'git %s\n' "$*" >> "${T43_STATE_DIR}/git-log.txt"
+exit 0
+T43GITEOF
+chmod +x "$t43_stub_bin/git"
+
+if command -v jq >/dev/null 2>&1; then
+    ln -sf "$(command -v jq)" "$t43_stub_bin/jq"
+fi
+if command -v python3 >/dev/null 2>&1; then
+    ln -sf "$(command -v python3)" "$t43_stub_bin/python3"
+fi
+
+set +e
+t43_out=$(T43_STATE_DIR="$t43_state_dir" \
+    PATH="$t43_stub_bin:$PATH" \
+    AGENT_ID="43434343-dead-beef-cafe-000000000003" \
+    ISSUE_NUMBER="3225" \
+    AGENT_WORKSPACE="$t43_workspace" \
+    REPO_ROOT="$t43_repo_root" \
+    DATABASE_URL="postgres://test" \
+    AGENT_RUNNER_DRY_RUN="0" \
+    AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS="2" \
+    FIX_CONFLICT_MAX_ATTEMPTS="2" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t41_funcs"'"
+        handle_fix_conflict
+    ' 2>&1)
+t43_rc=$?
+set -e
+
+if [[ "$t43_rc" -eq 0 ]]; then
+    pass "#3225 T43 — handle_fix_conflict exits 0 on budget exhaustion"
+else
+    fail "#3225 T43 — handle_fix_conflict exits 0 on budget exhaustion" \
+         "rc=$t43_rc, output: $t43_out"
+fi
+
+# claude was NOT invoked (budget gate short-circuited).
+if [[ ! -s "$t43_state_dir/claude-log.txt" ]]; then
+    pass "#3225 T43 — claude skipped on budget exhaustion"
+else
+    fail "#3225 T43 — claude skipped on budget exhaustion" \
+         "claude-log: $(cat "$t43_state_dir/claude-log.txt" 2>/dev/null)"
+fi
+
+# Envelope carries verdict=unresolvable + budget_exhausted=true.
+if printf '%s' "$t43_out" | grep -q '"budget_exhausted":[[:space:]]*true'; then
+    pass "#3225 T43 — envelope carries budget_exhausted=true"
+else
+    fail "#3225 T43 — envelope carries budget_exhausted=true" \
+         "output: $t43_out"
+fi
+
+# No increment (we skipped the skill, so the counter stays at 2).
+if [[ ! -s "$t43_state_dir/update-log.txt" ]]; then
+    pass "#3225 T43 — merge_conflict_attempts NOT incremented on budget exhaustion"
+else
+    fail "#3225 T43 — merge_conflict_attempts NOT incremented on budget exhaustion" \
+         "update-log: $(cat "$t43_state_dir/update-log.txt" 2>/dev/null)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

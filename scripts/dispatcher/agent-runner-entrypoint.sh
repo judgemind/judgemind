@@ -1353,6 +1353,230 @@ def _build_retro_input(
     }
 
 
+def _build_fix_conflict_input(
+    agent_id: str,
+    issue_number: int,
+    repo_root: Path,
+    github_repo: str,
+) -> dict:
+    """Build the /task-v2-fix-conflict input bundle (#3225).
+
+    Reads artifacts the entrypoint stashed when the rebase conflict
+    was detected (``{AGENT_WORKSPACE}/fix-conflict/`` — see
+    ``handle_push_and_pr`` and the start-of-ralph baseline rebase
+    branch). Provides:
+
+    * ``issue_body`` — original task for context.
+    * ``original_patch`` — agent's pre-rebase diff (from the stashed
+      ``original-patch.diff``, or ralph_patches DB row as fallback).
+    * ``conflict_files`` — list of ``{path, conflict_markers_text}``.
+    * ``main_commits_since_base`` — ``git log``-derived commits on
+      origin/main since the stashed merge-base.
+    * ``main_files_content`` — each conflict file's current
+      ``origin/main`` content.
+
+    Every fetch is best-effort: a missing artifact returns an empty
+    string / empty list so the skill's own guard clauses produce a
+    structured ``unresolvable`` verdict rather than crashing.
+    """
+    import os as _os
+    import subprocess as _subprocess
+
+    bundle = _fetch_issue_bundle(github_repo, issue_number)
+    issue_body = bundle.get("issue_body", "")
+
+    workspace = Path(_os.environ.get("AGENT_WORKSPACE", "/tmp"))
+    stage = workspace / "fix-conflict"
+
+    # Conflict files list.
+    conflict_files_txt = stage / "conflict-files.txt"
+    conflict_paths: list[str] = []
+    if conflict_files_txt.is_file():
+        try:
+            conflict_paths = [
+                ln.strip()
+                for ln in conflict_files_txt.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if ln.strip()
+            ]
+        except Exception:
+            conflict_paths = []
+
+    # Conflict markers per file — saved with slashes → "__".
+    markers_dir = stage / "conflict-markers"
+    conflict_files: list[dict] = []
+    for path in conflict_paths:
+        safe = path.replace("/", "__")
+        marker_file = markers_dir / safe
+        marker_text = ""
+        if marker_file.is_file():
+            try:
+                marker_text = marker_file.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except Exception:
+                marker_text = ""
+        conflict_files.append(
+            {"path": path, "conflict_markers_text": marker_text}
+        )
+
+    # Original patch.
+    original_patch_file = stage / "original-patch.diff"
+    original_patch = ""
+    if original_patch_file.is_file():
+        try:
+            original_patch = original_patch_file.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except Exception:
+            original_patch = ""
+    # Fallback: latest SHIP ralph_patches row. Single-line SELECT.
+    if not original_patch:
+        ralph_row = _db_query_one(
+            "SELECT patch_content FROM dispatcher.ralph_patches "
+            f"WHERE agent_id = '{agent_id}' "
+            "ORDER BY iteration_n DESC LIMIT 1"
+        )
+        # db_query_one collapses newlines to '\t' — that's fine for
+        # a patch used as reference material (not re-applied). A
+        # follow-up could use a dedicated multiline fetch, but the
+        # DB copy is already redundant with the git diff above.
+        original_patch = ralph_row or ""
+
+    # main_commits_since_base — ``git log`` between stashed
+    # merge-base and origin/main, newest-first. Best-effort: if the
+    # merge-base file is missing, we scan the last 10 commits on
+    # origin/main as a fallback.
+    merge_base_file = stage / "merge-base.txt"
+    merge_base_sha = ""
+    if merge_base_file.is_file():
+        try:
+            merge_base_sha = merge_base_file.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+        except Exception:
+            merge_base_sha = ""
+    main_commits: list[dict] = []
+    log_range = (
+        f"{merge_base_sha}..origin/main" if merge_base_sha else "origin/main"
+    )
+    try:
+        proc = _subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "log",
+                "--max-count=20",
+                "--pretty=format:%H%x1f%an%x1f%s%x1f%b%x1e",
+                log_range,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode == 0:
+            records = [
+                r.strip()
+                for r in (proc.stdout or "").split("\x1e")
+                if r.strip()
+            ]
+            for rec in records:
+                parts = rec.split("\x1f")
+                if len(parts) < 4:
+                    continue
+                sha, author, subject, body = parts[0], parts[1], parts[2], parts[3]
+                # Per-commit stat — best-effort, skip on failure.
+                stat = ""
+                try:
+                    stat_proc = _subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo_root),
+                            "show",
+                            "--stat",
+                            "--format=",
+                            sha,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    if stat_proc.returncode == 0:
+                        stat = (stat_proc.stdout or "").strip()
+                except Exception:
+                    stat = ""
+                main_commits.append(
+                    {
+                        "sha": sha,
+                        "author": author,
+                        "subject": subject,
+                        "body": body,
+                        "stat": stat,
+                    }
+                )
+    except Exception:
+        pass
+
+    # main_files_content — current origin/main content of each
+    # conflict file. ``git show origin/main:<path>`` is the
+    # authoritative reference.
+    main_files_content: list[dict] = []
+    for path in conflict_paths:
+        content = ""
+        try:
+            show_proc = _subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "show",
+                    f"origin/main:{path}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if show_proc.returncode == 0:
+                content = show_proc.stdout or ""
+        except Exception:
+            content = ""
+        main_files_content.append({"path": path, "content": content})
+
+    # attempt_number = current merge_conflict_attempts (pre-
+    # increment). The entrypoint increments AFTER the budget gate,
+    # so when the skill reads the input the counter already reflects
+    # this attempt.
+    attempts_raw = _db_query_one(
+        "SELECT COALESCE(merge_conflict_attempts, 0) FROM dispatcher.agents "
+        f"WHERE agent_id = '{agent_id}' LIMIT 1"
+    )
+    try:
+        attempt_number = int(attempts_raw) if attempts_raw else 1
+    except (TypeError, ValueError):
+        attempt_number = 1
+    if attempt_number < 1:
+        attempt_number = 1
+
+    return {
+        "agent_id": agent_id,
+        "issue_number": issue_number,
+        "issue_body": issue_body,
+        "original_patch": original_patch,
+        "conflict_files": conflict_files,
+        "main_commits_since_base": main_commits,
+        "main_files_content": main_files_content,
+        "worktree_path": str(repo_root),
+        "repo_root": str(repo_root),
+        "attempt_number": attempt_number,
+    }
+
+
 def _build_input(
     phase: str,
     agent_id: str,
@@ -1382,6 +1606,10 @@ def _build_input(
         return _build_summary_input(agent_id, issue_number, repo_root, github_repo)
     if phase == "fix-ci":
         return _build_fix_ci_input(agent_id, issue_number, repo_root, github_repo)
+    if phase == "fix-conflict":
+        return _build_fix_conflict_input(
+            agent_id, issue_number, repo_root, github_repo
+        )
     if phase == "verify":
         return _build_verify_input(agent_id, issue_number, repo_root, github_repo)
     if phase == "retro":
@@ -1498,13 +1726,14 @@ phase_to_skill() {
     # $1 = phase name. Prints the matching skill suffix (no `task-v2-`
     # prefix) on stdout. die()s if no mapping exists.
     case "$1" in
-        planning)  printf 'plan' ;;
-        ralph)     printf 'ralph' ;;
-        summary)   printf 'summary' ;;
-        fix_ci)    printf 'fix-ci' ;;
-        verify)    printf 'verify' ;;
-        retro)     printf 'retro' ;;
-        *)         die "no_skill_mapping_for_phase=$1" ;;
+        planning)       printf 'plan' ;;
+        ralph)          printf 'ralph' ;;
+        summary)        printf 'summary' ;;
+        fix_ci)         printf 'fix-ci' ;;
+        fix_conflict)   printf 'fix-conflict' ;;  # #3225
+        verify)         printf 'verify' ;;
+        retro)          printf 'retro' ;;
+        *)              die "no_skill_mapping_for_phase=$1" ;;
     esac
 }
 
@@ -1856,16 +2085,80 @@ handle_push_and_pr() {
         set -e
         log "push_and_pr_rebase_done" "exit_code=$_rebase_rc"
         if [[ "$_rebase_rc" -ne 0 ]]; then
-            # Rebase conflict. Abort the in-progress rebase so the
-            # worktree returns to its pre-rebase state, log the
-            # failure, and emit the structured envelope.
+            # #3225: Before aborting, capture the conflict state so the
+            # fix_conflict phase can feed it to the claude skill without
+            # needing to replay the rebase. Capture three things:
+            #   1. Conflicted file paths (``git diff --name-only
+            #      --diff-filter=U``) — one path per line.
+            #   2. Per-file ``conflict_markers_text`` — the on-disk
+            #      content WITH the ``<<<<<<<``/``=======``/``>>>>>>>``
+            #      markers. After ``rebase --abort`` the markers are
+            #      gone, so this capture must happen BEFORE the abort.
+            # The files are staged under
+            # ``{AGENT_WORKSPACE}/fix-conflict/`` for the input-shim
+            # to consume when the fix_conflict phase starts.
+            _fix_conflict_stage="$AGENT_WORKSPACE/fix-conflict"
+            mkdir -p "$_fix_conflict_stage/conflict-markers"
+            set +e
+            git -C "$REPO_ROOT" diff --name-only --diff-filter=U \
+                > "$_fix_conflict_stage/conflict-files.txt" \
+                2> "$AGENT_WORKSPACE/git-diff-conflict-files.stderr.log"
+            set -e
+            while IFS= read -r _cfile; do
+                if [[ -z "$_cfile" ]]; then
+                    continue
+                fi
+                # Stash the path with slashes replaced so a flat dir
+                # works without pre-creating the tree.
+                _safe=$(printf '%s' "$_cfile" | tr '/' '__')
+                if [[ -f "$REPO_ROOT/$_cfile" ]]; then
+                    cp "$REPO_ROOT/$_cfile" \
+                        "$_fix_conflict_stage/conflict-markers/$_safe" \
+                        2>/dev/null || true
+                fi
+            done < "$_fix_conflict_stage/conflict-files.txt"
+            # Also capture the pre-rebase patch (git diff
+            # origin/main..HEAD AT THE ATTEMPTED REBASE-ROOT — i.e.
+            # the original base before the rebase started). During a
+            # rebase the index is in an in-progress state, so we can
+            # read ORIG_HEAD to find what HEAD used to be.
+            set +e
+            git -C "$REPO_ROOT" diff "$(git -C "$REPO_ROOT" merge-base ORIG_HEAD origin/main 2>/dev/null)..ORIG_HEAD" \
+                > "$_fix_conflict_stage/original-patch.diff" \
+                2> "$AGENT_WORKSPACE/git-diff-original-patch.stderr.log" || true
+            set -e
+            # Capture the merge-base and HEAD SHAs for the input shim's
+            # ``main_commits_since_base`` builder.
+            set +e
+            git -C "$REPO_ROOT" rev-parse ORIG_HEAD \
+                > "$_fix_conflict_stage/orig-head.txt" 2>/dev/null || true
+            git -C "$REPO_ROOT" merge-base ORIG_HEAD origin/main \
+                > "$_fix_conflict_stage/merge-base.txt" 2>/dev/null || true
+            set -e
+            # Build a compact JSON list of conflict files for the
+            # phase_output envelope — one array the transition shim
+            # can pass straight into context["conflict_files"].
+            _conflict_files_json="[]"
+            if [[ -s "$_fix_conflict_stage/conflict-files.txt" ]]; then
+                _conflict_files_json=$(jq -R -s -c \
+                    'split("\n") | map(select(length > 0))' \
+                    "$_fix_conflict_stage/conflict-files.txt" 2>/dev/null \
+                    || printf '[]')
+            fi
+            # Now abort the in-progress rebase so the worktree returns
+            # to its pre-rebase state, log the failure, and emit the
+            # structured envelope.
             set +e
             git -C "$REPO_ROOT" rebase --abort \
                 > "$AGENT_WORKSPACE/git-rebase-abort.stdout.log" \
                 2> "$AGENT_WORKSPACE/git-rebase-abort.stderr.log"
             set -e
-            log "push_and_pr_rebase_conflict" "exit_code=$_rebase_rc"
-            printf '{"no_op": false, "rebase_failed": true}'
+            log "push_and_pr_rebase_conflict" "exit_code=$_rebase_rc" \
+                "conflict_files_json=$_conflict_files_json"
+            # #3225: emit conflict_files so transition_from_push_and_pr
+            # routes to fix_conflict with the file list in context.
+            printf '{"no_op": false, "rebase_failed": true, "conflict_files": %s}' \
+                "$_conflict_files_json"
             return 0
         fi
     else
@@ -1957,6 +2250,282 @@ handle_push_and_pr() {
 
     log "push_and_pr_pr_number_parse_failed" "stdout_tail=$(tail -c 200 "$AGENT_WORKSPACE/gh-pr-create.stdout.log" 2>/dev/null | tr '\n' ' ')"
     printf '{"no_op": false}'
+}
+
+# ── fix_conflict helpers (#3225) ──────────────────────────────────────────
+#
+# The fix_conflict phase recovers from pre-push rebase conflicts
+# (and start-of-ralph baseline rebase conflicts) by claude-resolving
+# the conflict against updated origin/main content instead of
+# abandoning the agent's ralph work.
+#
+# Budget bookkeeping lives in ``dispatcher.agents.merge_conflict_
+# attempts`` (migration 44). Every invocation of
+# ``handle_fix_conflict`` increments the counter BEFORE spawning the
+# claude skill; when the current value is already >=
+# FIX_CONFLICT_MAX_ATTEMPTS the handler emits a synthetic
+# ``{"verdict": "unresolvable", "budget_exhausted": true}`` output
+# without spending compute. The transition shim sees that verdict and
+# advances to ``conflict_unresolvable`` (terminal).
+#
+# The applied-commit step (on verdict=resolved) writes each
+# ``resolved_files[].content`` to its path under REPO_ROOT, stages
+# everything, and creates ONE new commit with a conventional-commits
+# message. A new commit (not a rebase) keeps the history
+# straightforward for the retry — push_and_pr will re-fetch + rebase
+# + push on re-entry.
+
+read_merge_conflict_attempts() {
+    # Column added by migration 44. Returns 0 if the column is
+    # missing (older dev DB snapshots). Mirrors the
+    # read_merge_unstick_attempts helper pattern.
+    _val=$(db_query_one "SELECT COALESCE(merge_conflict_attempts, 0)
+                            FROM dispatcher.agents
+                           WHERE agent_id = '$AGENT_ID'
+                           LIMIT 1;" 2>/dev/null || printf '')
+    if [[ -z "$_val" ]] || ! [[ "$_val" =~ ^[0-9]+$ ]]; then
+        printf '0'
+    else
+        printf '%s' "$_val"
+    fi
+}
+
+increment_merge_conflict_attempts() {
+    # Best-effort — a lost increment at most burns one extra fix-
+    # conflict attempt before the budget gate trips. Mirrors the
+    # increment_merge_unstick_attempts helper pattern.
+    db_exec "UPDATE dispatcher.agents
+                SET merge_conflict_attempts = COALESCE(merge_conflict_attempts, 0) + 1
+              WHERE agent_id = '$AGENT_ID';" \
+        >/dev/null 2>&1 || true
+}
+
+apply_resolved_files() {
+    # $1 = path to fix-conflict.json (the skill's output).
+    # Reads ``resolved_files[]`` from the JSON and writes each
+    # ``{path, content}`` entry to its repo-relative location under
+    # REPO_ROOT, then stages + commits via ``git``. Prints the created
+    # commit SHA on success (or empty on failure) and returns 0 on
+    # success, non-zero on any error.
+    _out_json="$1"
+    if [[ ! -s "$_out_json" ]]; then
+        log "fix_conflict_apply_empty_output"
+        return 1
+    fi
+    # Write each resolved file via a small helper (avoids inline
+    # python -c). The helper returns the number of files written on
+    # stdout.
+    _apply_helper="$AGENT_WORKSPACE/fix-conflict-apply.py"
+    cat > "$_apply_helper" <<'APPLYPY'
+import json
+import os
+import sys
+from pathlib import Path
+
+if len(sys.argv) != 3:
+    print("usage: apply.py <out-json> <repo-root>", file=sys.stderr)
+    sys.exit(2)
+out_path = Path(sys.argv[1])
+repo_root = Path(sys.argv[2])
+try:
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"parse_error: {exc}", file=sys.stderr)
+    sys.exit(3)
+resolved = data.get("resolved_files") or []
+if not isinstance(resolved, list) or not resolved:
+    print("no_resolved_files", file=sys.stderr)
+    sys.exit(4)
+written = 0
+for entry in resolved:
+    if not isinstance(entry, dict):
+        continue
+    path = entry.get("path")
+    content = entry.get("content")
+    if not path or content is None:
+        continue
+    # Defensive: reject absolute or parent-traversing paths.
+    if path.startswith("/") or ".." in Path(path).parts:
+        print(f"reject_unsafe_path: {path}", file=sys.stderr)
+        continue
+    target = repo_root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # content is a string; write as UTF-8, preserving whatever
+    # trailing-newline convention the skill emitted.
+    target.write_text(content, encoding="utf-8")
+    written += 1
+print(written)
+APPLYPY
+    set +e
+    _written=$(python3 "$_apply_helper" "$_out_json" "$REPO_ROOT" \
+        2> "$AGENT_WORKSPACE/fix-conflict-apply.stderr.log")
+    _apply_rc=$?
+    set -e
+    log "fix_conflict_apply_done" "exit_code=$_apply_rc" "files_written=$_written"
+    if [[ "$_apply_rc" -ne 0 ]]; then
+        return 1
+    fi
+    # Stage every file listed in resolved_files (use the helper's
+    # stderr-safe path listing instead of ``git add -A`` to avoid
+    # accidentally staging test artifacts the skill left behind).
+    _stage_helper="$AGENT_WORKSPACE/fix-conflict-stage-list.py"
+    cat > "$_stage_helper" <<'STAGEPY'
+import json
+import sys
+from pathlib import Path
+
+out_path = Path(sys.argv[1])
+try:
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(2)
+for entry in (data.get("resolved_files") or []):
+    if isinstance(entry, dict) and entry.get("path"):
+        print(entry["path"])
+STAGEPY
+    set +e
+    _paths_file="$AGENT_WORKSPACE/fix-conflict-stage-paths.txt"
+    python3 "$_stage_helper" "$_out_json" > "$_paths_file" \
+        2> "$AGENT_WORKSPACE/fix-conflict-stage-list.stderr.log"
+    _list_rc=$?
+    set -e
+    if [[ "$_list_rc" -ne 0 || ! -s "$_paths_file" ]]; then
+        log "fix_conflict_stage_list_failed" "exit_code=$_list_rc"
+        return 1
+    fi
+    # git add <file> for each staged path.
+    while IFS= read -r _sfile; do
+        if [[ -z "$_sfile" ]]; then
+            continue
+        fi
+        set +e
+        git -C "$REPO_ROOT" add -- "$_sfile" \
+            > /dev/null \
+            2>> "$AGENT_WORKSPACE/fix-conflict-add.stderr.log"
+        _add_rc=$?
+        set -e
+        if [[ "$_add_rc" -ne 0 ]]; then
+            log "fix_conflict_add_failed" "path=$_sfile" "exit_code=$_add_rc"
+            return 1
+        fi
+    done < "$_paths_file"
+    # Commit with a conventional-commits message.
+    _short_id=$(printf '%s' "$AGENT_ID" | tr -d '-' | cut -c1-8)
+    _commit_msg_path="$AGENT_WORKSPACE/fix-conflict-commit-msg.txt"
+    {
+        printf 'chore(agent): resolve rebase conflicts (#%s)\n\n' "${ISSUE_NUMBER:-0}"
+        printf 'fix_conflict skill reconciled conflicts against origin/main (#3225).\n'
+        printf 'agent=%s attempts=%s\n' "$_short_id" "$(read_merge_conflict_attempts)"
+    } > "$_commit_msg_path"
+    set +e
+    git -C "$REPO_ROOT" commit -F "$_commit_msg_path" \
+        > "$AGENT_WORKSPACE/fix-conflict-commit.stdout.log" \
+        2> "$AGENT_WORKSPACE/fix-conflict-commit.stderr.log"
+    _commit_rc=$?
+    set -e
+    log "fix_conflict_commit_done" "exit_code=$_commit_rc"
+    if [[ "$_commit_rc" -ne 0 ]]; then
+        log "fix_conflict_commit_failed" "exit_code=$_commit_rc" \
+            "stderr_tail=$(tail -c 200 "$AGENT_WORKSPACE/fix-conflict-commit.stderr.log" 2>/dev/null | tr '\n' ' ')"
+        return 1
+    fi
+    return 0
+}
+
+handle_fix_conflict() {
+    # Mechanical + claude-driven implementation of the fix_conflict
+    # phase (#3225).
+    #
+    # Flow:
+    #   1. Budget check — read merge_conflict_attempts; if already
+    #      >= FIX_CONFLICT_MAX_ATTEMPTS, emit the unresolvable +
+    #      budget_exhausted envelope without invoking claude.
+    #   2. Increment the counter before invoking claude (so a claude
+    #      crash still bumps the attempt count and a retry will hit
+    #      the budget gate if the skill is broken).
+    #   3. Invoke ``claude -p /task-v2-fix-conflict``. Input already
+    #      written by write_phase_input('fix-conflict'). Output read
+    #      from tmp/dispatcher-output/fix-conflict.json by
+    #      run_claude_phase.
+    #   4. On verdict=resolved: apply resolved_files as a new commit;
+    #      emit ``{"verdict": "resolved", ...}`` so the transition
+    #      shim re-enters push_and_pr.
+    #   5. On verdict=unresolvable (or any non-resolved output, or
+    #      an apply failure): emit the unresolvable envelope so the
+    #      transition shim advances to conflict_unresolvable.
+    #
+    # Prints the phase-output JSON on stdout for persist_phase_output
+    # + transition_for to consume. Always exits 0 — verdict-driven.
+
+    if [[ "$AGENT_RUNNER_DRY_RUN" == "1" ]]; then
+        log "fix_conflict_dry_run"
+        printf '{"verdict": "unresolvable", "resolution_notes": "dry-run: skill not invoked", "resolved_files": []}'
+        return 0
+    fi
+
+    # ── Budget gate ───────────────────────────────────────────────
+    _attempts=$(read_merge_conflict_attempts)
+    log "fix_conflict_budget_check" \
+        "attempts=$_attempts" \
+        "max=$FIX_CONFLICT_MAX_ATTEMPTS"
+    if [[ "$_attempts" -ge "$FIX_CONFLICT_MAX_ATTEMPTS" ]]; then
+        log "fix_conflict_budget_exhausted" \
+            "attempts=$_attempts" \
+            "max=$FIX_CONFLICT_MAX_ATTEMPTS"
+        # Emit the synthetic budget-exhausted envelope. The
+        # transition shim (transition_from_fix_conflict) sees
+        # verdict=unresolvable + budget_exhausted=true and routes to
+        # conflict_unresolvable via the diagnoser hint.
+        printf '{"verdict": "unresolvable", "budget_exhausted": true, "resolution_notes": "fix_conflict budget exhausted (attempts=%s, max=%s)", "resolved_files": []}' \
+            "$_attempts" "$FIX_CONFLICT_MAX_ATTEMPTS"
+        return 0
+    fi
+
+    # ── Increment BEFORE claude ──────────────────────────────────
+    # A claude crash still counts against the budget — otherwise a
+    # broken skill could spin forever.
+    increment_merge_conflict_attempts
+    _new_attempts=$(read_merge_conflict_attempts)
+    log "fix_conflict_attempts_incremented" "new_attempts=$_new_attempts"
+
+    # ── Invoke the claude skill ──────────────────────────────────
+    # run_claude_phase maps fix_conflict → fix-conflict and writes
+    # the input bundle via phase_input_shim.py.
+    _output=$(run_claude_phase "fix_conflict")
+    _verdict=$(printf '%s' "$_output" | jq -r '.verdict // ""' 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]')
+    log "fix_conflict_skill_verdict" "verdict=$_verdict"
+
+    if [[ "$_verdict" == "resolved" ]]; then
+        # Apply resolved_files as a new commit. The output JSON on
+        # disk is the authoritative source; apply_resolved_files
+        # reads it directly.
+        _out_json_path="$REPO_ROOT/tmp/dispatcher-output/fix-conflict.json"
+        if apply_resolved_files "$_out_json_path"; then
+            log "fix_conflict_resolved_applied"
+            printf '%s' "$_output"
+            return 0
+        fi
+        # Apply failed → demote to unresolvable so we don't re-enter
+        # push_and_pr with a broken tree. Preserve the skill's notes
+        # for the diagnoser.
+        log "fix_conflict_apply_failed_demoting_to_unresolvable"
+        _notes=$(printf '%s' "$_output" | jq -r '.resolution_notes // ""' 2>/dev/null)
+        printf '{"verdict": "unresolvable", "apply_failed": true, "resolution_notes": %s, "resolved_files": []}' \
+            "$(printf '%s' "apply_resolved_files failed after skill returned resolved; original notes: $_notes" | jq -R -s .)"
+        return 0
+    fi
+
+    # Any non-resolved verdict (unresolvable, missing, malformed) —
+    # pass through so the transition shim routes to
+    # conflict_unresolvable.
+    log "fix_conflict_not_resolved" "verdict=$_verdict"
+    if [[ -n "$_output" && "$_output" != "{}" ]]; then
+        printf '%s' "$_output"
+    else
+        printf '{"verdict": "unresolvable", "resolution_notes": "skill returned empty / malformed output", "resolved_files": []}'
+    fi
+    return 0
 }
 
 # ── Ralph HEAD-watcher (#3144) ────────────────────────────────────────────
@@ -2352,6 +2921,15 @@ DEPLOY_GRACE_SECONDS="${AGENT_RUNNER_DEPLOY_GRACE_SECONDS:-90}"
 # Max attempts to auto-unstick a merge stale-rollup rejection (#3163).
 # Matches ``MERGE_UNSTICK_MAX_ATTEMPTS`` in daemon.py.
 MERGE_UNSTICK_MAX_ATTEMPTS="${AGENT_RUNNER_MERGE_UNSTICK_MAX_ATTEMPTS:-1}"
+
+# #3225: max invocations of the fix_conflict phase's claude skill per
+# agent lifetime. The first attempt handles the common "main advanced
+# during ralph" case; a second attempt covers the edge case where main
+# advances AGAIN during the first resolution. Three attempts starts
+# looking like a livelock — route cleanly to conflict_unresolvable.
+# Tests override to 0 (budget-exhausted on first call) or 1 (allows
+# exactly one attempt) via the env var.
+FIX_CONFLICT_MAX_ATTEMPTS="${AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS:-2}"
 
 # Stderr substring that indicates the #2641/#3163 stale-rollup branch-
 # protection rejection. Matches ``STALE_ROLLUP_STDERR_MARKER`` in
@@ -3042,6 +3620,99 @@ while true; do
     # `/task-v2-push_and_pr` and got "Unknown command" back.
     case "$_current" in
         planning|ralph|summary|fix_ci|verify)
+            # #3225 secondary mitigation — run a baseline
+            # ``git fetch origin main && git rebase origin/main`` at
+            # the START of ralph (before any claude iterations). This
+            # cuts the conflict surface by the duration of ralph
+            # (~20-25 min) so the agent works against the latest main
+            # from the beginning. On conflict, short-circuit the
+            # claude invocation and emit the same rebase_failed
+            # envelope that push_and_pr emits — transition_from_ralph
+            # routes to fix_conflict.
+            if [[ "$_current" == "ralph" ]] && \
+               [[ "${AGENT_RUNNER_RALPH_BASELINE_REBASE:-1}" == "1" ]] && \
+               [[ "$AGENT_RUNNER_DRY_RUN" != "1" ]]; then
+                log "ralph_baseline_rebase_begin"
+                set +e
+                git -C "$REPO_ROOT" fetch origin main \
+                    > "$AGENT_WORKSPACE/ralph-baseline-fetch.stdout.log" \
+                    2> "$AGENT_WORKSPACE/ralph-baseline-fetch.stderr.log"
+                _baseline_fetch_rc=$?
+                set -e
+                log "ralph_baseline_fetch_done" "exit_code=$_baseline_fetch_rc"
+                if [[ "$_baseline_fetch_rc" -eq 0 ]]; then
+                    set +e
+                    git -C "$REPO_ROOT" rebase origin/main \
+                        > "$AGENT_WORKSPACE/ralph-baseline-rebase.stdout.log" \
+                        2> "$AGENT_WORKSPACE/ralph-baseline-rebase.stderr.log"
+                    _baseline_rebase_rc=$?
+                    set -e
+                    log "ralph_baseline_rebase_done" "exit_code=$_baseline_rebase_rc"
+                    if [[ "$_baseline_rebase_rc" -ne 0 ]]; then
+                        # Capture conflict files, stash markers, abort,
+                        # emit rebase_failed envelope. Same shape as
+                        # push_and_pr's conflict path so the
+                        # fix_conflict phase can consume either.
+                        _fix_conflict_stage="$AGENT_WORKSPACE/fix-conflict"
+                        mkdir -p "$_fix_conflict_stage/conflict-markers"
+                        set +e
+                        git -C "$REPO_ROOT" diff --name-only --diff-filter=U \
+                            > "$_fix_conflict_stage/conflict-files.txt" \
+                            2> "$AGENT_WORKSPACE/git-diff-conflict-files.stderr.log"
+                        set -e
+                        while IFS= read -r _cfile; do
+                            if [[ -z "$_cfile" ]]; then
+                                continue
+                            fi
+                            _safe=$(printf '%s' "$_cfile" | tr '/' '__')
+                            if [[ -f "$REPO_ROOT/$_cfile" ]]; then
+                                cp "$REPO_ROOT/$_cfile" \
+                                    "$_fix_conflict_stage/conflict-markers/$_safe" \
+                                    2>/dev/null || true
+                            fi
+                        done < "$_fix_conflict_stage/conflict-files.txt"
+                        set +e
+                        git -C "$REPO_ROOT" rev-parse ORIG_HEAD \
+                            > "$_fix_conflict_stage/orig-head.txt" 2>/dev/null || true
+                        git -C "$REPO_ROOT" merge-base ORIG_HEAD origin/main \
+                            > "$_fix_conflict_stage/merge-base.txt" 2>/dev/null || true
+                        git -C "$REPO_ROOT" rebase --abort \
+                            > "$AGENT_WORKSPACE/ralph-baseline-rebase-abort.stdout.log" \
+                            2> "$AGENT_WORKSPACE/ralph-baseline-rebase-abort.stderr.log"
+                        set -e
+                        _baseline_conflict_files_json="[]"
+                        if [[ -s "$_fix_conflict_stage/conflict-files.txt" ]]; then
+                            _baseline_conflict_files_json=$(jq -R -s -c \
+                                'split("\n") | map(select(length > 0))' \
+                                "$_fix_conflict_stage/conflict-files.txt" 2>/dev/null \
+                                || printf '[]')
+                        fi
+                        log "ralph_baseline_rebase_conflict" \
+                            "exit_code=$_baseline_rebase_rc" \
+                            "conflict_files_json=$_baseline_conflict_files_json"
+                        # Build a synthetic ralph-phase output with the
+                        # rebase_failed envelope. Persist + transition
+                        # via the normal shim path so the conflict
+                        # routes to fix_conflict.
+                        _ralph_baseline_output=$(printf '{"rebase_failed": true, "conflict_files": %s, "source_phase": "ralph"}' \
+                            "$_baseline_conflict_files_json")
+                        persist_phase_output "ralph" "$_ralph_baseline_output"
+                        _bt=$(transition_for "ralph" "$_ralph_baseline_output")
+                        _ba=$(printf '%s' "$_bt" | cut -f1)
+                        _bn=$(printf '%s' "$_bt" | cut -f2)
+                        if [[ "$_ba" == "advance" ]]; then
+                            advance_phase "$_bn"
+                        else
+                            log "ralph_baseline_transition_unrecognized" "action=$_ba"
+                            advance_phase "daemon_restart_abandoned" "crashed"
+                        fi
+                        continue
+                    fi
+                else
+                    log "ralph_baseline_fetch_failed_skipping" \
+                        "exit_code=$_baseline_fetch_rc"
+                fi
+            fi
             if [[ "$_current" == "ralph" ]]; then
                 # #3144: start the HEAD-watcher subshell so the long
                 # ralph phase emits per-iteration observability to
@@ -3077,12 +3748,22 @@ while true; do
                     advance_phase "$_next" "$_status"
                     ;;
                 route_to_diagnoser)
-                    # Stage 1b does not have the diagnoser integration
-                    # wired in; route to a terminal failure phase so
-                    # the loop exits cleanly. Stage 2's daemon-side
-                    # failure router owns the real category mapping.
-                    log "diagnoser_route_stub" "hint=$_hint"
-                    advance_phase "daemon_restart_abandoned" "failed"
+                    # #3225: for the conflict_unresolvable hint, route
+                    # to the dedicated terminal so the diagnoser
+                    # supervisor sweep picks it up with the right
+                    # category. Other hints keep the Stage-1b stub
+                    # terminal (the daemon-side failure router owns
+                    # the real category mapping for those).
+                    if [[ "$_hint" == "conflict_unresolvable" ]]; then
+                        log "diagnoser_route_conflict_unresolvable" "hint=$_hint"
+                        agent_runner_reaped_failure \
+                            "conflict_unresolvable" \
+                            "conflict_unresolvable" \
+                            "fix_conflict skill returned unresolvable or budget exhausted"
+                    else
+                        log "diagnoser_route_stub" "hint=$_hint"
+                        advance_phase "daemon_restart_abandoned" "failed"
+                    fi
                     ;;
                 unrecognized|*)
                     log "transition_unrecognized" "phase=$_current" "action=$_action"
@@ -3125,6 +3806,48 @@ while true; do
                 *)
                     log "push_and_pr_transition_unrecognized" "action=$_action"
                     advance_phase "daemon_restart_abandoned" "crashed"
+                    ;;
+            esac
+            ;;
+        fix_conflict)
+            # #3225: fix_conflict phase. Budget-gated claude-resolution
+            # of rebase conflicts. handle_fix_conflict enforces the
+            # per-agent FIX_CONFLICT_MAX_ATTEMPTS budget, invokes the
+            # claude skill, applies resolved_files as a new commit on
+            # verdict=resolved, and emits the output envelope the
+            # transition shim uses to advance.
+            _output=$(handle_fix_conflict)
+            persist_phase_output "fix_conflict" "$_output"
+            _transition=$(transition_for "fix_conflict" "$_output")
+            _action=$(printf '%s' "$_transition" | cut -f1)
+            _next=$(printf '%s' "$_transition" | cut -f2)
+            _status=$(printf '%s' "$_transition" | cut -f3)
+            _hint=$(printf '%s' "$_transition" | cut -f4)
+            case "$_action" in
+                advance)
+                    advance_phase "$_next"
+                    ;;
+                advance_with_status)
+                    advance_phase "$_next" "$_status"
+                    ;;
+                route_to_diagnoser)
+                    # conflict_unresolvable is the only hint we expect
+                    # here. Route to the dedicated terminal via
+                    # agent_runner_reaped_failure so the row carries
+                    # ``category=conflict_unresolvable`` for the
+                    # diagnoser sweep.
+                    log "fix_conflict_route_to_diagnoser" "hint=$_hint"
+                    agent_runner_reaped_failure \
+                        "conflict_unresolvable" \
+                        "conflict_unresolvable" \
+                        "fix_conflict skill returned unresolvable or budget exhausted"
+                    ;;
+                *)
+                    log "fix_conflict_transition_unrecognized" "action=$_action"
+                    agent_runner_reaped_failure \
+                        "conflict_unresolvable" \
+                        "unrecognized_output" \
+                        "fix_conflict transition shim returned $_action"
                     ;;
             esac
             ;;

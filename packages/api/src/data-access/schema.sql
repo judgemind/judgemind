@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 43 migrations.
+-- Generated from 44 migrations.
 
 
 
@@ -367,7 +367,8 @@ CREATE TABLE dispatcher.agents (
     agent_task_arn text,
     execution_mode text DEFAULT 'subprocess'::text NOT NULL,
     ralph_iterations_observed integer DEFAULT 0 NOT NULL,
-    merge_unstick_attempts integer DEFAULT 0 NOT NULL
+    merge_unstick_attempts integer DEFAULT 0 NOT NULL,
+    merge_conflict_attempts integer DEFAULT 0 NOT NULL
 );
 
 
@@ -411,6 +412,9 @@ COMMENT ON COLUMN dispatcher.agents.ralph_iterations_observed IS 'Count of ralph
 
 
 COMMENT ON COLUMN dispatcher.agents.merge_unstick_attempts IS 'Count of stale-rollup merge-phase auto-unstick attempts for this agent (#2641). Bounded at 1 per agent lifetime: the first stale-rollup rejection (GitHub stderr "base branch policy prohibits the merge" while ci-passed on HEAD is SUCCESS) bumps this to 1 and the daemon pushes an empty commit to force a fresh rollup evaluation; a second rejection in the same agent''s lifetime routes through _handle_agent_failure with category merge_unstick_exhausted.';
+
+
+COMMENT ON COLUMN dispatcher.agents.merge_conflict_attempts IS 'Count of fix_conflict-phase claude-resolution attempts for this agent (#3225). Bounded at FIX_CONFLICT_MAX_ATTEMPTS (default 2) per agent lifetime: each invocation of handle_fix_conflict increments this column before spawning the claude skill; when the value is already >= budget the handler advances to the conflict_unresolvable terminal without spending compute. Covers both the pre-push rebase-conflict path (push_and_pr) and the start-of-ralph baseline rebase-conflict path (secondary mitigation). See .claude/skills/task-v2-fix-conflict/SKILL.md.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (
