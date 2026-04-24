@@ -1425,6 +1425,733 @@ else
     pass "#3133 — output-file path suppresses .result diag when file present"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Stage 2 (#3135) — summary / fix-ci / verify / retro input parity
+#
+# The Stage 1b shim wrote identifier-only stubs for these four phases;
+# Stage 2 builds the same field set the daemon's ``_handle_phase_*``
+# builders assemble so ECS-mode agents reach the same verdicts as
+# subprocess-mode agents. These tests exercise ``phase_input_shim.py``
+# directly — running the full entrypoint per phase would require
+# stubbing an entire phase-sequence walk, which obscures the actual
+# input-build assertions.
+#
+# Setup: extract the shim file onto disk by running the entrypoint
+# once (in dry-run mode so it stops before the first claude invoke).
+# ══════════════════════════════════════════════════════════════════════════
+
+shim_workspace="$TEST_TMP/shim-workspace"
+mkdir -p "$shim_workspace"
+
+# Run the entrypoint with AGENT_RUNNER_DRY_RUN=1 so it stamps the shim
+# file under $AGENT_WORKSPACE and then short-circuits the phase loop.
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-shim-extract.txt"
+printf 'done\n' > "$PHASE_FIXTURE_FILE"
+set +e
+AGENT_ID="00000000-0000-0000-0000-000000000000" \
+    ISSUE_NUMBER="3135" \
+    DATABASE_URL="postgres://test" \
+    GITHUB_TOKEN="" \
+    AGENT_WORKSPACE="$shim_workspace" \
+    REPO_URL="https://example.invalid/repo.git" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+    PRIOR_PATCH_FIXTURE="" \
+    CLAUDE_VERDICT_FIXTURE="" \
+    PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+    PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+    AGENT_RUNNER_DRY_RUN=1 \
+    bash "$ENTRYPOINT" >/dev/null 2>&1
+set -e
+
+SHIM_PY="$shim_workspace/phase_input_shim.py"
+if [[ -f "$SHIM_PY" ]]; then
+    pass "#3135 — entrypoint stamps phase_input_shim.py file on disk"
+else
+    fail "#3135 — entrypoint stamps phase_input_shim.py file on disk" \
+         "expected file not found: $SHIM_PY"
+fi
+
+# Extend the gh stub with richer routes for the Stage 2 fetches:
+#   * ``gh issue view <N> --json ...``    → read $GH_ISSUE_FIXTURE
+#   * ``gh pr view <N> --json ...``       → read $GH_PR_FIXTURE
+#   * ``gh pr diff <N>``                  → read $GH_PR_DIFF_FIXTURE
+#   * ``gh run view --log-failed --job``  → read $GH_RUN_LOG_FIXTURE
+#   * ``gh run list --commit <sha>``      → read $GH_RUN_LIST_FIXTURE
+cat > "$STUB_BIN/gh" <<'GHEOF'
+#!/usr/bin/env bash
+set -u
+INVOCATIONS_DIR="${INVOCATIONS_DIR}"
+. "$(dirname "$0")/_record_invocation.sh" gh "$@"
+
+# Parse subcommand chain: ``gh issue view`` or ``gh pr view`` or
+# ``gh run view`` / ``gh run list`` — anything else is a no-op success.
+if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
+    if [[ -n "${GH_ISSUE_FIXTURE:-}" && -f "$GH_ISSUE_FIXTURE" ]]; then
+        cat "$GH_ISSUE_FIXTURE"
+        exit 0
+    fi
+    exit 1
+fi
+
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+    if [[ -n "${GH_PR_FIXTURE:-}" && -f "$GH_PR_FIXTURE" ]]; then
+        cat "$GH_PR_FIXTURE"
+        exit 0
+    fi
+    exit 1
+fi
+
+if [[ "${1:-}" == "pr" && "${2:-}" == "diff" ]]; then
+    if [[ -n "${GH_PR_DIFF_FIXTURE:-}" && -f "$GH_PR_DIFF_FIXTURE" ]]; then
+        cat "$GH_PR_DIFF_FIXTURE"
+        exit 0
+    fi
+    exit 1
+fi
+
+if [[ "${1:-}" == "run" && "${2:-}" == "view" ]]; then
+    if [[ -n "${GH_RUN_LOG_FIXTURE:-}" && -f "$GH_RUN_LOG_FIXTURE" ]]; then
+        cat "$GH_RUN_LOG_FIXTURE"
+        exit 0
+    fi
+    exit 1
+fi
+
+if [[ "${1:-}" == "run" && "${2:-}" == "list" ]]; then
+    if [[ -n "${GH_RUN_LIST_FIXTURE:-}" && -f "$GH_RUN_LIST_FIXTURE" ]]; then
+        cat "$GH_RUN_LIST_FIXTURE"
+        exit 0
+    fi
+    exit 1
+fi
+
+# Legacy route kept for push_and_pr tests.
+sub=""
+for arg in "$@"; do
+    if [[ "$sub" == "" && "$arg" != --* && "$arg" != -* ]]; then
+        sub="$arg"
+        continue
+    fi
+    if [[ -n "$sub" && "$sub" == "pr" && "$arg" != --* && "$arg" != -* ]]; then
+        if [[ "$arg" == "create" ]]; then
+            printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+            exit "${GH_PR_CREATE_EXIT:-0}"
+        fi
+    fi
+done
+
+exit 0
+GHEOF
+chmod +x "$STUB_BIN/gh"
+
+# Extend the psql stub with Stage 2 SELECTs on dispatcher.agents,
+# dispatcher.phase_outputs, dispatcher.phase_transitions, and
+# dispatcher.failures. Each new fixture env var is read on-demand so
+# individual tests configure only what they need.
+cat > "$STUB_BIN/psql" <<'PSQLEOF'
+#!/usr/bin/env bash
+set -u
+INVOCATIONS_DIR="${INVOCATIONS_DIR}"
+. "$(dirname "$0")/_record_invocation.sh" psql "$@"
+
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c)
+            shift
+            query="$1"
+            ;;
+    esac
+    shift || true
+done
+
+case "$query" in
+    *"SELECT phase"*"FROM dispatcher.agents"*)
+        if [[ -f "${PHASE_FIXTURE_FILE:-}" ]]; then
+            head -n 1 "$PHASE_FIXTURE_FILE"
+        fi
+        exit 0
+        ;;
+    *"SELECT COALESCE(pr_number"*"FROM dispatcher.agents"*)
+        printf '%s' "${DB_AGENT_PR_NUMBER:-0}"
+        exit 0
+        ;;
+    *"SELECT COALESCE(retries_used"*"FROM dispatcher.agents"*)
+        printf '%s' "${DB_AGENT_RETRIES_USED:-0}"
+        exit 0
+        ;;
+    *"EXTRACT(EPOCH FROM (now() - started_at))"*"FROM dispatcher.agents"*)
+        printf '%s' "${DB_AGENT_TOTAL_DURATION_S:-0}"
+        exit 0
+        ;;
+    *"SELECT output_json"*"FROM dispatcher.phase_outputs"*)
+        # Route by phase name substring.
+        if [[ "$query" == *"phase = 'summary'"* && -f "${DB_SUMMARY_OUTPUT_FIXTURE:-}" ]]; then
+            cat "$DB_SUMMARY_OUTPUT_FIXTURE"
+        elif [[ "$query" == *"phase = 'verify'"* && -f "${DB_VERIFY_OUTPUT_FIXTURE:-}" ]]; then
+            cat "$DB_VERIFY_OUTPUT_FIXTURE"
+        fi
+        exit 0
+        ;;
+    *"FROM dispatcher.phase_transitions"*)
+        if [[ -f "${DB_PHASE_TRANSITIONS_FIXTURE:-}" ]]; then
+            cat "$DB_PHASE_TRANSITIONS_FIXTURE"
+        fi
+        exit 0
+        ;;
+    *"FROM dispatcher.failures"*)
+        if [[ -f "${DB_FAILURES_FIXTURE:-}" ]]; then
+            cat "$DB_FAILURES_FIXTURE"
+        fi
+        exit 0
+        ;;
+    *"SELECT patch_content"*)
+        if [[ -f "${PRIOR_PATCH_FIXTURE:-}" ]]; then
+            cat "$PRIOR_PATCH_FIXTURE"
+        fi
+        exit 0
+        ;;
+    *"UPDATE dispatcher.agents"*"SET phase ="*)
+        new_phase=$(printf '%s' "$query" | sed -n "s/.*SET phase = '\\([^']*\\)'.*/\\1/p")
+        if [[ -n "$new_phase" && -f "${PHASE_FIXTURE_FILE:-}" ]]; then
+            printf '%s\n' "$new_phase" > "$PHASE_FIXTURE_FILE"
+        fi
+        exit 0
+        ;;
+    *"UPDATE dispatcher.agents"*"SET ended_at"*)
+        exit 0
+        ;;
+    *"INSERT INTO dispatcher.phase_outputs"*)
+        exit 0
+        ;;
+    *"INSERT INTO dispatcher.ralph_patches"*)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+PSQLEOF
+chmod +x "$STUB_BIN/psql"
+
+# Helper: invoke the shim directly and print the JSON payload path.
+run_shim() {
+    # $1 phase, $2 agent_id, $3 issue_number, $4 repo_root
+    local rc
+    set +e
+    python3 "$SHIM_PY" "$1" "$2" "$3" "$4" >/dev/null 2>&1
+    rc=$?
+    set -e
+    return $rc
+}
+
+# ── Test 17: summary input parity (AC-1 of #3135) ─────────────────────────
+setup_fixtures
+
+t17_repo="$TEST_TMP/t17-repo"
+mkdir -p "$t17_repo/.git" "$t17_repo/tmp/dispatcher-output"
+
+# Stage ralph output so the shim reads ralph_summary + changed_files.
+cat > "$t17_repo/tmp/dispatcher-output/ralph.json" <<'EOF'
+{
+  "agent_id": "17171717-1717-1717-1717-171717171717",
+  "verdict": "SHIP",
+  "summary": "Extended phase_input_shim with per-phase builders",
+  "changed_files": ["scripts/dispatcher/agent-runner-entrypoint.sh", "scripts/tests/test_agent_runner_entrypoint.sh"]
+}
+EOF
+
+cat > "$t17_repo/tmp/dispatcher-output/plan.json" <<'EOF'
+{
+  "agent_id": "17171717-1717-1717-1717-171717171717",
+  "acceptance_criteria": ["summary parity", "fix-ci parity", "verify parity", "retro parity"],
+  "scope_check": ["no daemon changes"],
+  "change_type": "dx_tooling",
+  "plan_text": "fixture plan body"
+}
+EOF
+
+GH_ISSUE_FIXTURE="$TEST_TMP/t17-issue.json"
+cat > "$GH_ISSUE_FIXTURE" <<'EOF'
+{
+  "number": 3135,
+  "title": "feat(agent-runner): Stage 2 input parity",
+  "body": "Body with AC.\n\n- [ ] summary parity\n- [ ] fix-ci parity",
+  "labels": [{"name": "area/infra"}],
+  "comments": [
+    {"author": {"login": "drewthaler"}, "authorAssociation": "COLLABORATOR", "createdAt": "2026-04-23T00:00:00Z", "body": "human comment"},
+    {"author": {"login": "github-actions[bot]"}, "authorAssociation": "NONE", "createdAt": "2026-04-23T00:00:00Z", "body": "bot comment"}
+  ],
+  "updatedAt": "2026-04-23T23:50:00Z"
+}
+EOF
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    GH_ISSUE_FIXTURE="$GH_ISSUE_FIXTURE" \
+    python3 "$SHIM_PY" summary "17171717-1717-1717-1717-171717171717" 3135 "$t17_repo" \
+    >/dev/null 2>&1
+t17_rc=$?
+set -e
+
+t17_input="$t17_repo/tmp/dispatcher-input/summary.json"
+
+if [[ $t17_rc -eq 0 && -f "$t17_input" ]]; then
+    pass "#3135 AC-1 — summary shim writes dispatcher-input/summary.json"
+else
+    fail "#3135 AC-1 — summary shim writes dispatcher-input/summary.json" \
+         "rc=$t17_rc, path=$t17_input"
+fi
+
+for field in agent_id issue_number issue_title issue_body issue_comments \
+             ralph_summary changed_files git_diff branch \
+             plan_acceptance_criteria scope_check worktree_path repo_root; do
+    if jq -e "has(\"$field\")" "$t17_input" >/dev/null 2>&1; then
+        pass "#3135 AC-1 — summary.json carries $field"
+    else
+        fail "#3135 AC-1 — summary.json carries $field" \
+             "content: $(cat "$t17_input" 2>/dev/null)"
+    fi
+done
+
+if jq -e '.ralph_summary == "Extended phase_input_shim with per-phase builders"' \
+     "$t17_input" >/dev/null 2>&1; then
+    pass "#3135 AC-1 — ralph_summary is read from ralph.json"
+else
+    fail "#3135 AC-1 — ralph_summary is read from ralph.json"
+fi
+
+if jq -e '.issue_title == "feat(agent-runner): Stage 2 input parity"' \
+     "$t17_input" >/dev/null 2>&1; then
+    pass "#3135 AC-1 — issue_title is refetched via gh issue view"
+else
+    fail "#3135 AC-1 — issue_title is refetched via gh issue view"
+fi
+
+if jq -e '.issue_comments | length == 1 and .[0].author == "drewthaler"' \
+     "$t17_input" >/dev/null 2>&1; then
+    pass "#3135 AC-1 — issue_comments excludes bot comments"
+else
+    fail "#3135 AC-1 — issue_comments excludes bot comments" \
+         "content: $(jq '.issue_comments' "$t17_input" 2>/dev/null)"
+fi
+
+if jq -e '.plan_acceptance_criteria | length == 4' "$t17_input" >/dev/null 2>&1; then
+    pass "#3135 AC-1 — plan_acceptance_criteria pulled from plan output"
+else
+    fail "#3135 AC-1 — plan_acceptance_criteria pulled from plan output"
+fi
+
+if jq -e '.changed_files | contains(["scripts/dispatcher/agent-runner-entrypoint.sh"])' \
+     "$t17_input" >/dev/null 2>&1; then
+    pass "#3135 AC-1 — changed_files preferred from ralph output"
+else
+    fail "#3135 AC-1 — changed_files preferred from ralph output"
+fi
+
+# ── Test 18: fix-ci input parity (AC-2 of #3135) ──────────────────────────
+setup_fixtures
+
+t18_repo="$TEST_TMP/t18-repo"
+mkdir -p "$t18_repo/.git" "$t18_repo/tmp/dispatcher-output"
+
+cat > "$t18_repo/tmp/dispatcher-output/plan.json" <<'EOF'
+{"agent_id": "18181818-1818-1818-1818-181818181818", "change_type": "api"}
+EOF
+
+GH_PR_FIXTURE="$TEST_TMP/t18-pr.json"
+cat > "$GH_PR_FIXTURE" <<'EOF'
+{
+  "statusCheckRollup": [
+    {"name": "CI / python-tests", "status": "COMPLETED", "conclusion": "FAILURE", "databaseId": 9001, "detailsUrl": "https://github.com/judgemind/judgemind/actions/runs/9001"},
+    {"name": "CI / lint", "status": "COMPLETED", "conclusion": "SUCCESS", "databaseId": 9002}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeef",
+  "mergeCommit": null
+}
+EOF
+
+GH_PR_DIFF_FIXTURE="$TEST_TMP/t18-pr-diff.patch"
+cat > "$GH_PR_DIFF_FIXTURE" <<'EOF'
+diff --git a/foo.py b/foo.py
+index 111..222 100644
+--- a/foo.py
++++ b/foo.py
+@@ -1 +1,2 @@
+ def f(): return 1
++# new line
+EOF
+
+GH_RUN_LOG_FIXTURE="$TEST_TMP/t18-run-log.txt"
+cat > "$GH_RUN_LOG_FIXTURE" <<'EOF'
+FAIL tests/test_foo.py::test_bar
+AssertionError: expected 2, got 1
+EOF
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    GH_PR_FIXTURE="$GH_PR_FIXTURE" \
+    GH_PR_DIFF_FIXTURE="$GH_PR_DIFF_FIXTURE" \
+    GH_RUN_LOG_FIXTURE="$GH_RUN_LOG_FIXTURE" \
+    DB_AGENT_PR_NUMBER="4242" \
+    DB_AGENT_RETRIES_USED="2" \
+    python3 "$SHIM_PY" fix-ci "18181818-1818-1818-1818-181818181818" 3135 "$t18_repo" \
+    >/dev/null 2>&1
+t18_rc=$?
+set -e
+
+t18_input="$t18_repo/tmp/dispatcher-input/fix-ci.json"
+if [[ $t18_rc -eq 0 && -f "$t18_input" ]]; then
+    pass "#3135 AC-2 — fix-ci shim writes dispatcher-input/fix-ci.json"
+else
+    fail "#3135 AC-2 — fix-ci shim writes dispatcher-input/fix-ci.json" \
+         "rc=$t18_rc, path=$t18_input"
+fi
+
+if jq -e '.pr_number == 4242' "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — pr_number read from dispatcher.agents"
+else
+    fail "#3135 AC-2 — pr_number read from dispatcher.agents" \
+         "content: $(cat "$t18_input" 2>/dev/null)"
+fi
+
+if jq -e '.previous_fix_attempts == 2' "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — previous_fix_attempts read from dispatcher.agents.retries_used"
+else
+    fail "#3135 AC-2 — previous_fix_attempts read from dispatcher.agents.retries_used"
+fi
+
+if jq -e '.failing_jobs | length == 1' "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — failing_jobs filters to FAILURE conclusion"
+else
+    fail "#3135 AC-2 — failing_jobs filters to FAILURE conclusion" \
+         "content: $(jq '.failing_jobs' "$t18_input" 2>/dev/null)"
+fi
+
+if jq -e '.failing_jobs[0].name == "CI / python-tests"' "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — failing_jobs carries job name"
+else
+    fail "#3135 AC-2 — failing_jobs carries job name"
+fi
+
+if jq -e '.failing_jobs[0].log_tail | contains("FAIL tests/test_foo.py")' \
+     "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — failing_jobs[*].log_tail fetched via gh run view --log-failed"
+else
+    fail "#3135 AC-2 — failing_jobs[*].log_tail fetched via gh run view --log-failed" \
+         "content: $(jq '.failing_jobs' "$t18_input" 2>/dev/null)"
+fi
+
+if jq -e '.git_diff_base_to_head | contains("def f(): return 1")' \
+     "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — git_diff_base_to_head read via gh pr diff"
+else
+    fail "#3135 AC-2 — git_diff_base_to_head read via gh pr diff" \
+         "content: $(jq -r '.git_diff_base_to_head' "$t18_input" 2>/dev/null | head -c 200)"
+fi
+
+if jq -e '.change_type == "api"' "$t18_input" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — change_type forwarded from plan output"
+else
+    fail "#3135 AC-2 — change_type forwarded from plan output"
+fi
+
+# Verify gh run view was called with --log-failed and --job.
+if grep -F -- "--log-failed" "$INVOCATIONS_DIR/gh.log" >/dev/null 2>&1 \
+   && grep -F -- "--job" "$INVOCATIONS_DIR/gh.log" >/dev/null 2>&1; then
+    pass "#3135 AC-2 — shim invokes gh run view --log-failed --job"
+else
+    fail "#3135 AC-2 — shim invokes gh run view --log-failed --job" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+fi
+
+# ── Test 19: verify input parity (AC-3 of #3135) ──────────────────────────
+setup_fixtures
+
+t19_repo="$TEST_TMP/t19-repo"
+mkdir -p "$t19_repo/.git" "$t19_repo/tmp/dispatcher-output"
+
+cat > "$t19_repo/tmp/dispatcher-output/plan.json" <<'EOF'
+{
+  "agent_id": "19191919-1919-1919-1919-191919191919",
+  "acceptance_criteria": ["AC from plan"],
+  "scope_check": ["scope_check entry"],
+  "change_type": "api",
+  "plan_text": "plan body text"
+}
+EOF
+
+# gh issue view returns the issue bundle (used as fallback for AC).
+GH_ISSUE_FIXTURE="$TEST_TMP/t19-issue.json"
+cat > "$GH_ISSUE_FIXTURE" <<'EOF'
+{
+  "number": 3135,
+  "title": "feat(agent-runner)",
+  "body": "Body\n\n- [ ] AC from issue body\n",
+  "labels": [],
+  "comments": [],
+  "updatedAt": "2026-04-23T00:00:00Z"
+}
+EOF
+
+# gh pr view for the merged PR (mergeCommit.oid).
+GH_PR_FIXTURE="$TEST_TMP/t19-pr.json"
+cat > "$GH_PR_FIXTURE" <<'EOF'
+{
+  "state": "MERGED",
+  "mergeCommit": {"oid": "abc123def456"},
+  "headRefOid": "deadbeef"
+}
+EOF
+
+# gh run list returns the deploy runs for the merge SHA.
+GH_RUN_LIST_FIXTURE="$TEST_TMP/t19-run-list.json"
+cat > "$GH_RUN_LIST_FIXTURE" <<'EOF'
+[
+  {"databaseId": 7001, "workflowName": "Deploy Dispatcher", "conclusion": "success", "status": "completed", "headSha": "abc123def456"},
+  {"databaseId": 7002, "workflowName": "CI", "conclusion": "success", "status": "completed", "headSha": "abc123def456"}
+]
+EOF
+
+# Summary's persisted phase_output carries deferred_acs.
+DB_SUMMARY_OUTPUT_FIXTURE="$TEST_TMP/t19-summary-output.json"
+cat > "$DB_SUMMARY_OUTPUT_FIXTURE" <<'EOF'
+{"deferred_acs": [{"index": 3, "reason": "marker", "verify_instruction": "Verify: curl dev"}]}
+EOF
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    GH_ISSUE_FIXTURE="$GH_ISSUE_FIXTURE" \
+    GH_PR_FIXTURE="$GH_PR_FIXTURE" \
+    GH_RUN_LIST_FIXTURE="$GH_RUN_LIST_FIXTURE" \
+    DB_AGENT_PR_NUMBER="5050" \
+    DB_SUMMARY_OUTPUT_FIXTURE="$DB_SUMMARY_OUTPUT_FIXTURE" \
+    python3 "$SHIM_PY" verify "19191919-1919-1919-1919-191919191919" 3135 "$t19_repo" \
+    >/dev/null 2>&1
+t19_rc=$?
+set -e
+
+t19_input="$t19_repo/tmp/dispatcher-input/verify.json"
+if [[ $t19_rc -eq 0 && -f "$t19_input" ]]; then
+    pass "#3135 AC-3 — verify shim writes dispatcher-input/verify.json"
+else
+    fail "#3135 AC-3 — verify shim writes dispatcher-input/verify.json" \
+         "rc=$t19_rc, path=$t19_input"
+fi
+
+if jq -e '.pr_number == 5050' "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — pr_number read from dispatcher.agents"
+else
+    fail "#3135 AC-3 — pr_number read from dispatcher.agents"
+fi
+
+if jq -e '.merged_commit_sha == "abc123def456"' "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — merged_commit_sha read via gh pr view --json mergeCommit"
+else
+    fail "#3135 AC-3 — merged_commit_sha read via gh pr view --json mergeCommit" \
+         "content: $(cat "$t19_input" 2>/dev/null)"
+fi
+
+if jq -e '.deploy_status.workflow_name == "Deploy Dispatcher"' \
+     "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — deploy_status derived from gh run list"
+else
+    fail "#3135 AC-3 — deploy_status derived from gh run list" \
+         "content: $(jq '.deploy_status' "$t19_input" 2>/dev/null)"
+fi
+
+if jq -e '.touched_services | contains(["judgemind-dispatcher-dev"])' \
+     "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — touched_services derived from deploy workflow names"
+else
+    fail "#3135 AC-3 — touched_services derived from deploy workflow names"
+fi
+
+if jq -e '.change_type == "dx_tooling"' "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — change_type inferred from deploy workflow"
+else
+    fail "#3135 AC-3 — change_type inferred from deploy workflow" \
+         "value: $(jq -r '.change_type' "$t19_input" 2>/dev/null)"
+fi
+
+if jq -e '.deferred_acs | length == 1 and .[0].index == 3' \
+     "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — deferred_acs read from summary's persisted phase_output"
+else
+    fail "#3135 AC-3 — deferred_acs read from summary's persisted phase_output" \
+         "content: $(jq '.deferred_acs' "$t19_input" 2>/dev/null)"
+fi
+
+if jq -e '.acceptance_criteria | contains(["AC from plan"])' \
+     "$t19_input" >/dev/null 2>&1; then
+    pass "#3135 AC-3 — acceptance_criteria preferred from plan output"
+else
+    fail "#3135 AC-3 — acceptance_criteria preferred from plan output"
+fi
+
+# ── Test 20: retro input parity (AC-4 of #3135) ───────────────────────────
+setup_fixtures
+
+t20_repo="$TEST_TMP/t20-repo"
+mkdir -p "$t20_repo/.git" "$t20_repo/tmp/dispatcher-output"
+
+cat > "$t20_repo/tmp/dispatcher-output/plan.json" <<'EOF'
+{
+  "agent_id": "20202020-2020-2020-2020-202020202020",
+  "scope_check_followups": ["scope item 1"],
+  "follow_ups": ["follow-up A"]
+}
+EOF
+
+# phase_transitions rows — two ralph, one awaiting_ci, one fix_ci.
+DB_PHASE_TRANSITIONS_FIXTURE="$TEST_TMP/t20-phase-transitions.tsv"
+printf 'planning\t2026-04-23T00:00:00Z\n' > "$DB_PHASE_TRANSITIONS_FIXTURE"
+printf 'ralph\t2026-04-23T00:05:00Z\n' >> "$DB_PHASE_TRANSITIONS_FIXTURE"
+printf 'ralph\t2026-04-23T00:10:00Z\n' >> "$DB_PHASE_TRANSITIONS_FIXTURE"
+printf 'awaiting_ci\t2026-04-23T00:15:00Z\n' >> "$DB_PHASE_TRANSITIONS_FIXTURE"
+printf 'fix_ci\t2026-04-23T00:20:00Z\n' >> "$DB_PHASE_TRANSITIONS_FIXTURE"
+
+DB_FAILURES_FIXTURE="$TEST_TMP/t20-failures.tsv"
+printf 'ci_red_after_retries\t2\t2026-04-23T00:15:00Z\t2026-04-23T00:20:00Z\n' > "$DB_FAILURES_FIXTURE"
+
+DB_VERIFY_OUTPUT_FIXTURE="$TEST_TMP/t20-verify-output.json"
+cat > "$DB_VERIFY_OUTPUT_FIXTURE" <<'EOF'
+{"evidence_md": "## Verification evidence\n\nAll ACs pass."}
+EOF
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    DB_AGENT_PR_NUMBER="6060" \
+    DB_AGENT_TOTAL_DURATION_S="1800" \
+    DB_PHASE_TRANSITIONS_FIXTURE="$DB_PHASE_TRANSITIONS_FIXTURE" \
+    DB_FAILURES_FIXTURE="$DB_FAILURES_FIXTURE" \
+    DB_VERIFY_OUTPUT_FIXTURE="$DB_VERIFY_OUTPUT_FIXTURE" \
+    python3 "$SHIM_PY" retro "20202020-2020-2020-2020-202020202020" 3135 "$t20_repo" \
+    >/dev/null 2>&1
+t20_rc=$?
+set -e
+
+t20_input="$t20_repo/tmp/dispatcher-input/retro.json"
+if [[ $t20_rc -eq 0 && -f "$t20_input" ]]; then
+    pass "#3135 AC-4 — retro shim writes dispatcher-input/retro.json"
+else
+    fail "#3135 AC-4 — retro shim writes dispatcher-input/retro.json" \
+         "rc=$t20_rc, path=$t20_input"
+fi
+
+if jq -e '.phase_transitions | length == 5' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — phase_transitions read from dispatcher.phase_transitions"
+else
+    fail "#3135 AC-4 — phase_transitions read from dispatcher.phase_transitions" \
+         "content: $(jq '.phase_transitions' "$t20_input" 2>/dev/null)"
+fi
+
+if jq -e '.ralph_iterations == 2' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — ralph_iterations derived from phase_transitions count"
+else
+    fail "#3135 AC-4 — ralph_iterations derived from phase_transitions count" \
+         "value: $(jq -r '.ralph_iterations' "$t20_input" 2>/dev/null)"
+fi
+
+if jq -e '.ci_attempts == 1 and .fix_ci_attempts == 1' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — ci_attempts and fix_ci_attempts counted from transitions"
+else
+    fail "#3135 AC-4 — ci_attempts and fix_ci_attempts counted from transitions"
+fi
+
+if jq -e '.failures | length == 1 and .[0].category == "ci_red_after_retries" and .[0].count == 2' \
+     "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — failures read from dispatcher.failures grouped"
+else
+    fail "#3135 AC-4 — failures read from dispatcher.failures grouped" \
+         "content: $(jq '.failures' "$t20_input" 2>/dev/null)"
+fi
+
+if jq -e '.total_duration_s == 1800' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — total_duration_s read via EXTRACT(EPOCH FROM ...)"
+else
+    fail "#3135 AC-4 — total_duration_s read via EXTRACT(EPOCH FROM ...)"
+fi
+
+if jq -e '.pr_number == 6060' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — pr_number read from dispatcher.agents"
+else
+    fail "#3135 AC-4 — pr_number read from dispatcher.agents"
+fi
+
+if jq -e '.scope_check_followups | contains(["scope item 1"])' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — scope_check_followups pulled from plan output"
+else
+    fail "#3135 AC-4 — scope_check_followups pulled from plan output"
+fi
+
+if jq -e '.plan_follow_ups | contains(["follow-up A"])' "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — plan_follow_ups pulled from plan output"
+else
+    fail "#3135 AC-4 — plan_follow_ups pulled from plan output"
+fi
+
+if jq -e '.verify_evidence_md | contains("Verification evidence")' \
+     "$t20_input" >/dev/null 2>&1; then
+    pass "#3135 AC-4 — verify_evidence_md read from phase_outputs"
+else
+    fail "#3135 AC-4 — verify_evidence_md read from phase_outputs"
+fi
+
+for field in diff_stats; do
+    if jq -e "has(\"$field\")" "$t20_input" >/dev/null 2>&1; then
+        pass "#3135 AC-4 — retro.json carries $field"
+    else
+        fail "#3135 AC-4 — retro.json carries $field"
+    fi
+done
+
+# ── Test 21: fallback cleanliness (unknown phase returns base) ────────────
+setup_fixtures
+
+t21_repo="$TEST_TMP/t21-repo"
+mkdir -p "$t21_repo/.git"
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    python3 "$SHIM_PY" bogus "21212121-2121-2121-2121-212121212121" 3135 "$t21_repo" \
+    >/dev/null 2>&1
+t21_rc=$?
+set -e
+
+t21_input="$t21_repo/tmp/dispatcher-input/bogus.json"
+if [[ $t21_rc -eq 0 && -f "$t21_input" ]]; then
+    pass "#3135 — unknown phase falls back to base identifiers (no crash)"
+else
+    fail "#3135 — unknown phase falls back to base identifiers (no crash)" \
+         "rc=$t21_rc"
+fi
+
+if jq -e '.agent_id == "21212121-2121-2121-2121-212121212121"' "$t21_input" >/dev/null 2>&1; then
+    pass "#3135 — unknown-phase fallback carries agent_id"
+else
+    fail "#3135 — unknown-phase fallback carries agent_id"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
