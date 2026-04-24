@@ -128,6 +128,24 @@ describe('normalizeSnapshotJson', () => {
     const [entry] = normalizeSnapshotJson(raw);
     expect(entry.body).toBeNull();
   });
+
+  it('emits null createdAt when the key is absent', () => {
+    const raw = [{ number: 1, title: 't', labels: [] }];
+    const [entry] = normalizeSnapshotJson(raw);
+    expect(entry.createdAt).toBeNull();
+  });
+
+  it('emits null createdAt when the value is null', () => {
+    const raw = [{ number: 1, title: 't', labels: [], createdAt: null }];
+    const [entry] = normalizeSnapshotJson(raw);
+    expect(entry.createdAt).toBeNull();
+  });
+
+  it('emits null createdAt when the value is an empty string', () => {
+    const raw = [{ number: 1, title: 't', labels: [], createdAt: '' }];
+    const [entry] = normalizeSnapshotJson(raw);
+    expect(entry.createdAt).toBeNull();
+  });
 });
 
 describe('queueItemFromSnapshot', () => {
@@ -169,6 +187,12 @@ describe('queueItemFromSnapshot', () => {
   it('returns empty blockedBy when body is missing and includeBlockedBy=true', () => {
     const result = queueItemFromSnapshot(base, true);
     expect(result.blockedBy).toEqual([]);
+  });
+
+  it('passes null createdAt through unchanged', () => {
+    const nullTs: SnapshotIssueRecord = { ...base, createdAt: null };
+    const result = queueItemFromSnapshot(nullTs, false);
+    expect(result.createdAt).toBeNull();
   });
 });
 
@@ -734,7 +758,7 @@ describe('sortAndSliceQueueReady', () => {
   function issue(
     number: number,
     labels: string[],
-    createdAt: string,
+    createdAt: string | null,
   ): SnapshotIssueRecord {
     return { number, title: `Issue ${number}`, labels, createdAt };
   }
@@ -857,6 +881,15 @@ describe('sortAndSliceQueueReady', () => {
     expect(result.map((r) => r.number)).toEqual([1, 2]);
   });
 
+  it('handles null createdAt by sorting them last within their bucket', () => {
+    const withTs = issue(1, ['priority/p1'], '2026-04-19T00:00:00Z');
+    const nullTs = issue(2, ['priority/p1'], null);
+
+    const result = sortAndSliceQueueReady([nullTs, withTs], 10);
+
+    expect(result.map((r) => r.number)).toEqual([1, 2]);
+  });
+
   it('handles a limit larger than the input length without padding', () => {
     const input: SnapshotIssueRecord[] = [
       issue(1, ['priority/p0'], '2026-04-19T00:00:00Z'),
@@ -882,7 +915,7 @@ describe('sortAndSliceQueueBlocked', () => {
   function issue(
     number: number,
     labels: string[],
-    createdAt: string,
+    createdAt: string | null,
     body?: string,
   ): SnapshotIssueRecord {
     const rec: SnapshotIssueRecord = {
@@ -1034,6 +1067,19 @@ describe('sortAndSliceQueueBlocked', () => {
     const withoutTs = issue(2, ['priority/p1', 'status/blocked'], '');
 
     const result = sortAndSliceQueueBlocked([withoutTs, withTs], 10);
+
+    expect(result.map((r) => r.number)).toEqual([1, 2]);
+  });
+
+  it('handles null createdAt by sorting them last within their bucket', () => {
+    const withTs = issue(
+      1,
+      ['priority/p1', 'status/blocked'],
+      '2026-04-19T00:00:00Z',
+    );
+    const nullTs = issue(2, ['priority/p1', 'status/blocked'], null);
+
+    const result = sortAndSliceQueueBlocked([nullTs, withTs], 10);
 
     expect(result.map((r) => r.number)).toEqual([1, 2]);
   });

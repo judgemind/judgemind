@@ -226,7 +226,8 @@ export const dispatcherTypeDefs = `#graphql
     """One of p0 | p1 | p2 | p3 | null (parsed from priority/pN label)."""
     priority: String
     labels: [String!]!
-    createdAt: DateTime!
+    """Null when the daemon snapshot's upstream GitHub lookup was missing or malformed."""
+    createdAt: DateTime
     """Issue numbers this issue is blocked by (from the 'Blocked by #N' lines
     in the body). Empty for queueReady items."""
     blockedBy: [Int!]!
