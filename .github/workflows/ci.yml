@@ -34,6 +34,7 @@ jobs:
       hooks: ${{ steps.changes.outputs.hooks }}
       githooks: ${{ steps.changes.outputs.githooks }}
       dispatcher-terminals: ${{ steps.changes.outputs.dispatcher-terminals }}
+      dispatcher-image: ${{ steps.changes.outputs.dispatcher-image }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -141,6 +142,13 @@ jobs:
               - 'packages/api/src/graphql/dispatcher/**'
               - 'packages/web/src/app/**/admin/dispatcher/**'
               # Include ci.yml so that edits to the dispatcher-terminal-consistency-check
+              # job are exercised on the PR that introduces them. Without this, the
+              # paths filter makes the job SKIP on its own PR — the #2410/#2505
+              # footgun. See scripts/check-ci-job-skipped.py.
+              - '.github/workflows/ci.yml'
+            dispatcher-image:
+              - 'Dockerfile.dispatcher'
+              # Include ci.yml so that edits to the dispatcher-image-version-check
               # job are exercised on the PR that introduces them. Without this, the
               # paths filter makes the job SKIP on its own PR — the #2410/#2505
               # footgun. See scripts/check-ci-job-skipped.py.
@@ -1382,10 +1390,27 @@ jobs:
               "body": "**Note:** This PR includes database migration changes. Migrations will be **auto-applied to the dev database** when this PR merges to main. Production migrations remain human-triggered.\n\nPlease ensure the migration is backwards-compatible with the current running code during the rollout window."
             }'
 
+  # ---------------------------------------------------------------
+  # Dispatcher image runtime version gate (#2972)
+  # Builds Dockerfile.dispatcher and asserts Python >= 3.12 and
+  # Node >= 20. Catches accidental base-image downgrades before
+  # they reach production.
+  # ---------------------------------------------------------------
+  dispatcher-image-version-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.dispatcher-image == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify dispatcher image meets minimum runtime version requirements
+        run: scripts/check-dispatcher-image-versions.sh --build Dockerfile.dispatcher
+
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
