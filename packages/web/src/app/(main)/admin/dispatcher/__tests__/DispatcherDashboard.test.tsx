@@ -746,3 +746,31 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
     expect(title.textContent).toBe('Recently completed — 10 / 183');
   });
 });
+
+// #2812 Phase 2 — layout density and gap tests.
+describe('DispatcherDashboard — #2812 Phase 2 layout refinements', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+  });
+
+  it('main deck has gap-y-4 not gap-y-6 (20% tighter vertical rhythm)', () => {
+    renderDashboard();
+    const deck = screen.getByTestId('dispatcher-two-column-deck');
+    expect(deck.className).toContain('gap-y-4');
+    expect(deck.className).not.toContain('gap-y-6');
+  });
+
+  it('RecentFailuresPanel wrapper has mt-4 not mt-6 (tighter spacing below config)', () => {
+    renderDashboard();
+    // The failures section wrapper is the div immediately wrapping RecentFailuresPanel.
+    // It is the element containing the "Recent failures (last 24h)" section heading.
+    const failuresHeading = screen.getByText(/recent failures/i);
+    const section = failuresHeading.closest('section')!;
+    const wrapper = section.parentElement!;
+    expect(wrapper.className).toContain('mt-4');
+    expect(wrapper.className).not.toContain('mt-6');
+  });
+});

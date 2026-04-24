@@ -26,6 +26,7 @@ import { RecentFailuresPanel } from './RecentFailuresPanel';
 import { ConfigPanel } from './ConfigPanel';
 import { ConfirmDialog, type ConfirmableCommand } from './ConfirmDialog';
 import { QueueFullDialog } from './QueueFullDialog';
+import { IssueLink } from './ui-primitives';
 
 /**
  * Polling interval for `dispatcherState`. Per spec §11, the daemon runs on
@@ -387,7 +388,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
       ) : (
         <>
           <div
-            className="grid grid-cols-1 gap-x-6 gap-y-6 lg:grid-cols-2"
+            className="grid grid-cols-1 gap-x-6 gap-y-4 lg:grid-cols-2"
             data-testid="dispatcher-two-column-deck"
           >
             {/*
@@ -396,7 +397,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
              * transitions from "next" to "now". See file-level docstring
              * for the full state-flow rationale (#2823).
              */}
-            <div className="flex flex-col gap-6" data-testid="dispatcher-column-left">
+            <div className="flex flex-col gap-4" data-testid="dispatcher-column-left">
               <ActiveAgentsTable
                 agents={state?.activeAgents ?? []}
                 disabled={controlLoading}
@@ -415,7 +416,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
              * completed. Blocked sits bottom-right — adjacent to the flow
              * but not part of the active cycle.
              */}
-            <div className="flex flex-col gap-6" data-testid="dispatcher-column-right">
+            <div className="flex flex-col gap-4" data-testid="dispatcher-column-right">
               <RecentCompletionsPanel
                 completions={state?.recentCompletions ?? []}
                 total={state?.recentCompletionsCount}
@@ -437,20 +438,13 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
             busyKey={busyConfigKey}
           />
 
-          <div className="mt-6">
+          <div className="mt-4">
             <RecentFailuresPanel failures={state?.recentFailures ?? []} />
           </div>
 
           <p className="mt-4 text-xs text-muted-foreground">
             Daemon command handlers tracked in{' '}
-            <a
-              href="https://github.com/judgemind/judgemind/issues/2801"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-brand-accent dark:text-brand-accent-light underline-offset-2 hover:underline"
-            >
-              #2801
-            </a>
+            <IssueLink number={2801} />
             . Control buttons write to <code className="font-mono">dispatcher.commands</code>{' '}
             today; daemon-side handlers land with that issue.
           </p>

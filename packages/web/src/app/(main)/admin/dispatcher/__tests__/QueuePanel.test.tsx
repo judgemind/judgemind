@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { QueueBlockedPanel, QueuePanel, QueueReadyPanel } from '../QueuePanel';
 import { formatCooldown } from '../QueuePanel';
@@ -290,6 +291,39 @@ describe('QueuePanel — #3159 clickable count', () => {
     );
     const count = screen.getByTestId('queue-ready-count');
     expect(count.getAttribute('aria-label')).toMatch(/agent-ready/i);
+  });
+});
+
+// --- #2812 — blocker tooltip on blocked-panel rows.
+//             When `blockedBy` is non-empty, the row shows a tooltip
+//             trigger whose content lists each blocker as an IssueLink.
+describe('QueuePanel — #2812 blocker tooltip', () => {
+  it('blocked row with non-empty blockedBy shows a tooltip trigger with IssueLink elements per blocker', async () => {
+    const user = userEvent.setup();
+    const blocked = [
+      item({ issueNumber: 2500, title: 'needs infra fix', blockedBy: [2400, 2450] }),
+    ];
+    render(<QueueBlockedPanel items={blocked} />);
+    // The tooltip trigger button must be present.
+    const trigger = screen.getByTestId('blocker-tooltip-trigger-2500');
+    expect(trigger).toBeInTheDocument();
+    // Hover the trigger to open the Radix tooltip and render the content portal.
+    await user.hover(trigger);
+    // Wait for the tooltip content to appear in the document.
+    const contents = await screen.findAllByTestId('blocker-tooltip-content-2500');
+    expect(contents.length).toBeGreaterThan(0);
+    // Each blocker number has an IssueLink inside the tooltip.
+    // Use getAllByTestId because Radix may render in multiple places (SSR portal).
+    expect(screen.getAllByTestId('issue-link-2400').length).toBeGreaterThan(0);
+    expect(screen.getAllByTestId('issue-link-2450').length).toBeGreaterThan(0);
+  });
+
+  it('blocked row with empty blockedBy does NOT render a blocker tooltip trigger', () => {
+    const blocked = [
+      item({ issueNumber: 2600, title: 'no blockers listed', blockedBy: [] }),
+    ];
+    render(<QueueBlockedPanel items={blocked} />);
+    expect(screen.queryByTestId('blocker-tooltip-trigger-2600')).not.toBeInTheDocument();
   });
 });
 

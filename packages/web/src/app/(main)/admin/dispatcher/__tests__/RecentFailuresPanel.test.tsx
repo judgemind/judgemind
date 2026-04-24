@@ -275,4 +275,40 @@ describe('RecentFailuresPanel', () => {
       expect(pill).toHaveAttribute('title', 'some_new_category');
     });
   });
+
+  // #2812 Phase 2 — visual refinement tests.
+  describe('#2812 Phase 2 visual refinements', () => {
+    it('category pill has font-mono class (§2.2 identifier monospace)', () => {
+      render(
+        <RecentFailuresPanel
+          failures={[makeFailure({ category: 'subprocess_crash' })]}
+          nowMs={NOW_MS}
+        />,
+      );
+      const pill = screen.getByTestId('failure-category-pill-subprocess_crash');
+      expect(pill.className).toContain('font-mono');
+    });
+
+    it('most-recent cell is the last column (rightmost position)', () => {
+      render(
+        <RecentFailuresPanel
+          failures={[
+            makeFailure({ category: 'subprocess_crash', issueNumber: 9999 }),
+          ]}
+          nowMs={NOW_MS}
+        />,
+      );
+      // Find the data row and get all td elements.
+      const pill = screen.getByTestId('failure-category-pill-subprocess_crash');
+      const row = pill.closest('tr')!;
+      const cells = Array.from(row.querySelectorAll('td'));
+      // Most-recent cell should be the last td.
+      const lastCell = cells[cells.length - 1];
+      // It should NOT contain an issue link (that has moved before most-recent).
+      expect(lastCell.querySelector('[data-testid^="issue-link-"]')).toBeNull();
+      // The most-recent cell contains relative time text (not an issue link or pill).
+      // It should be a text-like content showing a time like "5m ago".
+      expect(lastCell.textContent).toMatch(/ago/i);
+    });
+  });
 });

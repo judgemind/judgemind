@@ -75,8 +75,8 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
               </th>
               <th scope="col" className="py-2 font-medium">Category</th>
               <th scope="col" className="py-2 font-medium">Count</th>
-              <th scope="col" className="py-2 font-medium">Most recent</th>
               <th scope="col" className="py-2 font-medium">Issue</th>
+              <th scope="col" className="py-2 font-medium text-right">Most recent</th>
             </tr>
           </thead>
           <tbody>
@@ -112,7 +112,7 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
                       // (CloudWatch queries, SQL filters, copy-paste)
                       // while the visible pill text shows the
                       // operator-friendly `displayCategory` string.
-                      className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+                      className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
                       title={group.category}
                       data-category={group.category}
                       data-testid={`failure-category-pill-${group.category}`}
@@ -121,18 +121,18 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
                     </span>
                   </td>
                   <td className="py-2 font-mono text-foreground">{group.count}</td>
-                  <td
-                    className="py-2 text-xs text-muted-foreground"
-                    title={group.mostRecent.ts}
-                  >
-                    {formatRelativeTime(group.mostRecent.ts, nowMs)}
-                  </td>
                   <td className="py-2">
                     {group.mostRecent.issueNumber !== null ? (
                       <IssueLink number={group.mostRecent.issueNumber} />
                     ) : (
                       <span className="text-muted-foreground">&mdash;</span>
                     )}
+                  </td>
+                  <td
+                    className="py-2 text-right text-xs text-muted-foreground"
+                    title={group.mostRecent.ts}
+                  >
+                    {formatRelativeTime(group.mostRecent.ts, nowMs)}
                   </td>
                 </tr>
               );

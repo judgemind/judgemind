@@ -9,6 +9,19 @@
  *
  * Kept in one file because each component is ~10 lines and a separate
  * file-per-component would dilute the density-first design.
+ *
+ * §2.3 Amber/yellow audit pass (Phase 2, #2812):
+ *   - `BRAND_LINK_CLASSES` uses amber — hot links, explicitly exempt.
+ *   - `p1` PriorityBadge uses amber — time-sensitive tier, explicitly exempt.
+ *   - `INCOMPLETE_SUCCESS_CLASSES` uses amber — shipped-but-incomplete signal,
+ *     semantically distinct from p1 amber (different chip size/shape/context).
+ *   - `crashed` OutcomePill uses amber — pipeline anomaly requiring operator
+ *     attention; different shape (circular) from the hot-link and priority badge.
+ *   - `needs_review` OutcomePill uses yellow (not amber) — deliberately
+ *     adjacent but perceptibly distinct, per §2.3 comment.
+ *   - All other amber/yellow usages are semantic and documented. No spurious
+ *     decorative amber was introduced. Review confirmed: BRAND.md §3
+ *     "Minimal accent use" principle is satisfied.
  */
 
 const REPO = 'judgemind/judgemind';
