@@ -1749,6 +1749,7 @@ def _extract_priority(labels: Any) -> str | None:
     return best
 
 
+# Cross-language contract: scripts/dispatcher/tests/fixtures/priority_rank_cases.json is the source of truth; TS mirror is priorityRank in packages/api/src/graphql/dispatcher/parse-labels.ts.
 def _priority_rank(labels: list[str] | Any) -> int:
     """Return the lowest (highest-priority) rank implied by ``labels``.
 

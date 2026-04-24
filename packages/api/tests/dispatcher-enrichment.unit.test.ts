@@ -16,6 +16,9 @@
  *   - The ``parse-labels`` helpers remain pure — no fetch.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 import { describe, it, expect } from 'vitest';
 import {
   CATEGORY_DISPLAY_NAMES,
@@ -752,6 +755,31 @@ describe('priorityRank', () => {
     ];
     expect(ranks).toEqual([0, 1, 2, 3, PRIORITY_RANK_NO_LABEL]);
     expect(ranks).toEqual([...ranks].sort((a, b) => a - b));
+  });
+
+  it('matches the shared cross-language fixture', () => {
+    // Cross-language contract: scripts/dispatcher/tests/fixtures/priority_rank_cases.json
+    // is the source of truth shared with the Python _priority_rank helper in
+    // scripts/dispatcher/daemon.py.  If either side drifts, this test (or its
+    // Python mirror) will fail on the drifted case.
+    //
+    // Resolution is explicit and relative to __dirname because no other test in
+    // packages/api/tests/ currently reads a JSON fixture from outside the package.
+    const fixturePath = path.resolve(
+      __dirname,
+      '../../../scripts/dispatcher/tests/fixtures/priority_rank_cases.json',
+    );
+    const cases = JSON.parse(fs.readFileSync(fixturePath, 'utf8')) as Array<{
+      name: string;
+      labels: unknown[];
+      expected_rank: number;
+    }>;
+
+    expect(cases.length).toBeGreaterThanOrEqual(8);
+
+    for (const c of cases) {
+      expect(priorityRank(c.labels), `case '${c.name}'`).toBe(c.expected_rank);
+    }
   });
 });
 
