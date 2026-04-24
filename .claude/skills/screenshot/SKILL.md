@@ -64,6 +64,17 @@ The `--auth` flag fetches admin credentials from AWS Secrets Manager (`judgemind
 
 The `agent-admin` account on dev has `users.role = 'admin'`, so both admin dashboards (`/admin/data-quality`, `/admin/dispatcher`) render with full admin content. To add a new admin-gated page, gate on `user.role === 'admin'` and `--auth` will Just Work.
 
+**Capture state behind a single click (modal, dropdown, popover):**
+```
+scripts/run-py.sh scripts/screenshot.py --auth /admin/dispatcher \
+    --click '[data-testid="queue-ready-count"]' \
+    --output tmp/ready_dialog.png
+```
+
+The `--click <selector>` flag performs one `page.click(selector)` after the existing `--wait` and before the screenshot, so the captured image shows the post-click state. Pair with `--click-wait <ms>` (default 500) so animated UIs (Radix Dialog, etc.) finish rendering before the snapshot — set `--click-wait 0` to capture a mid-animation frame, or bump it higher for slow transitions.
+
+If the selector matches nothing, the script exits non-zero with `Click target not found: <selector>` rather than letting Playwright time out. Multi-step flows (open menu, then click item, then type) are out of scope — write a one-off Playwright script for those.
+
 ### Options
 
 | Flag | Default | Description |
@@ -75,6 +86,8 @@ The `agent-admin` account on dev has `users.role = 'admin'`, so both admin dashb
 | `--height` | 720 | Viewport height in pixels |
 | `--wait` | 3000 | Wait time in ms after page load for JS rendering |
 | `--auth` | off | Log in as admin before taking the screenshot. Fetches credentials from AWS Secrets Manager (`judgemind/dev/agent-admin`, a `role='admin'` user on dev). Required for admin pages. |
+| `--click` | none | CSS selector to click after the `--wait` and before the screenshot. Use to capture modals/dropdowns/popovers behind a single interaction. Exits non-zero if the selector matches nothing. |
+| `--click-wait` | 500 | Wait time in ms after `--click` for animations (Radix Dialog ~200ms etc.) to settle before the screenshot. |
 
 ---
 
