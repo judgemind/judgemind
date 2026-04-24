@@ -25,6 +25,14 @@ _psycopg_stub.errors = _psycopg_errors
 sys.modules["psycopg"] = _psycopg_stub  # always overwrite (collection runs first)
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom markers so ``pytest -m integration`` works without warnings."""
+    config.addinivalue_line(
+        "markers",
+        "integration: tests exercising real subprocess/filesystem/git — excluded from default CI run",
+    )
+
+
 @pytest.fixture
 def psycopg_stub() -> MagicMock:
     """Return the conftest-installed psycopg stub for tests that need to wire .connect, etc."""

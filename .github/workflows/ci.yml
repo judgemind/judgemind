@@ -586,7 +586,7 @@ jobs:
       # (scripts/dispatcher/tests/) rather than under scripts/tests/.
       # Mocks psycopg — no DB required in CI. See issue #2729.
       - name: Test dispatcher daemon skeleton
-        run: pytest scripts/dispatcher/tests/ -v --tb=short
+        run: pytest scripts/dispatcher/tests/ -v --tb=short -m "not integration"
       - name: Check AWS CLI boolean flag usage
         run: scripts/check-aws-bool-flags.sh
       - name: Check for forbidden ECS services-stable waiter usage
@@ -669,6 +669,29 @@ jobs:
           # dedicated CI jobs. See the comment above this step for why.
           SKIP_TESTS: "scripts/tests/test_pre_push.sh"
         run: scripts/run-scripts-tests.sh
+
+  # ---------------------------------------------------------------
+  # Dispatcher integration tests — real git/subprocess, no mocks.
+  # Runs on the same path filter as scripts-tests (scripts/**) but in
+  # a separate job so the unit job stays network-free and fast.
+  # See scripts/dispatcher/tests/test_daemon_integration.py for the
+  # marker convention.  Issue #2810.
+  # ---------------------------------------------------------------
+  dispatcher-integration-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: scripts
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install pytest -e packages/judgemind-config
+      - name: Run dispatcher integration tests
+        run: pytest scripts/dispatcher/tests/test_daemon_integration.py -v --tb=short -m integration
 
   # ---------------------------------------------------------------
   # Coverage gates: diff coverage (new lines) + overall floor ratchet
