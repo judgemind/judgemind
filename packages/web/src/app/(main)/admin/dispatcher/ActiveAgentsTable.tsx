@@ -157,9 +157,6 @@ function ActiveAgentRow({
         >
           {agent.phase}
         </span>
-        <span className="w-16 flex-shrink-0 text-right font-mono text-xs text-muted-foreground">
-          {elapsed}
-        </span>
         <span className="flex-shrink-0 text-xs">
           {logsHref ? (
             <a
@@ -178,6 +175,9 @@ function ActiveAgentRow({
               {agent.worktreePath.split('/').pop() ?? agent.worktreePath}
             </span>
           )}
+        </span>
+        <span className="w-16 flex-shrink-0 text-right font-mono text-xs text-muted-foreground">
+          {elapsed}
         </span>
         <span className="flex flex-shrink-0 gap-1">
           <Button

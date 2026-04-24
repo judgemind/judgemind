@@ -169,6 +169,18 @@ describe('RecentFailuresPanel', () => {
     });
   });
 
+  // #2812: §2.2 — category pill is font-mono.
+  it('§2.2 — category pill is font-mono', () => {
+    render(
+      <RecentFailuresPanel
+        failures={[makeFailure({ category: 'subprocess_crash', displayCategory: 'subprocess crashed' })]}
+        nowMs={NOW_MS}
+      />,
+    );
+    const pill = screen.getByTestId('failure-category-pill-subprocess_crash');
+    expect(pill.className).toContain('font-mono');
+  });
+
   // #2948: the Category column renders the operator-friendly
   // `displayCategory` string instead of the raw category token,
   // matching the Recently Completed tooltip rephrasing from #2935.
