@@ -54,6 +54,20 @@ If a task naturally breaks into 2+ independent pieces of work, create child issu
 - Sub-tasks should be self-contained — another agent should be able to pick one up independently.
 - Label child issues appropriately and add `agent/ready` if fully specified.
 
+## Backfill Migrations: Row-Class Coverage
+
+Why: Issues #2961 and #2960 revealed that a backfill migration silently skipped entire row classes — specifically, `failed` and `plan_blocked` rows were left un-updated because the SQL filter only matched the modal (`crashed`) case. The checklist below makes row-class coverage an explicit authoring and implementation requirement so the same oversight cannot recur. See #2961 (checklist formalized) and #2960 (prior incident).
+
+When filing or implementing an issue that includes a backfill migration (any PR touching `packages/api/migrations/*.sql` with an `UPDATE`, `DELETE`, or `INSERT` that writes against existing rows), follow this checklist:
+
+- **Enumerate every row class in the issue body.** If the affected table has a status/state/type column, list all distinct values that the migration must handle — not just the most common one. Present them as a table or bulleted list with the expected row count for each class (even if that count is 0).
+- **Cross-reference the SQL filter against each row class.** For each `(status, failure_summary, …)` tuple in your row-class table, verify the SQL `WHERE` clause matches or explicitly excludes that row. Distinct status values (`failed` / `plan_blocked` / `crashed`) require distinct `OR` branches or a generalized filter — a single-value filter is almost always a bug.
+- **The acceptance criteria must include a post-backfill invariant `SELECT`.** State the exact query and its expected result (typically `0` rows matching the pre-migration condition). Example:
+  ```
+  Verify: SELECT COUNT(*) FROM staging.captures WHERE … returns 0
+  ```
+- **For large tables, include a before/after row-count breakdown by status.** Confirm the counts add up correctly — total updated should equal the sum of per-class counts.
+
 ## Investigation Tasks
 
 Investigation tasks produce documentation, not code:
