@@ -821,6 +821,7 @@ class TestAtomicClaim:
         # #2899 — priority column is now part of every INSERT.
         insert_sql = inserts[0][0]
         assert "priority" in insert_sql
+        # Single atomic claim: exactly one commit.
         assert conn.commits == 1
         assert handler.events("claim_succeeded") != []
 
