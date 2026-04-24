@@ -3,6 +3,8 @@ node_modules/
 __pycache__/
 *.pyc
 .venv/
+# Dispatcher daemon venv (created by scripts/install-dispatcher-venv.sh)
+scripts/dispatcher/.venv/
 .venv-scripts/
 venv/
 
