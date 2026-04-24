@@ -112,7 +112,7 @@ export function RecentFailuresPanel({ failures, nowMs }: RecentFailuresPanelProp
                       // (CloudWatch queries, SQL filters, copy-paste)
                       // while the visible pill text shows the
                       // operator-friendly `displayCategory` string.
-                      className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+                      className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
                       title={group.category}
                       data-category={group.category}
                       data-testid={`failure-category-pill-${group.category}`}

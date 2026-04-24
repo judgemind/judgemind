@@ -11,6 +11,34 @@
  * file-per-component would dilute the density-first design.
  */
 
+// ---------------------------------------------------------------------------
+// Amber / yellow usage allow-list (#2812 AC3)
+//
+// All amber/yellow Tailwind classes in the dispatcher UI are SEMANTIC — they
+// encode outcome or status, not decoration. The approved uses are:
+//
+//   amber — p1 PriorityBadge (time-sensitive priority indicator)
+//           OutcomePill `crashed` variant (amber ⚠ — non-fatal agent failure)
+//           OutcomePill `shipped_incomplete` variant (amber ✓ — merged but
+//             post-merge bookkeeping not finished; #2953)
+//           INCOMPLETE_SUCCESS_CLASSES (same as above)
+//           Stale-data indicator in DispatcherDashboard (yellow-700/300 text
+//             + yellow-500 pulse dot — indicates last poll failed, cached state)
+//
+//   yellow — OutcomePill `needs_review` variant (yellow ◐ — ralph SHIP'd but
+//              operator review needed; #2856)
+//            Daemon paused-status pill in DispatcherHeader (if applicable)
+//
+// Hot links use `text-brand-accent` / `text-brand-accent-light` (the brand
+// amber token defined in tailwind.config.ts — see docs/BRAND.md §Tailwind
+// Token Mapping). This is NOT Tailwind's built-in `amber` scale — it maps
+// to the design-token alias and is also an approved use.
+//
+// Any new amber/yellow use MUST be added here with a rationale. The
+// absence of a use from this list is a signal to challenge it in review.
+// Audit: grep -n 'amber\|yellow' packages/web/src/app/(main)/admin/dispatcher/*.tsx
+// ---------------------------------------------------------------------------
+
 const REPO = 'judgemind/judgemind';
 
 // Brand amber token for hot links. Note: `text-accent` is shadcn's

@@ -3,6 +3,11 @@
 import type { CSSProperties } from 'react';
 import { SECTION_HEADING } from '@/lib/typography';
 import type { QueueItem } from '@/lib/dispatcher-queries';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { IssueLink, PriorityBadge } from './ui-primitives';
 
 interface QueuePanelProps {
@@ -318,13 +323,35 @@ export function QueueRow({
         </span>
       )}
       <div className="min-w-0 flex-1">
-        <span
-          className="block break-words text-foreground"
-          data-testid="queue-row-title"
-          title={item.title}
-        >
-          {item.title}
-        </span>
+        {item.blockedBy.length > 0 ? (
+          <Tooltip delayDuration={0}>
+            <TooltipTrigger asChild>
+              <span
+                className="block break-words text-foreground"
+                data-testid={`blocker-tooltip-trigger-${item.issueNumber}`}
+                title={item.title}
+              >
+                {item.title}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              <span className="flex flex-wrap items-center gap-1 text-xs">
+                Blocked by{' '}
+                {item.blockedBy.map((blockerNumber) => (
+                  <IssueLink key={blockerNumber} number={blockerNumber} />
+                ))}
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        ) : (
+          <span
+            className="block break-words text-foreground"
+            data-testid="queue-row-title"
+            title={item.title}
+          >
+            {item.title}
+          </span>
+        )}
       </div>
     </li>
   );

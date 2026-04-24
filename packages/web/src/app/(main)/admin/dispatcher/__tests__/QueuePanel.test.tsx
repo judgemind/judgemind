@@ -1,10 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
-import { QueueBlockedPanel, QueuePanel, QueueReadyPanel } from '../QueuePanel';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { RenderOptions } from '@testing-library/react';
+import type { ReactElement } from 'react';
+import { QueueBlockedPanel, QueuePanel, QueueReadyPanel, QueueRow } from '../QueuePanel';
 import { formatCooldown } from '../QueuePanel';
 import type { QueueItem } from '@/lib/dispatcher-queries';
+import { TooltipProvider } from '@/components/ui/tooltip';
 
 const now = Date.parse('2026-04-18T12:00:00Z');
+
+/**
+ * Render wrapper that includes `TooltipProvider` — required because `QueueRow`
+ * uses Radix `<Tooltip>` on blocked rows (#2812) and Radix requires the
+ * provider in the tree.
+ */
+function renderWithTooltip(ui: ReactElement, options?: RenderOptions) {
+  return render(<TooltipProvider>{ui}</TooltipProvider>, options);
+}
 
 function item(overrides: Partial<QueueItem>): QueueItem {
   return {
@@ -21,7 +33,7 @@ function item(overrides: Partial<QueueItem>): QueueItem {
 
 describe('QueuePanel', () => {
   it('renders empty states for both panels when no items', () => {
-    render(<QueuePanel queueReady={[]} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={[]} queueBlocked={[]} nowMs={now} />);
     expect(screen.getByText(/queue empty/i)).toBeInTheDocument();
     expect(screen.getByText(/no blocked issues/i)).toBeInTheDocument();
   });
@@ -31,7 +43,7 @@ describe('QueuePanel', () => {
       item({ issueNumber: 2801, title: 'wire dispatcherControl through to daemon' }),
       item({ issueNumber: 2802, title: 'recently completed panel', priority: 'p2' }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.getByTestId('issue-link-2801')).toHaveAttribute(
       'href',
       'https://github.com/judgemind/judgemind/issues/2801',
@@ -49,7 +61,7 @@ describe('QueuePanel', () => {
     const blocked = [
       item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
     ];
-    render(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
     expect(screen.getByTestId('issue-link-2500')).toBeInTheDocument();
     expect(screen.getByText('blocked issue')).toBeInTheDocument();
   });
@@ -60,7 +72,7 @@ describe('QueuePanel', () => {
       item({ issueNumber: 2801, title: 'first' }),
       item({ issueNumber: 2802, title: 'second' }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.queryByText('#1')).not.toBeInTheDocument();
     expect(screen.queryByText('#2')).not.toBeInTheDocument();
     expect(screen.queryAllByTestId('queue-row-slot')).toHaveLength(0);
@@ -70,7 +82,7 @@ describe('QueuePanel', () => {
     const blocked = [
       item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
     ];
-    render(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
     expect(screen.queryByText('[2]')).not.toBeInTheDocument();
   });
 
@@ -82,7 +94,7 @@ describe('QueuePanel', () => {
         createdAt: '2026-04-16T11:00:00Z', // 2 d ago from the fixed `now`
       }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.queryByText(/\bago\b/i)).not.toBeInTheDocument();
   });
 
@@ -90,7 +102,7 @@ describe('QueuePanel', () => {
     const longTitle =
       'fix(admin-dispatcher): (title unavailable) everywhere + 20562-day-ago timestamps + strip wasteful columns';
     const items = [item({ issueNumber: 2818, title: longTitle })];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     const titleEl = screen.getByText(longTitle);
     // Title cell uses `break-words` (soft wrap) rather than `truncate`.
     expect(titleEl.className).toMatch(/break-words/);
@@ -105,7 +117,7 @@ describe('QueuePanel', () => {
       item({ issueNumber: 2801, title: 'first' }),
       item({ issueNumber: 2802, title: 'second' }),
     ];
-    render(
+    renderWithTooltip(
       <QueuePanel
         queueReady={items}
         queueBlocked={[]}
@@ -125,7 +137,7 @@ describe('QueuePanel', () => {
     const blocked = [
       item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
     ];
-    render(
+    renderWithTooltip(
       <QueuePanel
         queueReady={[]}
         queueBlocked={blocked}
@@ -142,7 +154,7 @@ describe('QueuePanel', () => {
     // total>0 always yields at least 1 shown), but the blocked-panel
     // empty-with-total-nonzero case is explicitly called out in the
     // issue. The component MUST still render `0 / N`, never "0 shown".
-    render(
+    renderWithTooltip(
       <QueuePanel
         queueReady={[]}
         queueBlocked={[]}
@@ -161,7 +173,7 @@ describe('QueuePanel', () => {
     // have a total is strictly safer than guessing — total === shown
     // would be a lie when the tail is capped.
     const items = [item({ issueNumber: 2801, title: 'first' })];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('1 shown');
     expect(screen.getByTestId('queue-blocked-count')).toHaveTextContent('0 shown');
   });
@@ -176,7 +188,7 @@ describe('QueuePanel', () => {
       item({ issueNumber: 2801, title: 'first' }),
       item({ issueNumber: 2802, title: 'second' }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     const row1 = screen.getByTestId('queue-row-2801');
     const row2 = screen.getByTestId('queue-row-2802');
     expect((row1 as HTMLElement).style.viewTransitionName).toBe('issue-2801');
@@ -187,7 +199,7 @@ describe('QueuePanel', () => {
     const blocked = [
       item({ issueNumber: 2500, title: 'blocked issue' }),
     ];
-    render(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
     // Blocked rows are intentionally not animated — they don't show up
     // in the Queue → Active → Completed flow, and giving them the same
     // `issue-<N>` name as a ready row of the same issue number would
@@ -211,7 +223,7 @@ describe('QueuePanel', () => {
       item({ issueNumber: 3151, title: 'first' }),
       item({ issueNumber: 3152, title: 'second' }),
     ];
-    render(<QueueReadyPanel items={items} total={50} dialogOpen />);
+    renderWithTooltip(<QueueReadyPanel items={items} total={50} dialogOpen />);
     // Rows still render — only the animation hook is suppressed.
     expect(screen.getByText('first')).toBeInTheDocument();
     expect(screen.getByText('second')).toBeInTheDocument();
@@ -223,14 +235,14 @@ describe('QueuePanel', () => {
 
   it('#3206: ready rows KEEP view-transition-name when dialogOpen=false (default)', () => {
     const items = [item({ issueNumber: 3151, title: 'first' })];
-    render(<QueueReadyPanel items={items} total={50} />);
+    renderWithTooltip(<QueueReadyPanel items={items} total={50} />);
     const row = screen.getByTestId('queue-row-3151');
     expect((row as HTMLElement).style.viewTransitionName).toBe('issue-3151');
   });
 
   it('#3206: dialogOpen=true also strips view-transition-name when explicit', () => {
     const items = [item({ issueNumber: 3151, title: 'first' })];
-    render(<QueueReadyPanel items={items} total={50} dialogOpen={true} />);
+    renderWithTooltip(<QueueReadyPanel items={items} total={50} dialogOpen={true} />);
     // No queue-row-<N> testid → no view-transition-name in style.
     expect(screen.queryByTestId('queue-row-3151')).toBeNull();
   });
@@ -240,7 +252,7 @@ describe('QueuePanel', () => {
     const items = [
       item({ issueNumber: 3001, title: 'cooled down issue', cooldownSecondsRemaining: 1800 }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     const badge = screen.getByTestId('cooldown-badge-3001');
     expect(badge).toBeInTheDocument();
     // 1800s → 30m
@@ -251,7 +263,7 @@ describe('QueuePanel', () => {
     const items = [
       item({ issueNumber: 3002, title: 'fresh issue', cooldownSecondsRemaining: null }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.queryByTestId('cooldown-badge-3002')).toBeNull();
   });
 
@@ -259,7 +271,7 @@ describe('QueuePanel', () => {
     const items = [
       item({ issueNumber: 3003, title: 'expired cooldown', cooldownSecondsRemaining: 0 }),
     ];
-    render(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
+    renderWithTooltip(<QueuePanel queueReady={items} queueBlocked={[]} nowMs={now} />);
     expect(screen.queryByTestId('cooldown-badge-3003')).toBeNull();
   });
 });
@@ -274,14 +286,14 @@ describe('QueuePanel — #3159 clickable count', () => {
   ];
 
   it('ready: count renders as a span when onCountClick is omitted (back-compat)', () => {
-    render(<QueueReadyPanel items={items} total={50} />);
+    renderWithTooltip(<QueueReadyPanel items={items} total={50} />);
     const count = screen.getByTestId('queue-ready-count');
     expect(count.tagName).toBe('SPAN');
   });
 
   it('ready: count renders as a button and fires onCountClick when provided', () => {
     const onCountClick = vi.fn();
-    render(
+    renderWithTooltip(
       <QueueReadyPanel
         items={items}
         total={50}
@@ -296,14 +308,14 @@ describe('QueuePanel — #3159 clickable count', () => {
   });
 
   it('blocked: count renders as a span when onCountClick is omitted (back-compat)', () => {
-    render(<QueueBlockedPanel items={[]} total={5} />);
+    renderWithTooltip(<QueueBlockedPanel items={[]} total={5} />);
     const count = screen.getByTestId('queue-blocked-count');
     expect(count.tagName).toBe('SPAN');
   });
 
   it('blocked: count renders as a button and fires onCountClick when provided', () => {
     const onCountClick = vi.fn();
-    render(
+    renderWithTooltip(
       <QueueBlockedPanel
         items={items}
         total={50}
@@ -318,7 +330,7 @@ describe('QueuePanel — #3159 clickable count', () => {
 
   it('button has accessible aria-label that names the bucket', () => {
     const onCountClick = vi.fn();
-    render(
+    renderWithTooltip(
       <QueueReadyPanel
         items={items}
         total={50}
@@ -327,6 +339,73 @@ describe('QueuePanel — #3159 clickable count', () => {
     );
     const count = screen.getByTestId('queue-ready-count');
     expect(count.getAttribute('aria-label')).toMatch(/agent-ready/i);
+  });
+});
+
+// --- #2812 — blocker tooltip hot links on blocked rows.
+describe('QueuePanel — #2812 blocker tooltip', () => {
+  it('renders blocker numbers as hot links inside the blocked-row tooltip', async () => {
+    const blockedItem: QueueItem = {
+      issueNumber: 9001,
+      title: 'blocked issue with two blockers',
+      priority: 'p2',
+      labels: ['priority/p2', 'status/blocked'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [2500, 2600],
+      cooldownSecondsRemaining: null,
+    };
+    render(
+      <TooltipProvider>
+        <QueueRow item={blockedItem} />
+      </TooltipProvider>,
+    );
+    // The tooltip trigger should be present for rows with blockers.
+    const trigger = screen.getByTestId('blocker-tooltip-trigger-9001');
+    expect(trigger).toBeInTheDocument();
+    // Fire pointerMove to begin the tooltip open sequence (Radix opens on
+    // pointerMove). Then advance all timers (even delayDuration=0 uses setTimeout).
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        fireEvent.pointerMove(trigger);
+        vi.runAllTimers();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    // Tooltip content renders the blocker links.
+    const link2500 = screen.getAllByTestId('issue-link-2500')[0];
+    const link2600 = screen.getAllByTestId('issue-link-2600')[0];
+    expect(link2500).toBeInTheDocument();
+    expect(link2600).toBeInTheDocument();
+    // Check the links have the correct hrefs.
+    expect(link2500).toHaveAttribute(
+      'href',
+      'https://github.com/judgemind/judgemind/issues/2500',
+    );
+    expect(link2600).toHaveAttribute(
+      'href',
+      'https://github.com/judgemind/judgemind/issues/2600',
+    );
+  });
+
+  it('suppresses the blocker tooltip when blockedBy is empty', () => {
+    const readyItem: QueueItem = {
+      issueNumber: 9002,
+      title: 'ready issue no blockers',
+      priority: 'p2',
+      labels: ['priority/p2', 'agent/ready'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [],
+      cooldownSecondsRemaining: null,
+    };
+    render(
+      <TooltipProvider>
+        <QueueRow item={readyItem} />
+      </TooltipProvider>,
+    );
+    // No tooltip trigger for rows without blockers.
+    expect(screen.queryByTestId('blocker-tooltip-trigger-9002')).toBeNull();
   });
 });
 

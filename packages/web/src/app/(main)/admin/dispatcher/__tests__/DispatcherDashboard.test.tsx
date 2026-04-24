@@ -747,6 +747,39 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
   });
 });
 
+// #2812: Phase 2 polish — vertical density + IssueLink for #2801.
+describe('DispatcherDashboard — #2812 Phase 2 polish', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+  });
+
+  it('§2.1 — grid uses gap-y-4', () => {
+    renderDashboard();
+    const deck = screen.getByTestId('dispatcher-two-column-deck');
+    expect(deck.className).toMatch(/gap-x-6 gap-y-4/);
+  });
+
+  it('§2.1 — column wrappers use gap-4', () => {
+    renderDashboard();
+    const left = screen.getByTestId('dispatcher-column-left');
+    const right = screen.getByTestId('dispatcher-column-right');
+    expect(left.className).toMatch(/gap-4/);
+    expect(right.className).toMatch(/gap-4/);
+  });
+
+  it('§2.5 — #2801 issue reference is a hot link via IssueLink', () => {
+    renderDashboard();
+    expect(screen.getByTestId('issue-link-2801')).toBeInTheDocument();
+    expect(screen.getByTestId('issue-link-2801')).toHaveAttribute(
+      'href',
+      'https://github.com/judgemind/judgemind/issues/2801',
+    );
+  });
+});
+
 // #3206: Magic Move view-transition-names on cockpit panel rows must be
 // SUPPRESSED whenever any full-list dialog is open, otherwise the
 // browser's view-transition compositor layer paints over the Radix
