@@ -406,9 +406,18 @@ class TestSelfDeployDetectionPrePush:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         with patch(
             "subprocess.run",
-            side_effect=[rev_list_ahead, commit_ok, git_show, push_ok, pr_create_ok],
+            side_effect=[rev_list_ahead, commit_ok, git_show, fetch_ok, rebase_ok, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=2953, worktree=worktree)
 
@@ -479,9 +488,18 @@ class TestSelfDeployDetectionPrePush:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         with patch(
             "subprocess.run",
-            side_effect=[rev_list_ahead, commit_ok, git_show, push_ok, pr_create_ok],
+            side_effect=[rev_list_ahead, commit_ok, git_show, fetch_ok, rebase_ok, push_ok, pr_create_ok],
         ):
             d._push_and_open_pr(agent_id=agent_id, issue_number=42, worktree=worktree)
 
@@ -540,12 +558,23 @@ class TestSelfDeployDetectionPrePush:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         with patch(
             "subprocess.run",
             side_effect=[
                 rev_list_ahead,
                 commit_ok,
                 git_show_fail,
+                fetch_ok,
+                rebase_ok,
                 push_ok,
                 pr_create_ok,
             ],

@@ -303,6 +303,16 @@ class TestGitPushFailedWritesFailureRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        # Issue #2964: fetch+rebase fires before push on the clean path.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         # Issue #3089: ``git push`` now routes through the shared
         # 3-attempt retry helper, so the failing push consumes 3
         # ``subprocess.run`` calls instead of 1. ``time.sleep`` is
@@ -311,6 +321,8 @@ class TestGitPushFailedWritesFailureRow:
             rev_list_ahead,
             commit_ok,
             git_show_empty,
+            fetch_ok,
+            rebase_ok,
             push_fail,
             push_fail,
             push_fail,
@@ -385,6 +397,16 @@ class TestGitPushFailedWritesFailureRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        # Issue #2964: fetch+rebase fires before push on the clean path.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         # Issue #3089: 3-attempt retry — 3 push_fail results needed.
         with (
             patch(
@@ -393,6 +415,8 @@ class TestGitPushFailedWritesFailureRow:
                     rev_list_ahead,
                     commit_ok,
                     git_show_empty,
+                    fetch_ok,
+                    rebase_ok,
                     push_fail,
                     push_fail,
                     push_fail,
@@ -459,6 +483,16 @@ class TestGitPushFailedWritesPhaseOutputRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        # Issue #2964: fetch+rebase fires before push on the clean path.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         # Issue #3089: 3-attempt retry — 3 push_fail results needed.
         with (
             patch(
@@ -467,6 +501,8 @@ class TestGitPushFailedWritesPhaseOutputRow:
                     rev_list_ahead,
                     commit_ok,
                     git_show_empty,
+                    fetch_ok,
+                    rebase_ok,
                     push_fail,
                     push_fail,
                     push_fail,
