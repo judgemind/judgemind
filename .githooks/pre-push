@@ -125,8 +125,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
                     fi
                 fi
             elif [ -f "packages/$pkg/package.json" ]; then
-                if ! echo "$changed_ts_pkgs" | grep -qw "$pkg" 2>/dev/null; then
-                    changed_ts_pkgs="$changed_ts_pkgs $pkg"
+                # Skip files that ESLint cannot lint: SQL migrations and the
+                # schema snapshot. These are not TypeScript source files and
+                # triggering the lint/coverage pass on migration-only pushes
+                # causes `npm run lint` to fail because node_modules may not
+                # be installed. See #2877.
+                if [[ "$file" =~ ^packages/[^/]+/migrations/.+\.sql$ ]] \
+                        || [[ "$file" =~ ^packages/[^/]+/src/data-access/schema\.sql$ ]]; then
+                    : # non-lintable — skip changed_ts_pkgs accumulation
+                else
+                    if ! echo "$changed_ts_pkgs" | grep -qw "$pkg" 2>/dev/null; then
+                        changed_ts_pkgs="$changed_ts_pkgs $pkg"
+                    fi
                 fi
                 # Check if this is a code file (.ts, .tsx, .js, .jsx in src/ or tests/)
                 if [[ "$file" =~ ^packages/[^/]+/(src|tests|__tests__|lib)/.+\.(ts|tsx|js|jsx)$ ]]; then
