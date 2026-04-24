@@ -175,6 +175,20 @@ PHASE_DAEMON_RESTART_ABANDONED = "daemon_restart_abandoned"
 #: Killswitch engaged terminal phase.
 PHASE_PAUSED_BY_KILLSWITCH = "paused_by_killswitch"
 
+#: Agent-runner (#3086 Stage 2+) post-ralph phase-failure terminals.
+#: Set by ``agent_runner_reaped_failure`` in
+#: ``scripts/dispatcher/agent-runner-entrypoint.sh`` when one of the
+#: post-PR mechanical phases exhausts its budget (#3176). The daemon's
+#: subprocess path routes these through ``_handle_agent_failure`` +
+#: diagnoser; the ECS path uses these as direct terminals so the
+#: per-agent Fargate task exits cleanly (the daemon's supervisor tick
+#: still picks up the row for diagnosis via ``_find_diagnoser_candidates``).
+PHASE_AWAITING_CI_FAILED = "awaiting_ci_failed"
+PHASE_AWAITING_CI_TIMEOUT = "awaiting_ci_timeout"
+PHASE_MERGE_FAILED = "merge_failed"
+PHASE_AWAITING_DEPLOY_FAILED = "awaiting_deploy_failed"
+PHASE_AWAITING_DEPLOY_TIMEOUT = "awaiting_deploy_timeout"
+
 # ---------------------------------------------------------------------------
 # Verdict constants — the string values produced by the phase-output JSONs.
 # ---------------------------------------------------------------------------
@@ -255,6 +269,12 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_FORCE_STOPPED,
         PHASE_DAEMON_RESTART_ABANDONED,
         PHASE_PAUSED_BY_KILLSWITCH,
+        # #3176 — agent-runner post-ralph phase-failure terminals.
+        PHASE_AWAITING_CI_FAILED,
+        PHASE_AWAITING_CI_TIMEOUT,
+        PHASE_MERGE_FAILED,
+        PHASE_AWAITING_DEPLOY_FAILED,
+        PHASE_AWAITING_DEPLOY_TIMEOUT,
     }
 )
 
@@ -930,6 +950,11 @@ __all__ = [
     "PHASE_FORCE_STOPPED",
     "PHASE_DAEMON_RESTART_ABANDONED",
     "PHASE_PAUSED_BY_KILLSWITCH",
+    "PHASE_AWAITING_CI_FAILED",
+    "PHASE_AWAITING_CI_TIMEOUT",
+    "PHASE_MERGE_FAILED",
+    "PHASE_AWAITING_DEPLOY_FAILED",
+    "PHASE_AWAITING_DEPLOY_TIMEOUT",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",
