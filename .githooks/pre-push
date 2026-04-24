@@ -581,6 +581,23 @@ if [ -n "$changed_dispatcher_deps" ]; then
     else
         echo "  WARNING: scripts/check-dispatcher-image-deps.sh not found or not executable — skipping" >&2
     fi
+    # Issue #2829: git subprocesses in daemon.py must anchor at
+    # _git_parent_root(), not _repo_root() — the latter returns /app
+    # in Fargate (no .git directory). Mirrors the CI step so the
+    # failure is caught locally before the CI round trip.
+    if [ -x scripts/check-no-git-repo-root-anchor.sh ]; then
+        if ! run_check "_" "scripts/check-no-git-repo-root-anchor.sh" scripts/check-no-git-repo-root-anchor.sh; then
+            echo "  A git subprocess.run call in scripts/dispatcher/daemon.py" >&2
+            echo "  anchors at self._repo_root() instead of self._git_parent_root()." >&2
+            echo "  In Fargate mode, _repo_root() returns /app (no .git directory)." >&2
+            echo "" >&2
+            echo "  Fix: replace self._repo_root() with self._git_parent_root()" >&2
+            echo "  in the flagged git subprocess call. See issue #2829." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-no-git-repo-root-anchor.sh not found or not executable — skipping" >&2
+    fi
 fi
 
 # -------------------------------------------------------------------
