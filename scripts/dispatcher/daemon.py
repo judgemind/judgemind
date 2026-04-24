@@ -11600,17 +11600,26 @@ class DispatcherDaemon:
                 # handler has the counter in hand without a second
                 # round-trip. See ``_merge_pr_and_advance``.
                 #
-                # exec-mode-agnostic (#3158) — with a caveat: the
-                # SELECT matches BOTH subprocess and ECS agents. ECS
-                # agents in post-ralph phases are simultaneously
-                # advanced by the agent-runner's mechanical stubs,
-                # producing a daemon↔runner race. Tracked as
-                # #3167 in the #3158 audit (architectural decision
-                # needed: who owns the post-ralph pipeline).
+                # exec-mode-agnostic (#3158) — the SELECT itself
+                # matches BOTH subprocess and ECS agents, but the
+                # dispatch in :meth:`_advance_running_agents` branches
+                # on ``execution_mode`` to skip ECS rows entirely. The
+                # per-agent Fargate task-runner (#3176 Stage 3) drives
+                # its own post-ralph state machine (awaiting_ci →
+                # merge → awaiting_deploy → verify → retro), so the
+                # daemon's supervisor must NOT re-enter those phase
+                # handlers for ECS agents. Pre-#3196 the daemon's
+                # advance path raced the runner AND spawned claude
+                # subprocesses on the MainThread for ECS agents
+                # (verify/fix_ci/retro), which wedged scheduler_tick
+                # and blocked cap>1 Phase 4 entry. The ``execution_mode``
+                # column surfaces in the SELECT so the dispatch can
+                # filter on it without a second round-trip.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status, "
-                    "       merge_unstick_attempts "
+                    "       merge_unstick_attempts, "
+                    "       COALESCE(execution_mode, 'subprocess') "
                     "FROM dispatcher.agents "
                     "WHERE (status = 'running' "
                     "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
@@ -11633,6 +11642,15 @@ class DispatcherDaemon:
                                 int(row[7])
                                 if len(row) > 7 and row[7] is not None
                                 else 0
+                            ),
+                            # #3196: default to 'subprocess' if COALESCE
+                            # in the SELECT is stripped by a fake cursor
+                            # in tests. Also defaults to 'subprocess'
+                            # when the column is absent (pre-#3091
+                            # migration rows); the subprocess lane is
+                            # the legacy/safe default.
+                            "execution_mode": (
+                                str(row[8]) if len(row) > 8 and row[8] else "subprocess"
                             ),
                         }
                     )
@@ -11676,6 +11694,65 @@ class DispatcherDaemon:
             agent_id = agent["agent_id"]
             phase = agent["phase"]
             status = agent.get("status", "running")
+            # Issue #3196: ECS-mode agents have their own post-ralph
+            # state machine inside ``agent-runner-entrypoint.sh``
+            # (#3176 Stage 3) — awaiting_ci → merge → awaiting_deploy
+            # → verify → retro runs in the per-agent Fargate task.
+            # The daemon's supervisor tick MUST NOT re-enter the phase
+            # handlers below for ECS agents. Pre-#3196 the daemon
+            # raced the runner AND — worst case — spawned a claude
+            # subprocess on the MainThread inside
+            # ``_run_verify_and_complete`` / ``_run_fix_ci`` /
+            # ``_run_retro_phase``. The subprocess.wait() call on the
+            # MainThread blocked ``scheduler_tick`` for the full
+            # verify/retro duration (multiple minutes), which made
+            # ``concurrency_cap > 1`` impossible (no new claims) and
+            # eventually tripped the 5-minute
+            # ``scheduler_tick_stalled`` watchdog. Short-circuit here
+            # so the daemon observes the entrypoint's phase advances
+            # via the normal terminal SELECT (cleanup_done /
+            # cleanup_blocked) without ever entering a blocking
+            # subprocess.wait.
+            execution_mode = agent.get("execution_mode", "subprocess")
+            if execution_mode == "ecs":
+                # The ``awaiting_deploy`` phase carries the verify-
+                # blocks-MainThread regression (the bug the operator
+                # filed #3196 for); emit the AC-named event for that
+                # specific phase so grep-hooks catch the exact case.
+                # Other phases still need to be skipped to prevent
+                # the identical race, just with a generic event name.
+                if phase == "awaiting_deploy":
+                    self._log.info(
+                        "daemon.verify_skipped_ecs_agent",
+                        extra={
+                            "event": "verify_skipped_ecs_agent",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "pr_number": agent.get("pr_number"),
+                            "status": status,
+                            "detail": (
+                                "ECS agent — verify runs in Fargate "
+                                "agent-runner-entrypoint.sh; daemon "
+                                "does not re-enter verify on MainThread."
+                            ),
+                        },
+                    )
+                else:
+                    self._log.info(
+                        "daemon.supervise_skipped_ecs_agent",
+                        extra={
+                            "event": "supervise_skipped_ecs_agent",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "phase": phase,
+                            "status": status,
+                            "detail": (
+                                "ECS agent — agent-runner-entrypoint.sh "
+                                "owns post-ralph phase advancement."
+                            ),
+                        },
+                    )
+                continue
             try:
                 if phase == "awaiting_ci":
                     self._advance_awaiting_ci(agent)
@@ -13020,9 +13097,40 @@ class DispatcherDaemon:
         Finds the deploy runs triggered by the merge commit, polls
         their conclusions, and advances to verify on success / treats
         doc-only PRs as "no deploy applicable".
+
+        Issue #3196: ECS-mode agents are short-circuited at the top
+        of :meth:`_advance_running_agents`, so this method runs for
+        subprocess-mode agents only in the steady state. The redundant
+        ECS guard below is a belt-and-suspenders defense for recovery
+        / direct-call paths (tests, future refactors) — if an ECS agent
+        reaches this method, emit ``verify_skipped_ecs_agent`` and
+        return without spawning ``/task-v2-verify`` on the MainThread.
+        exec-mode-agnostic (#3196): the subprocess.wait() on the
+        MainThread inside ``_run_verify_and_complete`` is the specific
+        regression this method's ECS guard prevents.
         """
         agent_id = agent["agent_id"]
         pr_number = agent["pr_number"]
+
+        # Issue #3196: ECS agents run verify in the Fargate task
+        # (``agent-runner-entrypoint.sh``); the daemon must not
+        # re-enter verify on the MainThread.
+        execution_mode = agent.get("execution_mode", "subprocess")
+        if execution_mode == "ecs":
+            self._log.info(
+                "daemon.verify_skipped_ecs_agent",
+                extra={
+                    "event": "verify_skipped_ecs_agent",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "detail": (
+                        "ECS agent reached _advance_awaiting_deploy "
+                        "directly; verify runs in Fargate task."
+                    ),
+                },
+            )
+            return
 
         if pr_number is None:  # pragma: no cover — 3A always sets pr_number
             self._log.warning(
