@@ -442,6 +442,8 @@ New route `packages/web/app/admin/dispatcher/`.
 - `query dispatcherAgent(agentId)` → full detail for one agent (phase transitions, failures, PR status).
 - `mutation dispatcherControl(command, payload)` → writes a row to `dispatcher.commands`.
 
+**Capped-list convention:** any admin-scoped list field with a server-side cap MUST be paired with a `{listName}Depth` or `{listName}Count` non-null integer field so the cockpit can render `{shown} / {total}`. Two precedents: `queueDepth`/`blockedDepth` (queue panels, #2886) and `recentCompletionsCount` (recently-completed panel, #3172). When adding a new capped list, replicate the `formatCountLabel` helper in `packages/web/src/app/(main)/admin/dispatcher/QueuePanel.tsx` for consistent display.
+
 No subscriptions. Admin page uses Apollo `pollInterval: 2000` (2s). Dispatcher events happen on 30s/2min tick cadences, so a 2s polling delay is invisible — not worth the WebSocket infra.
 
 **UI sections:**
