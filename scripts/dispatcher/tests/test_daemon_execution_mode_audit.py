@@ -188,11 +188,14 @@ class TestCheckStuckAgentsExecutionModeFilter:
         conn.cursor_instance.fetchall_queue = [
             [("agent-sub", 2807, "ralph", 60000.0)],
         ]
-        # Retry marker COUNT + backoff config reads that
-        # _write_failure / _create_retry_marker issue.
+        # Per _flag_stuck_agents path: failure_id RETURNING from
+        # _write_failure, prior stuck check (no prior), retry marker
+        # COUNT, backoff config.
         conn.cursor_instance.fetch_queue = [
-            (0,),
-            ("[60,300,900]",),
+            (42,),  # failure_id RETURNING from _write_failure
+            None,  # _has_prior_stuck_timeout_in_window — no prior
+            (0,),  # prior retry marker count
+            ("[60,300,900]",),  # backoff config
         ]
 
         flagged = d._check_stuck_agents()

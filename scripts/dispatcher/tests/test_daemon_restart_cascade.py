@@ -713,6 +713,8 @@ class TestPerPhaseStuckTimeout:
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            (42,),  # failure_id RETURNING from _write_failure
+            None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff
         ]
@@ -732,6 +734,8 @@ class TestPerPhaseStuckTimeout:
         ]
         conn.cursor_instance.fetch_queue = [
             ('{"claiming": 300}',),  # operator override
+            (42,),  # failure_id RETURNING from _write_failure
+            None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior marker count
             ("[60,300,900]",),
         ]
@@ -746,6 +750,8 @@ class TestPerPhaseStuckTimeout:
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # no override
+            (42,),  # failure_id RETURNING from _write_failure
+            None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior marker count
             ("[60,300,900]",),
         ]

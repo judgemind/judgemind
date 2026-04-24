@@ -42,3 +42,13 @@ output "heartbeat_alarm_arn" {
   description = "ARN of the heartbeat staleness CloudWatch alarm (empty when enable_alerts is false)"
   value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.heartbeat_stale[0].arn : ""
 }
+
+output "stuck_timeout_repeated_alarm_arn" {
+  description = "ARN of the stuck_timeout_repeated CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.stuck_timeout_repeated[0].arn : ""
+}
+
+output "diagnoser_fallback_spike_alarm_arn" {
+  description = "ARN of the diagnoser_fallback_spike CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.diagnoser_fallback_spike[0].arn : ""
+}

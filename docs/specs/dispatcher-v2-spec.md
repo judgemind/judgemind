@@ -31,7 +31,7 @@
 3. **Runtime signals over post-hoc classification.** Failures are labeled by cheap deterministic signals (hooks, exit codes, timeouts). Weekly summaries are SQL aggregations, not LLM transcript reviews.
 4. **Retry markers, not retry RPCs.** Hooks and sub-subprocesses signal the daemon by writing rows (`dispatcher.failures`, `dispatcher.retry_markers`), never by calling back. Survives any crash.
 5. **Fail to escalate, not to silent drop.** After the retry budget is exhausted, the task gets `status/needs-human` and a Telegram message with the issue URL. Nothing quietly vanishes.
-6. **No LLM subprocess spans more than one workflow phase.** Each `claude -p` invocation runs one tightly-scoped phase (plan, implement, summarize, verify, etc.) with fresh context. Inter-phase handoff is strictly via `dispatcher.*` + small file artifacts the next phase reads. This is what lets us live without auto-compact in print mode (see §17 Risk 4b) and keeps every leaf LLM call small, reproducible, and replayable.
+6. **No LLM subprocess spans more than one workflow phase.** Each `claude -p` invocation runs one tightly-scoped phase (plan, implement, summarize, verify, etc.) with fresh context. Inter-phase handoff is strictly via `dispatcher.*` + small file artifacts the next phase reads. This is what lets us live without auto-compact in print mode (see §18 Risk 4b) and keeps every leaf LLM call small, reproducible, and replayable.
 
 ## 4. Architecture Overview
 
@@ -153,7 +153,7 @@ Every step is a single SQL transaction or idempotent git/gh call. Crash at any p
 
 ### 6a. Per-phase skills (`/task-v2-*`)
 
-New skills in .claude/skills/task-v2-\*/SKILL.md, each narrowly scoped to one phase. The original `/task` skill is unchanged and remains the laptop-dispatcher's execution path. Cutover and eventual deletion of `/task` is a manual follow-up after v2 proves itself (same pattern as `/dispatcher` — see §15).
+New skills in .claude/skills/task-v2-\*/SKILL.md, each narrowly scoped to one phase. The original `/task` skill is unchanged and remains the laptop-dispatcher's execution path. Cutover and eventual deletion of `/task` is a manual follow-up after v2 proves itself (same pattern as `/dispatcher` — see §16).
 
 | Skill | Input | Output | Typical context budget |
 |---|---|---|---|
@@ -487,7 +487,7 @@ Rationale: MCP tools are a Claude Code feature — they exist inside an active C
 
 Any new escalation path added later MUST extend the table in (A) with its own issue/PR URL — "something needs human attention" and "no link to act on" are incompatible.
 
-**Implementation:** ~20 lines of `httpx.post("https://api.telegram.org/bot<TOKEN>/sendMessage", json={...})`. Chat ID stored in `dispatcher.config.telegram_chat_id`. Bot token from Secrets Manager. Send failures are logged and swallowed — Telegram outages must never block the scheduler. Messages are persisted to `dispatcher.notifications` (schema TBD in §18) so we can reconstruct the escalation history even when Telegram is down.
+**Implementation:** ~20 lines of `httpx.post("https://api.telegram.org/bot<TOKEN>/sendMessage", json={...})`. Chat ID stored in `dispatcher.config.telegram_chat_id`. Bot token from Secrets Manager. Send failures are logged and swallowed — Telegram outages must never block the scheduler. Messages are persisted to `dispatcher.notifications` (schema TBD in §19) so we can reconstruct the escalation history even when Telegram is down.
 
 **If interactive chat becomes useful later:** the user opens a Claude Code session locally, points it at the same GraphQL, and reasons about state naturally. No always-on Claude process required, no MCP-in-container puzzle, no per-message LLM spend.
 
@@ -512,11 +512,49 @@ Terraform module `infra/terraform/modules/dispatcher-daemon/`:
 
 Prod deployment is out of scope for v1 — dev daemon handles both repos (same dev DB, same worktrees) until we prove stability.
 
-## 15. Migration Plan
+## 15. Observability
 
-**Throughout migration: both the laptop `/dispatcher` skill AND the original `/task` skill stay untouched.** They are the rollback target for every phase. Do not mark either deprecated, do not remove them from the skills index, do not rewrite CLAUDE.md to remove references. The new per-phase skills are created alongside under new names (`/task-v2-plan`, `/task-v2-ralph`, etc.) so the existing interactive loop continues working unchanged while v2 is brought up. Once v2 has proven itself in full production (post-Phase 4, measured against §16), the operator deletes the old skills manually as a standalone follow-up — not as part of these migration PRs.
+Three CloudWatch alarms are wired in `infra/terraform/modules/dispatcher-daemon/main.tf`, all gated on `var.enable_alerts` and routed to `var.alert_sns_topic_arn` (email + Telegram).
 
-**Phase 0 outcome — all 7 spikes returned GO.** The Phase 0 spikes ran in parallel over ~1 week and together de-risked the full architecture; every reasoned-but-untested claim in §4, §6, §7, §9, §14, and §17 now has empirical or analytical backing. The verdicts:
+### 15.1 Heartbeat staleness (see §14)
+
+| Field | Value |
+|---|---|
+| Metric | `HeartbeatAge` (Maximum) in `Judgemind/Dispatcher` |
+| Window / period | 60s × 5 consecutive evaluations |
+| Threshold | > `var.heartbeat_stale_seconds` (default 300 s) |
+| `treat_missing_data` | `notBreaching` — silence does not alarm during Phase 1 (daemon off) |
+
+Source: daemon emits `HeartbeatAge` via `_emit_heartbeat_metric` every supervisor tick.
+
+### 15.2 Stuck-timeout repeated
+
+| Field | Value |
+|---|---|
+| Metric | `StuckTimeoutRepeatedCount` (Sum) in `Judgemind/Dispatcher` |
+| Window / period | `var.stuck_timeout_repeated_window_seconds` (default 600 s) |
+| Threshold | ≥ 1 |
+| `treat_missing_data` | `notBreaching` |
+
+**Why a daemon-side signal, not a raw metric filter on `failure_detected`.**
+CloudWatch metric filters cannot express "same `agent_id`, count ≥ 2 in 10 min" without per-dimension math alarms (which require a static dimension set). Instead, the daemon's `_flag_stuck_agents` calls `_has_prior_stuck_timeout_in_window` after each `stuck_timeout` write; if a prior failure exists within 600 s it emits a dedicated `{ "event": "stuck_timeout_repeated", ... }` structured-log line. The metric filter counts those directly. Future editors: do not replace this with a filter on `failure_detected` — the per-agent check is load-bearing.
+
+### 15.3 Diagnoser fallback spike
+
+| Field | Value |
+|---|---|
+| Metric | `DiagnoserFallbackCount` (Sum) in `Judgemind/Dispatcher` |
+| Window / period | `var.diagnoser_fallback_window_seconds` (default 1800 s) |
+| Threshold | ≥ `var.diagnoser_fallback_threshold` (default 2) |
+| `treat_missing_data` | `notBreaching` |
+
+Source: daemon emits `{ "event": "diagnoser_fallback", ... }` whenever the diagnoser subprocess times out, returns non-zero, or produces malformed JSON and the mechanical escalation fallback fires instead. An isolated fallback is expected (transient timeout, model hiccup); ≥ 2 in 30 min indicates a systematic problem.
+
+## 16. Migration Plan
+
+**Throughout migration: both the laptop `/dispatcher` skill AND the original `/task` skill stay untouched.** They are the rollback target for every phase. Do not mark either deprecated, do not remove them from the skills index, do not rewrite CLAUDE.md to remove references. The new per-phase skills are created alongside under new names (`/task-v2-plan`, `/task-v2-ralph`, etc.) so the existing interactive loop continues working unchanged while v2 is brought up. Once v2 has proven itself in full production (post-Phase 4, measured against §17), the operator deletes the old skills manually as a standalone follow-up — not as part of these migration PRs.
+
+**Phase 0 outcome — all 7 spikes returned GO.** The Phase 0 spikes ran in parallel over ~1 week and together de-risked the full architecture; every reasoned-but-untested claim in §4, §6, §7, §9, §14, and §18 now has empirical or analytical backing. The verdicts:
 
 - **0.1 — `claude -p` end-to-end on Fargate: GO** (`docs/investigations/dispatcher-v2-spike-0.1.md`, #2683). All 4 scenarios (success, turn-limit, auth-fail, mcp-probe) booted and ran on Fargate in ~60s wall-clock; MCP tools propagate via explicit `--mcp-config`; one caveat (exit code 1 is ambiguous between auth-fail and turn-limit) folded into §8 as the tiered classifier.
 - **0.2 — Hook → Postgres from a `claude -p` subprocess: GO** (`docs/investigations/dispatcher-v2-spike-0.2.md`, #2684). `emit_failure.py` direct-insert design validated at p50=179 ms / p95=200 ms / max=202 ms across 20 cold-connection hook fires; zero failed inserts; graceful fail-mode when DB is unreachable.
@@ -526,7 +564,7 @@ Prod deployment is out of scope for v1 — dev daemon handles both repos (same d
 - **0.6 — Worktree footprint at peak concurrency: GO** (`docs/investigations/dispatcher-v2-spike-0.6.md`, #2688). Typical 5-worktree Python load is ~3.4 GB; realistic mixed peak is ~10 GB; adversarial worst case 19.6 GB. 50 GB ephemeral storage (already budgeted in §14) gives 5× headroom on the realistic peak. No EFS, no shared venvs, no change from spec.
 - **0.7 — Git + GitHub auth from Fargate: GO** (`docs/investigations/dispatcher-v2-spike-0.7.md`, #2689). Scoped PAT in Secrets Manager → `GITHUB_TOKEN` env var → `gh auth setup-git` → `git push` / `gh pr create` / `gh pr close` / `scripts/check-issue-author.sh` all succeed from inside the container. No GitHub App registration required for v1.
 
-Phase 1 can begin without revisiting any Phase 0 question; the remaining §17 Open Questions are non-blocking (cost projection, diagnoser effectiveness — both measurable only post-launch).
+Phase 1 can begin without revisiting any Phase 0 question; the remaining §18 Open Questions are non-blocking (cost projection, diagnoser effectiveness — both measurable only post-launch).
 
 **Phase 0: Spikes (parallel PRs, ~1 week).** Seven time-boxed experiments that verify the spec's reasoned-but-untested claims before any scaffolding lands. Failures here reshape the design, not just the schedule.
 
@@ -545,11 +583,11 @@ Sequence: 0.1 → 0.2 → 0.3 in series (each gates the next). 0.4–0.7 can run
 **Deferred spikes** (not blocking Phase 1):
 - Cursor `-p` hang-bug repro — only matters if/when we add a Cursor runner.
 - OpenCode hook DB-connection spike — only matters if/when we add an OpenCode runner.
-- Diagnoser effectiveness measurement — can only be measured post-launch over weeks (already Open Question 5 in §17).
+- Diagnoser effectiveness measurement — can only be measured post-launch over weeks (already Open Question 5 in §18).
 - Admin-page GraphQL authz — piggybacks on existing web app auth; no novel surface.
-- Cost projection — covered as Open Question 4 in §17; informational, not a design gate.
+- Cost projection — covered as Open Question 4 in §18; informational, not a design gate.
 
-Phase 0 does not require its own infrastructure — spikes run in the existing dev account using throwaway Fargate tasks, throwaway schema (`dispatcher_spike.*`), and a single test issue labeled `type/spike`. Every spike produces either a "go" note on the corresponding §17 Open Question or a design-change proposal.
+Phase 0 does not require its own infrastructure — spikes run in the existing dev account using throwaway Fargate tasks, throwaway schema (`dispatcher_spike.*`), and a single test issue labeled `type/spike`. Every spike produces either a "go" note on the corresponding §18 Open Question or a design-change proposal.
 
 **Phase 1: Scaffolding (1 PR, or a small series).**
 - New `dispatcher.*` schema via migration.
@@ -579,7 +617,7 @@ Gate: ≥10 successful task completions via the daemon; zero stuck agents; all r
 
 Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/dispatcher` + original `/task` as normal. State in `dispatcher.*` is read-only in that mode.
 
-## 16. Success Criteria
+## 17. Success Criteria
 
 - Daemon runs ≥14 days with no human intervention. Any intervention is a bug.
 - Retries resolve ≥80% of transient failures (stuck, 529, cwd drift) without human touch.
@@ -587,7 +625,7 @@ Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/di
 - Admin page answers "what is the dispatcher doing right now" in under 2s.
 - Weekly SQL-based summary produced reliably for ≥4 consecutive weeks; the operator can spot the top 3 failure categories at a glance.
 
-## 17. Risks & Open Questions (adversarial-review bait)
+## 18. Risks & Open Questions (adversarial-review bait)
 
 ### Risks
 
@@ -619,7 +657,7 @@ Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/di
 
 5. **Diagnoser net benefit — tiered version.** The tiered diagnoser (§8: mechanical first, diagnose only on recurrence or Tier 3) should see far fewer invocations than the always-diagnose original. Projected: ~2-3 invocations/week. At that volume, the effectiveness bar is low — we mainly need to verify the diagnoser doesn't make things worse than immediate human escalation. **Action:** first month of operation, dump every `dispatcher.diagnoses.recommendation` + its `outcome` weekly. If the diagnoser's recommendation was "retry" and the retry succeeded, that's net-positive latency savings; if it escalated, the human got a pre-analyzed failure; if it was wrong, measure the added-damage rate.
 
-## 18. Appendix — Schema DDL sketch
+## 19. Appendix — Schema DDL sketch
 
 ```sql
 CREATE SCHEMA dispatcher;
@@ -755,4 +793,4 @@ INSERT INTO dispatcher.config (key, value, updated_by) VALUES
 
 ---
 
-**Next step:** adversarial review. I'll spawn (or you spawn) a reviewer with this file as input and a specific brief to attack the design (not accept it) — look for correctness bugs, race conditions, operational traps, and cost blow-ups. Anything in §17 is fair game; anything not yet listed is bonus.
+**Next step:** adversarial review. I'll spawn (or you spawn) a reviewer with this file as input and a specific brief to attack the design (not accept it) — look for correctness bugs, race conditions, operational traps, and cost blow-ups. Anything in §18 is fair game; anything not yet listed is bonus.

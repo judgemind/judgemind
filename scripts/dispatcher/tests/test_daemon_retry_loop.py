@@ -148,10 +148,14 @@ class TestRetryLoopEndToEnd:
         ]
         # Per _check_stuck_agents + _create_retry_marker call order:
         # (1) stuck_timeout_s_by_phase config override (unset → None),
-        # (2) COUNT prior retry markers (0 → first attempt),
-        # (3) backoff schedule.
+        # (2) RETURNING failure_id from _write_failure INSERT,
+        # (3) _has_prior_stuck_timeout_in_window (no prior → None),
+        # (4) COUNT prior retry markers (0 → first attempt),
+        # (5) backoff schedule.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            (42,),  # failure_id RETURNING from _write_failure
+            None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior retry marker count
             ("[60,300,900]",),  # backoff schedule
         ]
