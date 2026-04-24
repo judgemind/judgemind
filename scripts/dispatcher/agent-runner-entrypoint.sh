@@ -2349,6 +2349,18 @@ classify_pr_rollup() {
     # mergeStateStatus`` stdout. Prints one of: green / red / pending /
     # error. Mirrors ``_ci_rollup_state`` in phase_transitions.py so
     # the ECS path uses the same merge gate as subprocess mode.
+    #
+    # statusCheckRollup is a heterogeneous list:
+    #   * CheckRun entries have ``.status`` + ``.conclusion`` (GitHub
+    #     Actions, container-based check runs).
+    #   * StatusContext entries have ``.state`` only (commit-status API,
+    #     third-party integrations like Vercel).
+    #
+    # We branch on ``.__typename`` so Vercel-style StatusContext entries
+    # classify correctly. Before #3200 the jq program only looked at
+    # ``.status`` + ``.conclusion`` and fell through to "pending" for
+    # any StatusContext entry — so every PR that exposed a Vercel
+    # status stayed pending forever and every ECS agent timed out.
     _status_file="$1"
     if [[ ! -s "$_status_file" ]]; then
         printf 'error'
@@ -2361,16 +2373,28 @@ classify_pr_rollup() {
             (.statusCheckRollup // []) as $rollup
             | ($rollup | map(select(type == "object"))) as $checks
             | ([$checks[]
-                | (.status // "" | ascii_upcase) as $st
-                | (.conclusion // "" | ascii_upcase) as $co
-                | if $st == "COMPLETED" then
-                      if ($co == "FAILURE" or $co == "CANCELLED"
-                          or $co == "TIMED_OUT" or $co == "ACTION_REQUIRED"
-                          or $co == "STARTUP_FAILURE") then "red"
-                      elif ($co == "SUCCESS" or $co == "SKIPPED"
-                            or $co == "NEUTRAL" or $co == "STALE") then "ok"
-                      else "red" end
-                  else "pending" end]) as $outcomes
+                | (.__typename // "" | ascii_upcase) as $tn
+                | if $tn == "STATUSCONTEXT" then
+                      # Commit-status API entries (Vercel, etc.): only
+                      # ``.state`` is populated. State vocabulary:
+                      # EXPECTED / PENDING / SUCCESS / FAILURE / ERROR.
+                      (.state // "" | ascii_upcase) as $cs
+                      | if ($cs == "FAILURE" or $cs == "ERROR") then "red"
+                        elif ($cs == "SUCCESS" or $cs == "NEUTRAL") then "ok"
+                        else "pending" end
+                  else
+                      # CheckRun (default) — the pre-#3200 code path.
+                      (.status // "" | ascii_upcase) as $st
+                      | (.conclusion // "" | ascii_upcase) as $co
+                      | if $st == "COMPLETED" then
+                            if ($co == "FAILURE" or $co == "CANCELLED"
+                                or $co == "TIMED_OUT" or $co == "ACTION_REQUIRED"
+                                or $co == "STARTUP_FAILURE") then "red"
+                            elif ($co == "SUCCESS" or $co == "SKIPPED"
+                                  or $co == "NEUTRAL" or $co == "STALE") then "ok"
+                            else "red" end
+                        else "pending" end
+                  end]) as $outcomes
             | if ($outcomes | index("red")) then "red"
               elif ($outcomes | index("pending")) then "pending"
               else
@@ -2509,6 +2533,23 @@ handle_awaiting_ci() {
             return 0
         fi
         if fetch_pr_status "$_pr_number"; then
+            # #3200 early-exit — after the PR is merged, ``mergeable``
+            # and ``mergeStateStatus`` both flip to ``UNKNOWN`` while
+            # ``mergeCommit.oid`` is populated with the squash SHA. The
+            # rollup classifier cannot distinguish "pending + UNKNOWN"
+            # from "merged + UNKNOWN" from the rollup alone, so short-
+            # circuit the poll on merge-commit presence.
+            _merge_oid_check=$(jq -r '.mergeCommit.oid // ""' \
+                "$AGENT_WORKSPACE/pr-status.json" 2>/dev/null || printf '')
+            if [[ -n "$_merge_oid_check" ]]; then
+                log "awaiting_ci_already_merged" \
+                    "pr_number=$_pr_number" \
+                    "merge_sha=$_merge_oid_check" \
+                    "rollup_state=green"
+                printf '{"rollup_state": "green", "pr_number": %s, "already_merged": true}' \
+                    "$_pr_number"
+                return 0
+            fi
             _state=$(classify_pr_rollup "$AGENT_WORKSPACE/pr-status.json")
             _fetch_rc=0
         else
