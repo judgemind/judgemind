@@ -92,9 +92,8 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
-json_only() {
-    awk '/^\[/{f=1} f&&!g{print} /^\]/{if(f)g=1}'
-}
+# shellcheck source=./_query_lib.sh
+. "$script_dir/_query_lib.sh"
 
 # Heavy-field SQL fragments — set to NULL when --full is not given,
 # so the bundled jsonb stays small enough to survive the ECS-exec
@@ -354,32 +353,16 @@ SELECT COALESCE(jsonb_agg(row), '[]'::jsonb) AS page FROM ordered;
 "
 
 run_query() {
-    # Back-to-back ECS-exec invocations occasionally return truncated
-    # output ('Cannot perform start session: EOF' mid-stream). The JSON
-    # comes through either well-formed or clearly chopped — jq's parser
-    # is a reliable integrity check, so retry up to 3 times when it
-    # rejects the response. Between attempts: a short sleep to let the
-    # SSM session machinery settle.
+    # Delegate to the shared _query_lib_run helper (which handles the
+    # `Cannot perform start session: EOF` truncation + retry story that
+    # originated here — see #3124 for the generalisation).
     local label="$1" sql="$2"
     if [[ "${ISSUE_TIMELINE_DEBUG_SQL:-0}" == "1" ]]; then
         echo "===== SQL ($label) =====" >&2
         echo "$sql" >&2
         echo "===== END SQL ($label) =====" >&2
     fi
-    local attempt out
-    for attempt in 1 2 3; do
-        out=$("$dev_db" "$sql" 2>/dev/null | json_only)
-        if [[ -n "$out" ]] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
-            printf '%s' "$out"
-            return 0
-        fi
-        if (( attempt < 3 )); then
-            echo "Warning: $label query returned malformed JSON on attempt $attempt — retrying" >&2
-            sleep 2
-        fi
-    done
-    echo "Error: $label query returned malformed JSON after 3 attempts" >&2
-    exit 2
+    _query_lib_run "$sql" "$label" || exit $?
 }
 
 header_result=$(run_query header "$header_sql")

@@ -41,23 +41,16 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
+# shellcheck source=./_query_lib.sh
+. "$script_dir/_query_lib.sh"
+
 usage() {
     sed -n '6,28p' "$0" | sed 's/^# \{0,1\}//' >&2
 }
 
-json_only() {
-    awk '/^\[/{f=1} f&&!g{print} /^\]/{if(f)g=1}'
-}
-
 query() {
     local sql="$1"
-    local result
-    result=$("$dev_db" "$sql" 2>/dev/null | json_only)
-    if [[ -z "$result" ]]; then
-        echo "Error: dev-db-query.sh returned no JSON" >&2
-        exit 2
-    fi
-    printf '%s' "$result"
+    _query_lib_run "$sql" "diagnoses"
 }
 
 # ─── Parse args ─────────────────────────────────────────────────────────
