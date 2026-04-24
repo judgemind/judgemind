@@ -24,6 +24,7 @@ import { ActiveAgentsTable } from './ActiveAgentsTable';
 import { QueueBlockedPanel, QueueReadyPanel } from './QueuePanel';
 import { RecentCompletionsPanel } from './RecentCompletionsPanel';
 import { RecentFailuresPanel } from './RecentFailuresPanel';
+import { DiagnoserEffectivenessPanel } from './DiagnoserEffectivenessPanel';
 import { ConfigPanel } from './ConfigPanel';
 import { ConfirmDialog, type ConfirmableCommand } from './ConfirmDialog';
 import { QueueFullDialog } from './QueueFullDialog';
@@ -445,6 +446,10 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
 
           <div className="mt-4">
             <RecentFailuresPanel failures={state?.recentFailures ?? []} />
+          </div>
+
+          <div className="mt-4">
+            <DiagnoserEffectivenessPanel />
           </div>
 
           <p className="mt-4 text-xs text-muted-foreground">

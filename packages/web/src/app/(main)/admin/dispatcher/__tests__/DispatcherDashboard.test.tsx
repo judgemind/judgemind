@@ -74,6 +74,16 @@ vi.mock('@apollo/client', async () => {
           refetch: mockRefetch,
         };
       }
+      if (opName === 'WeeklyDiagnoserReport') {
+        // #2800: return an empty array so existing tests don't fail on
+        // the new panel; the panel renders the empty-state copy quietly.
+        return {
+          data: { weeklyDiagnoserReport: [] },
+          loading: false,
+          error: undefined,
+          refetch: mockRefetch,
+        };
+      }
       return {
         data: mockQueryData,
         loading: false,
@@ -949,5 +959,26 @@ describe('DispatcherDashboard — #3206 dialog-open view-transition gate', () =>
         ) as HTMLElement
       ).style.viewTransitionName,
     ).toBe('');
+  });
+});
+
+describe('DispatcherDashboard — DiagnoserEffectivenessPanel (#2800)', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+  });
+
+  it('mounts the DiagnoserEffectivenessPanel (empty-state copy visible)', () => {
+    // The WeeklyDiagnoserReport mock in useQuery returns [] so the
+    // empty-state copy should render below the RecentFailuresPanel.
+    renderDashboard();
+    expect(
+      screen.getByText(/diagnoser effectiveness/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/no diagnoses with resolved outcomes yet/i),
+    ).toBeInTheDocument();
   });
 });

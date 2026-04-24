@@ -20,6 +20,7 @@ import { describe, it, expect } from 'vitest';
 import {
   CATEGORY_DISPLAY_NAMES,
   coerceNullableNumber,
+  diagnoserRowToGraphQL,
   displayCategoryFor,
   failureRowToGraphQL,
   normalizeSnapshotJson,
@@ -29,6 +30,7 @@ import {
   sortAndSliceQueueBlocked,
   sortAndSliceQueueReady,
   sumPhaseCost,
+  type DiagnoserEffectivenessRow,
   type SnapshotIssueRecord,
 } from '../src/graphql/dispatcher/resolvers';
 import {
@@ -1424,5 +1426,51 @@ describe('failureRowToGraphQL (#2948 — displayCategory field)', () => {
     });
     expect(out.category).toBe('');
     expect(out.displayCategory).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// diagnoserRowToGraphQL
+// ---------------------------------------------------------------------------
+
+describe('diagnoserRowToGraphQL', () => {
+  it('converts snake_case DB row to camelCase GraphQL shape', () => {
+    const row: DiagnoserEffectivenessRow = {
+      recommended_action: 'retry',
+      observed_outcome: 'succeeded',
+      count: '5',
+      day: '2026-04-18T00:00:00.000Z',
+    };
+    const out = diagnoserRowToGraphQL(row);
+    expect(out.recommendedAction).toBe('retry');
+    expect(out.observedOutcome).toBe('succeeded');
+    expect(out.count).toBe(5);
+    expect(out.day).toBe('2026-04-18T00:00:00.000Z');
+  });
+
+  it('parses count string to integer', () => {
+    const row: DiagnoserEffectivenessRow = {
+      recommended_action: 'skip',
+      observed_outcome: 'failed',
+      count: '12',
+      day: '2026-04-17T00:00:00.000Z',
+    };
+    const out = diagnoserRowToGraphQL(row);
+    expect(typeof out.count).toBe('number');
+    expect(out.count).toBe(12);
+  });
+
+  it('passes day through as DateTime string for scalar serialization', () => {
+    const isoDay = '2026-04-15T00:00:00+00:00';
+    const row: DiagnoserEffectivenessRow = {
+      recommended_action: 'retry',
+      observed_outcome: 'failed',
+      count: '1',
+      day: isoDay,
+    };
+    const out = diagnoserRowToGraphQL(row);
+    // The DateTime scalar serializes to a string; the raw value is passed
+    // through so the DateTimeScalar.serialize function handles formatting.
+    expect(out.day).toBe(isoDay);
   });
 });

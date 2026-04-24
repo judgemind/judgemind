@@ -228,6 +228,12 @@ export function createApolloClient(): ApolloClient<unknown> {
         DispatcherQueueFull: {
           keyFields: ['kind'],
         },
+        // DiagnoserEffectivenessRow: rollup row (issue #2800). No unique
+        // id field — the tuple (recommendedAction, observedOutcome, day)
+        // is the identity, but Apollo doesn't support compound keys cleanly
+        // here. Cache as literal array items; the query is not in the 2s
+        // poll path so stale merging is not a concern.
+        DiagnoserEffectivenessRow: { keyFields: false },
 
         // ---------------------------------------------------------------------
         // Types that intentionally do NOT need keyFields:
