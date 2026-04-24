@@ -140,6 +140,24 @@ variable "heartbeat_stale_seconds" {
   default     = 300
 }
 
+variable "stuck_timeout_repeated_window_seconds" {
+  description = "CloudWatch alarm period (seconds) for the stuck_timeout_repeated alarm. The alarm fires when at least one stuck_timeout_repeated event is observed in this window. Default 600 (10 min) per §15 of the spec."
+  type        = number
+  default     = 600
+}
+
+variable "diagnoser_fallback_window_seconds" {
+  description = "CloudWatch alarm period (seconds) for the diagnoser_fallback_spike alarm. Default 1800 (30 min)."
+  type        = number
+  default     = 1800
+}
+
+variable "diagnoser_fallback_threshold" {
+  description = "Number of diagnoser_fallback events within diagnoser_fallback_window_seconds that triggers the alarm. Default 2."
+  type        = number
+  default     = 2
+}
+
 # ─── Oneshot task launcher (scripts/ecs-run-task.sh) ────────────────────────
 # When these ARNs are wired, the daemon's task role gets the permission set
 # required by `scripts/ecs-run-task.sh` so ralph phases can launch data

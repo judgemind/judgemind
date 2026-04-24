@@ -21,8 +21,8 @@ belong to 3B-3E.
 
 Spec: ``docs/specs/dispatcher-v2-spec.md`` §6 (scheduler loop), §6a
 (per-phase skill contracts), §7 (supervisor loop), §14 (deployment),
-§15 (Phase 2 definition + gate), §17 Risk 2 (double-daemon race),
-§17 Risk 4a (subprocess timeout), §18 (schema DDL). Issues #2768
+§16 (Phase 2 definition + gate), §18 Risk 2 (double-daemon race),
+§18 Risk 4a (subprocess timeout), §19 (schema DDL). Issues #2768
 (Phase 2), #2783 (Phase 3A).
 
 Structured logging is JSON-per-line to stdout so CloudWatch Logs
@@ -114,7 +114,7 @@ from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
 DISPATCHER_SCHEMA = "dispatcher"
 
 #: Lease window — another running daemon whose heartbeat is newer than
-#: this many seconds blocks this one from spawning (§17 Risk 2). 60 s is
+#: this many seconds blocks this one from spawning (§18 Risk 2). 60 s is
 #: 2× the scheduler tick, so a healthy peer is always seen as active.
 LEASE_HEARTBEAT_WINDOW_SECONDS = 60
 
@@ -368,7 +368,7 @@ ORCHESTRATION_JOIN_TIMEOUT_SECONDS = 10
 
 #: Hard wall-clock timeout for each ``claude -p`` subprocess spawned
 #: from the orchestration path. Matches the 180-minute ceiling from
-#: spec §17 Risk 4a and the ``dispatcher.config.subprocess_timeout_s``
+#: spec §18 Risk 4a and the ``dispatcher.config.subprocess_timeout_s``
 #: seed value (10800s). Enforced via ``subprocess.run(..., timeout=...)``.
 CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60
 
@@ -738,7 +738,7 @@ GIT_PUSH_TIMEOUT_SECONDS = 1800
 #: burning through the candidate queue in a failure loop when paired
 #: with the partial UNIQUE INDEX (which only blocks re-claim for
 #: ``running``/``retrying``, not ``failed``/``crashed`` — see spec
-#: §17 Risk 2 and issue #2804). 3600s (60 min) gives the diagnoser a
+#: §18 Risk 2 and issue #2804). 3600s (60 min) gives the diagnoser a
 #: clear window to file a follow-up or un-fail the agent before the
 #: scheduler retries. Tuned for the cap=1 cutover; a higher cap may
 #: want a shorter cooldown to avoid starving the queue on transient
@@ -1409,6 +1409,14 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
 #: again in the afternoon) while not re-triggering on unrelated failures
 #: weeks later.
 TIER_2_RECURRENCE_WINDOW_SECONDS = 24 * 60 * 60
+
+#: Window used by :meth:`DispatcherDaemon._has_prior_stuck_timeout_in_window`
+#: to decide whether a stuck_timeout is a repeat (two occurrences in 10 min
+#: on the same agent) worth paging on. Distinct from
+#: :data:`TIER_2_RECURRENCE_WINDOW_SECONDS` (24 h) which controls the
+#: diagnoser trigger — 10 min is short enough to catch a thrash loop
+#: without false-positives from same-day but unrelated retries.
+STUCK_TIMEOUT_ALERT_WINDOW_SECONDS = 600
 
 #: Hard wall-clock timeout for the ``/diagnose-failure`` subprocess
 #: (``claude -p``). Matches spec §8 "5-min hard wall-clock timeout".
@@ -2195,7 +2203,7 @@ class DispatcherDaemon:
 
         # Under SERIALIZABLE we would be free of races here, but the
         # check + insert happens fast enough that two daemons booting
-        # simultaneously during a rolling deploy (§17 Risk 2) still race
+        # simultaneously during a rolling deploy (§18 Risk 2) still race
         # on the millisecond window. That is acceptable: the second
         # daemon's supervisor tick will observe the first one's heartbeat
         # within the next 120s and can be watchdog-killed. The lease
@@ -2556,7 +2564,7 @@ class DispatcherDaemon:
         #
         # Failures here (rate limit, network, auth) log + return -1 but
         # do NOT raise — the daemon must survive GitHub API hiccups,
-        # and the next tick will try again (§15).
+        # and the next tick will try again (§16).
         queue_depth = self._scan_queue_and_snapshot()
         t_step = self._record_scheduler_step("scan_queue", t_step)
 
@@ -3512,7 +3520,7 @@ class DispatcherDaemon:
         try:
             issues = self._fetch_agent_ready_issues()
         except RuntimeError as exc:
-            # Daemon must survive GitHub API hiccups (§15). Log + return
+            # Daemon must survive GitHub API hiccups (§16). Log + return
             # -1 so the caller knows the scan failed without crashing.
             self._log.warning(
                 "daemon.queue_scan_failed",
@@ -4508,7 +4516,7 @@ class DispatcherDaemon:
         ``dispatcher.agents.worktree_path`` row points at the same
         directory the supervisor / cleanup code later looks for
         (otherwise the worktree is "orphaned from the DB's perspective"
-        — see spec §17 Risk 1).
+        — see spec §18 Risk 1).
 
         When ``baseline_repo_root`` is set, the worktree lives in the
         sibling ``worktrees/`` directory next to the baseline clone
@@ -10682,7 +10690,7 @@ class DispatcherDaemon:
                 phase, worktree, agent_id
             )
         except subprocess.TimeoutExpired:
-            # Timeout = subprocess runaway (spec §17 Risk 4). Treat as
+            # Timeout = subprocess runaway (spec §18 Risk 4). Treat as
             # a generic ``subprocess_crash`` — the subprocess didn't
             # actually crash but the next retry needs a fresh worktree
             # just the same. Capture the log tail for triage — a runaway
@@ -14844,14 +14852,16 @@ class DispatcherDaemon:
         category: str,
         detected_by: str,
         details: dict[str, Any],
-    ) -> None:
-        """INSERT one row into ``dispatcher.failures``.
+    ) -> int | None:
+        """INSERT one row into ``dispatcher.failures`` and return the new ``failure_id``.
+
+        Returns ``None`` on DB error (best-effort: a DB hiccup logs +
+        rolls back but does not propagate, mirroring the hook-side
+        behaviour in ``emit_failure.py`` (§9)).
 
         ``agent_id=None`` is permitted (the schema allows it) and used by
         the GitHub rate-limit guard which is a daemon-level signal not
-        attributable to any single agent. Failures here are best-effort:
-        a DB hiccup logs + rolls back but does not propagate, mirroring
-        the hook-side behaviour in ``emit_failure.py`` (§9).
+        attributable to any single agent.
         """
         assert self._conn is not None, "connect() must run before failure write"
         try:
@@ -14859,9 +14869,11 @@ class DispatcherDaemon:
                 cur.execute(
                     "INSERT INTO dispatcher.failures "
                     "    (agent_id, category, detected_by, details) "
-                    "VALUES (%s, %s, %s, %s)",
+                    "VALUES (%s, %s, %s, %s) "
+                    "RETURNING failure_id",
                     (agent_id, category, detected_by, json.dumps(details, default=str)),
                 )
+                row = cur.fetchone()
             self._conn.commit()
         except Exception:
             self._log.exception(
@@ -14877,6 +14889,8 @@ class DispatcherDaemon:
                 self._conn.rollback()
             except Exception:  # pragma: no cover — best-effort
                 pass
+            return None
+        return int(row[0]) if row is not None else None
 
     @staticmethod
     def _classify_subprocess_failure(
@@ -15096,7 +15110,7 @@ class DispatcherDaemon:
             if elapsed_seconds < threshold:
                 continue
             try:
-                self._write_failure(
+                failure_id = self._write_failure(
                     agent_id=agent_id,
                     category=FAILURE_CATEGORY_STUCK_TIMEOUT,
                     detected_by="supervisor",
@@ -15133,6 +15147,27 @@ class DispatcherDaemon:
                         "threshold_seconds": threshold,
                     },
                 )
+                # Emit alert signal for CloudWatch alarm (#2878): if this
+                # agent had a prior stuck_timeout within the alert window,
+                # log a distinct event so the metric filter can count it.
+                # Pure signal — no change to retry/diagnose routing.
+                if failure_id is not None:
+                    prior_failure_id = self._has_prior_stuck_timeout_in_window(
+                        agent_id=agent_id,
+                        before_failure_id=failure_id,
+                        window_seconds=STUCK_TIMEOUT_ALERT_WINDOW_SECONDS,
+                    )
+                    if prior_failure_id is not None:
+                        self._log.warning(
+                            "daemon.stuck_timeout_repeated",
+                            extra={
+                                "event": "stuck_timeout_repeated",
+                                "agent_id": agent_id,
+                                "issue_number": issue_number,
+                                "window_seconds": STUCK_TIMEOUT_ALERT_WINDOW_SECONDS,
+                                "prior_failure_id": prior_failure_id,
+                            },
+                        )
                 # Enqueue the tier-1 retry marker. The processor picks
                 # it up on the next supervisor tick once the backoff
                 # window elapses.
@@ -16821,6 +16856,51 @@ class DispatcherDaemon:
                 pass
             return False
         return row is not None
+
+    def _has_prior_stuck_timeout_in_window(
+        self, *, agent_id: str, before_failure_id: int, window_seconds: int
+    ) -> int | None:
+        """Return the ``failure_id`` of the most-recent prior ``stuck_timeout``
+        for ``agent_id`` within the last ``window_seconds``, or ``None`` if
+        no such row exists.
+
+        Used by :meth:`_flag_stuck_agents` to decide whether to emit the
+        ``stuck_timeout_repeated`` alert event.  A plain metric filter on
+        ``failure_detected`` cannot express "same agent, count ≥ 2 in
+        10 min" — this daemon-side check writes a distinct log event so
+        the CloudWatch alarm can count directly.
+
+        Mirrors :meth:`_has_prior_same_category_failure` but is
+        parameterised on ``window_seconds`` (not the tier-2 24 h window)
+        and returns the prior row's ID instead of a boolean.
+        """
+        assert self._conn is not None, "connect() must run before recurrence check"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT failure_id FROM dispatcher.failures "
+                    "WHERE agent_id = %s "
+                    "  AND category = %s "
+                    "  AND failure_id < %s "
+                    "  AND ts > now() - make_interval(secs => %s) "
+                    "ORDER BY failure_id DESC "
+                    "LIMIT 1",
+                    (
+                        agent_id,
+                        FAILURE_CATEGORY_STUCK_TIMEOUT,
+                        before_failure_id,
+                        window_seconds,
+                    ),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        return int(row[0]) if row is not None else None
 
     def _build_diagnoser_context(self, candidate: dict[str, Any]) -> dict[str, Any]:
         """Assemble the JSONB context bundle passed to ``/diagnose-failure``.

@@ -813,3 +813,91 @@ resource "aws_cloudwatch_metric_alarm" "heartbeat_stale" {
   alarm_actions = [var.alert_sns_topic_arn]
   ok_actions    = [var.alert_sns_topic_arn]
 }
+
+# ── Stuck-timeout repeated alarm (#2878) ─────────────────────────────────────
+# Fires when the same agent hits stuck_timeout twice within 10 minutes.
+# A single stuck_timeout is expected (the mechanical retry path handles it);
+# two in quick succession indicate a thrash loop that will exhaust the
+# retry budget before a human notices.  The daemon emits a dedicated
+# ``stuck_timeout_repeated`` structured-log event (distinct from the raw
+# ``failure_detected`` event) because CloudWatch metric filters cannot
+# express "same agent_id, count ≥ 2 in 10 min" alone — the daemon-side
+# helper does the per-agent check and writes the signal.
+
+resource "aws_cloudwatch_log_metric_filter" "stuck_timeout_repeated" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-stuck-timeout-repeated"
+  pattern        = "{ $.event = \"stuck_timeout_repeated\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "StuckTimeoutRepeatedCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "stuck_timeout_repeated" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-stuck-timeout-repeated"
+  alarm_description = "An agent hit stuck_timeout twice within ${var.stuck_timeout_repeated_window_seconds}s (${var.environment}). The retry budget may be exhausted before the diagnoser fires — check ${aws_cloudwatch_log_group.dispatcher.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "StuckTimeoutRepeatedCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  period              = var.stuck_timeout_repeated_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+# ── Diagnoser fallback spike alarm (#2878) ────────────────────────────────────
+# Fires when the diagnoser falls back to mechanical escalation multiple
+# times in a short window.  Isolated fallbacks are normal (transient
+# timeout, malformed JSON) but a spike indicates a systematic problem with
+# the diagnoser skill or its input context.
+
+resource "aws_cloudwatch_log_metric_filter" "diagnoser_fallback" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-diagnoser-fallback"
+  pattern        = "{ $.event = \"diagnoser_fallback\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "DiagnoserFallbackCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "diagnoser_fallback_spike" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-diagnoser-fallback-spike"
+  alarm_description = "Diagnoser fell back to mechanical escalation >= ${var.diagnoser_fallback_threshold} times in ${var.diagnoser_fallback_window_seconds}s (${var.environment}). Check ${aws_cloudwatch_log_group.dispatcher.name} for diagnoser timeout or malformed output."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "DiagnoserFallbackCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.diagnoser_fallback_threshold
+  period              = var.diagnoser_fallback_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
