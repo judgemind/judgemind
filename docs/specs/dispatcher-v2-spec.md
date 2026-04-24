@@ -278,6 +278,36 @@ Skills read from the input file and write to the output file; neither should dep
 - `scripts/dispatcher/agent-runner-entrypoint.sh` is explicitly `!`-excluded from `deploy-dispatcher.yml` paths so entrypoint changes don't force a daemon redeploy.
 - `infra/terraform/modules/dispatcher-agent-runner/` defines the task-def, IAM role, security group, log group, and ECR repo. Auto-applied on merge by `.github/workflows/terraform.yml`'s `dev-apply` job (#3107).
 
+#### Debugging a live ECS agent
+
+When an agent-runner task is stuck or behaving unexpectedly and CloudWatch tail doesn't reveal enough, an operator can shell into the running container via ECS Exec (#3145). Prerequisites (all wired in terraform + daemon):
+
+- Task-role policy `task_ecs_exec_ssm` grants `ssmmessages:{Create,Open}{Control,Data}Channel`.
+- `_launch_agent_ecs_task` passes `enableExecuteCommand=True` on the RunTask call.
+- Operator machine has the Session Manager plugin installed (`brew install session-manager-plugin`).
+
+One-liner (fill in the task ARN from `dispatcher.agents.agent_task_arn` or `aws ecs list-tasks`):
+
+```bash
+aws ecs execute-command \
+  --cluster judgemind-dev \
+  --task <arn> \
+  --container agent-runner \
+  --interactive \
+  --command /bin/bash
+```
+
+Files and paths to inspect once inside the container:
+
+- `/var/lib/agent-runner/repo` — the agent's worktree clone. `git log`, `git status`, inspect any in-flight diff.
+- `/var/lib/agent-runner/claude-p-<phase>.stdout.json` — the raw JSON stream Claude emitted for the current/last phase. Useful when a phase is hung or produced garbled output.
+- `/var/lib/agent-runner/claude-p-<phase>.stderr.log` — stderr for the current/last `claude -p` invocation. Grep for connection errors, rate limits, and internal SDK exceptions.
+- `/var/lib/agent-runner/tmp/dispatcher-input/<phase>.json` — the input bundle the skill received (from `phase_input_shim.py`).
+- `/var/lib/agent-runner/tmp/dispatcher-output/<phase>.json` — the skill's structured output, once written.
+- `ps auxwwf` — show the process tree: is `claude -p` still running, or are we between phases?
+
+Note: `enableExecuteCommand` only takes effect on freshly-launched tasks. Tasks launched before #3145 merged cannot be execute-command-able retroactively — they must be let finish or stopped and relaunched.
+
 #### Known gaps
 
 - `daemon_restart_abandoned` is used by the entrypoint as a generic failed-terminal — it's a category error when the failure isn't actually from a daemon restart. Tracked as #3137.
