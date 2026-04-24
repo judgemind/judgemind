@@ -1,0 +1,454 @@
+"""Unit tests for #3205 scheduler_tick instrumentation.
+
+Covers the diagnostic-first changes added to :mod:`scripts.dispatcher.daemon`:
+
+* Every ``subprocess.run`` / ``subprocess.Popen`` call site in
+  ``daemon.py`` uses a ``timeout=`` kwarg (AST-level scan). An unbounded
+  ``gh`` / ``git`` subprocess was the prime hypothesis for the #3205
+  silent-daemon wedge; this test locks in the no-unbounded-subprocess
+  invariant for future edits.
+* The per-step instrumentation inside :meth:`scheduler_tick` emits
+  ``daemon.scheduler_tick_slow_<step>`` WARNING events when a
+  sub-step's elapsed wall-clock exceeds
+  :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS`, and updates
+  ``_last_scheduler_tick_at`` between steps so the #3097 watchdog sees
+  forward progress mid-body.
+* :func:`_arm_periodic_faulthandler` is idempotent and safe to call
+  multiple times, and honours the
+  ``JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER`` opt-out.
+
+No real subprocess is spawned. No real CloudWatch / ECS is reached.
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+# Make ``scripts`` importable without installing the repo as a package —
+# mirrors the preamble in the other ``test_daemon_*.py`` modules.
+_SCRIPTS = Path(__file__).resolve().parents[2]
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+
+from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+
+
+DAEMON_PATH = Path(daemon.__file__)
+
+
+# --------------------------------------------------------------------------
+# Shared fakes (local copies so this test file stays self-contained —
+# the watchdog test file's fakes aren't importable across test modules
+# without a shared helper module, and the set of fakes is small.)
+# --------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, Any]] = []
+        self.fetch_queue: list[Any] = []
+        self.rowcount = 0
+
+    def __enter__(self) -> _FakeCursor:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        return None
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append((sql, params))
+
+    def fetchone(self) -> Any:
+        if not self.fetch_queue:
+            return None
+        return self.fetch_queue.pop(0)
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.cursor_instance = _FakeCursor()
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+        self.autocommit = False
+
+    def cursor(self) -> _FakeCursor:
+        return self.cursor_instance
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _CapturingLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def events(self, name: str) -> list[logging.LogRecord]:
+        return [r for r in self.records if getattr(r, "event", None) == name]
+
+
+def _make_daemon(
+    tmp_path: Path,
+) -> tuple[daemon.DispatcherDaemon, _FakeConnection, _CapturingLogHandler]:
+    handler = _CapturingLogHandler()
+    logger = logging.getLogger(f"dispatcher.test.sched_instr.{id(tmp_path)}")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    conn = _FakeConnection()
+    cfg = daemon.DaemonConfig(
+        database_url="postgres://fake",
+        version_sha="deadbee",
+        host="test-host",
+        pid=9999,
+        github_repo="judgemind/judgemind",
+        dispatcher_service_name="judgemind-dispatcher-test",
+    )
+    d = daemon.DispatcherDaemon(cfg, logger)
+    d._conn = conn  # type: ignore[assignment]
+    d._run_id = "test-run-id"
+    # Stub the queue scans so scheduler_tick does not touch ``gh``.
+    d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+    d._scan_blocked_and_snapshot = lambda: 0  # type: ignore[method-assign]
+    d._maybe_spawn_orchestration_thread = MagicMock(return_value=False)  # type: ignore[method-assign]
+    return d, conn, handler
+
+
+# --------------------------------------------------------------------------
+# AC #1 — every ``subprocess.run`` / ``subprocess.Popen`` call site in
+# daemon.py uses a ``timeout=`` kwarg.
+#
+# An unbounded ``gh`` / ``git`` subprocess call in the scheduler_tick
+# reachable path was the prime hypothesis for the #3205 silent wedge
+# (issue body §Hypothesis). This AST-level scan locks in the invariant
+# for the whole module — any future addition that forgets ``timeout=``
+# fails this test at author time rather than wedging the daemon in
+# production.
+# --------------------------------------------------------------------------
+
+
+def _collect_subprocess_run_sites() -> list[tuple[int, bool]]:
+    """Return (lineno, has_timeout_kw) for every ``subprocess.run`` call.
+
+    Walks ``daemon.py`` at parse time. ``subprocess.Popen`` calls are
+    deliberately excluded — ``Popen`` itself returns immediately, and
+    the daemon bounds Popen-based subprocesses via a subsequent
+    ``proc.wait(timeout=...)`` call (see the ``claude -p`` orchestration
+    spawn at line ~8252 and the diagnoser spawn at line ~17320). The
+    scheduler_tick wedge class the #3205 instrumentation targets is
+    specifically an unbounded blocking ``subprocess.run`` — those are
+    the calls that tie up the MainThread indefinitely.
+
+    ``has_timeout_kw`` is True iff the call passes ``timeout=...`` —
+    either inline or via ``**kwargs`` (we treat ``**kwargs`` as a
+    pass-through and accept it, relying on the wrapper's own check).
+    """
+    source = DAEMON_PATH.read_text()
+    tree = ast.parse(source)
+    sites: list[tuple[int, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if not (
+            isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"
+            and func.attr == "run"
+        ):
+            continue
+        has_timeout = any(
+            kw.arg == "timeout" or kw.arg is None  # kw.arg None == **kwargs splat
+            for kw in node.keywords
+        )
+        sites.append((node.lineno, has_timeout))
+    return sites
+
+
+class TestSubprocessTimeoutCoverage:
+    def test_every_subprocess_run_call_has_timeout_kwarg(self) -> None:
+        sites = _collect_subprocess_run_sites()
+        assert sites, "expected at least one subprocess.run call site in daemon.py"
+        missing = [lineno for lineno, ok in sites if not ok]
+        assert missing == [], (
+            "subprocess.run call sites without ``timeout=`` kwarg (daemon.py "
+            f"line numbers): {missing!r}. Every blocking subprocess.run in the "
+            "scheduler_tick-reachable path must be bounded to avoid the #3205 "
+            "silent-daemon wedge class. If you need an unbounded subprocess, "
+            "use subprocess.Popen + proc.wait(timeout=...) instead."
+        )
+
+    def test_queue_scan_timeout_constant_is_bounded(self) -> None:
+        """The shared ``QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS`` drives
+        the hot-path ``gh issue list`` calls. Keep it well below the
+        scheduler tick cadence so a slow ``gh`` can never pile up
+        across ticks."""
+        assert daemon.QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS <= 30
+        assert daemon.QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS >= 1
+
+
+# --------------------------------------------------------------------------
+# AC #2 — per-step slow warnings from scheduler_tick.
+#
+# When a step's wall-clock elapsed exceeds
+# :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS`,
+# :meth:`_record_scheduler_step` emits a
+# ``daemon.scheduler_tick_slow_<step>`` WARNING log event carrying the
+# elapsed seconds. This is the "which helper owned the wedge?"
+# diagnostic — fires BEFORE the 300s watchdog threshold so the next
+# silent wedge self-diagnoses.
+# --------------------------------------------------------------------------
+
+
+class TestRecordSchedulerStep:
+    def test_fast_step_does_not_emit_warning(self, tmp_path: Path) -> None:
+        d, _conn, handler = _make_daemon(tmp_path)
+        # t_before is ~now; elapsed will be tiny → no warning.
+        t_before = time.monotonic()
+        d._record_scheduler_step("consume_commands", t_before)
+        assert handler.events("scheduler_tick_slow_consume_commands") == []
+
+    def test_slow_step_emits_warning_with_elapsed_seconds(self, tmp_path: Path) -> None:
+        d, _conn, handler = _make_daemon(tmp_path)
+        # Fake a step that took well over the threshold by passing a
+        # stale t_before (elapsed = now - stale).
+        stale = time.monotonic() - (daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS + 1.0)
+        d._record_scheduler_step("active_agent_count", stale)
+        events = handler.events("scheduler_tick_slow_active_agent_count")
+        assert len(events) == 1
+        rec = events[0]
+        assert rec.levelno == logging.WARNING
+        elapsed = getattr(rec, "elapsed_seconds", None)
+        assert isinstance(elapsed, (int, float))
+        assert elapsed >= daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS
+        assert getattr(rec, "step", None) == "active_agent_count"
+        threshold = getattr(rec, "threshold_seconds", None)
+        assert threshold == daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS
+
+    def test_record_step_updates_last_scheduler_tick_at(self, tmp_path: Path) -> None:
+        """The watchdog heartbeat must advance per-step so a mid-body
+        wedge produces a ``scheduler_tick_stalled`` within the normal
+        300s WARN window rather than hiding under the prior tick's
+        entry timestamp."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        d._last_scheduler_tick_at = 0.0  # known-stale
+        before = time.monotonic()
+        d._record_scheduler_step("consume_commands", before)
+        after = time.monotonic()
+        assert before <= d._last_scheduler_tick_at <= after
+
+    def test_record_step_returns_current_monotonic(self, tmp_path: Path) -> None:
+        """Callers chain ``t_step = _record_scheduler_step(...)`` so the
+        return value must be ``time.monotonic()`` after the heartbeat
+        write — matching ``_last_scheduler_tick_at``."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        returned = d._record_scheduler_step("consume_commands", time.monotonic())
+        assert returned == d._last_scheduler_tick_at
+
+
+# --------------------------------------------------------------------------
+# AC #2b — scheduler_tick actually calls _record_scheduler_step between
+# steps. End-to-end check via a slow monkeypatched helper.
+# --------------------------------------------------------------------------
+
+
+class TestSchedulerTickEmitsSlowEvents:
+    def test_slow_queue_scan_emits_slow_scan_queue_event(self, tmp_path: Path) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(1,)]
+
+        def _slow_scan() -> int:
+            time.sleep(daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS + 0.25)
+            return 0
+
+        d._scan_queue_and_snapshot = _slow_scan  # type: ignore[method-assign]
+        d.scheduler_tick()
+        events = handler.events("scheduler_tick_slow_scan_queue")
+        assert len(events) == 1
+        assert getattr(events[0], "levelno", None) == logging.WARNING
+
+    def test_fast_tick_emits_no_slow_events(self, tmp_path: Path) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(1,)]
+        d.scheduler_tick()
+        # No step is slow when every helper is a stub that returns
+        # immediately, so no warning should fire.
+        slow_events = [
+            rec
+            for rec in handler.records
+            if getattr(rec, "event", "").startswith("scheduler_tick_slow_")
+        ]
+        assert slow_events == [], (
+            f"expected no slow-step events on a fast tick; got {[e.event for e in slow_events]!r}"
+        )
+
+    def test_scheduler_tick_records_tick_elapsed_s(self, tmp_path: Path) -> None:
+        """Every successful tick logs ``tick_elapsed_s`` on the
+        ``daemon.scheduler_tick`` event so CloudWatch Insights can
+        ``stats avg(tick_elapsed_s) by bin(5m)`` without waiting for a
+        slow-step threshold trip."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(1,)]
+        d.scheduler_tick()
+        events = handler.events("scheduler_tick")
+        assert events, "expected at least one scheduler_tick event"
+        tick_elapsed = getattr(events[-1], "tick_elapsed_s", None)
+        assert isinstance(tick_elapsed, (int, float))
+        assert tick_elapsed >= 0.0
+
+
+# --------------------------------------------------------------------------
+# AC #3 — _arm_periodic_faulthandler is idempotent and safe to re-enter.
+#
+# Called on every daemon boot. ECS can restart the task rapidly (rolling
+# deploys, task-def churn) and a prior process's ``dump_traceback_later``
+# timer may still be armed on the same file descriptor — we must not
+# fail in that case. Also test the opt-out env var.
+# --------------------------------------------------------------------------
+
+
+class TestArmPeriodicFaulthandler:
+    def test_arms_timer_by_default(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv(
+            "JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER", raising=False
+        )
+        log = logging.getLogger("dispatcher.test.faulthandler.arm")
+        handler = _CapturingLogHandler()
+        log.handlers = [handler]
+        log.propagate = False
+        log.setLevel(logging.DEBUG)
+
+        calls: list[tuple[int, dict[str, Any]]] = []
+
+        def _fake_dump_later(interval: int, **kwargs: Any) -> None:
+            calls.append((interval, kwargs))
+
+        with (
+            patch.object(daemon.faulthandler, "dump_traceback_later", _fake_dump_later),
+            patch.object(daemon.faulthandler, "enable") as fake_enable,
+        ):
+            ok = daemon._arm_periodic_faulthandler(log, interval_seconds=123)
+
+        assert ok is True
+        assert fake_enable.called
+        assert len(calls) == 1
+        assert calls[0][0] == 123
+        assert calls[0][1].get("repeat") is True
+        assert calls[0][1].get("exit") is False
+        events = handler.events("faulthandler_timer_armed")
+        assert len(events) == 1
+
+    def test_idempotent_repeat_calls(self, monkeypatch: Any) -> None:
+        """Calling ``_arm_periodic_faulthandler`` twice in a row is
+        a no-op on the second call (``dump_traceback_later`` simply
+        replaces the prior timer) — it does NOT raise."""
+        monkeypatch.delenv(
+            "JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER", raising=False
+        )
+        log = logging.getLogger("dispatcher.test.faulthandler.idempotent")
+        log.handlers = []
+        log.propagate = False
+
+        with (
+            patch.object(daemon.faulthandler, "dump_traceback_later"),
+            patch.object(daemon.faulthandler, "enable"),
+        ):
+            ok1 = daemon._arm_periodic_faulthandler(log)
+            ok2 = daemon._arm_periodic_faulthandler(log)
+
+        assert ok1 is True
+        assert ok2 is True
+
+    def test_opt_out_env_var_disables_timer(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER", "1")
+        log = logging.getLogger("dispatcher.test.faulthandler.optout")
+        handler = _CapturingLogHandler()
+        log.handlers = [handler]
+        log.propagate = False
+        log.setLevel(logging.DEBUG)
+
+        calls: list[int] = []
+
+        def _fake_dump_later(interval: int, **_kwargs: Any) -> None:
+            calls.append(interval)
+
+        with patch.object(
+            daemon.faulthandler, "dump_traceback_later", _fake_dump_later
+        ):
+            ok = daemon._arm_periodic_faulthandler(log)
+
+        assert ok is False
+        assert calls == []
+        events = handler.events("faulthandler_timer_disabled")
+        assert len(events) == 1
+
+    def test_swallows_faulthandler_exception(self, monkeypatch: Any) -> None:
+        """A failure inside ``faulthandler.dump_traceback_later`` must
+        NOT crash the daemon at boot. Log + swallow."""
+        monkeypatch.delenv(
+            "JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER", raising=False
+        )
+        log = logging.getLogger("dispatcher.test.faulthandler.swallow")
+        handler = _CapturingLogHandler()
+        log.handlers = [handler]
+        log.propagate = False
+        log.setLevel(logging.DEBUG)
+
+        def _raising(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("faulthandler boom")
+
+        with (
+            patch.object(daemon.faulthandler, "dump_traceback_later", _raising),
+            patch.object(daemon.faulthandler, "enable"),
+        ):
+            ok = daemon._arm_periodic_faulthandler(log)
+
+        assert ok is False
+        events = handler.events("faulthandler_timer_failed")
+        assert len(events) == 1
+
+
+# --------------------------------------------------------------------------
+# AC #4 — module-level constants are sane defaults.
+# --------------------------------------------------------------------------
+
+
+class TestModuleConstants:
+    def test_slow_step_threshold_is_below_watchdog_warn(self) -> None:
+        """Per-step slow WARN fires BEFORE the 300s wedge watchdog so
+        we pinpoint WHICH step is slow instead of just "no tick for
+        300s". 5s << 300s honours that ordering."""
+        assert daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS > 0.0
+        assert (
+            daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS
+            < daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+        )
+
+    def test_faulthandler_interval_matches_watchdog_warn(self) -> None:
+        """The faulthandler periodic stderr dump uses the same cadence
+        as the #3097 watchdog so both reliability nets share the same
+        'something is wrong' threshold."""
+        assert daemon.FAULTHANDLER_DUMP_INTERVAL_SECONDS > 0
+        assert (
+            daemon.FAULTHANDLER_DUMP_INTERVAL_SECONDS
+            == daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+        )

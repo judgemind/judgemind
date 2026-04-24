@@ -173,6 +173,36 @@ WATCHDOG_POLL_INTERVAL_SECONDS = 30
 #: the wedge lives.
 WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD = 20
 
+#: Per-step slow-warning threshold for :meth:`scheduler_tick` (#3205).
+#: Any individual sub-step (``_consume_commands`` / concurrency_cap read /
+#: ``_process_retry_markers`` / ``_reap_completed_agent_tasks`` /
+#: ``_scan_queue_and_snapshot`` / ``_scan_blocked_and_snapshot`` /
+#: ``_active_agent_count`` / ``_maybe_spawn_orchestration_thread``) that
+#: exceeds this wall-clock budget emits a
+#: ``daemon.scheduler_tick_slow_<step>`` WARNING with the measured
+#: elapsed seconds. Chosen to be comfortably above normal execution
+#: (single-digit ms for DB hits, low-hundreds-of-ms for ``gh`` calls)
+#: while still firing well before the #3097 watchdog's 300s wedge
+#: threshold — a 5s step repeated N times is the cheap path for us to
+#: pinpoint which helper owns the wedge BEFORE the main loop goes
+#: silent. Not operator-tunable today; flip to a config key if we end
+#: up needing per-environment overrides.
+SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS = 5.0
+
+#: Periodic faulthandler stderr-dump cadence (#3205). At daemon startup
+#: we arm :func:`faulthandler.dump_traceback_later(FAULTHANDLER_DUMP_INTERVAL_SECONDS,
+#: repeat=True)` so every live Python thread's stack prints to stderr
+#: (→ CloudWatch) on a fixed interval, regardless of any Python-level
+#: state. This is the "nuclear option" — if the watchdog thread itself
+#: is wedged (e.g. GIL starved, psycopg-deadlocked), the faulthandler
+#: timer fires from the C-level SIGALRM handler and produces a stack
+#: dump anyway. Matches the #3097 watchdog's WARN threshold so the two
+#: reliability nets share the same "something is wrong" cadence. Can
+#: be disabled in tests / local dev via the
+#: ``JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER=1`` env var so a
+#: pytest run doesn't spray tracebacks at the terminal every 5 min.
+FAULTHANDLER_DUMP_INTERVAL_SECONDS = 300
+
 #: Default retention window for ``dispatcher.queue_snapshots``. Matches
 #: the ``dispatcher_daemon`` CloudWatch log group default retention and
 #: covers the longest plausible multi-week post-mortem window. Overridable
@@ -2295,11 +2325,19 @@ class DispatcherDaemon:
         # fails to fire is a genuine tick-entry-level wedge, which is
         # exactly what the watchdog exists to catch.
         self._last_scheduler_tick_at = time.monotonic()
+        # #3205 per-step instrumentation. ``t_step`` marches forward as
+        # we close each sub-step; see :meth:`_record_scheduler_step` for
+        # the watchdog-heartbeat + slow-step-WARN semantics. The initial
+        # value matches the ``_last_scheduler_tick_at`` write above so
+        # the first step's elapsed is measured from tick entry.
+        t_step = self._last_scheduler_tick_at
+        t_tick_entry = t_step
 
         # 1. Consume any pending commands. Each command is dispatched to
         # its handler; consumed_at is set AFTER the handler returns so
         # a mid-handler crash leaves the command unconsumed for retry.
         commands_consumed = self._consume_commands()
+        t_step = self._record_scheduler_step("consume_commands", t_step)
 
         concurrency_cap: int | None = None
 
@@ -2314,6 +2352,7 @@ class DispatcherDaemon:
                 # Stored as JSONB — a bare number comes back as int.
                 concurrency_cap = int(row[0]) if row[0] is not None else None
         self._conn.commit()
+        t_step = self._record_scheduler_step("concurrency_cap_read", t_step)
 
         # Killswitch observation (#2847, amended #2884). Update the
         # observation state and the ``_pause_requested`` event so the
@@ -2402,6 +2441,7 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
+        t_step = self._record_scheduler_step("circuit_breaker_auto_close", t_step)
 
         # Issue #2949 — process infra-preemption retry markers BEFORE
         # scanning the ``agent/ready`` queue. When a daemon restart
@@ -2447,6 +2487,7 @@ class DispatcherDaemon:
                     "markers_processed": retry_markers_prioritized,
                 },
             )
+        t_step = self._record_scheduler_step("process_retry_markers", t_step)
 
         # #3091 Stage 2 reap pass. Observe any in-flight per-agent ECS
         # tasks (``dispatcher.agents.agent_task_arn IS NOT NULL``) and
@@ -2477,6 +2518,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_scheduler_step("reap_agent_tasks", t_step)
 
         # 3. Scan the ``agent/ready`` queue and persist a snapshot.
         #
@@ -2484,6 +2526,7 @@ class DispatcherDaemon:
         # do NOT raise — the daemon must survive GitHub API hiccups,
         # and the next tick will try again (§15).
         queue_depth = self._scan_queue_and_snapshot()
+        t_step = self._record_scheduler_step("scan_queue", t_step)
 
         # 3b. Scan the ``status/blocked`` list on a slower cadence
         # (every ``BLOCKED_SCAN_EVERY_N_TICKS`` ticks — ~2min at the
@@ -2494,6 +2537,7 @@ class DispatcherDaemon:
         blocked_depth = -1  # sentinel: "scan not attempted this tick"
         if self._should_run_blocked_scan():
             blocked_depth = self._scan_blocked_and_snapshot()
+        t_step = self._record_scheduler_step("scan_blocked", t_step)
 
         # 4. Phase 3A orchestration gate (#2783) — threaded spawn (#2847).
         #
@@ -2569,6 +2613,7 @@ class DispatcherDaemon:
             and not self._is_paused()
         ):
             active_agent_count = self._active_agent_count()
+            t_step = self._record_scheduler_step("active_agent_count", t_step)
             has_active_agent_this_tick = active_agent_count > 0
             gate_blocked_on_cap = active_agent_count >= concurrency_cap
             if active_agent_count < concurrency_cap:
@@ -2585,6 +2630,9 @@ class DispatcherDaemon:
                             "run_id": self._run_id,
                         },
                     )
+                t_step = self._record_scheduler_step(
+                    "maybe_spawn_orchestration", t_step
+                )
 
         self._scheduler_ticks += 1
         orchestration_thread_alive = self._orchestration_thread_alive()
@@ -2636,6 +2684,14 @@ class DispatcherDaemon:
                 orchestration_thread_alive = False
         else:
             self._orchestration_orphan_tick_count = 0
+        # #3205 — tick total-elapsed + end-of-body watchdog heartbeat.
+        # Refreshing ``_last_scheduler_tick_at`` here (in addition to
+        # the per-step updates above and the tick-entry update) ensures
+        # the watchdog measures the gap *between* tick bodies rather
+        # than just from tick entry — matching the pre-#3205 semantic
+        # while adding the mid-body observability.
+        tick_elapsed_s = time.monotonic() - t_tick_entry
+        self._last_scheduler_tick_at = time.monotonic()
         self._log.info(
             "daemon.scheduler_tick",
             extra={
@@ -2668,6 +2724,12 @@ class DispatcherDaemon:
                 # those ticks never read the count from the DB.
                 "active_agent_count": active_agent_count,
                 "gate_blocked_on_cap": gate_blocked_on_cap,
+                # #3205: wall-clock total elapsed for this tick body so
+                # the common-case duration shows up in CloudWatch
+                # Insights ``stats avg(tick_elapsed_s) by bin(5m)`` and
+                # regressions are visible without waiting for a
+                # ``scheduler_tick_slow_*`` threshold trip.
+                "tick_elapsed_s": round(tick_elapsed_s, 3),
             },
         )
         return {
@@ -19791,6 +19853,52 @@ class DispatcherDaemon:
             )
         return dump
 
+    def _record_scheduler_step(self, step: str, t_before: float) -> float:
+        """Refresh the watchdog heartbeat + warn on slow steps (#3205).
+
+        Called from :meth:`scheduler_tick` between each major sub-step
+        (``_consume_commands``, concurrency_cap read, ``_process_retry_markers``,
+        ``_reap_completed_agent_tasks``, ``_scan_queue_and_snapshot``,
+        ``_scan_blocked_and_snapshot``, ``_active_agent_count``,
+        ``_maybe_spawn_orchestration_thread``) so the #3097 watchdog
+        observes forward progress even when the tick body is long AND
+        so we can pinpoint which step owns a wedge BEFORE the 300s
+        watchdog threshold fires.
+
+        The pre-#3205 code updated ``_last_scheduler_tick_at`` only at
+        the start of the tick, which meant a mid-body wedge looked
+        "fresh" for the remainder of the current tick's budget — the
+        watchdog could only see stalls that spanned *between* ticks.
+        Updating after every step both shortens the watchdog's
+        observation window AND produces a ``scheduler_tick_slow_<step>``
+        WARNING naming the culprit step if its elapsed time exceeds
+        :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS` — so the NEXT
+        wedge self-diagnoses without waiting for the 5 min watchdog
+        dump.
+
+        Returns ``time.monotonic()`` so the caller can chain by passing
+        the return value as the next step's ``t_before``.
+        """
+        now = time.monotonic()
+        elapsed = now - t_before
+        # Advance the watchdog heartbeat. Single-writer (scheduler
+        # thread) / single-reader (watchdog thread) float assignment
+        # is atomic on CPython — same no-lock semantics as the tick-
+        # entry update at the top of scheduler_tick (#3097).
+        self._last_scheduler_tick_at = now
+        if elapsed >= SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS:
+            self._log.warning(
+                f"daemon.scheduler_tick_slow_{step}",
+                extra={
+                    "event": f"scheduler_tick_slow_{step}",
+                    "run_id": self._run_id,
+                    "step": step,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "threshold_seconds": SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS,
+                },
+            )
+        return now
+
     def _emit_scheduler_stall_warning(self, elapsed_seconds: float) -> None:
         """Log a WARNING ``scheduler_tick_stalled`` with a thread dump.
 
@@ -20254,6 +20362,72 @@ def _install_signal_handlers(daemon: DispatcherDaemon) -> None:
             continue
 
 
+def _arm_periodic_faulthandler(
+    log: logging.Logger,
+    *,
+    interval_seconds: int = FAULTHANDLER_DUMP_INTERVAL_SECONDS,
+) -> bool:
+    """Arm :func:`faulthandler.dump_traceback_later` if enabled (#3205).
+
+    This is the belt-and-braces reliability net for "Python is alive
+    but silent" wedges. On a schedule, a C-level SIGALRM handler walks
+    every Python thread's stack to stderr — regardless of GIL state,
+    psycopg deadlocks, logging-handler contention, or watchdog-thread
+    wedges. Paired with :meth:`_watchdog_loop` (Python-level) so one
+    of the two nets catches any wedge class.
+
+    Disabled when the ``JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER``
+    env var is truthy — tests and local dev opt out so a ``pytest`` run
+    doesn't spray tracebacks at the terminal every 5 minutes. Idempotent
+    on repeat calls: ``dump_traceback_later`` replaces any prior timer.
+
+    Returns True iff the timer was armed. Never raises — a failure here
+    is logged + swallowed; the daemon proceeds without the extra
+    reliability net rather than crashing at boot.
+    """
+    if os.environ.get("JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER", "").strip():
+        log.info(
+            "daemon.faulthandler_timer_disabled",
+            extra={
+                "event": "faulthandler_timer_disabled",
+                "reason": "JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER set",
+            },
+        )
+        return False
+    try:
+        # ``faulthandler.enable`` is idempotent. Install the base
+        # handlers so a SIGSEGV or fatal Python-level abort also gets a
+        # traceback to stderr before the process dies.
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        # ``dump_traceback_later`` replaces any prior timer — calling it
+        # again with the same args is a no-op except for re-arming the
+        # schedule. ``repeat=True`` fires every ``interval_seconds``.
+        # ``exit=False`` means we only dump; we do NOT kill the process
+        # — the #3097 watchdog owns the kill decision.
+        faulthandler.dump_traceback_later(
+            interval_seconds,
+            repeat=True,
+            file=sys.stderr,
+            exit=False,
+        )
+    except Exception:
+        log.exception(
+            "daemon.faulthandler_timer_failed",
+            extra={
+                "event": "faulthandler_timer_failed",
+            },
+        )
+        return False
+    log.info(
+        "daemon.faulthandler_timer_armed",
+        extra={
+            "event": "faulthandler_timer_armed",
+            "interval_seconds": interval_seconds,
+        },
+    )
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint. Returns an exit code."""
     try:
@@ -20263,6 +20437,10 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = _build_config(args)
     log = _configure_logging(cfg.log_level)
+    # #3205 — arm the periodic faulthandler timer early so even a
+    # connect-time wedge (psycopg.connect hanging on DNS, etc.) still
+    # produces a stderr stack dump after ``FAULTHANDLER_DUMP_INTERVAL_SECONDS``.
+    _arm_periodic_faulthandler(log)
 
     if not cfg.database_url:
         log.error(
