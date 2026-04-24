@@ -5907,6 +5907,84 @@ class DispatcherDaemon:
             except Exception:  # pragma: no cover
                 pass
 
+    def _persist_diagnoser_phase_output(
+        self,
+        agent_id: str,
+        diagnosis_id: int,
+        usage: dict[str, Any] | None,
+        log_text: str | None,
+    ) -> None:
+        """INSERT a ``dispatcher.phase_outputs`` row for a diagnoser run.
+
+        Mirrors :meth:`_persist_phase_output` but:
+
+        * Uses a constant ``phase='diagnose'`` — the diagnoser is not
+          part of the orchestration phase sequence.
+        * Sets ``output_json={"diagnosis_id": diagnosis_id}`` so
+          admin-page queries can JOIN back to ``dispatcher.diagnoses``.
+        * Does **not** write a ``dispatcher.phase_transitions`` row —
+          the diagnoser fires on already-failed agents and keeping the
+          transitions sequence clean preserves the dispatcher-v2 spec
+          invariant that transitions trace the orchestration flow.
+
+        Uses ``ON CONFLICT (agent_id, phase, attempt) DO UPDATE`` so a
+        second diagnosis on the same agent at the same ``retries_used``
+        count overwrites the earlier row (rare, cost telemetry is
+        aggregated, not per-row). Issue #2881.
+        """
+        assert self._conn is not None, "connect() must run before persisting"
+        attempt = self._current_attempt_for(agent_id)
+        u = usage or {}
+        output_json = json.dumps({"diagnosis_id": diagnosis_id}, default=str)
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.phase_outputs "
+                    "    (agent_id, phase, output_json, log_text, attempt, "
+                    "     tokens_input, tokens_output, tokens_cache_read, "
+                    "     tokens_cache_write, cost_usd, model_used) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (agent_id, phase, attempt) DO UPDATE SET "
+                    "    output_json         = EXCLUDED.output_json, "
+                    "    log_text            = EXCLUDED.log_text, "
+                    "    tokens_input        = EXCLUDED.tokens_input, "
+                    "    tokens_output       = EXCLUDED.tokens_output, "
+                    "    tokens_cache_read   = EXCLUDED.tokens_cache_read, "
+                    "    tokens_cache_write  = EXCLUDED.tokens_cache_write, "
+                    "    cost_usd            = EXCLUDED.cost_usd, "
+                    "    model_used          = EXCLUDED.model_used, "
+                    "    ts                  = now()",
+                    (
+                        agent_id,
+                        "diagnose",
+                        output_json,
+                        log_text,
+                        attempt,
+                        u.get("tokens_input"),
+                        u.get("tokens_output"),
+                        u.get("tokens_cache_read"),
+                        u.get("tokens_cache_write"),
+                        u.get("cost_usd"),
+                        u.get("model_used"),
+                    ),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.persist_diagnoser_phase_output_failed",
+                extra={
+                    "event": "persist_diagnoser_phase_output_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "diagnosis_id": diagnosis_id,
+                    "attempt": attempt,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
     def _current_attempt_for(self, agent_id: str) -> int:
         """Return the current retry attempt number for an agent.
 
@@ -8431,27 +8509,28 @@ class DispatcherDaemon:
         except Exception:  # pragma: no cover — defensive
             return
 
-    def _parse_phase_usage(self, worktree: Path, phase: str) -> dict[str, Any] | None:
-        """Parse the ``claude -p --output-format json`` usage envelope.
+    def _parse_usage_envelope(
+        self, stdout_path: Path, fallback_model: str | None
+    ) -> dict[str, Any] | None:
+        """Parse a ``claude -p --output-format json`` stdout file.
 
-        Reads ``{worktree}/tmp/claude-p-<phase>.stdout.json`` — the
-        single JSON object Claude Code writes to stdout when
-        ``--output-format json`` is passed. Extracts the fields we
-        persist on ``dispatcher.phase_outputs``:
+        Shared inner helper used by both :meth:`_parse_phase_usage` and
+        :meth:`_parse_diagnoser_usage`. Reads the JSON envelope at
+        *stdout_path*, validates the structure, and returns the
+        normalised usage dict:
 
         - ``tokens_input`` ← ``usage.input_tokens``
         - ``tokens_output`` ← ``usage.output_tokens``
         - ``tokens_cache_read`` ← ``usage.cache_read_input_tokens``
         - ``tokens_cache_write`` ← ``usage.cache_creation_input_tokens``
         - ``cost_usd`` ← ``total_cost_usd``
-        - ``model_used`` ← ``model`` (falls back to ``PHASE_MODELS[phase]``)
+        - ``model_used`` ← ``model`` (falls back to *fallback_model*)
 
-        Returns ``None`` on any error — the stdout file is missing,
-        empty, not JSON, or the envelope has no ``usage`` block. The
-        caller treats ``None`` the same as "no metering signal": the
-        new columns stay NULL, the row still inserts. Issue #2869.
+        Returns ``None`` on any error — the file is missing, empty, not
+        JSON, or the envelope has no ``usage`` block. The caller treats
+        ``None`` as "no metering signal": the new columns stay NULL and
+        the INSERT still runs. Issue #2869.
         """
-        stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
         if not stdout_path.exists():
             return None
         try:
@@ -8478,7 +8557,7 @@ class DispatcherDaemon:
             cost_usd = None
         model_used = envelope.get("model")
         if not isinstance(model_used, str) or not model_used:
-            model_used = PHASE_MODELS.get(phase)
+            model_used = fallback_model
 
         def _int_or_none(v: Any) -> int | None:
             try:
@@ -8496,6 +8575,39 @@ class DispatcherDaemon:
             "cost_usd": cost_usd,
             "model_used": model_used,
         }
+
+    def _parse_phase_usage(self, worktree: Path, phase: str) -> dict[str, Any] | None:
+        """Parse the ``claude -p --output-format json`` usage envelope.
+
+        Thin wrapper around :meth:`_parse_usage_envelope` that computes
+        the stdout path from the worktree + phase name and supplies
+        ``PHASE_MODELS[phase]`` as the model fallback.
+
+        Reads ``{worktree}/tmp/claude-p-<phase>.stdout.json``. Returns
+        ``None`` on any error — the stdout file is missing, empty, not
+        JSON, or the envelope has no ``usage`` block. The caller treats
+        ``None`` the same as "no metering signal": the new columns stay
+        NULL, the row still inserts. Issue #2869.
+        """
+        stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
+        return self._parse_usage_envelope(stdout_path, PHASE_MODELS.get(phase))
+
+    def _parse_diagnoser_usage(self, diagnosis_id: int) -> dict[str, Any] | None:
+        """Parse token usage from a diagnoser subprocess stdout file.
+
+        Thin wrapper around :meth:`_parse_usage_envelope` that computes
+        the stdout path for a diagnoser run — stored under
+        ``{repo_root}/tmp/claude-p-diagnose-<diagnosis_id>.stdout.json``
+        — and supplies ``DIAGNOSER_MODEL`` as the model fallback.
+
+        Returns ``None`` on any error (same semantics as
+        :meth:`_parse_phase_usage`). Issue #2881.
+        """
+        repo_root = self._repo_root_for_notify_script()
+        stdout_path = (
+            repo_root / "tmp" / f"claude-p-diagnose-{diagnosis_id}.stdout.json"
+        )
+        return self._parse_usage_envelope(stdout_path, DIAGNOSER_MODEL)
 
     def _claim_and_orchestrate_one(self) -> None:
         """Claim one issue and run the plan → ralph → summary → PR flow.
@@ -17400,6 +17512,8 @@ class DispatcherDaemon:
             str(DIAGNOSER_MAX_TURNS),
             "--model",
             DIAGNOSER_MODEL,
+            "--output-format",
+            "json",
             # See ``_spawn_phase_subprocess`` for the full rationale on
             # why the Fargate dispatcher runs subagents with
             # ``--dangerously-skip-permissions``. Same reasoning applies
@@ -17414,8 +17528,11 @@ class DispatcherDaemon:
         jsonl_path = (
             repo_root / "tmp" / ".dispatcher" / f"diagnose-{diagnosis_id}.jsonl"
         )
+        stdout_path = (
+            repo_root / "tmp" / f"claude-p-diagnose-{diagnosis_id}.stdout.json"
+        )
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_buf: list[str] = []
-        stdout_buf: list[str] = []
 
         class _ListSink:
             """File-like sink that appends each write to ``buf``."""
@@ -17442,6 +17559,7 @@ class DispatcherDaemon:
         except FileNotFoundError:
             return None, "claude binary not found"
 
+        stdout_file = stdout_path.open("w", encoding="utf-8")
         threads = stream_subprocess_output_async(
             proc,
             agent_id=f"diagnose-{diagnosis_id}",
@@ -17449,7 +17567,7 @@ class DispatcherDaemon:
             phase="diagnose",
             logger=self._log,
             jsonl_path=jsonl_path,
-            stdout_sink=_ListSink(stdout_buf),
+            stdout_sink=stdout_file,
             stderr_sink=_ListSink(stderr_buf),
         )
         try:
@@ -17461,10 +17579,14 @@ class DispatcherDaemon:
             except subprocess.TimeoutExpired:  # pragma: no cover
                 pass
             threads.join(timeout=10)
+            stdout_file.flush()
+            stdout_file.close()
             tail = ("".join(stderr_buf))[-500:]
             return None, tail
 
         threads.join(timeout=10)
+        stdout_file.flush()
+        stdout_file.close()
         stderr_tail = ("".join(stderr_buf))[-500:]
         return returncode, stderr_tail
 
@@ -18648,11 +18770,24 @@ class DispatcherDaemon:
                         "agent_id": candidate["agent_id"],
                         "category": candidate["category"],
                         "tier": candidate["tier"],
+                        "output_format": "json",
                     },
                 )
 
                 exit_code, stderr_tail = self._spawn_diagnoser_subprocess(diagnosis_id)
                 ran += 1
+
+                # Parse + persist metering before any branch — records
+                # cost even when the diagnoser timed out or exited
+                # non-zero (that's when opus-cost-vs-savings matters
+                # most). Issue #2881.
+                diag_usage = self._parse_diagnoser_usage(diagnosis_id)
+                self._persist_diagnoser_phase_output(
+                    agent_id=candidate["agent_id"],
+                    diagnosis_id=diagnosis_id,
+                    usage=diag_usage,
+                    log_text=stderr_tail if stderr_tail else None,
+                )
 
                 if exit_code is None:
                     # Timeout or subprocess could not be launched.
