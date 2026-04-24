@@ -108,16 +108,14 @@ reset_tmpdir() {
 # _mark_agent_terminal and _write_diagnosis_outcome_for_agent.
 write_daemon() {
     write_file "daemon.py" <<'EOF'
+TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "crashed", "plan_blocked", "needs_review"}
+)
+
 class Dispatcher:
     def _mark_agent_terminal(self, agent_id, status):
         """Mark an agent as terminal."""
-        terminal = status in (
-            "succeeded",
-            "failed",
-            "crashed",
-            "plan_blocked",
-            "needs_review",
-        )
+        terminal = status in TERMINAL_AGENT_STATUSES
         return terminal
 
     def _write_diagnosis_outcome_for_agent(self, agent_id, final_status):
@@ -193,14 +191,18 @@ EOF
 }
 
 # Write a canonical ui-primitives.tsx fixture.
+# Uses the real pattern: TERMINAL_AGENT_STATUSES array + derived OutcomeStatus type.
 write_ui_prim() {
     write_file "ui-primitives.tsx" <<'EOF'
-type OutcomeStatus =
-  | 'succeeded'
-  | 'failed'
-  | 'crashed'
-  | 'plan_blocked'
-  | 'needs_review';
+const TERMINAL_AGENT_STATUSES = [
+  'succeeded',
+  'failed',
+  'crashed',
+  'plan_blocked',
+  'needs_review',
+] as const;
+
+type OutcomeStatus = (typeof TERMINAL_AGENT_STATUSES)[number];
 
 const OUTCOME_STYLES: Record<
   OutcomeStatus,
@@ -333,19 +335,22 @@ assert_fails_files "resolvers.ts drift: missing terminal from SQL IN list fails"
     "$TMPDIR_TEST/completions.tsx"
 reset_tmpdir
 
-# ─── Test 4: ui-primitives.tsx drift — remove a terminal from OutcomeStatus ──
+# ─── Test 4: ui-primitives.tsx drift — remove a terminal from TERMINAL_AGENT_STATUSES ──
 write_daemon
 write_schema
 write_resolvers
 write_ui_prim
 write_completions
-# Overwrite ui-primitives.tsx missing 'needs_review' from OutcomeStatus union
+# Overwrite ui-primitives.tsx missing 'needs_review' from TERMINAL_AGENT_STATUSES array
 write_file "ui-primitives.tsx" <<'EOF'
-type OutcomeStatus =
-  | 'succeeded'
-  | 'failed'
-  | 'crashed'
-  | 'plan_blocked';
+const TERMINAL_AGENT_STATUSES = [
+  'succeeded',
+  'failed',
+  'crashed',
+  'plan_blocked',
+] as const;
+
+type OutcomeStatus = (typeof TERMINAL_AGENT_STATUSES)[number];
 
 const OUTCOME_STYLES: Record<
   OutcomeStatus,
@@ -418,16 +423,14 @@ write_completions
 # but _write_diagnosis_outcome_for_agent has a stale "timed_out" terminal
 # in the correct-outcome tuple that does NOT exist in canonical.
 write_file "daemon.py" <<'EOF'
+TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "crashed", "plan_blocked", "needs_review"}
+)
+
 class Dispatcher:
     def _mark_agent_terminal(self, agent_id, status):
         """Mark an agent as terminal."""
-        terminal = status in (
-            "succeeded",
-            "failed",
-            "crashed",
-            "plan_blocked",
-            "needs_review",
-        )
+        terminal = status in TERMINAL_AGENT_STATUSES
         return terminal
 
     def _write_diagnosis_outcome_for_agent(self, agent_id, final_status):
@@ -461,16 +464,14 @@ write_ui_prim
 write_completions
 # Write daemon.py with a stray/unknown status in ACTIVE_AGENT_STATUSES
 write_file "daemon.py" <<'EOF'
+TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "failed", "crashed", "plan_blocked", "needs_review"}
+)
+
 class Dispatcher:
     def _mark_agent_terminal(self, agent_id, status):
         """Mark an agent as terminal."""
-        terminal = status in (
-            "succeeded",
-            "failed",
-            "crashed",
-            "plan_blocked",
-            "needs_review",
-        )
+        terminal = status in TERMINAL_AGENT_STATUSES
         return terminal
 
     def _write_diagnosis_outcome_for_agent(self, agent_id, final_status):

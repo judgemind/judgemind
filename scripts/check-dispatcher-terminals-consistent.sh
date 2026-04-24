@@ -20,8 +20,9 @@
 #
 # Rule
 # ----
-# 1. Parse the canonical set from ``terminal = status in (...)`` inside
-#    ``_mark_agent_terminal`` in ``scripts/dispatcher/daemon.py``.
+# 1. Parse the canonical set from the module-level
+#    ``TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset({...})``
+#    constant in ``scripts/dispatcher/daemon.py``.
 #
 # 2. Check SET EQUALITY against:
 #      a. ``packages/api/src/graphql/dispatcher/schema.ts``
@@ -141,32 +142,21 @@ extract_quoted_tokens() {
 }
 
 # ─── Step 1: Extract canonical set from daemon.py ─────────────────────────
-# Find the ``terminal = status in (...)`` block inside _mark_agent_terminal.
-# Uses awk to scan the file in one pass.
-# POSIX awk: extract the quoted token on each line inside the block using
-# sub() to consume the leading portion, then print what's left between quotes.
-canonical_raw="$(awk '
-    /terminal = status in \(/ { in_block=1; next }
-    in_block && /^[[:space:]]*\)/ { exit }
-    in_block {
-        line = $0
-        # Try double-quoted token
-        if (sub(/^[^"]*"/, "", line)) {
-            sub(/".*/, "", line)
-            if (length(line) > 0) { print line; next }
-        }
-        # Reset line and try single-quoted token
-        line = $0
-        if (sub(/^[^'"'"']*'"'"'/, "", line)) {
-            sub(/'"'"'.*/, "", line)
-            if (length(line) > 0) { print line }
-        }
-    }
-' "$DAEMON_FILE" | tr '\n' ' ' | sed 's/ $//')"
+# Extract from the module-level frozenset literal:
+#   TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
+#       {"succeeded", "failed", ...}
+#   )
+# Model: scripts/check-dispatcher-terminal-statuses.sh extract_python().
+canonical_raw="$(awk '/^TERMINAL_AGENT_STATUSES.*frozenset/{p=1} p{print; if(/\)/) {p=0; exit}}' "$DAEMON_FILE" \
+    | grep -oE '"[a-z_]+"' \
+    | tr -d '"' \
+    | sort \
+    | tr '\n' ' ' \
+    | sed 's/ $//')"
 
 if [[ -z "$canonical_raw" ]]; then
     echo "ERROR: check-dispatcher-terminals-consistent: could not extract canonical terminal set from $DAEMON_FILE"
-    echo "  Expected to find:  terminal = status in (...)"
+    echo "  Expected to find:  TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset({...})"
     exit 1
 fi
 
@@ -199,6 +189,9 @@ if ! check_equality "schema.ts (docstrings)" "$schema_raw" "$CANONICAL"; then
 fi
 
 # ─── Step 2b: resolvers.ts — SQL IN lists ─────────────────────────────────
+# Only validates hardcoded inline SQL `status IN (...)` lists.  When resolvers.ts
+# uses a constant (e.g. `[...TERMINAL_AGENT_STATUSES]`) there are no inline lists
+# to check — empty result means no drift risk; skip equality check.
 if [[ ! -f "$RESOLVERS_FILE" ]]; then
     echo "check-dispatcher-terminals-consistent: no resolvers file at $RESOLVERS_FILE — nothing to check."
     exit 0
@@ -208,11 +201,13 @@ location_count=$((location_count + 1))
 resolvers_raw="$(grep -iE "status IN \(" "$RESOLVERS_FILE" \
     | tr "'" ' ' | tr ',' ' ' | tr '(' ' ' | tr ')' ' ' \
     | grep -oE '(succeeded|failed|crashed|plan_blocked|needs_review)' \
-    | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
 
-if ! check_equality "resolvers.ts (SQL IN lists)" "$resolvers_raw" "$CANONICAL"; then
-    failures=$((failures + 1))
-    echo "  File: $RESOLVERS_FILE"
+if [[ -n "$resolvers_raw" ]]; then
+    if ! check_equality "resolvers.ts (SQL IN lists)" "$resolvers_raw" "$CANONICAL"; then
+        failures=$((failures + 1))
+        echo "  File: $RESOLVERS_FILE"
+    fi
 fi
 
 # ─── Step 2c: ui-primitives.tsx — OutcomeStatus union AND OUTCOME_STYLES ──
@@ -222,25 +217,16 @@ if [[ ! -f "$UI_PRIM_FILE" ]]; then
 fi
 location_count=$((location_count + 1))
 
-# Extract OutcomeStatus union members using POSIX awk.
-# Terminated by the first line that ends with ';' after the opening line.
-union_raw="$(awk '
-    /^type OutcomeStatus[[:space:]]*=/ { in_union=1; next }
-    in_union {
-        line = $0
-        # Extract single-quoted token
-        if (sub(/^[^'"'"']*'"'"'/, "", line)) {
-            sub(/'"'"'.*/, "", line)
-            if (length(line) > 0) { print line }
-        }
-        # End: line ends with ;
-        if ($0 ~ /;[[:space:]]*$/) { exit }
-    }
-' "$UI_PRIM_FILE" \
-    | grep -E '^(succeeded|failed|crashed|plan_blocked|needs_review)$' \
-    | sort -u | tr '\n' ' ' | sed 's/ $//')"
+# Extract TERMINAL_AGENT_STATUSES array from ui-primitives.tsx.
+# OutcomeStatus is a derived type `(typeof TERMINAL_AGENT_STATUSES)[number]`
+# so the array is the actual source of truth; same awk pattern as
+# scripts/check-dispatcher-terminal-statuses.sh::extract_ts().
+union_raw="$(awk '/const TERMINAL_AGENT_STATUSES[[:space:]]*=[[:space:]]*\[/{p=1} p{print; if(/\] as const/) {p=0; exit}}' "$UI_PRIM_FILE" \
+    | grep -oE "'[a-z_]+'" \
+    | tr -d "'" \
+    | sort -u | tr '\n' ' ' | sed 's/ $//' || true)"
 
-if ! check_equality "ui-primitives.tsx (OutcomeStatus union)" "$union_raw" "$CANONICAL"; then
+if ! check_equality "ui-primitives.tsx (TERMINAL_AGENT_STATUSES array)" "$union_raw" "$CANONICAL"; then
     failures=$((failures + 1))
     echo "  File: $UI_PRIM_FILE"
 fi
@@ -395,10 +381,10 @@ if (( failures > 0 )); then
     echo ""
     echo "  Canonical set ($CANONICAL_COUNT terminals): $CANONICAL"
     echo "  Source: $DAEMON_FILE"
-    echo "         _mark_agent_terminal — terminal = status in (...)"
+    echo "         TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset({...})"
     echo ""
     echo "  Fix: update every flagged location to match the canonical set."
-    echo "  The canonical source is the tuple in _mark_agent_terminal."
+    echo "  The canonical source is TERMINAL_AGENT_STATUSES in daemon.py."
     exit 1
 fi
 
