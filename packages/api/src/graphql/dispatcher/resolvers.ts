@@ -271,17 +271,36 @@ function diagnoserRowToGraphQL(row: DiagnoserEffectivenessRow): Record<string, u
   };
 }
 
+/**
+ * Normalise a raw JSONB scalar value that is expected to be a string.
+ *
+ * node-postgres (pg) unwraps JSONB scalars to native JS values by
+ * default: a JSONB string `"circuit_breaker"` becomes the JS string
+ * `'circuit_breaker'`; JSONB `null` becomes JS `null`. This helper
+ * accepts that unwrapped shape and returns `null` for any non-string
+ * (including `null`, `undefined`, numbers, booleans, and objects).
+ *
+ * It is the TS counterpart of the Python `isinstance(raw, str)` gate
+ * used in `_read_cap_flipped_by` and related daemon readers — see
+ * `daemon.py:16131–16140`.
+ *
+ * Note: `JSON.parse` sites in this file at `normalizeSnapshotJson`
+ * (line 393) and `dispatcherSetConfig` (line 1149) are NOT JSONB
+ * scalar reads — they parse user mutation input and a snapshot-fallback
+ * blob respectively; they are intentionally unchanged.
+ */
+export function normalizeJsonbString(raw: unknown): string | null {
+  return typeof raw === 'string' ? raw : null;
+}
+
 async function querySpawnFrozenUntil(pool: Pool): Promise<string | null> {
   const { rows } = await pool.query<{ value: unknown }>(
     `SELECT value FROM dispatcher.config WHERE key = 'spawn_frozen_until'`,
   );
   if (rows.length === 0) return null;
   const raw = rows[0].value;
-  // jsonb comes back as the native JSON value; wrap string vs null carefully.
-  if (raw === null || raw === undefined) return null;
-  // Expect either a string (ISO-8601) or a JSON string literal
-  if (typeof raw === 'string') return raw;
-  return null;
+  // re: psycopg JSONB unwrap — see normalizeJsonbString above.
+  return normalizeJsonbString(raw);
 }
 
 /**
@@ -297,11 +316,8 @@ async function queryCapFlippedBy(pool: Pool): Promise<string | null> {
   );
   if (rows.length === 0) return null;
   const raw = rows[0].value;
-  if (raw === null || raw === undefined) return null;
-  // pg's jsonb parser unwraps scalars: JSON `"circuit_breaker"` → the
-  // JS string `'circuit_breaker'`; JSON `null` → JS `null`.
-  if (typeof raw === 'string') return raw;
-  return null;
+  // re: psycopg JSONB unwrap — see normalizeJsonbString above.
+  return normalizeJsonbString(raw);
 }
 
 async function queryQueueDepth(pool: Pool): Promise<number> {

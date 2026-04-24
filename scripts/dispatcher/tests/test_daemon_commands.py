@@ -36,6 +36,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fixtures import psycopg_jsonb, psycopg_jsonb_legacy  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -728,9 +729,47 @@ class TestClaimGateLegacyPausedKey:
     from dev-db-query still blocks new claims. These tests verify that
     escape hatch still works."""
 
+    @pytest.mark.parametrize(
+        "paused_value,shape_id",
+        [
+            (psycopg_jsonb(True), "psycopg3_native_bool"),
+            (psycopg_jsonb_legacy(True), "legacy_json_string"),
+        ],
+        ids=["psycopg3_native_bool", "legacy_json_string"],
+    )
+    def test_paused_via_is_paused_gate(self, paused_value: Any, shape_id: str) -> None:
+        """When paused=true in either JSONB shape, orchestration must not fire.
+
+        Issue #2874: psycopg3 native bool (production shape) and
+        JSON-encoded string (legacy fake-cursor shape) both block claims.
+        """
+        d, conn, _handler = _make_daemon_with_capture()
+        # SELECTs (in scheduler_tick order, cap>0 branch):
+        #   1. concurrency_cap = 1 (gate would normally proceed)
+        #   2. cap_flipped_by = None (overnight CB auto-close #2860; no-op)
+        #   3. _is_paused() = paused_value — the parametrized shape
+        conn.cursor_instance.fetch_queue = [(1,), None, (paused_value,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                f"must not spawn when paused (shape={shape_id!r})"
+            )
+        )
+        d._consume_commands = lambda: 0  # type: ignore[method-assign]
+
+        summary = d.scheduler_tick()
+
+        # Orchestration was not attempted.
+        assert summary["orchestration_attempted"] == 0
+        assert d._maybe_spawn_orchestration_thread.call_count == 0  # type: ignore[attr-defined]
+
     def test_claim_gate_respects_paused_key(self) -> None:
         """When paused=true (manually inserted), orchestration must not
-        fire even if cap > 0."""
+        fire even if cap > 0.
+
+        Kept as a standalone regression guard; the parametrized
+        ``test_paused_via_is_paused_gate`` covers both shapes.
+        """
         d, conn, handler = _make_daemon_with_capture()
         # SELECTs (in scheduler_tick order, cap>0 branch):
         #   1. concurrency_cap = 1 (gate would normally proceed)

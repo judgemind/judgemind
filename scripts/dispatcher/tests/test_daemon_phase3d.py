@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -58,6 +60,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher.tests._fixtures import psycopg_jsonb, psycopg_jsonb_legacy  # noqa: E402
 from dispatcher.tests._popen_fake import make_popen_factory  # noqa: E402
 
 
@@ -213,25 +216,33 @@ class TestMigration26ConfigSeeds:
 
 
 class TestDiagnoserEnabled:
+    """Issue #2874: parametrized over both JSONB shapes (psycopg3 native + legacy)."""
+
     def test_default_true_when_row_missing(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [None]
         assert d._diagnoser_enabled() is True
 
-    def test_true_when_row_is_true(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_true_both_shapes(self, tmp_path: Path, make_value: Any) -> None:
+        """Both JSONB shapes resolve to True for a stored 'true' value."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(True,)]
+        conn.cursor_instance.fetch_queue = [(make_value(True),)]
         assert d._diagnoser_enabled() is True
 
-    def test_false_when_row_is_false(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_false_both_shapes(self, tmp_path: Path, make_value: Any) -> None:
+        """Both JSONB shapes resolve to False for a stored 'false' value."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(False,)]
-        assert d._diagnoser_enabled() is False
-
-    def test_false_when_row_is_json_string_false(self, tmp_path: Path) -> None:
-        # psycopg may hand us a raw JSON string when the column is JSONB.
-        d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [("false",)]
+        conn.cursor_instance.fetch_queue = [(make_value(False),)]
         assert d._diagnoser_enabled() is False
 
     def test_defaults_true_on_malformed(self, tmp_path: Path) -> None:
@@ -241,14 +252,28 @@ class TestDiagnoserEnabled:
 
 
 class TestFallbackThreshold:
-    def test_reads_float(self, tmp_path: Path) -> None:
+    """Issue #2874: parametrized over both JSONB shapes (psycopg3 native + legacy)."""
+
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_reads_float_both_shapes(self, tmp_path: Path, make_value: Any) -> None:
+        """Both JSONB shapes resolve to the correct float value."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [("0.50",)]
+        conn.cursor_instance.fetch_queue = [(make_value(0.50),)]
         assert d._diagnoser_fallback_threshold() == 0.50
 
-    def test_reads_number(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_reads_quarter_both_shapes(self, tmp_path: Path, make_value: Any) -> None:
+        """Both JSONB shapes resolve to 0.25."""
         d, conn, _handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(0.25,)]
+        conn.cursor_instance.fetch_queue = [(make_value(0.25),)]
         assert d._diagnoser_fallback_threshold() == 0.25
 
     def test_default_when_row_missing(self, tmp_path: Path) -> None:

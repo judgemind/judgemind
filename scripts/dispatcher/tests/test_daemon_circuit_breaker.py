@@ -36,12 +36,15 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402
+from dispatcher.tests._fixtures import psycopg_jsonb, psycopg_jsonb_legacy  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -236,23 +239,42 @@ class TestWriteTerminalOutcome:
 
 
 class TestCBConfigReaders:
-    """The ``_cb_config_int``/``_cb_enabled`` helpers fall back to safe defaults."""
+    """The ``_cb_config_int``/``_cb_enabled`` helpers fall back to safe defaults.
+
+    Issue #2874: parametrized over both JSONB shapes — psycopg3 native
+    (production) and JSON-encoded string (legacy fake-cursor).
+    """
 
     def test_enabled_defaults_to_true_when_row_missing(self, tmp_path: Path) -> None:
         d, conn, _h = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [None]
         assert d._cb_enabled() is True
 
-    def test_enabled_reads_bool_from_config(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_enabled_reads_false_both_shapes(
+        self, tmp_path: Path, make_value: Any
+    ) -> None:
+        """Both JSONB shapes resolve to False for a stored 'false' value."""
         d, conn, _h = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(False,)]
+        conn.cursor_instance.fetch_queue = [(make_value(False),)]
         assert d._cb_enabled() is False
 
-    def test_enabled_parses_json_string(self, tmp_path: Path) -> None:
-        """Stored as JSONB → driver may hand us the string ``"false"``."""
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_enabled_reads_true_both_shapes(
+        self, tmp_path: Path, make_value: Any
+    ) -> None:
+        """Both JSONB shapes resolve to True for a stored 'true' value."""
         d, conn, _h = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [("false",)]
-        assert d._cb_enabled() is False
+        conn.cursor_instance.fetch_queue = [(make_value(True),)]
+        assert d._cb_enabled() is True
 
     def test_enabled_defaults_to_true_on_malformed_json(self, tmp_path: Path) -> None:
         d, conn, _h = _make_daemon(tmp_path)
@@ -264,15 +286,17 @@ class TestCBConfigReaders:
         conn.cursor_instance.fetch_queue = [None]
         assert d._cb_config_int("circuit_breaker_window_minutes", 30) == 30
 
-    def test_config_int_reads_raw_int(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_config_int_reads_int_both_shapes(
+        self, tmp_path: Path, make_value: Any
+    ) -> None:
+        """Both JSONB shapes resolve to the integer value."""
         d, conn, _h = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(10,)]
-        assert d._cb_config_int("circuit_breaker_window_size", 10) == 10
-
-    def test_config_int_parses_json_string(self, tmp_path: Path) -> None:
-        """An integer stored as a JSON string ``"5"`` still parses."""
-        d, conn, _h = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [("5",)]
+        conn.cursor_instance.fetch_queue = [(make_value(5),)]
         assert d._cb_config_int("circuit_breaker_bad_outcome_threshold", 999) == 5
 
     def test_config_int_negative_falls_back_to_default(self, tmp_path: Path) -> None:
@@ -502,6 +526,9 @@ class TestReadCapFlippedBy:
     Python string ``"circuit_breaker"`` (no quotes). Test fake cursors
     may pass the pre-decode shape ``'"circuit_breaker"'``. Both must
     resolve identically.
+
+    Issue #2874: parametrized over both shapes so both rails are asserted
+    from the same test body.
     """
 
     def test_returns_none_when_row_absent(self, tmp_path: Path) -> None:
@@ -515,16 +542,17 @@ class TestReadCapFlippedBy:
         conn.cursor_instance.fetch_queue = [(None,)]
         assert d._read_cap_flipped_by() is None
 
-    def test_returns_unwrapped_string_production_shape(self, tmp_path: Path) -> None:
-        """psycopg3 production shape: JSONB string → Python string (no quotes)."""
+    @pytest.mark.parametrize(
+        "make_value",
+        [psycopg_jsonb, psycopg_jsonb_legacy],
+        ids=["psycopg3_native", "legacy_json_string"],
+    )
+    def test_returns_unwrapped_string_both_shapes(
+        self, tmp_path: Path, make_value: Any
+    ) -> None:
+        """Both JSONB shapes resolve to 'circuit_breaker' (no surrounding quotes)."""
         d, conn, _h = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [("circuit_breaker",)]
-        assert d._read_cap_flipped_by() == "circuit_breaker"
-
-    def test_returns_unwrapped_string_fake_cursor_shape(self, tmp_path: Path) -> None:
-        """Test fixtures may pass JSON-encoded bytes — accepted equivalently."""
-        d, conn, _h = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [('"circuit_breaker"',)]
+        conn.cursor_instance.fetch_queue = [(make_value("circuit_breaker"),)]
         assert d._read_cap_flipped_by() == "circuit_breaker"
 
     def test_returns_none_for_non_string_value(self, tmp_path: Path) -> None:
