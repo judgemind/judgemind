@@ -551,6 +551,29 @@ if [ -n "$changed_dispatcher_deps" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Dispatcher git-repo-root guard — run when daemon.py changes (#2829)
+# -------------------------------------------------------------------
+# Checks that no ``subprocess.run(["git", ...])`` call in daemon.py
+# anchors to ``self._repo_root()`` (which returns ``/app`` on Fargate —
+# no ``.git`` child). The correct anchor is ``self._git_parent_root()``.
+# Prevents the #2804/#2821 class of "not a git repository" runtime bug
+# from being re-introduced. Mirrors the CI step so the failure is caught
+# locally before the CI round trip.
+changed_daemon=$(echo "$changed_files" | grep -E '^scripts/dispatcher/daemon\.py$' || true)
+if [ -n "$changed_daemon" ]; then
+    echo "pre-push: checking no git -C self._repo_root() pattern in daemon.py..." >&2
+    if [ -x scripts/check-no-git-repo-root.py ]; then
+        if ! run_check "_" "scripts/check-no-git-repo-root.py" scripts/check-no-git-repo-root.py; then
+            echo "  A git subprocess in daemon.py anchors to self._repo_root() —" >&2
+            echo "  this is the #2804/#2821 class of bug. Use self._git_parent_root()." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-no-git-repo-root.py not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Filename separator hygiene — always cheap, always run
 # -------------------------------------------------------------------
 # Flags same-directory filename pairs that differ only by `-` vs `_`
