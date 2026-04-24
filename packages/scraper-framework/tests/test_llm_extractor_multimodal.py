@@ -2995,6 +2995,35 @@ class TestPerPagePrompt:
         assert "Continuation pages" in PDF_PER_PAGE_PROMPT
         assert "Boilerplate-only pages" in PDF_PER_PAGE_PROMPT
 
+    def test_per_page_prompt_instructs_empty_cell_behavior(self) -> None:
+        """The prompt tells the LLM to emit ruling_text="" when the cell is empty."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        # The ruling_text field description must contain the empty-cell instruction.
+        ruling_text_section = PDF_PER_PAGE_PROMPT[PDF_PER_PAGE_PROMPT.index("ruling_text") :]
+        assert "empty" in ruling_text_section
+        # The LLM must not substitute nearby text.
+        assert "Do NOT substitute" in PDF_PER_PAGE_PROMPT
+        # Explicit empty-string directive.
+        assert 'ruling_text=""' in PDF_PER_PAGE_PROMPT
+
+    def test_per_page_prompt_describes_calendar_listing_rows(self) -> None:
+        """The prompt has a Calendar listings layout section."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        assert "Calendar listings" in PDF_PER_PAGE_PROMPT
+        # The section must instruct the LLM to emit empty ruling_text.
+        cal_section = PDF_PER_PAGE_PROMPT[PDF_PER_PAGE_PROMPT.index("Calendar listings") :]
+        assert "ruling_text" in cal_section
+
+    def test_per_page_prompt_includes_empty_cell_example(self) -> None:
+        """The example output section includes at least one entry with ruling_text=""."""
+        from framework.llm_extractor import PDF_PER_PAGE_PROMPT
+
+        example_section = PDF_PER_PAGE_PROMPT[PDF_PER_PAGE_PROMPT.index("## Example output") :]
+        # The example must show ruling_text as the empty string.
+        assert '"ruling_text": ""' in example_section
+
 
 # ---------------------------------------------------------------------------
 # Cross-reference resolution tests (#2317)
