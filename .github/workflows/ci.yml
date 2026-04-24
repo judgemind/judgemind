@@ -64,6 +64,11 @@ jobs:
               - 'packages/judgemind-config/**'
             api:
               - 'packages/api/**'
+              # Include ci.yml so that edits to the no-api-github-fetch-check
+              # job are exercised on the PR that introduces them.
+              # Without this, the paths filter makes the job SKIP on its own
+              # PR — the #2410/#2505 footgun. See scripts/check-ci-job-skipped.py.
+              - '.github/workflows/ci.yml'
             web:
               - 'packages/web/**'
             infra:
@@ -952,6 +957,18 @@ jobs:
         run: scripts/check-no-test-database-url-fallback.sh
 
   # ---------------------------------------------------------------
+  # GitHub API call guard: api container src must not call GitHub (#2839)
+  # ---------------------------------------------------------------
+  no-api-github-fetch-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Enforce API container has no GitHub API calls
+        run: scripts/check-no-api-github-fetch.sh
+
+  # ---------------------------------------------------------------
   # Schema drift guard: schema.sql must match applied migrations
   # ---------------------------------------------------------------
   schema-drift-check:
@@ -1311,7 +1328,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, no-api-github-fetch-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
