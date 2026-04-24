@@ -19,7 +19,6 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - **You MAY merge your own PRs** after `/ralph` and CI are green: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 - Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
 - Never deploy to production. Production deploys are human-only.
-- Never set `priority/p0` on issues unless explicitly told to by a human.
 - Never skip pre-PR checks. Run lint, format, AND tests locally before pushing.
 - Never share venvs between worktrees. Each worktree gets its own `.venv`.
 - Never create additional worktrees from inside a worktree via `git worktree add`. Fix bad state with `git checkout -- .` / `git clean -fd` rather than creating a new worktree.
