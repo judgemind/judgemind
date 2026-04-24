@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 42 migrations.
+-- Generated from 43 migrations.
 
 
 
@@ -366,7 +366,8 @@ CREATE TABLE dispatcher.agents (
     retroed_at timestamp with time zone,
     agent_task_arn text,
     execution_mode text DEFAULT 'subprocess'::text NOT NULL,
-    ralph_iterations_observed integer DEFAULT 0 NOT NULL
+    ralph_iterations_observed integer DEFAULT 0 NOT NULL,
+    merge_unstick_attempts integer DEFAULT 0 NOT NULL
 );
 
 
@@ -407,6 +408,9 @@ COMMENT ON COLUMN dispatcher.agents.execution_mode IS 'One of ''subprocess'' (le
 
 
 COMMENT ON COLUMN dispatcher.agents.ralph_iterations_observed IS 'Count of ralph iterations observed by the ECS agent-runner HEAD-watcher (#3144). Atomically UPDATEd per iteration when the watcher persists a new dispatcher.ralph_patches row. Subprocess-mode agents keep this at 0 — the daemon-side watcher (#3042) persists ralph_patches but does not update this column. Issue #3144.';
+
+
+COMMENT ON COLUMN dispatcher.agents.merge_unstick_attempts IS 'Count of stale-rollup merge-phase auto-unstick attempts for this agent (#2641). Bounded at 1 per agent lifetime: the first stale-rollup rejection (GitHub stderr "base branch policy prohibits the merge" while ci-passed on HEAD is SUCCESS) bumps this to 1 and the daemon pushes an empty commit to force a fresh rollup evaluation; a second rejection in the same agent''s lifetime routes through _handle_agent_failure with category merge_unstick_exhausted.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (

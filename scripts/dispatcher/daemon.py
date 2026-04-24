@@ -1031,6 +1031,38 @@ FAILURE_CATEGORY_DEPLOY_FAILED = "deploy_failed"
 #: for the dedicated per-category guidance.
 FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE = "verify_failed_post_merge"
 
+#: Tier-3 category from issue #2641 — the daemon's merge-phase handler
+#: already auto-unstuck one stale-rollup ``gh pr merge`` rejection by
+#: pushing an empty commit, and a second rejection (same agent, same
+#: failure signature) arrived on the next tick. Bounded at 1 unstick
+#: per agent lifetime per spec §6 ("Retry budget = 1"): a second
+#: occurrence means the empty-commit bump did NOT clear the underlying
+#: rollup problem, so the deterministic retry no longer helps.
+#: Diagnoser-actionable because the condition is almost always one of
+#: (a) an actual CI failure masquerading as a stale-rollup stderr,
+#: (b) branch protection unmet for a non-CI reason (missing review,
+#: linear history violation), or (c) a GitHub API bug the daemon can't
+#: work around mechanically. All three route to diagnoser actions
+#: (``block_and_comment`` / ``file_prerequisite_task`` / ``escalate``),
+#: not a mechanical retry.
+FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED = "merge_unstick_exhausted"
+
+#: GitHub's rejection stderr fragment when branch protection's
+#: statusCheckRollup evaluator still sees a stale FAILURE check_run
+#: from an earlier CI attempt even though the *latest* ci-passed
+#: check_run on HEAD is SUCCESS. Match is substring-based (case-
+#: insensitive) so it tolerates minor phrasing drift from the GitHub
+#: API. Issue #2641. See ``_merge_pr_and_advance`` for the auto-unstick
+#: recovery path this marker triggers.
+STALE_ROLLUP_STDERR_MARKER = "base branch policy prohibits the merge"
+
+#: Retry budget for the stale-rollup auto-unstick (#2641). After this
+#: many unstick attempts in a single agent's lifetime, the next
+#: stale-rollup rejection routes through ``_handle_agent_failure``
+#: under :data:`FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED`. 1 matches
+#: the spec: "at most one auto-unstick attempt per agent lifetime".
+MERGE_UNSTICK_MAX_ATTEMPTS = 1
+
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
 #: ``subprocess_auth_fail`` (halt — no retry) are intentionally
@@ -1282,6 +1314,8 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         # Audit-gap follow-ups from #3062 (tier-3 first-occurrence):
         FAILURE_CATEGORY_FIX_CI_BLOCKED,  # #3068
         FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,  # #3071
+        # #2641: merge-phase auto-unstick budget exhausted.
+        FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED,
     }
 )
 
@@ -11205,9 +11239,16 @@ class DispatcherDaemon:
                 # because the transition merge→awaiting_deploy flips
                 # status without changing phase — the next tick sees
                 # the succeeded branch.
+                # Issue #2641: ``merge_unstick_attempts`` surfaces the
+                # agent-lifetime budget for the stale-rollup auto-
+                # unstick path in the merge handler. Selected alongside
+                # the other awaiting_* bookkeeping so the merge-phase
+                # handler has the counter in hand without a second
+                # round-trip. See ``_merge_pr_and_advance``.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
-                    "       worktree_path, retries_used, status "
+                    "       worktree_path, retries_used, status, "
+                    "       merge_unstick_attempts "
                     "FROM dispatcher.agents "
                     "WHERE (status = 'running' "
                     "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
@@ -11226,6 +11267,11 @@ class DispatcherDaemon:
                             "worktree_path": str(row[4]),
                             "retries_used": int(row[5]) if row[5] is not None else 0,
                             "status": str(row[6]) if len(row) > 6 else "running",
+                            "merge_unstick_attempts": (
+                                int(row[7])
+                                if len(row) > 7 and row[7] is not None
+                                else 0
+                            ),
                         }
                     )
             self._conn.commit()
@@ -11595,7 +11641,27 @@ class DispatcherDaemon:
     def _merge_pr_and_advance(
         self, agent: dict[str, Any], pr_status: dict[str, Any]
     ) -> None:
-        """Squash-merge the PR, record the merge SHA, advance to deploy."""
+        """Squash-merge the PR, record the merge SHA, advance to deploy.
+
+        Issue #2641: when ``gh pr merge`` returns non-zero with the
+        stale-rollup marker (``base branch policy prohibits the merge``)
+        AND the daemon already observed ci-passed green for this PR —
+        the precondition for having reached this method via the
+        ``_classify_check_rollup → 'green'`` branch — the failure is
+        NOT a real CI regression. It's GitHub's branch-protection
+        evaluator still scoring an old FAILURE check_run from a rerun
+        on the same SHA. Bounded at 1 auto-unstick per agent lifetime
+        via :data:`MERGE_UNSTICK_MAX_ATTEMPTS` (see
+        :meth:`_try_auto_unstick_merge`). On second occurrence the
+        failure routes through :meth:`_handle_agent_failure` under
+        :data:`FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED`.
+
+        All other non-zero exits (gh_missing / timeout / any other
+        stderr) preserve the pre-#2641 behaviour: log and return so
+        the next tick re-polls the PR. Those paths are not terminal —
+        the rollup may transition pending/green/red again and the
+        merge-on-green decision will re-evaluate.
+        """
         agent_id = agent["agent_id"]
         pr_number = agent["pr_number"]
 
@@ -11628,7 +11694,8 @@ class DispatcherDaemon:
                         "agent_id": agent_id,
                     },
                 )
-            elif reason == "timeout":
+                return
+            if reason == "timeout":
                 self._log.warning(
                     "daemon.pr_merge_timeout",
                     extra={
@@ -11638,18 +11705,33 @@ class DispatcherDaemon:
                         "pr_number": pr_number,
                     },
                 )
-            else:
-                self._log.warning(
-                    "daemon.pr_merge_failed",
-                    extra={
-                        "event": "pr_merge_failed",
-                        "run_id": self._run_id,
-                        "agent_id": agent_id,
-                        "pr_number": pr_number,
-                        "exit_code": outcome.get("exit_code"),
-                        "stderr_tail": outcome.get("stderr_tail"),
-                    },
+                return
+            # nonzero_exit — inspect stderr for the stale-rollup
+            # signature. ``stderr_full`` is the complete stderr from
+            # the final attempt (populated by ``_subprocess_with_retry``
+            # alongside ``stderr_tail``). Fall back to the tail if the
+            # full stream is somehow absent.
+            stderr_text = outcome.get("stderr_full") or outcome.get("stderr_tail") or ""
+            stderr_tail = outcome.get("stderr_tail") or ""
+            exit_code = outcome.get("exit_code")
+            if STALE_ROLLUP_STDERR_MARKER in stderr_text.lower():
+                self._try_auto_unstick_merge(
+                    agent=agent,
+                    stderr_tail=stderr_tail,
+                    exit_code=exit_code,
                 )
+                return
+            self._log.warning(
+                "daemon.pr_merge_failed",
+                extra={
+                    "event": "pr_merge_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "exit_code": exit_code,
+                    "stderr_tail": stderr_tail,
+                },
+            )
             return
 
         # Extract the merge commit SHA from the PR status if available;
@@ -11689,6 +11771,271 @@ class DispatcherDaemon:
                 "merge_sha": merge_sha,
             },
         )
+
+    def _try_auto_unstick_merge(
+        self,
+        *,
+        agent: dict[str, Any],
+        stderr_tail: str,
+        exit_code: int | None,
+    ) -> None:
+        """Recover from a stale-rollup ``gh pr merge`` rejection (#2641).
+
+        Called from :meth:`_merge_pr_and_advance` when the merge failed
+        with ``base branch policy prohibits the merge`` after we
+        already observed ``ci-passed=SUCCESS`` for the current HEAD
+        (that's the precondition for reaching the merge call site via
+        the ``_classify_check_rollup → 'green'`` branch — the rollup
+        classifier requires ``mergeable='MERGEABLE'`` AND no FAILURE
+        conclusions, which implies latest ci-passed is SUCCESS).
+
+        On first occurrence (``merge_unstick_attempts == 0``): pushes
+        an empty commit to the PR branch to force GitHub to re-
+        evaluate the statusCheckRollup from scratch on the new SHA,
+        increments the counter, and leaves the agent in
+        ``awaiting_ci`` so the next supervisor tick re-polls the PR.
+        On subsequent occurrences (``>= MERGE_UNSTICK_MAX_ATTEMPTS``):
+        routes through :meth:`_handle_agent_failure` under
+        :data:`FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED` — the first
+        bump didn't clear the underlying problem, so the diagnoser
+        owns the escalation path.
+
+        Any failure in the empty-commit-push sequence (git commit
+        non-zero, git push non-zero / timeout) also routes through
+        :meth:`_handle_agent_failure` under the same category so the
+        diagnoser can distinguish the recovery-attempted-but-broken
+        path from a fresh stale-rollup.
+
+        All three transitions emit structured log events:
+        ``merge_stale_rollup_detected`` (every time the marker fires),
+        ``merge_auto_unstick_empty_commit_pushed`` (successful bump),
+        ``merge_unstick_exhausted`` (budget-exceeded terminal).
+        """
+        agent_id = agent["agent_id"]
+        pr_number = agent.get("pr_number")
+        issue_number = agent.get("issue_number")
+        attempts_so_far = int(agent.get("merge_unstick_attempts") or 0)
+        worktree = Path(agent["worktree_path"])
+
+        self._log.warning(
+            "daemon.merge_stale_rollup_detected",
+            extra={
+                "event": "merge_stale_rollup_detected",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "stderr_tail": stderr_tail,
+                "exit_code": exit_code,
+                "attempts_so_far": attempts_so_far,
+            },
+        )
+
+        # Budget check — second occurrence is terminal.
+        if attempts_so_far >= MERGE_UNSTICK_MAX_ATTEMPTS:
+            self._log.warning(
+                "daemon.merge_unstick_exhausted",
+                extra={
+                    "event": "merge_unstick_exhausted",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "attempts_so_far": attempts_so_far,
+                },
+            )
+            # ROUTING (#3062 #2641): ROUTED via _handle_agent_failure.
+            # Tier-3 category (see :data:`TIER_3_CATEGORIES`) so the
+            # diagnoser picks up the row on the next supervisor tick.
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED,
+                stderr_tail=stderr_tail,
+                exit_code=exit_code,
+                details={
+                    "pr_number": pr_number,
+                    "attempts_so_far": attempts_so_far,
+                    "stale_rollup_marker": STALE_ROLLUP_STDERR_MARKER,
+                },
+                issue_number=(int(issue_number) if issue_number is not None else None),
+            )
+            return
+
+        # First occurrence — push an empty commit to bump the SHA and
+        # force GitHub to re-evaluate the rollup.
+        branch = self._branch_for_agent(agent_id)
+        commit_msg = (
+            "ci: force fresh rollup evaluation (stale-ci-passed unstick, #2641)"
+        )
+
+        # cold-path (#3089): local fs ``git commit --allow-empty``;
+        # failures are deterministic (hook rejection, bad worktree
+        # state) and route via _handle_agent_failure → diagnoser.
+        try:
+            commit_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    commit_msg,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:
+            self._log.exception(
+                "daemon.merge_unstick_commit_failed",
+                extra={
+                    "event": "merge_unstick_commit_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                },
+            )
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED,
+                stderr_tail=str(exc),
+                exit_code=None,
+                details={
+                    "pr_number": pr_number,
+                    "sub_reason": "empty_commit_exception",
+                },
+                issue_number=(int(issue_number) if issue_number is not None else None),
+            )
+            return
+        if commit_result.returncode != 0:
+            tail = _stderr_tail(commit_result.stderr)
+            self._log.warning(
+                "daemon.merge_unstick_commit_failed",
+                extra={
+                    "event": "merge_unstick_commit_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "exit_code": commit_result.returncode,
+                    "stderr_tail": tail,
+                },
+            )
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED,
+                stderr_tail=tail,
+                exit_code=commit_result.returncode,
+                details={
+                    "pr_number": pr_number,
+                    "sub_reason": "empty_commit_nonzero_exit",
+                },
+                issue_number=(int(issue_number) if issue_number is not None else None),
+            )
+            return
+
+        # Issue #3089: hot-path ``git push`` — retry transient flakes
+        # before routing to the diagnoser. Same rationale as fix-CI's
+        # push retry.
+        push_cmd = [
+            "git",
+            "-C",
+            str(worktree),
+            "push",
+            "origin",
+            branch,
+        ]
+        push_outcome = self._subprocess_with_retry(
+            push_cmd,
+            event_name="merge_unstick_git_push",
+            timeout=GIT_PUSH_TIMEOUT_SECONDS,
+            extra_log_fields={
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+            },
+        )
+        if not push_outcome["ok"]:
+            tail = push_outcome.get("stderr_tail") or ""
+            self._log.warning(
+                "daemon.merge_unstick_push_failed",
+                extra={
+                    "event": "merge_unstick_push_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "reason": push_outcome.get("reason"),
+                    "exit_code": push_outcome.get("exit_code"),
+                    "stderr_tail": tail,
+                },
+            )
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED,
+                stderr_tail=tail,
+                exit_code=push_outcome.get("exit_code"),
+                details={
+                    "pr_number": pr_number,
+                    "sub_reason": "empty_commit_push_"
+                    + str(push_outcome.get("reason") or "unknown"),
+                },
+                issue_number=(int(issue_number) if issue_number is not None else None),
+            )
+            return
+
+        # Success — bump the counter, keep the phase pinned at
+        # ``awaiting_ci`` so the next supervisor tick re-polls on the
+        # new SHA (the empty commit replaces HEAD; GitHub will emit a
+        # fresh check_runs list for the new SHA and the rollup will
+        # reflect the real post-fix outcome).
+        self._increment_merge_unstick_attempts(agent_id)
+        self._log.info(
+            "daemon.merge_auto_unstick_empty_commit_pushed",
+            extra={
+                "event": "merge_auto_unstick_empty_commit_pushed",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "new_attempts": attempts_so_far + 1,
+            },
+        )
+
+    def _increment_merge_unstick_attempts(self, agent_id: str) -> None:
+        """UPDATE ``dispatcher.agents.merge_unstick_attempts += 1``.
+
+        Issue #2641. Best-effort: a DB error logs + rolls back without
+        raising (matches the ``_increment_retries_used`` pattern). A
+        lost increment is acceptable: the worst case is that the next
+        supervisor tick re-attempts a second unstick instead of
+        classifying as exhausted, which at most burns one extra empty
+        commit before the real failure surfaces.
+        """
+        assert self._conn is not None, "connect() must run before update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET merge_unstick_attempts = merge_unstick_attempts + 1 "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.increment_merge_unstick_attempts_failed",
+                extra={
+                    "event": "increment_merge_unstick_attempts_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
 
     @staticmethod
     def _extract_merge_sha(pr_status: dict[str, Any]) -> str | None:
