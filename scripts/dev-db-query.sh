@@ -185,10 +185,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 runner_encoded=$(base64 < "$SCRIPT_DIR/dev_db_query_runner.py" | tr -d '\n')
 remote_script="/tmp/_dev_db_query_runner.py"
 
-aws ecs execute-command \
+# The tail `sleep 1` gives the SSM / ECS-exec transport a chance to deliver
+# the final output chunk before the remote bash exits and the session closes.
+# Without this, large payloads occasionally land with mid-field truncation +
+# an `Exiting session with sessionId:` or `Cannot perform start session: EOF`
+# trailer (#3195). The compact-flag (3rd arg to the runner) further reduces
+# bytes-in-flight so the payload is less likely to exceed SSM's per-session
+# output budget in the first place.
+#
+# The output is then piped through grep filters that strip the SSM plugin's
+# own chatter — the `Starting session` / `Exiting session` / `Cannot perform
+# start session: EOF` / `The Session Manager plugin was installed` lines —
+# so downstream consumers (jq, awk) see only the Python runner's JSON
+# output, not the transport's bookkeeping messages (#3195 Layer 1).
+#
+# stderr preserves the original log messages so callers can still see
+# `Running query on dev database via ECS Exec...` etc.
+# Capture aws output first so a real aws failure isn't masked by grep's
+# exit-1-when-all-lines-filtered behaviour. `grep -Ev` can legitimately
+# return 1 (every line matched) for e.g. an empty query result wrapped in
+# SSM banner/trailer, which is not an error from our perspective.
+aws_output=$(aws ecs execute-command \
     --cluster "$CLUSTER" \
     --task "$task_arn" \
     --container "$CONTAINER" \
     --interactive \
     --region "$REGION" \
-    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag; rm -f $remote_script'"
+    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag 1; sync; rm -f $remote_script; sleep 1'")
+
+# Strip the SSM plugin's bookkeeping lines, then print the rest. Matches
+# both "SessionId" and "sessionId" casings — the plugin currently emits
+# "SessionId" on session start and "sessionId" on session end.
+printf '%s\n' "$aws_output" \
+    | grep -Ev '^(Starting session with [Ss]essionId|Exiting session with [Ss]essionId|Cannot perform start session|The Session Manager plugin was installed successfully)' \
+    || true

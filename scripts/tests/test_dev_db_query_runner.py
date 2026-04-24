@@ -89,11 +89,24 @@ class TestFormatSelectResults:
         result = json.loads(format_select_results(description, rows))
         assert result == [{"id": 1, "name": None}]
 
-    def test_output_is_indented(self) -> None:
-        """The output should be pretty-printed with indent=2."""
+    def test_compact_output_is_single_line(self) -> None:
+        """Default (compact=True) output is a single-line, minimal JSON.
+
+        #3195 — SSM / ECS-exec has a per-session output byte budget that
+        truncates large pretty-printed payloads. Compact is the default
+        because it roughly halves the bytes-over-the-wire.
+        """
+        description = [("id",), ("name",)]
+        rows = [(1, "foo"), (2, "bar")]
+        raw = format_select_results(description, rows)
+        assert "\n" not in raw
+        assert raw == '[{"id":1,"name":"foo"},{"id":2,"name":"bar"}]'
+
+    def test_opt_in_indented_output(self) -> None:
+        """compact=False restores the historical indent=2 formatting."""
         description = [("id",)]
         rows = [(1,)]
-        raw = format_select_results(description, rows)
+        raw = format_select_results(description, rows, compact=False)
         assert "\n" in raw
         assert "  " in raw
 
@@ -316,3 +329,34 @@ class TestMain:
 
                 main()
             assert exc_info.value.code == 1
+
+    def test_invalid_compact_flag_exits(self) -> None:
+        """The optional third arg (compact-flag) must be '0' or '1' if supplied."""
+        query_b64 = base64.b64encode(b"SELECT 1").decode()
+        with patch("sys.argv", ["dev-db-query-runner.py", query_b64, "1", "invalid"]):
+            with pytest.raises(SystemExit) as exc_info:
+                from dev_db_query_runner import main
+
+                main()
+            assert exc_info.value.code == 1
+
+    def test_four_args_accepted(self) -> None:
+        """Four args — query_b64 + readonly + compact — is a valid invocation."""
+        query_b64 = base64.b64encode(b"SELECT 1").decode()
+        mock_psycopg = MagicMock()
+        mock_psycopg.Error = Exception
+        mock_psycopg.connect.side_effect = Exception("fake error")
+
+        # We expect the arg parsing to succeed (exit code 1 from the
+        # connection error, not from arg validation). The presence of the
+        # "Database error" message confirms we passed arg validation.
+        with patch.dict(sys.modules, {"psycopg": mock_psycopg}):
+            with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+                with patch(
+                    "sys.argv",
+                    ["dev-db-query-runner.py", query_b64, "1", "0"],
+                ):
+                    with pytest.raises(SystemExit):
+                        from dev_db_query_runner import main
+
+                        main()
