@@ -4,15 +4,15 @@ Machine-readable checklist of rules extracted from CLAUDE.md. Agents should vali
 
 ## Enforced Rules (hook + scripts/preflight.sh)
 
-| ID | Rule | Enforcement | Script Function |
-|----|------|-------------|-----------------|
-| E-01 | No `$()`, heredocs, or backtick expansion | PreToolUse hook blocks | `preflight_no_forbidden_syntax` |
-| E-02 | Fetch/rebase before analyzing code | Manual / script check | `preflight_branch_fresh --fetch` |
-| E-03 | Must be in a worktree during task work | Manual / script check | `preflight_in_worktree` |
-| E-04 | Venv must be local to worktree | Manual / script check | `preflight_venv_local` |
-| E-05 | Never push to main/master | PreToolUse hook blocks | `preflight_not_on_main` |
-| E-06 | No `git worktree add` inside worktrees | PreToolUse hook blocks | — |
-| E-07 | No bare `git stash pop` / `git stash apply` (#2749) | PreToolUse hook blocks | — |
+| ID | Rule | Enforcement | Standalone Script | Script Function |
+|----|------|-------------|-------------------|-----------------|
+| E-01 | No `$()`, heredocs, or backtick expansion | PreToolUse hook blocks | `scripts/preflight/no-forbidden-syntax.sh` | `preflight_no_forbidden_syntax` |
+| E-02 | Fetch/rebase before analyzing code | Manual / script check | `scripts/preflight/branch-fresh.sh --fetch` | `preflight_branch_fresh --fetch` |
+| E-03 | Must be in a worktree during task work | Manual / script check | `scripts/preflight/in-worktree.sh` | `preflight_in_worktree` |
+| E-04 | Venv must be local to worktree | Manual / script check | `scripts/preflight/venv-local.sh` | `preflight_venv_local` |
+| E-05 | Never push to main/master | PreToolUse hook blocks | `scripts/preflight/not-on-main.sh` | `preflight_not_on_main` |
+| E-06 | No `git worktree add` inside worktrees | PreToolUse hook blocks | — | — |
+| E-07 | No bare `git stash pop` / `git stash apply` (#2749) | PreToolUse hook blocks | — | — |
 
 ## Shell Command Rules
 

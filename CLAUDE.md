@@ -42,13 +42,12 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 The PreToolUse hook (`.claude/hooks/preflight-bash.sh`) and `scripts/preflight.sh` enforce the Critical Rules above. See `docs/agent/interactive-shell-rules.md` for the full operator-laptop vs. Fargate-runtime scope split.
 
 ```bash
-source scripts/preflight.sh
-preflight_in_worktree       # Fail if pwd is main repo, not a worktree
-preflight_not_on_main       # Fail if on main/master branch
-preflight_branch_fresh      # Fail if behind origin/main (add --fetch to fetch first)
-preflight_venv_local        # Fail if .venv is missing or is a symlink
-preflight_no_duplicate_pr N # Check if open PR already exists for issue #N
-preflight_rate_budget       # Warn if GitHub API rate budget < 100 remaining
+scripts/preflight/in-worktree.sh       # Fail if pwd is main repo, not a worktree
+scripts/preflight/not-on-main.sh       # Fail if on main/master branch
+scripts/preflight/branch-fresh.sh      # Fail if behind origin/main (pass --fetch to fetch first)
+scripts/preflight/venv-local.sh        # Fail if .venv is missing or is a symlink
+scripts/preflight/no-duplicate-pr.sh N # Check if open PR already exists for issue #N
+scripts/preflight/rate-budget.sh       # Warn if GitHub API rate budget < 100 remaining
 ```
 
 ## Project Context
