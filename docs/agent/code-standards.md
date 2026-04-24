@@ -65,6 +65,16 @@ The `archive/`, `eval/`, `tests/`, and `spotcheck/` subdirectories under `script
 - Write clear docstrings/comments for non-obvious logic.
 - **When removing or renaming module-level exports** (functions, classes, constants), grep for all import sites across the entire codebase (`src/` and `tests/`) before committing. Update or remove every import — not just the test file matching the modified module. Broken imports in unrelated test files will not surface until CI runs the full suite, and may not surface at all if the tests are skipped or filtered.
 
+## S3 write discipline
+
+Rules that apply to every script or service that writes or copies objects under the `raw/` prefix in S3:
+
+- **All raw S3 writes go through `S3Archiver.archive()`**, which asserts `sha256(bytes) == filename_hash` before the PUT. Never call `s3_client.put_object()` directly for `raw/` objects.
+- **Any new script that copies, re-keys, or migrates S3 objects under `raw/`** must call `verify_key_matches_bytes(s3_client, bucket, key)` on both source AND destination after the copy. Reference: lessons from #2638 / #2663.
+- **Never derive an S3 key from a DB column** without also re-hashing the bytes you intend to write under that key. The DB value may be stale or wrong; only the bytes are authoritative.
+
+Helpers are in `packages/scraper-framework/src/framework/s3_integrity.py` — use `verify_key_matches_bytes` for a boolean check and `assert_key_matches_bytes` for a hard assertion (raises `S3MislabelError` on any mismatch or missing object).
+
 ## Performance awareness
 
 Every diff review must check for these common bottlenecks:

@@ -56,6 +56,7 @@ from .models import (
 from .retry import retry_async, retry_sync
 from .runner import get_scraper_ids, run_scrapers
 from .s3_cache import CachedS3Client, make_s3_client
+from .s3_integrity import S3MislabelError, assert_key_matches_bytes, verify_key_matches_bytes
 from .search import IndexingConsumer, create_index
 from .storage import S3Archiver, build_s3_key
 from .turnstile_solver import solve_turnstile
@@ -86,6 +87,9 @@ __all__ = [
     "IndexingConsumer",
     "RedisEventBus",
     "S3Archiver",
+    "S3MislabelError",
+    "assert_key_matches_bytes",
+    "verify_key_matches_bytes",
     "ScraperConfig",
     "ScraperHealthEvent",
     "ScraperPhase",
