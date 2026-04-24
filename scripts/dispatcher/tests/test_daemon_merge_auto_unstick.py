@@ -650,9 +650,7 @@ class TestMigrationSmoke:
         Lookup is by suffix so a rebase-induced rename (#2916
         migration-number collision dance) doesn't break the test.
         """
-        migrations_dir = (
-            _SCRIPTS.parent / "packages" / "api" / "migrations"
-        )
+        migrations_dir = _SCRIPTS.parent / "packages" / "api" / "migrations"
         candidates = sorted(
             migrations_dir.glob("*_dispatcher-agent-merge-unstick-attempts.sql")
         )
