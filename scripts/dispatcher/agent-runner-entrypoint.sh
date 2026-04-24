@@ -1722,6 +1722,7 @@ persist_phase_output() {
     if [[ -z "$_output_json" ]]; then
         _output_json="{}"
     fi
+    # Schema parity enforced by scripts/tests/test_phase_outputs_insert_shape.py
     _escaped=$(printf '%s' "$_output_json" | sed "s/'/''/g")
     db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
              VALUES ('$AGENT_ID', '$_phase', '$_escaped'::jsonb)
@@ -2504,6 +2505,7 @@ agent_runner_reaped_failure() {
     # masked the crash already, but without ON CONFLICT the failure
     # payload simply wasn't persisted — operators lost the reaper's
     # category + reason context on re-entry.
+    # Schema parity enforced by scripts/tests/test_phase_outputs_insert_shape.py
     db_exec "INSERT INTO dispatcher.phase_outputs
                (agent_id, phase, output_json)
              VALUES
