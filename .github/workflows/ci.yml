@@ -643,6 +643,15 @@ jobs:
       # silent-ECS-agent-loss bug from creeping back in.
       - name: Verify every dispatcher.agents SQL site is execution_mode-aware
         run: scripts/check-dispatcher-execution-mode-aware.sh
+      # Issue #2829: every ``subprocess.run([... "git" ...])`` call site in
+      # ``scripts/dispatcher/daemon.py`` whose first positional arg resolves
+      # to a list literal beginning with ``"git"`` AND containing
+      # ``self._repo_root()`` is a bug — in Fargate mode, ``_repo_root()``
+      # returns ``/app`` (no ``.git`` directory). The correct anchor is
+      # ``_git_parent_root()``.
+      - name: Verify no git subprocess in daemon.py anchors at self._repo_root()
+        if: needs.detect-changes.outputs.scripts == 'true'
+        run: bash scripts/check-no-git-repo-root-anchor.sh
       # Issue #3082: operator laptops run macOS's stock bash 3.2.
       # Shell scripts under scripts/**/*.sh must stick to the bash 3.2
       # subset — no mapfile, readarray, associative arrays, nameref,
