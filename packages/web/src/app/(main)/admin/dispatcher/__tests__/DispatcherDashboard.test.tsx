@@ -746,3 +746,175 @@ describe('DispatcherDashboard — #3172 dialog title denominator', () => {
     expect(title.textContent).toBe('Recently completed — 10 / 183');
   });
 });
+
+// #3206: Magic Move view-transition-names on cockpit panel rows must be
+// SUPPRESSED whenever any full-list dialog is open, otherwise the
+// browser's view-transition compositor layer paints over the Radix
+// dialog content (see issue body for root-cause analysis).
+describe('DispatcherDashboard — #3206 dialog-open view-transition gate', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueueFullData.READY = undefined;
+    mockQueueFullData.BLOCKED = undefined;
+    mockQueueFullData.COMPLETED = undefined;
+  });
+
+  const baseReady = [
+    {
+      issueNumber: 3151,
+      title: 'ready-row-1',
+      priority: 'p2',
+      labels: ['priority/p2', 'agent/ready'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [],
+      cooldownSecondsRemaining: null,
+    },
+  ];
+  const baseCompletions = [
+    {
+      agentId: 'aabbccdd-eeff-0011-2233-445566778899',
+      issueNumber: 2805,
+      issueTitle: 'recent-completion',
+      priority: 'p2',
+      status: 'succeeded',
+      startedAt: '2026-04-18T11:50:00Z',
+      endedAt: '2026-04-18T11:55:00Z',
+      prNumber: 2811,
+      totalTokens: null,
+      totalCostUsd: null,
+      failureSummary: null,
+      mergedAt: '2026-04-18T11:50:00Z',
+      verifiedAt: '2026-04-18T11:53:00Z',
+      verifySkipReason: null,
+      retroedAt: '2026-04-18T11:55:00Z',
+    },
+  ];
+  const baseActive = [
+    {
+      id: 'aabbccdd-eeff-0011-2233-445566778899',
+      issueNumber: 3100,
+      issueTitle: 'active-agent',
+      priority: 'p2',
+      worktreePath: '/Users/x/.claude/worktrees/agent-aabbccdd',
+      phase: 'ralph',
+      status: 'running',
+      startedAt: '2026-04-18T11:00:00Z',
+      endedAt: null,
+      exitCode: null,
+      prNumber: null,
+      retriesUsed: 0,
+    },
+  ];
+
+  it('ready rows carry view-transition-name when no dialog is open', () => {
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        queueReady: baseReady,
+        queueDepth: 1,
+      },
+    };
+    renderDashboard();
+    const row = screen.getByTestId('queue-row-3151');
+    expect((row as HTMLElement).style.viewTransitionName).toBe('issue-3151');
+  });
+
+  it('opening the Ready dialog strips view-transition-name from Ready rows', async () => {
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        queueReady: baseReady,
+        queueDepth: 1,
+      },
+    };
+    mockQueueFullData.READY = {
+      dispatcherQueueFull: {
+        kind: 'READY',
+        queueItems: baseReady,
+        completions: [],
+      },
+    };
+    renderDashboard();
+    // Sanity: pre-click the row carries the name.
+    const rowBefore = screen.getByTestId('queue-row-3151');
+    expect((rowBefore as HTMLElement).style.viewTransitionName).toBe(
+      'issue-3151',
+    );
+    fireEvent.click(screen.getByTestId('queue-ready-count'));
+    await screen.findByTestId('queue-full-dialog');
+    // After the dialog opens, the ready row is re-rendered without a
+    // `viewTransitionName` — it's no longer a queue-row-<N> testid'd
+    // element (the row only carries the testid when `animated`).
+    expect(screen.queryByTestId('queue-row-3151')).toBeNull();
+  });
+
+  it('opening the Blocked dialog ALSO strips Ready rows and Active / Completed transitions', async () => {
+    // All three other panels' rows need to stop animating when any
+    // dialog is open — the dialog is modal over the full cockpit, not
+    // just its own column. Exercise this by opening the BLOCKED dialog
+    // (which has no animated rows itself) and confirming the OTHER
+    // panels' rows lose their view-transition-names.
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        queueReady: baseReady,
+        queueDepth: 1,
+        queueBlocked: [],
+        blockedDepth: 3,
+        activeAgents: baseActive,
+        recentCompletions: baseCompletions,
+        recentCompletionsCount: 1,
+      },
+    };
+    mockQueueFullData.BLOCKED = {
+      dispatcherQueueFull: {
+        kind: 'BLOCKED',
+        queueItems: [],
+        completions: [],
+      },
+    };
+    renderDashboard();
+    // Pre-click: all three animated rows have their names.
+    expect(
+      (screen.getByTestId('queue-row-3151') as HTMLElement).style
+        .viewTransitionName,
+    ).toBe('issue-3151');
+    expect(
+      (
+        screen.getByTestId(
+          'active-agent-row-aabbccdd-eeff-0011-2233-445566778899',
+        ) as HTMLElement
+      ).style.viewTransitionName,
+    ).toBe('issue-3100');
+    expect(
+      (
+        screen.getByTestId(
+          'completion-row-aabbccdd-eeff-0011-2233-445566778899',
+        ) as HTMLElement
+      ).style.viewTransitionName,
+    ).toBe('agent-aabbccdd-eeff-0011-2233-445566778899');
+
+    fireEvent.click(screen.getByTestId('queue-blocked-count'));
+    await screen.findByTestId('queue-full-dialog');
+
+    // Post-click: Active and Completed row names are gone; Ready row
+    // drops the `queue-row-<N>` testid entirely (animated=false).
+    expect(screen.queryByTestId('queue-row-3151')).toBeNull();
+    expect(
+      (
+        screen.getByTestId(
+          'active-agent-row-aabbccdd-eeff-0011-2233-445566778899',
+        ) as HTMLElement
+      ).style.viewTransitionName,
+    ).toBe('');
+    expect(
+      (
+        screen.getByTestId(
+          'completion-row-aabbccdd-eeff-0011-2233-445566778899',
+        ) as HTMLElement
+      ).style.viewTransitionName,
+    ).toBe('');
+  });
+});
