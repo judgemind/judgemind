@@ -1097,6 +1097,13 @@ FAILURE_CATEGORY_PUSH_FAILED = "push_failed"
 FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED = "pre_push_hook_rejected"
 FAILURE_CATEGORY_GIT_PUSH_NETWORK = "git_push_network"
 
+#: Tier-3, first-occurrence, non-retryable. Set when the pre-push rebase in
+#: _push_and_open_pr detects merge conflicts. Distinct from
+#: FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE (which is set after /task-v2-fix-conflict
+#: tries and fails to resolve): this is the *detection* category before any
+#: resolution attempt.
+FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH = "merge_conflict_at_push"
+
 #: Additional terminal-failure categories routed through the diagnoser
 #: by the unified ``_handle_agent_failure`` path (issue #3032).
 #: ``pr_create_failed`` — ``gh pr create`` non-zero exit or exception;
@@ -1183,9 +1190,18 @@ FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED = "merge_unstick_exhausted"
 #: routes these to ``AC_INFEASIBLE`` when the ``resolution_notes`` in
 #: phase_outputs indicate a semantic collision (function rewritten,
 #: feature reverted) or to ``retry_with_hint`` when the collision
-#: looks like a routine sibling-PR timing issue. The subprocess path
-#: currently has no equivalent — daemon.py doesn't run a pre-push
-#: rebase today — but when it is added it must route here.
+#: looks like a routine sibling-PR timing issue.
+#:
+#: **Semantic split from FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH:**
+#: ``conflict_unresolvable`` is set *after* ``/task-v2-fix-conflict``
+#: has tried (and failed) to resolve the conflict — it signals that
+#: resolution was attempted and could not succeed. By contrast,
+#: ``merge_conflict_at_push`` (set by the daemon's pre-push rebase in
+#: ``_push_and_open_pr``) is the *first-detection* category, before any
+#: resolution attempt. The diagnoser reads ``resolution_notes`` from
+#: phase_outputs to distinguish semantic collision from a sibling-PR
+#: timing race; the latter is a candidate for ``retry_with_hint`` once
+#: the blocking PR merges.
 FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 
 #: GitHub's rejection stderr fragment when branch protection's
@@ -1462,6 +1478,13 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         # from the phase_outputs row and picks AC_INFEASIBLE vs
         # retry_with_hint based on the semantic-collision signal.
         FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
+        # #2964: pre-push rebase in _push_and_open_pr detected merge
+        # conflicts. First-detection category (before any resolution
+        # attempt). See FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE for the
+        # semantic split. Non-retryable: the diagnoser routes to
+        # retry_with_hint (sibling-PR race) or AC_INFEASIBLE (semantic
+        # collision) based on conflict_files.
+        FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH,
     }
 )
 
@@ -11762,6 +11785,135 @@ class DispatcherDaemon:
         # git push -u origin <branch>
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         branch = f"agent/{short_id}"
+
+        # Issue #2964: Fetch latest main and rebase before pushing to detect
+        # conflicts early. On conflict: abort the rebase, persist phase output,
+        # fail with FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH, and return without
+        # pushing. On fetch failure or rebase timeout: fall through to push
+        # (best-effort, non-blocking).
+        fetch_ok = False
+        try:
+            fetch_result = subprocess.run(
+                ["git", "-C", str(worktree), "fetch", "origin", "main"],
+                capture_output=True,
+                text=True,
+                timeout=BASELINE_FETCH_TIMEOUT_SECONDS,
+            )
+            if fetch_result.returncode == 0:
+                fetch_ok = True
+            else:
+                self._log.warning(
+                    "daemon.push_and_pr_fetch_failed",
+                    extra={
+                        "event": "push_and_pr_fetch_failed",
+                        "agent_id": agent_id,
+                        "fetch_ok": False,
+                        "rebase_outcome": "skipped",
+                        "stderr": fetch_result.stderr[:500],
+                    },
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            self._log.warning(
+                "daemon.push_and_pr_fetch_failed",
+                extra={
+                    "event": "push_and_pr_fetch_failed",
+                    "agent_id": agent_id,
+                    "fetch_ok": False,
+                    "rebase_outcome": "skipped",
+                    "exc": str(exc),
+                },
+            )
+
+        if fetch_ok:
+            try:
+                rebase_result = subprocess.run(
+                    ["git", "-C", str(worktree), "rebase", "origin/main"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if rebase_result.returncode == 0:
+                    self._log.info(
+                        "daemon.push_and_pr_rebase_clean",
+                        extra={
+                            "event": "push_and_pr_rebase_clean",
+                            "agent_id": agent_id,
+                            "fetch_ok": True,
+                            "rebase_outcome": "clean",
+                        },
+                    )
+                else:
+                    # Capture conflicting files before aborting — markers
+                    # are in the index during the conflicted rebase.
+                    conflict_files_result = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(worktree),
+                            "diff",
+                            "--name-only",
+                            "--diff-filter=U",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    conflict_files = [
+                        f
+                        for f in conflict_files_result.stdout.strip().splitlines()
+                        if f
+                    ]
+                    subprocess.run(
+                        ["git", "-C", str(worktree), "rebase", "--abort"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    log_text = (
+                        f"rebase stderr:\n{rebase_result.stderr}\nconflict files:\n"
+                        + "\n".join(conflict_files)
+                    )
+                    self._log.warning(
+                        "daemon.push_and_pr_rebase_conflict",
+                        extra={
+                            "event": "push_and_pr_rebase_conflict",
+                            "agent_id": agent_id,
+                            "fetch_ok": True,
+                            "rebase_outcome": "conflict",
+                            "conflict_files": conflict_files,
+                        },
+                    )
+                    self._persist_phase_output(
+                        agent_id=agent_id,
+                        phase="push_and_pr",
+                        output_json={
+                            "conflict_files": conflict_files,
+                            "branch": branch,
+                        },
+                        log_text=log_text,
+                    )
+                    self._handle_agent_failure(
+                        agent_id=agent_id,
+                        category=FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH,
+                        phase="push_and_pr",
+                        stderr_tail="",
+                        exit_code=rebase_result.returncode,
+                        details={"conflict_files": conflict_files, "branch": branch},
+                        issue_number=issue_number,
+                    )
+                    return
+            except subprocess.TimeoutExpired as exc:
+                self._log.warning(
+                    "daemon.push_and_pr_rebase_timeout",
+                    extra={
+                        "event": "push_and_pr_rebase_timeout",
+                        "agent_id": agent_id,
+                        "fetch_ok": True,
+                        "rebase_outcome": "skipped",
+                        "exc": str(exc),
+                    },
+                )
+
         push_cmd = [
             "git",
             "-C",

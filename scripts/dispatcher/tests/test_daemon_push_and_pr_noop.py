@@ -326,6 +326,15 @@ class TestNormalShipPathUnaffected:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         push_ok = subprocess.CompletedProcess(
             args=["git", "push"], returncode=0, stdout="", stderr=""
         )
@@ -342,6 +351,8 @@ class TestNormalShipPathUnaffected:
                 rev_list_ahead,
                 commit_ok,
                 git_show_empty,
+                fetch_ok,
+                rebase_ok,
                 push_ok,
                 pr_create_ok,
             ],
@@ -352,16 +363,18 @@ class TestNormalShipPathUnaffected:
                 worktree=worktree,
             )
 
-        # All five subprocess calls fired in order.
+        # All seven subprocess calls fired in order.
         argvs = [call.args[0] for call in run_mock.call_args_list]
-        assert len(argvs) == 5, (
-            f"Expected 5 subprocess calls on normal SHIP; got {argvs}"
+        assert len(argvs) == 7, (
+            f"Expected 7 subprocess calls on normal SHIP; got {argvs}"
         )
         assert "rev-list" in argvs[0]
         assert "commit" in argvs[1] and "--amend" in argvs[1]
         assert "show" in argvs[2]
-        assert "push" in argvs[3]
-        assert argvs[4][:3] == ["gh", "pr", "create"]
+        assert "fetch" in argvs[3]
+        assert "rebase" in argvs[4]
+        assert "push" in argvs[5]
+        assert argvs[6][:3] == ["gh", "pr", "create"]
 
         # No push_and_pr_skipped_no_op event on the normal path.
         # (The method transitions to awaiting_ci via _mark_agent_terminal
