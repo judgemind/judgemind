@@ -236,6 +236,54 @@ Model selection at the CLI: Claude uses `--model <alias\|id>` (aliases `opus`/`s
 
 **Cost/quality shadow mode.** A future experiment — `runner_shadow` in config lets a second runner execute the same phase in parallel with its output discarded and diff-logged to `dispatcher.phase_outputs` (distinguished by `phase='<phase>@shadow:<runner>'`). Useful for measuring "would Gemini have produced a similar plan?" without cutting over. Out of scope for Phase 1-4 migration; noted here so the schema doesn't preclude it. The Gemini free OAuth tier (1000 rpd on Gemini 3 Pro) is generous enough to run meaningful shadow traffic without a budget line.
 
+### 6c. ECS execution mode (per-agent Fargate)
+
+`dispatcher.config.agent_execution_mode` controls how the daemon spawns agents, orthogonal to runner choice (§6b):
+
+- `'subprocess'` (historical default): daemon forks the runner (e.g. `claude -p /task-v2-<phase>`) as a child process inside its own ECS task. Each daemon redeploy SIGKILLs all child processes, abandoning in-flight agents.
+- `'ecs'` (Option A, #3086/#3078): daemon calls `ecs:RunTask` to launch a dedicated per-agent task from the `judgemind-dispatcher-agent-runner-dev` task-definition family. The agent-runner task is independent of the daemon task — daemon redeploys no longer kill agents.
+
+The config flag is stored on the agent row at claim-time (`dispatcher.agents.execution_mode`) and is immutable for that agent's lifetime.
+
+#### Agent-runner lifecycle
+
+1. Daemon claims an issue; config value snapshotted onto the agent row.
+2. Daemon's `_launch_agent_ecs_task` calls `ecs:RunTask` on the agent-runner task-def, passing `AGENT_ID` + `ISSUE_NUMBER` as container env. `agent_task_arn` populated on the agent row. Launch is wrapped in a 3-attempt / 1s+2s backoff retry (matches the #3053/#3085 retry pattern for transient AWS errors).
+3. Agent-runner entrypoint (`scripts/dispatcher/agent-runner-entrypoint.sh`) clones the repo, creates an agent branch, and runs a phase loop: claiming → planning → ralph → summary → push_and_pr → awaiting_ci → merge → awaiting_deploy → verify → retro → done. Phase-transition logic comes from the shared `phase_transitions.py` module — the same state machine the daemon uses in subprocess mode.
+4. Each phase writes an input bundle at `tmp/dispatcher-input/<phase>.json` via `phase_input_shim.py` (embedded Python in the entrypoint), invokes `claude -p /task-v2-<skill> $AGENT_ID` against the clone's `.claude/skills/`, reads the structured output from `tmp/dispatcher-output/<skill>.json`, persists to `dispatcher.phase_outputs`, and advances phase state.
+5. Daemon's `_reap_completed_agent_tasks` (scheduler_tick) polls `ecs:DescribeTasks` on every non-null `agent_task_arn`. STOPPED-success → noop/gap-close; STOPPED-failure → `_handle_agent_failure`; RUNNING → noop. Fresh daemons after a redeploy just resume observing the ARNs — no abandonment bookkeeping needed.
+
+#### Data-path parity (input/output contract)
+
+Both execution modes preserve the same skill contract:
+
+| Direction | Path | Written by |
+|---|---|---|
+| Input | `tmp/dispatcher-input/<phase>.json` | subprocess daemon's `_write_phase_input`, OR agent-runner's `phase_input_shim.py` |
+| Output | `tmp/dispatcher-output/<skill>.json` | the skill itself (emits structured JSON via its `/task-v2-*` implementation) |
+
+Skills read from the input file and write to the output file; neither should depend on `claude -p`'s `.result` field or on any other execution-mode-specific plumbing. When porting a mechanism between execution modes, preserve both paths. The subprocess daemon's `_write_phase_input` + per-phase `_handle_phase_*` builders are mirrored in the entrypoint's `phase_input_shim.py` builders (summary/fix-ci/verify/retro parity, #3135).
+
+#### IAM scope (dispatcher task role, ECS-mode only)
+
+- `ecs:RunTask`, `ecs:StopTask` — scoped to the agent-runner task-def family.
+- `ecs:TagResource` on `task/<cluster>/*` — required when RunTask uses tags (missed in the original Stage 2 IAM, added in #3129).
+- `ecs:DescribeTasks` — conditioned on `ecs:cluster`.
+- `iam:PassRole` — scoped to the agent-runner execution + task roles.
+
+#### Image + terraform pipelines
+
+- `Dockerfile.dispatcher-agent-runner` is a sibling of `Dockerfile.dispatcher`: same base image + tooling, different ENTRYPOINT. Kept as two files (not `--target` variants) per the #3090 scope note.
+- `.github/workflows/deploy-agent-runner.yml` auto-builds the agent-runner image on changes to `Dockerfile.dispatcher-agent-runner`, `scripts/dispatcher/agent-runner-entrypoint.sh`, or `scripts/dispatcher/phase_transitions.py`. Publishes `<sha7>` + `latest` tags to `judgemind/dispatcher-agent-runner` ECR.
+- `scripts/dispatcher/agent-runner-entrypoint.sh` is explicitly `!`-excluded from `deploy-dispatcher.yml` paths so entrypoint changes don't force a daemon redeploy.
+- `infra/terraform/modules/dispatcher-agent-runner/` defines the task-def, IAM role, security group, log group, and ECR repo. Auto-applied on merge by `.github/workflows/terraform.yml`'s `dev-apply` job (#3107).
+
+#### Known gaps
+
+- `daemon_restart_abandoned` is used by the entrypoint as a generic failed-terminal — it's a category error when the failure isn't actually from a daemon restart. Tracked as #3137.
+- No `launch-agent-runner-smoke.sh` DX helper yet — Stage 3 smokes were run by hand. Tracked as #3138.
+- ECS agent-runner has no equivalent of the daemon's `CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS`. If claude hangs inside a phase, the task runs indefinitely. Needs a wall-clock timeout per-phase or per-task.
+
 ## 7. Supervisor Loop (every 2min)
 
 1. **Stuck detection.** Agents with `status='running'` and no `dispatcher.phase_transitions` update in >30min are flagged. Writes `dispatcher.failures(category='stuck_timeout')`. `stuck_timeout` is mechanical (§8), so this creates a `dispatcher.retry_markers` row directly with exponential backoff (60s → 300s → 900s; give up after attempt 3). Judgment-required failures route through a diagnoser subprocess first (§8 Diagnosis step) — no retry marker is created until the diagnoser returns.
