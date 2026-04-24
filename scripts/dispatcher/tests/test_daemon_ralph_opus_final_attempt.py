@@ -249,7 +249,9 @@ class TestRalphSpawnUsesAttemptAwareModel:
         d, conn, _handler = _make_daemon(tmp_path)
         # retries_used = MAX_RETRY_ATTEMPTS - 1 → 1-indexed attempt ==
         # MAX_RETRY_ATTEMPTS (the final budgeted attempt) → Opus.
-        conn.cursor_instance.fetch_queue = [(daemon.MAX_RETRY_ATTEMPTS - 1,)]
+        # None first: consumed by _read_max_turns_overrides() (returns {});
+        # the tuple is then read by _current_attempt_for().
+        conn.cursor_instance.fetch_queue = [None, (daemon.MAX_RETRY_ATTEMPTS - 1,)]
 
         captured: dict[str, Any] = {}
         _patch_popen_and_forwarder(monkeypatch, captured)
@@ -281,7 +283,9 @@ class TestRalphSpawnUsesAttemptAwareModel:
         default. A CloudWatch query over a retry stretch can therefore
         grep ``model = 'opus'`` to find final-attempt ralph runs."""
         d, conn, handler = _make_daemon(tmp_path)
-        conn.cursor_instance.fetch_queue = [(daemon.MAX_RETRY_ATTEMPTS - 1,)]
+        # None first: consumed by _read_max_turns_overrides() (returns {});
+        # the tuple is then read by _current_attempt_for().
+        conn.cursor_instance.fetch_queue = [None, (daemon.MAX_RETRY_ATTEMPTS - 1,)]
 
         _patch_popen_and_forwarder(monkeypatch)
         d._spawn_phase_subprocess("ralph", tmp_path, "agent-uuid")
