@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# venv: N/A — pure bash + scripts/dev-db-query.sh + jq
+# venv: N/A — pure bash + scripts/dev-db-query.sh + jq + aws cli
 # permanent: true
 #
 # agent-timeline.sh — Human-readable timeline for a dispatcher agent.
@@ -10,6 +10,22 @@
 # I default to Pacific in conversation and need an unambiguous column for
 # each (see feedback memory `feedback_timezone_in_communication.md`).
 #
+# For ECS-mode agents (execution_mode='ecs'), also prints two extra
+# sections (#3147):
+#   * ECS agent-runner — task ARN + copy-pasteable ecs:execute-command
+#     one-liner + CPU/memory averages from Container Insights for the
+#     agent-runner TaskDefinitionFamily over the agent's lifetime window.
+#     Family-level metrics are the finest granularity under the
+#     `enabled` Container Insights tier (per-TaskId requires
+#     `enhanced`, which is not live). See #3146 for the tier/doc
+#     trail and `docs/agent/infrastructure-reference.md` §Container
+#     Insights for the query shape.
+#   * Ralph iterations — one row per ralph_patches entry for this agent,
+#     showing iteration_n, created_at, commit_sha, verdict, and the
+#     parsed Subject line from git format-patch content.
+#
+# Subprocess-mode agents render unchanged — the ECS sections are skipped.
+#
 # Usage:
 #   scripts/dispatcher/helpers/agent-timeline.sh <agent-id-or-prefix>
 #
@@ -19,6 +35,27 @@
 # The prefix only needs to be unique among the most recent agents; if it
 # matches multiple rows the script prints candidates and exits non-zero so
 # you can disambiguate.
+#
+# Graceful degradation:
+#   * Missing `aws` CLI, failing `get-metric-data` call, or empty metric
+#     response → the CPU/memory lines show "(metrics unavailable)".
+#   * NULL task ARN (e.g. ECS agent killed before RunTask) → the
+#     exec-cmd line shows "(no task ARN recorded)".
+#   * No ralph_patches rows yet → the iterations section shows
+#     "(no iterations yet)".
+# None of these produce a hard failure — the helper's primary purpose
+# is to render the DB-backed timeline, and the new sections are
+# supplemental.
+#
+# Environment overrides (all optional — the defaults match dev):
+#   ECS_CLUSTER        — cluster name (default: judgemind-dev).
+#   ECS_AGENT_FAMILY   — agent-runner TaskDefinitionFamily
+#                        (default: judgemind-dispatcher-agent-runner-dev).
+#   AWS_REGION         — region passed to `aws cloudwatch`
+#                        (default: us-west-2).
+#   AGENT_TIMELINE_SKIP_METRICS — if non-empty, skip the CloudWatch
+#                        call entirely and show "(metrics unavailable)".
+#                        Used by tests.
 #
 # Exit codes:
 #   0  — printed timeline for exactly one matching agent.
@@ -109,6 +146,12 @@ WITH
       'priority',    priority,
       'issue_title', issue_title,
       'failure_summary', failure_summary,
+      'execution_mode', execution_mode,
+      'agent_task_arn', agent_task_arn,
+      'ralph_iterations_observed', ralph_iterations_observed,
+      'started_epoch', EXTRACT(EPOCH FROM started_at)::bigint,
+      'ended_epoch',   CASE WHEN ended_at IS NULL THEN NULL
+                             ELSE EXTRACT(EPOCH FROM ended_at)::bigint END,
       'spawned_utc', to_char(started_at AT TIME ZONE 'UTC',               'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
       'spawned_pt',  to_char(started_at AT TIME ZONE 'America/Los_Angeles', 'YYYY-MM-DD HH24:MI:SS\" PT\"'),
       'ended_utc',   CASE WHEN ended_at IS NULL THEN NULL
@@ -198,13 +241,44 @@ WITH
       WHERE agent_id = '${agent_id}'
       ORDER BY marker_id
     ) x
+  ),
+  ralph_iterations AS (
+    -- #3147: one row per ralph_patches entry for this agent. The ECS
+    -- agent-runner HEAD-watcher (#3144) writes per-iteration rows with
+    -- iteration_n + verdict='LOOP'; ralph SHIP adds a row with
+    -- verdict='SHIP' and iteration_n=NULL. Legacy pre-#3026 rows have
+    -- both columns NULL. The parsed Subject line comes from
+    -- ``git format-patch`` output at the head of patch_content — it's
+    -- the human-readable commit subject for the iteration's cumulative
+    -- work. We use substring(... FROM '...') to pull just that one
+    -- line, guarding against NULL patch_content with NULLIF so the
+    -- helper still shows the row even if the subject extraction
+    -- misses.
+    SELECT COALESCE(jsonb_agg(i), '[]'::jsonb) AS data FROM (
+      SELECT jsonb_build_object(
+        'iteration_n',     iteration_n,
+        'verdict',         verdict,
+        'commit_sha',      commit_sha,
+        'commit_sha_short', CASE WHEN commit_sha IS NULL THEN NULL
+                                  ELSE substring(commit_sha, 1, 7) END,
+        'commit_subject',  NULLIF(
+                             substring(patch_content FROM 'Subject: \[PATCH\] ([^\n\r]+)'),
+                             ''),
+        'created_utc',     to_char(created_at AT TIME ZONE 'UTC',               'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+        'created_pt',      to_char(created_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"')
+      ) AS i
+      FROM dispatcher.ralph_patches
+      WHERE agent_id = '${agent_id}'
+      ORDER BY created_at, iteration_n NULLS LAST
+    ) x
   )
 SELECT jsonb_build_object(
-  'agent',         (SELECT data FROM agent),
-  'transitions',   (SELECT data FROM transitions),
-  'failures',      (SELECT data FROM failures),
-  'diagnoses',     (SELECT data FROM diagnoses),
-  'retry_markers', (SELECT data FROM retry_markers)
+  'agent',            (SELECT data FROM agent),
+  'transitions',      (SELECT data FROM transitions),
+  'failures',         (SELECT data FROM failures),
+  'diagnoses',        (SELECT data FROM diagnoses),
+  'retry_markers',    (SELECT data FROM retry_markers),
+  'ralph_iterations', (SELECT data FROM ralph_iterations)
 ) AS timeline;
 "
 
@@ -217,6 +291,134 @@ fi
 
 # dev-db-query.sh returns an array-of-one-row; pull out the single `timeline` object.
 timeline=$(echo "$timeline_result" | jq '.[0].timeline')
+
+# ─── ECS-mode only: fetch CPU/memory from Container Insights ─────────
+# Only runs when execution_mode='ecs'. We call `aws cloudwatch
+# get-metric-data` once each for CpuUtilized and MemoryUtilized at the
+# TaskDefinitionFamily granularity (per-TaskId requires the
+# `enhanced` tier, see #3146). The time window is bounded by the
+# agent's started_at / ended_at (or `now` if still running). Failures
+# are non-fatal — we inject `null` into the timeline JSON and the jq
+# output downgrades to "(metrics unavailable)".
+#
+# bash 3.2 compat: no process-substitution-into-mapfile, no namerefs,
+# no `declare -A`. We construct JSON via jq and pass it through a
+# simple variable.
+
+execution_mode=$(echo "$timeline" | jq -r '.agent.execution_mode // "subprocess"')
+ecs_cluster="${ECS_CLUSTER:-judgemind-dev}"
+ecs_family="${ECS_AGENT_FAMILY:-judgemind-dispatcher-agent-runner-dev}"
+aws_region="${AWS_REGION:-us-west-2}"
+
+ecs_metrics_json="null"
+
+if [[ "$execution_mode" == "ecs" && -z "${AGENT_TIMELINE_SKIP_METRICS:-}" ]]; then
+    if command -v aws >/dev/null 2>&1; then
+        started_epoch=$(echo "$timeline" | jq -r '.agent.started_epoch // empty')
+        ended_epoch=$(echo "$timeline" | jq -r '.agent.ended_epoch // empty')
+
+        if [[ -n "$started_epoch" ]]; then
+            # Default end = now. Subtract a small cushion (120s) from
+            # the start so that agents whose first metric datapoint
+            # arrives up to 2 minutes after started_at still match.
+            start_ts="$started_epoch"
+            if [[ -n "$ended_epoch" ]]; then
+                end_ts="$ended_epoch"
+            else
+                end_ts=$(date -u +%s)
+            fi
+            # Widen the start slightly so the first minute bucket is
+            # included (CloudWatch Period=60 aligns on wall-clock
+            # minutes).
+            start_ts=$((start_ts - 60))
+            end_ts=$((end_ts + 60))
+
+            # ISO 8601 with Z. BSD date (macOS): `date -u -r N +FMT`.
+            # GNU date (Linux / Fargate agent-runner): `date -u -d @N
+            # +FMT`. Detect once and use the right form.
+            if date -u -r "$start_ts" +%FT%TZ >/dev/null 2>&1; then
+                # BSD date (macOS)
+                start_iso=$(date -u -r "$start_ts" +%FT%TZ)
+                end_iso=$(date -u -r "$end_ts" +%FT%TZ)
+            else
+                # GNU date (Linux / Fargate)
+                start_iso=$(date -u -d "@$start_ts" +%FT%TZ)
+                end_iso=$(date -u -d "@$end_ts" +%FT%TZ)
+            fi
+
+            # Build one metric-data-query JSON per metric. We keep both
+            # in a single call for efficiency.
+            mdq=$(jq -cn \
+                --arg family "$ecs_family" \
+                --arg cluster "$ecs_cluster" \
+                '[
+                  {
+                    Id: "cpu",
+                    MetricStat: {
+                      Metric: {
+                        Namespace: "ECS/ContainerInsights",
+                        MetricName: "CpuUtilized",
+                        Dimensions: [
+                          {Name: "TaskDefinitionFamily", Value: $family},
+                          {Name: "ClusterName", Value: $cluster}
+                        ]
+                      },
+                      Period: 60,
+                      Stat: "Average"
+                    },
+                    ReturnData: true
+                  },
+                  {
+                    Id: "mem",
+                    MetricStat: {
+                      Metric: {
+                        Namespace: "ECS/ContainerInsights",
+                        MetricName: "MemoryUtilized",
+                        Dimensions: [
+                          {Name: "TaskDefinitionFamily", Value: $family},
+                          {Name: "ClusterName", Value: $cluster}
+                        ]
+                      },
+                      Period: 60,
+                      Stat: "Average"
+                    },
+                    ReturnData: true
+                  }
+                ]')
+
+            cw_out=$(aws cloudwatch get-metric-data \
+                --region "$aws_region" \
+                --start-time "$start_iso" \
+                --end-time "$end_iso" \
+                --metric-data-queries "$mdq" 2>/dev/null || true)
+
+            if [[ -n "$cw_out" ]] && printf '%s' "$cw_out" | jq -e '.MetricDataResults' >/dev/null 2>&1; then
+                # Average the Values[] arrays. If both are empty, the
+                # reducer below emits null and the jq render falls
+                # back to "(metrics unavailable)".
+                ecs_metrics_json=$(printf '%s' "$cw_out" | jq -c '
+                    .MetricDataResults as $r
+                    | (($r[] | select(.Id == "cpu") | .Values) // []) as $cpu
+                    | (($r[] | select(.Id == "mem") | .Values) // []) as $mem
+                    | {
+                        cpu_avg: (if ($cpu | length) > 0 then ($cpu | add / length) else null end),
+                        cpu_points: ($cpu | length),
+                        mem_avg: (if ($mem | length) > 0 then ($mem | add / length) else null end),
+                        mem_points: ($mem | length),
+                        window_start: "'"$start_iso"'",
+                        window_end:   "'"$end_iso"'",
+                        family: "'"$ecs_family"'",
+                        cluster: "'"$ecs_cluster"'"
+                      }
+                ' 2>/dev/null || echo "null")
+            fi
+        fi
+    fi
+fi
+
+# Splice metrics into the timeline JSON so the jq render can see both.
+timeline=$(echo "$timeline" | jq --argjson m "$ecs_metrics_json" \
+    '. + {ecs_metrics: $m}')
 
 # ─── Format and print ────────────────────────────────────────────────
 
@@ -269,6 +471,51 @@ echo "$timeline" | jq -r '
         else ($root.retry_markers | map(
           "  id=\(.marker_id)  attempt=\(.attempt)  reason=\(.reason)  \(if .resolved then "resolved@\(.resolved_utc)" else "pending (retry_after=\(.retry_after_utc))" end)"
         ))
+      end
+    ) + (
+      # ─── #3147: ECS agent-runner block ────────────────────────────
+      # Only rendered when execution_mode='ecs'. Subprocess-mode
+      # agents are unchanged — no new sections emitted.
+      if ($a.execution_mode // "subprocess") != "ecs"
+        then []
+        else
+          ["", "── ECS agent-runner ──"] +
+          (if ($a.agent_task_arn // null) != null
+            then
+              ($a.agent_task_arn | split("/")) as $parts
+              | ($parts[-1] // "?") as $task_id
+              | [
+                  "  task_arn: \($a.agent_task_arn)",
+                  "  task_id:  \($task_id)",
+                  "  exec-cmd: aws ecs execute-command --cluster \(($root.ecs_metrics.cluster // "judgemind-dev")) --task \($task_id) --container agent-runner --interactive --command /bin/bash"
+                ]
+            else ["  task_arn: (no task ARN recorded)"]
+          end) +
+          (if ($root.ecs_metrics // null) == null or ($root.ecs_metrics.cpu_avg // null) == null
+            then ["  task CPU: (metrics unavailable)"]
+            else ["  task CPU: \(($root.ecs_metrics.cpu_avg * 10 | round) / 10) units (family avg over \(($root.ecs_metrics.cpu_points)) datapoint\(if $root.ecs_metrics.cpu_points == 1 then "" else "s" end), family=\($root.ecs_metrics.family))"]
+          end) +
+          (if ($root.ecs_metrics // null) == null or ($root.ecs_metrics.mem_avg // null) == null
+            then ["  task mem: (metrics unavailable)"]
+            else ["  task mem: \(($root.ecs_metrics.mem_avg * 10 | round) / 10) MiB (family avg over \(($root.ecs_metrics.mem_points)) datapoint\(if $root.ecs_metrics.mem_points == 1 then "" else "s" end))"]
+          end) +
+          ["  iterations_observed: \($a.ralph_iterations_observed // 0)"]
+      end
+    ) + (
+      # ─── #3147: Ralph iterations block ────────────────────────────
+      # Only rendered when execution_mode='ecs'. The rows come from
+      # dispatcher.ralph_patches — the HEAD-watcher writes one per
+      # iteration plus a SHIP row (iteration_n=NULL, verdict='SHIP').
+      if ($a.execution_mode // "subprocess") != "ecs"
+        then []
+        else
+          ["", "── Ralph iterations (ECS, in-flight or terminal) ──"] +
+          (if ($root.ralph_iterations // [] | length) == 0
+            then ["  (no iterations yet)"]
+            else ($root.ralph_iterations | map(
+              "  iter=\(.iteration_n // "·")  verdict=\(.verdict // "·")  \(.created_utc)  \(.commit_sha_short // "·······")\(if .commit_subject then "  \(.commit_subject)" else "" end)"
+            ))
+          end)
       end
     )
   | .[]
