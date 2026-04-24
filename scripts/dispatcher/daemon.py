@@ -1113,6 +1113,19 @@ FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE = "verify_failed_post_merge"
 #: not a mechanical retry.
 FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED = "merge_unstick_exhausted"
 
+#: #3225 — fix_conflict terminal category. Set by the agent-runner
+#: entrypoint (``agent_runner_reaped_failure``) when
+#: ``handle_fix_conflict`` either exhausts the per-agent
+#: ``merge_conflict_attempts`` budget OR the claude skill returns
+#: ``verdict='unresolvable'``. The diagnoser (``/diagnose-failure``)
+#: routes these to ``AC_INFEASIBLE`` when the ``resolution_notes`` in
+#: phase_outputs indicate a semantic collision (function rewritten,
+#: feature reverted) or to ``retry_with_hint`` when the collision
+#: looks like a routine sibling-PR timing issue. The subprocess path
+#: currently has no equivalent — daemon.py doesn't run a pre-push
+#: rebase today — but when it is added it must route here.
+FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
+
 #: GitHub's rejection stderr fragment when branch protection's
 #: statusCheckRollup evaluator still sees a stale FAILURE check_run
 #: from an earlier CI attempt even though the *latest* ci-passed
@@ -1382,6 +1395,11 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,  # #3071
         # #2641: merge-phase auto-unstick budget exhausted.
         FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED,
+        # #3225: fix_conflict budget exhausted OR skill returned
+        # verdict=unresolvable. The diagnoser reads resolution_notes
+        # from the phase_outputs row and picks AC_INFEASIBLE vs
+        # retry_with_hint based on the semantic-collision signal.
+        FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
     }
 )
 

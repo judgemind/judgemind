@@ -290,6 +290,49 @@ Two categories land in this skill via the post-exit parse path added for #3010:
 
 ---
 
+## Per-category guidance — fix_conflict terminal (issue #3225)
+
+### `conflict_unresolvable` — fix_conflict skill couldn't resolve a rebase conflict
+
+This category is set by the agent-runner entrypoint when:
+
+1. The `/task-v2-fix-conflict` skill returned `verdict="unresolvable"` (semantic collision it couldn't reconcile), OR
+2. The per-agent `merge_conflict_attempts` budget was exhausted (default `FIX_CONFLICT_MAX_ATTEMPTS=2`). The synthetic output has `budget_exhausted=true`.
+
+The agent's pre-rebase ralph patch is still preserved in `dispatcher.ralph_patches` — the branch was never pushed, there is no PR. The issue is still `status/in-progress`; no PR exists.
+
+**Context bundle extras.** In addition to the shared bundle shape, the daemon's phase_outputs row for this agent (`phase='fix_conflict'`, attempt N) carries the skill's full output JSON. Read the `resolution_notes` field from `context.prior_failures[0].details.resolution_notes` (or re-fetch from `dispatcher.phase_outputs` if the daemon didn't inline it). Also inspect:
+
+- `conflict_files` (list of str) — paths that couldn't be reconciled.
+- `budget_exhausted` (bool) — `true` means the skill was never invoked on this attempt; the counter was already at the cap.
+- Main's recent commits on those files (same source as the skill's `main_commits_since_base` input — re-fetch via `git log origin/main`).
+
+**Default action selection:**
+
+| Situation (evidence in `resolution_notes`) | Action | Why |
+|---|---|---|
+| Notes indicate a **semantic collision** — e.g. `"function X was rewritten on main"`, `"main reverted the feature this PR depended on"`, `"signature changed and agent's call no longer type-checks"` | **`escalate`** (or `reissue` with a clarified `new_scope` if the AC itself needs rewriting) | Maps to the spec's `AC_INFEASIBLE` intent: the agent's original intent no longer fits on top of the new base. A fresh ralph with the same AC will hit the same wall. Needs human judgment on whether the AC still makes sense. Use `reissue` when a clarified AC on top of the updated main would unblock the work; otherwise `escalate`. |
+| Notes indicate a **routine parallel-edit conflict** — e.g. `"main landed a sibling feature with overlapping design; agent can re-attempt with updated context"`, `"main refactored imports; agent's additions still valid but need re-anchoring"` | **`retry_with_hint`** | A fresh agent starting from the updated main will produce a compatible implementation naturally. Write a `hint` that names the conflict files and the commits on main the next agent needs to read. Example: `"Previous attempt hit a rebase conflict against PR #<sibling> in <file>. Main has since landed <commit sha/subject>. Re-read <file> on main and re-apply the acceptance criteria against the updated shape."` |
+| `budget_exhausted=true` AND prior `fix_conflict` failures in the bundle each had `resolution_notes` that read like semantic collisions | **`escalate`** | Two rounds couldn't reconcile — the conflict is structural. Mark needs-human. |
+| `budget_exhausted=true` but no prior fix_conflict failures in the bundle (fresh agent, budget-gate fired on the first invocation — shouldn't happen under default cap=2 but is possible when an operator set `AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS=0` for a test) | **`retry`** | Transient config issue — fresh agent with restored budget will succeed. |
+| `resolution_notes` is empty or missing (skill crashed before writing) | **`retry`** | Treat as a transient skill failure; the next agent will re-encounter the conflict and can either resolve or return a populated unresolvable. |
+
+**Do NOT pick `close` for this category** — the issue is still open and has a valid backlog item; a rebase conflict is not evidence the issue is invalid.
+
+**Do NOT pick `file_prerequisite_task`** unless the conflict's root cause is a fleet-wide pattern (e.g. multiple agents hitting the same class of conflict against the same sibling PR). The fix_conflict skill is the right layer for per-issue conflict resolution; filing a prerequisite task is a fallback for when the conflict is infrastructural (e.g. the baseline rebase keeps failing due to a branch-protection mis-config — which would surface differently anyway).
+
+**`hint` content for `retry_with_hint`.** Keep it concrete:
+
+- Name the conflict files.
+- Name the merging commit from `main_commits_since_base` (by subject if SHA is unwieldy).
+- Tell the next agent to re-read the updated main-side files before planning.
+
+Example hint:
+
+> Previous attempt hit a rebase conflict in `packages/web/app/(main)/admin/dispatcher/a.tsx` after PR #3218 landed. Main now has commit `feat(dispatcher-v2): UI polish phase 2` that refactored the same component. Re-read the current file on main before re-applying this issue's acceptance criteria.
+
+---
+
 ## Per-category guidance — post-merge verify failure (issue #3071)
 
 ### `verify_failed_post_merge` — post-merge regression signal

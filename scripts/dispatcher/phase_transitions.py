@@ -126,6 +126,15 @@ PHASE_AWAITING_CI = "awaiting_ci"
 #: Fix-CI retry skill (``/task-v2-fix-ci``). Runs on red CI.
 PHASE_FIX_CI = "fix_ci"
 
+#: Fix-conflict skill (``/task-v2-fix-conflict``). Runs when
+#: ``push_and_pr``'s pre-push rebase — or the start-of-ralph baseline
+#: rebase — hits a merge conflict against ``origin/main``. The skill
+#: semantically resolves the conflict against updated main-branch
+#: content and returns ``resolved`` with a new file set (entrypoint
+#: commits + re-enters push_and_pr) or ``unresolvable`` (entrypoint
+#: routes to the ``conflict_unresolvable`` terminal). See #3225.
+PHASE_FIX_CONFLICT = "fix_conflict"
+
 #: Merge step. Squash-merge the PR.
 PHASE_MERGE = "merge"
 
@@ -189,6 +198,13 @@ PHASE_MERGE_FAILED = "merge_failed"
 PHASE_AWAITING_DEPLOY_FAILED = "awaiting_deploy_failed"
 PHASE_AWAITING_DEPLOY_TIMEOUT = "awaiting_deploy_timeout"
 
+#: #3225 — fix_conflict terminal. Set when the fix_conflict skill
+#: returns ``verdict='unresolvable'`` or when ``merge_conflict_attempts
+#: >= FIX_CONFLICT_MAX_ATTEMPTS``. Routed through the diagnoser (via the
+#: supervisor tick's ``_find_diagnoser_candidates`` sweep) under
+#: ``FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE``.
+PHASE_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
+
 # ---------------------------------------------------------------------------
 # Verdict constants — the string values produced by the phase-output JSONs.
 # ---------------------------------------------------------------------------
@@ -216,6 +232,15 @@ VERDICT_FAILED = "FAILED"
 #: Verify passed / skipped cleanly.
 VERDICT_VERIFIED = "VERIFIED"
 VERDICT_SKIPPED = "SKIPPED"
+
+#: Fix-conflict skill verdicts (#3225). Lower-case to match the skill's
+#: on-disk contract (``.claude/skills/task-v2-fix-conflict/SKILL.md``).
+#: The skill writes verdict in lower-case so an operator scanning the
+#: output JSON sees "resolved"/"unresolvable" rather than SHOUTED
+#: UPPERCASE. The transition function upper-cases for comparison, so
+#: callers can emit either.
+VERDICT_RESOLVED = "RESOLVED"
+VERDICT_UNRESOLVABLE = "UNRESOLVABLE"
 
 # ---------------------------------------------------------------------------
 # Terminal-status enumeration. Mirrors ``TERMINAL_AGENT_STATUSES`` in
@@ -275,6 +300,8 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_MERGE_FAILED,
         PHASE_AWAITING_DEPLOY_FAILED,
         PHASE_AWAITING_DEPLOY_TIMEOUT,
+        # #3225 — fix_conflict terminal.
+        PHASE_CONFLICT_UNRESOLVABLE,
     }
 )
 
@@ -347,6 +374,11 @@ FAILURE_HINT_VERIFY_FAILED_POST_MERGE = "verify_failed_post_merge"
 
 #: Plan phase returned BLOCKED. Terminal (``status='plan_blocked'``).
 FAILURE_HINT_PLAN_BLOCKED = "plan_blocked"
+
+#: Fix-conflict skill emitted ``verdict='unresolvable'`` OR the
+#: per-agent ``merge_conflict_attempts`` budget is exhausted. Maps to
+#: ``FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE`` in daemon.py. See #3225.
+FAILURE_HINT_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +488,31 @@ def transition_from_ralph(output: Mapping[str, Any] | None) -> PhaseTransition:
     * anything else (``REVISE``-exhausted, worker-STUCK twice) —
       non-SHIP terminal per #3054. Route through
       :func:`FAILURE_HINT_RALPH_NOT_SHIP`.
+
+    #3225 secondary mitigation — the entrypoint runs
+    ``git fetch origin main && git rebase origin/main`` at the START
+    of ralph (before any claude iterations) so the agent works
+    against the latest main from the beginning rather than
+    discovering the conflict after ~25 min of ralph work. When that
+    baseline rebase conflicts, the entrypoint emits
+    ``{"rebase_failed": true, "conflict_files": [...]}`` as the
+    ralph phase output — same envelope shape as push_and_pr — and
+    this function advances to ``fix_conflict``. The start-of-ralph
+    path takes precedence over verdict parsing because no claude
+    skill has run yet.
     """
+    # #3225: start-of-ralph baseline rebase conflict. Short-circuits
+    # the verdict check because the claude skill never ran.
+    if output and output.get("rebase_failed"):
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE,
+            next_phase=PHASE_FIX_CONFLICT,
+            reason="ralph baseline rebase conflict — routing to fix_conflict (#3225)",
+            context={
+                "conflict_files": output.get("conflict_files") or [],
+                "source_phase": "ralph",
+            },
+        )
     verdict = _verdict(output)
     if verdict == VERDICT_SHIP:
         return PhaseTransition(
@@ -526,6 +582,11 @@ def transition_from_push_and_pr(
     * ``no_op=True`` — ralph's #3039 no-op-SHIP guardrail fired; the
       working tree was clean on SHIP. Terminal success with phase
       ``no_op``, status ``succeeded``. No PR, no CI, no merge.
+    * ``rebase_failed=True`` (#3225) — the pre-push
+      ``git rebase origin/main`` hit a conflict. Advance to the
+      ``fix_conflict`` phase, where a claude skill semantically
+      resolves the conflict and either re-enters push_and_pr or
+      routes to ``conflict_unresolvable``.
     * otherwise — PR was opened; advance to ``awaiting_ci``.
     """
     if output and output.get("no_op"):
@@ -534,6 +595,21 @@ def transition_from_push_and_pr(
             next_phase=PHASE_NO_OP,
             terminal_status=AgentStatus.SUCCEEDED.value,
             reason="push_and_pr no-op SHIP (#3039)",
+        )
+    # #3225: pre-push rebase conflict. The entrypoint emits
+    # ``{"rebase_failed": true, "conflict_files": [...]}`` when
+    # ``git rebase origin/main`` hits a conflict. Route to
+    # fix_conflict instead of letting the agent fall through to
+    # awaiting_ci with missing_pr.
+    if output and output.get("rebase_failed"):
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE,
+            next_phase=PHASE_FIX_CONFLICT,
+            reason="push_and_pr rebase conflict — routing to fix_conflict (#3225)",
+            context={
+                "conflict_files": output.get("conflict_files") or [],
+                "source_phase": "push_and_pr",
+            },
         )
     return PhaseTransition(
         action=TransitionAction.ADVANCE,
@@ -615,6 +691,67 @@ def transition_from_fix_ci(output: Mapping[str, Any] | None) -> PhaseTransition:
         context={
             "verdict": verdict,
             "block_reason": (output or {}).get("block_reason"),
+        },
+    )
+
+
+def transition_from_fix_conflict(
+    output: Mapping[str, Any] | None,
+) -> PhaseTransition:
+    """Return the phase transition after ``/task-v2-fix-conflict`` runs.
+
+    Added by #3225. The fix_conflict phase recovers from pre-push
+    rebase conflicts (and, in the secondary-mitigation path, from
+    start-of-ralph baseline rebase conflicts) by claude-resolving the
+    conflict against updated ``origin/main`` content instead of
+    abandoning the agent's ralph work.
+
+    The skill's output JSON carries a ``verdict`` field (``resolved``
+    or ``unresolvable``). The entrypoint is responsible for:
+
+    * **Budget gate.** Before invoking the skill, it checks
+      ``dispatcher.agents.merge_conflict_attempts`` against
+      ``FIX_CONFLICT_MAX_ATTEMPTS`` (2 per agent lifetime). A budget
+      exhaustion surfaces here as a synthetic
+      ``verdict='unresolvable', budget_exhausted=true`` output so this
+      pure function can stay I/O-free.
+    * **Apply the resolution.** On ``verdict='resolved'``, the
+      entrypoint writes ``resolved_files[]`` back into the worktree
+      as a new commit on the agent branch, then re-enters
+      ``push_and_pr`` — which will re-fetch + rebase + push.
+    * **Route to terminal.** On ``verdict='unresolvable'``, the
+      entrypoint advances to ``conflict_unresolvable`` and lets the
+      supervisor tick's ``_find_diagnoser_candidates`` sweep pick it
+      up for a diagnoser recommendation.
+
+    Verdicts:
+
+    * ``RESOLVED`` — conflict resolved, re-enter ``push_and_pr``.
+    * ``UNRESOLVABLE`` (or unrecognized / missing) — route to
+      diagnoser with ``FAILURE_HINT_CONFLICT_UNRESOLVABLE``.
+    """
+    verdict = _verdict(output)
+    if verdict == VERDICT_RESOLVED:
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE,
+            next_phase=PHASE_PUSH_AND_PR,
+            reason="fix_conflict RESOLVED",
+            context={
+                "resolution_notes": (output or {}).get("resolution_notes"),
+                "resolved_files_count": len((output or {}).get("resolved_files") or []),
+            },
+        )
+    # UNRESOLVABLE, budget_exhausted, or any unrecognized verdict —
+    # route to the diagnoser for retry_with_hint / AC_INFEASIBLE.
+    return PhaseTransition(
+        action=TransitionAction.ROUTE_TO_DIAGNOSER,
+        failure_hint=FAILURE_HINT_CONFLICT_UNRESOLVABLE,
+        reason=f"fix_conflict non-resolved verdict: {verdict or '(missing)'}",
+        context={
+            "verdict": verdict,
+            "resolution_notes": (output or {}).get("resolution_notes"),
+            "budget_exhausted": bool((output or {}).get("budget_exhausted")),
+            "conflict_files": (output or {}).get("conflict_files") or [],
         },
     )
 
@@ -866,6 +1003,7 @@ _VERDICT_DRIVEN_TRANSITIONS: dict[
     PHASE_SUMMARY: transition_from_summary,
     PHASE_PUSH_AND_PR: transition_from_push_and_pr,
     PHASE_FIX_CI: transition_from_fix_ci,
+    PHASE_FIX_CONFLICT: transition_from_fix_conflict,
     PHASE_VERIFY: transition_from_verify,
 }
 
@@ -940,6 +1078,7 @@ ACTIVE_PHASES: frozenset[str] = frozenset(
         PHASE_PUSH_AND_PR,
         PHASE_AWAITING_CI,
         PHASE_FIX_CI,
+        PHASE_FIX_CONFLICT,
         PHASE_MERGE,
         PHASE_AWAITING_DEPLOY,
         PHASE_VERIFY,
@@ -967,6 +1106,7 @@ __all__ = [
     "PHASE_PUSH_AND_PR",
     "PHASE_AWAITING_CI",
     "PHASE_FIX_CI",
+    "PHASE_FIX_CONFLICT",
     "PHASE_MERGE",
     "PHASE_AWAITING_DEPLOY",
     "PHASE_VERIFY",
@@ -986,6 +1126,7 @@ __all__ = [
     "PHASE_MERGE_FAILED",
     "PHASE_AWAITING_DEPLOY_FAILED",
     "PHASE_AWAITING_DEPLOY_TIMEOUT",
+    "PHASE_CONFLICT_UNRESOLVABLE",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",
@@ -995,6 +1136,8 @@ __all__ = [
     "VERDICT_FAILED",
     "VERDICT_VERIFIED",
     "VERDICT_SKIPPED",
+    "VERDICT_RESOLVED",
+    "VERDICT_UNRESOLVABLE",
     # Status
     "AgentStatus",
     "TERMINAL_STATUSES",
@@ -1007,6 +1150,7 @@ __all__ = [
     "FAILURE_HINT_FIX_CI_BLOCKED",
     "FAILURE_HINT_VERIFY_FAILED_POST_MERGE",
     "FAILURE_HINT_PLAN_BLOCKED",
+    "FAILURE_HINT_CONFLICT_UNRESOLVABLE",
     # Transition dataclass + enum
     "PhaseTransition",
     "TransitionAction",
@@ -1017,6 +1161,7 @@ __all__ = [
     "transition_from_push_and_pr",
     "transition_from_awaiting_ci",
     "transition_from_fix_ci",
+    "transition_from_fix_conflict",
     "transition_from_merge",
     "transition_from_awaiting_deploy",
     "transition_from_verify",

@@ -529,6 +529,163 @@ class TestTransitionFromFixCi:
 
 
 # --------------------------------------------------------------------------
+# transition_from_fix_conflict (#3225)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromFixConflict:
+    """Fix-conflict transitions (#3225): RESOLVED re-enters push_and_pr, UNRESOLVABLE routes to diagnoser."""
+
+    def test_resolved_advances_to_push_and_pr(self) -> None:
+        result = pt.transition_from_fix_conflict(
+            {
+                "verdict": "resolved",
+                "resolution_notes": "reconciled 2 hunks against main's refactor",
+                "resolved_files": [
+                    {"path": "packages/web/app/a.tsx", "content": "..."},
+                    {"path": "packages/web/app/b.tsx", "content": "..."},
+                ],
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_PUSH_AND_PR
+        assert result.context["resolved_files_count"] == 2
+        assert (
+            result.context["resolution_notes"]
+            == "reconciled 2 hunks against main's refactor"
+        )
+
+    def test_resolved_uppercase_still_matches(self) -> None:
+        # Verdict matching is case-insensitive via str.upper() — skill
+        # emits lowercase, daemon constants are upper.
+        result = pt.transition_from_fix_conflict({"verdict": "RESOLVED"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_PUSH_AND_PR
+
+    def test_unresolvable_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_fix_conflict(
+            {
+                "verdict": "unresolvable",
+                "resolution_notes": "function X was rewritten on main",
+                "conflict_files": ["packages/api/src/x.py"],
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_CONFLICT_UNRESOLVABLE
+        assert result.context["verdict"] == "UNRESOLVABLE"
+        assert result.context["resolution_notes"] == "function X was rewritten on main"
+        assert result.context["conflict_files"] == ["packages/api/src/x.py"]
+        assert result.context["budget_exhausted"] is False
+
+    def test_budget_exhausted_routes_to_diagnoser(self) -> None:
+        # Entrypoint emits this shape when merge_conflict_attempts >=
+        # FIX_CONFLICT_MAX_ATTEMPTS — no claude was invoked. The
+        # transition still routes to diagnoser; the budget_exhausted
+        # flag propagates via context so the diagnoser can distinguish
+        # "we never tried" from "we tried and failed semantically".
+        result = pt.transition_from_fix_conflict(
+            {
+                "verdict": "unresolvable",
+                "resolution_notes": "budget exhausted after 2 attempts",
+                "budget_exhausted": True,
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_CONFLICT_UNRESOLVABLE
+        assert result.context["budget_exhausted"] is True
+
+    def test_missing_verdict_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_fix_conflict({})
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_CONFLICT_UNRESOLVABLE
+        assert result.context["verdict"] == ""
+
+    def test_none_output_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_fix_conflict(None)
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_CONFLICT_UNRESOLVABLE
+
+
+# --------------------------------------------------------------------------
+# transition_from_push_and_pr — rebase_failed branch (#3225)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromPushAndPrRebaseConflict:
+    """#3225: push_and_pr emits rebase_failed → advance to fix_conflict."""
+
+    def test_rebase_failed_advances_to_fix_conflict(self) -> None:
+        result = pt.transition_from_push_and_pr(
+            {
+                "rebase_failed": True,
+                "conflict_files": [
+                    "packages/web/app/(main)/admin/dispatcher/a.tsx",
+                    "packages/web/app/(main)/admin/dispatcher/b.tsx",
+                ],
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_FIX_CONFLICT
+        assert result.context["conflict_files"] == [
+            "packages/web/app/(main)/admin/dispatcher/a.tsx",
+            "packages/web/app/(main)/admin/dispatcher/b.tsx",
+        ]
+        assert result.context["source_phase"] == "push_and_pr"
+
+    def test_rebase_failed_takes_precedence_over_no_op(self) -> None:
+        # Defensive — if the entrypoint somehow emits both (shouldn't
+        # happen, but paranoia is cheap here), the no-op SHIP terminal
+        # wins because it signals "ralph had no changes" which is
+        # incompatible with "rebase conflicted on changes".
+        result = pt.transition_from_push_and_pr({"rebase_failed": True, "no_op": True})
+        # no_op wins (ordered check).
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_NO_OP
+
+    def test_missing_rebase_failed_advances_normally(self) -> None:
+        result = pt.transition_from_push_and_pr({"pr_number": 4242})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_AWAITING_CI
+
+
+# --------------------------------------------------------------------------
+# transition_from_ralph — rebase_failed branch (#3225 secondary mitigation)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromRalphBaselineRebaseConflict:
+    """#3225: start-of-ralph baseline rebase failure → fix_conflict."""
+
+    def test_rebase_failed_short_circuits_verdict_check(self) -> None:
+        # The entrypoint emits rebase_failed BEFORE any claude
+        # iterations ran, so there is no verdict field yet. Transition
+        # must still advance to fix_conflict rather than falling into
+        # the RALPH_NOT_SHIP diagnoser branch.
+        result = pt.transition_from_ralph(
+            {"rebase_failed": True, "conflict_files": ["x.py", "y.py"]}
+        )
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_FIX_CONFLICT
+        assert result.context["conflict_files"] == ["x.py", "y.py"]
+        assert result.context["source_phase"] == "ralph"
+
+    def test_rebase_failed_beats_verdict(self) -> None:
+        # Even if a verdict is somehow present alongside rebase_failed,
+        # the rebase-failure takes precedence — the claude iterations
+        # never actually executed, so any verdict would be stale.
+        result = pt.transition_from_ralph({"rebase_failed": True, "verdict": "SHIP"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_FIX_CONFLICT
+
+    def test_no_rebase_failed_advances_via_verdict(self) -> None:
+        # Sanity check: pre-existing SHIP behaviour is preserved when
+        # rebase_failed is absent.
+        result = pt.transition_from_ralph({"verdict": "SHIP"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_SUMMARY
+
+
+# --------------------------------------------------------------------------
 # transition_from_merge
 # --------------------------------------------------------------------------
 
@@ -674,6 +831,22 @@ class TestNextPhaseFromVerdict:
         result = pt.next_phase_from_verdict(pt.PHASE_FIX_CI, {"verdict": "PATCHED"})
         assert result.next_phase == pt.PHASE_AWAITING_CI
 
+    def test_dispatches_fix_conflict_correctly(self) -> None:
+        """#3225 — fix_conflict is dispatch-table wired for RESOLVED."""
+        result = pt.next_phase_from_verdict(
+            pt.PHASE_FIX_CONFLICT, {"verdict": "resolved"}
+        )
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_PUSH_AND_PR
+
+    def test_dispatches_fix_conflict_unresolvable(self) -> None:
+        result = pt.next_phase_from_verdict(
+            pt.PHASE_FIX_CONFLICT,
+            {"verdict": "unresolvable", "resolution_notes": "reason"},
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_CONFLICT_UNRESOLVABLE
+
     def test_dispatches_verify_correctly(self) -> None:
         result = pt.next_phase_from_verdict(pt.PHASE_VERIFY, {"verdict": "VERIFIED"})
         assert result.next_phase == pt.PHASE_DONE
@@ -716,6 +889,14 @@ class TestTerminalPhaseAndStatus:
         assert pt.is_terminal_phase(pt.PHASE_AWAITING_DEPLOY_FAILED) is True
         assert pt.is_terminal_phase(pt.PHASE_AWAITING_DEPLOY_TIMEOUT) is True
 
+    def test_is_terminal_phase_true_for_conflict_unresolvable(self) -> None:
+        """#3225 — fix_conflict budget-exhausted / unresolvable terminal."""
+        assert pt.is_terminal_phase(pt.PHASE_CONFLICT_UNRESOLVABLE) is True
+
+    def test_fix_conflict_is_intermediate_not_terminal(self) -> None:
+        """#3225 — fix_conflict is active, not terminal (it advances)."""
+        assert pt.is_terminal_phase(pt.PHASE_FIX_CONFLICT) is False
+
     def test_is_terminal_phase_false_for_intermediate(self) -> None:
         assert pt.is_terminal_phase(pt.PHASE_PLANNING) is False
         assert pt.is_terminal_phase(pt.PHASE_RALPH) is False
@@ -755,6 +936,7 @@ class TestTerminalPhaseAndStatus:
             pt.PHASE_PUSH_AND_PR,
             pt.PHASE_AWAITING_CI,
             pt.PHASE_FIX_CI,
+            pt.PHASE_FIX_CONFLICT,  # #3225
             pt.PHASE_MERGE,
             pt.PHASE_AWAITING_DEPLOY,
             pt.PHASE_VERIFY,
@@ -762,6 +944,7 @@ class TestTerminalPhaseAndStatus:
             pt.PHASE_DONE,
             pt.PHASE_RETRO_DONE,
             pt.PHASE_PLAN_BLOCKED,
+            pt.PHASE_CONFLICT_UNRESOLVABLE,  # #3225
         ):
             assert pt.is_known_phase(phase), f"{phase!r} should be known"
 
