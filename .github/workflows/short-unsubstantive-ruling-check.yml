@@ -1,0 +1,320 @@
+name: Short-Unsubstantive Ruling Check
+
+on:
+  schedule:
+    # Hourly at :20 — offset from data-quality (:15) and api-error (:45)
+    # so schedules do not collide. Rulings are scraped daily, so hourly
+    # is more than enough to catch a new wave of short unsubstantive rows.
+    - cron: '20 * * * *'
+  # Allow manual trigger for debugging / issue verification.
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Breach threshold per county (default: 5)"
+        required: false
+        type: string
+      county:
+        description: "Limit the check to a specific county"
+        required: false
+        type: string
+
+# Only one check at a time.
+concurrency:
+  group: short-unsubstantive-ruling-check
+  cancel-in-progress: true
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  short-unsubstantive-check:
+    name: Detect counties with short unsubstantive rulings
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/check-short-unsubstantive-rulings.py
+            scripts/ecs-run-task.sh
+            scripts/ecs-logs.sh
+            scripts/notify-telegram.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build script arguments
+        id: args
+        run: |
+          ARGS="--json --persist-metrics"
+          if [ -n "${{ inputs.threshold }}" ]; then
+            ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+          fi
+          if [ -n "${{ inputs.county }}" ]; then
+            ARGS="$ARGS --county ${{ inputs.county }}"
+          fi
+          echo "script_args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Run short-unsubstantive check on ECS
+        id: check
+        env:
+          SCRIPT_ARGS: ${{ steps.args.outputs.script_args }}
+        run: |
+          # Run on ECS so the script has DATABASE_URL injected from Secrets
+          # Manager and can reach the private VPC. Use --cpu 256/--memory 512
+          # since this is a lightweight SQL-only check.
+          set +e
+          scripts/ecs-run-task.sh \
+            --cpu 256 --memory 512 \
+            --timeout 300 \
+            --latest-image \
+            scripts/check-short-unsubstantive-rulings.py -- $SCRIPT_ARGS 2>&1 \
+            | tee /tmp/check_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          # Extract the JSON portion from the mixed ECS log output. The
+          # script prints a single JSON blob to stdout; ECS task wrapper
+          # adds surrounding logs. We grep the first line that starts with
+          # "{" and read until the matching closing brace at column 0.
+          python3 - <<'PY'
+          import json, re, sys
+          text = open("/tmp/check_output.txt").read()
+          # Extract JSON blocks (greedy, starting with "{" at col 0, ending
+          # with "}" at col 0). Take the last matching block — the script
+          # output is the last JSON the ECS wrapper printed.
+          matches = re.findall(r"(?ms)^\{\n.*?^\}", text)
+          if not matches:
+              print("Could not find JSON block in output; assuming healthy.")
+              open("/tmp/check_json.txt", "w").write(
+                  '{"healthy": true, "breaches": [], "county_counts": [], "checked_count": 0}'
+              )
+              sys.exit(0)
+          blob = matches[-1]
+          try:
+              json.loads(blob)
+          except Exception as exc:
+              print(f"Parsed JSON block failed to load: {exc}; assuming healthy.")
+              blob = '{"healthy": true, "breaches": [], "county_counts": [], "checked_count": 0}'
+          open("/tmp/check_json.txt", "w").write(blob)
+          PY
+
+          HEALTHY=$(python3 -c "import json; print(json.load(open('/tmp/check_json.txt'))['healthy'])")
+          if [ "$HEALTHY" = "True" ]; then
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "No short-unsubstantive ruling breaches detected."
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "Short-unsubstantive ruling breaches detected (exit code $EXIT_CODE)."
+          fi
+
+      - name: Extract alert summary
+        if: steps.check.outputs.healthy == 'false'
+        id: summary
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          data = json.load(open("/tmp/check_json.txt"))
+          breaches = data.get("breaches", [])
+          lines = [
+              "| County | Count (7d) | Threshold |",
+              "| --- | --- | --- |",
+          ]
+          for b in breaches:
+              lines.append(
+                  "| {county} | {count} | {threshold} |".format(
+                      county=b["county"],
+                      count=b["count"],
+                      threshold=b["threshold"],
+                  )
+              )
+          open("/tmp/alert_summary.md", "w").write("\n".join(lines))
+
+          # Telegram one-liner
+          parts = [
+              f'{b["county"]} ({b["count"]} short unsubstantive rulings in 7d)'
+              for b in breaches
+          ]
+          open("/tmp/alert_telegram.txt", "w").write(
+              "; ".join(parts) if parts else "Unknown alert"
+          )
+          PY
+
+          echo "Alert summary:"
+          cat /tmp/alert_summary.md
+
+      - name: Check for existing open issue
+        if: steps.check.outputs.healthy == 'false'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "short-unsubstantive-ruling-alert" \
+            --json number \
+            --limit 1 \
+            -q '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Open short-unsubstantive-ruling-alert issue already exists: #${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create failure issue
+        id: create-issue
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "## Short-Unsubstantive Ruling Alert"
+            echo ""
+            echo "One or more counties have more than the threshold number of"
+            echo "rulings in the last 7 days with \`char_length(ruling_text) < 200\`,"
+            echo "\`motion IS NULL\`, and \`outcome IS NULL\`."
+            echo "These rulings slipped past the extraction pipeline without"
+            echo "useful structured fields."
+            echo ""
+            echo "### Breaches"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "### Context"
+            echo ""
+            echo "- **Workflow run:** ${RUN_URL}"
+            echo "- **Timestamp:** ${TIMESTAMP}"
+            echo "- **Check script:** \`scripts/check-short-unsubstantive-rulings.py\`"
+            echo ""
+            echo "### Next Steps"
+            echo ""
+            echo "1. Sample the short rulings for the affected county:"
+            echo "   \`\`\`sql"
+            echo "   SELECT ruling_date, county, char_length(ruling_text), ruling_text"
+            echo "   FROM derived.rulings"
+            echo "   WHERE char_length(ruling_text) < 200"
+            echo "     AND motion IS NULL"
+            echo "     AND outcome IS NULL"
+            echo "     AND ruling_date > NOW() - INTERVAL '7 days'"
+            echo "   ORDER BY county, ruling_date DESC"
+            echo "   LIMIT 20;"
+            echo "   \`\`\`"
+            echo "2. Check whether the originating court HTML changed format"
+            echo "   (the filter \`_drop_short_unsubstantive_rulings\` in"
+            echo "   \`llm_extractor.py\` logs filtered rows)."
+            echo "3. If extraction is failing, file a \`priority/p1\` bug"
+            echo "   against the affected scraper."
+            echo ""
+            echo "This issue was created automatically by the short-unsubstantive"
+            echo "ruling check workflow. It will not create duplicates while this"
+            echo "issue is open."
+          } > /tmp/issue_body.md
+
+          ISSUE_URL=$(gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Short-unsubstantive ruling alert: extraction quality degraded" \
+            --body-file /tmp/issue_body.md \
+            --label "priority/p1,area/scraping,short-unsubstantive-ruling-alert,agent/ready")
+
+          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        if: steps.create-issue.outputs.created == 'true'
+        continue-on-error: true
+        run: |
+          ISSUE_URL="${{ steps.create-issue.outputs.issue_url }}"
+          ISSUE_NUM="${ISSUE_URL##*/}"
+          TG_SUMMARY=$(cat /tmp/alert_telegram.txt 2>/dev/null || echo "Alert details unavailable.")
+
+          {
+            echo "<b>Short-Unsubstantive Ruling Alert</b>"
+            echo ""
+            echo "${TG_SUMMARY}"
+            echo ""
+            echo "Issue #${ISSUE_NUM}: ${ISSUE_URL}"
+          } > /tmp/tg_message.txt
+
+          scripts/notify-telegram.sh --message-file /tmp/tg_message.txt
+
+      - name: Update existing issue with new failures
+        if: >-
+          steps.check.outputs.healthy == 'false' &&
+          steps.existing.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.existing.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          {
+            echo "### Update: still in breach at ${TIMESTAMP}"
+            echo ""
+            cat /tmp/alert_summary.md
+            echo ""
+            echo ""
+            echo "**Workflow run:** ${RUN_URL}"
+          } > /tmp/comment_body.md
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/comment_body.md
+
+      - name: Auto-close resolved issues
+        if: steps.check.outputs.healthy == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label "short-unsubstantive-ruling-alert" \
+            --json number \
+            -q '.[].number')
+
+          if [ -z "$ISSUES" ]; then
+            echo "No open short-unsubstantive-ruling-alert issues to close."
+            exit 0
+          fi
+
+          for ISSUE_NUM in $ISSUES; do
+            echo "Closing issue #${ISSUE_NUM} — no active breach."
+
+            {
+              echo "No counties are currently in a short-unsubstantive ruling breach. Auto-closing."
+              echo ""
+              echo "**Passing workflow run:** ${RUN_URL}"
+            } > /tmp/close_comment.md
+
+            gh issue comment "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/close_comment.md
+
+            gh issue close "$ISSUE_NUM" \
+              --repo "${{ github.repository }}" \
+              --reason completed
+          done
