@@ -11664,6 +11664,7 @@ class DispatcherDaemon:
             phase="awaiting_ci",
             exit_code=None,
             pr_number=pr_number,
+            issue_number=issue_number,
         )
 
     @staticmethod
