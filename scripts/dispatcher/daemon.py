@@ -896,6 +896,19 @@ TERMINAL_AGENT_STATUSES: frozenset[str] = frozenset(
     {"succeeded", "failed", "crashed", "plan_blocked", "needs_review"}
 )
 
+#: Subset of :data:`TERMINAL_AGENT_STATUSES` that count as a
+#: *correct* outcome for retry-effectiveness classification written to
+#: ``dispatcher.diagnoses.outcome``.  A retry that resolves to one of
+#: these is recorded as ``retry_outcome='succeeded'`` — meaning the
+#: diagnoser's recommendation led to a desired end-state, regardless of
+#: whether a PR shipped (``succeeded``) or the plan was intentionally
+#: declined (``plan_blocked``) or flagged for operator review
+#: (``needs_review``).  The complement — any terminal status not in
+#: this set — is recorded as ``retry_outcome='failed'``.
+CORRECT_OUTCOME_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "plan_blocked", "needs_review"}
+)
+
 # --------------------------------------------------------------------------
 # Milestone columns on ``dispatcher.agents`` — split the single
 # ``status='succeeded'`` terminal write into four independently-stamped
@@ -7905,13 +7918,12 @@ class DispatcherDaemon:
         done.
         """
         assert self._conn is not None, "connect() must run before update"
-        terminal = status in (
-            "succeeded",
-            "failed",
-            "crashed",
-            "plan_blocked",
-            "needs_review",
-        )
+        if status != "running" and status not in TERMINAL_AGENT_STATUSES:
+            raise AssertionError(
+                f"_mark_agent_terminal got unknown status={status!r}; "
+                f"must be 'running' or in TERMINAL_AGENT_STATUSES"
+            )
+        terminal = status in TERMINAL_AGENT_STATUSES
         # Issue #2913: clear ``failure_summary`` on correct-outcome
         # terminals so a row that previously held a crash message from
         # an earlier iteration (crashed → retry_reset → succeeded) does
@@ -14743,7 +14755,7 @@ class DispatcherDaemon:
         # decisions against the retry-success rate.
         retry_outcome = (
             "succeeded"
-            if final_status in ("succeeded", "plan_blocked", "needs_review")
+            if final_status in CORRECT_OUTCOME_TERMINAL_STATUSES
             else "failed"
         )
         outcome = {
