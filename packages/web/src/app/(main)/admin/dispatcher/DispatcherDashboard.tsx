@@ -13,6 +13,7 @@ import {
   DISPATCHER_STATE_QUERY,
   type DispatcherCommand,
   type DispatcherControlData,
+  type DispatcherQueueKind,
   type DispatcherSetConfigData,
   type DispatcherStateData,
 } from '@/lib/dispatcher-queries';
@@ -24,6 +25,7 @@ import { RecentCompletionsPanel } from './RecentCompletionsPanel';
 import { RecentFailuresPanel } from './RecentFailuresPanel';
 import { ConfigPanel } from './ConfigPanel';
 import { ConfirmDialog, type ConfirmableCommand } from './ConfirmDialog';
+import { QueueFullDialog } from './QueueFullDialog';
 
 /**
  * Polling interval for `dispatcherState`. Per spec §11, the daemon runs on
@@ -109,6 +111,12 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   const [commandError, setCommandError] = useState<string | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [busyConfigKey, setBusyConfigKey] = useState<string | null>(null);
+  // #3159: which expand-count dialog is open (Ready / Blocked / Recently
+  // Completed). Null when no dialog is open. Drives both `<QueueFullDialog>`'s
+  // visibility and the `dispatcherQueueFull` query's `skip` flag — closing
+  // the dialog cancels any in-flight fetch the next time the operator
+  // clicks a count.
+  const [fullDialogKind, setFullDialogKind] = useState<DispatcherQueueKind | null>(null);
 
   const { data, loading, error, refetch } = useQuery<DispatcherStateData>(
     DISPATCHER_STATE_QUERY,
@@ -397,6 +405,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
               <QueueReadyPanel
                 items={state?.queueReady ?? []}
                 total={state?.queueDepth}
+                onCountClick={() => setFullDialogKind('READY')}
               />
             </div>
 
@@ -409,10 +418,12 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
             <div className="flex flex-col gap-6" data-testid="dispatcher-column-right">
               <RecentCompletionsPanel
                 completions={state?.recentCompletions ?? []}
+                onCountClick={() => setFullDialogKind('COMPLETED')}
               />
               <QueueBlockedPanel
                 items={state?.queueBlocked ?? []}
                 total={state?.blockedDepth}
+                onCountClick={() => setFullDialogKind('BLOCKED')}
               />
             </div>
           </div>
@@ -450,6 +461,18 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         capDetail={pendingCommand === LOWER_CAP_CONFIRM ? pendingCap : null}
         onConfirm={handleConfirm}
         onCancel={handleCancel}
+      />
+
+      {/*
+       * #3159: full-list expand dialog for the cockpit's three count
+       * badges. The query inside `QueueFullDialog` is gated on
+       * `kind !== null`, so closing the dialog (ESC, click outside,
+       * X button) cancels future fetches until the operator clicks a
+       * count again.
+       */}
+      <QueueFullDialog
+        kind={fullDialogKind}
+        onClose={() => setFullDialogKind(null)}
       />
     </div>
   );

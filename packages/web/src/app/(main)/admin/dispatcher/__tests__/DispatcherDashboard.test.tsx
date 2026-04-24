@@ -27,17 +27,60 @@ const mockSetConfigMutate = vi.fn().mockResolvedValue({ data: {} });
 const mockRefetch = vi.fn().mockResolvedValue({ data: {} });
 
 let mockQueryData: { dispatcherState?: Record<string, unknown> } | undefined;
+// #3159: separate mock data for the `dispatcherQueueFull` query fired
+// only when the operator opens an expand-count dialog. Keyed by the
+// `kind` variable so the mock can serve READY / BLOCKED / COMPLETED
+// distinctly. Default empty so existing tests don't accidentally render
+// dialog rows.
+const mockQueueFullData: Record<
+  string,
+  { dispatcherQueueFull?: Record<string, unknown> } | undefined
+> = {
+  READY: undefined,
+  BLOCKED: undefined,
+  COMPLETED: undefined,
+};
 
 vi.mock('@apollo/client', async () => {
   const actual = await vi.importActual<typeof import('@apollo/client')>('@apollo/client');
   return {
     ...actual,
-    useQuery: () => ({
-      data: mockQueryData,
-      loading: false,
-      error: undefined,
-      refetch: mockRefetch,
-    }),
+    useQuery: (
+      doc: { definitions?: Array<{ name?: { value?: string } }> },
+      options?: {
+        variables?: { kind?: string };
+        skip?: boolean;
+      },
+    ) => {
+      const opName = doc?.definitions?.[0]?.name?.value ?? '';
+      if (opName === 'DispatcherQueueFull') {
+        // #3159: serve per-kind mock data. When `skip` is true (dialog
+        // closed) Apollo would return `data: undefined`; mirror that
+        // semantic here so tests that don't open the dialog don't see
+        // stray dialog rows.
+        if (options?.skip) {
+          return {
+            data: undefined,
+            loading: false,
+            error: undefined,
+            refetch: mockRefetch,
+          };
+        }
+        const kind = options?.variables?.kind ?? 'READY';
+        return {
+          data: mockQueueFullData[kind],
+          loading: false,
+          error: undefined,
+          refetch: mockRefetch,
+        };
+      }
+      return {
+        data: mockQueryData,
+        loading: false,
+        error: undefined,
+        refetch: mockRefetch,
+      };
+    },
     useMutation: (doc: { definitions?: Array<{ name?: { value?: string } }> }) => {
       const opName = doc?.definitions?.[0]?.name?.value ?? '';
       if (opName === 'DispatcherControl') {
@@ -475,5 +518,104 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
     };
     renderDashboard();
     expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 7');
+  });
+});
+
+describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+    mockQueueFullData.READY = undefined;
+    mockQueueFullData.BLOCKED = undefined;
+    mockQueueFullData.COMPLETED = undefined;
+  });
+
+  it('renders all three count badges as buttons (Ready, Blocked, Recently Completed)', () => {
+    renderDashboard();
+    expect(screen.getByTestId('queue-ready-count').tagName).toBe('BUTTON');
+    expect(screen.getByTestId('queue-blocked-count').tagName).toBe('BUTTON');
+    expect(screen.getByTestId('recent-completions-count').tagName).toBe(
+      'BUTTON',
+    );
+  });
+
+  it('clicking the Ready count opens the dialog with the READY title', async () => {
+    mockQueueFullData.READY = {
+      dispatcherQueueFull: {
+        kind: 'READY',
+        queueItems: [],
+        completions: [],
+      },
+    };
+    renderDashboard();
+    expect(screen.queryByTestId('queue-full-dialog')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('queue-ready-count'));
+    const title = await screen.findByTestId('queue-full-dialog-title');
+    expect(title.textContent).toMatch(/agent-ready queue/i);
+  });
+
+  it('clicking the Blocked count opens the dialog with the BLOCKED title', async () => {
+    mockQueueFullData.BLOCKED = {
+      dispatcherQueueFull: {
+        kind: 'BLOCKED',
+        queueItems: [],
+        completions: [],
+      },
+    };
+    renderDashboard();
+    fireEvent.click(screen.getByTestId('queue-blocked-count'));
+    const title = await screen.findByTestId('queue-full-dialog-title');
+    expect(title.textContent).toMatch(/blocked queue/i);
+  });
+
+  it('clicking the Recently Completed count opens the dialog with the COMPLETED title', async () => {
+    mockQueueFullData.COMPLETED = {
+      dispatcherQueueFull: {
+        kind: 'COMPLETED',
+        queueItems: [],
+        completions: [],
+      },
+    };
+    renderDashboard();
+    fireEvent.click(screen.getByTestId('recent-completions-count'));
+    const title = await screen.findByTestId('queue-full-dialog-title');
+    expect(title.textContent).toMatch(/recently completed/i);
+  });
+
+  it('dialog does NOT open by default and does NOT prefetch on mount', () => {
+    renderDashboard();
+    // No dialog DOM, no list rendered.
+    expect(screen.queryByTestId('queue-full-dialog')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('queue-full-dialog-list')).not.toBeInTheDocument();
+  });
+
+  it('dialog renders the full list with no 10-cap (READY, 25 items)', async () => {
+    const items = Array.from({ length: 25 }, (_, i) => ({
+      issueNumber: 9000 + i,
+      title: `issue ${9000 + i}`,
+      priority: 'p2',
+      labels: ['priority/p2', 'agent/ready'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [],
+      cooldownSecondsRemaining: null,
+    }));
+    mockQueueFullData.READY = {
+      dispatcherQueueFull: {
+        kind: 'READY',
+        queueItems: items,
+        completions: [],
+      },
+    };
+    renderDashboard();
+    fireEvent.click(screen.getByTestId('queue-ready-count'));
+    await screen.findByTestId('queue-full-dialog-list');
+    // 25 issue links rendered — well past the 10-cap.
+    for (const it of items) {
+      expect(
+        screen.getByTestId(`issue-link-${it.issueNumber}`),
+      ).toBeInTheDocument();
+    }
   });
 });

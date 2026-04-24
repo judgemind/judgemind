@@ -96,6 +96,51 @@ export const DISPATCHER_STATE_QUERY = gql`
   }
 `;
 
+/**
+ * Full-list payload for the cockpit's expand-count dialogs (issue #3159).
+ * Fired only on dialog open — NOT in the 2s `dispatcherState` poll path.
+ * The server resolves this from the same snapshot tables as the capped
+ * `DispatcherState` panels (`dispatcher.queue_snapshots` /
+ * `dispatcher.blocked_snapshots` / `dispatcher.agents`), so opening the
+ * dialog adds no GitHub API traffic.
+ *
+ * `kind` arg is required; the response echoes it back so Apollo can
+ * normalize the cache by bucket — see `apollo-client.ts` for the
+ * `keyFields: ['kind']` entry.
+ */
+export const DISPATCHER_QUEUE_FULL_QUERY = gql`
+  query DispatcherQueueFull($kind: DispatcherQueueKind!) {
+    dispatcherQueueFull(kind: $kind) {
+      kind
+      queueItems {
+        issueNumber
+        title
+        priority
+        labels
+        createdAt
+        blockedBy
+        cooldownSecondsRemaining
+      }
+      completions {
+        agentId
+        issueNumber
+        issueTitle
+        priority
+        status
+        endedAt
+        prNumber
+        totalTokens
+        totalCostUsd
+        failureSummary
+        mergedAt
+        verifiedAt
+        verifySkipReason
+        retroedAt
+      }
+    }
+  }
+`;
+
 export const DISPATCHER_CONTROL_MUTATION = gql`
   mutation DispatcherControl($command: DispatcherCommand!, $payload: JSON) {
     dispatcherControl(command: $command, payload: $payload) {
@@ -320,4 +365,25 @@ export interface DispatcherCommandResult {
 
 export interface DispatcherControlData {
   dispatcherControl: DispatcherCommandResult;
+}
+
+/**
+ * Bucket selector for `dispatcherQueueFull` (issue #3159). Mirrors the
+ * `DispatcherQueueKind` enum in the API schema.
+ */
+export type DispatcherQueueKind = 'READY' | 'BLOCKED' | 'COMPLETED';
+
+/**
+ * Result type for `dispatcherQueueFull` (issue #3159). Exactly one of
+ * `queueItems` (READY / BLOCKED) or `completions` (COMPLETED) is
+ * populated per request — the other is empty.
+ */
+export interface DispatcherQueueFull {
+  kind: DispatcherQueueKind;
+  queueItems: QueueItem[];
+  completions: RecentCompletion[];
+}
+
+export interface DispatcherQueueFullData {
+  dispatcherQueueFull: DispatcherQueueFull;
 }

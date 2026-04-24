@@ -14,6 +14,15 @@ interface RecentCompletionsPanelProps {
    * row falls back to `Date.now()` at render time.
    */
   nowMs?: number;
+  /**
+   * When provided, the count label in the panel header becomes a
+   * clickable button that triggers this callback. The cockpit
+   * dashboard wires this to open the full-list dialog (issue #3159).
+   * When omitted, the count renders as the existing inline parenthesised
+   * count — preserves back-compat for tests and any caller that hasn't
+   * wired up the dialog.
+   */
+  onCountClick?: () => void;
 }
 
 /**
@@ -56,13 +65,32 @@ interface RecentCompletionsPanelProps {
 export function RecentCompletionsPanel({
   completions,
   nowMs,
+  onCountClick,
 }: RecentCompletionsPanelProps) {
+  // #3159: when a click handler is provided, surface a separate
+  // clickable count badge (matching the QueuePanel pattern) so the
+  // operator has a consistent expand-affordance across all three
+  // bottom-row panels. The legacy inline `({n})` rendering is preserved
+  // for back-compat when no handler is wired (existing test fixtures
+  // and any non-cockpit caller).
+  const countText = String(completions.length);
   return (
     <section aria-labelledby="recent-completions-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
         <h2 id="recent-completions-heading" className={SECTION_HEADING}>
-          Recently completed ({completions.length})
+          {onCountClick ? 'Recently completed' : `Recently completed (${countText})`}
         </h2>
+        {onCountClick && (
+          <button
+            type="button"
+            onClick={onCountClick}
+            data-testid="recent-completions-count"
+            aria-label={`Show full recent-completions list (${countText})`}
+            className="font-mono text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm cursor-pointer"
+          >
+            {countText}
+          </button>
+        )}
       </div>
       {completions.length === 0 ? (
         <p className="py-2 text-sm text-muted-foreground">
@@ -83,7 +111,12 @@ export function RecentCompletionsPanel({
   );
 }
 
-function RecentCompletionRow({
+/**
+ * One row in the Recently Completed panel. Exported so the full-list
+ * dialog (`QueueFullDialog`, issue #3159) can render the same row layout
+ * without duplicating the markup.
+ */
+export function RecentCompletionRow({
   completion,
   nowMs,
 }: {

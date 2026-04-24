@@ -32,6 +32,16 @@ const FAILED_AGENT_COOLDOWN_SECONDS = parseInt(
 );
 
 /**
+ * Hard upper bound for `dispatcherQueueFull` — the cockpit dialog reads
+ * the entire snapshot, but we cap at 1000 so a runaway snapshot (e.g. an
+ * unbounded daemon scrape) can't OOM the resolver. In practice the
+ * `agent/ready` and `status/blocked` open-issue lists are <100 (issue
+ * #3159 expects ~83 max). Same cap applies to the recent-completions
+ * lookup. Issue #3159.
+ */
+const DISPATCHER_QUEUE_FULL_LIMIT = 1000;
+
+/**
  * Shape of a single entry in the enrichment JSON the daemon writes
  * into ``dispatcher.queue_snapshots.issues_json`` /
  * ``dispatcher.blocked_snapshots.issues_json`` (issue #2820). Must
@@ -958,6 +968,57 @@ export const dispatcherResolvers = {
       requireDispatcherAdmin(user);
       const row = await queryAgent(pool, agentId);
       return row ? agentRowToGraphQL(row) : null;
+    },
+
+    /**
+     * Full-list payload for the cockpit's expand-count dialogs (issue
+     * #3159). One request returns every item in the requested bucket —
+     * no 10-cap. Reads exclusively from the same snapshot tables as the
+     * capped `DispatcherState` fields, so there are no GitHub API calls
+     * and no risk of fanning the API container's PAT budget.
+     *
+     * Implementation reuses `queryQueueReady` / `queryQueueBlocked` /
+     * `queryRecentCompletions` with a deliberately loose cap
+     * (`DISPATCHER_QUEUE_FULL_LIMIT`). The snapshot tables hold "open
+     * issues observed by the daemon's last scan" so the absolute upper
+     * bound is the open-issue count — typically <100, hard-capped here
+     * at 1000 so a runaway snapshot can't OOM the response.
+     *
+     * Routed by `kind`:
+     *   - READY → `queueItems` populated from queue_snapshots, completions empty.
+     *   - BLOCKED → `queueItems` populated from blocked_snapshots, completions empty.
+     *   - COMPLETED → `completions` populated from agents, queueItems empty.
+     */
+    dispatcherQueueFull: async (
+      _: unknown,
+      { kind }: { kind: 'READY' | 'BLOCKED' | 'COMPLETED' },
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      if (kind === 'READY') {
+        const queueItems = await queryQueueReady(
+          pool,
+          DISPATCHER_QUEUE_FULL_LIMIT,
+        );
+        return { kind, queueItems, completions: [] };
+      }
+      if (kind === 'BLOCKED') {
+        const queueItems = await queryQueueBlocked(
+          pool,
+          DISPATCHER_QUEUE_FULL_LIMIT,
+        );
+        return { kind, queueItems, completions: [] };
+      }
+      // COMPLETED
+      const rows = await queryRecentCompletions(
+        pool,
+        DISPATCHER_QUEUE_FULL_LIMIT,
+      );
+      return {
+        kind,
+        queueItems: [],
+        completions: recentCompletionsToGraphQL(rows),
+      };
     },
   },
 
