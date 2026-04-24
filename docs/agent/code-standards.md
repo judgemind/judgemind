@@ -137,6 +137,8 @@ npm test             # Vitest
 
 For `packages/web/`, also run `npm run build`. The same diff coverage and floor ratchet gates apply to TypeScript packages (CI reads `lcov.info`).
 
+`packages/web/` also has `npm run check` — covers hardcoded-colors, apollo-keyfields, and graphql-queries, the CI hygiene guards that fail fast. Run it before pushing large frontend changes.
+
 ### Terraform (from `infra/terraform/`)
 
 ```

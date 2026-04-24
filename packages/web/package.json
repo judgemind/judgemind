@@ -11,7 +11,8 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "check": "bash ../../scripts/check-hardcoded-colors.sh && bash ../../scripts/check-apollo-keyfields.sh && bash ../../scripts/check-graphql-queries.sh"
   },
   "dependencies": {
     "@apollo/client": "^3.9",
