@@ -14,11 +14,10 @@
 # - CloudWatch log group ``/ecs/judgemind-dispatcher-agent-runner-<env>``.
 # - Execution role (ECR pull + log writes + secret fetches).
 # - Task role (narrow: Secrets Manager read on DATABASE_URL + GitHub
-#   PAT, CloudWatch log writes into the agent-runner log group only).
-#   Deliberately does NOT include ``ecs:RunTask`` or ECS Exec / SSM —
-#   the agent-runner is a leaf; it does not spawn further ECS tasks
-#   and operators don't need to shell into running agents (use
-#   CloudWatch log tail instead).
+#   PAT, CloudWatch log writes into the agent-runner log group only,
+#   plus ``ssmmessages:*`` for ECS Exec-based live debugging — #3145).
+#   Deliberately does NOT include ``ecs:RunTask`` — the agent-runner
+#   is a leaf; it does not spawn further ECS tasks.
 # - Security group (outbound HTTPS + Postgres, same egress profile as
 #   the daemon so GitHub / Anthropic / Postgres all reach from inside).
 # - ECS task definition ``judgemind-dispatcher-agent-runner-<env>``
@@ -138,6 +137,12 @@ resource "aws_iam_role_policy" "execution_secrets" {
 #     (the container may re-read these during long-running phases).
 #   * CloudWatch `logs:PutLogEvents` on the agent-runner log group
 #     only (narrower than the daemon's wildcard).
+#   * ECS Exec (``ssmmessages:*``) — operators need live interactive
+#     inspection of a running agent (worktree contents, claude
+#     stdout/stderr files, git log, process tree) when CloudWatch tail
+#     isn't enough. See #3145. Mirrors the dispatcher-daemon task role
+#     (``infra/terraform/modules/dispatcher-daemon/main.tf``
+#     ``task_ecs_exec_ssm``).
 #
 # What it deliberately does NOT have:
 #
@@ -145,10 +150,6 @@ resource "aws_iam_role_policy" "execution_secrets" {
 #     not spawn further ECS tasks. Granting RunTask would let a
 #     compromised agent kick off its own children (or arbitrary other
 #     task definitions).
-#   * ECS Exec (``ssmmessages:*``) — operators tail CloudWatch logs
-#     instead of shelling into a running agent. If exec access is ever
-#     needed for an incident, the operator can temporarily attach a
-#     policy out-of-band.
 #   * CloudWatch PutMetricData — the daemon emits agent metrics (Stage
 #     2+); the agent-runner itself is metered via phase_outputs rows,
 #     not directly.
@@ -207,6 +208,40 @@ resource "aws_iam_role_policy" "task_log_writes" {
         # only log destination is its own group.
         Resource = "${aws_cloudwatch_log_group.agent_runner.arn}:*"
       }
+    ]
+  })
+}
+
+# ─── IAM: ECS Exec (ssmmessages) ───────────────────────────────────────────
+#
+# Required for ``aws ecs execute-command`` to shell into a running
+# agent-runner task for live debugging (#3145). The task-def also sets
+# ``enable_execute_command = true`` below, which + this policy + the
+# per-RunTask ``enableExecuteCommand`` flag in ``daemon.py`` together
+# enable the ECS Exec data plane end-to-end.
+#
+# Mirrors the dispatcher-daemon ``task_ecs_exec_ssm`` policy. The
+# ``ssmmessages`` actions require ``Resource = "*"`` because the SSM
+# session is created dynamically per-exec-invocation.
+
+resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
+  name = "${local.task_family}-task-ecs-exec-ssm"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowECSExec"
+        Effect = "Allow"
+        Action = [
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
+        ]
+        Resource = "*"
+      },
     ]
   })
 }

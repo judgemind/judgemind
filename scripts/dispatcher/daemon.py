@@ -18014,6 +18014,15 @@ class DispatcherDaemon:
                     networkConfiguration=network_configuration,
                     tags=tags,
                     propagateTags="TASK_DEFINITION",
+                    # ECS Exec: operators need to shell into a running
+                    # agent-runner for live debugging of stuck / long-
+                    # running phases (#3145). ``enableExecuteCommand``
+                    # is a per-RunTask flag — it is NOT a task-def
+                    # attribute in the AWS API. The task role's
+                    # ``ssmmessages:*`` policy (set in the
+                    # dispatcher-agent-runner terraform module) is the
+                    # IAM half; this flag is the data-plane half.
+                    enableExecuteCommand=True,
                 )
             except Exception as exc:  # noqa: BLE001 — classified below
                 last_exc = exc

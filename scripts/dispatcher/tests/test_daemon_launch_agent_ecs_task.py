@@ -154,6 +154,9 @@ class TestLaunchAgentECSTaskHappyPath:
         tag_map = {t["key"]: t["value"] for t in call_kwargs["tags"]}
         assert tag_map["agent_id"] == "agent-1"
         assert tag_map["issue_number"] == "42"
+        # ECS Exec enabled per-invocation (#3145) — operators need to
+        # shell into a running agent-runner for live debugging.
+        assert call_kwargs["enableExecuteCommand"] is True
 
     def test_success_persists_task_arn_and_execution_mode(self) -> None:
         d, conn = _make_daemon()
