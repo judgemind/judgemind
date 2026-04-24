@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { notFound } from 'next/navigation';
-import { useMutation, useQuery } from '@apollo/client';
+import { useMutation } from '@apollo/client';
 import { useAuth } from '@/providers/AuthProvider';
 import { ErrorBanner } from '@/components/ErrorBanner';
 import { useViewTransitionUpdate } from '@/hooks/useViewTransition';
@@ -18,6 +18,7 @@ import {
   type DispatcherStateData,
 } from '@/lib/dispatcher-queries';
 import { DispatcherHeader } from './DispatcherHeader';
+import { usePollBackoff } from './usePollBackoff';
 import { DispatcherControls } from './DispatcherControls';
 import { ActiveAgentsTable } from './ActiveAgentsTable';
 import { QueueBlockedPanel, QueueReadyPanel } from './QueuePanel';
@@ -26,12 +27,6 @@ import { RecentFailuresPanel } from './RecentFailuresPanel';
 import { ConfigPanel } from './ConfigPanel';
 import { ConfirmDialog, type ConfirmableCommand } from './ConfirmDialog';
 import { QueueFullDialog } from './QueueFullDialog';
-
-/**
- * Polling interval for `dispatcherState`. Per spec §11, the daemon runs on
- * 30s/2min cadences, so a 2s polling delay is invisible.
- */
-const POLL_INTERVAL_MS = 2000;
 
 /**
  * Sentinel value passed to the `ConfirmDialog` when the operator is
@@ -118,14 +113,11 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   // clicks a count.
   const [fullDialogKind, setFullDialogKind] = useState<DispatcherQueueKind | null>(null);
 
-  const { data, loading, error, refetch } = useQuery<DispatcherStateData>(
-    DISPATCHER_STATE_QUERY,
-    {
-      skip: !authReady,
-      pollInterval: authReady ? POLL_INTERVAL_MS : 0,
-      fetchPolicy: 'cache-and-network',
-    },
-  );
+  const { data, loading, error, isStale, refetch } = usePollBackoff<DispatcherStateData>({
+    query: DISPATCHER_STATE_QUERY,
+    skip: !authReady,
+    fetchPolicy: 'cache-and-network',
+  });
 
   // Magic Move wiring (#2967). Apollo's `useQuery` pushes poll results
   // straight into `data`, but Magic Move needs the DOM mutation to happen
@@ -331,7 +323,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
           <h1 className={PAGE_TITLE}>Dispatcher</h1>
           <DispatcherHeader currentRun={state?.currentRun ?? null} />
-          {error && state && (
+          {isStale && state && (
             <span
               data-testid="dispatcher-stale-indicator"
               role="status"

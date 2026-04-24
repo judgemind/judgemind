@@ -5,6 +5,21 @@ import { formatUptime } from './format-helpers';
 
 type DaemonStatus = 'running' | 'paused' | 'stopped' | 'unhealthy';
 
+/**
+ * Age threshold (in seconds) after which a daemon run is considered
+ * unhealthy. Lowered from 180s to 90s (#3141) to align with the new
+ * 30s scheduler-tick heartbeat cadence (was 2-min supervisor only).
+ */
+export const UNHEALTHY_AGE_SECONDS = 90;
+
+/**
+ * Returns true when the daemon heartbeat is older than
+ * `UNHEALTHY_AGE_SECONDS`. Exported for unit testing.
+ */
+export function isUnhealthy(seconds: number): boolean {
+  return seconds > UNHEALTHY_AGE_SECONDS;
+}
+
 // Per #2805 §2.3 the pill is informational status, not a CTA — kept
 // compact (text-xs) with a subtle colored dot + neutral surround rather
 // than the previous large filled badge. Borderless.
@@ -27,8 +42,9 @@ const STATUS_TEXT: Record<DaemonStatus, string> = {
  *
  * - `null` run → never booted → "stopped"
  * - `stoppedAt` populated → clean shutdown → "stopped"
- * - heartbeat older than 3 minutes (well outside the 2-min supervisor
- *   tick) → "unhealthy"
+ * - heartbeat older than `UNHEALTHY_AGE_SECONDS` (90s, #3141 — lowered
+ *   from 180s now that the 30s scheduler tick also writes the heartbeat)
+ *   → "unhealthy"
  * - otherwise → "running". The daemon pauses via `dispatcher.commands`
  *   without writing a new runs row, so Phase 1 does not distinguish
  *   paused-vs-running from the `runs` table alone. A follow-up will
@@ -43,7 +59,7 @@ export function deriveDaemonStatus(
   const heartbeat = new Date(run.heartbeatTs).getTime();
   if (!Number.isFinite(heartbeat)) return 'unhealthy';
   const ageMs = nowMs - heartbeat;
-  if (ageMs > 3 * 60 * 1000) return 'unhealthy';
+  if (isUnhealthy(ageMs / 1000)) return 'unhealthy';
   return 'running';
 }
 

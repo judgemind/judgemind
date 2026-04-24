@@ -1,8 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { DispatcherHeader, deriveDaemonStatus } from '../DispatcherHeader';
+import { DispatcherHeader, deriveDaemonStatus, isUnhealthy, UNHEALTHY_AGE_SECONDS } from '../DispatcherHeader';
 
 const now = Date.parse('2026-04-18T12:00:00Z');
+
+describe('isUnhealthy', () => {
+  it('returns false for age < UNHEALTHY_AGE_SECONDS (89s)', () => {
+    expect(isUnhealthy(89)).toBe(false);
+  });
+
+  it('returns false at exactly UNHEALTHY_AGE_SECONDS (90s boundary is exclusive)', () => {
+    expect(isUnhealthy(UNHEALTHY_AGE_SECONDS)).toBe(false);
+  });
+
+  it('returns true for age > UNHEALTHY_AGE_SECONDS (91s)', () => {
+    expect(isUnhealthy(91)).toBe(true);
+  });
+
+  it('UNHEALTHY_AGE_SECONDS is 90', () => {
+    expect(UNHEALTHY_AGE_SECONDS).toBe(90);
+  });
+});
 
 describe('deriveDaemonStatus', () => {
   it('null run → stopped', () => {
@@ -22,12 +40,14 @@ describe('deriveDaemonStatus', () => {
     expect(deriveDaemonStatus(run, now)).toBe('stopped');
   });
 
-  it('stale heartbeat → unhealthy', () => {
+  it('stale heartbeat (91s old) → unhealthy at 90s threshold', () => {
+    // 91 seconds before now = 11:58:29Z
+    const heartbeatTs = new Date(now - 91 * 1000).toISOString();
     const run = {
       runId: 'r',
       startedAt: '2026-04-18T00:00:00Z',
       stoppedAt: null,
-      heartbeatTs: '2026-04-18T11:50:00Z',
+      heartbeatTs,
       versionSha: 'deadbeef',
       host: 'h',
       pid: 1,
@@ -35,12 +55,14 @@ describe('deriveDaemonStatus', () => {
     expect(deriveDaemonStatus(run, now)).toBe('unhealthy');
   });
 
-  it('fresh heartbeat → running', () => {
+  it('fresh heartbeat (89s old) → running at 90s threshold', () => {
+    // 89 seconds before now = 11:58:31Z
+    const heartbeatTs = new Date(now - 89 * 1000).toISOString();
     const run = {
       runId: 'r',
       startedAt: '2026-04-18T00:00:00Z',
       stoppedAt: null,
-      heartbeatTs: '2026-04-18T11:59:30Z',
+      heartbeatTs,
       versionSha: 'deadbeef',
       host: 'h',
       pid: 1,

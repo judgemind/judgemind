@@ -29,6 +29,9 @@ let mockQueryResult: {
 let mockMutationFn: ReturnType<typeof vi.fn>;
 let mockMutationLoading: boolean;
 let notFoundCallCount = 0;
+// #3141: isStale flag for usePollBackoff — controlled by tests that need to
+// exercise the stale indicator.
+let mockIsStale = false;
 
 vi.mock('@/providers/AuthProvider', () => ({
   useAuth: () => mockAuthResult,
@@ -50,6 +53,18 @@ vi.mock('@apollo/client', async () => {
     useMutation: () => [mockMutationFn, { loading: mockMutationLoading }],
   };
 });
+
+// #3141: mock usePollBackoff to pass through the Apollo useQuery mock data
+// and expose an injectable isStale flag.
+vi.mock('../src/app/(main)/admin/dispatcher/usePollBackoff', () => ({
+  usePollBackoff: () => ({
+    data: mockQueryResult.data,
+    loading: mockQueryResult.loading,
+    error: mockQueryResult.error,
+    isStale: mockIsStale,
+    refetch: mockQueryResult.refetch,
+  }),
+}));
 
 // ---------------------------------------------------------------------------
 // Import after mocks
@@ -162,6 +177,7 @@ function makeActiveState() {
 describe('DispatcherDashboard', () => {
   beforeEach(() => {
     notFoundCallCount = 0;
+    mockIsStale = false;
     mockAuthResult = {
       user: makeAdminUser(),
       loading: false,
@@ -329,11 +345,12 @@ describe('DispatcherDashboard', () => {
   });
 
   it('keeps rendering the dashboard with a stale indicator when a polling refetch fails (#2842)', () => {
-    // Simulate Apollo's polling contract: `data` from the last successful
-    // fetch stays populated while `error` reflects the latest failure.
+    // Simulate usePollBackoff reporting stale after consecutive failures
+    // (#3141: isStale replaces the old error && state check).
     mockQueryResult.data = makeActiveState();
     mockQueryResult.loading = false;
-    mockQueryResult.error = new Error('network blip');
+    mockQueryResult.error = undefined;
+    mockIsStale = true;
     render(<DispatcherDashboard />);
     // Dashboard is still rendered — no ErrorBanner takeover.
     expect(screen.getByRole('heading', { level: 1, name: /Dispatcher/i })).toBeInTheDocument();
@@ -345,15 +362,15 @@ describe('DispatcherDashboard', () => {
   });
 
   it('clears the stale indicator when the next poll succeeds (#2842)', () => {
-    // First render: transient poll failure after a successful load.
+    // First render: usePollBackoff reports isStale after repeated failures.
     mockQueryResult.data = makeActiveState();
     mockQueryResult.loading = false;
-    mockQueryResult.error = new Error('network blip');
+    mockQueryResult.error = undefined;
+    mockIsStale = true;
     const { rerender } = render(<DispatcherDashboard />);
     expect(screen.getByTestId('dispatcher-stale-indicator')).toBeInTheDocument();
-    // Second render: the next poll succeeds, so `error` clears while
-    // `data` stays populated.
-    mockQueryResult.error = undefined;
+    // Second render: the next poll succeeds, so isStale clears.
+    mockIsStale = false;
     rerender(<DispatcherDashboard />);
     expect(screen.queryByTestId('dispatcher-stale-indicator')).not.toBeInTheDocument();
     // Dashboard is still rendered and there was no retry click.

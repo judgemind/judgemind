@@ -27,6 +27,9 @@ const mockSetConfigMutate = vi.fn().mockResolvedValue({ data: {} });
 const mockRefetch = vi.fn().mockResolvedValue({ data: {} });
 
 let mockQueryData: { dispatcherState?: Record<string, unknown> } | undefined;
+// #3141: `usePollBackoff` isStale flag — controlled by tests that need to
+// exercise the stale indicator. Default false for all other tests.
+let mockIsStale = false;
 // #3159: separate mock data for the `dispatcherQueueFull` query fired
 // only when the operator opens an expand-count dialog. Keyed by the
 // `kind` variable so the mock can serve READY / BLOCKED / COMPLETED
@@ -94,6 +97,23 @@ vi.mock('@apollo/client', async () => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// usePollBackoff mock (#3141) — controls isStale for stale-indicator tests.
+// Forwards data/loading/error from the @apollo/client useQuery mock so
+// existing tests that depend on mockQueryData continue to work.
+// ---------------------------------------------------------------------------
+vi.mock('../usePollBackoff', () => ({
+  usePollBackoff: (
+    _opts: unknown,
+  ) => ({
+    data: mockQueryData,
+    loading: false,
+    error: undefined,
+    isStale: mockIsStale,
+    refetch: mockRefetch,
+  }),
+}));
+
 vi.mock('next/navigation', () => ({
   notFound: () => {
     throw new Error('notFound called in test');
@@ -159,6 +179,7 @@ describe('DispatcherDashboard — #2884 simplified command surface', () => {
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
+    mockIsStale = false;
   });
 
   it('Start fires immediately and does NOT send any context headers', async () => {
@@ -224,6 +245,7 @@ describe('DispatcherDashboard — config edit lifecycle', () => {
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
+    mockIsStale = false;
   });
 
   it('raising concurrency_cap commits immediately without any context headers (#2884)', async () => {
@@ -302,6 +324,7 @@ describe('DispatcherDashboard — #2823 state-flow two-column layout', () => {
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
     mockQueryData = { dispatcherState: { ...BASE_STATE } };
+    mockIsStale = false;
   });
 
   it('renders both columns inside a single `lg:grid-cols-2` deck', () => {
@@ -374,6 +397,7 @@ describe('DispatcherDashboard — #2860 circuit-breaker banner', () => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockIsStale = false;
   });
 
   it('renders the banner when circuitBreakerOpen is true', () => {
@@ -428,6 +452,7 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
+    mockIsStale = false;
   });
 
   it('wraps subsequent poll state updates in document.startViewTransition when available', async () => {
@@ -530,6 +555,7 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
     mockQueueFullData.READY = undefined;
     mockQueueFullData.BLOCKED = undefined;
     mockQueueFullData.COMPLETED = undefined;
+    mockIsStale = false;
   });
 
   it('renders all three count badges as buttons (Ready, Blocked, Recently Completed)', () => {
@@ -617,5 +643,29 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
         screen.getByTestId(`issue-link-${it.issueNumber}`),
       ).toBeInTheDocument();
     }
+  });
+});
+
+describe('DispatcherDashboard — #3141 stale indicator debounce', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueryData = { dispatcherState: { ...BASE_STATE } };
+    mockIsStale = false;
+  });
+
+  it('stale indicator is absent when isStale is false (first poll failure)', () => {
+    // One simulated failure: isStale should remain false.
+    mockIsStale = false;
+    renderDashboard();
+    expect(screen.queryByTestId('dispatcher-stale-indicator')).not.toBeInTheDocument();
+  });
+
+  it('stale indicator appears when isStale is true (two consecutive failures)', () => {
+    // Two consecutive failures: isStale flips to true.
+    mockIsStale = true;
+    renderDashboard();
+    expect(screen.getByTestId('dispatcher-stale-indicator')).toBeInTheDocument();
   });
 });

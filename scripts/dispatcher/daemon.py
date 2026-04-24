@@ -2167,6 +2167,13 @@ class DispatcherDaemon:
         """Run one scheduler tick — queue scan + retry drain + Phase 3A orchestration.
 
         Steps (in order; DB work is one transaction per step for isolation):
+            0. Write ``heartbeat_ts = now()`` to ``dispatcher.runs`` (#3141).
+               Runs in its own small transaction before any other step so
+               failures in later steps do not prevent the heartbeat from
+               landing. This lowers the effective heartbeat cadence from
+               the 2-min supervisor tick to the 30s scheduler tick,
+               making the cockpit's 90s "unhealthy" threshold reliably
+               achievable.
             1. Consume any pending ``dispatcher.commands`` via
                :meth:`_consume_commands`. Each command is dispatched to
                its handler; consumed_at is set AFTER the handler so a
@@ -2209,6 +2216,9 @@ class DispatcherDaemon:
 
         Returns a small summary dict for logging + tests. Keys:
 
+            * ``heartbeat_written``: 1 if the ``dispatcher.runs``
+              heartbeat UPDATE succeeded, 0 if it failed or was skipped
+              (#3141).
             * ``commands_consumed``: int, rowcount from step 1.
             * ``concurrency_cap``: int, or ``-1`` sentinel if unset.
             * ``queue_depth``: int, ``-1`` if the scan failed.
@@ -2239,6 +2249,32 @@ class DispatcherDaemon:
         # fails to fire is a genuine tick-entry-level wedge, which is
         # exactly what the watchdog exists to catch.
         self._last_scheduler_tick_at = time.monotonic()
+
+        # Step 0 — Heartbeat UPDATE (#3141). Write ``heartbeat_ts = now()``
+        # to ``dispatcher.runs`` so the cockpit's 90s "unhealthy" threshold
+        # is reliably met at the 30s scheduler cadence rather than only at
+        # the 2-min supervisor cadence. Runs in its own small transaction
+        # before any other step so failures in _consume_commands or later
+        # steps do not prevent the heartbeat from landing. Failure here is
+        # logged but not re-raised — the scheduler tick must survive a
+        # transient DB hiccup.
+        heartbeat_written = 0
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.runs SET heartbeat_ts = now() WHERE run_id = %s",
+                    (self._run_id,),
+                )
+            self._conn.commit()
+            heartbeat_written = 1
+        except Exception:
+            self._log.exception(
+                "daemon.scheduler_heartbeat_failed",
+                extra={
+                    "event": "scheduler_heartbeat_failed",
+                    "run_id": self._run_id,
+                },
+            )
 
         # 1. Consume any pending commands. Each command is dispatched to
         # its handler; consumed_at is set AFTER the handler returns so
@@ -2505,6 +2541,8 @@ class DispatcherDaemon:
                 "event": "scheduler_tick",
                 "run_id": self._run_id,
                 "tick_n": self._scheduler_ticks,
+                # #3141: heartbeat UPDATE result for observability.
+                "heartbeat_written": bool(heartbeat_written),
                 "commands_consumed": commands_consumed,
                 "concurrency_cap": concurrency_cap,
                 "queue_depth": queue_depth,
@@ -2527,6 +2565,8 @@ class DispatcherDaemon:
             },
         )
         return {
+            # #3141: 1 if the heartbeat UPDATE landed, 0 on DB failure.
+            "heartbeat_written": heartbeat_written,
             "commands_consumed": commands_consumed,
             "concurrency_cap": -1 if concurrency_cap is None else concurrency_cap,
             "queue_depth": queue_depth,

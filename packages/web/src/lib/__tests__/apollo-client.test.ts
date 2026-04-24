@@ -1,15 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ApolloLink } from '@apollo/client';
+import { ApolloLink, Observable } from '@apollo/client';
+import type { ErrorHandler } from '@apollo/client/link/error';
+
+// Capture the errorHandler function passed to onError so tests can invoke
+// it directly to assert retry behaviour without needing a live HTTP server.
+let capturedErrorHandler: ErrorHandler | null = null;
 
 // Mock @apollo/client/link/error before importing the module under test.
 // onError must return a valid ApolloLink instance for ApolloLink.from() to work.
 vi.mock('@apollo/client/link/error', () => ({
-  onError: vi.fn(
-    () =>
-      new ApolloLink((operation, forward) => {
-        return forward(operation);
-      }),
-  ),
+  onError: vi.fn((handler: ErrorHandler) => {
+    capturedErrorHandler = handler;
+    return new ApolloLink((operation, forward) => {
+      return forward(operation);
+    });
+  }),
 }));
 
 // Mock auth-tokens module
@@ -23,6 +28,7 @@ vi.mock('../auth-tokens', () => ({
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  capturedErrorHandler = null;
 });
 
 describe('createApolloClient', () => {
@@ -627,5 +633,99 @@ describe('createApolloClient', () => {
     expect(counties).toContain('Los Angeles');
     expect(counties).toContain('Orange');
     expect(counties).toContain('San Diego');
+  });
+});
+
+describe('createApolloClient — UNAUTHENTICATED soft-reconnect (#3141 AC5)', () => {
+  it('error link receives handler that retries with refreshed Bearer token', async () => {
+    // Import must come after capturedErrorHandler reset in beforeEach.
+    const { createApolloClient } = await import('../apollo-client');
+    const { setAccessToken, getAccessToken } = await import('../auth-tokens');
+
+    const client = createApolloClient();
+    expect(client).toBeDefined();
+
+    // The onError mock should have captured the handler.
+    expect(capturedErrorHandler).not.toBeNull();
+
+    // Stub client.mutate to simulate a successful token refresh.
+    const refreshedToken = 'refreshed-access-token-abc123';
+    const mockMutate = vi.fn().mockResolvedValue({
+      data: { refreshToken: { accessToken: refreshedToken } },
+    });
+    client.mutate = mockMutate;
+
+    // Build a mock operation with a controllable setContext.
+    const contextHeaders: Record<string, string> = {};
+    const mockOperation = {
+      operationName: 'DispatcherState',
+      setContext: vi.fn((ctx: unknown) => {
+        const typedCtx = ctx as { headers?: Record<string, string> };
+        if (typedCtx.headers) {
+          Object.assign(contextHeaders, typedCtx.headers);
+        }
+      }),
+      getContext: vi.fn(() => ({})),
+      variables: {},
+      extensions: {},
+      query: { kind: 'Document', definitions: [] },
+    } as unknown as Parameters<ErrorHandler>[0]['operation'];
+
+    // `forward` returns an Observable that the handler subscribes to after
+    // setting the new token on the operation context.
+    const mockForward = vi.fn((_op: unknown) => {
+      return new Observable((observer) => {
+        observer.next({ data: { dispatcherState: {} } });
+        observer.complete();
+      });
+    }) as unknown as Parameters<ErrorHandler>[0]['forward'];
+
+    // Invoke the captured error handler with an UNAUTHENTICATED error.
+    const observable = capturedErrorHandler!({
+      graphQLErrors: [
+        {
+          message: 'Unauthorized',
+          extensions: { code: 'UNAUTHENTICATED' },
+          locations: undefined,
+          path: undefined,
+        },
+      ],
+      networkError: null,
+      operation: mockOperation,
+      forward: mockForward,
+      response: undefined,
+    });
+
+    // Wait for the refresh + retry observable to resolve.
+    await new Promise<void>((resolve, reject) => {
+      if (!observable) {
+        // Handler returned undefined — UNAUTHENTICATED path not taken.
+        reject(new Error('handler did not return an Observable for UNAUTHENTICATED error'));
+        return;
+      }
+      observable.subscribe({
+        next: () => {},
+        error: reject,
+        complete: resolve,
+      });
+    });
+
+    // The refresh mutation was called once.
+    expect(mockMutate).toHaveBeenCalledTimes(1);
+    expect(mockMutate.mock.calls[0][0]).toMatchObject({
+      mutation: expect.objectContaining({ kind: 'Document' }),
+    });
+
+    // setAccessToken was called with the refreshed token.
+    expect(setAccessToken).toHaveBeenCalledWith(refreshedToken);
+
+    // The retried operation had its context set with the new Bearer token.
+    expect(contextHeaders['authorization']).toBe(`Bearer ${refreshedToken}`);
+
+    // forward was called once with the updated operation (the retry).
+    expect(mockForward).toHaveBeenCalledTimes(1);
+
+    // Suppress unused-variable lint on getAccessToken (imported for symmetry).
+    expect(getAccessToken).toBeDefined();
   });
 });

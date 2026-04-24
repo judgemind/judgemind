@@ -459,6 +459,72 @@ class TestScanQueueAndSnapshot:
 
 
 # --------------------------------------------------------------------------
+# scheduler_tick — heartbeat UPDATE (#3141)
+# --------------------------------------------------------------------------
+
+
+class TestSchedulerTickHeartbeat:
+    """scheduler_tick() writes heartbeat_ts on every tick (#3141)."""
+
+    def test_scheduler_tick_updates_heartbeat(self) -> None:
+        """scheduler_tick runs UPDATE dispatcher.runs SET heartbeat_ts = now()."""
+        d, conn, _handler = _make_daemon_with_capture()
+        # fetch_queue drives the concurrency_cap SELECT (step 2).
+        conn.cursor_instance.fetch_queue = [(0,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+
+        summary = d.scheduler_tick()
+
+        heartbeat_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.runs SET heartbeat_ts = now()" in e[0]
+        ]
+        assert len(heartbeat_updates) >= 1, (
+            "scheduler_tick must run UPDATE dispatcher.runs SET heartbeat_ts = now()"
+        )
+        # The run_id parameter must be passed.
+        assert heartbeat_updates[0][1] == ("test-run-id",)
+        # Summary dict records the write.
+        assert summary["heartbeat_written"] == 1
+
+    def test_heartbeat_written_before_commands(self) -> None:
+        """The heartbeat UPDATE is the first SQL executed in scheduler_tick."""
+        d, conn, _handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetch_queue = [(0,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+
+        d.scheduler_tick()
+
+        # The very first execute call must be the heartbeat UPDATE.
+        first_sql = conn.cursor_instance.executed[0][0]
+        assert "UPDATE dispatcher.runs SET heartbeat_ts = now()" in first_sql, (
+            f"Expected heartbeat UPDATE first, got: {first_sql!r}"
+        )
+
+    def test_later_step_failure_does_not_skip_heartbeat(self) -> None:
+        """Even if _fetch_agent_ready_issues raises, the heartbeat still lands."""
+        d, conn, handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetch_queue = [(0,)]
+
+        def boom() -> Any:
+            raise RuntimeError("gh exit=1")
+
+        d._fetch_agent_ready_issues = boom  # type: ignore[method-assign]
+
+        # scheduler_tick must not raise and the heartbeat UPDATE must have run.
+        summary = d.scheduler_tick()
+        assert summary["heartbeat_written"] == 1
+
+        heartbeat_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.runs SET heartbeat_ts = now()" in e[0]
+        ]
+        assert len(heartbeat_updates) >= 1
+
+
+# --------------------------------------------------------------------------
 # scheduler_tick — Phase 2 integration (queue scan wired in)
 # --------------------------------------------------------------------------
 
