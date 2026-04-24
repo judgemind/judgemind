@@ -574,6 +574,35 @@ if [ -n "$changed_dispatcher_deps" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Dispatcher terminal-status consistency drift — run when daemon or
+# API/web dispatcher files change (#2870)
+# -------------------------------------------------------------------
+# Cross-checks the five terminal-status literals (succeeded / failed /
+# crashed / plan_blocked / needs_review) across daemon.py, the GraphQL
+# schema, the SQL resolver, ui-primitives.tsx, and
+# RecentCompletionsPanel.tsx. Mirrors the CI step so drift is caught
+# locally before the CI round trip.
+changed_dispatcher_terminals=$(echo "$changed_files" \
+    | grep -E '^(scripts/dispatcher/daemon\.py|packages/api/src/graphql/dispatcher/|packages/web/src/app/.*/admin/dispatcher/)' || true)
+if [ -n "$changed_dispatcher_terminals" ]; then
+    echo "pre-push: checking dispatcher terminal-status consistency..." >&2
+    if [ -x scripts/check-dispatcher-terminals-consistent.sh ]; then
+        if ! run_check "_" "scripts/check-dispatcher-terminals-consistent.sh" scripts/check-dispatcher-terminals-consistent.sh; then
+            echo "  The dispatcher terminal-status set is out of sync across" >&2
+            echo "  daemon.py, schema.ts, resolvers.ts, ui-primitives.tsx," >&2
+            echo "  or RecentCompletionsPanel.tsx." >&2
+            echo "" >&2
+            echo "  Fix: update every flagged location to match the canonical" >&2
+            echo "  set. The canonical source is _mark_agent_terminal in" >&2
+            echo "  scripts/dispatcher/daemon.py." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-dispatcher-terminals-consistent.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Filename separator hygiene — always cheap, always run
 # -------------------------------------------------------------------
 # Flags same-directory filename pairs that differ only by `-` vs `_`
