@@ -50,6 +50,7 @@ Write `{worktree}/tmp/dispatcher-output/fix-ci.json`:
   "agent_id": "<echo>",
   "pr_number": <int>,
   "verdict": "PATCHED" | "BLOCKED" | "FLAKY",
+  "rebase_outcome": "clean" | "resolved" | "conflict_unresolvable" | "skipped",
   "failure_category": "lint" | "format" | "type_error" | "test_failure" | "coverage_floor" |
                        "infra_external" | "missing_secret_or_config" | "build_failure" |
                        "markdown_links" | "hygiene_guard" | "ci_config" | "other",
@@ -65,7 +66,37 @@ Write `{worktree}/tmp/dispatcher-output/fix-ci.json`:
 - `BLOCKED` — the agent cannot fix this failure (missing secret, repo permissions, external infra beyond repo control, or fix-attempts exhausted). `block_reason` is populated with a concrete one-step human action. Daemon escalates to `status/needs-human` + `priority/p1`.
 - `FLAKY` — transient failure (intermittent timeout, AWS 5xx, etc.) with no code change needed. `flaky_evidence` explains. Daemon reruns the job once; second flaky → escalate.
 
+**`rebase_outcome` field** (required, enum): populated in Step 0 before the CI-fix logic runs. Values:
+
+- `"clean"` — rebase succeeded (possibly a no-op; branch was already up to date). Normal flow continues.
+- `"resolved"` — rebase encountered conflict markers; the skill resolved them semantically and ran `git rebase --continue`. Normal flow continues.
+- `"conflict_unresolvable"` — conflicts could not be resolved (semantic collision or turn budget exhausted). Skill ran `git rebase --abort` and returns verdict=`BLOCKED`.
+- `"skipped"` — reserved for input-JSON-missing or malformed; rebase step could not run.
+
+**Force-push semantics:** After a rebase (Step 0), the local branch's SHAs are rewritten. The daemon's `_apply_fix_ci_patch` push therefore uses `--force-with-lease` (never bare `--force`). `--force-with-lease` verifies the remote hasn't diverged since our last fetch — safe for a CI-fix branch that only the daemon writes.
+
+**`fix_ci_rebase_outcome` observability contract:** The skill emits `echo FIX_CI_REBASE_OUTCOME=<value>` to stdout immediately after Step 0 completes. The stream_forwarder tags this line in CloudWatch. The daemon re-emits it as a structured `daemon.fix_ci_rebase_outcome` log event (with `event="fix_ci_rebase_outcome"`, `run_id`, `agent_id`, `pr_number`, `rebase_outcome`) after parsing the output JSON, unconditionally — old-skill payloads that omit the field log `rebase_outcome=None` and are trivially spottable.
+
 Always exit 0. Verdict comes from the JSON, not the exit code.
+
+---
+
+## Step 0 — Rebase against origin/main (mandatory, unconditional)
+
+Before reading any failure logs, bring the branch up to date with `origin/main`. This ensures the CI fix applies cleanly on top of the current main and that the force-pushed commit is not based on a stale tree.
+
+```
+git -C <worktree_path> fetch origin main
+git -C <worktree_path> rebase origin/main
+```
+
+Three outcomes:
+
+**`clean`** — rebase succeeded (exit 0, no conflict markers). Set `rebase_outcome="clean"`. Emit `echo FIX_CI_REBASE_OUTCOME=clean`. Proceed to Step 1.
+
+**`resolved`** — rebase paused with conflict markers (exit non-zero, files contain `<<<<<<<`). Resolve conflicts semantically: read each conflicted file's markers; classify per the taxonomy in `.claude/skills/task-v2-fix-conflict/SKILL.md` §Step 2 (parallel edits / overlapping-compatible / semantic collision). For parallel-edits and overlapping-compatible conflicts: accept the merged result, run `git add <file>` per resolved file, then `git rebase --continue`. If all conflicts resolve: set `rebase_outcome="resolved"`. Emit `echo FIX_CI_REBASE_OUTCOME=resolved`. Proceed to Step 1. If turn budget is exhausted mid-rebase, escalate to `conflict_unresolvable`.
+
+**`conflict_unresolvable`** — classification returned semantic collision for any file, OR reconciliation loop exceeded turn budget. Run `git rebase --abort`. Set `rebase_outcome="conflict_unresolvable"`. Emit `echo FIX_CI_REBASE_OUTCOME=conflict_unresolvable`. Write output JSON with `verdict="BLOCKED"`, `block_reason` naming the conflicting file(s) and the colliding main commits (obtain via `git log --oneline origin/main ^HEAD~1 -- <file>`). Skip Steps 1–5 entirely.
 
 ---
 
@@ -168,6 +199,8 @@ For verdict=`FLAKY`:
 - **Attempt 1** — try to fix. Verdict=`PATCHED` if successful.
 - **Attempt 2** — if the first fix itself landed but didn't close all failures, try again. Same worktree.
 - **Attempt 3+** — if `previous_fix_attempts >= 2` and the same failure recurs, the pattern suggests a misdiagnosis. Return verdict=`BLOCKED` with `block_reason="CI failure persisted after <N> fix attempts; needs human diagnosis"` and let the daemon escalate.
+
+If `rebase_outcome="conflict_unresolvable"`, the shared `FIX_CI_MAX_RETRIES=3` budget still applies — a fresh attempt on the next retry will see a fresh `origin/main` tip and may succeed.
 
 ## Reminders
 
