@@ -25,6 +25,16 @@ from __future__ import annotations
 
 Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header and activates the correct venv automatically.
 
+#### Dispatcher daemon venv
+
+`scripts/dispatcher/` has no `pyproject.toml`, so `scripts/install-package-venv.sh` cannot bootstrap its venv. Use the dedicated helper instead:
+
+```
+scripts/install-dispatcher-venv.sh
+```
+
+This creates `scripts/dispatcher/.venv` and installs `pytest`, `ruff`, `boto3`, and an editable `packages/judgemind-config` — the four dependencies required by the dispatcher test suite. The script is idempotent: re-running it on an existing venv is safe.
+
 **One-off and permanent markers.** **Every** top-level script must carry exactly one of the following markers, as a standalone top-level comment anywhere in the **first 50 lines** of the file (the header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring):
 
 - `# one-off: true` — finite-lifetime script (backfills, cleanups, fixups) tied to a specific bug fix or migration. Candidate for archival to `scripts/archive/` once its work is done.
