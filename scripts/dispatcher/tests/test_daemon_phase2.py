@@ -384,6 +384,7 @@ class TestScanQueueAndSnapshot:
             },
         ]
         assert params[3] == "test-run-id"
+        # Single atomic scan-and-insert: exactly one commit.
         assert conn.commits == 1
         # Structured log emitted.
         scans = handler.events("queue_scan")

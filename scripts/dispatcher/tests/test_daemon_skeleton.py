@@ -200,21 +200,33 @@ class TestSchedulerTick:
         summary = d.scheduler_tick()
         assert summary["commands_consumed"] == 3
         assert summary["concurrency_cap"] == 0
-        # Five commits on the first tick:
-        #   1. config read (command consumption is now its own transaction
-        #      managed by _consume_commands, which is stubbed here),
-        #   2. infra-preemption retry-marker SELECT (#2949 pre-scan drain
-        #      runs in its own transaction; the fake cursor returns an
-        #      empty fetchall so no markers are processed here),
-        #   3. per-agent ECS reap SELECT (#3091 — empty active-rows,
-        #      early returns after commit),
-        #   4. queue_snapshots INSERT (Phase 2 addition, #2768),
-        #   5. blocked_snapshots INSERT (#2820) — always runs on the
-        #      first tick so the admin page has a populated blocked
-        #      panel immediately after daemon boot.
-        # Each scan is isolated in its own transaction. Phase 3A gate stays
-        # closed at ``concurrency_cap=0`` so no additional reads/commits.
-        assert fake_conn.commits == 5
+        executed = fake_conn.cursor_instance.executed
+        # Config SELECT fired (step 2 of scheduler_tick).
+        # The SQL reads "SELECT value FROM dispatcher.config WHERE key = %s"
+        # with ("concurrency_cap",) as the bound parameter.
+        assert any(
+            "FROM dispatcher.config" in sql for sql, _ in executed
+        ), "config SELECT (dispatcher.config) must fire"
+        # Infra-preemption retry-marker SELECT fired (#2949 pre-scan drain).
+        assert any(
+            "FROM dispatcher.retry_markers" in sql for sql, _ in executed
+        ), "retry_markers SELECT must fire before queue scan"
+        # Per-agent ECS reap SELECT fired (#3091).
+        assert any(
+            "agent_task_arn IS NOT NULL" in sql for sql, _ in executed
+        ), "ECS reap SELECT (agent_task_arn) must fire"
+        # queue_snapshots INSERT fired (Phase 2 addition, #2768).
+        assert any(
+            "INSERT INTO dispatcher.queue_snapshots" in sql for sql, _ in executed
+        ), "queue_snapshots INSERT must fire"
+        # blocked_snapshots INSERT fired (#2820 — always on the first tick).
+        assert any(
+            "INSERT INTO dispatcher.blocked_snapshots" in sql for sql, _ in executed
+        ), "blocked_snapshots INSERT must fire on the first tick"
+        # At least one commit — each step above runs in its own transaction.
+        # Later phases may add optional DB reads that commit independently;
+        # the exact count is not a contract (see issue #2797).
+        assert fake_conn.commits >= 1
         # Tick counter incremented.
         assert d._scheduler_ticks == 1
 
@@ -286,6 +298,7 @@ class TestShutdown:
         sql, params = executed[0]
         assert "UPDATE dispatcher.runs SET stopped_at" in sql
         assert params == ("test-run-id",)
+        # Single atomic method → exactly one commit.
         assert fake_conn.commits == 1
 
     def test_mark_stopped_noop_if_not_registered(self) -> None:
