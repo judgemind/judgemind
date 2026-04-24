@@ -47,27 +47,20 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
+# shellcheck source=./_query_lib.sh
+. "$script_dir/_query_lib.sh"
+
 usage() {
     sed -n '6,27p' "$0" | sed 's/^# \{0,1\}//' >&2
 }
 
 # ─── Helpers ────────────────────────────────────────────────────────────
 
-# Strip dev-db-query.sh preamble chatter; keep only the JSON array.
-json_only() {
-    awk '/^\[/{f=1} f&&!g{print} /^\]/{if(f)g=1}'
-}
-
-# Run a query and return the JSON array. Fail (exit 2) on empty.
+# Run a query and return the JSON array. _query_lib_run validates the JSON
+# and retries on transient ECS-exec stream failures — see #3124.
 query() {
     local sql="$1"
-    local result
-    result=$("$dev_db" "$sql" 2>/dev/null | json_only)
-    if [[ -z "$result" ]]; then
-        echo "Error: dev-db-query.sh returned no JSON for: $sql" >&2
-        exit 2
-    fi
-    printf '%s' "$result"
+    _query_lib_run "$sql" "breaker"
 }
 
 # Resolve an agent UUID prefix (min 4 hex chars) to a single agent_id.
@@ -109,9 +102,13 @@ issue_and_wait() {
     local deadline=$((SECONDS + 90))
     while (( SECONDS < deadline )); do
         local row
-        row=$("$dev_db" "$poll_sql" 2>/dev/null | json_only)
+        # Single-shot poll: if parsing fails here, fall through to the
+        # next tick rather than hard-exit — the command may still be
+        # consumed shortly. _query_lib_run's retry would also work but
+        # its 3×(attempt+2s sleep) worst-case would blow the 5s cadence.
+        row=$("$dev_db" "$poll_sql" 2>/dev/null | _query_lib_json_only)
         local consumed
-        consumed=$(echo "$row" | jq -r '.[0].consumed_utc // "null"')
+        consumed=$(printf '%s' "$row" | jq -r '.[0].consumed_utc // "null"' 2>/dev/null || printf 'null')
         if [[ "$consumed" != "null" ]]; then
             echo "Consumed at ${consumed}Z." >&2
             printf '%s' "$cmd_id"

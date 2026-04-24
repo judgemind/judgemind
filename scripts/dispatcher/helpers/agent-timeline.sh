@@ -58,11 +58,18 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
+# shellcheck source=./_query_lib.sh
+. "$script_dir/_query_lib.sh"
+
 # ─── Resolve prefix to a unique agent_id ─────────────────────────────
 
 resolve_sql="SELECT agent_id::text AS id, issue_number, phase, status FROM dispatcher.agents WHERE agent_id::text LIKE '${prefix}%' ORDER BY started_at DESC LIMIT 5;"
 
-resolve_json=$("$dev_db" "$resolve_sql" 2>/dev/null | awk '/^\[/{f=1} f&&!g{print} /^\]/{if(f)g=1}')
+# _query_lib_run validates + retries on transient ECS-exec stream failures
+# — replaces the older inline awk|jq pipeline that occasionally emitted a
+# bare `parse error: Invalid numeric literal` when the SSM stream
+# delivered a partial payload. See #3124.
+resolve_json=$(_query_lib_run "$resolve_sql" "agent-timeline resolve") || exit $?
 
 if [[ -z "$resolve_json" ]]; then
     echo "Error: dev-db-query.sh produced no result" >&2
@@ -201,7 +208,7 @@ SELECT jsonb_build_object(
 ) AS timeline;
 "
 
-timeline_result=$("$dev_db" "$timeline_sql" 2>/dev/null | awk '/^\[/{f=1} f&&!g{print} /^\]/{if(f)g=1}')
+timeline_result=$(_query_lib_run "$timeline_sql" "agent-timeline fetch") || exit $?
 
 if [[ -z "$timeline_result" ]]; then
     echo "Error: timeline query returned no result" >&2
