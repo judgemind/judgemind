@@ -3,7 +3,7 @@
 # with them as environment variables. Secrets never touch disk or stdout.
 #
 # Usage:
-#   scripts/with-secret.sh -e VAR=secret-id:.jq_field [-e ...] -- command [args...]
+#   scripts/with-secret.sh [-e VAR=secret-id:.jq_field ...] [--verbose|-v] -- command [args...]
 #
 # Examples:
 #   scripts/with-secret.sh -e CF_API_TOKEN=judgemind/cloudflare:.token -- terraform apply
@@ -12,14 +12,28 @@
 #
 # The :.field suffix extracts a JSON key from the secret string using python3.
 # Omit the :.field suffix to use the raw SecretString value.
+#
+# Options:
+#   --verbose, -v   Print "Resolved VAR from secret-id" for each secret resolved
+#
+# Environment:
+#   JM_VERBOSE=1    Same as --verbose
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
 
 declare -a ENV_SPECS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --verbose|-v)
+            VERBOSE=1
+            shift
+            ;;
         -e)
             if [[ $# -lt 2 ]]; then
                 echo "Error: -e requires an argument (VAR=secret-id[:. field])" >&2
@@ -103,6 +117,7 @@ print(data[key], end='')
     fi
 
     export "$var_name=$value"
+    vlog "Resolved $var_name from $secret_id"
 done
 
 # Execute the command with the secrets in the environment

@@ -34,6 +34,35 @@
 
   The script uses Python's `shutil.copy2()` internally, which bypasses the platform restriction. **Do not use `cp` directly** — it may also be blocked. This pattern applies to skill definitions (`SKILL.md`), hook scripts, and any other file under `.claude/`.
 
+### JM_VERBOSE escape hatch for terse agent-facing scripts
+
+The following agent-facing scripts are **terse by default** — they emit only the essential output (one success line, or an error if something fails). To restore the full verbose output for debugging, either pass `--verbose` / `-v` or set `JM_VERBOSE=1` in the environment:
+
+- `scripts/block-issue.sh`
+- `scripts/unblock-dependents.sh`
+- `scripts/dev-db-query.sh`
+- `scripts/with-secret.sh`
+- `scripts/ecs-run-task.sh`
+- `scripts/ecs-run.sh`
+- `scripts/ecs-redeploy.sh`
+- `scripts/cleanup_worktree.sh`
+- `scripts/check-duplicate-pr.sh`
+- `scripts/write-claude-file.sh`
+- `scripts/check-issue-author.sh`
+- `scripts/ecs-logs.sh`
+
+**Usage examples:**
+
+```bash
+# flag form
+scripts/ecs-run-task.sh --verbose scripts/backfill_summaries.py
+
+# env var form (useful when the script is called indirectly)
+JM_VERBOSE=1 scripts/ecs-logs.sh /ecs/judgemind-scraper-dev
+```
+
+The `JM_VERBOSE` env var flows through to any sub-scripts that also source `scripts/_terse_lib.sh`, so a single prefix covers the whole call chain.
+
 ## settings.json takes effect on NEXT session, not current
 
 The Claude Code CLI reads `.claude/settings.json` **once at session start**. Edits made to the file during a running session — including entries added via the `update-config` skill or by writing the file directly — do not apply to that session. They take effect only in future sessions. This includes `/task` subagents spawned with `isolation: "worktree"`, which start a fresh Claude session and will see the updated settings from the moment they launch.

@@ -20,6 +20,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
+
 # ─── Defaults ──────────────────────────────────────────────────────────────
 
 REGION="${AWS_DEFAULT_REGION:-us-west-2}"
@@ -76,6 +80,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --follow|-f)
             FOLLOW=true
+            shift
+            ;;
+        --verbose|-v)
+            VERBOSE=1
             shift
             ;;
         --lines|-n)
@@ -229,9 +237,9 @@ find_stream() {
 }
 
 STREAM=$(find_stream)
-echo "Log group:  $LOG_GROUP" >&2
-echo "Stream:     $STREAM" >&2
-echo "---" >&2
+vlog "Log group:  $LOG_GROUP"
+vlog "Stream:     $STREAM"
+vlog "---"
 
 # ─── Fetch and display log events ─────────────────────────────────────────
 
@@ -293,7 +301,7 @@ fetch_events
 
 # Follow mode: poll for new events
 if [[ "$FOLLOW" == true ]]; then
-    echo "--- following (Ctrl+C to stop) ---" >&2
+    vlog "--- following (Ctrl+C to stop) ---"
     while true; do
         sleep "$POLL_INTERVAL"
         fetch_events

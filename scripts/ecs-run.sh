@@ -47,6 +47,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
+
 CLUSTER="judgemind-dev"
 SERVICE="judgemind-ingestion-worker-dev"
 CONTAINER="ingestion-worker"
@@ -77,6 +81,10 @@ while [[ $# -gt 0 ]]; do
         --script)
             SCRIPT_PATH="$2"
             shift 2
+            ;;
+        --verbose|-v)
+            VERBOSE=1
+            shift
             ;;
         --help|-h)
             head -n 46 "$0" | tail -n +2 | sed 's/^# \?//'
@@ -130,14 +138,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ─── Optionally redeploy ──────────────────────────────────────────────────
 
 if [[ "$REDEPLOY" == "true" ]]; then
-    echo "Redeploying $SERVICE on $CLUSTER to pick up latest code..." >&2
+    vlog "Redeploying $SERVICE on $CLUSTER to pick up latest code..."
     "$REPO_ROOT/scripts/ecs-redeploy.sh" "$SERVICE" "$CLUSTER"
-    echo "" >&2
+    vlog ""
 fi
 
 # ─── Resolve a running task ARN ──────────────────────────────────────────
 
-echo "Finding a running task for service=$SERVICE cluster=$CLUSTER..." >&2
+vlog "Finding a running task for service=$SERVICE cluster=$CLUSTER..."
 
 task_arn=$(aws ecs list-tasks \
     --cluster "$CLUSTER" \
@@ -162,8 +170,7 @@ if [[ -z "$task_arn" || "$task_arn" == "None" ]]; then
     exit 1
 fi
 
-echo "Task: $task_arn" >&2
-echo "" >&2
+vlog "Task: $task_arn"
 
 # ─── Build and execute the command ─────────────────────────────────────────
 
@@ -192,20 +199,20 @@ if [[ -n "$SCRIPT_PATH" ]]; then
     remote_script="/tmp/_ecs_run_script"
     cmd="bash -c 'echo $encoded | base64 -d > $remote_script && $interpreter $remote_script$script_args; rm -f $remote_script'"
 
-    echo "Transferring script: $SCRIPT_PATH" >&2
-    echo "Interpreter: $interpreter" >&2
+    vlog "Transferring script: $SCRIPT_PATH"
+    vlog "Interpreter: $interpreter"
     if [[ -n "$script_args" ]]; then
-        echo "Script args:$script_args" >&2
+        vlog "Script args:$script_args"
     fi
 else
     # Direct command mode: join all remaining args into a single command string
     cmd="$*"
 
-    echo "Running: $cmd" >&2
+    vlog "Running: $cmd"
 fi
 
-echo "Container: $CONTAINER" >&2
-echo "─────────────────────────────────────────────────────────────" >&2
+vlog "Container: $CONTAINER"
+vlog "─────────────────────────────────────────────────────────────"
 
 aws ecs execute-command \
     --cluster "$CLUSTER" \

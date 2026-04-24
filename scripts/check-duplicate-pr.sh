@@ -11,9 +11,12 @@
 # permission and runs without prompts. See #2706.
 #
 # Usage:
-#   scripts/check-duplicate-pr.sh <issue_number>
+#   scripts/check-duplicate-pr.sh [--verbose|-v] <issue_number>
 #   scripts/check-duplicate-pr.sh 42
 #   scripts/check-duplicate-pr.sh '#42'       # leading # is stripped
+#
+# Options:
+#   --verbose, -v   Pass JM_VERBOSE=1 through to show PREFLIGHT WARN lines
 #
 # Exit codes (pass-through from preflight_no_duplicate_pr):
 #   0 — Duplicate PR found. A "duplicate:" line is printed to stdout with the
@@ -28,8 +31,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
 # shellcheck source=./preflight.sh
 source "$SCRIPT_DIR/preflight.sh"
+
+# Parse --verbose/-v before the issue number
+if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
+    VERBOSE=1
+    shift
+fi
 
 # Strip a leading '#' from the issue argument (if present) for display.
 issue_arg="${1:-}"

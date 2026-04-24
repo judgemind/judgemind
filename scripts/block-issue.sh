@@ -6,8 +6,14 @@
 # If the section or line already exists, it is not duplicated.
 #
 # Usage:
-#   scripts/block-issue.sh <issue> <blocker>
+#   scripts/block-issue.sh [--verbose|-v] <issue> <blocker>
 #   scripts/block-issue.sh 1144 1143
+#
+# Options:
+#   --verbose, -v   Show detailed progress output (default: terse)
+#
+# Environment:
+#   JM_VERBOSE=1    Same as --verbose
 #
 # This script exists because agents were inconsistent about how they marked
 # issues as blocked — sometimes adding only the label or only a comment, which
@@ -15,6 +21,11 @@
 # always present.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
+eval "$(terse_parse_verbose_flag "$@")"
 
 if [ $# -ne 2 ]; then
     echo "Usage: scripts/block-issue.sh <issue> <blocker>" >&2
@@ -41,7 +52,7 @@ BODY=$(gh issue view "$ISSUE" --repo "$REPO" --json body -q '.body' 2>/dev/null)
 
 # Check if already blocked by this exact issue
 if echo "$BODY" | grep -qE "^Blocked by #${BLOCKER}\b"; then
-    echo "Issue #$ISSUE already has 'Blocked by #$BLOCKER' in body — skipping body update."
+    vlog "Issue #$ISSUE already has 'Blocked by #$BLOCKER' in body — skipping body update."
 else
     # Check if ## Dependencies section exists
     if echo "$BODY" | grep -q "^## Dependencies"; then
@@ -73,16 +84,16 @@ Blocked by #${BLOCKER}"
     # Write to a temp file and update the issue body
     TMPFILE=$(mktemp)
     echo "$UPDATED_BODY" > "$TMPFILE"
-    gh issue edit "$ISSUE" --repo "$REPO" --body-file "$TMPFILE"
+    gh issue edit "$ISSUE" --repo "$REPO" --body-file "$TMPFILE" > /dev/null
     rm -f "$TMPFILE"
-    echo "Added 'Blocked by #$BLOCKER' to issue #$ISSUE body."
+    vlog "Added 'Blocked by #$BLOCKER' to issue #$ISSUE body."
 fi
 
 # Add status/blocked and remove agent/ready labels
-gh issue edit "$ISSUE" --repo "$REPO" --add-label "status/blocked" --remove-label "agent/ready" 2>/dev/null || {
+gh issue edit "$ISSUE" --repo "$REPO" --add-label "status/blocked" --remove-label "agent/ready" > /dev/null 2>/dev/null || {
     # If agent/ready doesn't exist, try just adding status/blocked
-    gh issue edit "$ISSUE" --repo "$REPO" --add-label "status/blocked" 2>/dev/null || true
+    gh issue edit "$ISSUE" --repo "$REPO" --add-label "status/blocked" > /dev/null 2>/dev/null || true
 }
-echo "Labels updated on issue #$ISSUE: +status/blocked, -agent/ready."
+vlog "Labels updated on issue #$ISSUE: +status/blocked, -agent/ready."
 
-echo "Done — issue #$ISSUE is now blocked by #$BLOCKER."
+echo "Blocked #$ISSUE by #$BLOCKER."

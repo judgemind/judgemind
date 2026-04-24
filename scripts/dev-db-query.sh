@@ -12,15 +12,25 @@
 #   - The ingestion worker ECS service must be running with execute command enabled
 #
 # Usage:
-#   scripts/dev-db-query.sh "SELECT COUNT(*) FROM rulings"
+#   scripts/dev-db-query.sh [--verbose|-v] "SELECT COUNT(*) FROM rulings"
 #   scripts/dev-db-query.sh "SELECT id, case_number FROM rulings LIMIT 5"
 #   scripts/dev-db-query.sh "SELECT * FROM courts WHERE state = 'CA'"
 #
 # By default, the session is set to read-only mode (SET default_transaction_read_only = on)
 # so that only SELECT/EXPLAIN queries succeed. Use --rw to allow writes:
 #   scripts/dev-db-query.sh --rw "UPDATE rulings SET status = 'active' WHERE id = 1"
+#
+# Options:
+#   --verbose, -v   Show task ARN and progress lines (default: suppress)
+#
+# Environment:
+#   JM_VERBOSE=1    Same as --verbose
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
 
 CLUSTER="judgemind-dev"
 SERVICE="judgemind-ingestion-worker-dev"
@@ -32,6 +42,12 @@ REGION="us-west-2"
 READ_ONLY=true
 if [[ "${1:-}" == "--rw" ]]; then
     READ_ONLY=false
+    shift
+fi
+
+# Parse --verbose/-v (JM_VERBOSE already handled by _terse_lib.sh source)
+if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
+    VERBOSE=1
     shift
 fi
 
@@ -61,9 +77,8 @@ fi
 
 query="$1"
 
-echo "Running query on dev database via ECS Exec..." >&2
-echo "Task: $task_arn" >&2
-echo "" >&2
+vlog "Running query on dev database via ECS Exec..."
+vlog "Task: $task_arn"
 
 # Base64-encode the query to avoid quoting issues with single/double quotes
 # in SQL (e.g. WHERE status = 'active'). The runner script decodes it.
@@ -85,14 +100,31 @@ fi
 # pattern used by ecs-run.sh --script.  This avoids the fragile one-liner that
 # was previously embedded in the --command string.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 runner_encoded=$(base64 < "$SCRIPT_DIR/dev_db_query_runner.py" | tr -d '\n')
 remote_script="/tmp/_dev_db_query_runner.py"
 
-aws ecs execute-command \
-    --cluster "$CLUSTER" \
-    --task "$task_arn" \
-    --container "$CONTAINER" \
-    --interactive \
-    --region "$REGION" \
-    --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag; rm -f $remote_script'"
+if [[ "${VERBOSE:-0}" == "1" ]]; then
+    aws ecs execute-command \
+        --cluster "$CLUSTER" \
+        --task "$task_arn" \
+        --container "$CONTAINER" \
+        --interactive \
+        --region "$REGION" \
+        --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag; rm -f $remote_script'"
+else
+    # Filter Session Manager plugin chatter from stdout; JSON result passes through.
+    aws ecs execute-command \
+        --cluster "$CLUSTER" \
+        --task "$task_arn" \
+        --container "$CONTAINER" \
+        --interactive \
+        --region "$REGION" \
+        --command "bash -c 'echo $runner_encoded | base64 -d > $remote_script && python3 $remote_script $query_b64 $readonly_flag; rm -f $remote_script'" \
+    | awk '
+        /^[[:space:]]*$/ { blank=1; next }
+        /The Session Manager plugin will handle the SSM stream data/ { blank=0; next }
+        /Starting session with SessionId/ { blank=0; next }
+        /Cannot perform start session/ { blank=0; next }
+        { if (blank) { print ""; blank=0 } print }
+    '
+fi

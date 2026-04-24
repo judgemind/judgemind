@@ -16,6 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLEANUP_SCRIPT="$SCRIPT_DIR/cleanup_worktree.sh"
+TERSE_LIB="$SCRIPT_DIR/_terse_lib.sh"
 FAILURES=0
 TESTS=0
 
@@ -37,6 +38,14 @@ make_temp_dir() {
     dir=$(mktemp -d)
     TEMP_DIRS+=("$dir")
     echo "$dir"
+}
+
+# Copy cleanup_worktree.sh + its _terse_lib.sh dependency into a scripts dir.
+install_cleanup_script() {
+    local dest_scripts_dir="$1"
+    cp "$CLEANUP_SCRIPT" "$dest_scripts_dir/cleanup_worktree.sh"
+    chmod +x "$dest_scripts_dir/cleanup_worktree.sh"
+    cp "$TERSE_LIB" "$dest_scripts_dir/_terse_lib.sh"
 }
 
 pass() {
@@ -64,8 +73,7 @@ test_find_repo_root_main_repo() {
     mkdir -p "$repo/.git"
     touch "$repo/CLAUDE.md"
     mkdir -p "$repo/scripts"
-    cp "$CLEANUP_SCRIPT" "$repo/scripts/cleanup_worktree.sh"
-    chmod +x "$repo/scripts/cleanup_worktree.sh"
+    install_cleanup_script "$repo/scripts"
 
     # Source the script to get find_repo_root, override BASH_SOURCE behavior
     # by calling the function directly
@@ -257,8 +265,7 @@ test_main_resolves_correct_path_from_worktree() {
     echo "gitdir: $repo/.git/worktrees/agent-abcd1234" > "$worktree/.git"
 
     # Copy cleanup_worktree.sh into the worktree
-    cp "$CLEANUP_SCRIPT" "$worktree/scripts/cleanup_worktree.sh"
-    chmod +x "$worktree/scripts/cleanup_worktree.sh"
+    install_cleanup_script "$worktree/scripts"
 
     # Call main with a bogus worktree path — we just want to check it
     # resolves repo_root correctly (it will fail on safety checks, that's fine)
@@ -313,8 +320,7 @@ test_cleanup_heals_stale_metadata() {
     # Drop a working copy of the cleanup script into the repo so it can
     # find the repo root via its own location.
     mkdir -p "$repo/scripts"
-    cp "$CLEANUP_SCRIPT" "$repo/scripts/cleanup_worktree.sh"
-    chmod +x "$repo/scripts/cleanup_worktree.sh"
+    install_cleanup_script "$repo/scripts"
 
     # Create a stub session log so safety check 2 would pass — but note
     # the stale-metadata branch should return 0 *before* the session-log
@@ -363,8 +369,7 @@ test_cleanup_no_metadata_is_noop() {
     git -C "$repo" commit -m "init" -q
 
     mkdir -p "$repo/scripts"
-    cp "$CLEANUP_SCRIPT" "$repo/scripts/cleanup_worktree.sh"
-    chmod +x "$repo/scripts/cleanup_worktree.sh"
+    install_cleanup_script "$repo/scripts"
 
     # Ensure no .git/worktrees directory exists at all.
     rm -rf "$repo/.git/worktrees"
@@ -381,6 +386,62 @@ test_cleanup_no_metadata_is_noop() {
     fi
 }
 
+# Test 8: --verbose flag accepted (no error even with missing worktree)
+test_verbose_flag_accepted() {
+    local repo
+    repo=$(make_temp_dir)
+
+    git -C "$repo" init --initial-branch main -q
+    git -C "$repo" config user.email "test@example.com"
+    git -C "$repo" config user.name "Test"
+    touch "$repo/CLAUDE.md"
+    git -C "$repo" add CLAUDE.md
+    git -C "$repo" commit -m "init" -q
+
+    mkdir -p "$repo/scripts"
+    install_cleanup_script "$repo/scripts"
+
+    # --verbose with a missing path → should give a safety error, not a parse error
+    local output
+    local exit_code=0
+    output=$("$repo/scripts/cleanup_worktree.sh" --verbose ".claude/worktrees/agent-missing1" 2>&1) || exit_code=$?
+
+    # The important thing: script didn't crash on --verbose parsing
+    if echo "$output" | grep -qi "verbose\|parse\|unknown option"; then
+        fail "--verbose flag accepted without parse error" \
+            "unexpected output: $output"
+    else
+        pass "--verbose flag accepted without parse error"
+    fi
+}
+
+# Test 9: JM_VERBOSE=1 accepted
+test_jm_verbose_accepted() {
+    local repo
+    repo=$(make_temp_dir)
+
+    git -C "$repo" init --initial-branch main -q
+    git -C "$repo" config user.email "test@example.com"
+    git -C "$repo" config user.name "Test"
+    touch "$repo/CLAUDE.md"
+    git -C "$repo" add CLAUDE.md
+    git -C "$repo" commit -m "init" -q
+
+    mkdir -p "$repo/scripts"
+    install_cleanup_script "$repo/scripts"
+
+    local output
+    local exit_code=0
+    output=$(JM_VERBOSE=1 "$repo/scripts/cleanup_worktree.sh" ".claude/worktrees/agent-missing2" 2>&1) || exit_code=$?
+
+    if echo "$output" | grep -qi "verbose\|parse\|unknown option"; then
+        fail "JM_VERBOSE=1 accepted without parse error" \
+            "unexpected output: $output"
+    else
+        pass "JM_VERBOSE=1 accepted without parse error"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_find_repo_root_main_repo
@@ -390,6 +451,8 @@ test_find_repo_root_worktree_only
 test_main_resolves_correct_path_from_worktree
 test_cleanup_heals_stale_metadata
 test_cleanup_no_metadata_is_noop
+test_verbose_flag_accepted
+test_jm_verbose_accepted
 
 echo ""
 echo "────────────────────────────────────────────"

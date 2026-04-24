@@ -170,7 +170,7 @@ test_healthy_stream_selected() {
         PATH="$tmpdir/bin:$PATH" \
         MOCK_STREAMS=$'ecs/container/task-a\tecs/container/task-b\tecs/container/task-c' \
         MOCK_STALE_STREAMS="" \
-        "$ECS_LOGS" /ecs/test-group --lines 1 2>&1
+        "$ECS_LOGS" /ecs/test-group --verbose --lines 1 2>&1
     ) || true
 
     if echo "$output" | grep -q "Stream:.*ecs/container/task-a"; then
@@ -190,7 +190,7 @@ test_stale_stream_fallback() {
         PATH="$tmpdir/bin:$PATH" \
         MOCK_STREAMS=$'ecs/container/stale-task\tecs/container/good-task\tecs/container/task-c' \
         MOCK_STALE_STREAMS="ecs/container/stale-task" \
-        "$ECS_LOGS" /ecs/test-group --lines 1 2>&1
+        "$ECS_LOGS" /ecs/test-group --verbose --lines 1 2>&1
     ) || true
 
     # Should show warning about the stale stream
@@ -218,7 +218,7 @@ test_multiple_stale_fallback() {
         PATH="$tmpdir/bin:$PATH" \
         MOCK_STREAMS=$'ecs/container/stale-1\tecs/container/stale-2\tecs/container/good-task' \
         MOCK_STALE_STREAMS="ecs/container/stale-1,ecs/container/stale-2" \
-        "$ECS_LOGS" /ecs/test-group --lines 1 2>&1
+        "$ECS_LOGS" /ecs/test-group --verbose --lines 1 2>&1
     ) || true
 
     # Should select the third stream
@@ -266,7 +266,7 @@ test_single_stream_in_output() {
         PATH="$tmpdir/bin:$PATH" \
         MOCK_STREAMS=$'ecs/container/task-a\tecs/container/task-b' \
         MOCK_STALE_STREAMS="" \
-        "$ECS_LOGS" /ecs/test-group --lines 1 2>&1
+        "$ECS_LOGS" /ecs/test-group --verbose --lines 1 2>&1
     ) || true
 
     # Count how many "Stream:" lines there are — should be exactly 1
@@ -314,6 +314,78 @@ test_no_streams() {
     fi
 }
 
+# Test 10: Default-mode suppresses Log group/Stream/--- preamble on stderr
+test_terse_mode_no_preamble() {
+    local tmpdir
+    tmpdir=$(setup_mock_aws)
+
+    local stderr_output
+    stderr_output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        MOCK_STREAMS=$'ecs/container/task-a' \
+        MOCK_STALE_STREAMS="" \
+        "$ECS_LOGS" /ecs/test-group --lines 1 2>&1 >/dev/null
+    ) || true
+
+    # In terse mode, Log group/Stream/--- should NOT appear on stderr
+    if echo "$stderr_output" | grep -q "^Log group:"; then
+        fail "terse mode suppresses Log group: preamble" \
+            "Log group: appeared in stderr: $stderr_output"
+    else
+        pass "terse mode suppresses Log group: preamble"
+    fi
+
+    if echo "$stderr_output" | grep -q "^Stream:"; then
+        fail "terse mode suppresses Stream: preamble" \
+            "Stream: appeared in stderr: $stderr_output"
+    else
+        pass "terse mode suppresses Stream: preamble"
+    fi
+}
+
+# Test 11: --verbose mode restores Log group/Stream preamble
+test_verbose_restores_preamble() {
+    local tmpdir
+    tmpdir=$(setup_mock_aws)
+
+    local stderr_output
+    stderr_output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        MOCK_STREAMS=$'ecs/container/task-a' \
+        MOCK_STALE_STREAMS="" \
+        "$ECS_LOGS" /ecs/test-group --verbose --lines 1 2>&1 >/dev/null
+    ) || true
+
+    if echo "$stderr_output" | grep -q "Log group:"; then
+        pass "--verbose restores Log group: preamble"
+    else
+        fail "--verbose restores Log group: preamble" \
+            "Log group: not in stderr: $stderr_output"
+    fi
+}
+
+# Test 12: JM_VERBOSE=1 restores preamble
+test_jm_verbose_restores_preamble() {
+    local tmpdir
+    tmpdir=$(setup_mock_aws)
+
+    local stderr_output
+    stderr_output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        MOCK_STREAMS=$'ecs/container/task-a' \
+        MOCK_STALE_STREAMS="" \
+        JM_VERBOSE=1 \
+        "$ECS_LOGS" /ecs/test-group --lines 1 2>&1 >/dev/null
+    ) || true
+
+    if echo "$stderr_output" | grep -q "Log group:"; then
+        pass "JM_VERBOSE=1 restores Log group: preamble"
+    else
+        fail "JM_VERBOSE=1 restores Log group: preamble" \
+            "Log group: not in stderr: $stderr_output"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_no_args
@@ -325,6 +397,9 @@ test_multiple_stale_fallback
 test_all_stale_error
 test_single_stream_in_output
 test_no_streams
+test_terse_mode_no_preamble
+test_verbose_restores_preamble
+test_jm_verbose_restores_preamble
 
 echo ""
 echo "────────────────────────────────────────────"

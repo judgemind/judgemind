@@ -23,8 +23,25 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
+
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REGION="us-west-2"
+
+# Parse --verbose/-v before positional args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verbose|-v)
+            VERBOSE=1
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 SERVICE="${1:-}"
 CLUSTER="${2:-judgemind-dev}"
@@ -36,7 +53,8 @@ if [[ -z "$SERVICE" ]]; then
     exit 1
 fi
 
-echo "Forcing new deployment: cluster=$CLUSTER service=$SERVICE" >&2
+vlog "Forcing new deployment: cluster=$CLUSTER service=$SERVICE"
+echo "Redeploying $CLUSTER/$SERVICE..." >&2
 
 # Step 1 — Force a new deployment and capture the new deployment ID.
 #
@@ -58,7 +76,7 @@ if [[ -z "$NEW_DEPLOYMENT_ID" || "$NEW_DEPLOYMENT_ID" == "None" ]]; then
     exit 1
 fi
 
-echo "Deployment started: $NEW_DEPLOYMENT_ID" >&2
+vlog "Deployment started: $NEW_DEPLOYMENT_ID"
 
 # Step 2 — Wait for OUR deployment to reach COMPLETED.
 #
@@ -97,12 +115,35 @@ if [[ -z "$TASK_ARNS" ]]; then
 fi
 
 # Describe tasks to get task IDs and image digests
-aws ecs describe-tasks \
+TASKS_JSON=$(aws ecs describe-tasks \
     --cluster "$CLUSTER" \
     --tasks $TASK_ARNS \
     --region "$REGION" \
-    --output table \
+    --output json \
     --no-cli-pager \
-    --query 'tasks[*].{TaskId: taskArn, Status: lastStatus, Image: containers[0].image, ImageDigest: containers[0].imageDigest}'
+    --query 'tasks[*].{TaskId: taskArn, Status: lastStatus, Image: containers[0].image, ImageDigest: containers[0].imageDigest}')
+
+if [[ "${VERBOSE:-0}" == "1" ]]; then
+    echo "$TASKS_JSON" | python3 -c "
+import sys, json
+tasks = json.load(sys.stdin)
+print('{:<60} {:<10} {:<20}'.format('TaskId', 'Status', 'ImageDigest'))
+print('-' * 94)
+for t in tasks:
+    tid = t.get('TaskId', '')[-12:]
+    status = t.get('Status', '')
+    digest = (t.get('ImageDigest') or '')[:20]
+    print('{:<60} {:<10} {:<20}'.format(tid, status, digest))
+"
+else
+    echo "$TASKS_JSON" | python3 -c "
+import sys, json
+tasks = json.load(sys.stdin)
+for t in tasks:
+    tid = t.get('TaskId', '').split('/')[-1]
+    digest = (t.get('ImageDigest') or 'unknown')[:20]
+    print('Deployed: {} image={}'.format(tid, digest))
+"
+fi
 
 echo "Deployment complete." >&2

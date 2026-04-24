@@ -109,6 +109,62 @@ echo "nested" > "$TEST_DIR/src5.txt"
 
 assert_content "$TEST_DIR/sub/dir/dst5.txt" "nested" "File created in nested directory"
 
+# --- Test 6: Default-mode success is silent (no output) ---
+echo "--- Test 6: Default-mode success is silent ---"
+echo "content" > "$TEST_DIR/src6.txt"
+all_output=$("$SCRIPT" "$TEST_DIR/src6.txt" "$TEST_DIR/dst6.txt" 2>&1) || true
+line_count=$(echo "$all_output" | grep -c . || true)
+if [ "$line_count" -eq 0 ]; then
+    echo "PASS: default-mode success is silent (0 lines)"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: default-mode success is silent (got $line_count lines: $all_output)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- Test 7: --verbose flag restores Copied line ---
+echo "--- Test 7: --verbose restores Copied line ---"
+echo "content7" > "$TEST_DIR/src7.txt"
+verbose_output=$("$SCRIPT" --verbose "$TEST_DIR/src7.txt" "$TEST_DIR/dst7.txt" 2>&1) || true
+if echo "$verbose_output" | grep -qi "copied\|src7\|dst7"; then
+    echo "PASS: --verbose shows Copied line"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: --verbose shows Copied line (got: $verbose_output)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- Test 8: JM_VERBOSE=1 restores Copied line ---
+echo "--- Test 8: JM_VERBOSE=1 restores Copied line ---"
+echo "content8" > "$TEST_DIR/src8.txt"
+env_verbose_output=$(JM_VERBOSE=1 "$SCRIPT" "$TEST_DIR/src8.txt" "$TEST_DIR/dst8.txt" 2>&1) || true
+if echo "$env_verbose_output" | grep -qi "copied\|src8\|dst8"; then
+    echo "PASS: JM_VERBOSE=1 shows Copied line"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: JM_VERBOSE=1 shows Copied line (got: $env_verbose_output)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- Test 9: Failure path stays loud ---
+echo "--- Test 9: Failure path stays loud ---"
+exit_code=0
+stderr_fail=$("$SCRIPT" "$TEST_DIR/nonexistent.txt" "$TEST_DIR/dst9.txt" 2>&1 >/dev/null) || exit_code=$?
+if [ "$exit_code" -ne 0 ]; then
+    echo "PASS: exits non-zero on missing source"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: exits non-zero on missing source (expected non-zero, got 0)"
+    FAIL=$((FAIL + 1))
+fi
+if echo "$stderr_fail" | grep -qi "error\|does not exist"; then
+    echo "PASS: failure path contains error message"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: failure path contains error message (got: $stderr_fail)"
+    FAIL=$((FAIL + 1))
+fi
+
 # --- Summary ---
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

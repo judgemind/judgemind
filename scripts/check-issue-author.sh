@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check whether a GitHub issue was filed by a trusted author.
 #
-# Usage: scripts/check-issue-author.sh <issue-number>
+# Usage: scripts/check-issue-author.sh [--verbose|-v] <issue-number>
 #
 # Exit codes:
 #   0 — trusted author (OWNER, MEMBER, COLLABORATOR)
@@ -10,8 +10,25 @@
 #
 # Trusted means the issue author has write access or higher on the repo.
 # The dispatcher and /task skill call this before picking up work.
+#
+# Options:
+#   --verbose, -v   No extra output (the single output line is always emitted);
+#                   flag accepted for API consistency with other terse scripts.
+#
+# Environment:
+#   JM_VERBOSE=1    Same as --verbose
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR/_terse_lib.sh"
+
+# Parse --verbose/-v before the issue number
+if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
+    VERBOSE=1
+    shift
+fi
 
 ISSUE="${1:?Usage: check-issue-author.sh <issue-number>}"
 REPO="judgemind/judgemind"

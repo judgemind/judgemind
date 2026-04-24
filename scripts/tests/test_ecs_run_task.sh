@@ -316,6 +316,70 @@ test_timeout_wraps_interpreter_not_download() {
     fi
 }
 
+# Test 7: --verbose flag is accepted (dry-run still completes)
+test_verbose_flag_accepted() {
+    local fake_script tmpdir output exit_code
+    fake_script=$(make_fake_script)
+    tmpdir=$(setup_mock_aws)
+
+    exit_code=0
+    output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        "$ECS_RUN_TASK" --verbose --dry-run "$fake_script" 2>&1
+    ) || exit_code=$?
+
+    # dry-run exits 0 by design
+    if [[ $exit_code -eq 0 ]]; then
+        pass "--verbose flag accepted in dry-run mode"
+    else
+        fail "--verbose flag accepted in dry-run mode" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 8: JM_VERBOSE=1 accepted (dry-run still completes)
+test_jm_verbose_accepted() {
+    local fake_script tmpdir output exit_code
+    fake_script=$(make_fake_script)
+    tmpdir=$(setup_mock_aws)
+
+    exit_code=0
+    output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        JM_VERBOSE=1 \
+        "$ECS_RUN_TASK" --dry-run "$fake_script" 2>&1
+    ) || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        pass "JM_VERBOSE=1 accepted in dry-run mode"
+    else
+        fail "JM_VERBOSE=1 accepted in dry-run mode" "exit=$exit_code output=$output"
+    fi
+}
+
+# Test 9: Default-mode dry-run stderr is terse (no "Resolving networking" etc.)
+test_default_mode_is_terse() {
+    local fake_script tmpdir output
+    fake_script=$(make_fake_script)
+    tmpdir=$(setup_mock_aws)
+
+    output=$(
+        PATH="$tmpdir/bin:$PATH" \
+        "$ECS_RUN_TASK" --dry-run "$fake_script" 2>&1
+    ) || true
+
+    if echo "$output" | grep -q "Resolving networking"; then
+        fail "default mode does not show Resolving networking" "output: $output"
+    else
+        pass "default mode suppresses Resolving networking"
+    fi
+
+    if echo "$output" | grep -q "Reading latest task definition"; then
+        fail "default mode does not show Reading latest task definition" "output: $output"
+    else
+        pass "default mode suppresses Reading latest task definition"
+    fi
+}
+
 # ── Run all tests ──────────────────────────────────────────────────────────
 
 test_help_documents_max_runtime
@@ -324,6 +388,9 @@ test_without_max_runtime_no_timeout_wrapper
 test_with_max_runtime_wraps_timeout
 test_max_runtime_zero_disables
 test_timeout_wraps_interpreter_not_download
+test_verbose_flag_accepted
+test_jm_verbose_accepted
+test_default_mode_is_terse
 
 echo ""
 echo "────────────────────────────────────────────"

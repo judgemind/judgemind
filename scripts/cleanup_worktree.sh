@@ -38,6 +38,17 @@ if [[ "$_CLEANUP_SOURCED" -eq 0 ]]; then
     set -euo pipefail
 fi
 
+# Source terse lib (must happen after BASH_SOURCE detection to avoid side effects)
+_CLEANUP_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$_CLEANUP_SCRIPT_DIR/_terse_lib.sh"
+
+# Parse --verbose/-v from first arg if it appears before the worktree path
+if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
+    VERBOSE=1
+    shift
+fi
+
 # --- Find repo root ---
 find_repo_root() {
     # Walk up from this script's location to find the repo root.
@@ -136,16 +147,16 @@ remove_worktree() {
 
     # Try git worktree remove --force
     if git -C "$repo_root" worktree remove --force "$worktree_path" 2>/dev/null; then
-        echo "Removed worktree via git: $worktree_path" >&2
+        vlog "Removed worktree via git: $worktree_path"
         return 0
     fi
 
-    echo "git worktree remove failed, falling back to rm + prune" >&2
+    vlog "git worktree remove failed, falling back to rm + prune"
 
     # Fallback: rm -rf + git worktree prune
     if rm -rf "$worktree_path"; then
         git -C "$repo_root" worktree prune 2>/dev/null || true
-        echo "Removed worktree via rm + prune: $worktree_path" >&2
+        vlog "Removed worktree via rm + prune: $worktree_path"
         return 0
     fi
 
@@ -198,7 +209,7 @@ main() {
 
     # Check if worktree still exists
     if [[ ! -d "$worktree_path" ]]; then
-        echo "Worktree already removed: $worktree_path" >&2
+        vlog "Worktree already removed: $worktree_path"
         # Heal stale git metadata. If the on-disk dir is gone but
         # .git/worktrees/<dir_name>/ still exists (e.g., an earlier
         # cleanup crashed mid-way, or something rm -rf'd the dir
@@ -210,7 +221,7 @@ main() {
         local metadata_dir="$repo_root/.git/worktrees/$dir_name"
         if [[ -d "$metadata_dir" ]]; then
             rm -rf "$metadata_dir"
-            echo "Cleaned up stale metadata: $metadata_dir" >&2
+            vlog "Cleaned up stale metadata: $metadata_dir"
         fi
         return 0
     fi
@@ -225,7 +236,7 @@ main() {
     # Safety check 3: verify agent is finished
     local reason
     if reason="$(agent_is_finished "$jsonl_path" 2>&1)"; then
-        echo "Agent confirmed finished: $reason" >&2
+        vlog "Agent confirmed finished: $reason"
     else
         echo "ERROR: agent appears to still be running: $reason" >&2
         return 1
@@ -233,6 +244,7 @@ main() {
 
     # Remove the worktree (this also cd's to repo root)
     if remove_worktree "$repo_root" "$worktree_path"; then
+        echo "Removed worktree $dir_name" >&2
         return 0
     fi
     return 1

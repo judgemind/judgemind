@@ -10,16 +10,24 @@
 # process described in docs/agent/task-dependencies.md §When you finish a task.
 #
 # Usage:
-#   scripts/unblock-dependents.sh <closed-issue>
+#   scripts/unblock-dependents.sh [--verbose|-v] <closed-issue>
 #   scripts/unblock-dependents.sh 1939
 #   scripts/unblock-dependents.sh --dry-run 1939
 #   scripts/unblock-dependents.sh --help
 #
 # Options:
-#   --dry-run   Show what would be done without making changes
-#   --help      Show this help message
+#   --dry-run       Show what would be done without making changes
+#   --verbose, -v   Show detailed progress output (default: terse)
+#   --help          Show this help message
+#
+# Environment:
+#   JM_VERBOSE=1    Same as --verbose
 
 set -euo pipefail
+
+SCRIPT_DIR_UNBLOCK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR_UNBLOCK/_terse_lib.sh"
 
 DRY_RUN=false
 
@@ -28,6 +36,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --verbose|-v)
+            VERBOSE=1
             shift
             ;;
         --help|-h)
@@ -78,7 +90,7 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # Search for open issues containing "Blocked by #N"
-echo "Searching for open issues blocked by #$CLOSED_ISSUE..."
+vlog "Searching for open issues blocked by #$CLOSED_ISSUE..."
 BLOCKED_ISSUES=$(gh issue list --repo "$REPO" \
     --state open \
     --search "\"Blocked by #$CLOSED_ISSUE\"" \
@@ -95,12 +107,10 @@ if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
     exit 0
 fi
 
-echo "Found $COUNT candidate issue(s). Checking blockers..."
-echo ""
+vlog "Found $COUNT candidate issue(s). Checking blockers..."
 
 # Resolve the directory for temp files
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORK_TMPDIR="${SCRIPT_DIR}/../tmp"
+WORK_TMPDIR="${SCRIPT_DIR_UNBLOCK}/../tmp"
 mkdir -p "$WORK_TMPDIR"
 
 # Delegate to Python helper for JSON parsing and body manipulation
@@ -109,4 +119,6 @@ CLOSED_ISSUE="$CLOSED_ISSUE" \
 DRY_RUN="$DRY_RUN" \
 BLOCKED_ISSUES="$BLOCKED_ISSUES" \
 WORK_TMPDIR="$WORK_TMPDIR" \
-python3 "$SCRIPT_DIR/_unblock_dependents.py"
+JM_VERBOSE="${JM_VERBOSE:-}" \
+VERBOSE="${VERBOSE:-0}" \
+python3 "$SCRIPT_DIR_UNBLOCK/_unblock_dependents.py"

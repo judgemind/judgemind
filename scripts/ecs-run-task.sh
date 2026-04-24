@@ -72,6 +72,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR_ERT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_terse_lib.sh
+source "$SCRIPT_DIR_ERT/_terse_lib.sh"
+
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
 ENVIRONMENT="dev"
@@ -143,6 +147,10 @@ while [[ $# -gt 0 ]]; do
             MAX_RUNTIME="$2"
             shift 2
             ;;
+        --verbose|-v)
+            VERBOSE=1
+            shift
+            ;;
         --help|-h)
             head -n 66 "$0" | tail -n +2 | sed 's/^# \?//'
             exit 0
@@ -183,7 +191,7 @@ if [[ -n "$LOGS_TASK_ARN" ]]; then
     fi
 
     # Describe the task to get its status
-    echo "Task ARN: ${LOGS_TASK_ARN}" >&2
+    vlog "Task ARN: ${LOGS_TASK_ARN}"
 
     TASK_DESCRIBE=$(aws ecs describe-tasks \
         --cluster "$CLUSTER_FROM_ARN" \
@@ -236,11 +244,10 @@ PYEOF
     LOGS_ENV=$(echo "$CLUSTER_FROM_ARN" | rev | cut -d'-' -f1 | rev)
     LOGS_LOG_GROUP="/ecs/judgemind-ingestion-worker-${LOGS_ENV}"
 
-    echo "" >&2
+    vlog ""
     echo "─── Task Logs ───────────────────────────────────────────────────" >&2
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR_ERT/.." && pwd)"
 
     # Retry log retrieval — CloudWatch may still be ingesting events
     LOGS_OK=false
@@ -336,8 +343,8 @@ cleanup() {
     local exit_code=$?
 
     if [[ -n "$ONESHOT_TASK_DEF_ARN" ]]; then
-        echo "" >&2
-        echo "Cleaning up: deregistering oneshot task definition..." >&2
+        vlog ""
+        vlog "Cleaning up: deregistering oneshot task definition..."
         aws ecs deregister-task-definition \
             --task-definition "$ONESHOT_TASK_DEF_ARN" \
             --region "$REGION" \
@@ -346,12 +353,12 @@ cleanup() {
     fi
 
     if [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "false" ]]; then
-        echo "Cleaning up: removing script from S3..." >&2
+        vlog "Cleaning up: removing script from S3..."
         aws s3 rm "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
             --region "$REGION" > /dev/null 2>&1 || true
     elif [[ -n "$S3_SCRIPT_KEY" && "$DETACH" == "true" ]]; then
-        echo "Detach mode: S3 script at s3://${S3_BUCKET}/${S3_SCRIPT_KEY} left for task to download." >&2
-        echo "Clean it up manually after the task completes, or it will expire from bucket lifecycle rules." >&2
+        vlog "Detach mode: S3 script at s3://${S3_BUCKET}/${S3_SCRIPT_KEY} left for task to download."
+        vlog "Clean it up manually after the task completes, or it will expire from bucket lifecycle rules."
     fi
 
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -365,8 +372,7 @@ trap cleanup EXIT
 
 # ─── Resolve the repo root ──────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR_ERT/.." && pwd)"
 
 # Create a temporary directory for intermediate files
 TMP_DIR=$(mktemp -d)
@@ -376,7 +382,7 @@ TMP_DIR=$(mktemp -d)
 SOURCE_FAMILY="judgemind-ingestion-worker-${ENVIRONMENT}"
 CLUSTER="judgemind-${ENVIRONMENT}"
 
-echo "Reading latest task definition for ${SOURCE_FAMILY}..." >&2
+vlog "Reading latest task definition for ${SOURCE_FAMILY}..."
 
 SOURCE_TASK_DEF=$(aws ecs describe-task-definition \
     --task-definition "$SOURCE_FAMILY" \
@@ -446,35 +452,35 @@ if [[ -n "$LATEST_ECR_INFO" && "$LATEST_ECR_INFO" != "null" ]]; then
     if [[ -n "$SERVICE_DIGEST" && "$SERVICE_DIGEST" != "$LATEST_DIGEST" ]]; then
         if [[ "$USE_SERVICE_IMAGE" == "true" ]]; then
             # Explicitly opted into the service image despite mismatch
-            echo "" >&2
-            echo "NOTE: Service image differs from latest ECR image, but --service-image was specified." >&2
-            echo "  Service image tag: ${SERVICE_IMAGE_TAG}" >&2
-            echo "  Service digest:    ${SERVICE_DIGEST}" >&2
-            echo "  Latest digest:     ${LATEST_DIGEST}" >&2
-            echo "  Latest pushed:     ${LATEST_PUSHED}" >&2
-            echo "Using the service image as requested." >&2
-            echo "" >&2
+            vlog ""
+            vlog "NOTE: Service image differs from latest ECR image, but --service-image was specified."
+            vlog "  Service image tag: ${SERVICE_IMAGE_TAG}"
+            vlog "  Service digest:    ${SERVICE_DIGEST}"
+            vlog "  Latest digest:     ${LATEST_DIGEST}"
+            vlog "  Latest pushed:     ${LATEST_PUSHED}"
+            vlog "Using the service image as requested."
+            vlog ""
         else
             # Default behavior: use the latest ECR image to avoid stale code
-            echo "Service image differs from latest ECR image — using latest (pushed ${LATEST_PUSHED})." >&2
-            echo "  Service image tag: ${SERVICE_IMAGE_TAG}" >&2
-            echo "  Service digest:    ${SERVICE_DIGEST}" >&2
-            echo "  Latest digest:     ${LATEST_DIGEST}" >&2
-            echo "To use the service's (possibly stale) image instead:" >&2
-            echo "  scripts/ecs-run-task.sh --service-image <script-path> [-- args...]" >&2
-            echo "" >&2
+            vlog "Service image differs from latest ECR image — using latest (pushed ${LATEST_PUSHED})."
+            vlog "  Service image tag: ${SERVICE_IMAGE_TAG}"
+            vlog "  Service digest:    ${SERVICE_DIGEST}"
+            vlog "  Latest digest:     ${LATEST_DIGEST}"
+            vlog "To use the service's (possibly stale) image instead:"
+            vlog "  scripts/ecs-run-task.sh --service-image <script-path> [-- args...]"
+            vlog ""
             OVERRIDE_IMAGE="${ECR_REPO_URI}:latest"
         fi
     else
         # Digests match — service is up to date, nothing to override
         if [[ "$USE_LATEST_IMAGE" == "true" || "$USE_SERVICE_IMAGE" == "true" ]]; then
-            echo "Service image already matches the latest ECR image — no override needed." >&2
+            vlog "Service image already matches the latest ECR image — no override needed."
         fi
     fi
 else
     # Could not resolve latest ECR image — fall back to service image
-    echo "WARNING: Could not resolve latest image from ECR repository '${ECR_REPO_NAME}'." >&2
-    echo "Falling back to the service's image." >&2
+    vlog "WARNING: Could not resolve latest image from ECR repository '${ECR_REPO_NAME}'."
+    vlog "Falling back to the service's image."
 fi
 
 # ─── Step 1c: Resolve task role override ─────────────────────────────────────
@@ -482,7 +488,7 @@ fi
 OVERRIDE_ROLE_ARN=""
 
 if [[ -n "$ROLE_OVERRIDE" ]]; then
-    echo "Resolving IAM role '${ROLE_OVERRIDE}'..." >&2
+    vlog "Resolving IAM role '${ROLE_OVERRIDE}'..."
     OVERRIDE_ROLE_ARN=$(aws iam get-role \
         --role-name "$ROLE_OVERRIDE" \
         --region "$REGION" \
@@ -493,7 +499,7 @@ if [[ -n "$ROLE_OVERRIDE" ]]; then
         echo "Check the role name and your AWS credentials." >&2
         exit 1
     }
-    echo "Task role override: ${OVERRIDE_ROLE_ARN}" >&2
+    vlog "Task role override: ${OVERRIDE_ROLE_ARN}"
 fi
 
 # ─── Step 2: Prepare the script payload ──────────────────────────────────────
@@ -551,8 +557,8 @@ fi
 if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
     USE_S3=true
     S3_SCRIPT_KEY="oneshot-scripts/${ONESHOT_ID}/${SCRIPT_BASENAME}"
-    echo "Script is ${SCRIPT_SIZE} bytes (exceeds inline limit)." >&2
-    echo "Uploading to s3://${S3_BUCKET}/${S3_SCRIPT_KEY}..." >&2
+    vlog "Script is ${SCRIPT_SIZE} bytes (exceeds inline limit)."
+    vlog "Uploading to s3://${S3_BUCKET}/${S3_SCRIPT_KEY}..."
 
     if [[ "$DRY_RUN" == "false" ]]; then
         aws s3 cp "$SCRIPT_PATH" "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
@@ -581,25 +587,25 @@ else
     COMMAND_STR="echo ${ENCODED} | base64 -d > /tmp/_oneshot_script && ${INVOCATION}"
 fi
 
-echo "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)" >&2
-echo "Interpreter: ${INTERPRETER}" >&2
-echo "Resources: ${CPU} CPU / ${MEMORY} MB memory" >&2
+vlog "Script: ${SCRIPT_PATH} (${SCRIPT_SIZE} bytes)"
+vlog "Interpreter: ${INTERPRETER}"
+vlog "Resources: ${CPU} CPU / ${MEMORY} MB memory"
 if [[ -n "$MAX_RUNTIME" && "$MAX_RUNTIME" -gt 0 ]]; then
-    echo "Max runtime: ${MAX_RUNTIME}s (timeout --signal=TERM --kill-after=30)" >&2
+    vlog "Max runtime: ${MAX_RUNTIME}s (timeout --signal=TERM --kill-after=30)"
 fi
 if [[ -n "$OVERRIDE_ROLE_ARN" ]]; then
-    echo "Task role: ${ROLE_OVERRIDE} (override)" >&2
+    vlog "Task role: ${ROLE_OVERRIDE} (override)"
 fi
 if [[ -n "$OVERRIDE_IMAGE" ]]; then
-    echo "Image: ${OVERRIDE_IMAGE} (--latest-image)" >&2
+    vlog "Image: ${OVERRIDE_IMAGE} (--latest-image)"
 else
-    echo "Image: ${SERVICE_IMAGE} (from service task def)" >&2
+    vlog "Image: ${SERVICE_IMAGE} (from service task def)"
 fi
-echo "Delivery: $(if [[ "$USE_S3" == "true" ]]; then echo "S3 (pre-signed URL, 5 min TTL)"; else echo "inline (base64)"; fi)" >&2
+vlog "Delivery: $(if [[ "$USE_S3" == "true" ]]; then echo "S3 (pre-signed URL, 5 min TTL)"; else echo "inline (base64)"; fi)"
 if [[ ${#SCRIPT_ARGS[@]} -gt 0 ]]; then
-    echo "Script args:${ARGS_STR}" >&2
+    vlog "Script args:${ARGS_STR}"
 fi
-echo "" >&2
+vlog ""
 
 # ─── Step 3: Register the oneshot task definition ────────────────────────────
 
@@ -666,7 +672,7 @@ if not task_def["taskRoleArn"]:
 json.dump(task_def, sys.stdout, indent=2)
 PYEOF
 
-echo "Building oneshot task definition (family=${ONESHOT_FAMILY})..." >&2
+vlog "Building oneshot task definition (family=${ONESHOT_FAMILY})..."
 
 TASK_DEF_JSON=$(echo "$SOURCE_TASK_DEF" | \
     COMMAND_STR="$COMMAND_STR" \
@@ -697,13 +703,13 @@ REGISTER_OUTPUT=$(aws ecs register-task-definition \
 
 ONESHOT_TASK_DEF_ARN=$(echo "$REGISTER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['taskDefinition']['taskDefinitionArn'])")
 
-echo "Registered: ${ONESHOT_TASK_DEF_ARN}" >&2
+vlog "Registered: ${ONESHOT_TASK_DEF_ARN}"
 
 # ─── Step 4: Resolve networking from the ingestion worker service ────────────
 
 SERVICE_NAME="judgemind-ingestion-worker-${ENVIRONMENT}"
 
-echo "Resolving networking from service ${SERVICE_NAME}..." >&2
+vlog "Resolving networking from service ${SERVICE_NAME}..."
 
 NETWORK_CONFIG=$(aws ecs describe-services \
     --cluster "$CLUSTER" \
@@ -722,13 +728,13 @@ fi
 SUBNETS=$(echo "$NETWORK_CONFIG" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(d['subnets']))")
 SECURITY_GROUPS=$(echo "$NETWORK_CONFIG" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join(d['securityGroups']))")
 
-echo "Subnets: ${SUBNETS}" >&2
-echo "Security groups: ${SECURITY_GROUPS}" >&2
+vlog "Subnets: ${SUBNETS}"
+vlog "Security groups: ${SECURITY_GROUPS}"
 
 # ─── Step 5: Run the task ────────────────────────────────────────────────────
 
-echo "" >&2
-echo "Launching oneshot task..." >&2
+vlog ""
+vlog "Launching oneshot task..."
 
 RUN_OUTPUT=$(aws ecs run-task \
     --cluster "$CLUSTER" \
@@ -754,24 +760,23 @@ fi
 # Extract just the task ID from the ARN for log stream lookup
 TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
 
-echo "Task ARN: ${TASK_ARN}" >&2
-echo "Task ID:  ${TASK_ID}" >&2
+vlog "Task ARN: ${TASK_ARN}"
+vlog "Task ID:  ${TASK_ID}"
 
 # Print the log location so the user can find logs easily
 LOG_GROUP="/ecs/judgemind-ingestion-worker-${ENVIRONMENT}"
 LOG_STREAM="oneshot/oneshot/${TASK_ID}"
-echo "" >&2
-echo "Logs:" >&2
-echo "  Log group:  ${LOG_GROUP}" >&2
-echo "  Log stream: ${LOG_STREAM}" >&2
-echo "  Tail logs:  scripts/ecs-task-logs.sh ${TASK_ID}" >&2
-echo "  Full status: scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
-echo "" >&2
+echo "Launched task ${TASK_ARN}" >&2
+echo "Logs: scripts/ecs-run-task.sh --logs ${TASK_ARN}" >&2
+vlog "  Log group:  ${LOG_GROUP}"
+vlog "  Log stream: ${LOG_STREAM}"
+vlog "  Tail logs:  scripts/ecs-task-logs.sh ${TASK_ID}"
+vlog ""
 
 # ─── Detach mode: print ARN to stdout and exit ──────────────────────────────
 
 if [[ "$DETACH" == "true" ]]; then
-    echo "Detach mode: task launched successfully." >&2
+    vlog "Detach mode: task launched successfully."
 
     # Print the task ARN to stdout (everything else goes to stderr)
     # so callers can capture it easily.
@@ -781,7 +786,7 @@ fi
 
 # ─── Step 6: Poll for completion with real-time log streaming ────────────────
 
-echo "Waiting for task to complete (timeout: ${TIMEOUT}s)..." >&2
+vlog "Waiting for task to complete (timeout: ${TIMEOUT}s)..."
 
 POLL_INTERVAL=10
 ELAPSED=0
@@ -900,11 +905,11 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
     if [[ "$LOG_STREAMING" == "false" && ( "$CURRENT_STATUS" == "RUNNING" || "$CURRENT_STATUS" == "STOPPED" ) ]]; then
         LOG_STREAM_NAME=$(find_log_stream)
         if [[ -n "$LOG_STREAM_NAME" ]]; then
-            echo "Log stream: ${LOG_STREAM_NAME}" >&2
+            vlog "Log stream: ${LOG_STREAM_NAME}"
             echo "─── Live Logs ───────────────────────────────────────────────────" >&2
             LOG_STREAMING=true
         else
-            echo "Waiting for log stream to appear..." >&2
+            vlog "Waiting for log stream to appear..."
         fi
     fi
 
@@ -930,7 +935,7 @@ if [[ "$LOG_STREAMING" == "false" ]]; then
         sleep "$_stream_wait"
         LOG_STREAM_NAME=$(find_log_stream)
         if [[ -n "$LOG_STREAM_NAME" ]]; then
-            echo "Log stream: ${LOG_STREAM_NAME}" >&2
+            vlog "Log stream: ${LOG_STREAM_NAME}"
             echo "─── Live Logs ───────────────────────────────────────────────────" >&2
             LOG_STREAMING=true
             break

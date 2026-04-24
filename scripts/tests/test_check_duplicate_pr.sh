@@ -77,6 +77,7 @@ fi
 MOCK_BIN_DIR=$(mktemp -d)
 TEMP_DIRS+=("$MOCK_BIN_DIR")
 ORIG_PATH_SAVE="$PATH"
+MOCK_BIN_DIR_VERBOSE=""
 export PATH="$MOCK_BIN_DIR:$ORIG_PATH_SAVE"
 
 # ── Test 2: exit 1 when no duplicate PR exists ─────────────────────────────
@@ -201,6 +202,46 @@ else
 fi
 
 # Restore PATH
+export PATH="$ORIG_PATH_SAVE"
+
+# ── Test 7: --verbose flag accepted (output contract unchanged) ───────────
+
+MOCK_BIN_DIR_VERBOSE=$(mktemp -d)
+TEMP_DIRS+=("$MOCK_BIN_DIR_VERBOSE")
+export PATH="$MOCK_BIN_DIR_VERBOSE:$ORIG_PATH_SAVE"
+
+cat > "$MOCK_BIN_DIR_VERBOSE/gh" << 'MOCKGH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "pr" && "${2:-}" == "list" ]]; then
+    echo "[]"
+    exit 0
+fi
+exit 0
+MOCKGH
+chmod +x "$MOCK_BIN_DIR_VERBOSE/gh"
+
+exit_code=0
+output=$("$WRAPPER" --verbose 99999 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"ok"* ]]; then
+    pass "--verbose still produces ok: contract line"
+else
+    fail "--verbose still produces ok: contract line" "exit=$exit_code output='$output'"
+fi
+
+export PATH="$ORIG_PATH_SAVE"
+
+# ── Test 8: JM_VERBOSE=1 accepted (output contract unchanged) ────────────
+
+export PATH="$MOCK_BIN_DIR_VERBOSE:$ORIG_PATH_SAVE"
+
+exit_code=0
+output=$(JM_VERBOSE=1 "$WRAPPER" 99999 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 1 && "$output" == *"ok"* ]]; then
+    pass "JM_VERBOSE=1 still produces ok: contract line"
+else
+    fail "JM_VERBOSE=1 still produces ok: contract line" "exit=$exit_code output='$output'"
+fi
+
 export PATH="$ORIG_PATH_SAVE"
 
 # ── Summary ───────────────────────────────────────────────────────────────
