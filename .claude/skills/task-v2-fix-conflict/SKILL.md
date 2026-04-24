@@ -2,7 +2,7 @@
 description: Fix-conflict phase for the per-phase /task-v2 pipeline. Reads a rebase-conflict bundle, resolves conflicts semantically against updated origin/main content, and produces either a resolved-file set OR an unresolvable signal.
 argument-hint: "<agent-id>"
 maxTurns: 60
-model: haiku
+model: sonnet
 ---
 
 # /task-v2-fix-conflict skill
