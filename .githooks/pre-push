@@ -521,6 +521,29 @@ if [ -n "$changed_migrations" ]; then
 fi
 
 # -------------------------------------------------------------------
+# BRAND.md ↔ tailwind.config.ts drift — run when either file changes
+# -------------------------------------------------------------------
+# Mirrors the CI `docs-tailwind-drift-check` job so a token-value
+# mismatch between docs/BRAND.md and packages/web/tailwind.config.ts
+# is caught locally before CI runs (#2831).
+changed_brand_tokens=$(echo "$changed_files" \
+    | grep -E '^(docs/BRAND\.md|packages/web/tailwind\.config\.ts)$' || true)
+if [ -n "$changed_brand_tokens" ]; then
+    echo "pre-push: checking BRAND.md ↔ tailwind.config.ts token sync..." >&2
+    if [ -x scripts/check-brand-md-tokens.sh ]; then
+        if ! run_check "_" "scripts/check-brand-md-tokens.sh" scripts/check-brand-md-tokens.sh; then
+            echo "  docs/BRAND.md and packages/web/tailwind.config.ts are out of sync." >&2
+            echo "" >&2
+            echo "  Fix: update tailwind.config.ts to match docs/BRAND.md" >&2
+            echo "  (or vice-versa). See docs/BRAND.md §Tailwind Token Mapping." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-brand-md-tokens.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Dispatcher image dependency drift — run when the daemon or its
 # Dockerfile changes (#2776)
 # -------------------------------------------------------------------
