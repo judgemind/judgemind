@@ -26,6 +26,33 @@ All external calls — subprocess (``claude -p``, ``gh``, ``git``,
 ``scripts/check-issue-author.sh``) and psycopg — are mocked. The
 orchestration path does not exercise ``claude`` or ``gh`` binaries on
 the test runner.
+
+Fakes & fixtures
+----------------
+``_FakeCursor`` is the shared DB cursor stub used throughout this file.
+
+**Preferred pattern — dict-keyed responses (issue #2793):**
+Set ``cursor.fetch_responses`` to a ``dict[str, Any]`` that maps SQL
+fragment strings to the value ``fetchone()`` should return.  On each
+``fetchone()`` call the cursor inspects the last executed SQL
+(``self.executed[-1][0]``) and returns the value whose key is a
+substring of that SQL (insertion-order, first match wins).  This is
+robust against positional reordering of DB calls.
+
+Example::
+
+    conn.cursor_instance.fetch_responses = {
+        "status = 'retrying'": None,
+        "FROM dispatcher.queue_snapshots": (None, [42]),
+        "FROM dispatcher.agents WHERE issue_number": None,
+    }
+
+**Legacy pattern — positional queue (kept for existing tests):**
+Set ``cursor.fetch_queue`` to a list; each ``fetchone()`` call pops
+the front element.  Tests that haven't migrated still work unchanged —
+when ``fetch_responses`` is empty (the default) ``fetchone()`` falls
+back to the legacy queue exactly as before.  New tests should prefer
+``fetch_responses``; the queue is a last resort.
 """
 
 from __future__ import annotations
@@ -60,6 +87,7 @@ class _FakeCursor:
         self.executed: list[tuple[str, Any]] = []
         self.fetch_queue: list[Any] = []
         self.fetchall_queue: list[list[Any]] = []
+        self.fetch_responses: dict[str, Any] = {}
         self.rowcount = 0
 
     def __enter__(self) -> _FakeCursor:
@@ -72,6 +100,11 @@ class _FakeCursor:
         self.executed.append((sql, params))
 
     def fetchone(self) -> Any:
+        if self.fetch_responses and self.executed:
+            last_sql = self.executed[-1][0]
+            for fragment, value in self.fetch_responses.items():
+                if fragment in last_sql:
+                    return value
         if not self.fetch_queue:
             return None
         return self.fetch_queue.pop(0)
@@ -137,6 +170,83 @@ def _make_daemon(
     d._conn = conn  # type: ignore[assignment]
     d._run_id = "test-run-id"
     return d, conn, handler
+
+
+# --------------------------------------------------------------------------
+# _FakeCursor dispatcher unit tests (issue #2793)
+# --------------------------------------------------------------------------
+
+
+class TestFakeCursorDispatcher:
+    """Unit tests for the ``fetch_responses`` dict-keyed dispatcher on ``_FakeCursor``.
+
+    These tests exercise the new dispatcher mechanism directly — not only
+    via the integrated orchestration test — so regressions in the helper
+    are caught at the lowest level.
+    """
+
+    def test_fetch_responses_substring_match_returns_mapped_value(self) -> None:
+        """A key that is a substring of the last executed SQL returns its value."""
+        cur = _FakeCursor()
+        cur.fetch_responses = {"FROM dispatcher.queue_snapshots": (None, [42])}
+        cur.execute(
+            "SELECT snapshot FROM dispatcher.queue_snapshots ORDER BY id DESC LIMIT 1"
+        )
+        assert cur.fetchone() == (None, [42])
+
+    def test_fetch_responses_first_matching_key_wins(self) -> None:
+        """When multiple keys match, insertion order determines the winner."""
+        cur = _FakeCursor()
+        cur.fetch_responses = {
+            "dispatcher": "first",
+            "queue_snapshots": "second",
+        }
+        cur.execute("SELECT * FROM dispatcher.queue_snapshots")
+        # "dispatcher" comes first in insertion order — it wins.
+        assert cur.fetchone() == "first"
+
+    def test_fetch_responses_no_match_falls_back_to_fetch_queue(self) -> None:
+        """When no key matches, the legacy positional queue is used."""
+        cur = _FakeCursor()
+        cur.fetch_responses = {"no_such_fragment": "should_not_return"}
+        cur.fetch_queue = ["from_queue"]
+        cur.execute("SELECT 1")
+        assert cur.fetchone() == "from_queue"
+
+    def test_fetch_responses_no_match_empty_queue_returns_none(self) -> None:
+        """When no key matches and the queue is empty, None is returned."""
+        cur = _FakeCursor()
+        cur.fetch_responses = {"no_such_fragment": "something"}
+        cur.execute("SELECT 1")
+        assert cur.fetchone() is None
+
+    def test_fetch_responses_does_not_consume_fetch_queue_on_match(self) -> None:
+        """A successful dict match leaves the positional queue untouched."""
+        cur = _FakeCursor()
+        cur.fetch_responses = {"SELECT 1": "matched"}
+        cur.fetch_queue = ["queue_item"]
+        cur.execute("SELECT 1")
+        cur.fetchone()  # consumes the dict match
+        # fetch_queue must still have its item intact.
+        assert cur.fetch_queue == ["queue_item"]
+
+    def test_empty_fetch_responses_is_pure_passthrough_to_fetch_queue(self) -> None:
+        """When ``fetch_responses`` is empty (the default), behaviour is unchanged.
+
+        This guards AC2: every existing test that never sets
+        ``fetch_responses`` continues to work identically to before.
+        """
+        cur = _FakeCursor()
+        # fetch_responses is intentionally left at its default empty dict.
+        cur.fetch_queue = ["a", "b", "c"]
+        cur.execute("SELECT 1")
+        assert cur.fetchone() == "a"
+        cur.execute("SELECT 2")
+        assert cur.fetchone() == "b"
+        cur.execute("SELECT 3")
+        assert cur.fetchone() == "c"
+        cur.execute("SELECT 4")
+        assert cur.fetchone() is None
 
 
 # --------------------------------------------------------------------------
@@ -1370,15 +1480,18 @@ class TestHappyPathOrchestration:
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
 
-        # 1. Queue snapshot read returns one candidate.
-        # 2. _issue_already_attempted SELECT returns None (not attempted).
-        # Fetches in order: (1) Phase 3C resume-retry SELECT — no
-        # retrying agent; (2) latest queue_snapshot issue_numbers;
-        # (3) _issue_already_attempted SELECT — not attempted.
-        # Queue snapshot read now returns (issues_json, issue_numbers) —
-        # issues_json=None triggers the pre-#2820 fallback which uses
-        # the raw issue_numbers array (issue #2835).
-        conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
+        # Named fetch_responses dispatcher (issue #2793) — robust against
+        # positional reordering of DB calls.
+        # (1) Phase 3C resume-retry SELECT — no retrying agent → None.
+        # (2) Latest queue_snapshot row: issues_json=None triggers the
+        #     pre-#2820 fallback that uses the raw issue_numbers array
+        #     (issue #2835).
+        # (3) _issue_already_attempted SELECT — not attempted → None.
+        conn.cursor_instance.fetch_responses = {
+            "status = 'retrying'": None,
+            "FROM dispatcher.queue_snapshots": (None, [42]),
+            "FROM dispatcher.agents WHERE issue_number": None,
+        }
 
         # Trust check passes.
         def fake_check_run(cmd: list[str], **kwargs: Any) -> Any:
