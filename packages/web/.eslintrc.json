@@ -20,7 +20,8 @@
     {
       "files": ["src/app/**/*.{ts,tsx}", "src/components/**/*.{ts,tsx}"],
       "rules": {
-        "local/clickable-table-row": "error"
+        "local/clickable-table-row": "error",
+        "local/polled-query-error-guard": "error"
       }
     },
     {
