@@ -2498,13 +2498,17 @@ class DispatcherDaemon:
         # 4. Phase 3A orchestration gate (#2783) — threaded spawn (#2847).
         #
         # Only enter the claim + orchestrate path when (a) the live
-        # ``concurrency_cap`` is >0 AND (b) no agent is currently in
-        # flight for this daemon run AND (c) Phase 3C's GitHub
-        # rate-limit skip flag is not active AND (d) no orchestration
-        # worker thread from a prior tick is still alive. Phase 3 runs
-        # at ``concurrency_cap=1`` (one subprocess at a time); Phase 3E
-        # flips the value from 0 to 1. Until then the gate stays
-        # closed and this branch is a no-op.
+        # ``concurrency_cap`` is >0 AND (b) the current count of
+        # ``status='running'`` agents is strictly less than that cap
+        # AND (c) Phase 3C's GitHub rate-limit skip flag is not active
+        # AND (d) no orchestration worker thread from a prior tick is
+        # still alive. The pre-#3199 gate was a single-slot binary
+        # check (``not _has_active_agent()``) which silently clamped
+        # ``cap > 1`` to one concurrent agent — see #3199 for the
+        # Phase 4 ECS incident. ``_active_agent_count()`` reads the
+        # actual denominator so ``cap == 2`` claims a second slot
+        # after the first agent's ECS task is launched and the
+        # orchestration thread exits.
         #
         # Orchestration runs on a dedicated worker thread so this tick
         # returns quickly (spawn + return = ~ms) and the main run loop
@@ -2515,18 +2519,38 @@ class DispatcherDaemon:
         # phase boundary (≤60s for plan; worst-case ~one ralph
         # iteration for ralph).
         #
+        # ``_maybe_spawn_orchestration_thread`` serializes spawns
+        # per-tick via its own thread-alive guard — at most one new
+        # orchestration thread is spawned per tick even when the gate
+        # opens. Under ECS mode that is fine: the prior tick's
+        # orchestration exits in seconds after launching its Fargate
+        # task, so the next tick can spawn the second agent's
+        # orchestration thread. Under subprocess mode the fix is a
+        # no-op at ``cap == 1`` (``0 < 1`` opens the gate on empty,
+        # ``1 < 1`` closes it once one agent runs — identical to the
+        # old boolean); at ``cap > 1`` subprocess threads contend for
+        # the same orchestration slot across ticks but that is
+        # intentional — an operator opting into ``cap > 1`` on
+        # subprocess accepts the per-tick spawn rate (#3199).
+        #
         # Exceptions here are caught + logged but not re-raised — the
         # scheduler tick must survive any spawn failure so the next
         # tick can try again. Worker-thread exceptions are caught in
         # ``_orchestration_worker_entry``.
         orchestration_attempted = False
-        # #3184 — capture the result of ``_has_active_agent`` when we
-        # call it inside the claim gate so the supervisor orphan check
-        # below can reuse it without a second DB round-trip. ``None``
-        # here means "not checked this tick" (rate-skipped or paused
-        # branches), which is also the signal for the orphan check to
-        # skip this tick and reset the counter.
+        # #3199 — capture the running-agent count once inside the
+        # claim gate so the cap comparison and the scheduler_tick log
+        # event share a single DB round-trip. ``None`` here means
+        # "not checked this tick" (rate-skipped or paused branches);
+        # the supervisor orphan check below and the log event both
+        # interpret ``None`` as "no evidence" rather than "zero".
+        active_agent_count: int | None = None
+        # #3184 — the supervisor orphan detector below needs a
+        # boolean "did we observe 'no active agent' this tick" signal.
+        # Derived from ``active_agent_count`` so the semantics stay
+        # identical to the pre-#3199 ``_has_active_agent()`` call.
         has_active_agent_this_tick: bool | None = None
+        gate_blocked_on_cap: bool | None = None
         rate_skip_active = self._gh_rate_skip_active()
         if rate_skip_active:
             self._log.info(
@@ -2544,8 +2568,10 @@ class DispatcherDaemon:
             and concurrency_cap > 0
             and not self._is_paused()
         ):
-            has_active_agent_this_tick = self._has_active_agent()
-            if not has_active_agent_this_tick:
+            active_agent_count = self._active_agent_count()
+            has_active_agent_this_tick = active_agent_count > 0
+            gate_blocked_on_cap = active_agent_count >= concurrency_cap
+            if active_agent_count < concurrency_cap:
                 try:
                     orchestration_attempted = self._maybe_spawn_orchestration_thread()
                 except Exception:
@@ -2635,6 +2661,13 @@ class DispatcherDaemon:
                 "reap_success": reap_summary["reaped_success"],
                 "reap_failure": reap_summary["reaped_failure"],
                 "reap_still_running": reap_summary["still_running"],
+                # #3199: concurrency-cap gate denominator so CloudWatch
+                # Insights can self-diagnose "why didn't the daemon
+                # spawn a second agent when cap=2?". ``None`` on ticks
+                # that skipped the gate (rate-limited or paused) —
+                # those ticks never read the count from the DB.
+                "active_agent_count": active_agent_count,
+                "gate_blocked_on_cap": gate_blocked_on_cap,
             },
         )
         return {
@@ -2643,6 +2676,15 @@ class DispatcherDaemon:
             "queue_depth": queue_depth,
             "blocked_depth": blocked_depth,
             "orchestration_attempted": 1 if orchestration_attempted else 0,
+            # #3199 observability — concurrency-cap gate diagnostics.
+            # ``-1`` means "not checked this tick" (rate-skipped or
+            # paused branches); a real zero means "no running agents."
+            "active_agent_count": (
+                -1 if active_agent_count is None else active_agent_count
+            ),
+            "gate_blocked_on_cap": (
+                -1 if gate_blocked_on_cap is None else (1 if gate_blocked_on_cap else 0)
+            ),
             # #2847 observability fields for tests and CloudWatch.
             "orchestration_thread_alive": 1 if orchestration_thread_alive else 0,
             "pause_requested": 1 if pause_requested else 0,
@@ -3644,6 +3686,13 @@ class DispatcherDaemon:
         — no ``kind`` filter needed. Historical ``kind='task-skill'``
         rows the /task skill wrote pre-#2927 were cleaned up at
         deploy time (see #2927 cleanup commit).
+
+        **Callers.** Used by the supervisor orphan-detection guard in
+        :meth:`scheduler_tick` (boolean "thread alive but no active
+        agent" mismatch — see #3184) where only the presence/absence
+        signal matters. The concurrency-cap gate itself uses
+        :meth:`_active_agent_count` so ``concurrency_cap > 1`` can
+        actually claim more than one slot (#3199).
         """
         assert self._conn is not None, "connect() must run before checking"
         try:
@@ -3672,6 +3721,58 @@ class DispatcherDaemon:
             # rather than double-spawn on a confused DB state.
             return True
         return row is not None
+
+    def _active_agent_count(self) -> int:
+        """Return the number of agent rows currently ``status='running'``.
+
+        Counterpart to :meth:`_has_active_agent`. The concurrency-cap
+        gate in :meth:`scheduler_tick` compares this count against
+        ``concurrency_cap`` so ``cap > 1`` actually claims extra slots
+        instead of being silently clamped to 1 by the old boolean gate
+        (#3199). Keeps the same ``status='running'`` predicate as
+        :meth:`_has_active_agent` — subprocess and ECS agents both
+        count as one slot.
+
+        Fail-closed semantics match :meth:`_has_active_agent`: a DB
+        error returns a "cap is full" sentinel (``INT_MAX``-equivalent)
+        so the next tick skips spawning rather than double-claiming on
+        a confused DB state. Mapped as a large integer rather than a
+        symbolic sentinel so the ``< concurrency_cap`` gate naturally
+        evaluates False without special-casing.
+        """
+        assert self._conn is not None, "connect() must run before checking"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM dispatcher.agents WHERE status = 'running'",
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.active_agent_count_failed",
+                extra={
+                    "event": "active_agent_count_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            # Fail-closed — a sentinel that is always >= any realistic
+            # ``concurrency_cap`` so the gate evaluates False and we
+            # skip this tick rather than double-spawn on a confused
+            # DB state. Mirrors :meth:`_has_active_agent`'s fail-closed
+            # behaviour (returns True on error).
+            return 1_000_000
+        if row is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError, IndexError):
+            # Defensive: malformed cursor row shouldn't crash the tick.
+            return 1_000_000
 
     def _latest_queue_snapshot_issues(self) -> list[int]:
         """Return issue numbers from the most recent queue snapshot, priority-sorted.

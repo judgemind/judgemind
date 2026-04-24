@@ -499,6 +499,267 @@ class TestHasActiveAgent:
 
 
 # --------------------------------------------------------------------------
+# _active_agent_count (#3199)
+# --------------------------------------------------------------------------
+
+
+class TestActiveAgentCount:
+    """``_active_agent_count`` returns the concurrency-cap gate denominator.
+
+    Pre-#3199 the gate was a binary ``_has_active_agent()`` check which
+    silently clamped ``concurrency_cap > 1`` to one concurrent agent.
+    The new helper returns the actual running-agent count so the
+    scheduler gate can compare ``count < cap``.
+    """
+
+    def test_no_running_rows_returns_zero(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+        assert d._active_agent_count() == 0
+
+    def test_one_running_row_returns_one(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(1,)]
+        assert d._active_agent_count() == 1
+
+    def test_two_running_rows_returns_two(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(2,)]
+        assert d._active_agent_count() == 2
+
+    def test_no_row_returns_zero(self, tmp_path: Path) -> None:
+        """Defensive: missing cursor row (None) is treated as zero, not fail-closed.
+
+        ``COUNT(*)`` should always return a row, but if the stub or a
+        malformed DB response returns ``None`` from ``fetchone()``, we
+        treat that as "zero running" rather than the fail-closed
+        sentinel — otherwise every tick after a single malformed read
+        would refuse to spawn.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [None]
+        assert d._active_agent_count() == 0
+
+    def test_db_error_fails_closed(self, tmp_path: Path) -> None:
+        """Fail-closed on DB error: return a sentinel ≥ any realistic cap."""
+        d, conn, _handler = _make_daemon(tmp_path)
+
+        def boom(sql: str, params: Any = None) -> None:
+            raise RuntimeError("connection lost")
+
+        conn.cursor_instance.execute = boom  # type: ignore[method-assign]
+        # Sentinel is large enough that ``count < cap`` is always False
+        # for any realistic concurrency_cap.
+        count = d._active_agent_count()
+        assert count >= 1_000
+        assert conn.rollbacks >= 1
+
+    def test_sql_uses_count_star_and_running_filter(self, tmp_path: Path) -> None:
+        """Lock in the SELECT shape so future refactors don't silently change semantics."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(0,)]
+        d._active_agent_count()
+
+        counts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "COUNT(*)" in e[0] and "dispatcher.agents" in e[0]
+        ]
+        assert counts, "expected _active_agent_count to issue a COUNT(*) SELECT"
+        sql, _params = counts[0]
+        assert "status = 'running'" in sql
+        assert "kind" not in sql, (
+            "_active_agent_count must not carry a kind filter — every row "
+            "is daemon-owned post-#2927. Actual SQL: " + sql
+        )
+
+
+# --------------------------------------------------------------------------
+# scheduler_tick concurrency_cap > 1 gate (#3199)
+# --------------------------------------------------------------------------
+
+
+class TestSchedulerGateCapGreaterThanOne:
+    """The ``scheduler_tick`` gate compares running-agent count to ``concurrency_cap``.
+
+    Pre-#3199 the gate used ``not self._has_active_agent()`` — a
+    binary single-slot check that silently clamped ``cap > 1`` to one
+    concurrent agent. Post-#3199 the gate is
+    ``self._active_agent_count() < concurrency_cap`` so a second slot
+    opens when the first agent's orchestration thread has exited but
+    its ``status='running'`` row is still alive (ECS mode, see #3199).
+    """
+
+    # Cursor fetch sequence per scheduler_tick (all via fetchone; the
+    # fetchall-based SELECTs for commands / retry markers / reap pass
+    # do NOT consume positional slots here):
+    #   0: config SELECT ``concurrency_cap`` → wants ``(cap,)``
+    #   1: config SELECT ``cap_flipped_by``  → wants ``None``
+    #      (via ``_check_circuit_breaker_auto_close`` — cap≥1 only)
+    #   2: config SELECT ``paused``          → wants ``None``
+    #      (via ``_is_paused`` before the gate proper)
+    #   3: COUNT(*) ``dispatcher.agents``    → wants ``(count,)``
+    #      (via ``_active_agent_count`` — the #3199 gate denominator)
+    def test_cap_two_with_zero_running_attempts_spawn(self, tmp_path: Path) -> None:
+        """cap=2, count=0 → gate open, spawn attempted."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(2,), None, None, (0,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 1
+        assert summary["active_agent_count"] == 0
+        assert summary["gate_blocked_on_cap"] == 0
+        assert d._maybe_spawn_orchestration_thread.call_count == 1  # type: ignore[attr-defined]
+
+    def test_cap_two_with_one_running_still_spawns(self, tmp_path: Path) -> None:
+        """cap=2, count=1 → 1 < 2 so the gate is OPEN — this is the #3199 fix.
+
+        Pre-#3199 the gate closed on ANY active agent; with cap=2 this
+        meant the second slot was never claimed. Post-#3199 the gate
+        opens because ``1 < 2`` is True.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(2,), None, None, (1,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 1
+        assert summary["active_agent_count"] == 1
+        assert summary["gate_blocked_on_cap"] == 0
+
+    def test_cap_two_with_two_running_closes_gate(self, tmp_path: Path) -> None:
+        """cap=2, count=2 → 2 < 2 is False, gate closed, no spawn."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(2,), None, None, (2,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("must not spawn when count == cap")
+        )
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 0
+        assert summary["active_agent_count"] == 2
+        assert summary["gate_blocked_on_cap"] == 1
+
+    def test_three_tick_sequence_cap_two_count_zero_one_two(
+        self, tmp_path: Path
+    ) -> None:
+        """Three consecutive ticks at cap=2 with active_agent_count going 0→1→2.
+
+        This is the AC #3 regression: stub ``_active_agent_count`` to
+        return 0, 1, 2 over three ticks with cap=2 and assert
+        ``orchestration_attempted`` is True on ticks 1 and 2 (count
+        strictly less than cap) and False on tick 3 (count == cap).
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+
+        counts = iter([0, 1, 2])
+        d._active_agent_count = lambda: next(counts)  # type: ignore[method-assign]
+        spawn_mock = MagicMock(return_value=True)
+        d._maybe_spawn_orchestration_thread = spawn_mock  # type: ignore[method-assign]
+
+        results: list[dict[str, Any]] = []
+        for _ in range(3):
+            # Per-tick fetch_queue: config cap=2, cap_flipped_by None,
+            # _is_paused None. ``_active_agent_count`` is stubbed above
+            # so we don't feed a COUNT(*) response through fetch_queue.
+            conn.cursor_instance.fetch_queue = [(2,), None, None]
+            results.append(d.scheduler_tick())
+
+        assert results[0]["orchestration_attempted"] == 1
+        assert results[0]["active_agent_count"] == 0
+        assert results[1]["orchestration_attempted"] == 1
+        assert results[1]["active_agent_count"] == 1
+        assert results[2]["orchestration_attempted"] == 0
+        assert results[2]["active_agent_count"] == 2
+        assert results[2]["gate_blocked_on_cap"] == 1
+        # ``_maybe_spawn_orchestration_thread`` called on ticks 1 and
+        # 2 only — not on the tick that hit the cap.
+        assert spawn_mock.call_count == 2
+
+    def test_cap_one_regression_count_zero_spawns(self, tmp_path: Path) -> None:
+        """Regression: cap=1 behaviour unchanged from pre-#3199.
+
+        ``0 < 1`` is True → spawn attempted — identical to the old
+        ``not _has_active_agent()`` check when no agents are running.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(1,), None, None, (0,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 1
+        assert summary["active_agent_count"] == 0
+
+    def test_cap_one_regression_count_one_closes_gate(self, tmp_path: Path) -> None:
+        """Regression: cap=1, count=1 → gate closed (pre-#3199 parity).
+
+        ``1 < 1`` is False — identical semantics to the old binary
+        ``_has_active_agent()`` check.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(1,), None, None, (1,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("must not spawn when count == cap=1")
+        )
+        summary = d.scheduler_tick()
+        assert summary["orchestration_attempted"] == 0
+        assert summary["active_agent_count"] == 1
+        assert summary["gate_blocked_on_cap"] == 1
+
+    def test_log_event_includes_active_agent_count(self, tmp_path: Path) -> None:
+        """``scheduler_tick`` log event carries ``active_agent_count``.
+
+        AC #2 — CloudWatch Insights can self-diagnose the gate decision
+        without inspecting the DB.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(2,), None, None, (1,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
+        d.scheduler_tick()
+
+        events = handler.events("scheduler_tick")
+        assert events, "expected a scheduler_tick log event"
+        record = events[-1]
+        assert getattr(record, "active_agent_count", "MISSING") == 1
+        assert getattr(record, "gate_blocked_on_cap", "MISSING") is False
+
+    def test_log_event_active_count_none_when_rate_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """Rate-skipped tick logs ``active_agent_count=None`` — gate never read the DB."""
+        d, conn, handler = _make_daemon(tmp_path)
+        # Mark the GH rate-limit skip flag as active so the claim gate
+        # short-circuits before reading the agent count.
+        d._gh_rate_skip_active = lambda: True  # type: ignore[method-assign]
+        # config cap=2 + cap_flipped_by None (circuit-breaker auto-close
+        # check still fires ahead of the rate-skip branch).
+        conn.cursor_instance.fetch_queue = [(2,), None]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("must not spawn when rate-skipped")
+        )
+        d.scheduler_tick()
+
+        events = handler.events("scheduler_tick")
+        assert events
+        record = events[-1]
+        assert getattr(record, "active_agent_count", "MISSING") is None
+        assert getattr(record, "gate_blocked_on_cap", "MISSING") is None
+
+
+# --------------------------------------------------------------------------
 # _latest_queue_snapshot_issues
 # --------------------------------------------------------------------------
 
