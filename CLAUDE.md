@@ -186,6 +186,8 @@ GitHub allows 5,000 API requests per hour. Always use `--interval 60` with `gh r
 
 **GitHub:** org `judgemind/judgemind`. **AWS:** account `155326049300`, region `us-west-2`.
 
+**Dispatcher Telegram notifications (issue #2861):** The daemon fires per-event Telegram messages on every `succeeded` / `plan_blocked` / `needs_review` / `failed` terminal transition (throttled to ≤1 per `telegram_per_event_throttle_seconds`, default 30s) and a periodic digest every `digest_interval_seconds` (default 4h). Both are configurable via `dispatcher.config` rows seeded by migration `44_dispatcher-telegram-notifications.sql`. Recipient management (the `allowed_user_ids` list) is via the `judgemind/telegram/bot` Secrets Manager secret — see `scripts/notify-telegram.sh`. No new `chat_id` config key is needed; the script reads recipient IDs from the secret.
+
 For detailed infrastructure reference (Vercel, Terraform state, ECS, secrets), see `docs/agent/infrastructure-reference.md`.
 
 ## Code Standards & Pre-PR Checks

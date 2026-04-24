@@ -484,8 +484,12 @@ Rationale: MCP tools are a Claude Code feature — they exist inside an active C
 | `claude -p` catastrophic failure (CLI missing, auth broken, image bad) | symptom, last log lines | dispatcher admin URL |
 
 **(B) Status messages — informational, no action expected.** Included for situational awareness; omit URLs unless they add value.
-- Daemon boot (startup + version SHA)
-- Daily summary at 18:00 UTC (N PRs merged, M failures by category, queue depth)
+
+| Trigger | Message contents |
+|---|---|
+| Daemon boot | Startup line + version SHA |
+| Per-event terminal (succeeded / plan_blocked / needs_review / failed) | Emoji + status + issue #N + title + PR # (if any); throttled ≤1/30s (configurable via `dispatcher.config.telegram_per_event_throttle_seconds`) |
+| Periodic digest (every `digest_interval_seconds`, default 4h) | Header line + five buckets: Shipped / Needs review / Plan blocked / Failed / Queue depth; window is since last digest |
 
 Any new escalation path added later MUST extend the table in (A) with its own issue/PR URL — "something needs human attention" and "no link to act on" are incompatible.
 

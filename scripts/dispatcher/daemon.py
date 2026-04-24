@@ -64,6 +64,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import collections
 import faulthandler
 import json
 import logging
@@ -1611,6 +1612,31 @@ NOTIFY_TELEGRAM_SCRIPT_RELPATH = "scripts/notify-telegram.sh"
 #: on a healthy network.
 NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS = 30
 
+#: Per-event Telegram notification constants (issue #2861).
+#:
+#: ``DEFAULT_PER_EVENT_TELEGRAM_THROTTLE_SECONDS`` — minimum gap between
+#: consecutive per-event sends. Configurable via
+#: ``dispatcher.config.telegram_per_event_throttle_seconds``.
+DEFAULT_PER_EVENT_TELEGRAM_THROTTLE_SECONDS = 30
+
+#: How often the daemon emits the periodic digest. Configurable via
+#: ``dispatcher.config.digest_interval_seconds``.
+DEFAULT_DIGEST_INTERVAL_SECONDS = 4 * 3600  # 14400
+
+#: Defensive cap on the in-memory per-event queue. Prevents an unbounded
+#: terminal-transition cascade from growing the queue without bound.
+#: When the queue reaches this size the oldest message is dropped and
+#: ``daemon.per_event_telegram_queue_full`` is logged.
+PER_EVENT_TELEGRAM_QUEUE_MAX = 50
+
+#: Emoji map for per-event Telegram messages (issue #2861).
+_PER_EVENT_TELEGRAM_EMOJI: dict[str, str] = {
+    "succeeded": "\U0001f3af",  # 🎯
+    "plan_blocked": "\U0001f6d1",  # 🛑
+    "needs_review": "\u26a0\ufe0f",  # ⚠️
+    "failed": "\u274c",  # ❌
+}
+
 #: Per-exit-code mapping for ``scripts/notify-telegram.sh``. Values are
 #: ``(event_suffix, reason)`` tuples. Callers prepend a domain prefix
 #: (e.g. ``circuit_breaker_telegram_``) to build the full event name and
@@ -2178,6 +2204,28 @@ class DispatcherDaemon:
         # thread handle was already cleared) resets the counter to 0 —
         # the threshold is "consecutive," not "cumulative."
         self._orchestration_orphan_tick_count: int = 0
+        # Issue #2861 — per-event Telegram notification state.
+        #
+        # ``_per_event_telegram_queue`` is a bounded deque of
+        # ``(status, message)`` pairs enqueued by ``_enqueue_per_event_telegram``
+        # after each terminal transition. ``_drain_per_event_telegram_queue``
+        # pops and sends at most one message per 30s (configurable).
+        #
+        # ``_last_per_event_telegram_emit_monotonic`` is the ``time.monotonic()``
+        # of the last successful per-event send — used to enforce the throttle.
+        # Initialized to 0.0 so the first message fires immediately on the
+        # first drain call.
+        #
+        # ``_last_digest_emit_at`` is the UTC wall-clock time of the last
+        # digest send. ``None`` until the first digest fires; seeded from
+        # ``dispatcher.config.last_digest_at`` in the first ``_maybe_emit_digest``
+        # call. When ``None``, the digest covers the last
+        # ``digest_interval_seconds`` seconds (configurable).
+        self._per_event_telegram_queue: collections.deque[tuple[str, str]] = (
+            collections.deque(maxlen=PER_EVENT_TELEGRAM_QUEUE_MAX)
+        )
+        self._last_per_event_telegram_emit_monotonic: float = 0.0
+        self._last_digest_emit_at: datetime | None = None
         # #3184 — instrumentation hooks for the force-stop wedge.
         #
         # Each ``force_stop`` command that targets a specific agent_id
@@ -2668,6 +2716,21 @@ class DispatcherDaemon:
         if self._should_run_blocked_scan():
             blocked_depth = self._scan_blocked_and_snapshot()
         t_step = self._record_scheduler_step("scan_blocked", t_step)
+
+        # Per-event Telegram drain (#2861). Pops at most one queued
+        # message when the throttle window has elapsed. Best-effort —
+        # exceptions here cannot stall the orchestration gate below.
+        try:
+            self._drain_per_event_telegram_queue()
+        except Exception:
+            self._log.exception(
+                "daemon.per_event_telegram_drain_failed",
+                extra={
+                    "event": "per_event_telegram_drain_failed",
+                    "run_id": self._run_id,
+                },
+            )
+        t_step = self._record_scheduler_step("drain_per_event_telegram", t_step)
 
         # 4. Phase 3A orchestration gate (#2783) — threaded spawn (#2847).
         #
@@ -8343,6 +8406,28 @@ class DispatcherDaemon:
                         "event": "circuit_breaker_evaluate_failed",
                         "run_id": self._run_id,
                         "agent_id": agent_id,
+                    },
+                )
+
+            # Per-event Telegram notification (#2861): enqueue a message
+            # for succeeded / plan_blocked / needs_review / failed. The
+            # enqueue is best-effort — a failure here cannot roll back
+            # the terminal-status update above.
+            try:
+                self._enqueue_per_event_telegram(
+                    status=status,
+                    agent_id=agent_id,
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                )
+            except Exception:
+                self._log.exception(
+                    "daemon.per_event_telegram_enqueue_failed",
+                    extra={
+                        "event": "per_event_telegram_enqueue_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "status": status,
                     },
                 )
 
@@ -17019,37 +17104,33 @@ class DispatcherDaemon:
                 )
         return True
 
-    def _send_circuit_breaker_telegram_alert(
+    def _send_telegram_alert(
         self,
         *,
-        bad_count: int,
-        window_size: int,
-        window_minutes: int,
-        statuses: list[str],
+        message: str,
+        event_domain: str,
     ) -> None:
-        """Fire a Telegram alert via ``scripts/notify-telegram.sh``.
+        """Generic Telegram send via ``scripts/notify-telegram.sh``.
 
-        Best-effort — a non-zero exit from the helper is logged as a
-        warning and the breaker is still considered "opened" (the cap
-        flip is the safety action; the alert is operator-UX).
+        Shared by :meth:`_send_circuit_breaker_telegram_alert`,
+        :meth:`_drain_per_event_telegram_queue`, and
+        :meth:`_maybe_emit_digest` (issue #2861). The caller supplies:
 
-        Exit-code handling is delegated to
-        :func:`_map_notify_telegram_exit_code` so new daemon callers can
-        reuse the mapping. Issue #3061: prior to this change the helper
-        script exited 0 on three "misconfigured" paths (secret fetch
-        fail, empty bot_token, empty user_ids), so this method logged
-        ``circuit_breaker_telegram_sent`` for deliveries that never
-        actually happened. The helper now exits 3/4/5 on those paths
-        and this method maps them to ``circuit_breaker_telegram_config_missing``
-        with a ``reason`` field so the false-success events are gone.
+        - ``message`` — plain-text body to deliver.
+        - ``event_domain`` — prefix for the structured log event names,
+          e.g. ``circuit_breaker``, ``per_event``, ``digest``. The
+          method emits ``daemon.<event_domain>_telegram_<suffix>``.
+
+        Best-effort — non-zero exit codes are logged as warnings.
+        Exit-code handling is delegated to :func:`_map_notify_telegram_exit_code`.
         """
         repo_root = self._repo_root_for_notify_script()
         notify_script = repo_root / NOTIFY_TELEGRAM_SCRIPT_RELPATH
         if not notify_script.exists():
             self._log.info(
-                "daemon.circuit_breaker_telegram_skipped_no_script",
+                f"daemon.{event_domain}_telegram_skipped_no_script",
                 extra={
-                    "event": "circuit_breaker_telegram_skipped_no_script",
+                    "event": f"{event_domain}_telegram_skipped_no_script",
                     "run_id": self._run_id,
                     "script_path": str(notify_script),
                 },
@@ -17057,17 +17138,11 @@ class DispatcherDaemon:
             return
 
         # Write the message to a temp file and pass via --message-file
-        # so the daemon does not inline secret-ish content (bad status
-        # strings) into argv where it could leak to ps listings.
-        message = self._render_circuit_breaker_telegram_message(
-            bad_count=bad_count,
-            window_size=window_size,
-            window_minutes=window_minutes,
-            statuses=statuses,
-        )
+        # so the daemon does not inline secret-ish content into argv
+        # where it could leak to ps listings.
         tmp_dir = repo_root / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        msg_path = tmp_dir / f"circuit-breaker-alert-{self._run_id or 'unknown'}.txt"
+        msg_path = tmp_dir / f"{event_domain}-alert-{self._run_id or 'unknown'}.txt"
         msg_path.write_text(message, encoding="utf-8")
 
         try:
@@ -17080,9 +17155,9 @@ class DispatcherDaemon:
             )
         except subprocess.TimeoutExpired:
             self._log.warning(
-                "daemon.circuit_breaker_telegram_timeout",
+                f"daemon.{event_domain}_telegram_timeout",
                 extra={
-                    "event": "circuit_breaker_telegram_timeout",
+                    "event": f"{event_domain}_telegram_timeout",
                     "run_id": self._run_id,
                     "timeout_s": NOTIFY_TELEGRAM_SUBPROCESS_TIMEOUT_SECONDS,
                 },
@@ -17090,7 +17165,7 @@ class DispatcherDaemon:
             return
 
         event_suffix, reason = _map_notify_telegram_exit_code(result.returncode)
-        event_name = f"circuit_breaker_telegram_{event_suffix}"
+        event_name = f"{event_domain}_telegram_{event_suffix}"
         log_extra: dict[str, Any] = {
             "event": event_name,
             "run_id": self._run_id,
@@ -17105,6 +17180,35 @@ class DispatcherDaemon:
             self._log.info(f"daemon.{event_name}", extra=log_extra)
         else:
             self._log.warning(f"daemon.{event_name}", extra=log_extra)
+
+    def _send_circuit_breaker_telegram_alert(
+        self,
+        *,
+        bad_count: int,
+        window_size: int,
+        window_minutes: int,
+        statuses: list[str],
+    ) -> None:
+        """Fire a Telegram alert via ``scripts/notify-telegram.sh``.
+
+        Best-effort — a non-zero exit from the helper is logged as a
+        warning and the breaker is still considered "opened" (the cap
+        flip is the safety action; the alert is operator-UX).
+
+        Delegates to :meth:`_send_telegram_alert` with
+        ``event_domain='circuit_breaker'`` so existing CloudWatch
+        queries keyed to ``circuit_breaker_telegram_sent`` are
+        unchanged. Issue #3061 exit-code mapping is preserved because
+        :meth:`_send_telegram_alert` calls
+        :func:`_map_notify_telegram_exit_code` the same way.
+        """
+        message = self._render_circuit_breaker_telegram_message(
+            bad_count=bad_count,
+            window_size=window_size,
+            window_minutes=window_minutes,
+            statuses=statuses,
+        )
+        self._send_telegram_alert(message=message, event_domain="circuit_breaker")
 
     def _render_circuit_breaker_telegram_message(
         self,
@@ -17148,6 +17252,284 @@ class DispatcherDaemon:
         if baseline:
             return Path(baseline)
         return Path(__file__).resolve().parents[2]
+
+    # ── Per-event Telegram notifications (#2861) ──────────────────────
+
+    def _render_per_event_telegram(
+        self,
+        *,
+        agent_row: dict[str, Any],
+        status: str,
+        pr_number: int | None,
+        block_reason: str | None,
+        unmet_criteria: list[str] | None,
+    ) -> str:
+        """Render the per-terminal-event Telegram message body.
+
+        Uses the emoji map in :data:`_PER_EVENT_TELEGRAM_EMOJI` to
+        produce a concise one-screen summary the operator can read on
+        mobile. ``agent_row`` must contain at least ``issue_number`` and
+        ``issue_title``; ``started_at`` / ``ended_at`` are included when
+        present.
+
+        Issue #2861: status ∈ {succeeded, plan_blocked, needs_review, failed}.
+        """
+        emoji = _PER_EVENT_TELEGRAM_EMOJI.get(status, "ℹ️")
+        issue_number = agent_row.get("issue_number", "?")
+        issue_title = agent_row.get("issue_title") or "(no title)"
+        started_at = agent_row.get("started_at")
+        ended_at = agent_row.get("ended_at")
+
+        lines: list[str] = [
+            f"{emoji} Dispatcher agent {status}",
+            f"Issue #{issue_number} — {issue_title}",
+        ]
+        if pr_number is not None:
+            lines.append(f"PR #{pr_number} merged")
+        if block_reason:
+            lines.append(f"Blocked: {block_reason}")
+        if unmet_criteria:
+            lines.append("Unmet criteria: " + "; ".join(unmet_criteria[:5]))
+        if started_at:
+            lines.append(f"Started: {started_at}")
+        if ended_at:
+            lines.append(f"Ended: {ended_at}")
+        return "\n".join(lines)
+
+    def _enqueue_per_event_telegram(
+        self,
+        *,
+        status: str,
+        agent_id: str,
+        issue_number: int | None = None,
+        pr_number: int | None = None,
+        block_reason: str | None = None,
+        unmet_criteria: list[str] | None = None,
+    ) -> None:
+        """Append a per-event Telegram message to the bounded queue.
+
+        Called at the end of ``_mark_agent_terminal`` for statuses in
+        {succeeded, plan_blocked, needs_review, failed}. When the queue
+        is at capacity (``PER_EVENT_TELEGRAM_QUEUE_MAX``) the oldest
+        message is silently dropped by the ``deque(maxlen=...)``
+        behaviour, and ``daemon.per_event_telegram_queue_full`` is logged
+        so operators can tune the cap or throttle.
+
+        Reads ``issue_number``, ``issue_title``, ``started_at``, and
+        ``ended_at`` from ``dispatcher.agents`` so the message is
+        self-contained. Issue #2861.
+        """
+        if status not in _PER_EVENT_TELEGRAM_EMOJI:
+            return
+
+        # Fetch agent row for display fields. Fail-closed: on any DB
+        # error an empty dict is used and the message falls back to
+        # "?" / "(no title)" placeholders.
+        agent_row: dict[str, Any] = {}
+        if self._conn is not None:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT issue_number, issue_title, started_at, ended_at "
+                        "FROM dispatcher.agents WHERE agent_id = %s",
+                        (agent_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        agent_row = {
+                            "issue_number": row[0]
+                            if row[0] is not None
+                            else issue_number,
+                            "issue_title": row[1],
+                            "started_at": str(row[2]) if row[2] else None,
+                            "ended_at": str(row[3]) if row[3] else None,
+                        }
+            except Exception:
+                pass  # use empty dict — placeholders render fine
+
+        if not agent_row and issue_number is not None:
+            agent_row = {"issue_number": issue_number}
+
+        # Check BEFORE append — deque(maxlen=N) silently drops oldest on
+        # overflow; we want to log the event first.
+        if len(self._per_event_telegram_queue) >= PER_EVENT_TELEGRAM_QUEUE_MAX:
+            self._log.warning(
+                "daemon.per_event_telegram_queue_full",
+                extra={
+                    "event": "per_event_telegram_queue_full",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "queue_size": len(self._per_event_telegram_queue),
+                    "cap": PER_EVENT_TELEGRAM_QUEUE_MAX,
+                },
+            )
+
+        message = self._render_per_event_telegram(
+            agent_row=agent_row,
+            status=status,
+            pr_number=pr_number,
+            block_reason=block_reason,
+            unmet_criteria=unmet_criteria,
+        )
+        self._per_event_telegram_queue.append((status, message))
+
+    def _drain_per_event_telegram_queue(self) -> None:
+        """Pop and send at most one queued per-event Telegram message.
+
+        Enforces the ``telegram_per_event_throttle_seconds`` configurable
+        throttle — at most one message per throttle window. Called once
+        per ``scheduler_tick`` (30s cadence). Issue #2861.
+        """
+        if not self._per_event_telegram_queue:
+            return
+
+        throttle_s = self._cb_config_int(
+            "telegram_per_event_throttle_seconds",
+            DEFAULT_PER_EVENT_TELEGRAM_THROTTLE_SECONDS,
+        )
+        now_mono = time.monotonic()
+        if now_mono - self._last_per_event_telegram_emit_monotonic < throttle_s:
+            return
+
+        _status, message = self._per_event_telegram_queue.popleft()
+        self._send_telegram_alert(message=message, event_domain="per_event")
+        self._last_per_event_telegram_emit_monotonic = time.monotonic()
+
+    def _maybe_emit_digest(self) -> None:
+        """Emit a periodic Telegram digest of terminal outcomes.
+
+        Checks whether ``digest_interval_seconds`` has elapsed since the
+        last digest (``last_digest_at`` in ``dispatcher.config``). When
+        it has, queries ``dispatcher.terminal_outcomes`` for all outcomes
+        in the window, renders a Markdown-shape summary, sends via
+        :meth:`_send_telegram_alert`, and writes the new
+        ``last_digest_at`` back to ``dispatcher.config``.
+
+        Idempotent within the interval — a second call within the same
+        window is a no-op (no subprocess, no config write). Issue #2861.
+        """
+        assert self._conn is not None, "connect() must run before digest"
+
+        interval_s = self._cb_config_int(
+            "digest_interval_seconds",
+            DEFAULT_DIGEST_INTERVAL_SECONDS,
+        )
+
+        # Seed ``_last_digest_emit_at`` from config on first call.
+        if self._last_digest_emit_at is None:
+            raw = self._cb_config_str("last_digest_at", "null")
+            if raw and raw != "null":
+                try:
+                    self._last_digest_emit_at = datetime.fromisoformat(raw)
+                except (ValueError, TypeError):
+                    pass
+
+        now = datetime.now(UTC)
+
+        if self._last_digest_emit_at is not None:
+            elapsed = (now - self._last_digest_emit_at).total_seconds()
+            if elapsed < interval_s:
+                return  # Not yet — noop.
+
+        # Determine the window start.
+        if self._last_digest_emit_at is not None:
+            window_start = self._last_digest_emit_at
+        else:
+            window_start = datetime.fromtimestamp(now.timestamp() - interval_s, tz=UTC)
+
+        # Query terminal outcomes for the window.
+        rows: list[tuple[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, count(*) "
+                    "FROM dispatcher.terminal_outcomes "
+                    "WHERE ended_at >= %s AND ended_at <= %s "
+                    "GROUP BY status",
+                    (window_start, now),
+                )
+                rows = cur.fetchall()
+        except Exception:
+            self._log.exception(
+                "daemon.digest_query_failed",
+                extra={
+                    "event": "digest_query_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            return
+
+        # Also read queue depth.
+        queue_depth = -1
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM dispatcher.agents "
+                    "WHERE status = 'claiming' OR "
+                    "      (status = 'running' AND phase NOT IN "
+                    "       ('awaiting_ci', 'awaiting_deploy', 'awaiting_verify'))"
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    queue_depth = int(row[0] or 0)
+        except Exception:
+            pass  # queue_depth stays -1
+
+        # Bucketize counts.
+        counts: dict[str, int] = {}
+        for status_val, cnt in rows:
+            counts[str(status_val)] = int(cnt)
+
+        shipped = counts.get("succeeded", 0)
+        needs_review_cnt = counts.get("needs_review", 0)
+        plan_blocked_cnt = counts.get("plan_blocked", 0)
+        failed_cnt = counts.get("failed", 0)
+
+        interval_h = round(interval_s / 3600, 1)
+        window_label = (
+            f"{interval_h:.0f}h" if interval_h == int(interval_h) else f"{interval_h}h"
+        )
+        header = (
+            f"Dispatcher digest \u00b7 {now.strftime('%Y-%m-%dT%H:%MZ')} "
+            f"\u00b7 window: {window_label}"
+        )
+
+        body_lines = [
+            header,
+            "",
+            f"Shipped: {shipped}",
+            f"Needs review: {needs_review_cnt}",
+            f"Plan blocked: {plan_blocked_cnt}",
+            f"Failed: {failed_cnt}",
+            f"Queue depth: {'unknown' if queue_depth < 0 else queue_depth}",
+        ]
+        message = "\n".join(body_lines)
+        self._send_telegram_alert(message=message, event_domain="digest")
+
+        # Persist the new ``last_digest_at`` to ``dispatcher.config``.
+        self._last_digest_emit_at = now
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.config (key, value, updated_by) "
+                    "VALUES ('last_digest_at', %s, 'daemon') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                    "    updated_by = EXCLUDED.updated_by",
+                    (now.isoformat(),),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.digest_config_write_failed",
+                extra={
+                    "event": "digest_config_write_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
 
     def _check_circuit_breaker_auto_close(self, current_cap: int) -> bool:
         """Auto-close the breaker if the operator manually raised the cap.
@@ -19403,6 +19785,20 @@ class DispatcherDaemon:
                 "daemon.diagnoser_pass_failed",
                 extra={
                     "event": "diagnoser_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Periodic Telegram digest (#2861). 120s supervisor cadence is
+        # plenty for a 4h-interval check. Best-effort — exceptions here
+        # cannot stall the heartbeat / metric emission below.
+        try:
+            self._maybe_emit_digest()
+        except Exception:
+            self._log.exception(
+                "daemon.digest_emit_failed",
+                extra={
+                    "event": "digest_emit_failed",
                     "run_id": self._run_id,
                 },
             )
