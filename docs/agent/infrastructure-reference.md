@@ -336,6 +336,44 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --coun
 
 Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
 
+### Container Insights (per-task CPU/memory/network visibility)
+
+Container Insights is **enabled** on the `judgemind-dev` ECS cluster (see `aws_ecs_cluster.main` in `infra/terraform/modules/compute/main.tf`). Under the `enabled` tier — which is what's live — CloudWatch emits metrics in the `ECS/ContainerInsights` namespace at these dimension levels:
+
+| Dimension set | What you can ask |
+|---|---|
+| `ClusterName` | Cluster-wide CPU / memory / network / storage totals |
+| `ClusterName + ServiceName` | Per-service (e.g. `judgemind-dispatcher-dev`, `judgemind-api-dev`, `judgemind-ingestion-worker-dev`) |
+| `ClusterName + TaskDefinitionFamily` | Per-task-definition-family (covers oneshot `judgemind-oneshot-dev`, `judgemind-scraper-dev`, and agent-runner family rollups) |
+
+Metrics include `CpuUtilized`, `CpuReserved`, `MemoryUtilized`, `MemoryReserved`, `NetworkRxBytes`, `NetworkTxBytes`, `StorageReadBytes`, `StorageWriteBytes`, `EphemeralStorageUtilized`, `EphemeralStorageReserved`, and Fargate task counters (`RunningTaskCount`, etc.).
+
+**Per-`TaskId` metrics require the `enhanced` tier** (billed higher). Under `enabled`, you cannot select a single ECS task ARN — pivot to `TaskDefinitionFamily` when you need narrower dimensions than `ServiceName`. Oneshot tasks (`judgemind-oneshot-dev`) share one family across all launches, so intra-family correlation is done via CloudWatch logs (filter by task id) plus the family-level metric totals over the same time window.
+
+**Per-service query example** — CPU for the dispatcher service over the last hour (MCP-first: `mcp__awslabs_cloudwatch-mcp-server__get_metric_data`). CLI fallback:
+
+```
+aws cloudwatch get-metric-data --region us-west-2 \
+  --start-time $(date -u -v-1H +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+  --metric-data-queries '[{"Id":"m1","MetricStat":{"Metric":{"Namespace":"ECS/ContainerInsights","MetricName":"CpuUtilized","Dimensions":[{"Name":"ServiceName","Value":"judgemind-dispatcher-dev"},{"Name":"ClusterName","Value":"judgemind-dev"}]},"Period":60,"Stat":"Average"},"ReturnData":true}]'
+```
+
+**Per-task-definition-family query example** — memory for a oneshot family:
+
+```
+aws cloudwatch get-metric-data --region us-west-2 \
+  --start-time $(date -u -v-1H +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+  --metric-data-queries '[{"Id":"m1","MetricStat":{"Metric":{"Namespace":"ECS/ContainerInsights","MetricName":"MemoryUtilized","Dimensions":[{"Name":"TaskDefinitionFamily","Value":"judgemind-oneshot-dev"},{"Name":"ClusterName","Value":"judgemind-dev"}]},"Period":60,"Stat":"Maximum"},"ReturnData":true}]'
+```
+
+**When a task is "stuck," correlate three signals:**
+
+1. **Metric rollup by family/service** at `Period=60, Stat=Maximum` for `MemoryUtilized` and `CpuUtilized` — flat near zero for many minutes on a task that claims to be running suggests the process is hung, not thrashing.
+2. **CloudWatch Logs** for the task-specific log stream (the task id suffix in `/ecs/<family>` / `/ecs/<service>` log groups) to correlate metric flats with absence of log lines.
+3. **`DescribeTasks`** for the task ARN to confirm `healthStatus`, `lastStatus`, and `stoppedReason` haven't flipped.
+
+If a future investigation genuinely requires per-task-ARN metrics (to disambiguate two concurrent oneshots within the same family), toggle the setting to `enhanced` on a targeted basis — expect a billing uptick proportional to concurrent task count.
+
 ### Dev DB Connection Budget
 
 The dev RDS instance (`judgemind-dev`) runs on **`db.t4g.small`** (2 GB RAM).  PostgreSQL 16's `max_connections` is derived from the instance-class memory via the formula `LEAST({DBInstanceClassMemory/9531392}, 5000)` — on `db.t4g.small` this resolves to roughly **~170 connections**.  Reserved slots:
