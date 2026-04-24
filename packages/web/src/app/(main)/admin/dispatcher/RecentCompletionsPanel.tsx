@@ -16,6 +16,16 @@ interface RecentCompletionsPanelProps {
    */
   nowMs?: number;
   /**
+   * Total count of terminal-status rows in `dispatcher.agents`
+   * (sourced from `DispatcherState.recentCompletionsCount`). When
+   * provided, the panel header count badge renders `{shown} / {total}`
+   * to match the Ready/Blocked panels (issue #3172). When omitted, the
+   * count falls back to the bare `{shown}` value (back-compat for
+   * existing test fixtures and any caller that hasn't wired up the new
+   * field).
+   */
+  total?: number;
+  /**
    * When provided, the count label in the panel header becomes a
    * clickable button that triggers this callback. The cockpit
    * dashboard wires this to open the full-list dialog (issue #3159).
@@ -73,6 +83,7 @@ interface RecentCompletionsPanelProps {
 export function RecentCompletionsPanel({
   completions,
   nowMs,
+  total,
   onCountClick,
 }: RecentCompletionsPanelProps) {
   // #3159: when a click handler is provided, surface a separate
@@ -81,7 +92,12 @@ export function RecentCompletionsPanel({
   // bottom-row panels. The legacy inline `({n})` rendering is preserved
   // for back-compat when no handler is wired (existing test fixtures
   // and any non-cockpit caller).
-  const countText = String(completions.length);
+  //
+  // #3172: both code paths (clickable badge + inline parenthetical) now
+  // route through `formatCountLabel`. When `total` is provided we render
+  // `{shown} / {total}` exactly like Ready/Blocked; when it's omitted we
+  // fall back to `{shown}` so existing fixtures keep working.
+  const countText = formatRecentCompletionsCount(completions.length, total);
   return (
     <section aria-labelledby="recent-completions-heading">
       <div className="flex items-center justify-between border-b border-border pb-2 mb-2">
@@ -117,6 +133,27 @@ export function RecentCompletionsPanel({
       )}
     </section>
   );
+}
+
+/**
+ * Format the panel-header count badge. Matches the
+ * `formatCountLabel` shape from `QueuePanel.tsx` so all three
+ * bottom-row panels render `{shown} / {total}` consistently
+ * (issue #3172). When `total` is omitted, fall back to bare
+ * `{shown}` — preserves back-compat for tests and any caller that
+ * hasn't wired up `DispatcherState.recentCompletionsCount`.
+ *
+ * Edge case: when `total` is provided but `shown === 0`, render `0 / N`
+ * (never just `0`) — empty-panel UX stays obvious while still
+ * communicating the denominator. Mirrors the `0 / N` case the Ready
+ * and Blocked panels handle.
+ */
+function formatRecentCompletionsCount(
+  shown: number,
+  total: number | undefined,
+): string {
+  if (typeof total === 'number') return `${shown} / ${total}`;
+  return String(shown);
 }
 
 /**
@@ -403,4 +440,5 @@ export {
   formatRelativeTime,
   formatPacificDatetime,
   formatStartDurationEndTitle,
+  formatRecentCompletionsCount,
 };

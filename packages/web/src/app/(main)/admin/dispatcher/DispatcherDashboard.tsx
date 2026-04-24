@@ -418,6 +418,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
             <div className="flex flex-col gap-6" data-testid="dispatcher-column-right">
               <RecentCompletionsPanel
                 completions={state?.recentCompletions ?? []}
+                total={state?.recentCompletionsCount}
                 onCountClick={() => setFullDialogKind('COMPLETED')}
               />
               <QueueBlockedPanel
@@ -469,13 +470,61 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
        * `kind !== null`, so closing the dialog (ESC, click outside,
        * X button) cancels future fetches until the operator clicks a
        * count again.
+       *
+       * #3172: thread `shown` / `total` through so the dialog title
+       * carries the same `{shown} / {total}` denominator the badge
+       * displayed. `shown` is the panel's rendered list length (capped
+       * at 10 server-side); `total` comes from the matching depth field
+       * on `DispatcherState`. Both are scoped to the currently-open
+       * `kind` — when no dialog is open, both are undefined and the
+       * helper renders nothing (the dialog is unmounted anyway).
        */}
       <QueueFullDialog
         kind={fullDialogKind}
+        shown={shownForKind(fullDialogKind, state)}
+        total={totalForKind(fullDialogKind, state)}
         onClose={() => setFullDialogKind(null)}
       />
     </div>
   );
+}
+
+/**
+ * Compute the `shown` value to pass to `<QueueFullDialog>` so the
+ * dialog title reads `{shown} / {total}` matching the badge that
+ * opened it (issue #3172). `shown` is the count of items the panel was
+ * rendering at click time — capped server-side at 10 for the queue
+ * panels, capped at 10 by the `recentCompletions` resolver for the
+ * Recently Completed panel.
+ *
+ * Returns `undefined` when no dialog is open or when `state` is not yet
+ * loaded — `formatDialogTitle` falls back to a clean labelled title in
+ * that case.
+ */
+function shownForKind(
+  kind: DispatcherQueueKind | null,
+  state: DispatcherStateData['dispatcherState'] | undefined,
+): number | undefined {
+  if (kind === null || state === undefined) return undefined;
+  if (kind === 'READY') return state.queueReady.length;
+  if (kind === 'BLOCKED') return state.queueBlocked.length;
+  return state.recentCompletions.length;
+}
+
+/**
+ * Companion to `shownForKind` — returns the matching depth field from
+ * `DispatcherState` so the dialog title can render the `{shown} /
+ * {total}` denominator. Returns `undefined` when no dialog is open or
+ * when `state` is not loaded.
+ */
+function totalForKind(
+  kind: DispatcherQueueKind | null,
+  state: DispatcherStateData['dispatcherState'] | undefined,
+): number | undefined {
+  if (kind === null || state === undefined) return undefined;
+  if (kind === 'READY') return state.queueDepth;
+  if (kind === 'BLOCKED') return state.blockedDepth;
+  return state.recentCompletionsCount;
 }
 
 function parsePositiveInt(jsonValue: string): number | null {
