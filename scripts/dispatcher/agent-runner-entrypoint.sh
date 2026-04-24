@@ -382,15 +382,20 @@ transition_for() {
 # own path uses the same CLI); non-interactive auth is already wired
 # up in the entrypoint's ``gh auth login --with-token`` step earlier.
 #
-# Stage 1b scope (#3133): plan + ralph inputs are built fully so the
-# smoke exercises planning → ralph with real object `.result` values.
-# summary / fix-ci / verify / retro inputs are minimal — they include
-# the required identifier fields (agent_id, issue_number, worktree_path)
-# plus whatever the shim can derive locally, but the richer context
-# (git diff, CI failing jobs, deploy status, phase_transitions) stays
-# the daemon's job. Each of those skills will still BLOCK cleanly when
-# its input is incomplete, which is the correct behaviour for a
-# smoke-only image — Stage 2 fleshes out the per-phase wiring.
+# Stage 2 scope (#3135): every claude-driven phase's input is built to
+# the same shape the daemon's ``_handle_phase_*`` builders assemble.
+# Plan + ralph continue to mirror the daemon's identifier + issue
+# bundle; summary now carries ralph_summary + git_diff + branch +
+# plan-derived acceptance_criteria; fix-ci reads pr_number + the PR's
+# failing-job metadata + per-job log tails via ``gh run view
+# --log-failed --job``; verify reads the merged commit SHA + deploy-
+# run conclusion + deferred_acs (from summary's persisted output);
+# retro reads phase_transitions + failures from their respective
+# ``dispatcher.*`` tables plus counter derivations that match the
+# daemon's ``_build_retro_input``. Every gh / psql call is best-
+# effort — a missing row / 404 returns an empty value so each skill's
+# own guard clauses still produce a structured BLOCKED / FAILED
+# verdict when data genuinely isn't available.
 #
 # Module lookup matches phase_transitions_shim.py: PHASE_INPUT_DIR /
 # PHASE_INPUT_PARENT env vars let tests stub the script at a writable
@@ -407,17 +412,47 @@ Invoked with argv = [phase, agent_id, issue_number, repo_root]. Writes
 ``{repo_root}/tmp/dispatcher-input/<phase>.json`` matching each skill's
 input contract (see .claude/skills/task-v2-<phase>/SKILL.md).
 
-Minimal Stage 1b scope (#3133):
+Stage 2 scope (#3135): every phase's input is built to the same shape
+the daemon's ``_handle_phase_*`` builders assemble, so ECS-mode agents
+reach the same verdicts as subprocess-mode agents. Specifically:
+
   * planning — full input via ``gh issue view --json`` (mirrors the
     daemon's ``_fetch_issue_bundle``). Non-bot comments filtered.
     ``Blocked by #N`` + ``Parent: #N`` parsed from body.
   * ralph — plan output from ``dispatcher-output/plan.json`` + the
     identifiers; ``max_iterations`` defaults to 5 matching the daemon.
-  * summary / fix-ci / verify / retro — identifier fields + whatever
-    can be derived locally (prior phase outputs, branch name, git diff
-    for summary). Fields the daemon has (CI job logs, deploy status,
-    phase_transitions timing) are left empty; each skill short-circuits
-    with a structured BLOCKED verdict rather than a string ``.result``.
+  * summary — refetched issue bundle, ralph_summary from
+    ``dispatcher-output/ralph.json``, ``changed_files``, ``git_diff``
+    against ``origin/main``, ``branch``, and plan-derived
+    ``plan_acceptance_criteria`` + ``scope_check``.
+  * fix-ci — ``pr_number`` from ``dispatcher.agents`` plus the
+    failing-job metadata via ``gh pr view --json statusCheckRollup``,
+    each enriched with ``log_tail`` via
+    ``gh run view --log-failed --job <id>``. ``git_diff_base_to_head``
+    from ``gh pr diff``, ``previous_fix_attempts`` from
+    ``dispatcher.agents.retries_used``.
+  * verify — ``pr_number`` + ``merged_commit_sha`` from
+    ``gh pr view --json mergeCommit``; ``deploy_status`` +
+    ``touched_services`` + ``change_type`` from ``gh run list``
+    filtered to the merge SHA; ``deferred_acs`` from
+    ``dispatcher.phase_outputs WHERE phase='summary'``;
+    ``acceptance_criteria`` extracted from the issue body via the same
+    regex the daemon uses.
+  * retro — ``phase_transitions`` + ``failures`` from their
+    respective ``dispatcher.*`` tables, ``ralph_iterations`` /
+    ``ci_attempts`` / ``fix_ci_attempts`` derived from the transitions
+    log, ``total_duration_s`` from ``now() - agents.started_at``,
+    ``scope_check_followups`` / ``plan_follow_ups`` from plan output,
+    ``verify_evidence_md`` from the verify phase_outputs row.
+
+All DB reads go through ``psql $DATABASE_URL -At`` (the same
+connection string the entrypoint already trusts for its own
+``db_exec`` / ``db_query_one`` shell helpers). GitHub reads go through
+``gh`` which is already authenticated by the entrypoint's
+``gh auth login --with-token`` step. Every fetch is best-effort: a
+missing row or a ``gh`` 404 returns an empty / zero value so the
+skill's own guard clauses are what trigger a BLOCKED verdict — never
+an uncaught exception from this shim.
 
 Exit codes: 0 on write success, 2 on unrecoverable error (caller
 should log + continue — the skill's missing-input path still works).
@@ -428,6 +463,18 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+# Cap on failing jobs embedded in fix-ci input — mirrors the daemon's
+# ``FIX_CI_MAX_FAILING_JOBS`` constant. Keeps the payload bounded when
+# a PR has dozens of red checks (e.g. matrix explosions).
+FIX_CI_MAX_FAILING_JOBS = 10
+
+# Cap on log bytes captured per failing job. The daemon lets the skill
+# pull tails itself, but in ECS mode we do it here because the skill's
+# container does not have PAT scopes for CloudWatch Logs / Actions API.
+# 200 lines * ~200 bytes/line = ~40KB; cap to 64KB per job for safety.
+FIX_CI_LOG_TAIL_BYTES = 64 * 1024
 
 
 def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -441,15 +488,248 @@ def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Parsing helpers (mirror DispatcherDaemon)
+# ─────────────────────────────────────────────────────────────────────
+
+
 def _parse_blocked_by(body: str) -> list[int]:
     """Mirror DispatcherDaemon._parse_blocked_by."""
     return [int(m) for m in re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body)]
 
 
-def _parse_parent_issue(body: str) -> int | None:
+def _parse_parent_issue(body):
     """Mirror DispatcherDaemon._parse_parent_issue."""
     match = re.search(r"(?im)^\s*parent\s*:\s*#(\d+)\s*$", body)
     return int(match.group(1)) if match else None
+
+
+def _extract_acceptance_criteria(body: str) -> list[str]:
+    """Mirror DispatcherDaemon._extract_acceptance_criteria.
+
+    Pull ``- [ ] …`` checkboxes out of the issue body, skipping
+    verification / automated-checks / test-plan sections.
+    """
+    lines = body.splitlines()
+    skip_sections = {"post-deploy verification", "automated checks", "test plan"}
+    in_skip_section = False
+    criteria: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading_text = stripped.lstrip("#").strip().lower()
+            in_skip_section = any(tag in heading_text for tag in skip_sections)
+            continue
+        if in_skip_section:
+            continue
+        match = re.match(r"^\s*-\s*\[[ xX]\]\s*(.+)$", line)
+        if match:
+            criteria.append(match.group(1).strip())
+    return criteria
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DB helpers (shell out to psql — entrypoint already uses it)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _db_query_one(sql: str) -> str:
+    """Execute a SELECT against ``$DATABASE_URL`` and return stdout.
+
+    Uses ``psql -At`` (unaligned, tuples-only) so the result is the
+    raw first-row value. Empty string on error — the caller is
+    expected to tolerate missing data.
+    """
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return ""
+    try:
+        outcome = _run(
+            ["psql", database_url, "-v", "ON_ERROR_STOP=1", "-At", "-c", sql],
+            timeout=20,
+        )
+    except Exception:
+        return ""
+    if outcome.returncode != 0:
+        return ""
+    return (outcome.stdout or "").rstrip("\n")
+
+
+def _db_query_rows(sql: str, field_sep: str = "\t") -> list[list[str]]:
+    """Execute a SELECT and return a list of row field lists.
+
+    Uses ``psql -At -F <sep>`` so each line is one row and each field
+    is separated by ``field_sep``. Default TAB — tolerates values with
+    newlines only if the caller ensures there are none (e.g. by
+    rtrimming / replacing in SQL). Empty list on error.
+    """
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return []
+    try:
+        outcome = _run(
+            [
+                "psql",
+                database_url,
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-At",
+                "-F",
+                field_sep,
+                "-c",
+                sql,
+            ],
+            timeout=20,
+        )
+    except Exception:
+        return []
+    if outcome.returncode != 0:
+        return []
+    rows: list[list[str]] = []
+    for line in (outcome.stdout or "").splitlines():
+        if not line:
+            continue
+        rows.append(line.split(field_sep))
+    return rows
+
+
+def _db_fetch_agent_pr_number(agent_id: str) -> int:
+    """Return the agent's ``dispatcher.agents.pr_number`` or 0."""
+    # Escape single quotes in agent_id for the SQL literal. Agent IDs
+    # are UUIDs so this is defensive but not load-bearing.
+    agent_sql = agent_id.replace("'", "''")
+    raw = _db_query_one(
+        "SELECT COALESCE(pr_number::text, '0') "
+        "FROM dispatcher.agents "
+        f"WHERE agent_id = '{agent_sql}' "
+        "LIMIT 1;"
+    )
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _db_fetch_agent_retries_used(agent_id: str) -> int:
+    """Return ``dispatcher.agents.retries_used`` or 0."""
+    agent_sql = agent_id.replace("'", "''")
+    raw = _db_query_one(
+        "SELECT COALESCE(retries_used, 0)::text "
+        "FROM dispatcher.agents "
+        f"WHERE agent_id = '{agent_sql}' "
+        "LIMIT 1;"
+    )
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _db_fetch_agent_total_duration_s(agent_id: str) -> int:
+    """Seconds since ``dispatcher.agents.started_at``.
+
+    Matches DispatcherDaemon._fetch_agent_total_duration_s. 0 on error
+    or missing row.
+    """
+    agent_sql = agent_id.replace("'", "''")
+    raw = _db_query_one(
+        "SELECT COALESCE("
+        "  EXTRACT(EPOCH FROM (now() - started_at))::int, "
+        "  0"
+        ")::text "
+        "FROM dispatcher.agents "
+        f"WHERE agent_id = '{agent_sql}' "
+        "LIMIT 1;"
+    )
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _db_fetch_phase_output(agent_id: str, phase: str) -> dict:
+    """Read ``dispatcher.phase_outputs.output_json`` for (agent_id, phase).
+
+    Returns the parsed JSON object or ``{}`` if missing / malformed /
+    not-a-dict. Mirrors DispatcherDaemon._fetch_phase_output.
+    """
+    agent_sql = agent_id.replace("'", "''")
+    phase_sql = phase.replace("'", "''")
+    raw = _db_query_one(
+        "SELECT output_json::text "
+        "FROM dispatcher.phase_outputs "
+        f"WHERE agent_id = '{agent_sql}' AND phase = '{phase_sql}' "
+        "ORDER BY ts DESC LIMIT 1;"
+    )
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _db_fetch_phase_transitions(agent_id: str) -> list[dict]:
+    """Read ``dispatcher.phase_transitions`` ordered oldest-first.
+
+    Returns ``[{phase, ts}]``. Mirrors
+    DispatcherDaemon._fetch_phase_transitions — the retro skill's
+    input contract lists richer fields (``started_at`` / ``ended_at`` /
+    ``duration_s`` / ``outcome``) but the daemon only populates
+    ``{phase, ts}`` because that's what the table stores. We match.
+    """
+    agent_sql = agent_id.replace("'", "''")
+    rows = _db_query_rows(
+        "SELECT phase, ts::text "
+        "FROM dispatcher.phase_transitions "
+        f"WHERE agent_id = '{agent_sql}' "
+        "ORDER BY ts ASC;"
+    )
+    result: list[dict] = []
+    for row in rows:
+        if len(row) < 2:
+            continue
+        result.append({"phase": row[0], "ts": row[1]})
+    return result
+
+
+def _db_fetch_failures_grouped(agent_id: str) -> list[dict]:
+    """Read ``dispatcher.failures`` grouped by category, highest-count first.
+
+    Returns ``[{category, count, first_seen, last_seen}]``. Mirrors
+    DispatcherDaemon._fetch_failures_grouped.
+    """
+    agent_sql = agent_id.replace("'", "''")
+    rows = _db_query_rows(
+        "SELECT category, count(*)::text, min(ts)::text, max(ts)::text "
+        "FROM dispatcher.failures "
+        f"WHERE agent_id = '{agent_sql}' "
+        "GROUP BY category "
+        "ORDER BY count(*) DESC;"
+    )
+    result: list[dict] = []
+    for row in rows:
+        if len(row) < 4:
+            continue
+        try:
+            count = int(row[1])
+        except ValueError:
+            count = 0
+        result.append(
+            {
+                "category": row[0],
+                "count": count,
+                "first_seen": row[2],
+                "last_seen": row[3],
+            }
+        )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GitHub helpers
+# ─────────────────────────────────────────────────────────────────────
 
 
 def _fetch_issue_bundle(repo: str, issue_number: int) -> dict:
@@ -529,15 +809,260 @@ def _fetch_issue_bundle(repo: str, issue_number: int) -> dict:
     }
 
 
+def _fetch_pr_status(repo: str, pr_number: int) -> dict:
+    """Return the ``gh pr view --json ...`` payload or ``{}``.
+
+    Pulls the same fields the daemon's ``_fetch_pr_status`` asks for.
+    """
+    if not pr_number:
+        return {}
+    cmd = [
+        "gh",
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit",
+    ]
+    outcome = _run(cmd, timeout=30)
+    if outcome.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(outcome.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _fetch_pr_diff(repo: str, pr_number: int) -> str:
+    """Return the PR's base-to-head diff, empty string on error."""
+    if not pr_number:
+        return ""
+    cmd = ["gh", "pr", "diff", str(pr_number), "--repo", repo]
+    outcome = _run(cmd, timeout=60)
+    if outcome.returncode != 0:
+        return ""
+    return outcome.stdout or ""
+
+
+def _extract_failing_jobs(pr_status: dict) -> list[dict]:
+    """Mirror DispatcherDaemon._extract_failing_jobs (pre-log-tail).
+
+    Returns up to ``FIX_CI_MAX_FAILING_JOBS`` entries.
+    """
+    failure_conclusions = {
+        "FAILURE",
+        "CANCELLED",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+        "STARTUP_FAILURE",
+    }
+    rollup = pr_status.get("statusCheckRollup") or []
+    failing: list[dict] = []
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        conclusion = str(check.get("conclusion") or "").upper()
+        status = str(check.get("status") or "").upper()
+        if status == "COMPLETED" and conclusion in failure_conclusions:
+            failing.append(
+                {
+                    "name": check.get("name") or check.get("context") or "",
+                    "conclusion": conclusion,
+                    "databaseId": check.get("databaseId"),
+                    "detailsUrl": check.get("detailsUrl"),
+                }
+            )
+        if len(failing) >= FIX_CI_MAX_FAILING_JOBS:
+            break
+    return failing
+
+
+def _fetch_job_log_tail(repo: str, job_database_id) -> str:
+    """Fetch ``gh run view --log-failed --job <id>`` output.
+
+    Uses ``--job`` with the job's ``databaseId`` — the daemon comment
+    references this shape. Caps at ``FIX_CI_LOG_TAIL_BYTES`` so a
+    multi-megabyte build log doesn't bloat the skill input. Empty
+    string on any failure.
+    """
+    if not job_database_id:
+        return ""
+    cmd = [
+        "gh",
+        "run",
+        "view",
+        "--repo",
+        repo,
+        "--log-failed",
+        "--job",
+        str(job_database_id),
+    ]
+    try:
+        outcome = _run(cmd, timeout=60)
+    except Exception:
+        return ""
+    if outcome.returncode != 0:
+        return ""
+    out = outcome.stdout or ""
+    if len(out) > FIX_CI_LOG_TAIL_BYTES:
+        # Keep the tail — failures usually surface near the end of the
+        # log, and the skill explicitly expects "last ~200 lines".
+        out = out[-FIX_CI_LOG_TAIL_BYTES:]
+    return out
+
+
+def _enrich_failing_jobs_with_logs(repo: str, jobs: list[dict]) -> list[dict]:
+    """Attach a ``log_tail`` to each failing-job entry."""
+    enriched: list[dict] = []
+    for job in jobs:
+        tail = _fetch_job_log_tail(repo, job.get("databaseId"))
+        enriched.append({**job, "log_tail": tail})
+    return enriched
+
+
+def _fetch_merged_pr_info(repo: str, pr_number: int) -> dict:
+    """Return ``{merge_commit_sha, pr_state}`` for a PR."""
+    if not pr_number:
+        return {"merge_commit_sha": "", "pr_state": ""}
+    cmd = [
+        "gh",
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "state,mergeCommit,headRefOid",
+    ]
+    outcome = _run(cmd, timeout=30)
+    if outcome.returncode != 0:
+        return {"merge_commit_sha": "", "pr_state": ""}
+    try:
+        payload = json.loads(outcome.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"merge_commit_sha": "", "pr_state": ""}
+    sha = ""
+    merge_commit = payload.get("mergeCommit")
+    if isinstance(merge_commit, dict):
+        sha = str(merge_commit.get("oid") or "")
+    if not sha:
+        head = payload.get("headRefOid")
+        if isinstance(head, str):
+            sha = head
+    return {
+        "merge_commit_sha": sha,
+        "pr_state": str(payload.get("state") or ""),
+    }
+
+
+def _fetch_deploy_runs_for_sha(repo: str, sha: str) -> list[dict]:
+    """Return workflow runs with ``headSha`` equal to ``sha``.
+
+    Matches the daemon's post-merge deploy-run filter: only runs on
+    the merge commit count toward ``deploy_status``. Empty list on
+    error or no runs.
+    """
+    if not sha:
+        return []
+    cmd = [
+        "gh",
+        "run",
+        "list",
+        "--repo",
+        repo,
+        "--commit",
+        sha,
+        "--limit",
+        "20",
+        "--json",
+        "databaseId,workflowName,conclusion,status,headSha,createdAt,updatedAt",
+    ]
+    outcome = _run(cmd, timeout=30)
+    if outcome.returncode != 0:
+        return []
+    try:
+        payload = json.loads(outcome.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    # Keep only entries whose name starts with ``Deploy`` or is
+    # ``Terraform`` — matches the daemon's workflow-name-to-type map.
+    filtered: list[dict] = []
+    for run in payload:
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("workflowName") or "")
+        if name.startswith("Deploy") or name == "Terraform":
+            filtered.append(run)
+    return filtered
+
+
+def _select_deploy_status(deploy_runs: list[dict]):
+    """Mirror DispatcherDaemon._select_deploy_status."""
+    if not deploy_runs:
+        return None
+    first = deploy_runs[0]
+    return {
+        "workflow_name": first.get("workflowName"),
+        "run_id": first.get("databaseId"),
+        "conclusion": first.get("conclusion"),
+        "duration_s": None,
+    }
+
+
+def _infer_change_type(deploy_runs: list[dict]) -> str:
+    """Mirror DispatcherDaemon._infer_change_type."""
+    if not deploy_runs:
+        return "no_deployed_component"
+    name_to_type = {
+        "Deploy API": "api",
+        "Deploy Dispatcher": "dx_tooling",
+        "Deploy Scraper": "scraper",
+        "Deploy Production": "web",
+        "Deploy Production (Web)": "web",
+        "Terraform": "dx_tooling",
+    }
+    for run in deploy_runs:
+        mapped = name_to_type.get(str(run.get("workflowName") or ""))
+        if mapped:
+            return mapped
+    return "dx_tooling"
+
+
+def _touched_services_from_runs(deploy_runs: list[dict]) -> list[str]:
+    """Mirror DispatcherDaemon._touched_services_from_runs."""
+    name_to_service = {
+        "Deploy API": "judgemind-api-dev",
+        "Deploy Dispatcher": "judgemind-dispatcher-dev",
+        "Deploy Scraper": "judgemind-scraper-dev",
+    }
+    services: list[str] = []
+    for run in deploy_runs:
+        svc = name_to_service.get(str(run.get("workflowName") or ""))
+        if svc and svc not in services:
+            services.append(svc)
+    return services
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Local state helpers (worktree filesystem + git)
+# ─────────────────────────────────────────────────────────────────────
+
+
 def _read_prior_output(repo_root: Path, phase: str) -> dict:
     """Read ``{repo_root}/tmp/dispatcher-output/<phase>.json`` if present."""
     path = repo_root / "tmp" / "dispatcher-output" / f"{phase}.json"
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text())
+        parsed = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _git_diff(repo_root: Path) -> str:
@@ -585,6 +1110,246 @@ def _git_current_branch(repo_root: Path) -> str:
     return (out.stdout or "").strip() if out.returncode == 0 else ""
 
 
+def _git_diff_stats(repo_root: Path) -> dict:
+    """Return ``{files_changed, insertions, deletions}`` from shortstat.
+
+    Uses ``git diff --shortstat origin/main...HEAD``. Empty on failure
+    with zeros so the retro skill's required ``diff_stats`` field is
+    always a dict of ints (not None).
+    """
+    zero = {"files_changed": 0, "insertions": 0, "deletions": 0}
+    try:
+        out = _run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "diff",
+                "--shortstat",
+                "origin/main...HEAD",
+            ],
+            timeout=30,
+        )
+    except Exception:
+        return zero
+    if out.returncode != 0:
+        return zero
+    line = (out.stdout or "").strip()
+    # Example: " 3 files changed, 42 insertions(+), 5 deletions(-)"
+    files = 0
+    ins = 0
+    dels = 0
+    m = re.search(r"(\d+)\s+files?\s+changed", line)
+    if m:
+        files = int(m.group(1))
+    m = re.search(r"(\d+)\s+insertions?\(\+\)", line)
+    if m:
+        ins = int(m.group(1))
+    m = re.search(r"(\d+)\s+deletions?\(-\)", line)
+    if m:
+        dels = int(m.group(1))
+    return {"files_changed": files, "insertions": ins, "deletions": dels}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-phase builders
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _normalize_deferred_acs(raw) -> list[dict]:
+    """Mirror the daemon's deferred_acs coercion in _run_verify_and_complete."""
+    result: list[dict] = []
+    if not isinstance(raw, list):
+        return result
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("index")
+        try:
+            idx_int = int(idx) if idx is not None else None
+        except (TypeError, ValueError):
+            idx_int = None
+        result.append(
+            {
+                "index": idx_int,
+                "reason": str(entry.get("reason") or ""),
+                "verify_instruction": str(entry.get("verify_instruction") or ""),
+            }
+        )
+    return result
+
+
+def _build_summary_input(
+    agent_id: str,
+    issue_number: int,
+    repo_root: Path,
+    github_repo: str,
+) -> dict:
+    """Match DispatcherDaemon._run_summary_phase's summary_input shape."""
+    bundle = _fetch_issue_bundle(github_repo, issue_number)
+    plan = _read_prior_output(repo_root, "plan")
+    ralph = _read_prior_output(repo_root, "ralph")
+    # The daemon prefers ralph's own ``changed_files`` list if populated;
+    # falls back to a git diff read against HEAD. We match, except we
+    # fall back to ``origin/main...HEAD`` instead of ``HEAD`` because
+    # the entrypoint's git state includes the ralph-committed work on
+    # the branch rather than a dirty worktree (#2971).
+    changed_files = ralph.get("changed_files") or _git_changed_files(repo_root)
+    return {
+        "agent_id": agent_id,
+        "issue_number": issue_number,
+        "issue_title": bundle.get("issue_title", ""),
+        "issue_body": bundle.get("issue_body", ""),
+        "issue_comments": bundle.get("issue_comments", []),
+        "ralph_summary": ralph.get("summary", ""),
+        "changed_files": changed_files,
+        "git_diff": _git_diff(repo_root),
+        "worktree_path": str(repo_root),
+        "repo_root": str(repo_root),
+        "branch": _git_current_branch(repo_root),
+        "plan_acceptance_criteria": plan.get("acceptance_criteria", []) or [],
+        "scope_check": plan.get("scope_check", []) or [],
+    }
+
+
+def _build_fix_ci_input(
+    agent_id: str,
+    issue_number: int,
+    repo_root: Path,
+    github_repo: str,
+) -> dict:
+    """Match DispatcherDaemon._run_fix_ci's fix_ci_input shape."""
+    pr_number = _db_fetch_agent_pr_number(agent_id)
+    retries_used = _db_fetch_agent_retries_used(agent_id)
+    pr_status = _fetch_pr_status(github_repo, pr_number)
+    failing_jobs_raw = _extract_failing_jobs(pr_status)
+    failing_jobs = _enrich_failing_jobs_with_logs(github_repo, failing_jobs_raw)
+    # Prefer the PR's full base-to-head diff so fix-ci sees exactly
+    # what shipped (matches daemon behaviour). Fall back to local
+    # ``git diff`` if gh is unreachable.
+    git_diff = _fetch_pr_diff(github_repo, pr_number) or _git_diff(repo_root)
+    plan = _read_prior_output(repo_root, "plan")
+    branch = _git_current_branch(repo_root)
+    return {
+        "agent_id": agent_id,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "branch": branch,
+        "failing_jobs": failing_jobs,
+        "git_diff_base_to_head": git_diff,
+        "worktree_path": str(repo_root),
+        "repo_root": str(repo_root),
+        "previous_fix_attempts": retries_used,
+        "change_type": plan.get("change_type", "") if isinstance(plan, dict) else "",
+    }
+
+
+def _build_verify_input(
+    agent_id: str,
+    issue_number: int,
+    repo_root: Path,
+    github_repo: str,
+) -> dict:
+    """Match DispatcherDaemon._run_verify_and_complete's verify_input shape."""
+    pr_number = _db_fetch_agent_pr_number(agent_id)
+    merge_info = _fetch_merged_pr_info(github_repo, pr_number)
+    merge_sha = merge_info.get("merge_commit_sha", "")
+    deploy_runs = _fetch_deploy_runs_for_sha(github_repo, merge_sha)
+    deploy_status = _select_deploy_status(deploy_runs)
+    change_type = _infer_change_type(deploy_runs)
+    touched_services = _touched_services_from_runs(deploy_runs)
+    bundle = _fetch_issue_bundle(github_repo, issue_number)
+    # Prefer plan-output's AC list (authoritative at claim time); fall
+    # back to extracting from the issue body via the same regex the
+    # daemon uses. If both are empty the verify skill tolerates that
+    # with a FAILED verdict.
+    plan = _read_prior_output(repo_root, "plan")
+    acceptance_criteria = plan.get("acceptance_criteria") or []
+    if not acceptance_criteria:
+        acceptance_criteria = _extract_acceptance_criteria(bundle.get("issue_body") or "")
+    # deferred_acs lives in summary's persisted output — the daemon
+    # reads it from dispatcher.phase_outputs WHERE phase='summary'. We
+    # do the same via _db_fetch_phase_output, then normalize.
+    summary_persisted = _db_fetch_phase_output(agent_id, "summary")
+    deferred_acs = _normalize_deferred_acs(summary_persisted.get("deferred_acs"))
+    return {
+        "agent_id": agent_id,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "acceptance_criteria": acceptance_criteria,
+        "change_type": change_type,
+        "touched_services": touched_services,
+        "deploy_status": deploy_status,
+        "merged_commit_sha": merge_sha,
+        "worktree_path": str(repo_root),
+        "repo_root": str(repo_root),
+        "plan_text": plan.get("plan_text", "") if isinstance(plan, dict) else "",
+        "scope_check": plan.get("scope_check", []) or [],
+        "deferred_acs": deferred_acs,
+    }
+
+
+def _build_retro_input(
+    agent_id: str,
+    issue_number: int,
+    repo_root: Path,
+) -> dict:
+    """Match DispatcherDaemon._build_retro_input's payload shape."""
+    pr_number = _db_fetch_agent_pr_number(agent_id)
+    phase_transitions = _db_fetch_phase_transitions(agent_id)
+    failures = _db_fetch_failures_grouped(agent_id)
+    # Counters derived from phase_transitions, with floors of 1 for
+    # ralph_iterations + ci_attempts matching the daemon.
+    ralph_iterations = sum(
+        1 for p in phase_transitions if p.get("phase") == "ralph"
+    )
+    ci_attempts = sum(
+        1 for p in phase_transitions if p.get("phase") == "awaiting_ci"
+    )
+    fix_ci_attempts = sum(
+        1 for p in phase_transitions if p.get("phase") == "fix_ci"
+    )
+    if ralph_iterations < 1:
+        ralph_iterations = 1
+    if ci_attempts < 1:
+        ci_attempts = 1
+    total_duration_s = _db_fetch_agent_total_duration_s(agent_id)
+    plan = _read_prior_output(repo_root, "plan")
+    scope_check_followups: list[str] = []
+    plan_follow_ups: list[str] = []
+    if isinstance(plan, dict):
+        scope_raw = plan.get("scope_check_followups") or []
+        if isinstance(scope_raw, list):
+            scope_check_followups = [str(x) for x in scope_raw if x]
+        follow_raw = (
+            plan.get("follow_ups")
+            or plan.get("plan_follow_ups")
+            or []
+        )
+        if isinstance(follow_raw, list):
+            plan_follow_ups = [str(x) for x in follow_raw if x]
+    verify_output = _db_fetch_phase_output(agent_id, "verify")
+    verify_evidence_md = str(verify_output.get("evidence_md") or "")
+    diff_stats = _git_diff_stats(repo_root)
+    return {
+        "agent_id": agent_id,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "phase_transitions": phase_transitions,
+        "failures": failures,
+        "ralph_iterations": ralph_iterations,
+        "ci_attempts": ci_attempts,
+        "fix_ci_attempts": fix_ci_attempts,
+        "total_duration_s": total_duration_s,
+        "diff_stats": diff_stats,
+        "worktree_path": str(repo_root),
+        "repo_root": str(repo_root),
+        "scope_check_followups": scope_check_followups,
+        "plan_follow_ups": plan_follow_ups,
+        "verify_evidence_md": verify_evidence_md,
+    }
+
+
 def _build_input(
     phase: str,
     agent_id: str,
@@ -611,61 +1376,13 @@ def _build_input(
             "dependencies_installed": plan.get("dependencies_to_install", []) or [],
         }
     if phase == "summary":
-        bundle = _fetch_issue_bundle(github_repo, issue_number)
-        plan = _read_prior_output(repo_root, "plan")
-        ralph = _read_prior_output(repo_root, "ralph")
-        changed_files = ralph.get("changed_files") or _git_changed_files(repo_root)
-        return {
-            **base,
-            "issue_title": bundle.get("issue_title", ""),
-            "issue_body": bundle.get("issue_body", ""),
-            "issue_comments": bundle.get("issue_comments", []),
-            "ralph_summary": ralph.get("summary", "") if isinstance(ralph, dict) else "",
-            "changed_files": changed_files,
-            "git_diff": _git_diff(repo_root),
-            "branch": _git_current_branch(repo_root),
-            "plan_acceptance_criteria": plan.get("acceptance_criteria", []) or [],
-            "scope_check": plan.get("scope_check", []) or [],
-        }
+        return _build_summary_input(agent_id, issue_number, repo_root, github_repo)
     if phase == "fix-ci":
-        plan = _read_prior_output(repo_root, "plan")
-        return {
-            **base,
-            "pr_number": 0,
-            "branch": _git_current_branch(repo_root),
-            "failing_jobs": [],
-            "git_diff_base_to_head": _git_diff(repo_root),
-            "previous_fix_attempts": 0,
-            "change_type": plan.get("change_type", "") if isinstance(plan, dict) else "",
-        }
+        return _build_fix_ci_input(agent_id, issue_number, repo_root, github_repo)
     if phase == "verify":
-        plan = _read_prior_output(repo_root, "plan")
-        return {
-            **base,
-            "pr_number": 0,
-            "acceptance_criteria": plan.get("acceptance_criteria", []) or [],
-            "change_type": plan.get("change_type", "") if isinstance(plan, dict) else "",
-            "touched_services": [],
-            "deploy_status": None,
-            "merged_commit_sha": "",
-            "plan_text": plan.get("plan_text", "") if isinstance(plan, dict) else "",
-            "scope_check": plan.get("scope_check", []) or [],
-            "deferred_acs": [],
-        }
+        return _build_verify_input(agent_id, issue_number, repo_root, github_repo)
     if phase == "retro":
-        return {
-            **base,
-            "pr_number": 0,
-            "phase_transitions": [],
-            "failures": [],
-            "ralph_iterations": 0,
-            "ci_attempts": 0,
-            "fix_ci_attempts": 0,
-            "total_duration_s": 0,
-            "diff_stats": {"files_changed": 0, "insertions": 0, "deletions": 0},
-            "scope_check_followups": [],
-            "plan_follow_ups": [],
-        }
+        return _build_retro_input(agent_id, issue_number, repo_root)
     # Unknown phase — return the base shape; skill will BLOCK on
     # missing required fields, which is the correct behaviour.
     return base
