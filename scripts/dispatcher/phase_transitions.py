@@ -198,6 +198,21 @@ PHASE_MERGE_FAILED = "merge_failed"
 PHASE_AWAITING_DEPLOY_FAILED = "awaiting_deploy_failed"
 PHASE_AWAITING_DEPLOY_TIMEOUT = "awaiting_deploy_timeout"
 
+#: #3245 — fix_ci terminal for the agent-runner (ECS) path. Set when
+#: the fix_ci skill returned ``verdict=BLOCKED`` (or unrecognized) OR
+#: when the entrypoint's local git stage/commit/push of the skill's
+#: patch failed (missing commit_message, empty diff, git add/commit/push
+#: non-zero exit). The daemon-side path handles these cases in
+#: ``_run_fix_ci`` / ``_apply_fix_ci_patch`` via
+#: ``_handle_agent_failure`` with tier-3 ``FAILURE_CATEGORY_FIX_CI_BLOCKED``
+#: / tier-2 ``FAILURE_CATEGORY_FIX_CI_APPLY_FAILED``; the ECS path
+#: uses this direct terminal so the per-agent Fargate task exits
+#: cleanly (the daemon's supervisor tick still picks up the row for
+#: diagnosis via ``_find_diagnoser_candidates``). Matches the existing
+#: ECS-terminal pattern established by #3176 for awaiting_ci /
+#: merge / awaiting_deploy.
+PHASE_FIX_CI_FAILED = "fix_ci_failed"
+
 #: #3225 — fix_conflict terminal. Set when the fix_conflict skill
 #: returns ``verdict='unresolvable'`` or when ``merge_conflict_attempts
 #: >= FIX_CONFLICT_MAX_ATTEMPTS``. Routed through the diagnoser (via the
@@ -302,6 +317,8 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_AWAITING_DEPLOY_TIMEOUT,
         # #3225 — fix_conflict terminal.
         PHASE_CONFLICT_UNRESOLVABLE,
+        # #3245 — fix_ci terminal for the ECS agent-runner path.
+        PHASE_FIX_CI_FAILED,
     }
 )
 
@@ -1127,6 +1144,7 @@ __all__ = [
     "PHASE_AWAITING_DEPLOY_FAILED",
     "PHASE_AWAITING_DEPLOY_TIMEOUT",
     "PHASE_CONFLICT_UNRESOLVABLE",
+    "PHASE_FIX_CI_FAILED",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",

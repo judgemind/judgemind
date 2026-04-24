@@ -2528,6 +2528,250 @@ handle_fix_conflict() {
     return 0
 }
 
+# ── fix_ci handler (#3245) ────────────────────────────────────────────────
+#
+# ECS-mode equivalent of the subprocess daemon's ``_run_fix_ci`` +
+# ``_apply_fix_ci_patch`` (scripts/dispatcher/daemon.py ~line 12697 and
+# 12979). Before #3245 the entrypoint dispatched ``fix_ci`` through the
+# generic ``planning|ralph|summary|verify`` case — it called the skill,
+# persisted the phase_output, and routed via ``transition_for`` but
+# never staged / committed / pushed the working-tree changes the skill
+# had just produced. Result: every ECS agent with initially-red CI
+# looped 40 iterations of "sonnet patches the worktree → entrypoint
+# discards the patch → CI re-runs unchanged → red → fix_ci again,"
+# wasting ~75 min + 40 sonnet invocations per agent. See issue #3245
+# and the /task-v2-fix-ci SKILL.md (lines 64 + 160) which explicitly
+# defers git ops to "the daemon."
+#
+# The ``/task-v2-fix-ci`` skill writes a JSON envelope of shape:
+#
+#     {
+#       "verdict": "PATCHED" | "BLOCKED" | "FLAKY",
+#       "commit_message": "fix(area): desc — CI (#<PR>)",
+#       "changed_files": ["path1", "path2", ...],
+#       "block_reason": "<str>" | null,
+#       "flaky_evidence": "<str>" | null,
+#       ...
+#     }
+#
+# After ``run_claude_phase "fix_ci"`` returns, this handler:
+#
+#   * **PATCHED** — reads ``commit_message``, runs ``git add -A``,
+#     verifies ``git diff --cached`` has staged changes (empty-diff
+#     means the skill lied), runs ``git commit -m <msg>`` and
+#     ``git push origin <branch>``. On success leaves the agent in
+#     ``awaiting_ci`` so the next tick re-polls CI against the new
+#     commit. On any failure (missing commit_message, empty diff,
+#     git add/commit/push non-zero exit) advances to ``fix_ci_failed``
+#     terminal via ``agent_runner_reaped_failure``.
+#   * **FLAKY** — no code change; advance back to ``awaiting_ci`` so
+#     the next poll re-checks the rollup (GitHub may auto-retry a
+#     flaky job, or a manual nudge resolves eventually). Mirrors the
+#     daemon's FLAKY branch.
+#   * **BLOCKED** (or unrecognized verdict) — log and route to
+#     ``fix_ci_failed`` terminal. Same as daemon except the daemon's
+#     tier-3 failure-row + diagnoser routing is not mirrored here —
+#     the terminal signals "this agent is done, daemon supervisor
+#     picks it up from the failure_row category." (The daemon-side
+#     ``_handle_agent_failure`` would normally write the failure row;
+#     in ECS mode the supervisor's ``_find_diagnoser_candidates`` sweep
+#     picks up the agent by its terminal phase instead.)
+#
+# Log event names (``fix_ci_patch_pushed``, ``fix_ci_missing_commit_
+# message``, ``fix_ci_git_commit_failed``, ``fix_ci_git_push_failed``,
+# ``fix_ci_patch_empty``, ``fix_ci_flaky``, ``fix_ci_blocked``,
+# ``fix_ci_unrecognized_verdict``) mirror the daemon's names so
+# CloudWatch log-insights queries work across both paths.
+#
+# Prints the phase-output JSON on stdout (the same JSON that
+# ``run_claude_phase`` emitted, possibly re-wrapped) for
+# ``persist_phase_output`` in the caller. Always exits 0 — the
+# caller decides whether to advance or leave the terminal alone.
+#
+# Side effects (handler-owned, distinct from the ``run_claude_phase``
+# flow — so this handler does its own advance via
+# ``advance_phase`` / ``agent_runner_reaped_failure``):
+#
+#   * ``git -C "$REPO_ROOT" add -A`` (stage skill's edits).
+#   * ``git -C "$REPO_ROOT" diff --cached --quiet`` (empty-diff check).
+#   * ``git -C "$REPO_ROOT" commit -m "$commit_message"`` (commit).
+#   * ``git -C "$REPO_ROOT" push origin HEAD`` (push to PR branch).
+#
+# The caller (the fix_ci case arm) consumes the $_output envelope via
+# ``persist_phase_output`` but delegates transition to this handler
+# by reading the ``$_fix_ci_next_action`` global it writes before
+# returning. Pattern matches ``handle_awaiting_ci`` which also owns
+# its own advance decisions from within the handler via
+# ``advance_phase`` / ``agent_runner_reaped_failure`` calls.
+handle_fix_ci() {
+    # Invoke the /task-v2-fix-ci skill via run_claude_phase, parse
+    # the verdict, and stage+commit+push on PATCHED. Mirrors the
+    # daemon's ``_run_fix_ci`` + ``_apply_fix_ci_patch`` for the ECS
+    # path. Prints the skill's output JSON on stdout (so the caller
+    # can persist it into phase_outputs), advances the phase row
+    # internally via ``advance_phase`` / ``agent_runner_reaped_failure``,
+    # and always exits 0.
+    #
+    # Environment inputs:
+    #   REPO_ROOT       — per-agent clone root (contains the worktree
+    #                     changes written by the skill).
+    #   BRANCH_NAME     — the agent's branch name (e.g. agent/<shortid>).
+    #   AGENT_WORKSPACE — stderr/stdout log capture dir.
+
+    _output=$(run_claude_phase "fix_ci")
+    persist_phase_output "fix_ci" "$_output"
+
+    _verdict=$(printf '%s' "$_output" | jq -r '.verdict // "" | ascii_upcase' 2>/dev/null)
+    log "fix_ci_verdict" "verdict=$_verdict"
+
+    if [[ "$_verdict" == "PATCHED" ]]; then
+        # Parse commit_message from the skill output. The daemon
+        # treats a missing / empty commit_message as a hard failure
+        # via FAILURE_CATEGORY_FIX_CI_APPLY_FAILED + sub_reason=
+        # missing_commit_message. We terminal to fix_ci_failed.
+        _commit_msg=$(printf '%s' "$_output" | jq -r '.commit_message // ""' 2>/dev/null)
+        if [[ -z "$_commit_msg" ]]; then
+            log "fix_ci_missing_commit_message" "verdict=$_verdict"
+            agent_runner_reaped_failure \
+                "fix_ci_failed" \
+                "missing_commit_message" \
+                "fix_ci skill returned PATCHED with no commit_message"
+            return 0
+        fi
+
+        # Stage all worktree changes. ``git add -A`` mirrors the
+        # daemon (daemon.py line ~13039) — the skill may have
+        # created new files or deleted ones, so staging by
+        # changed_files list alone can miss deletions / renames.
+        set +e
+        git -C "$REPO_ROOT" add -A \
+            > "$AGENT_WORKSPACE/fix-ci-git-add.stdout.log" \
+            2> "$AGENT_WORKSPACE/fix-ci-git-add.stderr.log"
+        _add_rc=$?
+        set -e
+        if [[ "$_add_rc" -ne 0 ]]; then
+            _add_tail=$(tail -c 200 "$AGENT_WORKSPACE/fix-ci-git-add.stderr.log" \
+                2>/dev/null | tr '\n' ' ')
+            log "fix_ci_git_add_failed" \
+                "exit_code=$_add_rc" \
+                "stderr_tail=$_add_tail"
+            agent_runner_reaped_failure \
+                "fix_ci_failed" \
+                "git_add_failed" \
+                "git add -A exit=$_add_rc stderr=$_add_tail"
+            return 0
+        fi
+
+        # Empty-diff check (#3245): if the skill said PATCHED but
+        # wrote no changes to the working tree, ``git diff --cached
+        # --quiet`` exits 0 (nothing staged). Treat as BLOCKED — the
+        # skill's self-report was wrong and a plain ``git commit``
+        # would also fail non-zero downstream, but this explicit
+        # check gives a dedicated log event for CloudWatch.
+        set +e
+        git -C "$REPO_ROOT" diff --cached --quiet \
+            > /dev/null 2>&1
+        _diff_rc=$?
+        set -e
+        if [[ "$_diff_rc" -eq 0 ]]; then
+            # Exit 0 from ``diff --quiet`` = no staged changes.
+            log "fix_ci_patch_empty" \
+                "verdict=$_verdict" \
+                "commit_message=$_commit_msg"
+            agent_runner_reaped_failure \
+                "fix_ci_failed" \
+                "patch_empty" \
+                "fix_ci PATCHED but no changes staged after git add -A"
+            return 0
+        fi
+
+        # Commit. Write the message to a file so ``git commit -F`` gets
+        # the literal message verbatim — avoids any quoting / $-expansion
+        # hazards with multi-line or special-char commit messages.
+        _commit_msg_path="$AGENT_WORKSPACE/fix-ci-commit-msg.txt"
+        printf '%s' "$_commit_msg" > "$_commit_msg_path"
+        set +e
+        git -C "$REPO_ROOT" commit -F "$_commit_msg_path" \
+            > "$AGENT_WORKSPACE/fix-ci-git-commit.stdout.log" \
+            2> "$AGENT_WORKSPACE/fix-ci-git-commit.stderr.log"
+        _commit_rc=$?
+        set -e
+        if [[ "$_commit_rc" -ne 0 ]]; then
+            _commit_tail=$(tail -c 200 "$AGENT_WORKSPACE/fix-ci-git-commit.stderr.log" \
+                2>/dev/null | tr '\n' ' ')
+            log "fix_ci_git_commit_failed" \
+                "exit_code=$_commit_rc" \
+                "stderr_tail=$_commit_tail"
+            agent_runner_reaped_failure \
+                "fix_ci_failed" \
+                "git_commit_failed" \
+                "git commit exit=$_commit_rc stderr=$_commit_tail"
+            return 0
+        fi
+
+        # Push. The entrypoint uses the agent's named branch rather than
+        # ``HEAD`` so the push target is unambiguous even if a rebase or
+        # detached-HEAD state somehow snuck in — matches daemon.py line
+        # ~13166's ``push origin <branch>`` pattern.
+        set +e
+        git -C "$REPO_ROOT" push origin "$BRANCH_NAME" \
+            > "$AGENT_WORKSPACE/fix-ci-git-push.stdout.log" \
+            2> "$AGENT_WORKSPACE/fix-ci-git-push.stderr.log"
+        _push_rc=$?
+        set -e
+        if [[ "$_push_rc" -ne 0 ]]; then
+            _push_tail=$(tail -c 200 "$AGENT_WORKSPACE/fix-ci-git-push.stderr.log" \
+                2>/dev/null | tr '\n' ' ')
+            log "fix_ci_git_push_failed" \
+                "exit_code=$_push_rc" \
+                "stderr_tail=$_push_tail"
+            agent_runner_reaped_failure \
+                "fix_ci_failed" \
+                "git_push_failed" \
+                "git push exit=$_push_rc stderr=$_push_tail"
+            return 0
+        fi
+
+        log "fix_ci_patch_pushed" \
+            "branch=$BRANCH_NAME" \
+            "commit_message=$_commit_msg"
+        # Back to awaiting_ci so the next supervisor tick re-polls
+        # the rollup against the new push. Mirrors daemon behavior
+        # (daemon.py: fix_ci success leaves phase=awaiting_ci).
+        advance_phase "awaiting_ci"
+        printf '%s' "$_output"
+        return 0
+    fi
+
+    if [[ "$_verdict" == "FLAKY" ]]; then
+        _flaky_evidence=$(printf '%s' "$_output" | jq -r '.flaky_evidence // ""' 2>/dev/null)
+        log "fix_ci_flaky" "flaky_evidence=$_flaky_evidence"
+        # No code change. Next tick re-polls CI. GitHub may auto-retry
+        # the flaky job, or a manual nudge resolves eventually.
+        advance_phase "awaiting_ci"
+        printf '%s' "$_output"
+        return 0
+    fi
+
+    # BLOCKED or unrecognized verdict — terminal.
+    if [[ "$_verdict" == "BLOCKED" ]]; then
+        _block_reason=$(printf '%s' "$_output" | jq -r '.block_reason // ""' 2>/dev/null)
+        log "fix_ci_blocked" "block_reason=$_block_reason"
+        agent_runner_reaped_failure \
+            "fix_ci_failed" \
+            "fix_ci_blocked" \
+            "fix_ci skill returned BLOCKED: $_block_reason"
+    else
+        log "fix_ci_unrecognized_verdict" "verdict=$_verdict"
+        agent_runner_reaped_failure \
+            "fix_ci_failed" \
+            "unrecognized_verdict" \
+            "fix_ci skill returned unrecognized verdict: $_verdict"
+    fi
+    printf '%s' "$_output"
+    return 0
+}
+
 # ── Ralph HEAD-watcher (#3144) ────────────────────────────────────────────
 #
 # ECS-mode equivalent of the daemon's ``_start_ralph_head_watcher``
@@ -3619,7 +3863,7 @@ while true; do
     # Stage 1b dispatch, which called `/task-v2-claiming` /
     # `/task-v2-push_and_pr` and got "Unknown command" back.
     case "$_current" in
-        planning|ralph|summary|fix_ci|verify)
+        planning|ralph|summary|verify)
             # #3225 secondary mitigation — run a baseline
             # ``git fetch origin main && git rebase origin/main`` at
             # the START of ralph (before any claude iterations). This
@@ -3850,6 +4094,25 @@ while true; do
                         "fix_conflict transition shim returned $_action"
                     ;;
             esac
+            ;;
+        fix_ci)
+            # #3245: fix_ci phase. Split out of the generic Claude-phase
+            # case because — unlike planning/ralph/summary/verify — the
+            # /task-v2-fix-ci skill explicitly defers git ops to "the
+            # daemon" (SKILL.md lines 64 + 160). Before #3245 the ECS
+            # entrypoint ran fix_ci through the generic arm and never
+            # staged / committed / pushed the skill's patch; every agent
+            # with initially-red CI looped 40 iterations without adding
+            # a single commit. handle_fix_ci mirrors the subprocess
+            # daemon's ``_run_fix_ci`` + ``_apply_fix_ci_patch`` (daemon.py
+            # ~line 12697 / 12979): PATCHED → stage + commit + push +
+            # back to awaiting_ci; FLAKY → back to awaiting_ci without
+            # commit; BLOCKED / unrecognized → fix_ci_failed terminal.
+            # handle_fix_ci owns its own advance_phase /
+            # agent_runner_reaped_failure calls so the dispatch case
+            # just invokes the handler and lets the next loop tick
+            # observe the new phase row.
+            handle_fix_ci >/dev/null
             ;;
         awaiting_ci)
             # #3176: real implementation — poll ``gh pr view`` rollup,

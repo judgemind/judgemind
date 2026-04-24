@@ -4152,6 +4152,486 @@ else
          "update-log: $(cat "$t43_state_dir/update-log.txt" 2>/dev/null)"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Tests T44–T49: #3245 — handle_fix_ci stages, commits, and pushes the
+# /task-v2-fix-ci skill's patches. Before #3245 the ECS entrypoint
+# dispatched ``fix_ci`` through the generic Claude-phase case — it
+# invoked the skill, persisted the phase_output, and advanced via
+# ``transition_for``, but NEVER staged / committed / pushed the working-
+# tree changes that /task-v2-fix-ci actually produced. Every ECS agent
+# with initially-red CI looped 40 fix_ci iterations adding zero commits.
+#
+# These tests extract ``handle_fix_ci`` from the entrypoint and drive
+# it directly with stubbed git/psql/claude, asserting that:
+#
+#   T44 — PATCHED verdict → git add + commit + push invoked, advance to
+#         awaiting_ci, ``fix_ci_patch_pushed`` log event emitted.
+#   T45 — BLOCKED verdict → no commit attempted, ``fix_ci_blocked`` event,
+#         advance to terminal ``fix_ci_failed``.
+#   T46 — PATCHED with empty commit_message → treated as BLOCKED,
+#         ``fix_ci_missing_commit_message`` event, terminal.
+#   T47 — PATCHED with stub that stages nothing (empty diff) → treated
+#         as BLOCKED, ``fix_ci_patch_empty`` event, terminal.
+#   T48 — PATCHED but ``git push`` fails → ``fix_ci_git_push_failed``
+#         event, terminal.
+#   T49 — FLAKY verdict → advance to awaiting_ci, no commit attempted.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Common helper: extract the handler + its dependencies from the real
+# entrypoint so each test exercises the production code path, not a
+# vendored copy.
+t44_funcs="$TEST_TMP/t44-funcs.sh"
+printf 'exec 3>&1\n' > "$t44_funcs"
+
+for fn in db_exec db_query_one log persist_phase_output \
+          phase_to_skill \
+          read_phase_output \
+          write_phase_input \
+          run_claude_phase \
+          advance_phase \
+          agent_runner_reaped_failure \
+          handle_fix_ci; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t44_funcs"
+done
+
+# Sanity: handle_fix_ci and its dependencies were extracted.
+if grep -q "^handle_fix_ci()" "$t44_funcs"; then
+    pass "#3245 T44 setup — extracted handle_fix_ci from entrypoint"
+else
+    fail "#3245 T44 setup — extracted handle_fix_ci from entrypoint" \
+         "fixture head: $(head -c 400 "$t44_funcs")"
+fi
+
+# Shared stub-builder helper: generates stubs into $1 (bin dir) that log
+# all invocations to $2 (state dir). Defaults: git/gh/psql/claude all
+# exit 0; set GIT_PUSH_EXIT=N in the test env to simulate a push
+# failure, GIT_DIFF_CACHED_EXIT=0 to simulate an empty staged diff.
+make_fix_ci_stubs() {
+    _stub_bin="$1"
+    _state_dir="$2"
+
+    cat > "$_stub_bin/git" <<'T44GITEOF'
+#!/usr/bin/env bash
+set -u
+# Log argv (one arg per line for easy parsing).
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+# Skip any `-C <dir>` prefix to find the subcommand.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -C) shift 2 || true; continue ;;
+        *) break ;;
+    esac
+done
+
+sub="${1:-}"
+case "$sub" in
+    add)
+        exit "${GIT_ADD_EXIT:-0}"
+        ;;
+    diff)
+        # ``git diff --cached --quiet`` — exit 0 = no changes, 1 = changes.
+        # Tests that want to simulate "skill lied, nothing staged" set
+        # GIT_DIFF_CACHED_EXIT=0. Default is 1 (there ARE staged changes).
+        exit "${GIT_DIFF_CACHED_EXIT:-1}"
+        ;;
+    commit)
+        exit "${GIT_COMMIT_EXIT:-0}"
+        ;;
+    push)
+        exit "${GIT_PUSH_EXIT:-0}"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+T44GITEOF
+    chmod +x "$_stub_bin/git"
+
+    cat > "$_stub_bin/psql" <<'T44PSQLEOF'
+#!/usr/bin/env bash
+set -u
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) shift; query="$1" ;;
+    esac
+    shift || true
+done
+printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
+exit 0
+T44PSQLEOF
+    chmod +x "$_stub_bin/psql"
+
+    # claude stub — the handler's run_claude_phase reads its output from
+    # $REPO_ROOT/tmp/dispatcher-output/fix-ci.json (see read_phase_output),
+    # so this stub just logs the invocation and exits 0; the per-test
+    # fix-ci.json fixture seeded under $T_REPO_ROOT is the actual source
+    # of truth for the verdict.
+    cat > "$_stub_bin/claude" <<'T44CLAUDEEOF'
+#!/usr/bin/env bash
+printf 'CLAUDE_INVOKED %s\n' "$*" >> "${T_STATE_DIR}/claude-log.txt"
+# Emit a minimal envelope on stdout — ignored by the handler because
+# read_phase_output reads the tmp/dispatcher-output/fix-ci.json file
+# first and returns 0 when it parses as JSON.
+printf '{"result": {"verdict": "PATCHED"}}\n'
+exit 0
+T44CLAUDEEOF
+    chmod +x "$_stub_bin/claude"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_stub_bin/jq"
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        ln -sf "$(command -v python3)" "$_stub_bin/python3"
+    fi
+}
+
+# Per-test runner: isolates env, drives handle_fix_ci, returns rc + output.
+# Usage: run_fix_ci_test <test-id> <fix-ci-output-json> [extra env var=value ...]
+run_fix_ci_test() {
+    _test_id="$1"
+    shift
+    _fixci_json="$1"
+    shift
+
+    _tworkspace="$TEST_TMP/${_test_id}-workspace"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_tworkspace" "$_trepo" "$_tstate" "$_tbin"
+    mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
+
+    # Seed the dispatcher-output/fix-ci.json with the test's JSON fixture.
+    printf '%s' "$_fixci_json" > "$_trepo/tmp/dispatcher-output/fix-ci.json"
+    # Seed a minimal dispatcher-input/fix-ci.json so write_phase_input's
+    # python3 shim has a directory to write to.
+    printf '{}' > "$_trepo/tmp/dispatcher-input/fix-ci.json"
+
+    # Phase-input shim no-op.
+    _tshim="$TEST_TMP/${_test_id}-phase-input-shim.py"
+    cat > "$_tshim" <<'T44SHIMEOF'
+import sys
+sys.exit(0)
+T44SHIMEOF
+
+    make_fix_ci_stubs "$_tbin" "$_tstate"
+
+    set +e
+    # Extra env vars come in as "$@" (e.g. GIT_PUSH_EXIT=128). Bash's
+    # VAR=value prefix only works as a single compound command; here the
+    # compound starts with a ``$()``-captured subshell which resets the
+    # prefix semantics, so we route the extras through ``env -S`` instead.
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        T_REPO_ROOT="$_trepo" \
+        PATH="$_tbin:$PATH" \
+        AGENT_ID="${_test_id}-dead-beef-cafe-000000000099" \
+        ISSUE_NUMBER="3245" \
+        AGENT_WORKSPACE="$_tworkspace" \
+        REPO_ROOT="$_trepo" \
+        BRANCH_NAME="agent/${_test_id}abcd" \
+        DATABASE_URL="postgres://test" \
+        AGENT_RUNNER_DRY_RUN="0" \
+        AGENT_RUNNER_PHASE_INPUT_SHIM="$_tshim" \
+        PHASE_INPUT_SHIM="$_tshim" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            # shellcheck disable=SC1090
+            . "'"$t44_funcs"'"
+            handle_fix_ci
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    # Make the state dir + rc + output available to the caller via
+    # globals (bash 3.2 — no nameref / assoc-array returns).
+    FIXCI_TEST_RC="$_trc"
+    FIXCI_TEST_OUT="$_tout"
+    FIXCI_TEST_STATE="$_tstate"
+    FIXCI_TEST_REPO="$_trepo"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T44: PATCHED verdict → git add + commit + push + advance awaiting_ci
+# ══════════════════════════════════════════════════════════════════════════
+
+t44_json='{"verdict": "PATCHED", "commit_message": "fix(scraping): lint E501 — CI (#9999)", "changed_files": ["a.py", "b.py"]}'
+run_fix_ci_test "t44" "$t44_json"
+
+if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
+    pass "#3245 T44 — handle_fix_ci exits 0 on PATCHED"
+else
+    fail "#3245 T44 — handle_fix_ci exits 0 on PATCHED" \
+         "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
+fi
+
+# git add was invoked.
+if grep -qE "CALL .*\\badd\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T44 — git add invoked on PATCHED"
+else
+    fail "#3245 T44 — git add invoked on PATCHED" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# git commit was invoked.
+if grep -qE "CALL .*\\bcommit\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T44 — git commit invoked on PATCHED"
+else
+    fail "#3245 T44 — git commit invoked on PATCHED" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# git push was invoked with the branch name.
+if grep -qE "CALL .*\\bpush\\b.*agent/t44abcd" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T44 — git push origin <branch> invoked on PATCHED"
+else
+    fail "#3245 T44 — git push origin <branch> invoked on PATCHED" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Success log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patch_pushed"; then
+    pass "#3245 T44 — fix_ci_patch_pushed log event emitted"
+else
+    fail "#3245 T44 — fix_ci_patch_pushed log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# Phase advanced to awaiting_ci. advance_phase runs a DB UPDATE via psql.
+if grep -q "SET phase = 'awaiting_ci'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T44 — advance_phase awaiting_ci executed on PATCHED"
+else
+    fail "#3245 T44 — advance_phase awaiting_ci executed on PATCHED" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T45: BLOCKED verdict → no commit, advance to fix_ci_failed terminal
+# ══════════════════════════════════════════════════════════════════════════
+
+t45_json='{"verdict": "BLOCKED", "block_reason": "secret AWS_SECRET not set in CI environment — ops must provision"}'
+run_fix_ci_test "t45" "$t45_json"
+
+if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
+    pass "#3245 T45 — handle_fix_ci exits 0 on BLOCKED"
+else
+    fail "#3245 T45 — handle_fix_ci exits 0 on BLOCKED" \
+         "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
+fi
+
+# No git commit attempted (and no git add, no push).
+if ! grep -qE "CALL .*\\bcommit\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T45 — no git commit attempted on BLOCKED"
+else
+    fail "#3245 T45 — no git commit attempted on BLOCKED" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+if ! grep -qE "CALL .*\\bpush\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T45 — no git push attempted on BLOCKED"
+else
+    fail "#3245 T45 — no git push attempted on BLOCKED" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# fix_ci_blocked log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_blocked"; then
+    pass "#3245 T45 — fix_ci_blocked log event emitted"
+else
+    fail "#3245 T45 — fix_ci_blocked log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# Routed to fix_ci_failed terminal — agent_runner_reaped_failure runs
+# an UPDATE setting phase='fix_ci_failed' status='failed'.
+if grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T45 — advances to fix_ci_failed terminal on BLOCKED"
+else
+    fail "#3245 T45 — advances to fix_ci_failed terminal on BLOCKED" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T46: PATCHED with empty commit_message → treated as BLOCKED
+# (fix_ci_missing_commit_message event, terminal fix_ci_failed).
+# ══════════════════════════════════════════════════════════════════════════
+
+t46_json='{"verdict": "PATCHED", "commit_message": "", "changed_files": ["a.py"]}'
+run_fix_ci_test "t46" "$t46_json"
+
+if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
+    pass "#3245 T46 — handle_fix_ci exits 0 on PATCHED+empty-commit-message"
+else
+    fail "#3245 T46 — handle_fix_ci exits 0 on PATCHED+empty-commit-message" \
+         "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
+fi
+
+# Diagnostic log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_missing_commit_message"; then
+    pass "#3245 T46 — fix_ci_missing_commit_message log event emitted"
+else
+    fail "#3245 T46 — fix_ci_missing_commit_message log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# No git commit attempted.
+if ! grep -qE "CALL .*\\bcommit\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T46 — no git commit attempted on empty commit_message"
+else
+    fail "#3245 T46 — no git commit attempted on empty commit_message" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Routed to fix_ci_failed terminal.
+if grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T46 — advances to fix_ci_failed terminal on empty commit_message"
+else
+    fail "#3245 T46 — advances to fix_ci_failed terminal on empty commit_message" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T47: PATCHED but ``git diff --cached --quiet`` returns 0
+# (no staged changes) → treated as BLOCKED via fix_ci_patch_empty event.
+# ══════════════════════════════════════════════════════════════════════════
+
+t47_json='{"verdict": "PATCHED", "commit_message": "fix(area): thing — CI (#9999)", "changed_files": []}'
+run_fix_ci_test "t47" "$t47_json" GIT_DIFF_CACHED_EXIT=0
+
+if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
+    pass "#3245 T47 — handle_fix_ci exits 0 on PATCHED+empty-diff"
+else
+    fail "#3245 T47 — handle_fix_ci exits 0 on PATCHED+empty-diff" \
+         "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
+fi
+
+# Diagnostic log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patch_empty"; then
+    pass "#3245 T47 — fix_ci_patch_empty log event emitted"
+else
+    fail "#3245 T47 — fix_ci_patch_empty log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# git add ran (the stub succeeds), but no commit / push.
+if grep -qE "CALL .*\\badd\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T47 — git add ran (before empty-diff detection)"
+else
+    fail "#3245 T47 — git add ran (before empty-diff detection)" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+if ! grep -qE "CALL .*\\bcommit\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T47 — no git commit attempted after empty-diff detection"
+else
+    fail "#3245 T47 — no git commit attempted after empty-diff detection" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Terminal fix_ci_failed.
+if grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T47 — advances to fix_ci_failed terminal on empty-diff"
+else
+    fail "#3245 T47 — advances to fix_ci_failed terminal on empty-diff" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T48: PATCHED but ``git push`` exits non-zero →
+# fix_ci_git_push_failed log event, terminal fix_ci_failed.
+# ══════════════════════════════════════════════════════════════════════════
+
+t48_json='{"verdict": "PATCHED", "commit_message": "fix(scraping): foo — CI (#9999)", "changed_files": ["a.py"]}'
+run_fix_ci_test "t48" "$t48_json" GIT_PUSH_EXIT=128
+
+if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
+    pass "#3245 T48 — handle_fix_ci exits 0 on PATCHED+push-failure"
+else
+    fail "#3245 T48 — handle_fix_ci exits 0 on PATCHED+push-failure" \
+         "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
+fi
+
+# Push was attempted (commit succeeded first).
+if grep -qE "CALL .*\\bpush\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T48 — git push attempted on PATCHED"
+else
+    fail "#3245 T48 — git push attempted on PATCHED" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Diagnostic log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_git_push_failed"; then
+    pass "#3245 T48 — fix_ci_git_push_failed log event emitted"
+else
+    fail "#3245 T48 — fix_ci_git_push_failed log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# Terminal fix_ci_failed (not awaiting_ci — push failure is fatal).
+if grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T48 — advances to fix_ci_failed terminal on push failure"
+else
+    fail "#3245 T48 — advances to fix_ci_failed terminal on push failure" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+# Negative: must NOT have advanced to awaiting_ci (that would let the
+# supervisor re-enter a broken push loop).
+if ! grep -q "SET phase = 'awaiting_ci'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T48 — does not advance to awaiting_ci on push failure"
+else
+    fail "#3245 T48 — does not advance to awaiting_ci on push failure" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T49: FLAKY verdict → advance to awaiting_ci, no commit, no push.
+# ══════════════════════════════════════════════════════════════════════════
+
+t49_json='{"verdict": "FLAKY", "flaky_evidence": "httpx.TimeoutError to api.anthropic.com in packages/api tests — intermittent"}'
+run_fix_ci_test "t49" "$t49_json"
+
+if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
+    pass "#3245 T49 — handle_fix_ci exits 0 on FLAKY"
+else
+    fail "#3245 T49 — handle_fix_ci exits 0 on FLAKY" \
+         "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
+fi
+
+# fix_ci_flaky log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_flaky"; then
+    pass "#3245 T49 — fix_ci_flaky log event emitted"
+else
+    fail "#3245 T49 — fix_ci_flaky log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# No git add / commit / push attempted on FLAKY.
+if ! grep -qE "CALL .*\\badd\\b|CALL .*\\bcommit\\b|CALL .*\\bpush\\b" \
+    "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3245 T49 — no git add/commit/push on FLAKY"
+else
+    fail "#3245 T49 — no git add/commit/push on FLAKY" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Advanced to awaiting_ci (not fix_ci_failed).
+if grep -q "SET phase = 'awaiting_ci'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T49 — advances to awaiting_ci on FLAKY (re-poll)"
+else
+    fail "#3245 T49 — advances to awaiting_ci on FLAKY (re-poll)" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+if ! grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3245 T49 — does NOT advance to fix_ci_failed on FLAKY"
+else
+    fail "#3245 T49 — does NOT advance to fix_ci_failed on FLAKY" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
