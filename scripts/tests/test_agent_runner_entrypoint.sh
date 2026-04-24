@@ -57,6 +57,10 @@ fail() {
 TEST_TMP=""
 cleanup() {
     set +eu
+    if [[ "${TEST_AGENT_RUNNER_KEEP_TMP:-0}" == "1" ]]; then
+        echo "TEST_AGENT_RUNNER_KEEP_TMP=1 — keeping $TEST_TMP for inspection"
+        return
+    fi
     if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
         rm -rf "$TEST_TMP"
     fi
@@ -149,6 +153,29 @@ case "$query" in
         exit 0
         ;;
     *"INSERT INTO dispatcher.ralph_patches"*)
+        # #3144 T26 knob — simulate DB down during the HEAD-watcher's
+        # per-iteration INSERT. The watcher's ``if ! psql … ; then``
+        # guard must catch the non-zero exit and emit
+        # ``ralph_head_watcher_db_failure`` without crashing.
+        if [[ "${PSQL_FAIL_ON_INSERT:-0}" == "1" ]]; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    *"SELECT 1 FROM dispatcher.ralph_patches"*)
+        # #3144 HEAD-watcher SELECT-then-INSERT guard. Returns empty
+        # (not-exists) by default so tests see fresh INSERT paths.
+        # Set RALPH_PATCH_EXISTS=1 to simulate a prior iteration
+        # already persisted.
+        if [[ "${RALPH_PATCH_EXISTS:-0}" == "1" ]]; then
+            printf '1\n'
+        fi
+        exit 0
+        ;;
+    *"UPDATE dispatcher.agents"*"SET ralph_iterations_observed"*)
+        # #3144 HEAD-watcher counter bump. Acknowledge the query so the
+        # invocation log picks it up; the test grep'd specifically for
+        # this substring.
         exit 0
         ;;
     *)
@@ -278,6 +305,36 @@ case "$subcommand" in
         ;;
     format-patch)
         printf 'From deadbeefcafe Mon Sep 17 00:00:00 2001\nfake patch content\n'
+        exit 0
+        ;;
+    log)
+        # `git log --reverse --format='%H' origin/main..HEAD` — baseline.
+        # `git log --reverse --format='%H %s' origin/main..HEAD` — tick.
+        # The HEAD-watcher test (#3144) sets RALPH_HEAD_WATCHER_COMMITS_FILE
+        # to a path whose contents are one commit per line in the
+        # ``<sha> <subject>`` shape. The stub emits either just SHAs
+        # (for --format='%H') or the full line (for --format='%H %s')
+        # depending on the format flag — so the entrypoint's seen-file
+        # bookkeeping (which grep's the SHA) works against both calls.
+        _want_subject=0
+        for _arg in "$@"; do
+            case "$_arg" in
+                --format=*%s*)
+                    _want_subject=1
+                    ;;
+            esac
+        done
+        if [[ -f "${RALPH_HEAD_WATCHER_COMMITS_FILE:-}" ]]; then
+            if [[ "$_want_subject" == "1" ]]; then
+                cat "$RALPH_HEAD_WATCHER_COMMITS_FILE"
+            else
+                # Strip subjects — emit SHA per line only.
+                awk '{print $1}' "$RALPH_HEAD_WATCHER_COMMITS_FILE"
+            fi
+            exit 0
+        fi
+        # Default: no commits. The entrypoint's baseline + tick paths
+        # both tolerate empty output (no new commits to emit on).
         exit 0
         ;;
     am)
@@ -1627,6 +1684,20 @@ case "$query" in
         exit 0
         ;;
     *"INSERT INTO dispatcher.ralph_patches"*)
+        # #3144 T26 knob — see equivalent in the earlier stub (L151).
+        if [[ "${PSQL_FAIL_ON_INSERT:-0}" == "1" ]]; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    *"SELECT 1 FROM dispatcher.ralph_patches"*)
+        if [[ "${RALPH_PATCH_EXISTS:-0}" == "1" ]]; then
+            printf '1\n'
+        fi
+        exit 0
+        ;;
+    *"UPDATE dispatcher.agents"*"SET ralph_iterations_observed"*)
+        # #3144 HEAD-watcher counter bump.
         exit 0
         ;;
     *)
@@ -2150,6 +2221,377 @@ if jq -e '.agent_id == "21212121-2121-2121-2121-212121212121"' "$t21_input" >/de
     pass "#3135 — unknown-phase fallback carries agent_id"
 else
     fail "#3135 — unknown-phase fallback carries agent_id"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Tests 22-26: Ralph HEAD-watcher (#3144)
+#
+# The watcher is a subshell started before run_claude_phase "ralph" and
+# killed after. These tests exercise it in isolation via
+# AGENT_RUNNER_WATCHER_TEST_MODE=1, which runs start → sleep → stop
+# without spinning the full phase loop. The git stub's `log`
+# subcommand reads RALPH_HEAD_WATCHER_COMMITS_FILE so the test can
+# mutate the commit set mid-run to simulate ralph committing.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Shared helper to run the watcher in test mode with consistent env.
+# Arguments:
+#   $1 = workspace dir
+#   $2 = commits fixture path that the watcher's `git log` stub will
+#        read from (pre-seeded empty; the seeder below overwrites it).
+#   $3 = seed-commits fixture — a separate file the entrypoint's test
+#        hook copies INTO $2 after the watcher takes its baseline
+#        snapshot. Pass "" to simulate "no new commits during ralph".
+#   $4 = sleep seconds (how long the watcher runs after seeding)
+#   $5 = poll interval seconds
+#   $6 = extra env vars (list of VAR=VAL tokens, one per slot)
+run_watcher_test() {
+    _wtest_workspace="$1"
+    _wtest_commits="$2"
+    _wtest_seed="$3"
+    _wtest_sleep="$4"
+    _wtest_poll="$5"
+    _wtest_extra="$6"
+    mkdir -p "$_wtest_workspace"
+
+    set +e
+    # Start with an empty commits file so the watcher's baseline
+    # captures zero commits. The AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS
+    # hook inside the entrypoint then cp's the seed into $_wtest_commits
+    # so the FIRST tick sees them as "new" and fires events.
+    : > "$_wtest_commits"
+
+    # Pass the extra VAR=VAL tokens via explicit export-in-a-subshell.
+    # An earlier design passed them through an array ``_cmd=(env A=1
+    # $extra bash …)`` with ``$extra`` word-splitting, but the
+    # unquoted expansion inside a bash 3.2 array initializer dropped
+    # the extra tokens in the real test run (setup_fixtures context?
+    # shopt inheritance? unclear — the direct-repro script worked
+    # fine). An explicit ``export`` in a subshell is unambiguous.
+    (
+        export AGENT_ID="abababab-cdcd-efef-0101-020202020202"
+        export ISSUE_NUMBER="3144"
+        export DATABASE_URL="postgres://test"
+        export GITHUB_TOKEN=""
+        export AGENT_WORKSPACE="$_wtest_workspace"
+        export REPO_URL="https://example.invalid/repo.git"
+        export PATH="$STUB_BIN:$PATH"
+        export INVOCATIONS_DIR="$INVOCATIONS_DIR"
+        export PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher"
+        export PHASE_TRANSITIONS_PARENT="$REPO_ROOT"
+        export AGENT_RUNNER_WATCHER_TEST_MODE=1
+        export AGENT_RUNNER_WATCHER_TEST_SLEEP="$_wtest_sleep"
+        export AGENT_RUNNER_RALPH_HEAD_POLL_INTERVAL="$_wtest_poll"
+        export RALPH_HEAD_WATCHER_COMMITS_FILE="$_wtest_commits"
+        export AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS="$_wtest_seed"
+        if [[ -n "$_wtest_extra" ]]; then
+            # Tokens are space-separated VAR=VAL pairs. Export each.
+            for _tok in $_wtest_extra; do
+                export "$_tok"
+            done
+        fi
+        bash "$ENTRYPOINT" 2>&1
+    )
+    _wtest_rc=$?
+    set -e
+    return $_wtest_rc
+}
+
+# ── Test 22: Zero-iteration ralph — no commits, no ralph_patches rows ──────
+setup_fixtures
+
+t22_workspace="$TEST_TMP/t22-workspace"
+t22_commits="$TEST_TMP/t22-commits.txt"
+t22_seed=""   # no seed → nothing new appears during ralph
+
+set +e
+t22_out=$(run_watcher_test "$t22_workspace" "$t22_commits" "$t22_seed" 1 1 "")
+t22_rc=$?
+set -e
+
+if [[ $t22_rc -eq 0 ]]; then
+    pass "#3144 T22 — watcher test mode exits 0 with no commits"
+else
+    fail "#3144 T22 — watcher test mode exits 0 with no commits" \
+         "rc=$t22_rc, out tail: $(printf '%s\n' "$t22_out" | tail -10)"
+fi
+
+if printf '%s' "$t22_out" | grep -q "ralph_head_watcher_started"; then
+    pass "#3144 T22 — watcher logs ralph_head_watcher_started"
+else
+    fail "#3144 T22 — watcher logs ralph_head_watcher_started" "out: $t22_out"
+fi
+
+if printf '%s' "$t22_out" | grep -q "ralph_head_watcher_stopped"; then
+    pass "#3144 T22 — watcher logs ralph_head_watcher_stopped"
+else
+    fail "#3144 T22 — watcher logs ralph_head_watcher_stopped" "out: $t22_out"
+fi
+
+# No ralph_iteration_observed events when no commits.
+if printf '%s' "$t22_out" | grep -q "ralph_iteration_observed"; then
+    fail "#3144 T22 — no ralph_iteration_observed when no commits" "out: $t22_out"
+else
+    pass "#3144 T22 — no ralph_iteration_observed when no commits"
+fi
+
+# No INSERT into ralph_patches.
+if grep -q "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log"; then
+    fail "#3144 T22 — no ralph_patches INSERT when no commits" \
+         "psql log: $(cat "$INVOCATIONS_DIR/psql.log")"
+else
+    pass "#3144 T22 — no ralph_patches INSERT when no commits"
+fi
+
+# ── Test 23: Single-iteration — one commit seeded, expect 1 INSERT + UPDATE
+setup_fixtures
+
+t23_workspace="$TEST_TMP/t23-workspace"
+t23_commits="$TEST_TMP/t23-commits.txt"
+t23_seed="$TEST_TMP/t23-seed.txt"
+printf 'aaaaaaa1 first ralph iteration commit\n' > "$t23_seed"
+
+set +e
+t23_out=$(run_watcher_test "$t23_workspace" "$t23_commits" "$t23_seed" 3 1 "")
+t23_rc=$?
+set -e
+
+if [[ $t23_rc -eq 0 ]]; then
+    pass "#3144 T23 — watcher exits 0 with one commit"
+else
+    fail "#3144 T23 — watcher exits 0 with one commit" "rc=$t23_rc"
+fi
+
+# Exactly one ralph_iteration_observed event.
+_t23_iter_count=$(printf '%s' "$t23_out" | grep -c "ralph_iteration_observed" || true)
+if [[ "$_t23_iter_count" -eq 1 ]]; then
+    pass "#3144 T23 — exactly one ralph_iteration_observed event"
+else
+    fail "#3144 T23 — exactly one ralph_iteration_observed event" \
+         "got $_t23_iter_count events. out: $t23_out"
+fi
+
+# The event carries iteration_n=1 and the seeded commit SHA.
+if printf '%s' "$t23_out" | grep "ralph_iteration_observed" | grep -q "iteration_n\": \"1\""; then
+    pass "#3144 T23 — ralph_iteration_observed carries iteration_n=1"
+else
+    fail "#3144 T23 — ralph_iteration_observed carries iteration_n=1" \
+         "event line: $(printf '%s' "$t23_out" | grep 'ralph_iteration_observed' | head -1)"
+fi
+
+if printf '%s' "$t23_out" | grep "ralph_iteration_observed" | grep -q "aaaaaaa1"; then
+    pass "#3144 T23 — ralph_iteration_observed carries commit_sha"
+else
+    fail "#3144 T23 — ralph_iteration_observed carries commit_sha"
+fi
+
+if printf '%s' "$t23_out" | grep "ralph_iteration_observed" \
+     | grep -q "commit_subject_first_80\": \"first ralph iteration commit"; then
+    pass "#3144 T23 — event carries truncated commit subject"
+else
+    fail "#3144 T23 — event carries truncated commit subject" \
+         "event line: $(printf '%s' "$t23_out" | grep 'ralph_iteration_observed' | head -1)"
+fi
+
+# Exactly one INSERT INTO dispatcher.ralph_patches.
+_t23_insert_count=$(grep -c "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
+_t23_insert_count=${_t23_insert_count:-0}
+if [[ "$_t23_insert_count" -eq 1 ]]; then
+    pass "#3144 T23 — one INSERT into dispatcher.ralph_patches"
+else
+    fail "#3144 T23 — one INSERT into dispatcher.ralph_patches" \
+         "got $_t23_insert_count inserts"
+fi
+
+# Exactly one UPDATE to dispatcher.agents SET ralph_iterations_observed.
+_t23_update_count=$(grep -c "ralph_iterations_observed" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
+_t23_update_count=${_t23_update_count:-0}
+if [[ "$_t23_update_count" -ge 1 ]]; then
+    pass "#3144 T23 — UPDATE dispatcher.agents SET ralph_iterations_observed"
+else
+    fail "#3144 T23 — UPDATE dispatcher.agents SET ralph_iterations_observed" \
+         "psql log: $(cat "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# SELECT-then-INSERT guard against double-emit races. The watcher
+# issues a SELECT for an existing (agent_id, iteration_n) row before
+# each INSERT. This avoids adding a DB uniqueness constraint that
+# would also affect the daemon's subprocess-mode insert path — see
+# migration 42's rationale for the non-change.
+if grep -F "SELECT 1 FROM dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log" \
+     | grep -q "iteration_n"; then
+    pass "#3144 T23 — SELECT guard runs before each INSERT"
+else
+    fail "#3144 T23 — SELECT guard runs before each INSERT" \
+         "psql log: $(head -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ── Test 24: Multi-iteration — three commits, expect iteration_n 1..3 ──────
+setup_fixtures
+
+t24_workspace="$TEST_TMP/t24-workspace"
+t24_commits="$TEST_TMP/t24-commits.txt"
+t24_seed="$TEST_TMP/t24-seed.txt"
+printf 'ddddddd1 iteration one subject\n' > "$t24_seed"
+printf 'ddddddd2 iteration two subject\n' >> "$t24_seed"
+printf 'ddddddd3 iteration three subject\n' >> "$t24_seed"
+
+set +e
+t24_out=$(run_watcher_test "$t24_workspace" "$t24_commits" "$t24_seed" 3 1 "")
+t24_rc=$?
+set -e
+
+if [[ $t24_rc -eq 0 ]]; then
+    pass "#3144 T24 — watcher exits 0 with three commits"
+else
+    fail "#3144 T24 — watcher exits 0 with three commits" "rc=$t24_rc"
+fi
+
+# Three ralph_iteration_observed events, one per commit.
+_t24_iter_count=$(printf '%s' "$t24_out" | grep -c "ralph_iteration_observed" || true)
+if [[ "$_t24_iter_count" -eq 3 ]]; then
+    pass "#3144 T24 — exactly three ralph_iteration_observed events"
+else
+    fail "#3144 T24 — exactly three ralph_iteration_observed events" \
+         "got $_t24_iter_count events"
+fi
+
+# Iteration numbers are 1, 2, 3 in order.
+for n in 1 2 3; do
+    if printf '%s' "$t24_out" | grep "ralph_iteration_observed" \
+         | grep -q "iteration_n\": \"$n\""; then
+        pass "#3144 T24 — iteration_n=$n observed"
+    else
+        fail "#3144 T24 — iteration_n=$n observed"
+    fi
+done
+
+# Three INSERT statements, one per iteration.
+_t24_insert_count=$(grep -c "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
+_t24_insert_count=${_t24_insert_count:-0}
+if [[ "$_t24_insert_count" -eq 3 ]]; then
+    pass "#3144 T24 — three INSERTs into dispatcher.ralph_patches"
+else
+    fail "#3144 T24 — three INSERTs into dispatcher.ralph_patches" \
+         "got $_t24_insert_count"
+fi
+
+# ── Test 25: Shutdown race — ralph exits mid-poll, watcher dies cleanly ────
+setup_fixtures
+
+t25_workspace="$TEST_TMP/t25-workspace"
+t25_commits="$TEST_TMP/t25-commits.txt"
+t25_seed=""   # no commits to seed — testing the teardown path
+
+# Sleep 0s, poll every 60s. start_ralph_head_watcher forks, the test-
+# mode driver immediately runs stop (sleep 0), so the subshell is
+# killed mid-first-tick. Assert: no dangling process, no errors.
+set +e
+t25_out=$(run_watcher_test "$t25_workspace" "$t25_commits" "$t25_seed" 0 60 "")
+t25_rc=$?
+set -e
+
+if [[ $t25_rc -eq 0 ]]; then
+    pass "#3144 T25 — shutdown-race: watcher exits 0 when killed mid-poll"
+else
+    fail "#3144 T25 — shutdown-race: watcher exits 0 when killed mid-poll" \
+         "rc=$t25_rc, out: $(printf '%s\n' "$t25_out" | tail -10)"
+fi
+
+if printf '%s' "$t25_out" | grep -q "ralph_head_watcher_kill_sent"; then
+    pass "#3144 T25 — watcher logs kill_sent on shutdown"
+else
+    fail "#3144 T25 — watcher logs kill_sent on shutdown" "out: $t25_out"
+fi
+
+if printf '%s' "$t25_out" | grep -q "ralph_head_watcher_stopped"; then
+    pass "#3144 T25 — watcher logs stopped event after wait"
+else
+    fail "#3144 T25 — watcher logs stopped event after wait" "out: $t25_out"
+fi
+
+# No partial row / no INSERT attempted (no commits were in the list).
+if grep -q "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log"; then
+    fail "#3144 T25 — no partial ralph_patches INSERT on shutdown race" \
+         "psql log: $(cat "$INVOCATIONS_DIR/psql.log")"
+else
+    pass "#3144 T25 — no partial ralph_patches INSERT on shutdown race"
+fi
+
+# ── Test 26: DB down — watcher logs warning, doesn't crash ────────────────
+setup_fixtures
+
+t26_workspace="$TEST_TMP/t26-workspace"
+t26_commits="$TEST_TMP/t26-commits.txt"
+t26_seed="$TEST_TMP/t26-seed.txt"
+printf 'eeeeeee1 iteration with DB down\n' > "$t26_seed"
+
+# PSQL_FAIL_ON_INSERT=1 tells our stub to exit 1 for any INSERT. The
+# watcher should log ralph_head_watcher_db_failure and continue; the
+# agent-runner top-level must not crash.
+set +e
+t26_out=$(run_watcher_test "$t26_workspace" "$t26_commits" "$t26_seed" 3 1 "PSQL_FAIL_ON_INSERT=1")
+t26_rc=$?
+set -e
+
+if [[ $t26_rc -eq 0 ]]; then
+    pass "#3144 T26 — watcher exits 0 even with DB INSERT failures"
+else
+    fail "#3144 T26 — watcher exits 0 even with DB INSERT failures" \
+         "rc=$t26_rc, out: $(printf '%s\n' "$t26_out" | tail -10)"
+fi
+
+if printf '%s' "$t26_out" | grep -q "ralph_head_watcher_db_failure"; then
+    pass "#3144 T26 — watcher logs ralph_head_watcher_db_failure on INSERT error"
+else
+    fail "#3144 T26 — watcher logs ralph_head_watcher_db_failure on INSERT error" \
+         "out: $t26_out"
+fi
+
+# The observed event still fires before the DB error (defensible — the
+# user sees the commit appeared in CloudWatch even if persist failed).
+if printf '%s' "$t26_out" | grep -q "ralph_iteration_observed"; then
+    pass "#3144 T26 — ralph_iteration_observed still emitted on DB failure"
+else
+    fail "#3144 T26 — ralph_iteration_observed still emitted on DB failure"
+fi
+
+# ── Test 27: SELECT-then-INSERT skips duplicate (agent_id, iteration_n) ────
+setup_fixtures
+
+t27_workspace="$TEST_TMP/t27-workspace"
+t27_commits="$TEST_TMP/t27-commits.txt"
+t27_seed="$TEST_TMP/t27-seed.txt"
+printf 'fffffff1 should be skipped as duplicate\n' > "$t27_seed"
+
+# RALPH_PATCH_EXISTS=1 makes the stub's SELECT return "1" → the
+# watcher treats this iteration as already-persisted and logs
+# ralph_head_watcher_skip_existing instead of attempting the INSERT.
+set +e
+t27_out=$(run_watcher_test "$t27_workspace" "$t27_commits" "$t27_seed" 3 1 "RALPH_PATCH_EXISTS=1")
+t27_rc=$?
+set -e
+
+if [[ $t27_rc -eq 0 ]]; then
+    pass "#3144 T27 — watcher exits 0 on SELECT-exists guard hit"
+else
+    fail "#3144 T27 — watcher exits 0 on SELECT-exists guard hit" \
+         "rc=$t27_rc"
+fi
+
+if printf '%s' "$t27_out" | grep -q "ralph_head_watcher_skip_existing"; then
+    pass "#3144 T27 — watcher logs skip_existing when SELECT finds a prior row"
+else
+    fail "#3144 T27 — watcher logs skip_existing when SELECT finds a prior row" \
+         "out: $t27_out"
+fi
+
+# No INSERT should be attempted for the duplicate iteration.
+if grep -q "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log"; then
+    fail "#3144 T27 — no INSERT when SELECT-exists guard fires" \
+         "psql log: $(cat "$INVOCATIONS_DIR/psql.log")"
+else
+    pass "#3144 T27 — no INSERT when SELECT-exists guard fires"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

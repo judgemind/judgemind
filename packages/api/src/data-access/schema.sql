@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 41 migrations.
+-- Generated from 42 migrations.
 
 
 
@@ -365,7 +365,8 @@ CREATE TABLE dispatcher.agents (
     verify_skip_reason text,
     retroed_at timestamp with time zone,
     agent_task_arn text,
-    execution_mode text DEFAULT 'subprocess'::text NOT NULL
+    execution_mode text DEFAULT 'subprocess'::text NOT NULL,
+    ralph_iterations_observed integer DEFAULT 0 NOT NULL
 );
 
 
@@ -403,6 +404,9 @@ COMMENT ON COLUMN dispatcher.agents.agent_task_arn IS 'ECS task ARN of the per-a
 
 
 COMMENT ON COLUMN dispatcher.agents.execution_mode IS 'One of ''subprocess'' (legacy, default) | ''ecs'' (per-agent Fargate task via ecs:RunTask). Set once at claim time from dispatcher.config.agent_execution_mode and held immutable across the agent''s lifetime. See #3091 / #3086 / #3078.';
+
+
+COMMENT ON COLUMN dispatcher.agents.ralph_iterations_observed IS 'Count of ralph iterations observed by the ECS agent-runner HEAD-watcher (#3144). Atomically UPDATEd per iteration when the watcher persists a new dispatcher.ralph_patches row. Subprocess-mode agents keep this at 0 — the daemon-side watcher (#3042) persists ralph_patches but does not update this column. Issue #3144.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (

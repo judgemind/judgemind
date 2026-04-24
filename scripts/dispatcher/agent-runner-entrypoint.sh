@@ -1765,6 +1765,298 @@ handle_push_and_pr() {
     printf '{"no_op": false}'
 }
 
+# ── Ralph HEAD-watcher (#3144) ────────────────────────────────────────────
+#
+# ECS-mode equivalent of the daemon's ``_start_ralph_head_watcher``
+# (#3042). The daemon's watcher only runs in subprocess mode — when the
+# dispatcher runs in ECS mode, every ralph phase was invisible between
+# ``claude_phase_begin`` and ``claude_phase_done`` (30-120 min later).
+# Concrete cost: agent ``6e79fb52`` on #2671 spent 85+ minutes in ralph
+# on 2026-04-23 with zero CloudWatch events and zero
+# ``dispatcher.ralph_patches`` rows, making "is ralph stuck or just
+# slow?" unanswerable from the fleet-status page.
+#
+# This subshell polls ``git log origin/main..HEAD`` every
+# ``$AGENT_RUNNER_RALPH_HEAD_POLL_INTERVAL`` seconds (default 30, matches
+# the daemon's ``RALPH_HEAD_POLL_INTERVAL_SECONDS``) and for each new
+# commit:
+#
+#   1. Emits ``agent_runner.ralph_iteration_observed`` with
+#      ``iteration_n`` (1-based count from origin/main..HEAD),
+#      ``commit_sha``, and ``commit_subject_first_80``.
+#   2. INSERTs a ``dispatcher.ralph_patches`` row with
+#      ``iteration_n``, ``commit_sha``, and the cumulative patch
+#      content from ``git format-patch origin/main..HEAD --stdout``
+#      (mirrors the daemon's format — full range, not ``-1 HEAD``).
+#      Uses ``ON CONFLICT (agent_id, iteration_n) DO NOTHING`` via the
+#      partial unique index from migration 42 so the watcher and
+#      ``persist_ralph_patch`` can't double-insert the same iteration.
+#   3. UPDATEs ``dispatcher.agents.ralph_iterations_observed`` to the
+#      current count so admin / fleet-status reads the value without
+#      a subquery.
+#
+# Failure handling — all best-effort, must never fault ralph:
+#
+# * DB down → emit ``ralph_head_watcher_db_failure`` warning, sleep,
+#   retry next tick. Never exit the subshell loop.
+# * git rev-parse failure → tolerate silently (transient lock during
+#   concurrent ``git commit``), retry next tick.
+# * Empty / unparseable format-patch → log ``ralph_head_watcher_empty_
+#   patch`` and skip the INSERT for this iteration.
+#
+# Lifecycle:
+#
+# * Started right before ``run_claude_phase "ralph"``, PID captured in
+#   ``$_ralph_watcher_pid``.
+# * Stopped right after — kill + wait for clean shutdown.
+# * The subshell writes a sentinel file so the caller can sanity-check
+#   the watcher actually got to its first poll before ralph ran.
+
+RALPH_HEAD_POLL_INTERVAL="${AGENT_RUNNER_RALPH_HEAD_POLL_INTERVAL:-30}"
+
+ralph_head_watcher_loop() {
+    # Body of the subshell. Runs until killed. Never exits on its own.
+    #
+    # Tracks seen commit SHAs in a flat file (parallel-indexed-array
+    # equivalent that survives bash 3.2's lack of associative arrays).
+    # Each line is one SHA. On each tick we read the current
+    # ``origin/main..HEAD`` commit list oldest-first and diff it
+    # against the seen file.
+
+    # SIGTERM / SIGINT → kill any running ``sleep`` child + exit. In
+    # bash 3.2 a foreground ``sleep`` blocks signal handling until it
+    # returns, which would delay stop_ralph_head_watcher's ``wait``
+    # past the end of ralph by up to one poll interval. Running the
+    # sleep in the background and ``wait``-ing on it lets the signal
+    # land immediately, the trap fires, and the kill here severs the
+    # sleep child so our exit is prompt.
+    _ralph_watcher_sleep_pid=""
+    trap '[[ -n "$_ralph_watcher_sleep_pid" ]] && kill "$_ralph_watcher_sleep_pid" 2>/dev/null; exit 0' TERM INT
+    _seen_file="$AGENT_WORKSPACE/ralph-head-watcher-seen.txt"
+    : > "$_seen_file"
+
+    # Baseline establishment: any commits that already exist at watcher
+    # start (e.g. prior-patch re-applied via ``git am``) are recorded as
+    # seen but do NOT emit events. Only NEW commits during ralph
+    # trigger ``ralph_iteration_observed``.
+    _baseline_log="$AGENT_WORKSPACE/ralph-head-watcher-baseline.log"
+    if git -C "$REPO_ROOT" log --reverse --format='%H' origin/main..HEAD \
+            > "$_baseline_log" 2>/dev/null; then
+        cp "$_baseline_log" "$_seen_file"
+        _baseline_count=$(wc -l < "$_seen_file" | tr -d ' ')
+    else
+        _baseline_count=0
+    fi
+
+    log "ralph_head_watcher_started" \
+        "poll_interval=$RALPH_HEAD_POLL_INTERVAL" \
+        "baseline_count=$_baseline_count"
+
+    # Sentinel so the test harness can confirm the watcher started.
+    printf 'started\n' > "$AGENT_WORKSPACE/ralph-head-watcher.started"
+
+    while true; do
+        ralph_head_watcher_tick "$_seen_file" || true
+        # Background the sleep so the trap can interrupt it. ``wait``
+        # returns non-zero when a trapped signal fires, which is fine
+        # — the trap has already called exit 0.
+        sleep "$RALPH_HEAD_POLL_INTERVAL" &
+        _ralph_watcher_sleep_pid=$!
+        wait "$_ralph_watcher_sleep_pid" 2>/dev/null || true
+        _ralph_watcher_sleep_pid=""
+    done
+}
+
+ralph_head_watcher_tick() {
+    # One polling iteration. Returns non-zero on any unrecoverable
+    # error so the loop can ``|| true`` it without leaking.
+    _seen_file="$1"
+    _current_log="$AGENT_WORKSPACE/ralph-head-watcher-current.log"
+
+    # Oldest-first so iteration_n counts up monotonically.
+    if ! git -C "$REPO_ROOT" log --reverse --format='%H %s' origin/main..HEAD \
+            > "$_current_log" 2>/dev/null; then
+        # Transient git error (worktree lock, concurrent commit). Skip.
+        return 0
+    fi
+
+    # Iterate each line; for any SHA not yet in $_seen_file, emit +
+    # persist + append. Bash 3.2 compat: ``while IFS= read``, not
+    # ``readarray``.
+    _iteration_n=0
+    while IFS= read -r _line; do
+        _iteration_n=$((_iteration_n + 1))
+        if [[ -z "$_line" ]]; then
+            continue
+        fi
+        _sha="${_line%% *}"
+        _subject="${_line#* }"
+        if [[ "$_sha" == "$_line" ]]; then
+            # Malformed line (no space) — skip defensively.
+            continue
+        fi
+        # Already observed? (grep -F -x -q for exact full-line match.)
+        if grep -F -x -q "$_sha" "$_seen_file" 2>/dev/null; then
+            continue
+        fi
+
+        # Truncate subject to 80 chars for the structured log field.
+        # ``cut -c 1-80`` is bash-3.2-safe and byte-oriented (which is
+        # fine — this is a triage field, not an exact excerpt).
+        _subject_80=$(printf '%s' "$_subject" | cut -c 1-80)
+
+        ralph_head_watcher_persist "$_iteration_n" "$_sha" "$_subject_80"
+
+        # Record AFTER the persist attempt so a persist failure does
+        # not silently drop the SHA from the retry set on the next
+        # tick. (Persist is idempotent via ON CONFLICT DO NOTHING, so
+        # re-attempting is safe.)
+        printf '%s\n' "$_sha" >> "$_seen_file"
+    done < "$_current_log"
+}
+
+ralph_head_watcher_persist() {
+    # $1 = iteration_n (1-based count from origin/main..HEAD), $2 =
+    # commit_sha, $3 = subject_80. Emits the structured log event and
+    # persists the patch + bumps the counter. All DB failures are
+    # tolerated with a warning — the watcher is purely observational.
+    _iter="$1"
+    _sha="$2"
+    _subject_80="$3"
+
+    log "ralph_iteration_observed" \
+        "iteration_n=$_iter" \
+        "commit_sha=$_sha" \
+        "commit_subject_first_80=$_subject_80"
+
+    # Capture the cumulative patch (full range). Mirrors the daemon's
+    # ``_persist_ralph_iteration_patch`` — resume via ``git am --3way``
+    # wants the whole series, not just the last commit.
+    _patch_file="$AGENT_WORKSPACE/ralph-iter-$_iter.patch"
+    if ! git -C "$REPO_ROOT" format-patch origin/main..HEAD --stdout \
+            > "$_patch_file" 2>/dev/null; then
+        log "ralph_head_watcher_empty_patch" \
+            "iteration_n=$_iter" \
+            "commit_sha=$_sha" \
+            "reason=format_patch_failed"
+        return 0
+    fi
+    if [[ ! -s "$_patch_file" ]]; then
+        log "ralph_head_watcher_empty_patch" \
+            "iteration_n=$_iter" \
+            "commit_sha=$_sha" \
+            "reason=empty_output"
+        return 0
+    fi
+
+    _escaped_patch=$(sed "s/'/''/g" "$_patch_file")
+    _issue_clause="${ISSUE_NUMBER:-0}"
+
+    # SELECT-then-INSERT guard against double-emit races. The race we
+    # care about: ralph's own SHIP-time ``persist_ralph_patch`` and
+    # this watcher both seeing the final commit. Migration 42 notes
+    # why we don't add a ``(agent_id, iteration_n)`` unique constraint
+    # instead: the daemon's subprocess-mode
+    # ``_persist_ralph_iteration_patch`` inserts without ON CONFLICT
+    # handling, so retroactively adding uniqueness would break the
+    # daemon path. The cost of SELECT-then-INSERT is a second round-
+    # trip per iteration — negligible at our write rate.
+    _check_sql="SELECT 1 FROM dispatcher.ralph_patches
+                 WHERE agent_id = '$AGENT_ID'
+                   AND iteration_n = $_iter
+                 LIMIT 1;"
+    if ! _already=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -At -c "$_check_sql" 2>/dev/null); then
+        log "ralph_head_watcher_db_failure" \
+            "iteration_n=$_iter" \
+            "commit_sha=$_sha" \
+            "op=select_existing_iteration"
+        return 0
+    fi
+    if [[ "$_already" == "1" ]]; then
+        log "ralph_head_watcher_skip_existing" \
+            "iteration_n=$_iter" \
+            "commit_sha=$_sha"
+        return 0
+    fi
+
+    _sql="INSERT INTO dispatcher.ralph_patches
+            (agent_id, issue_number, patch_content, commit_sha,
+             iteration_n, verdict)
+          VALUES
+            ('$AGENT_ID', $_issue_clause, '$_escaped_patch',
+             '$_sha', $_iter, 'LOOP');"
+
+    if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "$_sql" >/dev/null 2>&1; then
+        log "ralph_head_watcher_db_failure" \
+            "iteration_n=$_iter" \
+            "commit_sha=$_sha" \
+            "op=insert_ralph_patches"
+        return 0
+    fi
+
+    # Atomic UPDATE — set to the current iteration count (GREATEST
+    # handles out-of-order arrival though the tick is strictly
+    # monotone today). Separate statement so an INSERT conflict still
+    # keeps the counter in sync on the next tick.
+    _update_sql="UPDATE dispatcher.agents
+                    SET ralph_iterations_observed =
+                        GREATEST(ralph_iterations_observed, $_iter)
+                  WHERE agent_id = '$AGENT_ID';"
+    if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "$_update_sql" >/dev/null 2>&1; then
+        log "ralph_head_watcher_db_failure" \
+            "iteration_n=$_iter" \
+            "commit_sha=$_sha" \
+            "op=update_agents_counter"
+        return 0
+    fi
+
+    log "ralph_head_watcher_persisted" \
+        "iteration_n=$_iter" \
+        "commit_sha=$_sha"
+}
+
+start_ralph_head_watcher() {
+    # Fork the watcher subshell. Sets ``$_ralph_watcher_pid`` in the
+    # caller's scope (global var — bash 3.2 compat, no ``local -n``).
+    # When AGENT_RUNNER_DISABLE_RALPH_HEAD_WATCHER=1 (tests, emergency
+    # kill-switch), skip entirely.
+    _ralph_watcher_pid=""
+    if [[ "${AGENT_RUNNER_DISABLE_RALPH_HEAD_WATCHER:-0}" == "1" ]]; then
+        log "ralph_head_watcher_disabled"
+        return 0
+    fi
+
+    # Run the loop in a subshell. fd 3 is inherited so log() still
+    # writes to the top-level stdout the CloudWatch agent reads.
+    ralph_head_watcher_loop &
+    _ralph_watcher_pid=$!
+    log "ralph_head_watcher_forked" "pid=$_ralph_watcher_pid"
+}
+
+stop_ralph_head_watcher() {
+    # Kill the watcher subshell + reap it. Idempotent — safe to call
+    # on disable path where _ralph_watcher_pid is empty.
+    if [[ -z "${_ralph_watcher_pid:-}" ]]; then
+        return 0
+    fi
+    # SIGTERM first (default for kill). The subshell is a plain
+    # polling loop with no cleanup state beyond closing fds.
+    if kill "$_ralph_watcher_pid" 2>/dev/null; then
+        log "ralph_head_watcher_kill_sent" "pid=$_ralph_watcher_pid"
+    fi
+    # ``wait`` with set -e would turn a nonzero exit into a fatal.
+    # Disable -e around the reap — SIGTERM yields exit 143, which is
+    # normal termination for us.
+    set +e
+    wait "$_ralph_watcher_pid" 2>/dev/null
+    _wait_rc=$?
+    set -e
+    log "ralph_head_watcher_stopped" \
+        "pid=$_ralph_watcher_pid" \
+        "wait_rc=$_wait_rc"
+    _ralph_watcher_pid=""
+}
+
 persist_ralph_patch() {
     # Called on ralph SHIP when the worktree has a staged/committed
     # diff. Reads `git format-patch -1 HEAD --stdout` and INSERTs the
@@ -1850,6 +2142,43 @@ is_terminal() {
     [[ "$_result" == "yes" ]]
 }
 
+# ── Test hook: run the ralph HEAD-watcher standalone (#3144) ---------------
+#
+# The HEAD-watcher tests need to drive start_ralph_head_watcher +
+# stop_ralph_head_watcher without spinning the whole phase loop. When
+# AGENT_RUNNER_WATCHER_TEST_MODE=1, run:
+#
+#   start_ralph_head_watcher
+#   (optional) cp $AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS → git stub's
+#              RALPH_HEAD_WATCHER_COMMITS_FILE — lets the test inject
+#              "new commits after baseline" without the baseline
+#              capturing them up front. The baseline reads an empty
+#              commits file, the tick reads the seeded one.
+#   sleep $AGENT_RUNNER_WATCHER_TEST_SLEEP (default 2)
+#   stop_ralph_head_watcher
+#
+# …and exit 0. The test harness preseeds the git + psql stubs and
+# inspects the invocation logs + log events post-exit.
+if [[ "${AGENT_RUNNER_WATCHER_TEST_MODE:-0}" == "1" ]]; then
+    log "watcher_test_mode_begin"
+    start_ralph_head_watcher
+    # Give the subshell a moment to take its baseline snapshot (an
+    # empty origin/main..HEAD, since the watcher starts before ralph
+    # has committed anything). Then seed commits so the NEXT tick
+    # sees them as new.
+    sleep 0.2 2>/dev/null || sleep 1
+    if [[ -n "${AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS:-}" \
+            && -f "$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS" \
+            && -n "${RALPH_HEAD_WATCHER_COMMITS_FILE:-}" ]]; then
+        cp "$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS" "$RALPH_HEAD_WATCHER_COMMITS_FILE"
+        log "watcher_test_mode_seeded" "src=$AGENT_RUNNER_WATCHER_TEST_SEED_COMMITS"
+    fi
+    sleep "${AGENT_RUNNER_WATCHER_TEST_SLEEP:-2}"
+    stop_ralph_head_watcher
+    log "watcher_test_mode_end"
+    exit 0
+fi
+
 # ── Main phase loop ---------------------------------------------------------
 #
 # Safety cap on iterations — if a bug causes the phase to advance to
@@ -1891,7 +2220,19 @@ while true; do
     # `/task-v2-push_and_pr` and got "Unknown command" back.
     case "$_current" in
         planning|ralph|summary|fix_ci|verify)
+            if [[ "$_current" == "ralph" ]]; then
+                # #3144: start the HEAD-watcher subshell so the long
+                # ralph phase emits per-iteration observability to
+                # CloudWatch + dispatcher.ralph_patches. The watcher is
+                # stopped unconditionally after run_claude_phase returns
+                # (success or failure) so the subshell never outlives
+                # the phase it instruments.
+                start_ralph_head_watcher
+            fi
             _output=$(run_claude_phase "$_current")
+            if [[ "$_current" == "ralph" ]]; then
+                stop_ralph_head_watcher
+            fi
             persist_phase_output "$_current" "$_output"
             if [[ "$_current" == "ralph" ]]; then
                 # Mirror the daemon's post-SHIP ralph_patches persist.
