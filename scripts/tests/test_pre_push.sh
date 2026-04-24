@@ -29,6 +29,8 @@
 #   7. Missing actionlint on workflow     WARNING only, exit 0
 #   8. Missing terraform on infra change  WARNING only, exit 0
 #  11. run_check helper surfaces ruff error tail + Full log path (#2973 AC1)
+#  12. Migration-only push skips TS lint  no 'checking TypeScript package' (#2877 AC1)
+#  13. Real TS change still fires lint    'checking TypeScript package' present (#2877 AC2)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -525,6 +527,87 @@ elif ! echo "$hook_out" | grep -q "Full log: /tmp/prepush-testpkg-ruff-check.log
     report_fail "expected 'Full log: /tmp/prepush-testpkg-ruff-check.log' in output (#2973 AC1)" "$hook_out"
 else
     report_pass "run_check helper surfaces ruff error tail and Full log path (#2973 AC1)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 12: Migration-only push does NOT fire TS lint (#2877 AC1)
+# ───────────────────────────────────────────────────────────────────────
+# A push that touches only packages/api/migrations/*.sql must NOT trigger
+# the TypeScript lint pass. Seeding only a package.json + SQL migration
+# (no .ts files) and asserting the hook does not emit
+# "checking TypeScript package 'api'" verifies the fix.
+echo "[scenario 12] migration-only push — TS lint should NOT fire (#2877 AC1)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-migration-only
+# Seed package.json in the initial commit so the hook can detect it as a
+# TS package, but do NOT include it in the feature diff — only the SQL
+# migration is new in this push.
+mkdir -p "$WORK/packages/api/migrations"
+cat > "$WORK/packages/api/package.json" <<'JSON'
+{
+  "name": "api",
+  "version": "0.0.1",
+  "scripts": {}
+}
+JSON
+git -C "$WORK" add packages/api/package.json
+git -C "$WORK" commit --quiet -m "chore: seed api package.json"
+git -C "$WORK" push --quiet origin feature-migration-only
+# Now add only the migration — this is what the hook diff will see.
+cat > "$WORK/packages/api/migrations/0001_foo.sql" <<'SQL'
+-- Up migration
+CREATE TABLE IF NOT EXISTS foo (id SERIAL PRIMARY KEY);
+
+-- Down migration
+DROP TABLE IF EXISTS foo;
+SQL
+git -C "$WORK" add packages/api/migrations/0001_foo.sql
+git -C "$WORK" commit --quiet -m "migration: add foo table"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+prev_sha="$(git -C "$WORK" rev-parse origin/feature-migration-only)"
+
+run_hook "refs/heads/feature-migration-only $feat_sha refs/heads/feature-migration-only $prev_sha"
+
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "migration-only push should exit 0, got rc=$hook_rc (#2877 AC1)" "$hook_out"
+elif echo "$hook_out" | grep -q "checking TypeScript package 'api'"; then
+    report_fail "migration-only push must NOT fire TS lint (#2877 AC1)" "$hook_out"
+else
+    report_pass "migration-only push skips TS lint check (#2877 AC1)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 13: Real TS change still fires lint (#2877 AC2)
+# ───────────────────────────────────────────────────────────────────────
+# A push that touches a real .ts file under packages/api/src/ must still
+# trigger the TS lint pass. We seed a package.json without a lint script
+# so the hook takes the "No lint script found" path but still emits the
+# "checking TypeScript package 'api'" line, confirming the branch fires.
+echo "[scenario 13] real TS change — TS lint should fire (#2877 AC2)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-ts-change
+mkdir -p "$WORK/packages/api/src"
+cat > "$WORK/packages/api/package.json" <<'JSON'
+{
+  "name": "api",
+  "version": "0.0.1",
+  "scripts": {}
+}
+JSON
+cat > "$WORK/packages/api/src/index.ts" <<'TS'
+// Minimal TypeScript stub for pre-push hook testing.
+export const hello = (): string => "hello";
+TS
+git -C "$WORK" add packages/api
+git -C "$WORK" commit --quiet -m "feat: add api src/index.ts"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-ts-change $feat_sha refs/heads/feature-ts-change $ZERO_SHA"
+
+if echo "$hook_out" | grep -q "checking TypeScript package 'api'"; then
+    report_pass "real TS change fires TS lint check (#2877 AC2)"
+else
+    report_fail "real TS change must fire TS lint check (#2877 AC2)" "$hook_out"
 fi
 
 # ───────────────────────────────────────────────────────────────────────
