@@ -411,6 +411,7 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
             a.issue_title,
             a.priority,
             a.status,
+            a.started_at,
             a.ended_at,
             a.pr_number,
             a.failure_summary,
@@ -697,6 +698,13 @@ function recentCompletionsToGraphQL(
       // ``#<number>``.
       issueTitle: title,
       status: row.status,
+      // #3024: ``started_at`` paired with ``ended_at`` so the admin cockpit
+      // can render a Start/Duration/End tooltip on the relative-time cell.
+      // ``dispatcher.agents.started_at`` is non-nullable per migration 25,
+      // so this never collapses to null in practice — fall through to the
+      // raw row value and let GraphQL surface a coercion error if a future
+      // migration ever relaxes the column.
+      startedAt: row.started_at,
       endedAt: row.ended_at,
       prNumber: row.pr_number ?? null,
       // #2869: metering fields. Coerced to Number because pg returns

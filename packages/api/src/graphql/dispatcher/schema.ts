@@ -256,6 +256,12 @@ export const dispatcherTypeDefs = `#graphql
     """One of succeeded | failed | crashed | plan_blocked | needs_review.
     See \`DispatcherAgent.status\` for the semantics of each value."""
     status: String!
+    """Timestamp the agent claimed the issue (\`dispatcher.agents.started_at\`).
+    Always populated — \`started_at\` is non-nullable on the agents table.
+    Issue #3024: paired with \`endedAt\` so the admin cockpit can render a
+    Start/Duration/End tooltip on the relative-time cell in the Recently
+    completed panel."""
+    startedAt: DateTime!
     endedAt: DateTime!
     """PR number if the agent produced one; null otherwise. \`needs_review\`
     rows (#2856) always have \`prNumber\` populated because the whole

@@ -6,6 +6,7 @@ import {
   formatTokenCount,
   formatRelativeTime,
   formatPacificDatetime,
+  formatStartDurationEndTitle,
 } from '../RecentCompletionsPanel';
 import type { RecentCompletion } from '@/lib/dispatcher-queries';
 
@@ -18,6 +19,10 @@ function completion(overrides: Partial<RecentCompletion>): RecentCompletion {
     issueTitle: 'wire dispatcher admin dashboard',
     priority: 'p2',
     status: 'succeeded',
+    // #3024: startedAt is now a non-nullable field on RecentCompletion.
+    // Default to 5 minutes before endedAt so the tooltip duration math
+    // resolves to a tidy "5m 0s" in the existing assertions.
+    startedAt: '2026-04-18T11:50:00Z',
     endedAt: '2026-04-18T11:55:00Z',
     prNumber: 2811,
     totalTokens: null,
@@ -292,10 +297,11 @@ describe('RecentCompletionsPanel', () => {
     ).toBeTruthy();
   });
 
-  it('#2932: sets the native `title` attribute on the cell to a Pacific-time datetime', () => {
+  it('#2932 / #3024: sets the native `title` attribute on the cell to a Pacific-time tooltip', () => {
     const items = [
       completion({
         agentId: 'agent-pacific',
+        startedAt: '2026-04-18T11:50:00Z',
         endedAt: '2026-04-18T11:55:00Z',
       }),
     ];
@@ -303,12 +309,12 @@ describe('RecentCompletionsPanel', () => {
     const cell = screen.getByTestId('completion-row-relative-time');
     const title = cell.getAttribute('title');
     expect(title).not.toBeNull();
-    // Format: "YYYY-MM-DD HH:MM:SS PDT" or "PST" — Pacific time always
-    // abbreviates to one of these two. April is PDT.
-    expect(title).toMatch(
-      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T$/,
-    );
+    // #3024 expanded the tooltip to three lines (Start / Duration / End)
+    // — assert the End line still carries a PT abbreviation (April → PDT).
     expect(title).toContain('PDT');
+    expect(title).toMatch(
+      /End:\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T/,
+    );
   });
 
   it('#2932: falls back to Date.now() when nowMs prop is omitted', () => {
@@ -321,6 +327,8 @@ describe('RecentCompletionsPanel', () => {
     const cell = screen.getByTestId('completion-row-relative-time');
     expect(cell).toBeInTheDocument();
     // Must have a non-empty title attribute (Pacific datetime).
+    // #3024: the tooltip is now multi-line; the End line is the last and
+    // still ends with the PT abbreviation.
     expect(cell.getAttribute('title')).toMatch(/P[DS]T$/);
   });
 
@@ -511,6 +519,149 @@ describe('formatPacificDatetime (#2932)', () => {
     expect(formatPacificDatetime(ms)).toMatch(
       /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T$/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #3024 — Recently completed tooltip: Start / Duration / End in PT.
+// ---------------------------------------------------------------------------
+
+describe('RecentCompletionsPanel — #3024 Start/Duration/End tooltip', () => {
+  it('renders a three-line tooltip on the relative-time cell', () => {
+    // 5-minute run ending 5 minutes before the fixed `now`.
+    const items = [
+      completion({
+        agentId: 'agent-3024-3line',
+        startedAt: '2026-04-18T11:50:00Z',
+        endedAt: '2026-04-18T11:55:00Z',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const cell = screen.getByTestId('completion-row-relative-time');
+    const title = cell.getAttribute('title');
+    expect(title).not.toBeNull();
+    // Three lines, one for each of Start / Duration / End.
+    const lines = (title as string).split('\n');
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^Start:\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T$/);
+    expect(lines[1]).toMatch(/^Duration:\s+/);
+    expect(lines[2]).toMatch(/^End:\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} P[DS]T$/);
+  });
+
+  it('renders the exact start, duration, and end values for a known fixture', () => {
+    // 11:50:00Z → 04:50:00 PDT, 11:55:00Z → 04:55:00 PDT, 5-minute span.
+    const items = [
+      completion({
+        agentId: 'agent-3024-known',
+        startedAt: '2026-04-18T11:50:00Z',
+        endedAt: '2026-04-18T11:55:00Z',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const cell = screen.getByTestId('completion-row-relative-time');
+    expect(cell.getAttribute('title')).toBe(
+      'Start:    2026-04-18 04:50:00 PDT\n' +
+        'Duration: 5m 0s\n' +
+        'End:      2026-04-18 04:55:00 PDT',
+    );
+  });
+
+  it('falls back to a single-line PT end-time tooltip when startedAt is unparseable', () => {
+    // Defensive case — `RecentCompletion.startedAt` is non-nullable on
+    // the API side, but the panel still degrades gracefully if a
+    // garbage value ever sneaks through (e.g. a future migration drift).
+    const items = [
+      completion({
+        agentId: 'agent-3024-bad-start',
+        // Intentionally feeding an unparseable string — `RecentCompletion.
+        // startedAt` is typed `string` so this is type-valid; we only
+        // care that the runtime path is defensive.
+        startedAt: 'not-a-date',
+        endedAt: '2026-04-18T11:55:00Z',
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const cell = screen.getByTestId('completion-row-relative-time');
+    const title = cell.getAttribute('title');
+    expect(title).toBe('2026-04-18 04:55:00 PDT');
+    // No newlines — fallback is single-line.
+    expect(title).not.toContain('\n');
+  });
+});
+
+describe('formatStartDurationEndTitle (#3024)', () => {
+  function ms(iso: string): number {
+    return Date.parse(iso);
+  }
+
+  it('formats a sub-minute run as a three-line PT tooltip', () => {
+    const start = ms('2026-04-18T11:50:00Z');
+    const end = ms('2026-04-18T11:50:42Z');
+    expect(formatStartDurationEndTitle(start, end)).toBe(
+      'Start:    2026-04-18 04:50:00 PDT\n' +
+        'Duration: 42s\n' +
+        'End:      2026-04-18 04:50:42 PDT',
+    );
+  });
+
+  it('formats a 15m 17s run with explicit minutes+seconds', () => {
+    const start = ms('2026-04-22T16:41:16Z'); // 09:41:16 PDT
+    const end = ms('2026-04-22T16:56:33Z'); // 09:56:33 PDT
+    expect(formatStartDurationEndTitle(start, end)).toBe(
+      'Start:    2026-04-22 09:41:16 PDT\n' +
+        'Duration: 15m 17s\n' +
+        'End:      2026-04-22 09:56:33 PDT',
+    );
+  });
+
+  it('drops the seconds component once the run is at least an hour long', () => {
+    // 2h 3m 0s span — the duration string must collapse to "2h 3m" per
+    // the spec ("`2h 3m` is fine if seconds are 0").
+    const start = ms('2026-04-18T10:00:00Z');
+    const end = ms('2026-04-18T12:03:00Z');
+    const result = formatStartDurationEndTitle(start, end);
+    expect(result).toContain('Duration: 2h 3m');
+    // Seconds explicitly absent — shouldn't render "2h 3m 0s".
+    expect(result).not.toContain('Duration: 2h 3m 0s');
+  });
+
+  it('formats a multi-day run with days+hours', () => {
+    const start = ms('2026-04-15T10:00:00Z');
+    const end = ms('2026-04-16T14:00:00Z'); // 1 day 4 hours
+    expect(formatStartDurationEndTitle(start, end)).toContain(
+      'Duration: 1d 4h',
+    );
+  });
+
+  it('formats a January run with PST (standard time) on both lines', () => {
+    const start = ms('2026-01-15T18:00:00Z');
+    const end = ms('2026-01-15T18:30:00Z');
+    expect(formatStartDurationEndTitle(start, end)).toBe(
+      'Start:    2026-01-15 10:00:00 PST\n' +
+        'Duration: 30m 0s\n' +
+        'End:      2026-01-15 10:30:00 PST',
+    );
+  });
+
+  it('renders an em-dash duration when end precedes start (clock skew)', () => {
+    // Defensive: negative durations collapse to the em-dash sentinel
+    // from `formatDurationMs` rather than rendering "-3m 0s".
+    const start = ms('2026-04-18T12:00:00Z');
+    const end = ms('2026-04-18T11:57:00Z'); // 3 minutes earlier
+    const result = formatStartDurationEndTitle(start, end);
+    expect(result).toContain('Duration: —');
+  });
+
+  it('uses two-space alignment after the field labels', () => {
+    // Visual-alignment guard: the field labels are padded so the values
+    // line up across all three rows when the tooltip is rendered.
+    const start = ms('2026-04-18T11:50:00Z');
+    const end = ms('2026-04-18T11:55:00Z');
+    const result = formatStartDurationEndTitle(start, end);
+    const lines = result.split('\n');
+    expect(lines[0].startsWith('Start:    ')).toBe(true); // 4 trailing spaces
+    expect(lines[1].startsWith('Duration: ')).toBe(true); // 1 trailing space
+    expect(lines[2].startsWith('End:      ')).toBe(true); // 6 trailing spaces
   });
 });
 
