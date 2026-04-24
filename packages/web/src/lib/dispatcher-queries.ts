@@ -84,6 +84,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         verifySkipReason
         retroedAt
       }
+      recentCompletionsCount
       config {
         key
         value
@@ -326,6 +327,11 @@ export interface DispatcherState {
   queueReady: QueueItem[];
   queueBlocked: QueueItem[];
   recentCompletions: RecentCompletion[];
+  /** Total count of terminal-status rows in `dispatcher.agents` (#3172).
+   * Paired with `recentCompletions` (capped at 10 server-side) so the
+   * admin-cockpit panel header can render `{shown} / {total}`, matching
+   * the Ready/Blocked panels. Returns 0 when the table is empty. */
+  recentCompletionsCount: number;
   config: DispatcherConfigEntry[];
   spawnFrozenUntil: string | null;
   /** True when the circuit breaker is open (#2860). */

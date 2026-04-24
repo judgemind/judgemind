@@ -128,6 +128,7 @@ const BASE_STATE = {
   queueReady: [],
   queueBlocked: [],
   recentCompletions: [],
+  recentCompletionsCount: 0,
   config: [
     {
       key: 'concurrency_cap',
@@ -553,7 +554,9 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
     expect(screen.queryByTestId('queue-full-dialog')).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId('queue-ready-count'));
     const title = await screen.findByTestId('queue-full-dialog-title');
-    expect(title.textContent).toMatch(/agent-ready queue/i);
+    // #3172: title now matches the panel heading "Queue: Agent-ready"
+    // exactly (was "Agent-ready queue (N)" pre-#3172).
+    expect(title.textContent).toMatch(/queue: agent-ready/i);
   });
 
   it('clicking the Blocked count opens the dialog with the BLOCKED title', async () => {
@@ -567,7 +570,9 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
     renderDashboard();
     fireEvent.click(screen.getByTestId('queue-blocked-count'));
     const title = await screen.findByTestId('queue-full-dialog-title');
-    expect(title.textContent).toMatch(/blocked queue/i);
+    // #3172: title now matches the panel heading "Queue: Blocked" exactly
+    // (was "Blocked queue (N)" pre-#3172).
+    expect(title.textContent).toMatch(/queue: blocked/i);
   });
 
   it('clicking the Recently Completed count opens the dialog with the COMPLETED title', async () => {
@@ -617,5 +622,127 @@ describe('DispatcherDashboard — #3159 expand-count dialog wiring', () => {
         screen.getByTestId(`issue-link-${it.issueNumber}`),
       ).toBeInTheDocument();
     }
+  });
+});
+
+// #3172: dialog title carries the same {shown} / {total} denominator as
+// the badge that opened it, and labels match the panel headings exactly.
+describe('DispatcherDashboard — #3172 dialog title denominator', () => {
+  beforeEach(() => {
+    mockControlMutate.mockClear();
+    mockSetConfigMutate.mockClear();
+    mockRefetch.mockClear();
+    mockQueueFullData.READY = undefined;
+    mockQueueFullData.BLOCKED = undefined;
+    mockQueueFullData.COMPLETED = undefined;
+  });
+
+  it('READY dialog title reads `Queue: Agent-ready — {shown} / {total}` matching the badge', async () => {
+    // Panel renders 10 (capped); the daemon has scanned 50 ready issues.
+    const items = Array.from({ length: 10 }, (_, i) => ({
+      issueNumber: 8000 + i,
+      title: `ready ${8000 + i}`,
+      priority: 'p2',
+      labels: ['priority/p2', 'agent/ready'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [],
+      cooldownSecondsRemaining: null,
+    }));
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        queueDepth: 50,
+        queueReady: items,
+      },
+    };
+    mockQueueFullData.READY = {
+      dispatcherQueueFull: {
+        kind: 'READY',
+        queueItems: items,
+        completions: [],
+      },
+    };
+    renderDashboard();
+    // Sanity: badge shows `10 / 50` (existing #2886 behaviour).
+    expect(screen.getByTestId('queue-ready-count')).toHaveTextContent(
+      '10 / 50',
+    );
+    fireEvent.click(screen.getByTestId('queue-ready-count'));
+    const title = await screen.findByTestId('queue-full-dialog-title');
+    expect(title.textContent).toBe('Queue: Agent-ready — 10 / 50');
+  });
+
+  it('BLOCKED dialog title reads `Queue: Blocked — {shown} / {total}`', async () => {
+    const items = Array.from({ length: 4 }, (_, i) => ({
+      issueNumber: 7000 + i,
+      title: `blocked ${7000 + i}`,
+      priority: 'p2',
+      labels: ['priority/p2', 'status/blocked'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [42],
+      cooldownSecondsRemaining: null,
+    }));
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        blockedDepth: 12,
+        queueBlocked: items,
+      },
+    };
+    mockQueueFullData.BLOCKED = {
+      dispatcherQueueFull: {
+        kind: 'BLOCKED',
+        queueItems: items,
+        completions: [],
+      },
+    };
+    renderDashboard();
+    expect(screen.getByTestId('queue-blocked-count')).toHaveTextContent(
+      '4 / 12',
+    );
+    fireEvent.click(screen.getByTestId('queue-blocked-count'));
+    const title = await screen.findByTestId('queue-full-dialog-title');
+    expect(title.textContent).toBe('Queue: Blocked — 4 / 12');
+  });
+
+  it('COMPLETED dialog title reads `Recently completed — {shown} / {total}`', async () => {
+    const completions = Array.from({ length: 10 }, (_, i) => ({
+      agentId: `aaaaaaaa-bbbb-cccc-dddd-${String(i).padStart(12, '0')}`,
+      issueNumber: 6000 + i,
+      issueTitle: `done ${6000 + i}`,
+      priority: 'p2',
+      status: 'succeeded',
+      startedAt: '2026-04-18T11:50:00Z',
+      endedAt: '2026-04-18T11:55:00Z',
+      prNumber: 7000 + i,
+      totalTokens: null,
+      totalCostUsd: null,
+      failureSummary: null,
+      mergedAt: '2026-04-18T11:50:00Z',
+      verifiedAt: '2026-04-18T11:53:00Z',
+      verifySkipReason: null,
+      retroedAt: '2026-04-18T11:55:00Z',
+    }));
+    mockQueryData = {
+      dispatcherState: {
+        ...BASE_STATE,
+        recentCompletions: completions,
+        recentCompletionsCount: 183,
+      },
+    };
+    mockQueueFullData.COMPLETED = {
+      dispatcherQueueFull: {
+        kind: 'COMPLETED',
+        queueItems: [],
+        completions,
+      },
+    };
+    renderDashboard();
+    expect(screen.getByTestId('recent-completions-count')).toHaveTextContent(
+      '10 / 183',
+    );
+    fireEvent.click(screen.getByTestId('recent-completions-count'));
+    const title = await screen.findByTestId('queue-full-dialog-title');
+    expect(title.textContent).toBe('Recently completed — 10 / 183');
   });
 });

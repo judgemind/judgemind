@@ -757,4 +757,74 @@ describe('RecentCompletionsPanel — Magic Move view-transition names (#2967)', 
       expect(badge.getAttribute('aria-label')).toMatch(/recent-completions/i);
     });
   });
+
+  // #3172: panel header now renders `{shown} / {total}` matching the
+  // Ready/Blocked panels. `total` comes from
+  // `DispatcherState.recentCompletionsCount`. Both code paths
+  // (clickable badge + inline parenthetical) route through the helper.
+  describe('#3172 {shown} / {total} count', () => {
+    it('clickable badge renders `{shown} / {total}` when total is provided', () => {
+      const onCountClick = vi.fn();
+      render(
+        <RecentCompletionsPanel
+          completions={[
+            completion({ agentId: 'a-1' }),
+            completion({ agentId: 'a-2' }),
+            completion({ agentId: 'a-3' }),
+          ]}
+          nowMs={now}
+          total={183}
+          onCountClick={onCountClick}
+        />,
+      );
+      const badge = screen.getByTestId('recent-completions-count');
+      expect(badge).toHaveTextContent('3 / 183');
+    });
+
+    it('inline parenthetical renders `({shown} / {total})` when onCountClick is omitted', () => {
+      render(
+        <RecentCompletionsPanel
+          completions={[
+            completion({ agentId: 'a-1' }),
+            completion({ agentId: 'a-2' }),
+          ]}
+          nowMs={now}
+          total={42}
+        />,
+      );
+      expect(
+        screen.getByRole('heading', {
+          name: /recently completed \(2 \/ 42\)/i,
+        }),
+      ).toBeInTheDocument();
+    });
+
+    it('falls back to `{shown}` when total is omitted (back-compat)', () => {
+      const onCountClick = vi.fn();
+      render(
+        <RecentCompletionsPanel
+          completions={[completion({ agentId: 'a-1' })]}
+          nowMs={now}
+          onCountClick={onCountClick}
+        />,
+      );
+      // No `total` prop — badge shows just the count, no slash.
+      const badge = screen.getByTestId('recent-completions-count');
+      expect(badge.textContent).toBe('1');
+    });
+
+    it('renders `0 / N` when there are no rows but total is provided', () => {
+      const onCountClick = vi.fn();
+      render(
+        <RecentCompletionsPanel
+          completions={[]}
+          nowMs={now}
+          total={5}
+          onCountClick={onCountClick}
+        />,
+      );
+      const badge = screen.getByTestId('recent-completions-count');
+      expect(badge).toHaveTextContent('0 / 5');
+    });
+  });
 });

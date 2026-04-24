@@ -318,28 +318,80 @@ describe('QueueFullDialog — close handling', () => {
 
 describe('formatDialogTitle', () => {
   it('returns empty string for kind=null', () => {
-    expect(formatDialogTitle(null, 0, false)).toBe('');
+    expect(formatDialogTitle(null, 0, 0, false)).toBe('');
   });
 
-  it('renders Agent-ready queue (N) for READY', () => {
-    expect(formatDialogTitle('READY', 12, false)).toBe(
-      'Agent-ready queue (12)',
+  // #3172: title labels match panel headings character-for-character
+  // and the count decoration becomes `{shown} / {total}`.
+  it('renders `Queue: Agent-ready — {shown} / {total}` for READY', () => {
+    expect(formatDialogTitle('READY', 10, 50, false)).toBe(
+      'Queue: Agent-ready — 10 / 50',
     );
   });
 
-  it('renders Blocked queue (N) for BLOCKED', () => {
-    expect(formatDialogTitle('BLOCKED', 5, false)).toBe('Blocked queue (5)');
-  });
-
-  it('renders Recently completed (N) for COMPLETED', () => {
-    expect(formatDialogTitle('COMPLETED', 7, false)).toBe(
-      'Recently completed (7)',
+  it('renders `Queue: Blocked — {shown} / {total}` for BLOCKED', () => {
+    expect(formatDialogTitle('BLOCKED', 5, 12, false)).toBe(
+      'Queue: Blocked — 5 / 12',
     );
   });
 
-  it('appends a (loading…) marker while loading', () => {
-    expect(formatDialogTitle('READY', 0, true)).toBe(
-      'Agent-ready queue (loading…)',
+  it('renders `Recently completed — {shown} / {total}` for COMPLETED', () => {
+    expect(formatDialogTitle('COMPLETED', 10, 183, false)).toBe(
+      'Recently completed — 10 / 183',
     );
+  });
+
+  it('appends a — loading… marker while loading', () => {
+    expect(formatDialogTitle('READY', 0, 0, true)).toBe(
+      'Queue: Agent-ready — loading…',
+    );
+  });
+
+  it('drops the count decoration when shown or total is undefined', () => {
+    // Back-compat fallback for callers that don't supply both numbers
+    // (e.g. existing test fixtures, or a future caller that hasn't yet
+    // wired up the depth fields).
+    expect(formatDialogTitle('READY', undefined, 50, false)).toBe(
+      'Queue: Agent-ready',
+    );
+    expect(formatDialogTitle('READY', 10, undefined, false)).toBe(
+      'Queue: Agent-ready',
+    );
+    expect(formatDialogTitle('READY', undefined, undefined, false)).toBe(
+      'Queue: Agent-ready',
+    );
+  });
+
+  it('label strings match the panel heading strings exactly', () => {
+    // Guards against the #3172 regression where the dialog's labels
+    // ("Agent-ready queue", "Blocked queue") inverted the noun/qualifier
+    // order vs. the panel headings ("Queue: Agent-ready", "Queue: Blocked")
+    // — operators saw two different strings for the same thing.
+    expect(formatDialogTitle('READY', undefined, undefined, false)).toBe(
+      'Queue: Agent-ready',
+    );
+    expect(formatDialogTitle('BLOCKED', undefined, undefined, false)).toBe(
+      'Queue: Blocked',
+    );
+    expect(formatDialogTitle('COMPLETED', undefined, undefined, false)).toBe(
+      'Recently completed',
+    );
+  });
+});
+
+describe('QueueFullDialog — #3172 width', () => {
+  it('uses max-w-4xl on DialogContent for the wide cockpit layout', () => {
+    resetMocks();
+    mockData.READY = {
+      dispatcherQueueFull: {
+        kind: 'READY',
+        queueItems: [],
+        completions: [],
+      },
+    };
+    render(<QueueFullDialog kind="READY" onClose={vi.fn()} />);
+    const content = screen.getByTestId('queue-full-dialog');
+    expect(content.className).toMatch(/\bmax-w-4xl\b/);
+    expect(content.className).not.toMatch(/\bmax-w-2xl\b/);
   });
 });

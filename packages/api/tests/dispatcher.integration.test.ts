@@ -337,6 +337,67 @@ describe('dispatcherState — admin', () => {
     // the inserted run in cleanup tears down the snapshot rows too.
   });
 
+  it('recentCompletionsCount equals SELECT COUNT(*) on terminal agent rows (#3172)', async () => {
+    // Seed three additional terminal-status agents and one running agent.
+    // recentCompletionsCount must include the three terminals (+ ended_at)
+    // and exclude the running one. We use COUNT(*) directly to compare
+    // rather than asserting a hard number, because earlier tests in this
+    // suite may have left other terminal rows behind that we should still
+    // pick up.
+    const runId = await insertRun();
+    const baseIssue = 999_300;
+    // Three terminals: succeeded / failed / plan_blocked, all with ended_at set.
+    const terminalStatuses = ['succeeded', 'failed', 'plan_blocked'];
+    for (let i = 0; i < terminalStatuses.length; i += 1) {
+      const { rows } = await pool.query<{ agent_id: string }>(
+        `INSERT INTO dispatcher.agents
+           (parent_run_id, kind, issue_number, worktree_path, phase, status,
+            started_at, ended_at)
+         VALUES ($1, 'task', $2, $3, 'retro', $4,
+                 now() - interval '1 hour',
+                 now() - interval '1 minute')
+         RETURNING agent_id`,
+        [
+          runId,
+          baseIssue + i,
+          `/tmp/${MARKER}/agent-count-${baseIssue + i}`,
+          terminalStatuses[i],
+        ],
+      );
+      insertedAgentIds.push(rows[0].agent_id);
+    }
+    // One running agent — must NOT count toward recentCompletionsCount.
+    await insertAgent({
+      runId,
+      issueNumber: baseIssue + 100,
+      status: 'running',
+      phase: 'ralph-worker',
+    });
+
+    const body = await gql(
+      `{ dispatcherState { recentCompletionsCount } }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    expect(typeof state.recentCompletionsCount).toBe('number');
+
+    // Query the same filter directly to confirm the resolver's count
+    // matches `SELECT COUNT(*)` on the underlying table — same filter
+    // `queryRecentCompletions` uses.
+    const { rows: countRows } = await pool.query<{ count: number | string }>(
+      `SELECT COUNT(*)::int AS count
+         FROM dispatcher.agents
+        WHERE status IN ('succeeded', 'failed', 'crashed', 'plan_blocked', 'needs_review')
+          AND ended_at IS NOT NULL`,
+    );
+    const dbCount = Number(countRows[0].count);
+    expect(state.recentCompletionsCount).toBe(dbCount);
+    // Sanity: at least our 3 fresh terminals are counted.
+    expect(dbCount).toBeGreaterThanOrEqual(3);
+  });
+
   it('blockedDepth reflects the latest row in dispatcher.blocked_snapshots (#2886)', async () => {
     // Mirror the queueDepth test — seed two blocked snapshots and
     // confirm the resolver returns the latest-by-observed_at value.

@@ -36,10 +36,28 @@ import { RecentCompletionRow } from './RecentCompletionsPanel';
  */
 export function QueueFullDialog({
   kind,
+  shown,
+  total,
   onClose,
 }: {
   /** Open when not null — also drives which kind to fetch. */
   kind: DispatcherQueueKind | null;
+  /**
+   * Number of rows the panel that opened this dialog was rendering at
+   * click time (capped at 10 server-side). Surfaced in the title's
+   * `{shown} / {total}` so the dialog title carries the same denominator
+   * as the badge the operator just clicked (issue #3172). Optional —
+   * when omitted the title falls back to bare `{label}` without a count
+   * decoration so existing test fixtures keep working.
+   */
+  shown?: number;
+  /**
+   * Total count of rows in the bucket the panel knows about (sourced
+   * from `DispatcherState.queueDepth` / `blockedDepth` /
+   * `recentCompletionsCount`). Same role as `shown` — surfaces the
+   * denominator. Optional for the same back-compat reason.
+   */
+  total?: number;
   /** Called when the dialog closes (ESC, click outside, X button). */
   onClose: () => void;
 }) {
@@ -61,10 +79,8 @@ export function QueueFullDialog({
   const payload = data?.dispatcherQueueFull;
   const queueItems = payload?.queueItems ?? [];
   const completions = payload?.completions ?? [];
-  const totalCount =
-    kind === 'COMPLETED' ? completions.length : queueItems.length;
 
-  const titleText = formatDialogTitle(kind, totalCount, loading);
+  const titleText = formatDialogTitle(kind, shown, total, loading);
 
   return (
     <Dialog
@@ -74,7 +90,13 @@ export function QueueFullDialog({
       }}
     >
       <DialogContent
-        className="max-w-2xl"
+        // #3172: bumped from `max-w-2xl` (42rem / 672px) to `max-w-4xl`
+        // (56rem / 896px). The cockpit page is a wide 3-column layout
+        // and the previous width forced full issue rows (issue link +
+        // priority badge + PR link + title) to wrap awkwardly. `max-w-4xl`
+        // gives ~30% more horizontal room without crowding the page on
+        // common 1280px+ viewports.
+        className="max-w-4xl"
         data-testid="queue-full-dialog"
       >
         <DialogHeader>
@@ -209,22 +231,43 @@ function DialogList({
 }
 
 /**
- * Format the dialog title — the heading text mirrors which bucket the
- * operator opened. Pure helper so the test can exercise the formatting
- * without rendering the dialog. Issue #3159.
+ * Format the dialog title — the heading text mirrors the panel heading
+ * the operator just clicked, and the count decoration carries the same
+ * `{shown} / {total}` denominator the badge displayed.
+ *
+ * Issue #3172 made two changes vs. the original #3159 shape:
+ *  1. Labels now match the panel headings exactly:
+ *     - `READY`     → `Queue: Agent-ready`   (matches `QueuePanel.tsx`)
+ *     - `BLOCKED`   → `Queue: Blocked`       (matches `QueuePanel.tsx`)
+ *     - `COMPLETED` → `Recently completed`   (matches `RecentCompletionsPanel.tsx`)
+ *     The original `Agent-ready queue (N)` / `Blocked queue (N)` strings
+ *     inverted the noun/qualifier order vs. the panel headings, so the
+ *     dialog visually disconnected from the badge that opened it.
+ *  2. Count decoration is `{shown} / {total}` (em-dash separator), not
+ *     `(N)`. When `shown` and `total` are both numbers, the title
+ *     reads e.g. `Queue: Agent-ready — 10 / 50`. When either is
+ *     undefined (back-compat / kind=null), the count decoration is
+ *     dropped so the title stays clean.
+ *
+ * Pure helper so the test can exercise the formatting without rendering
+ * the dialog.
  */
 export function formatDialogTitle(
   kind: DispatcherQueueKind | null,
-  count: number,
+  shown: number | undefined,
+  total: number | undefined,
   loading: boolean,
 ): string {
   if (kind === null) return '';
   const label =
     kind === 'READY'
-      ? 'Agent-ready queue'
+      ? 'Queue: Agent-ready'
       : kind === 'BLOCKED'
-        ? 'Blocked queue'
+        ? 'Queue: Blocked'
         : 'Recently completed';
-  if (loading) return `${label} (loading…)`;
-  return `${label} (${count})`;
+  if (loading) return `${label} — loading…`;
+  if (typeof shown === 'number' && typeof total === 'number') {
+    return `${label} — ${shown} / ${total}`;
+  }
+  return label;
 }

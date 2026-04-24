@@ -384,6 +384,16 @@ export const dispatcherTypeDefs = `#graphql
     ('succeeded','failed','crashed','plan_blocked','needs_review')
     ordered by \`ended_at\` DESC."""
     recentCompletions: [RecentCompletion!]!
+    """Total count of terminal-status rows in \`dispatcher.agents\`
+    (status IN \`('succeeded','failed','crashed','plan_blocked','needs_review')\`).
+    Same filter \`recentCompletions\` (and \`dispatcherQueueFull(kind: COMPLETED)\`)
+    use — paired with the capped \`recentCompletions\` list so the
+    admin-cockpit panel header can render \`{shown} / {total}\`,
+    matching the Ready/Blocked panels (issue #3172). \`dispatcher.agents\`
+    is not currently in the daemon's housekeeping target list, so this
+    grows unboundedly — well within the 1000-row dialog cap today
+    (~180 rows on dev). Returns 0 when the table is empty (fresh deploy)."""
+    recentCompletionsCount: Int!
     """All live-editable \`dispatcher.config\` entries (#2805 §1.6)."""
     config: [DispatcherConfigEntry!]!
     """\`dispatcher.config.value\` for \`spawn_frozen_until\` (§10), or null if not set."""

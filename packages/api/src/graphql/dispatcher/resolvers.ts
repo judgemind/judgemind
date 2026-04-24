@@ -448,6 +448,31 @@ async function queryRecentCompletions(pool: Pool, limit: number): Promise<Row[]>
   return rows;
 }
 
+/**
+ * Total count of terminal-status rows in `dispatcher.agents` — same
+ * filter as `queryRecentCompletions` so the admin-cockpit panel header
+ * can render `{shown} / {total}` for the Recently Completed panel
+ * (issue #3172). Mirrors the `queryQueueDepth` / `queryBlockedDepth`
+ * fall-back-to-0 contract: the GraphQL field is `Int!` (non-null), so
+ * a fresh deploy with no agent rows yet returns 0 rather than null.
+ *
+ * `dispatcher.agents` is NOT in `_HOUSEKEEPING_TARGETS`
+ * (`scripts/dispatcher/daemon.py`), so the count grows unboundedly. Today
+ * dev has ~180 rows — well within the 1000-row safety cap that
+ * `dispatcherQueueFull(kind: COMPLETED)` enforces.
+ */
+async function queryRecentCompletionsCount(pool: Pool): Promise<number> {
+  const { rows } = await pool.query<{ count: number | string }>(
+    `SELECT COUNT(*)::int AS count
+       FROM dispatcher.agents
+      WHERE status IN ('succeeded', 'failed', 'crashed', 'plan_blocked', 'needs_review')
+        AND ended_at IS NOT NULL`,
+  );
+  if (rows.length === 0) return 0;
+  const raw = rows[0].count;
+  return typeof raw === 'number' ? raw : Number(raw);
+}
+
 async function queryConfig(pool: Pool): Promise<Row[]> {
   const { rows } = await pool.query<Row>(
     `SELECT key, value, updated_at, updated_by
@@ -1141,6 +1166,15 @@ export const dispatcherResolvers = {
       requireDispatcherAdmin(user);
       const rows = await queryRecentCompletions(pool, 10);
       return recentCompletionsToGraphQL(rows);
+    },
+
+    recentCompletionsCount: async (
+      _: unknown,
+      __: unknown,
+      { pool, user }: DispatcherContext,
+    ) => {
+      requireDispatcherAdmin(user);
+      return queryRecentCompletionsCount(pool);
     },
 
     config: async (_: unknown, __: unknown, { pool, user }: DispatcherContext) => {
