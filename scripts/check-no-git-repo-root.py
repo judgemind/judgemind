@@ -180,9 +180,7 @@ def main(argv: list[str]) -> int:
         target = _DEFAULT_TARGET
 
     if not target.is_file():
-        print(
-            f"check-no-git-repo-root: no target file at {target} — nothing to check."
-        )
+        print(f"check-no-git-repo-root: no target file at {target} — nothing to check.")
         return 0
 
     violations = find_violations(target)
@@ -194,7 +192,9 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    print("ERROR: git subprocess call(s) anchored to self._repo_root().", file=sys.stderr)
+    print(
+        "ERROR: git subprocess call(s) anchored to self._repo_root().", file=sys.stderr
+    )
     print("", file=sys.stderr)
     print(f"  Target: {target}", file=sys.stderr)
     print("", file=sys.stderr)

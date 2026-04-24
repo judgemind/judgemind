@@ -37,9 +37,17 @@ write_file() {
 
 assert_passes() {
     local desc="$1"
-    local target="$2"
+    local target="${2:-}"
     TESTS=$((TESTS + 1))
-    if "$CHECK_SCRIPT" "$target" > /dev/null 2>&1; then
+    local cmd_ok=true
+    if [[ -n "$target" ]]; then
+        "$CHECK_SCRIPT" "$target" > /dev/null 2>&1 || cmd_ok=false
+    else
+        # Called with no target (e.g. from _guard_self_match_helpers.sh) —
+        # run the checker against its default target (daemon.py).
+        "$CHECK_SCRIPT" > /dev/null 2>&1 || cmd_ok=false
+    fi
+    if $cmd_ok; then
         echo "PASS: $desc"
     else
         echo "FAIL: $desc (expected success, got failure)"
@@ -57,6 +65,11 @@ assert_fails() {
     else
         echo "PASS: $desc"
     fi
+}
+
+reset_tmpdir() {
+    rm -rf "$TMPDIR_TEST"/*
+    rm -rf "$TMPDIR_TEST"/.[!.]* 2>/dev/null || true
 }
 
 # ─── Test 1: FAIL — single-line git call with str(self._repo_root()) ────────
@@ -263,6 +276,14 @@ if [[ -f "$DAEMON_PATH" ]]; then
 else
     echo "SKIP: $DAEMON_PATH not present — skipping regression test"
 fi
+
+# ─── Test 14: No self-match on ci.yml step name ──────────────────────────────
+# Ensures the checker does not accidentally flag its own CI step name.
+# See scripts/tests/_guard_self_match_helpers.sh and issue #2542.
+# shellcheck source=./_guard_self_match_helpers.sh
+source "$SCRIPT_DIR/tests/_guard_self_match_helpers.sh"
+assert_no_self_match_on_ci_step_name \
+    "scripts/check-no-git-repo-root.py" "yml"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
