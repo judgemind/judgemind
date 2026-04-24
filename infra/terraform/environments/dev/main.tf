@@ -341,10 +341,14 @@ module "dispatcher_agent_runner" {
   private_subnet_ids = module.networking.private_subnet_ids
   ecr_repository_url = module.ecr.dispatcher_agent_runner_repository_url
 
-  # Stage 1b baseline: 0.5 vCPU / 1 GiB. Bump (along with task_memory) if
-  # Stage 3 smoke shows the ralph workload needs more headroom.
-  task_cpu    = 512
-  task_memory = 1024
+  # Sized to match the subprocess-daemon envelope (4 vCPU / 16 GiB) — the
+  # envelope ralph was designed against. The Stage 1b baseline (512 / 1024)
+  # pegged memory at 1022/1024 MB for hours under real ralph workload and
+  # CPU-saturated at 509/512 in bursts (see #3153 evidence). Can shrink once
+  # subprocess mode is retired and the dispatcher daemon scales down
+  # correspondingly.
+  task_cpu    = 4096
+  task_memory = 16384
 
   # Secret wiring — same ARNs the daemon uses.
   anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
