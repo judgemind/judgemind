@@ -294,6 +294,31 @@ Shadcn's `TableRow` component applies `hover:bg-muted/50` by default, which make
 
 **Alternative:** for list pages where every column is informational (no checkboxes, no inline buttons), prefer the `<Link>`-wrapped row pattern used in `CasesList` and `RulingsFeed` — the entire row is a `<Link>` with `className="block ..."`. This gives native right-click / cmd-click behavior without needing `stopPropagation` plumbing. The `TableRow` + `onClick` pattern is appropriate when the row contains selection checkboxes or other interactive controls that cannot live inside an `<a>` tag.
 
+### Apollo Polling
+
+When a `useQuery` hook has a `pollInterval`, Apollo continues to re-run the query on a timer. On a poll failure the query returns a new `error` **alongside the stale `data`** from the last successful fetch. A bare `if (error) return <ErrorBanner/>` short-circuit discards that stale data and shows a blank or broken UI — even though the component could display the last-known values to the user.
+
+**Rule:** always guard the error short-circuit with `if (error && !data)` in polled queries. Show the error only when there is no data to fall back to.
+
+```tsx
+// Wrong — hides stale data on poll failures
+const { data, loading, error } = useQuery(QUERY, { pollInterval: 5000 });
+if (error) return <ErrorBanner error={error} />;
+
+// Correct — falls back to stale data when a subsequent poll errors
+const { data, loading, error } = useQuery(QUERY, { pollInterval: 5000 });
+if (error && !data) return <ErrorBanner error={error} />;
+```
+
+The same rule applies to renamed bindings:
+
+```tsx
+const { data: state, loading, error: queryError } = useQuery(QUERY, { pollInterval: 5000 });
+if (queryError && !state) return <ErrorBanner error={queryError} />;
+```
+
+**Enforcement:** an ESLint rule (`local/polled-query-error-guard`) flags any `useQuery` callsite with `pollInterval` where the destructured `error` binding is used in a bare `if (error)` that returns JSX. The rule emits an auto-fix rewriting the test to `error && !data`. See `packages/web/eslint-rules/polled-query-error-guard.js` and issue [#2850](https://github.com/judgemind/judgemind/issues/2850).
+
 ### Loading States
 
 - Skeleton loaders matching the shape of the content they replace
