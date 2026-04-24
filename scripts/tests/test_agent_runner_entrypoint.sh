@@ -3229,6 +3229,208 @@ else
          "git log: $(cat "$INVOCATIONS_DIR/git.log")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# #3200 — classify_pr_rollup must handle StatusContext entries (Vercel,
+# third-party commit-status API) as well as CheckRun entries, and
+# handle_awaiting_ci must early-exit when the PR is already merged.
+#
+# Fixtures drive `awaiting_ci` through one poll iteration. A "green"
+# rollup advances the phase to `merge`; a "red" rollup advances to
+# `fix_ci`. An already-merged PR short-circuits to green immediately.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── Test 36: Fixture A — CheckRuns only, all SUCCESS + CLEAN → green ──────
+# (Regression guard for the pre-#3200 happy path. Mirrors T28 but with
+# an explicit fixture so the assertions don't depend on the default
+# stub output.)
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t36.txt"
+printf 'awaiting_ci\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t36_pr_view="$TEST_TMP/t36-pr-view.json"
+cat > "$t36_pr_view" <<'EOF'
+{
+  "statusCheckRollup": [
+    {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SKIPPED"}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": null
+}
+EOF
+
+t36_workspace="$TEST_TMP/t36-workspace"
+set +e
+t36_out=$(run_post_pr_phase "awaiting_ci" "$t36_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_PR_VIEW_JSON_FIXTURE=$t36_pr_view" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t36_out" | grep -q '"rollup_state": "green"'; then
+    pass "#3200 T36 — fixture A (CheckRun-only, all SUCCESS + CLEAN) → green"
+else
+    fail "#3200 T36 — fixture A (CheckRun-only, all SUCCESS + CLEAN) → green" \
+         "out tail: $(printf '%s' "$t36_out" | tail -c 500)"
+fi
+
+# ── Test 37: Fixture B — StatusContext SUCCESS + CheckRuns SUCCESS + CLEAN → green
+# (This is the live-reproducible bug: PR #3198 shape. Pre-#3200 the
+# StatusContext entry fell through to "pending" so the function never
+# returned green and every ECS agent hit the 60min timeout.)
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t37.txt"
+printf 'awaiting_ci\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t37_pr_view="$TEST_TMP/t37-pr-view.json"
+cat > "$t37_pr_view" <<'EOF'
+{
+  "statusCheckRollup": [
+    {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SKIPPED"},
+    {"__typename": "StatusContext", "context": "Vercel", "state": "SUCCESS"}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": null
+}
+EOF
+
+t37_workspace="$TEST_TMP/t37-workspace"
+set +e
+t37_out=$(run_post_pr_phase "awaiting_ci" "$t37_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_PR_VIEW_JSON_FIXTURE=$t37_pr_view" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t37_out" | grep -q '"rollup_state": "green"'; then
+    pass "#3200 T37 — fixture B (StatusContext SUCCESS + CheckRuns + CLEAN) → green"
+else
+    fail "#3200 T37 — fixture B (StatusContext SUCCESS + CheckRuns + CLEAN) → green" \
+         "out tail: $(printf '%s' "$t37_out" | tail -c 500)"
+fi
+
+# Phase advances past awaiting_ci to merge → the classifier returned green.
+if grep -q "SET phase = \\\\'merge\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3200 T37 — fixture B advances to merge on green"
+else
+    fail "#3200 T37 — fixture B advances to merge on green" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ── Test 38: Fixture C — StatusContext FAILURE → red → advances to fix_ci
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t38.txt"
+printf 'awaiting_ci\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t38_pr_view="$TEST_TMP/t38-pr-view.json"
+cat > "$t38_pr_view" <<'EOF'
+{
+  "statusCheckRollup": [
+    {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"__typename": "StatusContext", "context": "Vercel", "state": "FAILURE"}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": null
+}
+EOF
+
+t38_workspace="$TEST_TMP/t38-workspace"
+set +e
+t38_out=$(run_post_pr_phase "awaiting_ci" "$t38_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_PR_VIEW_JSON_FIXTURE=$t38_pr_view" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t38_out" | grep -q '"rollup_state": "red"'; then
+    pass "#3200 T38 — fixture C (StatusContext FAILURE) → red"
+else
+    fail "#3200 T38 — fixture C (StatusContext FAILURE) → red" \
+         "out tail: $(printf '%s' "$t38_out" | tail -c 500)"
+fi
+
+if grep -q "SET phase = \\\\'fix_ci\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3200 T38 — fixture C advances to fix_ci on red"
+else
+    fail "#3200 T38 — fixture C advances to fix_ci on red" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ── Test 39: Fixture D — already-merged PR (mergeCommit.oid set,
+# mergeStateStatus=UNKNOWN) → handle_awaiting_ci short-circuits to green
+# without even looking at the rollup classifier.
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t39.txt"
+printf 'awaiting_ci\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t39_pr_view="$TEST_TMP/t39-pr-view.json"
+cat > "$t39_pr_view" <<'EOF'
+{
+  "statusCheckRollup": [
+    {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"}
+  ],
+  "mergeable": "UNKNOWN",
+  "mergeStateStatus": "UNKNOWN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": {"oid": "a300318bd5b1813da8dea78a28eb5b37c0d427ac"}
+}
+EOF
+
+t39_workspace="$TEST_TMP/t39-workspace"
+set +e
+t39_out=$(run_post_pr_phase "awaiting_ci" "$t39_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_PR_VIEW_JSON_FIXTURE=$t39_pr_view" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t39_out" | grep -q "awaiting_ci_already_merged"; then
+    pass "#3200 T39 — fixture D (merged PR) emits awaiting_ci_already_merged"
+else
+    fail "#3200 T39 — fixture D (merged PR) emits awaiting_ci_already_merged" \
+         "out tail: $(printf '%s' "$t39_out" | tail -c 500)"
+fi
+
+# handle_awaiting_ci's JSON payload is captured by the caller into
+# $_output and then INSERTed into dispatcher.phase_outputs — so the
+# already_merged flag surfaces in the psql invocation log, not in the
+# entrypoint's stdout.
+if grep -F "already_merged" "$INVOCATIONS_DIR/psql.log" >/dev/null 2>&1; then
+    pass "#3200 T39 — fixture D short-circuits with already_merged payload (persisted to phase_outputs)"
+else
+    fail "#3200 T39 — fixture D short-circuits with already_merged payload (persisted to phase_outputs)" \
+         "psql log tail: $(tail -c 800 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# Merged PR still advances to merge (caller transitions green → merge).
+if grep -q "SET phase = \\\\'merge\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3200 T39 — fixture D advances to merge on already-merged short-circuit"
+else
+    fail "#3200 T39 — fixture D advances to merge on already-merged short-circuit" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

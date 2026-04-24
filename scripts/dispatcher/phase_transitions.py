@@ -760,6 +760,12 @@ _CI_FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
 #: Check-run conclusions that count as green.
 _CI_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
 
+#: StatusContext (commit-status API, e.g. Vercel) states that count as red.
+_CI_STATUSCONTEXT_FAILURE_STATES: frozenset[str] = frozenset({"FAILURE", "ERROR"})
+
+#: StatusContext states that count as green.
+_CI_STATUSCONTEXT_SUCCESS_STATES: frozenset[str] = frozenset({"SUCCESS", "NEUTRAL"})
+
 
 def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     """Classify a ``gh pr view --json`` rollup as green / red / pending.
@@ -769,12 +775,25 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     the agent-runner can use it identically without duplicating the
     check-run conclusion constants.
 
+    statusCheckRollup is a heterogeneous list:
+
+    * ``CheckRun`` entries have ``.status`` + ``.conclusion`` (GitHub
+      Actions, container-based check runs).
+    * ``StatusContext`` entries have ``.state`` only (commit-status
+      API, third-party integrations like Vercel). Before #3200 this
+      function only inspected ``.status`` + ``.conclusion`` and fell
+      through to "pending" for any StatusContext entry — so every PR
+      that exposed a Vercel status stayed pending forever.
+
     Rules (short-circuit ordering):
 
-    1. If any check has a RED conclusion (FAILURE / CANCELLED /
-       TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE) → red.
-    2. If any check is not yet COMPLETED (status in_progress /
-       queued / pending) → pending.
+    1. If any check has a RED outcome (CheckRun conclusion in
+       FAILURE / CANCELLED / TIMED_OUT / ACTION_REQUIRED /
+       STARTUP_FAILURE, or StatusContext state in FAILURE / ERROR)
+       → red.
+    2. If any check is not yet complete (CheckRun status
+       in_progress / queued / pending, or StatusContext state
+       EXPECTED / PENDING) → pending.
     3. If mergeable is not ``MERGEABLE`` or mergeStateStatus is not
        ``CLEAN`` → pending (the merge-conflict polling path; we
        treat it as "not ready yet" rather than red).
@@ -791,6 +810,18 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     for check in rollup:
         if not isinstance(check, dict):
             continue
+        typename = str(check.get("__typename") or "").upper()
+        if typename == "STATUSCONTEXT":
+            state = str(check.get("state") or "").upper()
+            if state in _CI_STATUSCONTEXT_FAILURE_STATES:
+                return "red"
+            if state in _CI_STATUSCONTEXT_SUCCESS_STATES:
+                continue
+            # EXPECTED / PENDING / unknown / "" → not yet done.
+            any_pending = True
+            continue
+
+        # CheckRun (default) — pre-#3200 code path.
         status = str(check.get("status") or "").upper()
         conclusion = str(check.get("conclusion") or "").upper()
         if status == "COMPLETED":

@@ -366,6 +366,126 @@ class TestTransitionFromAwaitingCi:
         result = pt.transition_from_awaiting_ci(status)
         assert result.next_phase == pt.PHASE_MERGE
 
+    # ----- #3200 StatusContext coverage ------------------------------------
+
+    def test_statuscontext_success_counts_as_green(self) -> None:
+        # Regression for #3200 — the live-reproducible bug: Vercel-
+        # style StatusContext entries have no ``.status``/``.conclusion``,
+        # only ``.state``. Pre-fix the classifier fell through to
+        # "pending" so every PR with a Vercel status was stuck.
+        status = self._make_status(
+            [
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "name": "lint",
+                },
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "SUCCESS",
+                },
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_MERGE
+
+    def test_statuscontext_failure_counts_as_red(self) -> None:
+        status = self._make_status(
+            [
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "FAILURE",
+                },
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.next_phase == pt.PHASE_FIX_CI
+
+    def test_statuscontext_error_counts_as_red(self) -> None:
+        status = self._make_status(
+            [
+                {
+                    "__typename": "StatusContext",
+                    "context": "build",
+                    "state": "ERROR",
+                },
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.next_phase == pt.PHASE_FIX_CI
+
+    def test_statuscontext_pending_stays_pending(self) -> None:
+        # PENDING / EXPECTED state — StatusContext entry hasn't
+        # completed; must stay in awaiting_ci rather than returning
+        # green.
+        status = self._make_status(
+            [
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "name": "lint",
+                },
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "PENDING",
+                },
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.next_phase == pt.PHASE_AWAITING_CI
+
+    def test_statuscontext_expected_stays_pending(self) -> None:
+        status = self._make_status(
+            [
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "EXPECTED",
+                },
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.next_phase == pt.PHASE_AWAITING_CI
+
+    def test_mixed_checkrun_and_statuscontext_all_green(self) -> None:
+        # Real PR #3198 shape — 3 CheckRuns + 1 Vercel StatusContext,
+        # all success, MERGEABLE + CLEAN.
+        status = self._make_status(
+            [
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "name": "lint",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "name": "build",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "NEUTRAL",
+                    "name": "codecov",
+                },
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "SUCCESS",
+                },
+            ]
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.next_phase == pt.PHASE_MERGE
+
 
 # --------------------------------------------------------------------------
 # transition_from_fix_ci
