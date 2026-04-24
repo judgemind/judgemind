@@ -459,12 +459,12 @@ class TestScanQueueAndSnapshot:
 
 
 # --------------------------------------------------------------------------
-# scheduler_tick — Phase 2 integration (guard + scan wired in)
+# scheduler_tick — Phase 2 integration (queue scan wired in)
 # --------------------------------------------------------------------------
 
 
 class TestSchedulerTickPhase2:
-    """Scheduler tick now runs queue scan + fires the concurrency guard."""
+    """Scheduler tick runs the queue scan and writes a snapshot row."""
 
     def test_runs_queue_scan_and_returns_depth(self) -> None:
         d, conn, handler = _make_daemon_with_capture()
@@ -490,36 +490,6 @@ class TestSchedulerTickPhase2:
         ticks = handler.events("scheduler_tick")
         assert len(ticks) == 1
         assert ticks[0].queue_depth == 1
-
-    def test_warns_when_concurrency_cap_nonzero(self) -> None:
-        d, conn, handler = _make_daemon_with_capture()
-        # Scheduler reads concurrency_cap = 5 (Phase 1 default seed).
-        conn.cursor_instance.fetch_queue = [(5,)]
-        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-
-        d.scheduler_tick()
-        warnings = handler.events("phase2_concurrency_cap_nonzero")
-        assert len(warnings) == 1
-        assert warnings[0].observed_concurrency_cap == 5
-        assert warnings[0].required_concurrency_cap == 0
-
-    def test_no_warning_when_concurrency_cap_zero(self) -> None:
-        d, conn, handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetch_queue = [(0,)]
-        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-
-        d.scheduler_tick()
-        assert handler.events("phase2_concurrency_cap_nonzero") == []
-
-    def test_no_warning_when_concurrency_cap_missing(self) -> None:
-        """Missing config key is a soft no-op; daemon runs but does not warn."""
-        d, conn, handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetch_queue = [None]
-        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-
-        summary = d.scheduler_tick()
-        assert summary["concurrency_cap"] == -1
-        assert handler.events("phase2_concurrency_cap_nonzero") == []
 
     def test_queue_scan_failure_does_not_crash_tick(self) -> None:
         d, conn, handler = _make_daemon_with_capture()

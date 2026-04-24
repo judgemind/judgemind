@@ -285,15 +285,6 @@ AGENT_RUNNER_RUN_TASK_RETRYABLE_CODES: frozenset[str] = frozenset(
     }
 )
 
-#: Phase 2 spawn-safety invariant: this value must be 0. The daemon
-#: asserts this on every scheduler tick and logs a warning if the live
-#: ``dispatcher.config.concurrency_cap`` is anything else. The actual
-#: spawn path was added in Phase 3A (#2783) but remains gated on
-#: ``concurrency_cap > 0`` — until Phase 3E flips it to 1, the
-#: orchestration path stays cold in production and the Phase 2 guard
-#: continues to warn on any non-zero value.
-PHASE_2_REQUIRED_CONCURRENCY_CAP = 0
-
 #: Killswitch terminal phase name (#2847). When the scheduler observes
 #: ``concurrency_cap=0`` mid-orchestration and the killswitch engages
 #: (not a #2884 graceful ``stop``), the worker thread aborts at the
@@ -1797,8 +1788,6 @@ class DispatcherDaemon:
               :meth:`_consume_commands`; each dispatched to its handler
               with consumed_at set AFTER the handler (#2801);
             - read ``dispatcher.config.concurrency_cap``;
-            - enforce the Phase 2 spawn-safety guard (warn if
-              ``concurrency_cap != 0``);
             - scan the GitHub ``agent/ready`` queue via ``gh issue list``
               and INSERT a row into ``dispatcher.queue_snapshots``;
             - **Phase 3A (#2783):** if ``concurrency_cap > 0`` AND no
@@ -2141,7 +2130,7 @@ class DispatcherDaemon:
     # ── scheduler tick (every ``tick_scheduler_seconds``) ───────────────
 
     def scheduler_tick(self) -> dict[str, int]:
-        """Run one scheduler tick. Phase 2 = queue scan + spawn-safety guard.
+        """Run one scheduler tick — queue scan + retry drain + Phase 3A orchestration.
 
         Steps (in order; DB work is one transaction per step for isolation):
             1. Consume any pending ``dispatcher.commands`` via
@@ -2153,8 +2142,7 @@ class DispatcherDaemon:
                observation, and SET (cap==0) or CLEAR (cap>0) the
                ``_pause_requested`` killswitch event for the worker thread
                to observe between phases (#2847).
-            3. Fire the Phase 2 spawn-safety guard (log-only warning).
-            4. Drain due retry markers whose reason is in
+            3. Drain due retry markers whose reason is in
                :data:`_INFRA_PREEMPTION_CATEGORIES` via
                :meth:`_process_retry_markers(only_infra_preemption=True)`
                (#2949). Those markers re-add ``agent/ready`` to the
@@ -2165,10 +2153,10 @@ class DispatcherDaemon:
                retries (``subprocess_crash``, ``stuck_timeout``,
                ``gh_rate_exhausted``, ``operator_retry``) stay on the
                supervisor-tick drain.
-            5. Scan the GitHub ``agent/ready`` queue and write a row to
+            4. Scan the GitHub ``agent/ready`` queue and write a row to
                ``dispatcher.queue_snapshots``; run the blocked-list scan
                on its slower cadence.
-            6. If the gate allows, spawn the orchestration worker thread
+            5. If the gate allows, spawn the orchestration worker thread
                (#2847). The spawn is non-blocking — the worker runs on a
                dedicated thread with its own psycopg connection so this
                tick returns promptly, preserving the 30s cadence even
@@ -2324,30 +2312,6 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
-
-        # Phase 2 spawn-safety guard: the spawn path does not exist yet,
-        # but a future Phase 3 wiring mistake could activate it. Warn if
-        # the live config disagrees with the Phase 2 invariant. The
-        # guard is advisory only — no subprocess is spawned regardless of
-        # what ``concurrency_cap`` is set to in the database.
-        if (
-            concurrency_cap is not None
-            and concurrency_cap != PHASE_2_REQUIRED_CONCURRENCY_CAP
-        ):
-            self._log.warning(
-                "daemon.phase2_concurrency_cap_nonzero",
-                extra={
-                    "event": "phase2_concurrency_cap_nonzero",
-                    "run_id": self._run_id,
-                    "observed_concurrency_cap": concurrency_cap,
-                    "required_concurrency_cap": PHASE_2_REQUIRED_CONCURRENCY_CAP,
-                    "detail": (
-                        "Phase 2 is shadow mode — daemon must not spawn "
-                        "subprocesses. concurrency_cap should be 0 until "
-                        "Phase 3 cut-over."
-                    ),
-                },
-            )
 
         # Issue #2949 — process infra-preemption retry markers BEFORE
         # scanning the ``agent/ready`` queue. When a daemon restart
