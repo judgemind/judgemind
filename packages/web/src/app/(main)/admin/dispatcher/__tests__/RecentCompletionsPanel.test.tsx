@@ -697,6 +697,43 @@ describe('RecentCompletionsPanel — Magic Move view-transition names (#2967)', 
     );
   });
 
+  // --- #3206 — view-transition gate while a full-list dialog is open.
+  //             Same root cause as the QueueRow gate: view-transition
+  //             pseudo-elements paint above the regular z-index stack
+  //             and would render over an open dialog during the cockpit's
+  //             2s `dispatcherState` poll.
+  it('#3206: rows DROP view-transition-name when dialogOpen=true', () => {
+    const items = [
+      completion({
+        agentId: 'aabbccdd-eeff-0011-2233-445566778899',
+        issueNumber: 3206,
+      }),
+    ];
+    render(
+      <RecentCompletionsPanel completions={items} nowMs={now} dialogOpen />,
+    );
+    const row = screen.getByTestId(
+      'completion-row-aabbccdd-eeff-0011-2233-445566778899',
+    );
+    expect((row as HTMLElement).style.viewTransitionName).toBe('');
+  });
+
+  it('#3206: rows KEEP view-transition-name when dialogOpen=false (default)', () => {
+    const items = [
+      completion({
+        agentId: 'aabbccdd-eeff-0011-2233-445566778899',
+        issueNumber: 3206,
+      }),
+    ];
+    render(<RecentCompletionsPanel completions={items} nowMs={now} />);
+    const row = screen.getByTestId(
+      'completion-row-aabbccdd-eeff-0011-2233-445566778899',
+    );
+    expect((row as HTMLElement).style.viewTransitionName).toBe(
+      'agent-aabbccdd-eeff-0011-2233-445566778899',
+    );
+  });
+
   // --- #3159 — clickable count opens the full-list dialog. The count
   //             becomes a separate `<button>` badge in the header when
   //             `onCountClick` is provided; the inline `(N)` parenthesised

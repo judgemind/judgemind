@@ -145,6 +145,7 @@ export function QueueReadyPanel({
   items,
   total,
   onCountClick,
+  dialogOpen = false,
 }: {
   items: readonly QueueItem[];
   total?: number;
@@ -156,6 +157,18 @@ export function QueueReadyPanel({
    * caller that hasn't wired up the dialog.
    */
   onCountClick?: () => void;
+  /**
+   * When true, suppress the Magic Move ``view-transition-name`` on each
+   * row so the cockpit's poll-driven view-transitions (#2967) don't
+   * paint browser-managed ``::view-transition-*`` pseudo-elements
+   * directly over an open full-list dialog (#3164/#3178). View-transition
+   * pseudos render on a compositor layer that sits above the regular
+   * z-index stack, so Radix Dialog's ``z-50`` content can't out-stack
+   * them — the only fix is to suppress the transition trigger while a
+   * dialog is open. The cockpit dashboard threads this from
+   * ``fullDialogKind !== null``. Issue #3206.
+   */
+  dialogOpen?: boolean;
 }) {
   return (
     <section aria-labelledby="queue-ready-heading">
@@ -185,7 +198,7 @@ export function QueueReadyPanel({
             <QueueRow
               key={item.issueNumber}
               item={item}
-              animated
+              animated={!dialogOpen}
             />
           ))}
         </ul>

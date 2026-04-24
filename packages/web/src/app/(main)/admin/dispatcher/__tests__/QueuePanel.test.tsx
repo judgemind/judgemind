@@ -198,6 +198,43 @@ describe('QueuePanel', () => {
     expect(screen.queryByTestId('queue-row-2500')).toBeNull();
   });
 
+  // --- #3206 — view-transition gate while a full-list dialog is open.
+  //             The cockpit's `dispatcherState` poll fires
+  //             `document.startViewTransition` every 2s; the browser
+  //             paints `::view-transition-*` pseudo-elements on a
+  //             compositor layer above the regular z-index stack, so
+  //             any row carrying a `viewTransitionName` would render
+  //             over the open dialog. The fix is to suppress the name
+  //             on every row whenever `dialogOpen` is true.
+  it('#3206: ready rows DROP view-transition-name when dialogOpen=true', () => {
+    const items = [
+      item({ issueNumber: 3151, title: 'first' }),
+      item({ issueNumber: 3152, title: 'second' }),
+    ];
+    render(<QueueReadyPanel items={items} total={50} dialogOpen />);
+    // Rows still render — only the animation hook is suppressed.
+    expect(screen.getByText('first')).toBeInTheDocument();
+    expect(screen.getByText('second')).toBeInTheDocument();
+    // Non-animated rows omit the testid (per QueueRow's own contract);
+    // assert absence of the animated-row testid.
+    expect(screen.queryByTestId('queue-row-3151')).toBeNull();
+    expect(screen.queryByTestId('queue-row-3152')).toBeNull();
+  });
+
+  it('#3206: ready rows KEEP view-transition-name when dialogOpen=false (default)', () => {
+    const items = [item({ issueNumber: 3151, title: 'first' })];
+    render(<QueueReadyPanel items={items} total={50} />);
+    const row = screen.getByTestId('queue-row-3151');
+    expect((row as HTMLElement).style.viewTransitionName).toBe('issue-3151');
+  });
+
+  it('#3206: dialogOpen=true also strips view-transition-name when explicit', () => {
+    const items = [item({ issueNumber: 3151, title: 'first' })];
+    render(<QueueReadyPanel items={items} total={50} dialogOpen={true} />);
+    // No queue-row-<N> testid → no view-transition-name in style.
+    expect(screen.queryByTestId('queue-row-3151')).toBeNull();
+  });
+
   // --- #3001 — cooldown badge on queue-ready rows.
   it('#3001: renders cooldown badge when cooldownSecondsRemaining > 0', () => {
     const items = [

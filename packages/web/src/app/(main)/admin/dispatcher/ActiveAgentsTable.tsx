@@ -14,6 +14,18 @@ interface ActiveAgentsTableProps {
   onAgentAction: (command: 'retry' | 'force_stop', agentId: string) => void;
   /** Override for deterministic tests. */
   nowMs?: number;
+  /**
+   * When true, suppress the Magic Move ``view-transition-name`` on each
+   * active-agent row so the cockpit's poll-driven view-transitions
+   * (#2967) don't paint browser-managed ``::view-transition-*``
+   * pseudo-elements over an open full-list dialog (#3164/#3178).
+   * View-transition pseudos render on a compositor layer above the
+   * regular z-index stack, so Radix Dialog's ``z-50`` content can't
+   * out-stack them — the only fix is to skip the transition trigger
+   * while any dialog is open. Threaded from ``fullDialogKind !== null``.
+   * Issue #3206.
+   */
+  dialogOpen?: boolean;
 }
 
 /**
@@ -27,6 +39,7 @@ export function ActiveAgentsTable({
   disabled,
   onAgentAction,
   nowMs,
+  dialogOpen = false,
 }: ActiveAgentsTableProps) {
   return (
     <section aria-labelledby="active-agents-heading">
@@ -46,6 +59,7 @@ export function ActiveAgentsTable({
               disabled={disabled}
               onAction={onAgentAction}
               nowMs={nowMs}
+              animated={!dialogOpen}
             />
           ))}
         </ul>
@@ -59,11 +73,20 @@ function ActiveAgentRow({
   disabled,
   onAction,
   nowMs,
+  animated = true,
 }: {
   agent: DispatcherAgent;
   disabled?: boolean;
   onAction: (command: 'retry' | 'force_stop', agentId: string) => void;
   nowMs?: number;
+  /**
+   * When ``true`` (default — preserves prior behaviour), carry the Magic
+   * Move ``view-transition-name`` on both wrappers (issue-N outer,
+   * agent-X inner). When ``false`` (cockpit passes ``!dialogOpen``),
+   * the wrappers omit ``viewTransitionName`` so poll-driven
+   * view-transitions don't paint over an open full-list dialog (#3206).
+   */
+  animated?: boolean;
 }) {
   const logsHref = worktreeLogsUrl(agent.worktreePath);
   const elapsed = formatUptime(agent.startedAt, nowMs);
@@ -80,12 +103,17 @@ function ActiveAgentRow({
   // ward in the same frame. See tmp/magic-move-proto.html for the
   // reference visual. CSSProperties doesn't yet type-check
   // `viewTransitionName`; we spread the key in via a narrow cast.
-  const outerStyle = {
-    viewTransitionName: `issue-${agent.issueNumber}`,
-  } as CSSProperties;
-  const innerStyle = {
-    viewTransitionName: `agent-${agent.id}`,
-  } as CSSProperties;
+  //
+  // #3206: when `animated` is false, drop both names so poll-driven
+  // view-transitions (fired by `useViewTransitionUpdate` in
+  // `DispatcherDashboard`) don't paint browser-managed
+  // `::view-transition-*` pseudo-elements over an open full-list dialog.
+  const outerStyle = animated
+    ? ({ viewTransitionName: `issue-${agent.issueNumber}` } as CSSProperties)
+    : undefined;
+  const innerStyle = animated
+    ? ({ viewTransitionName: `agent-${agent.id}` } as CSSProperties)
+    : undefined;
   return (
     <li
       className="py-2 text-sm hover:bg-muted/50"

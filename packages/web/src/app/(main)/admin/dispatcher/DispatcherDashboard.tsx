@@ -401,11 +401,13 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
                 agents={state?.activeAgents ?? []}
                 disabled={controlLoading}
                 onAgentAction={handleAgentAction}
+                dialogOpen={fullDialogKind !== null}
               />
               <QueueReadyPanel
                 items={state?.queueReady ?? []}
                 total={state?.queueDepth}
                 onCountClick={() => setFullDialogKind('READY')}
+                dialogOpen={fullDialogKind !== null}
               />
             </div>
 
@@ -420,6 +422,7 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
                 completions={state?.recentCompletions ?? []}
                 total={state?.recentCompletionsCount}
                 onCountClick={() => setFullDialogKind('COMPLETED')}
+                dialogOpen={fullDialogKind !== null}
               />
               <QueueBlockedPanel
                 items={state?.queueBlocked ?? []}

@@ -34,6 +34,15 @@ interface RecentCompletionsPanelProps {
    * wired up the dialog.
    */
   onCountClick?: () => void;
+  /**
+   * When true, suppress the Magic Move ``view-transition-name`` on each
+   * completion row. Same rationale as `QueueReadyPanel.dialogOpen`
+   * (issue #3206): view-transition pseudo-elements paint above the
+   * regular z-index stack, so they would render on top of an open
+   * full-list dialog during the cockpit's poll-driven transitions.
+   * The cockpit dashboard threads this from ``fullDialogKind !== null``.
+   */
+  dialogOpen?: boolean;
 }
 
 /**
@@ -85,6 +94,7 @@ export function RecentCompletionsPanel({
   nowMs,
   total,
   onCountClick,
+  dialogOpen = false,
 }: RecentCompletionsPanelProps) {
   // #3159: when a click handler is provided, surface a separate
   // clickable count badge (matching the QueuePanel pattern) so the
@@ -127,6 +137,7 @@ export function RecentCompletionsPanel({
               key={completion.agentId}
               completion={completion}
               nowMs={nowMs}
+              animated={!dialogOpen}
             />
           ))}
         </ul>
@@ -164,9 +175,18 @@ function formatRecentCompletionsCount(
 export function RecentCompletionRow({
   completion,
   nowMs,
+  animated = true,
 }: {
   completion: RecentCompletion;
   nowMs?: number;
+  /**
+   * When ``true`` (default — preserves prior behaviour), carry the Magic
+   * Move ``view-transition-name`` that enables the Active-to-Completed
+   * card animation (#2967). When ``false``, the row's ``style`` omits
+   * ``viewTransitionName`` so poll-driven view-transitions don't paint
+   * over an open full-list dialog (#3206).
+   */
+  animated?: boolean;
 }) {
   const costFootnote = formatCostFootnote(
     completion.totalCostUsd,
@@ -196,9 +216,14 @@ export function RecentCompletionRow({
   // so that the inner `agent-X` wrapper of the matching Active row can
   // Magic Move into this slot when the agent transitions to a terminal
   // state. See tmp/magic-move-proto.html for the reference visual.
-  const rowStyle = {
-    viewTransitionName: `agent-${completion.agentId}`,
-  } as CSSProperties;
+  //
+  // #3206: when `animated` is false (the cockpit dashboard passes
+  // `!dialogOpen`), drop the `viewTransitionName` so poll-driven
+  // view-transitions don't paint browser-managed pseudo-elements over
+  // an open full-list dialog.
+  const rowStyle = animated
+    ? ({ viewTransitionName: `agent-${completion.agentId}` } as CSSProperties)
+    : undefined;
   return (
     <li
       className="flex items-start gap-3 py-2 text-sm hover:bg-muted/50"

@@ -144,3 +144,37 @@ describe('ActiveAgentsTable — Magic Move view-transition names (#2967)', () =>
     expect(outer.contains(inner)).toBe(true);
   });
 });
+
+describe('ActiveAgentsTable — #3206 view-transition gate while dialog open', () => {
+  it('drops view-transition-name on BOTH wrappers when dialogOpen=true', () => {
+    const agent = makeAgent({ id: 'agent-42', issueNumber: 3206 });
+    render(
+      <ActiveAgentsTable
+        agents={[agent]}
+        onAgentAction={vi.fn()}
+        dialogOpen
+      />,
+    );
+    const outer = screen.getByTestId(`active-agent-row-${agent.id}`);
+    const inner = screen.getByTestId(`active-agent-inner-${agent.id}`);
+    // Both wrappers must drop the name — leaving either in place would
+    // still let view-transition pseudo-elements paint over the dialog.
+    expect((outer as HTMLElement).style.viewTransitionName).toBe('');
+    expect((inner as HTMLElement).style.viewTransitionName).toBe('');
+  });
+
+  it('keeps view-transition-name when dialogOpen=false (default — preserves Magic Move)', () => {
+    const agent = makeAgent({ id: 'agent-42', issueNumber: 3206 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const outer = screen.getByTestId(`active-agent-row-${agent.id}`);
+    const inner = screen.getByTestId(`active-agent-inner-${agent.id}`);
+    expect((outer as HTMLElement).style.viewTransitionName).toBe(
+      `issue-${agent.issueNumber}`,
+    );
+    expect((inner as HTMLElement).style.viewTransitionName).toBe(
+      `agent-${agent.id}`,
+    );
+  });
+});
