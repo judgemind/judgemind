@@ -11,6 +11,7 @@ Usage:
     scripts/run-py.sh scripts/screenshot.py /rulings --width 1280 --height 720
     scripts/run-py.sh scripts/screenshot.py /rulings --wait 5000
     scripts/run-py.sh scripts/screenshot.py --auth /admin/data-quality --output tmp/dq.png
+    scripts/run-py.sh scripts/screenshot.py --auth /admin/dispatcher --click '[data-testid="queue-ready-count"]' --output tmp/ready_dialog.png
 
 Requires the scraper-framework venv (which includes playwright). Run via
 scripts/run-py.sh, which reads the ``# venv:`` header and activates the
@@ -149,6 +150,16 @@ def main() -> None:
         action="store_true",
         help="Log in as admin before taking the screenshot (fetches credentials from AWS Secrets Manager)",
     )
+    parser.add_argument(
+        "--click",
+        help="CSS selector to click after navigation (for capturing modal/dialog state)",
+    )
+    parser.add_argument(
+        "--click-wait",
+        type=int,
+        default=500,
+        help="Wait time in ms after the --click for animations to settle (default: 500)",
+    )
     args = parser.parse_args()
 
     url = validate_url(args.path)
@@ -181,6 +192,20 @@ def main() -> None:
         # Extra wait for client-side JS rendering (React hydration, data fetching)
         if args.wait > 0:
             page.wait_for_timeout(args.wait)
+
+        # Optional click to surface state behind a single interaction (modals,
+        # dropdowns, popovers). Use query_selector + element.click so a missing
+        # target produces a clear, fail-fast error rather than a Playwright
+        # timeout from page.click.
+        if args.click:
+            click_target = page.query_selector(args.click)
+            if click_target is None:
+                print(f"Click target not found: {args.click}", file=sys.stderr)
+                browser.close()
+                sys.exit(1)
+            click_target.click()
+            if args.click_wait > 0:
+                page.wait_for_timeout(args.click_wait)
 
         if args.selector:
             element = page.query_selector(args.selector)

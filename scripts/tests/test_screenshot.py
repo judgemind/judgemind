@@ -251,3 +251,199 @@ class TestMainAuthIntegration:
         # The target URL navigation happens after login
         target_goto = mock_page.goto.call_args_list[0]
         assert "admin/data-quality" in target_goto[0][0]
+
+
+class TestClickFlag:
+    """Tests for the --click and --click-wait flags.
+
+    Mirrors the patching pattern used by TestMainAuthIntegration so the lazy
+    ``from playwright.sync_api import sync_playwright`` inside ``main()``
+    works without playwright installed.
+    """
+
+    def _patch_modules(self, mock_sync_pw_fn: MagicMock) -> dict[str, MagicMock]:
+        mock_sync_api = MagicMock()
+        mock_sync_api.sync_playwright = mock_sync_pw_fn
+        mock_pw_pkg = MagicMock()
+        return {"playwright": mock_pw_pkg, "playwright.sync_api": mock_sync_api}
+
+    def test_click_invokes_query_selector_then_click(self) -> None:
+        """--click <sel> calls query_selector(sel) and then .click() on the result."""
+        from screenshot import main
+
+        test_args = [
+            "screenshot.py",
+            "/rulings",
+            "--click",
+            '[data-testid="queue-ready-count"]',
+        ]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+
+        mock_click_target = MagicMock()
+        mock_page.query_selector.return_value = mock_click_target
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            main()
+
+        mock_page.query_selector.assert_called_once_with(
+            '[data-testid="queue-ready-count"]'
+        )
+        mock_click_target.click.assert_called_once_with()
+
+    def test_click_default_wait_is_500_ms(self) -> None:
+        """Default --click-wait is 500ms; called via page.wait_for_timeout after click."""
+        from screenshot import main
+
+        test_args = ["screenshot.py", "/rulings", "--click", ".btn"]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+        mock_page.query_selector.return_value = MagicMock()
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            main()
+
+        # The default --wait is 3000ms (the existing post-load wait), then 500ms
+        # after the click — both go through page.wait_for_timeout.
+        wait_calls = [c.args[0] for c in mock_page.wait_for_timeout.call_args_list]
+        assert 500 in wait_calls
+
+    def test_click_wait_zero_skips_post_click_wait(self) -> None:
+        """--click-wait 0 must not invoke wait_for_timeout(0) after the click."""
+        from screenshot import main
+
+        test_args = [
+            "screenshot.py",
+            "/rulings",
+            "--click",
+            ".btn",
+            "--click-wait",
+            "0",
+            "--wait",
+            "0",
+        ]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+        mock_page.query_selector.return_value = MagicMock()
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            main()
+
+        # With both --wait 0 and --click-wait 0, no timeout calls fire at all.
+        mock_page.wait_for_timeout.assert_not_called()
+
+    def test_click_wait_custom_value(self) -> None:
+        """--click-wait <N> passes N to page.wait_for_timeout."""
+        from screenshot import main
+
+        test_args = [
+            "screenshot.py",
+            "/rulings",
+            "--click",
+            ".btn",
+            "--click-wait",
+            "1500",
+            "--wait",
+            "0",
+        ]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+        mock_page.query_selector.return_value = MagicMock()
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            main()
+
+        wait_calls = [c.args[0] for c in mock_page.wait_for_timeout.call_args_list]
+        assert wait_calls == [1500]
+
+    def test_click_missing_selector_exits_with_clear_error(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """If the click target is not found, exit non-zero with a one-line error."""
+        from screenshot import main
+
+        test_args = [
+            "screenshot.py",
+            "/rulings",
+            "--click",
+            '[data-testid="does-not-exist"]',
+        ]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+        mock_page.query_selector.return_value = None
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert 'Click target not found: [data-testid="does-not-exist"]' in captured.err
+
+    def test_no_click_flag_skips_click_entirely(self) -> None:
+        """Without --click, neither query_selector nor an extra wait fires."""
+        from screenshot import main
+
+        test_args = ["screenshot.py", "/rulings", "--wait", "0"]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            main()
+
+        # No click means no query_selector for a click target. (--selector
+        # would also call query_selector, but we did not pass it here.)
+        mock_page.query_selector.assert_not_called()
+        # No --click and --wait 0 means no wait_for_timeout calls at all.
+        mock_page.wait_for_timeout.assert_not_called()
+
+    def test_click_runs_after_wait_and_before_screenshot(self) -> None:
+        """Order must be: goto → wait_for_timeout (page wait) → click → wait_for_timeout (click wait) → screenshot."""
+        from screenshot import main
+
+        test_args = ["screenshot.py", "/rulings", "--click", ".btn"]
+        mock_sync_pw_fn, mock_page, _mock_browser = _make_mock_playwright()
+
+        # Build a single mock that records every relevant call so we can
+        # inspect ordering.
+        mock_click_target = MagicMock()
+        mock_page.query_selector.return_value = mock_click_target
+
+        # Use a parent MagicMock to record order across attributes.
+        ordered = MagicMock()
+        ordered.attach_mock(mock_page.goto, "goto")
+        ordered.attach_mock(mock_page.wait_for_timeout, "wait_for_timeout")
+        ordered.attach_mock(mock_page.query_selector, "query_selector")
+        ordered.attach_mock(mock_click_target.click, "click")
+        ordered.attach_mock(mock_page.screenshot, "screenshot")
+
+        with (
+            patch("sys.argv", test_args),
+            patch.dict("sys.modules", self._patch_modules(mock_sync_pw_fn)),
+        ):
+            main()
+
+        names = [c[0] for c in ordered.mock_calls]
+        # Expected sequence (using default --wait 3000 and --click-wait 500):
+        # goto, wait_for_timeout(3000), query_selector(.btn), click(),
+        # wait_for_timeout(500), screenshot(...)
+        assert names == [
+            "goto",
+            "wait_for_timeout",
+            "query_selector",
+            "click",
+            "wait_for_timeout",
+            "screenshot",
+        ]
