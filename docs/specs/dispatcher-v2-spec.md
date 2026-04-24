@@ -278,6 +278,10 @@ Skills read from the input file and write to the output file; neither should dep
 - `scripts/dispatcher/agent-runner-entrypoint.sh` is explicitly `!`-excluded from `deploy-dispatcher.yml` paths so entrypoint changes don't force a daemon redeploy.
 - `infra/terraform/modules/dispatcher-agent-runner/` defines the task-def, IAM role, security group, log group, and ECR repo. Auto-applied on merge by `.github/workflows/terraform.yml`'s `dev-apply` job (#3107).
 
+#### Sizing
+
+Agent-runner sizing matches the subprocess-daemon envelope (4 vCPU / 16 GiB) while subprocess mode remains the default. Can shrink once subprocess is retired and the dispatcher daemon scales down correspondingly. The initial Stage 1b baseline (512 CPU / 1024 MB) pegged memory at 1022/1024 MB for hours and saturated CPU at 509/512 in bursts under real ralph workload (#3153).
+
 #### Debugging a live ECS agent
 
 When an agent-runner task is stuck or behaving unexpectedly and CloudWatch tail doesn't reveal enough, an operator can shell into the running container via ECS Exec (#3145). Prerequisites (all wired in terraform + daemon):

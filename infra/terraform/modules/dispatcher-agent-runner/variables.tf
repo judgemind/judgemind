@@ -30,15 +30,15 @@ variable "image_tag" {
 }
 
 variable "task_cpu" {
-  description = "CPU units for the Fargate task (256 = 0.25 vCPU, 512 = 0.5 vCPU, 1024 = 1 vCPU). Stage 1b baseline is 512; bump to 1024 if smoke says the ralph workload needs more."
+  description = "CPU units for the Fargate task (256 = 0.25 vCPU, 512 = 0.5 vCPU, 1024 = 1 vCPU, 4096 = 4 vCPU). Default is 4096 to match the subprocess-daemon envelope — ralph workload under the 512-baseline saturated CPU at 509/512 for extended bursts (#3153)."
   type        = number
-  default     = 512
+  default     = 4096
 }
 
 variable "task_memory" {
-  description = "Memory (MiB) for the Fargate task. Stage 1b baseline is 1024; bump to 2048 alongside a task_cpu bump."
+  description = "Memory (MiB) for the Fargate task. Default is 16384 (16 GiB) to match the subprocess-daemon envelope — ralph pegged memory at 1022/1024 MB for hours under the 1024-baseline (#3153). Fargate valid pair: 4096 CPU / 16384 MB."
   type        = number
-  default     = 1024
+  default     = 16384
 }
 
 variable "ephemeral_storage_gib" {

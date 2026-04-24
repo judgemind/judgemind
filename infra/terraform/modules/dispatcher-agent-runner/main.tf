@@ -21,8 +21,11 @@
 # - Security group (outbound HTTPS + Postgres, same egress profile as
 #   the daemon so GitHub / Anthropic / Postgres all reach from inside).
 # - ECS task definition ``judgemind-dispatcher-agent-runner-<env>``
-#   wired at CPU=512 / memory=1024 per #3090's Stage 1b baseline. The
-#   issue note allows a bump to 1024 / 2048 if Stage 3 smoke says so.
+#   wired at CPU=4096 / memory=16384 to match the subprocess-daemon
+#   envelope — the sizing ralph was designed against. The initial
+#   Stage 1b baseline (512 / 1024) pegged memory at 1022/1024 MB and
+#   CPU at 509/512 under real ralph workload (#3153); can shrink once
+#   subprocess mode is retired.
 #
 # The security group ID + task-def family are exported so the daemon
 # (Stage 2) can reference them without re-declaring ARNs in the
@@ -248,9 +251,11 @@ resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
 
 # ─── ECS Task Definition ───────────────────────────────────────────────────
 #
-# CPU / memory: 512 / 1024 per #3090 Stage 1b baseline. Can be bumped
-# to 1024 / 2048 in a followup if smoke shows the ralph workload needs
-# more headroom (Fargate CPU/RAM pairing: 512 pairs with 1024-4096).
+# CPU / memory: 4096 / 16384 to match the subprocess-daemon envelope —
+# the sizing ralph was designed against. Earlier Stage 1b baseline
+# (512 / 1024) saturated CPU at 509/512 and memory at 1022/1024 MB under
+# real ralph workload (#3153). Can shrink once subprocess mode is retired
+# and the dispatcher daemon scales down correspondingly.
 #
 # stopTimeout: ECS/Fargate caps stopTimeout at 120 seconds. The #3090
 # issue text mentions "4h" but that's the expected agent lifetime, not
