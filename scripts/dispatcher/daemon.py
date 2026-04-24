@@ -2748,17 +2748,29 @@ class DispatcherDaemon:
 
         - **Per-agent (``payload['agentId']`` present)** — kill just
           that agent: update its ``status`` to ``crashed``, set
-          ``ended_at`` to now(), and SIGKILL the pid if it is local.
-          Does NOT touch ``concurrency_cap`` or any global flag —
-          other in-flight agents and new claims are unaffected.
-          Replaces the former ``force_kill`` command.
+          ``ended_at`` to now(), and signal the underlying runtime:
+          for ``execution_mode='subprocess'`` agents SIGKILL the pid,
+          for ``execution_mode='ecs'`` agents call
+          ``ecs:StopTask(agent_task_arn)`` (#3158). Does NOT touch
+          ``concurrency_cap`` or any global flag — other in-flight
+          agents and new claims are unaffected. Replaces the former
+          ``force_kill`` command.
+
+          Pre-#3158 this method SIGKILLed ``pid`` unconditionally.
+          ECS agents have NULL ``pid`` on the daemon host so the
+          SIGKILL was a no-op and the Fargate task kept running while
+          the DB row read ``crashed`` — a zombie state that could
+          persist for hours until the natural task completion.
         """
         agent_id = payload.get("agentId")
 
         if agent_id:
             # Per-agent force_stop — narrow scope, no global effects.
+            # #3158: SELECT ``execution_mode`` + ``agent_task_arn`` so
+            # the signal-delivery branch below can dispatch on mode.
             cur.execute(
-                "SELECT pid FROM dispatcher.agents WHERE agent_id = %s",
+                "SELECT pid, execution_mode, agent_task_arn "
+                "FROM dispatcher.agents WHERE agent_id = %s",
                 (agent_id,),
             )
             row = cur.fetchone()
@@ -2767,6 +2779,14 @@ class DispatcherDaemon:
                     f"force_stop: agent {agent_id!r} not found in dispatcher.agents"
                 )
             pid = int(row[0]) if row[0] is not None else None
+            raw_mode = row[1] if len(row) > 1 else None
+            mode = (
+                str(raw_mode).lower()
+                if raw_mode is not None
+                else DEFAULT_AGENT_EXECUTION_MODE
+            )
+            raw_arn = row[2] if len(row) > 2 else None
+            task_arn = str(raw_arn) if raw_arn is not None else None
 
             cur.execute(
                 "UPDATE dispatcher.agents "
@@ -2775,7 +2795,16 @@ class DispatcherDaemon:
                 (agent_id,),
             )
 
-            if pid is not None:
+            # #3158: signal-delivery branches on execution_mode.
+            # Subprocess agents: SIGKILL the pid. ECS agents:
+            # ``ecs:StopTask`` the Fargate task. Both branches are
+            # best-effort — the DB row is already flipped, so a
+            # signal failure means the reap tick (_reap_completed_
+            # agent_tasks, or a stuck_timeout sweep post-fix) is the
+            # backstop.
+            if mode == "ecs":
+                self._force_stop_ecs_task(agent_id, task_arn)
+            elif pid is not None:
                 try:
                     os.kill(pid, signal.SIGKILL)
                     self._log.info(
@@ -2801,6 +2830,8 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "pid": pid,
+                    "execution_mode": mode,
+                    "agent_task_arn": task_arn,
                 },
             )
             return
@@ -2844,6 +2875,13 @@ class DispatcherDaemon:
         if not agent_id:
             raise CommandError("retry command missing required payload.agentId")
 
+        # exec-mode-agnostic (#3158): operator-initiated retry read —
+        # ``status/retries_used`` have identical semantics for both
+        # subprocess and ECS agents. Post-#3158 the actual
+        # subprocess-lane pickup (_resume_retrying_agent) filters
+        # execution_mode='ecs' out, so flipping an ECS agent to
+        # 'retrying' here just surfaces a WARNING log per
+        # _warn_on_ecs_retrying_rows until #3168 wires ECS retries.
         cur.execute(
             "SELECT status, retries_used FROM dispatcher.agents WHERE agent_id = %s",
             (agent_id,),
@@ -3441,6 +3479,9 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before checking"
         try:
             with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): concurrency-cap predicate;
+                # ``status='running'`` counts equally for subprocess
+                # and ECS agents — they both consume one cap slot.
                 cur.execute(
                     "SELECT 1 FROM dispatcher.agents WHERE status = 'running' LIMIT 1",
                 )
@@ -4030,6 +4071,9 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before reading"
         try:
             with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): race-lost diagnostic;
+                # both subprocess and ECS agents write ``kind='task'``
+                # and the race classification is identical.
                 cur.execute(
                     "SELECT kind FROM dispatcher.agents "
                     "WHERE issue_number = %s "
@@ -5506,6 +5550,9 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before attempt read"
         try:
             with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): retry-counter read; both
+                # modes increment ``retries_used`` via the same
+                # :meth:`_process_retry_markers` path.
                 cur.execute(
                     "SELECT retries_used FROM dispatcher.agents WHERE agent_id = %s",
                     (agent_id,),
@@ -6625,7 +6672,12 @@ class DispatcherDaemon:
 
     def _update_agent_phase(self, agent_id: str, phase: str) -> None:
         """UPDATE ``dispatcher.agents.phase`` so the scheduler + admin
-        page see where the agent currently sits."""
+        page see where the agent currently sits.
+
+        exec-mode-agnostic (#3158): phase progression write. Daemon-
+        side advances call this; the agent-runner (ECS) writes phase
+        transitions via its own psql client to the same column.
+        """
         assert self._conn is not None, "connect() must run before update"
         try:
             with self._conn.cursor() as cur:
@@ -6677,6 +6729,11 @@ class DispatcherDaemon:
         for the ``succeeded`` branch (``ended_at``, ``failure_summary``
         cleanup, diagnosis outcome write-back, terminal-outcome circuit
         breaker feed) in one UPDATE so the admin row transitions atomically.
+
+        exec-mode-agnostic (#3158): merge-time stamp. PR merge is
+        observed by the daemon's awaiting_ci handler regardless of
+        how the agent wrote the phase; the ``status='succeeded'`` +
+        milestone columns are mode-independent.
         """
         assert self._conn is not None, "connect() must run before update"
         try:
@@ -6767,6 +6824,8 @@ class DispatcherDaemon:
         flipped it to ``succeeded`` at merge. The admin cockpit reads
         both columns and renders the pill color from their combined
         presence.
+
+        exec-mode-agnostic (#3158): milestone stamp; mode-independent.
         """
         assert self._conn is not None, "connect() must run before update"
         try:
@@ -6799,6 +6858,8 @@ class DispatcherDaemon:
         The verify phase later reads this column and no-ops if it's
         non-null, so the admin cockpit can distinguish "shipped + verify
         does not apply" from "shipped + verify failed to run".
+
+        exec-mode-agnostic (#3158): self-deploy flag; mode-independent.
         """
         assert self._conn is not None, "connect() must run before update"
         try:
@@ -6843,6 +6904,8 @@ class DispatcherDaemon:
         back to the pre-#3055 behaviour — the short-circuit is purely
         additive protection. A missing row also returns ``(False,
         False)``.
+
+        exec-mode-agnostic (#3158): milestone-read; mode-independent.
         """
         assert self._conn is not None, "connect() must run before read"
         try:
@@ -6893,6 +6956,9 @@ class DispatcherDaemon:
         state, but not a correctness bug (``merged_at`` is still set
         and the retro / cleanup state-machine can still drive the row
         to completion from there).
+
+        exec-mode-agnostic (#3158): post-merge state restore;
+        mode-independent.
         """
         assert self._conn is not None, "connect() must run before update"
         try:
@@ -6921,7 +6987,10 @@ class DispatcherDaemon:
                 pass
 
     def _read_verify_skip_reason(self, agent_id: str) -> str | None:
-        """Return the current ``verify_skip_reason`` for an agent, or None."""
+        """Return the current ``verify_skip_reason`` for an agent, or None.
+
+        exec-mode-agnostic (#3158): column read; mode-independent.
+        """
         assert self._conn is not None, "connect() must run before read"
         try:
             with self._conn.cursor() as cur:
@@ -6957,6 +7026,8 @@ class DispatcherDaemon:
         Issue #2953. Does NOT touch ``status`` or ``phase`` — those are
         handled by the existing ``_update_agent_phase(PHASE_RETRO_DONE)``
         call. Best-effort; a DB error here cannot unwind the retro work.
+
+        exec-mode-agnostic (#3158): milestone stamp; mode-independent.
         """
         assert self._conn is not None, "connect() must run before update"
         try:
@@ -7430,6 +7501,11 @@ class DispatcherDaemon:
         (written to the same column with richer LLM-authored prose).
         Best-effort — a write failure logs + rolls back but must not
         propagate; the terminal status was already committed.
+
+        exec-mode-agnostic (#3158): admin-cockpit hint write; the
+        same one-liner shape applies to subprocess and ECS agents
+        alike — the column is a pure render-hint derived from
+        ``status`` + ``phase`` + ``exit_code``.
         """
         assert self._conn is not None, "connect() must run before update"
         with self._conn.cursor() as cur:
@@ -7483,6 +7559,17 @@ class DispatcherDaemon:
         teardown, which is fine because those paths are rare edge cases
         and the DB row is already marked terminal (the authoritative
         interlock signal).
+
+        exec-mode-agnostic (#3158): canonical terminal writer — the
+        row transition is the contract. Mode-specific teardown
+        (SIGKILL pid for subprocess, ``ecs:StopTask`` for ECS) is the
+        caller's responsibility when the terminal write is
+        operator-initiated (see :meth:`_handle_force_stop` post-#3158)
+        or diagnoser-initiated (see #3165 follow-up). For
+        the natural-completion call sites (agent-runner writing its
+        own terminal before exit; daemon observing a completed merge),
+        there's nothing to stop — the underlying runtime is already
+        done.
         """
         assert self._conn is not None, "connect() must run before update"
         terminal = status in (
@@ -7906,6 +7993,8 @@ class DispatcherDaemon:
         structured-log ``issue_number`` field is simply serialized as
         JSON null so CloudWatch Log Insights can still filter by
         ``agent_id`` + ``phase``. Issue #3017.
+
+        exec-mode-agnostic (#3158): helper lookup; mode-independent.
         """
         conn = self._conn
         if conn is None:
@@ -8394,9 +8483,27 @@ class DispatcherDaemon:
         ``running``, creates a fresh worktree, and re-runs the
         plan → ralph → summary → PR pipeline.
 
-        Returns True when a retrying agent was picked up (the caller
-        must skip the new-claim path on the same tick). Returns False
-        when no retrying agent exists.
+        **Execution-mode filter (#3158).** The SELECT excludes
+        ``execution_mode = 'ecs'`` rows. The resume path creates a
+        *local* worktree on the daemon host and runs
+        :meth:`_run_orchestration_phases` in-process — the subprocess
+        lane. Pre-#3158 this method picked up ECS-mode rows whenever
+        any path (operator ``retry`` command, budgeted retry of a
+        stuck-timeout that was mis-fired at an ECS row) flipped them
+        to ``retrying``, silently forking the agent from ECS to
+        subprocess. NULL ``execution_mode`` (pre-#3091 migration 41
+        rows) defaults to subprocess via ``COALESCE``.
+
+        When an ECS row is observed in ``status='retrying'``, a
+        ``daemon.agent_ecs_retry_not_supported`` WARNING is emitted
+        once per observation so the operator sees it, and the row is
+        left in ``retrying`` (a follow-up sweep / the operator can
+        move it to terminal). Follow-up #3168 from the #3158 audit
+        tracks adding an ECS-native retry launcher.
+
+        Returns True when a subprocess-mode retrying agent was picked
+        up (the caller must skip the new-claim path on the same tick).
+        Returns False when no subprocess-mode retrying agent exists.
         """
         assert self._conn is not None, "connect() must run before resume"
 
@@ -8407,15 +8514,23 @@ class DispatcherDaemon:
                 # Oldest retrying agent first — FIFO fairness if multiple
                 # ever pile up (shouldn't at concurrency_cap=1 but cheap
                 # to order the right way anyway).
+                # #3158: ``COALESCE(execution_mode, 'subprocess') <> 'ecs'``
+                # excludes ECS-mode rows — see docstring.
                 cur.execute(
                     "SELECT agent_id, issue_number FROM dispatcher.agents "
                     "WHERE status = 'retrying' "
+                    "  AND COALESCE(execution_mode, 'subprocess') <> 'ecs' "
                     "ORDER BY started_at ASC "
                     "LIMIT 1",
                 )
                 row = cur.fetchone()
             self._conn.commit()
             if row is None:
+                # #3158: no subprocess-mode retrying agent. If there
+                # are ECS-mode retrying rows, log a warning so operators
+                # see them — they need manual attention until
+                # #3168 lands an ECS-native retry launcher.
+                self._warn_on_ecs_retrying_rows()
                 return False
             agent_id = str(row[0])
             issue_number = int(row[1]) if row[1] is not None else None
@@ -8515,6 +8630,58 @@ class DispatcherDaemon:
 
         self._run_orchestration_phases(agent_id, issue_number, worktree)
         return True
+
+    def _warn_on_ecs_retrying_rows(self) -> None:
+        """Log a WARNING for any ``status='retrying' execution_mode='ecs'`` rows.
+
+        #3158. The subprocess-lane resume path
+        (:meth:`_resume_retrying_agent`) filters these rows out so it
+        doesn't silently fork an ECS agent to subprocess mode. But the
+        rows still need operator visibility — the ECS retry surface is
+        not yet wired (see audit follow-up #3168), so an ECS row
+        stuck in ``retrying`` is invisible work that will never advance
+        without intervention.
+
+        Best-effort: a DB read failure here logs but does not propagate
+        — the scheduler tick must not stall on this diagnostic.
+        """
+        assert self._conn is not None, "connect() must run before ecs retry check"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, issue_number "
+                    "FROM dispatcher.agents "
+                    "WHERE status = 'retrying' "
+                    "  AND execution_mode = 'ecs' "
+                    "LIMIT 5",
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return
+        for row in rows or []:
+            self._log.warning(
+                "daemon.agent_ecs_retry_not_supported",
+                extra={
+                    "event": "agent_ecs_retry_not_supported",
+                    "run_id": self._run_id,
+                    "agent_id": str(row[0]),
+                    "issue_number": (int(row[1]) if row[1] is not None else None),
+                    "detail": (
+                        "ECS-mode agent in status='retrying'; the "
+                        "subprocess-lane resume path skips these rows "
+                        "(#3158) and the ECS-native retry launcher is "
+                        "not yet wired (audit follow-up #3168). "
+                        "Operator action required: either manually "
+                        "terminate (force_stop + agent/ready relabel) "
+                        "or wait for #3168."
+                    ),
+                },
+            )
 
     def _plan_blocked_comment_already_posted(self, issue_number: int) -> bool | None:
         """Return True if the plan-blocked sentinel comment is already on the issue.
@@ -9224,6 +9391,11 @@ class DispatcherDaemon:
         phase is NOT in :data:`_INFRA_PREEMPTION_CATEGORIES` (i.e. real
         budgeted retries: ``subprocess_crash``, ``stuck_timeout``,
         ``gh_rate_exhausted``, ``operator_retry``).
+
+        exec-mode-agnostic (#3158): failure-history read; the joined
+        ``phase_outputs`` rows are written by whichever runtime ran
+        the phase (daemon subprocess OR agent-runner), and the
+        terminal filter applies uniformly.
 
         Returns an empty list on any DB error (fail-open — the spawn
         continues without prior context).
@@ -11218,6 +11390,19 @@ class DispatcherDaemon:
 
         Cleanup_done / cleanup_blocked are deliberately excluded — they
         are terminal phases with no further advance to perform.
+
+        NOTE (#3158 audit follow-up #3167): this SELECT picks up
+        BOTH subprocess and ECS agents. For ECS agents the agent-
+        runner has its own mechanical stubs for these post-ralph
+        phases, so the daemon's advance handlers can race with the
+        agent-runner. Some advance handlers (``_run_fix_ci``) read
+        the local ``worktree_path`` which doesn't exist for ECS. The
+        fix shape is an architectural decision: either the daemon or
+        the agent-runner owns the post-ralph pipeline. Tracked in
+        #3167 from ``docs/investigations/
+        dispatcher-execution-mode-audit-2026-04.md``. Until then, the
+        race is observed-but-tolerable for the small number of ECS
+        agents in dev.
         """
         assert self._conn is not None, "connect() must run before reading"
 
@@ -11245,6 +11430,14 @@ class DispatcherDaemon:
                 # the other awaiting_* bookkeeping so the merge-phase
                 # handler has the counter in hand without a second
                 # round-trip. See ``_merge_pr_and_advance``.
+                #
+                # exec-mode-agnostic (#3158) — with a caveat: the
+                # SELECT matches BOTH subprocess and ECS agents. ECS
+                # agents in post-ralph phases are simultaneously
+                # advanced by the agent-runner's mechanical stubs,
+                # producing a daemon↔runner race. Tracked as
+                # #3167 in the #3158 audit (architectural decision
+                # needed: who owns the post-ralph pipeline).
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status, "
@@ -12012,6 +12205,9 @@ class DispatcherDaemon:
         supervisor tick re-attempts a second unstick instead of
         classifying as exhausted, which at most burns one extra empty
         commit before the real failure surfaces.
+
+        exec-mode-agnostic (#3158): merge-unstick counter bump;
+        mode-independent (merge is daemon-owned for both modes).
         """
         assert self._conn is not None, "connect() must run before update"
         try:
@@ -12618,7 +12814,11 @@ class DispatcherDaemon:
         )
 
     def _increment_retries_used(self, agent_id: str) -> None:
-        """UPDATE ``dispatcher.agents.retries_used = retries_used + 1``."""
+        """UPDATE ``dispatcher.agents.retries_used = retries_used + 1``.
+
+        exec-mode-agnostic (#3158): retry counter bump; both modes
+        track attempts via the same column.
+        """
         assert self._conn is not None, "connect() must run before update"
         try:
             with self._conn.cursor() as cur:
@@ -13712,7 +13912,11 @@ class DispatcherDaemon:
         return rows
 
     def _fetch_agent_total_duration_s(self, agent_id: str) -> int:
-        """Compute wall-clock seconds since the agent claimed."""
+        """Compute wall-clock seconds since the agent claimed.
+
+        exec-mode-agnostic (#3158): duration is started_at-relative;
+        claim-time stamp applies to both modes.
+        """
         assert self._conn is not None, "connect() must run before reading"
         try:
             with self._conn.cursor() as cur:
@@ -14332,16 +14536,39 @@ class DispatcherDaemon:
         (label-only /task coordination), so no kind-filter is needed
         — the #2903 task-skill guard has been removed.
 
+        **Execution-mode filter (#3158).** The SELECT excludes
+        ``execution_mode = 'ecs'`` rows. The per-phase stuck timer was
+        designed for subprocess-mode agents, whose
+        ``phase_transitions.ts`` is written by the daemon itself — so a
+        stuck subprocess always surfaces as an older MAX(ts). ECS
+        agents run the phase loop inside an independent Fargate task
+        whose lifecycle belongs to ECS, not to the daemon: a truly-hung
+        ECS task is caught by :meth:`_reap_completed_agent_tasks` when
+        ECS transitions the task to STOPPED (container health check,
+        SIGKILL, OOM) and routed via :meth:`_handle_agent_failure` with
+        category ``agent_task_stopped_unexpectedly``. Applying the
+        per-phase timer to an ECS agent is a silent-agent-loss risk:
+        (a) it flips the row to ``crashed`` while the Fargate task
+        keeps running (zombie state), (b) it enqueues a retry marker
+        which :meth:`_resume_retrying_agent` would pick up and
+        silently fork to subprocess mode. NULL ``execution_mode``
+        (pre-#3091 migration 41 rows) defaults to subprocess via
+        ``COALESCE``.
+
         Returns the number of stuck agents flagged this tick (for
         logging). Exceptions are caught per-agent + logged; one bad
         row cannot stall the scan.
         """
         assert self._conn is not None, "connect() must run before stuck check"
 
-        # Candidate rows: every running agent, regardless of elapsed
-        # time. The per-phase threshold comparison happens in Python
-        # so we can consult both the live config override and the
-        # module-level defaults without expressing them as SQL.
+        # Candidate rows: every running subprocess-mode agent,
+        # regardless of elapsed time. The per-phase threshold
+        # comparison happens in Python so we can consult both the live
+        # config override and the module-level defaults without
+        # expressing them as SQL.
+        #
+        # #3158: ``COALESCE(a.execution_mode, 'subprocess') <> 'ecs'``
+        # excludes ECS-mode agents — see method docstring for rationale.
         #
         # Fields: agent_id, issue_number, phase, elapsed_seconds.
         candidates: list[tuple[str, int | None, str | None, float]] = []
@@ -14358,7 +14585,8 @@ class DispatcherDaemon:
                     "    FROM dispatcher.phase_transitions "
                     "    WHERE agent_id = a.agent_id"
                     ") pt ON TRUE "
-                    "WHERE a.status = 'running'",
+                    "WHERE a.status = 'running' "
+                    "  AND COALESCE(a.execution_mode, 'subprocess') <> 'ecs'",
                 )
                 rows = cur.fetchall()
                 for row in rows:
@@ -15111,6 +15339,14 @@ class DispatcherDaemon:
                 # join) preserves the grep-ability of SQL statements
                 # in the daemon, which the fakes in
                 # ``test_daemon_phase3c.py`` rely on.
+                #
+                # exec-mode-agnostic (#3158): the reset itself is
+                # mode-independent — flip to retrying/claiming,
+                # increment counter. The MODE-FORK risk is downstream
+                # in :meth:`_resume_retrying_agent`, which was
+                # hardened in #3158 to filter out ``execution_mode =
+                # 'ecs'`` rows. So even if an ECS agent lands in
+                # retrying here, the subprocess lane won't pick it up.
                 reset_sql = (
                     "UPDATE dispatcher.agents "
                     "SET status = 'retrying', "
@@ -15493,6 +15729,9 @@ class DispatcherDaemon:
         time). Append-only: the ring-buffer semantics come from the
         rolling-window scan in :meth:`_evaluate_circuit_breaker`, not
         from deleting rows on write.
+
+        exec-mode-agnostic (#3158): circuit-breaker feed; a terminal
+        is a terminal regardless of which runtime produced it.
         """
         assert self._conn is not None, "connect() must run before outcome write"
         with self._conn.cursor() as cur:
@@ -16123,6 +16362,11 @@ class DispatcherDaemon:
         empty/null on failure — a stale or missing context is better
         than no diagnosis. The skill's decision-tree defaults to
         ``escalate`` on sparse context.
+
+        exec-mode-agnostic (#3158): diagnoser-context build; the
+        ``worktree_path`` field is read best-effort for the ralph-log
+        lookup, which gracefully degrades to empty string when the
+        path doesn't exist on the daemon host (ECS case).
         """
         assert self._conn is not None, "connect() must run before context build"
 
@@ -18544,6 +18788,80 @@ class DispatcherDaemon:
                 },
             )
 
+    def _force_stop_ecs_task(self, agent_id: str, task_arn: str | None) -> None:
+        """Best-effort ``ecs:StopTask`` for a per-agent Fargate task (#3158).
+
+        Called from :meth:`_handle_force_stop` when the agent has
+        ``execution_mode='ecs'``. Pre-#3158 the per-agent force_stop
+        only SIGKILLed the row's ``pid``, which for ECS agents is NULL
+        on the daemon host — the Fargate task kept running while the
+        DB row read ``crashed``. This helper closes the loop by
+        invoking ``ecs:StopTask`` on the recorded ``agent_task_arn``.
+
+        Best-effort by design:
+        - A missing ``task_arn`` (pre-launch crash, historical row)
+          logs and returns cleanly.
+        - A missing ``ecs_cluster_arn`` config (local dev / tests)
+          logs and returns cleanly.
+        - Any botocore exception (InvalidParameterException for an
+          already-STOPPED task, throttling, transient 5xx) is caught
+          and logged. The DB row is already flipped to ``crashed`` by
+          the caller, so the reap-tick loop (STOPPED →
+          :meth:`_handle_agent_failure`) is the backstop if the stop
+          call failed and the task is still running.
+        """
+        if not task_arn:
+            self._log.info(
+                "daemon.force_stop_ecs_task_no_arn",
+                extra={
+                    "event": "force_stop_ecs_task_no_arn",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            return
+        if not self._cfg.ecs_cluster_arn:
+            self._log.warning(
+                "daemon.force_stop_ecs_task_no_cluster",
+                extra={
+                    "event": "force_stop_ecs_task_no_cluster",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "task_arn": task_arn,
+                },
+            )
+            return
+        try:
+            if self._ecs_client is None:
+                self._ecs_client = self._make_ecs_client()
+            self._ecs_client.stop_task(
+                cluster=self._cfg.ecs_cluster_arn,
+                task=task_arn,
+                reason="operator_force_stop",
+            )
+            self._log.info(
+                "daemon.force_stop_ecs_task_sent",
+                extra={
+                    "event": "force_stop_ecs_task_sent",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "task_arn": task_arn,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — log + swallow
+            # Reset the client so the next call picks up a fresh one.
+            self._ecs_client = None
+            self._log.warning(
+                "daemon.force_stop_ecs_task_failed",
+                extra={
+                    "event": "force_stop_ecs_task_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "task_arn": task_arn,
+                    "detail": str(exc),
+                },
+            )
+
     def _reap_completed_agent_tasks(self) -> dict[str, int]:
         """Observe lifecycle of active per-agent ECS tasks (#3091).
 
@@ -18850,6 +19168,10 @@ class DispatcherDaemon:
         "agent-runner already wrote terminal" from "container died
         before entrypoint finished". Returns ``(None, None)`` on DB
         error — the caller treats that as "assume non-terminal".
+
+        exec-mode-agnostic (#3158): status/phase columns are written
+        by either runtime (subprocess via daemon, ECS via agent-
+        runner); the read is uniform.
         """
         assert self._conn is not None, "connect() must run before read"
         try:
