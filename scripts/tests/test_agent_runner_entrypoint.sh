@@ -652,6 +652,29 @@ else
     pass "phase_outputs INSERT omits nonexistent status column (#3115)"
 fi
 
+# #3219 regression guard — every INSERT into dispatcher.phase_outputs
+# must carry an ``ON CONFLICT (agent_id, phase, attempt) DO UPDATE``
+# clause so a legitimate re-entry (fix_ci → awaiting_ci is the
+# observed path from aa11f02a PR #3217 #2829) doesn't raise a
+# unique-constraint violation that propagates through db_exec's
+# ``-v ON_ERROR_STOP=1`` + ``set -euo pipefail`` and kills the
+# entrypoint (ECS exit 1 → daemon reaps as agent_task_stopped_
+# unexpectedly → PR stranded). The daemon's subprocess-mode
+# ``_persist_phase_output`` already writes the same ON CONFLICT
+# overwrite (daemon.py ~line 5818); this test keeps the entrypoint
+# at parity.
+insert_count=$(grep -c "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
+insert_count=${insert_count:-0}
+on_conflict_count=$(grep "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
+    | grep -c "ON CONFLICT (agent_id, phase, attempt) DO UPDATE" 2>/dev/null || true)
+on_conflict_count=${on_conflict_count:-0}
+if [[ "$insert_count" -gt 0 && "$insert_count" == "$on_conflict_count" ]]; then
+    pass "#3219 — every phase_outputs INSERT carries ON CONFLICT DO UPDATE (inserts=$insert_count)"
+else
+    fail "#3219 — every phase_outputs INSERT carries ON CONFLICT DO UPDATE" \
+         "inserts=$insert_count, with-on-conflict=$on_conflict_count. Sample: $(grep -m1 "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" | head -c 400)"
+fi
+
 # Verify ralph_patches was inserted on ralph SHIP.
 if grep -q "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log"; then
     pass "inserts ralph_patches row on ralph SHIP"
@@ -3429,6 +3452,211 @@ if grep -q "SET phase = \\\\'merge\\\\'" "$INVOCATIONS_DIR/psql.log"; then
 else
     fail "#3200 T39 — fixture D advances to merge on already-merged short-circuit" \
          "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 40: #3219 — persist_phase_output is idempotent on re-entry.
+#
+# Scenario under test: the daemon's subprocess-mode _persist_phase_output
+# uses ON CONFLICT (agent_id, phase, attempt) DO UPDATE, but the Stage 1b
+# entrypoint originally did a plain INSERT. When an ECS agent's CI went
+# red → fix_ci patched → re-entered awaiting_ci, the second
+# persist_phase_output call on the same (agent_id, phase, attempt)
+# tripped the idx_dispatcher_phase_outputs_agent_phase_attempt UNIQUE
+# index, psql exited 1, db_exec's ``-v ON_ERROR_STOP=1`` +
+# ``set -euo pipefail`` killed the entrypoint, ECS marked exit_code=1,
+# and the daemon reaped the agent as ``agent_task_stopped_unexpectedly``
+# with a stranded PR. Observed live on agent aa11f02a PR #3217 #2829
+# at 2026-04-24 14:26:52Z.
+#
+# This test isolates persist_phase_output by extracting just the
+# function definitions it needs (db_exec, log, persist_phase_output)
+# from the entrypoint via sed, then drives it with a psql stub that
+# enforces a real unique-constraint on (agent_id, phase, attempt).
+# If the INSERT lacks ON CONFLICT, the second call fails and
+# propagates exit 1. If ON CONFLICT is present, the second call
+# succeeds and the stored JSON is overwritten with EXCLUDED.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+
+# Extract the function definitions we need. Each function in the
+# entrypoint starts at ``<name>() {`` and ends at the first column-0
+# closing brace on its own line. We pull db_exec, log, and
+# persist_phase_output into a standalone fixture file so we can source
+# and invoke them without running the entrypoint's main loop.
+t40_funcs="$TEST_TMP/t40-funcs.sh"
+# Bootstrap: log() writes to fd 3 which the entrypoint's top-level wires
+# to stdout via ``exec 3>&1``. Reproduce that wiring here so the test
+# subshell doesn't hit "bad file descriptor" when persist_phase_output
+# calls log.
+printf 'exec 3>&1\n' > "$t40_funcs"
+
+# Extract `db_exec() { ... }` — the first brace-balanced block starting
+# at that token. Simple awk state machine: track brace depth from the
+# opening line, emit until depth returns to zero.
+awk '
+    /^db_exec\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t40_funcs"
+
+awk '
+    /^log\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t40_funcs"
+
+awk '
+    /^persist_phase_output\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t40_funcs"
+
+# Sanity: all three definitions extracted.
+for fn in db_exec log persist_phase_output; do
+    if grep -q "^${fn}()" "$t40_funcs"; then
+        pass "#3219 T40 — extracted ${fn} from entrypoint"
+    else
+        fail "#3219 T40 — extracted ${fn} from entrypoint" \
+             "fixture head: $(head -c 300 "$t40_funcs")"
+    fi
+done
+
+# Build a constraint-enforcing psql stub. Tracks (agent_id, phase, attempt)
+# tuples in a state file. Default attempt is 0 (schema default). On a
+# second INSERT for the same tuple:
+#   - If the query contains ``ON CONFLICT ... DO UPDATE``, overwrite the
+#     stored output_json and exit 0.
+#   - Otherwise, emit a realistic postgres unique-violation error and
+#     exit 1 (mirroring the real DB's behavior under
+#     ``-v ON_ERROR_STOP=1``).
+t40_state_dir="$TEST_TMP/t40-state"
+mkdir -p "$t40_state_dir"
+t40_stub_bin="$TEST_TMP/t40-bin"
+mkdir -p "$t40_stub_bin"
+
+cat > "$t40_stub_bin/psql" <<'T40PSQLEOF'
+#!/usr/bin/env bash
+set -u
+# Parse -c <query>.
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) shift; query="$1" ;;
+    esac
+    shift || true
+done
+
+# Only phase_outputs INSERTs matter to this test — everything else is
+# a silent success.
+if [[ "$query" != *"INSERT INTO dispatcher.phase_outputs"* ]]; then
+    exit 0
+fi
+
+# Extract agent_id and phase from the query. The entrypoint formats
+# VALUES as ('<agent_id>', '<phase>', '<output>'::jsonb) — we grep the
+# first two single-quoted tokens after VALUES.
+agent_id=$(printf '%s' "$query" | sed -n "s/.*VALUES[[:space:]]*([[:space:]]*'\\([^']*\\)'.*/\\1/p")
+phase=$(printf '%s' "$query" | sed -n "s/.*VALUES[[:space:]]*('[^']*'[[:space:]]*,[[:space:]]*'\\([^']*\\)'.*/\\1/p")
+# Entrypoint always lets attempt default to 0.
+attempt=0
+key="${agent_id}__${phase}__${attempt}"
+state_file="${T40_STATE_DIR}/${key}.json"
+output_json=$(printf '%s' "$query" \
+    | sed -n "s/.*VALUES[[:space:]]*('[^']*'[[:space:]]*,[[:space:]]*'[^']*'[[:space:]]*,[[:space:]]*'\\(.*\\)'::jsonb.*/\\1/p")
+
+if [[ -f "$state_file" ]]; then
+    # Second INSERT on same (agent_id, phase, attempt). ON CONFLICT
+    # DO UPDATE is the only escape hatch.
+    if [[ "$query" == *"ON CONFLICT (agent_id, phase, attempt) DO UPDATE"* ]]; then
+        printf '%s' "$output_json" > "$state_file"
+        exit 0
+    fi
+    printf 'ERROR:  duplicate key value violates unique constraint "idx_dispatcher_phase_outputs_agent_phase_attempt"\n' >&2
+    printf 'DETAIL:  Key (agent_id, phase, attempt)=(%s, %s, %d) already exists.\n' \
+        "$agent_id" "$phase" "$attempt" >&2
+    exit 1
+fi
+printf '%s' "$output_json" > "$state_file"
+exit 0
+T40PSQLEOF
+chmod +x "$t40_stub_bin/psql"
+
+# Drive persist_phase_output twice on the same (agent_id, phase, attempt=0).
+# Subshell-isolate so `set -euo pipefail` (mirroring the entrypoint)
+# applies only to this test. Capture rc from the second call to prove
+# it did not propagate exit 1.
+set +e
+t40_out=$(T40_STATE_DIR="$t40_state_dir" \
+    PATH="$t40_stub_bin:$PATH" \
+    AGENT_ID="40404040-dead-beef-cafe-000000000001" \
+    DATABASE_URL="postgres://test" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t40_funcs"'"
+        persist_phase_output "awaiting_ci" "{\"rollup_state\": \"red\", \"reason\": \"initial observation\"}"
+        persist_phase_output "awaiting_ci" "{\"rollup_state\": \"red\", \"reason\": \"re-entry after fix_ci\"}"
+        echo "second-call-rc=0"
+    ' 2>&1)
+t40_rc=$?
+set -e
+
+if [[ "$t40_rc" -eq 0 ]]; then
+    pass "#3219 T40 — persist_phase_output succeeds on second call with same (agent_id, phase, attempt)"
+else
+    fail "#3219 T40 — persist_phase_output succeeds on second call with same (agent_id, phase, attempt)" \
+         "rc=$t40_rc, output: $t40_out"
+fi
+
+if printf '%s' "$t40_out" | grep -q "second-call-rc=0"; then
+    pass "#3219 T40 — entrypoint reaches code after the second persist call (no set -e abort)"
+else
+    fail "#3219 T40 — entrypoint reaches code after the second persist call (no set -e abort)" \
+         "output: $t40_out"
+fi
+
+# Verify the stored row has the latest (second-call) output — ON CONFLICT
+# DO UPDATE SET output_json = EXCLUDED.output_json must have overwritten.
+t40_key="40404040-dead-beef-cafe-000000000001__awaiting_ci__0"
+t40_stored="$t40_state_dir/${t40_key}.json"
+if [[ -f "$t40_stored" ]] && grep -q "re-entry after fix_ci" "$t40_stored"; then
+    pass "#3219 T40 — stored phase_outputs row reflects the latest (second-call) payload"
+else
+    fail "#3219 T40 — stored phase_outputs row reflects the latest (second-call) payload" \
+         "stored=$(cat "$t40_stored" 2>/dev/null)"
+fi
+
+# Negative control: confirm the constraint-enforcing psql stub actually
+# rejects a second INSERT when ON CONFLICT is absent. Drives raw SQL
+# through db_exec to prove the stub catches the regression, not the
+# post-fix persist_phase_output implementation.
+t40_neg_state="$TEST_TMP/t40-neg-state"
+mkdir -p "$t40_neg_state"
+set +e
+t40_neg_out=$(T40_STATE_DIR="$t40_neg_state" \
+    PATH="$t40_stub_bin:$PATH" \
+    AGENT_ID="40404040-dead-beef-cafe-000000000002" \
+    DATABASE_URL="postgres://test" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t40_funcs"'"
+        db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
+                 VALUES ('\''40404040-dead-beef-cafe-000000000002'\'', '\''awaiting_ci'\'', '\''{}'\''::jsonb);"
+        db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
+                 VALUES ('\''40404040-dead-beef-cafe-000000000002'\'', '\''awaiting_ci'\'', '\''{}'\''::jsonb);"
+        echo "neg-second-call-rc=0"
+    ' 2>&1)
+t40_neg_rc=$?
+set -e
+
+if [[ "$t40_neg_rc" -ne 0 ]]; then
+    pass "#3219 T40 — constraint-enforcing psql stub rejects duplicate INSERT without ON CONFLICT (negative control)"
+else
+    fail "#3219 T40 — constraint-enforcing psql stub rejects duplicate INSERT without ON CONFLICT (negative control)" \
+         "rc=$t40_neg_rc (expected non-zero), output: $t40_neg_out"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

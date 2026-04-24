@@ -1684,6 +1684,33 @@ persist_phase_output() {
     # stay NULL here; Stage 2 wiring populates them once the daemon-
     # side log-capture path is in place.
     #
+    # #3219 — ON CONFLICT overwrite. The unique index
+    # ``idx_dispatcher_phase_outputs_agent_phase_attempt`` on
+    # ``(agent_id, phase, attempt)`` (migration 30) rejects a second
+    # INSERT on the same three-tuple. Re-entry to a phase is a legitimate
+    # case today — e.g. CI goes red, fix_ci patches, the entrypoint
+    # transitions back to ``awaiting_ci`` and calls persist_phase_output
+    # a second time with the same attempt (the entrypoint does not
+    # bump ``attempt``; retries_used / attempt increments are a daemon-
+    # side concern driven by ``_process_retry_markers``). Without the
+    # ON CONFLICT, the second INSERT raises a unique-constraint
+    # violation, psql exits 1, ``db_exec``'s ``-v ON_ERROR_STOP=1`` +
+    # ``set -euo pipefail`` kill the entrypoint, and the ECS task exits
+    # 1 → daemon marks the agent ``agent_task_stopped_unexpectedly`` →
+    # PR is stranded. The subprocess-mode daemon's
+    # ``_persist_phase_output`` already uses the same ON CONFLICT
+    # overwrite (see ``scripts/dispatcher/daemon.py`` ~line 5818), so
+    # this brings the entrypoint to parity.
+    #
+    # We intentionally overwrite rather than bumping ``attempt`` —
+    # the entrypoint has no access to the retry-counter state the
+    # daemon tracks, and a simple overwrite keeps re-entry idempotent
+    # without leaking any new semantics. The tradeoff is that fix_ci
+    # → awaiting_ci re-entry loses the prior awaiting_ci payload
+    # (typically a ``ci_red`` observation that prompted fix_ci); the
+    # ralph_patches table + the daemon-side fix_ci phase_output row
+    # preserve that history.
+    #
     # Default-substitute to an empty-object string if $2 is absent.
     # We spell the default in two stages rather than
     # ``${2:-{}}`` because bash's ``${param:-word}`` parser treats a
@@ -1697,7 +1724,10 @@ persist_phase_output() {
     fi
     _escaped=$(printf '%s' "$_output_json" | sed "s/'/''/g")
     db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
-             VALUES ('$AGENT_ID', '$_phase', '$_escaped'::jsonb);"
+             VALUES ('$AGENT_ID', '$_phase', '$_escaped'::jsonb)
+             ON CONFLICT (agent_id, phase, attempt) DO UPDATE
+               SET output_json = EXCLUDED.output_json,
+                   ts = now();"
     log "phase_output_persisted" "phase=$_phase"
 }
 
@@ -2464,11 +2494,24 @@ agent_runner_reaped_failure() {
         "category=$_category" \
         "reason=$_reason"
     _escaped_reason=$(printf '%s' "$_reason" | sed "s/'/''/g")
+    # #3219 — ON CONFLICT overwrite. See persist_phase_output for the
+    # full rationale; the short version is that the unique index
+    # ``idx_dispatcher_phase_outputs_agent_phase_attempt`` rejects a
+    # second INSERT on the same (agent_id, phase, attempt) three-tuple.
+    # The failure path can legitimately be reached with an existing
+    # phase_outputs row (e.g. awaiting_ci observed ``ci_red`` then the
+    # reaper fires on an unrecoverable branch). The ``|| true`` below
+    # masked the crash already, but without ON CONFLICT the failure
+    # payload simply wasn't persisted — operators lost the reaper's
+    # category + reason context on re-entry.
     db_exec "INSERT INTO dispatcher.phase_outputs
                (agent_id, phase, output_json)
              VALUES
                ('$AGENT_ID', '$_term_phase',
-                '{\"category\": \"$_category\", \"reason\": \"$_escaped_reason\"}'::jsonb);" \
+                '{\"category\": \"$_category\", \"reason\": \"$_escaped_reason\"}'::jsonb)
+             ON CONFLICT (agent_id, phase, attempt) DO UPDATE
+               SET output_json = EXCLUDED.output_json,
+                   ts = now();" \
         >/dev/null 2>&1 || true
     db_exec "UPDATE dispatcher.agents
                 SET phase = '$_term_phase', status = 'failed'
