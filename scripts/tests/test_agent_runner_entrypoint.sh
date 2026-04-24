@@ -132,6 +132,17 @@ case "$query" in
         fi
         exit 0
         ;;
+    *"SELECT pr_number"*"FROM dispatcher.agents"*)
+        # #3176 — post-PR handlers read pr_number from the agent row.
+        # Default 9999 matches the gh stub's canonical PR URL.
+        printf '%s\n' "${PR_NUMBER_FIXTURE:-9999}"
+        exit 0
+        ;;
+    *"SELECT COALESCE(merge_unstick_attempts"*|*"SELECT merge_unstick_attempts"*)
+        # #3176 — handle_merge's auto-unstick budget check.
+        printf '%s\n' "${MERGE_UNSTICK_ATTEMPTS_FIXTURE:-0}"
+        exit 0
+        ;;
     *"SELECT patch_content"*)
         if [[ -f "${PRIOR_PATCH_FIXTURE:-}" ]]; then
             cat "$PRIOR_PATCH_FIXTURE"
@@ -344,6 +355,25 @@ case "$subcommand" in
         # Honor GIT_PUSH_EXIT to simulate push failures.
         exit "${GIT_PUSH_EXIT:-0}"
         ;;
+    fetch)
+        # `git fetch origin main` — #3176 push_and_pr pre-push rebase.
+        exit "${GIT_FETCH_EXIT:-0}"
+        ;;
+    rebase)
+        # `git rebase origin/main` — #3176 push_and_pr pre-push rebase.
+        # `git rebase --abort` — #3176 conflict-abort on failed rebase.
+        for _arg in "$@"; do
+            if [[ "$_arg" == "--abort" ]]; then
+                exit 0
+            fi
+        done
+        exit "${GIT_REBASE_EXIT:-0}"
+        ;;
+    commit)
+        # `git commit --amend -F <file>` — #3176 summary amend.
+        # `git commit --allow-empty -m <msg>` — #3176 stale-rollup unstick.
+        exit "${GIT_COMMIT_EXIT:-0}"
+        ;;
     *)
         exit 0
         ;;
@@ -352,6 +382,20 @@ GITEOF
 chmod +x "$STUB_BIN/git"
 
 # ── gh stub ────────────────────────────────────────────────────────────────
+#
+# Supports the subcommands the entrypoint calls:
+#   * ``gh pr create`` — prints a PR URL, honours GH_PR_CREATE_EXIT.
+#   * ``gh pr view <N> --json ...`` — prints JSON from
+#     ``$GH_PR_VIEW_JSON_FIXTURE`` (defaults to a green rollup with a
+#     merged commit SHA of ``deadbeefcafe`` so the happy-path pipeline
+#     can merge + deploy without a fixture override).
+#   * ``gh pr merge`` — honours ``GH_PR_MERGE_EXIT`` (default 0). When
+#     ``GH_PR_MERGE_STDERR`` is non-empty, emits that text to stderr
+#     (used to simulate the #2641/#3163 stale-rollup rejection).
+#   * ``gh run list`` — prints the JSON array from
+#     ``$GH_RUN_LIST_JSON_FIXTURE`` (defaults to ``[]`` = no deploy
+#     workflows fired, so the entrypoint's awaiting_deploy "none"
+#     branch advances to verify).
 
 cat > "$STUB_BIN/gh" <<'GHEOF'
 #!/usr/bin/env bash
@@ -359,20 +403,67 @@ set -u
 INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 . "$(dirname "$0")/_record_invocation.sh" gh "$@"
 
-# Simulate `gh pr create` outcomes based on GH_PR_CREATE_EXIT.
+# Find the first two positional args (subcommand + verb, e.g. pr create).
 sub=""
+verb=""
 for arg in "$@"; do
-    if [[ "$sub" == "" && "$arg" != --* && "$arg" != -* ]]; then
+    case "$arg" in
+        --*|-*) continue ;;
+    esac
+    if [[ -z "$sub" ]]; then
         sub="$arg"
         continue
     fi
-    if [[ -n "$sub" && "$sub" == "pr" && "$arg" != --* && "$arg" != -* ]]; then
-        if [[ "$arg" == "create" ]]; then
-            printf 'https://github.com/judgemind/judgemind/pull/9999\n'
-            exit "${GH_PR_CREATE_EXIT:-0}"
-        fi
+    if [[ -z "$verb" ]]; then
+        verb="$arg"
+        break
     fi
 done
+
+case "$sub $verb" in
+    "pr create")
+        printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+        exit "${GH_PR_CREATE_EXIT:-0}"
+        ;;
+    "pr view")
+        if [[ -n "${GH_PR_VIEW_JSON_FIXTURE:-}" && -f "${GH_PR_VIEW_JSON_FIXTURE:-}" ]]; then
+            cat "$GH_PR_VIEW_JSON_FIXTURE"
+        else
+            # Default: green rollup, mergeable, with a merge SHA so
+            # happy-path tests can traverse awaiting_ci → merge →
+            # awaiting_deploy without fixture overrides.
+            cat <<'JSONEOF'
+{
+  "statusCheckRollup": [
+    {"name": "ci-passed", "status": "COMPLETED", "conclusion": "SUCCESS"}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": {"oid": "deadbeefcafe"}
+}
+JSONEOF
+        fi
+        exit 0
+        ;;
+    "pr merge")
+        if [[ -n "${GH_PR_MERGE_STDERR:-}" ]]; then
+            printf '%s\n' "$GH_PR_MERGE_STDERR" >&2
+        fi
+        exit "${GH_PR_MERGE_EXIT:-0}"
+        ;;
+    "run list")
+        if [[ -n "${GH_RUN_LIST_JSON_FIXTURE:-}" && -f "${GH_RUN_LIST_JSON_FIXTURE:-}" ]]; then
+            cat "$GH_RUN_LIST_JSON_FIXTURE"
+        else
+            printf '[]\n'
+        fi
+        exit "${GH_RUN_LIST_EXIT:-0}"
+        ;;
+    "auth login"|"auth setup-git")
+        exit 0
+        ;;
+esac
 
 exit 0
 GHEOF
@@ -1530,20 +1621,34 @@ else
          "expected file not found: $SHIM_PY"
 fi
 
-# Extend the gh stub with richer routes for the Stage 2 fetches:
+# Extend the gh stub with richer routes for the Stage 2 fetches and the
+# #3176 post-PR mechanical phases:
 #   * ``gh issue view <N> --json ...``    → read $GH_ISSUE_FIXTURE
-#   * ``gh pr view <N> --json ...``       → read $GH_PR_FIXTURE
+#   * ``gh pr view <N> --json ...``       → read $GH_PR_FIXTURE (shim
+#                                           tests) OR #3176
+#                                           $GH_PR_VIEW_JSON_FIXTURE
+#                                           (post-PR tests) — falls
+#                                           back to a canonical green
+#                                           rollup when neither is set.
 #   * ``gh pr diff <N>``                  → read $GH_PR_DIFF_FIXTURE
+#   * ``gh pr create``                    → honour GH_PR_CREATE_EXIT
+#                                           (defaults to 0, printing a
+#                                           canonical PR URL).
+#   * ``gh pr merge``                     → honour GH_PR_MERGE_EXIT +
+#                                           GH_PR_MERGE_STDERR (#3176).
 #   * ``gh run view --log-failed --job``  → read $GH_RUN_LOG_FIXTURE
 #   * ``gh run list --commit <sha>``      → read $GH_RUN_LIST_FIXTURE
+#                                           (shim tests) OR #3176
+#                                           $GH_RUN_LIST_JSON_FIXTURE
+#                                           (post-PR tests) — falls
+#                                           back to ``[]``.
 cat > "$STUB_BIN/gh" <<'GHEOF'
 #!/usr/bin/env bash
 set -u
 INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 . "$(dirname "$0")/_record_invocation.sh" gh "$@"
 
-# Parse subcommand chain: ``gh issue view`` or ``gh pr view`` or
-# ``gh run view`` / ``gh run list`` — anything else is a no-op success.
+# Parse subcommand chain.
 if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
     if [[ -n "${GH_ISSUE_FIXTURE:-}" && -f "$GH_ISSUE_FIXTURE" ]]; then
         cat "$GH_ISSUE_FIXTURE"
@@ -1553,11 +1658,30 @@ if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+    # Shim-test fixture (Stage 2) first, then #3176 post-PR fixture,
+    # then a canonical green-rollup fallback so happy-path tests can
+    # traverse awaiting_ci → merge → awaiting_deploy without setting
+    # any fixture at all.
     if [[ -n "${GH_PR_FIXTURE:-}" && -f "$GH_PR_FIXTURE" ]]; then
         cat "$GH_PR_FIXTURE"
         exit 0
     fi
-    exit 1
+    if [[ -n "${GH_PR_VIEW_JSON_FIXTURE:-}" && -f "$GH_PR_VIEW_JSON_FIXTURE" ]]; then
+        cat "$GH_PR_VIEW_JSON_FIXTURE"
+        exit 0
+    fi
+    cat <<'JSONEOF'
+{
+  "statusCheckRollup": [
+    {"name": "ci-passed", "status": "COMPLETED", "conclusion": "SUCCESS"}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": {"oid": "deadbeefcafe"}
+}
+JSONEOF
+    exit 0
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "diff" ]]; then
@@ -1566,6 +1690,14 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "diff" ]]; then
         exit 0
     fi
     exit 1
+fi
+
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+    # #3176: handle_merge calls ``gh pr merge <N> --squash --delete-branch``.
+    if [[ -n "${GH_PR_MERGE_STDERR:-}" ]]; then
+        printf '%s\n' "$GH_PR_MERGE_STDERR" >&2
+    fi
+    exit "${GH_PR_MERGE_EXIT:-0}"
 fi
 
 if [[ "${1:-}" == "run" && "${2:-}" == "view" ]]; then
@@ -1577,11 +1709,19 @@ if [[ "${1:-}" == "run" && "${2:-}" == "view" ]]; then
 fi
 
 if [[ "${1:-}" == "run" && "${2:-}" == "list" ]]; then
+    # Shim-test fixture (Stage 2) first, then #3176 post-PR fixture,
+    # then empty array fallback so awaiting_deploy's "no runs → verify"
+    # branch lights up without fixture setup.
     if [[ -n "${GH_RUN_LIST_FIXTURE:-}" && -f "$GH_RUN_LIST_FIXTURE" ]]; then
         cat "$GH_RUN_LIST_FIXTURE"
         exit 0
     fi
-    exit 1
+    if [[ -n "${GH_RUN_LIST_JSON_FIXTURE:-}" && -f "$GH_RUN_LIST_JSON_FIXTURE" ]]; then
+        cat "$GH_RUN_LIST_JSON_FIXTURE"
+        exit 0
+    fi
+    printf '[]\n'
+    exit "${GH_RUN_LIST_EXIT:-0}"
 fi
 
 # Legacy route kept for push_and_pr tests.
@@ -1629,6 +1769,16 @@ case "$query" in
         if [[ -f "${PHASE_FIXTURE_FILE:-}" ]]; then
             head -n 1 "$PHASE_FIXTURE_FILE"
         fi
+        exit 0
+        ;;
+    *"SELECT pr_number"*"FROM dispatcher.agents"*)
+        # #3176 — post-PR handlers read pr_number from the agent row.
+        printf '%s\n' "${PR_NUMBER_FIXTURE:-9999}"
+        exit 0
+        ;;
+    *"SELECT COALESCE(merge_unstick_attempts"*|*"SELECT merge_unstick_attempts"*)
+        # #3176 — handle_merge's auto-unstick budget check.
+        printf '%s\n' "${MERGE_UNSTICK_ATTEMPTS_FIXTURE:-0}"
         exit 0
         ;;
     *"SELECT COALESCE(pr_number"*"FROM dispatcher.agents"*)
@@ -2592,6 +2742,444 @@ if grep -q "INSERT INTO dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log"; t
          "psql log: $(cat "$INVOCATIONS_DIR/psql.log")"
 else
     pass "#3144 T27 — no INSERT when SELECT-exists guard fires"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# #3176 — real implementations for awaiting_ci / merge / awaiting_deploy.
+# Each test starts at the phase under test and drives one iteration.
+#
+# Shared helper — runs the entrypoint with the env vars the post-PR
+# handlers need (0-second polls so timeouts + happy-paths finish
+# instantly against the stubbed gh/psql).
+# ══════════════════════════════════════════════════════════════════════════
+
+run_post_pr_phase() {
+    # $1 = starting phase (awaiting_ci | merge | awaiting_deploy)
+    # $2 = workspace dir
+    # Remaining args are `VAR=VAL` tokens exported for the run.
+    _rpp_start_phase="$1"
+    _rpp_workspace="$2"
+    shift 2
+    mkdir -p "$_rpp_workspace"
+
+    set +e
+    (
+        export AGENT_ID="fe28f05f-0000-0000-0000-000000003176"
+        export ISSUE_NUMBER="3176"
+        export DATABASE_URL="postgres://test"
+        export GITHUB_TOKEN=""
+        export AGENT_WORKSPACE="$_rpp_workspace"
+        export REPO_URL="https://example.invalid/repo.git"
+        export PATH="$STUB_BIN:$PATH"
+        export INVOCATIONS_DIR="$INVOCATIONS_DIR"
+        export PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher"
+        export PHASE_TRANSITIONS_PARENT="$REPO_ROOT"
+        export AGENT_RUNNER_MAX_PHASE_ITERATIONS=10
+        # Poll every 0 seconds so any while-loop exits immediately;
+        # timeouts are 0 too so tests can drive the timeout branch.
+        export AGENT_RUNNER_CI_POLL_INTERVAL=0
+        export AGENT_RUNNER_DEPLOY_POLL_INTERVAL=0
+        export AGENT_RUNNER_DEPLOY_GRACE_SECONDS="${AGENT_RUNNER_DEPLOY_GRACE_SECONDS:-0}"
+        for _tok in "$@"; do
+            export "$_tok"
+        done
+        bash "$ENTRYPOINT" 2>&1
+    )
+    _rpp_rc=$?
+    set -e
+    return $_rpp_rc
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 28: awaiting_ci + green rollup → advances to merge.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t28.txt"
+printf 'awaiting_ci\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t28_workspace="$TEST_TMP/t28-workspace"
+set +e
+t28_out=$(run_post_pr_phase "awaiting_ci" "$t28_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999")
+set -e
+
+if printf '%s' "$t28_out" | grep -q '"rollup_state": "green"'; then
+    pass "#3176 T28 — awaiting_ci green rollup classified"
+else
+    fail "#3176 T28 — awaiting_ci green rollup classified" \
+         "out tail: $(printf '%s' "$t28_out" | tail -c 500)"
+fi
+
+# awaiting_ci green → advances to merge, which then runs (loop) to
+# awaiting_deploy. We assert SET phase = 'merge' appears.
+if grep -q "SET phase = \\\\'merge\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3176 T28 — awaiting_ci advances to merge on green"
+else
+    fail "#3176 T28 — awaiting_ci advances to merge on green" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 29: awaiting_ci + red rollup → advances to fix_ci (NOT merge).
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t29.txt"
+printf 'awaiting_ci\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+# Write a red-rollup fixture.
+t29_pr_view="$TEST_TMP/t29-pr-view.json"
+cat > "$t29_pr_view" <<'EOF'
+{
+  "statusCheckRollup": [
+    {"name": "ci-passed", "status": "COMPLETED", "conclusion": "FAILURE"}
+  ],
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "headRefOid": "deadbeefcafe",
+  "mergeCommit": null
+}
+EOF
+
+t29_workspace="$TEST_TMP/t29-workspace"
+set +e
+t29_out=$(run_post_pr_phase "awaiting_ci" "$t29_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_PR_VIEW_JSON_FIXTURE=$t29_pr_view" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t29_out" | grep -q '"rollup_state": "red"'; then
+    pass "#3176 T29 — awaiting_ci red rollup classified"
+else
+    fail "#3176 T29 — awaiting_ci red rollup classified" \
+         "out tail: $(printf '%s' "$t29_out" | tail -c 500)"
+fi
+
+if grep -q "SET phase = \\\\'fix_ci\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3176 T29 — awaiting_ci advances to fix_ci on red"
+else
+    fail "#3176 T29 — awaiting_ci advances to fix_ci on red" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# Verify merge was NOT invoked — red rollup must not trigger a merge.
+# We filter the gh log for lines containing `pr merge`.
+if grep -F "pr merge" "$INVOCATIONS_DIR/gh.log" >/dev/null 2>&1; then
+    fail "#3176 T29 — no gh pr merge invoked on red CI" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+else
+    pass "#3176 T29 — no gh pr merge invoked on red CI"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 30: merge stale-rollup → auto-unstick (empty commit + push) and
+# phase stays at awaiting_ci for next poll.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t30.txt"
+printf 'merge\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t30_workspace="$TEST_TMP/t30-workspace"
+set +e
+t30_out=$(run_post_pr_phase "merge" "$t30_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "MERGE_UNSTICK_ATTEMPTS_FIXTURE=0" \
+    "GH_PR_MERGE_EXIT=1" \
+    "GH_PR_MERGE_STDERR=error: base branch policy prohibits the merge" \
+    "GIT_REV_LIST_COUNT=1")
+set -e
+
+if printf '%s' "$t30_out" | grep -q "merge_stale_rollup_detected"; then
+    pass "#3176 T30 — merge stale-rollup detected"
+else
+    fail "#3176 T30 — merge stale-rollup detected" \
+         "out tail: $(printf '%s' "$t30_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t30_out" | grep -q "merge_auto_unstick_empty_commit_pushed"; then
+    pass "#3176 T30 — auto-unstick empty-commit push succeeded"
+else
+    fail "#3176 T30 — auto-unstick empty-commit push succeeded" \
+         "out tail: $(printf '%s' "$t30_out" | tail -c 500)"
+fi
+
+# Phase bounces back to awaiting_ci for the next poll.
+if grep -q "SET phase = \\\\'awaiting_ci\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3176 T30 — stale-rollup unstick returns phase to awaiting_ci"
+else
+    fail "#3176 T30 — stale-rollup unstick returns phase to awaiting_ci" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 31: merge stale-rollup with budget exhausted → terminal failure,
+# no additional empty commit attempted.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t31.txt"
+printf 'merge\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t31_workspace="$TEST_TMP/t31-workspace"
+set +e
+t31_out=$(run_post_pr_phase "merge" "$t31_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "MERGE_UNSTICK_ATTEMPTS_FIXTURE=1" \
+    "GH_PR_MERGE_EXIT=1" \
+    "GH_PR_MERGE_STDERR=error: base branch policy prohibits the merge")
+set -e
+
+if printf '%s' "$t31_out" | grep -q "merge_unstick_exhausted"; then
+    pass "#3176 T31 — merge unstick exhausted logged"
+else
+    fail "#3176 T31 — merge unstick exhausted logged" \
+         "out tail: $(printf '%s' "$t31_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t31_out" | grep -q "agent_runner_reaped_failure"; then
+    pass "#3176 T31 — agent_runner_reaped_failure emitted"
+else
+    fail "#3176 T31 — agent_runner_reaped_failure emitted" \
+         "out tail: $(printf '%s' "$t31_out" | tail -c 500)"
+fi
+
+# Phase advances to merge_failed (terminal).
+_t31_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t31_final" == "merge_failed" ]]; then
+    pass "#3176 T31 — phase terminates at merge_failed"
+else
+    fail "#3176 T31 — phase terminates at merge_failed" \
+         "actual final phase: $_t31_final"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 32: awaiting_deploy with no deploy workflows fired → short-grace
+# advance to verify.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t32.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+# Empty runs list → classify as "none" → awaiting_deploy advances to
+# verify after the grace window elapses. Grace window set to 0 so we
+# don't need to wait.
+t32_runs="$TEST_TMP/t32-runs.json"
+printf '[]\n' > "$t32_runs"
+
+t32_workspace="$TEST_TMP/t32-workspace"
+set +e
+t32_out=$(run_post_pr_phase "awaiting_deploy" "$t32_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t32_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0")
+set -e
+
+if printf '%s' "$t32_out" | grep -q "awaiting_deploy_no_runs"; then
+    pass "#3176 T32 — awaiting_deploy no-runs branch hit"
+else
+    fail "#3176 T32 — awaiting_deploy no-runs branch hit" \
+         "out tail: $(printf '%s' "$t32_out" | tail -c 500)"
+fi
+
+if grep -q "SET phase = \\\\'verify\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3176 T32 — awaiting_deploy no-runs advances to verify"
+else
+    fail "#3176 T32 — awaiting_deploy no-runs advances to verify" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 33: awaiting_deploy timeout → terminal failure.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t33.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+# Pending runs → classify as "pending" forever. Timeout=0 forces the
+# first-tick timeout branch.
+t33_runs="$TEST_TMP/t33-runs.json"
+cat > "$t33_runs" <<'EOF'
+[
+  {"databaseId": 1, "workflowName": "Deploy Dispatcher", "status": "IN_PROGRESS", "conclusion": null, "createdAt": "2026-04-23T00:00:00Z"}
+]
+EOF
+
+t33_workspace="$TEST_TMP/t33-workspace"
+set +e
+t33_out=$(run_post_pr_phase "awaiting_deploy" "$t33_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t33_runs" \
+    "AGENT_RUNNER_AWAITING_DEPLOY_TIMEOUT_SECONDS=0" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+if printf '%s' "$t33_out" | grep -q "awaiting_deploy_timeout"; then
+    pass "#3176 T33 — awaiting_deploy timeout logged"
+else
+    fail "#3176 T33 — awaiting_deploy timeout logged" \
+         "out tail: $(printf '%s' "$t33_out" | tail -c 500)"
+fi
+
+_t33_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t33_final" == "awaiting_deploy_timeout" ]]; then
+    pass "#3176 T33 — phase terminates at awaiting_deploy_timeout"
+else
+    fail "#3176 T33 — phase terminates at awaiting_deploy_timeout" \
+         "actual final phase: $_t33_final"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 34: push_and_pr reads summary.json for pr_title/pr_body_md and
+# commit_message; persists pr_number after successful PR create.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t34.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t34_workspace="$TEST_TMP/t34-workspace"
+mkdir -p "$t34_workspace/repo/tmp/dispatcher-output"
+cat > "$t34_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(agent-runner): real post-PR handlers (#3176)\n\nCloses #3176",
+  "pr_title": "feat(agent-runner): real post-PR handlers (#3176)",
+  "pr_body_md": "## Summary\nReal impls of awaiting_ci / merge / awaiting_deploy.\n\n## Test plan\n- [x] unit tests\n"
+}
+EOF
+
+set +e
+t34_out=$(run_post_pr_phase "push_and_pr" "$t34_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+# Summary output was read.
+if printf '%s' "$t34_out" | grep -q "push_and_pr_summary_output_read"; then
+    pass "#3176 T34 — push_and_pr reads tmp/dispatcher-output/summary.json"
+else
+    fail "#3176 T34 — push_and_pr reads tmp/dispatcher-output/summary.json" \
+         "out tail: $(printf '%s' "$t34_out" | tail -c 500)"
+fi
+
+# git commit --amend was invoked with -F.
+if grep -F "commit --amend -F" "$INVOCATIONS_DIR/git.log" >/dev/null 2>&1 \
+   || grep -F "commit" "$INVOCATIONS_DIR/git.log" | grep -F "amend" >/dev/null 2>&1; then
+    pass "#3176 T34 — push_and_pr amends commit with summary's commit_message"
+else
+    fail "#3176 T34 — push_and_pr amends commit with summary's commit_message" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+fi
+
+# git fetch origin main was invoked (pre-push rebase).
+if grep -F "fetch" "$INVOCATIONS_DIR/git.log" | grep -F "origin" | grep -F "main" >/dev/null 2>&1; then
+    pass "#3176 T34 — push_and_pr fetches origin/main pre-push"
+else
+    fail "#3176 T34 — push_and_pr fetches origin/main pre-push" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+fi
+
+# git rebase origin/main was invoked.
+if grep -F "rebase" "$INVOCATIONS_DIR/git.log" | grep -F "origin/main" >/dev/null 2>&1; then
+    pass "#3176 T34 — push_and_pr rebases on origin/main pre-push"
+else
+    fail "#3176 T34 — push_and_pr rebases on origin/main pre-push" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+fi
+
+# gh pr create was invoked with --title + --body-file, NOT --fill.
+if grep -F "pr" "$INVOCATIONS_DIR/gh.log" | grep -F "create" | grep -F -- "--title" >/dev/null 2>&1; then
+    pass "#3176 T34 — push_and_pr passes --title to gh pr create"
+else
+    fail "#3176 T34 — push_and_pr passes --title to gh pr create" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+fi
+
+if grep -F "pr" "$INVOCATIONS_DIR/gh.log" | grep -F "create" | grep -F -- "--body-file" >/dev/null 2>&1; then
+    pass "#3176 T34 — push_and_pr passes --body-file to gh pr create"
+else
+    fail "#3176 T34 — push_and_pr passes --body-file to gh pr create" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+fi
+
+# pr_number parsed + UPDATEd on the agent row.
+if printf '%s' "$t34_out" | grep -q "push_and_pr_pr_number_persisted"; then
+    pass "#3176 T34 — push_and_pr persists pr_number on the agent row"
+else
+    fail "#3176 T34 — push_and_pr persists pr_number on the agent row" \
+         "out tail: $(printf '%s' "$t34_out" | tail -c 500)"
+fi
+
+if grep -F "SET pr_number = 9999" "$INVOCATIONS_DIR/psql.log" >/dev/null 2>&1; then
+    pass "#3176 T34 — psql UPDATE dispatcher.agents SET pr_number = 9999"
+else
+    fail "#3176 T34 — psql UPDATE dispatcher.agents SET pr_number = 9999" \
+         "psql log sample: $(grep -m1 "SET pr_number" "$INVOCATIONS_DIR/psql.log" | head -c 200)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 35: push_and_pr rebase conflict → fail cleanly, no push attempted.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t35.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t35_workspace="$TEST_TMP/t35-workspace"
+mkdir -p "$t35_workspace"
+
+# The git stub needs to return non-zero on rebase. The only way to
+# condition the stub is via env var — add GIT_REBASE_EXIT.
+set +e
+t35_out=$(run_post_pr_phase "push_and_pr" "$t35_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "GIT_REBASE_EXIT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t35_out" | grep -q "push_and_pr_rebase_conflict"; then
+    pass "#3176 T35 — rebase conflict emits push_and_pr_rebase_conflict"
+else
+    fail "#3176 T35 — rebase conflict emits push_and_pr_rebase_conflict" \
+         "out tail: $(printf '%s' "$t35_out" | tail -c 500)"
+fi
+
+# No push attempted.
+if grep -F "push" "$INVOCATIONS_DIR/git.log" | grep -F "origin" | grep -v "fetch" | grep -v "rebase" >/dev/null 2>&1; then
+    fail "#3176 T35 — no push attempted on rebase conflict" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+else
+    pass "#3176 T35 — no push attempted on rebase conflict"
+fi
+
+# git rebase --abort was invoked to restore the worktree.
+if grep -F "rebase" "$INVOCATIONS_DIR/git.log" | grep -F "abort" >/dev/null 2>&1; then
+    pass "#3176 T35 — rebase conflict triggers git rebase --abort"
+else
+    fail "#3176 T35 — rebase conflict triggers git rebase --abort" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

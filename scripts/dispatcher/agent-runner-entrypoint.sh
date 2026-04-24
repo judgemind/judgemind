@@ -40,13 +40,16 @@
 #      immediately to `planning`. The daemon has already written the
 #      agent row by the time this task boots, so the claim step is
 #      nothing but a lifecycle marker.
-#   3. **Mechanical phases with side effects** — `push_and_pr` has a
-#      minimal in-process implementation (`handle_push_and_pr` ==
-#      `git push` + `gh pr create`). `awaiting_ci`, `merge`,
-#      `awaiting_deploy`, `retro`, and `setup` are stubbed: they
-#      advance to the documented "next" phase on the happy path so
-#      the smoke test can reach `done` without a full daemon
-#      integration. Stage 2 fleshes each stub out.
+#   3. **Mechanical phases with side effects** — `push_and_pr`,
+#      `awaiting_ci`, `merge`, and `awaiting_deploy` have in-process
+#      implementations mirroring the subprocess daemon's
+#      ``_push_and_open_pr`` / ``_advance_awaiting_ci`` /
+#      ``_merge_pr_and_advance`` / ``_advance_awaiting_deploy``. These
+#      are the critical post-ralph output-actions — without them an
+#      ECS agent opens a PR and then races through the remaining
+#      mechanical phases with stubs, abandoning the PR (see #3176).
+#      `retro` and `setup` remain stubbed on this path; Stage 3+
+#      wires them.
 #
 # The phase → skill-name mapping (`phase_to_skill`) is explicit and
 # dies on an unknown phase. Prior to #3117 the entrypoint constructed
@@ -1682,30 +1685,48 @@ persist_phase_output() {
 }
 
 handle_push_and_pr() {
-    # Mechanical implementation of the push_and_pr phase (#3117).
+    # Mechanical implementation of the push_and_pr phase (#3117, #3176).
     #
     # This phase is NOT claude-driven — the daemon handles push + PR
-    # creation inline today via `_handle_phase_push_and_pr` (daemon.py
-    # ~L10544). Prior to this fix the entrypoint's phase-dispatch case
-    # lumped `push_and_pr` in with the claude-driven branches and
-    # called `/task-v2-push_and_pr`, which returned "Unknown command"
-    # (the skill does not exist).
+    # creation inline today via ``_push_and_open_pr`` in daemon.py. This
+    # handler mirrors that flow for ECS-mode agents:
     #
-    # Stage 1b scope: the minimal viable push + PR, enough to get the
-    # smoke to exercise the phase boundary. Rich failure handling
-    # (commit --amend with the summary phase's commit_message, self-
-    # deploy detection, unmet-AC draft-PR, git_push_failed diagnoser
-    # routing) stays in the daemon's implementation and lands on the
-    # agent-runner side in a later Stage 2 PR.
+    #   1. #3039 no-op guardrail: if ``origin/main..HEAD`` is empty
+    #      (ralph SHIP with clean tree), emit ``{"no_op": true}`` and
+    #      let the transition shim flip the agent to ``succeeded``.
+    #   2. #3176 pre-push rebase: ``git fetch origin main`` then
+    #      ``git rebase origin/main`` so a stale branch tip doesn't
+    #      produce a CONFLICTING PR the moment main advances. Rebase
+    #      conflict → fail cleanly with ``push_failed: true`` so the
+    #      transition falls through to the unrecognized branch.
+    #   3. #3176 summary amend: read ``commit_message`` from
+    #      ``tmp/dispatcher-output/summary.json`` and
+    #      ``git commit --amend -F <file>`` to replace ralph's
+    #      placeholder ``"WIP: ralph output"`` commit with the
+    #      conventional-commits message produced by the summary skill.
+    #      Missing / unreadable summary output → fall through with the
+    #      existing ralph commit untouched (still produces a PR, just
+    #      without the rich title/body — subprocess mode raises this
+    #      as a PR_OUTPUT_MISSING failure; the entrypoint is intentionally
+    #      more tolerant so a partial summary doesn't abandon the PR).
+    #   4. Push the branch.
+    #   5. #3176 summary title/body: if ``summary.json`` provided
+    #      ``pr_title`` + ``pr_body_md``, pass them via
+    #      ``gh pr create --title "$T" --body-file <path>``. Otherwise
+    #      fall back to ``--fill`` (prior behaviour).
+    #   6. #3176 record pr_number: parse the PR number out of
+    #      ``gh pr create`` stdout and ``UPDATE dispatcher.agents
+    #      SET pr_number = $N`` so the green-counting audit sees the
+    #      PR linkage.
     #
     # Prints the phase-output JSON envelope on stdout so the caller
     # can persist it via persist_phase_output and drive the transition
-    # shim. Output shape matches `transition_from_push_and_pr`:
+    # shim. Output shape matches ``transition_from_push_and_pr``:
     #   {"no_op": true}   → terminal success (no commit to push)
     #   {"no_op": false}  → advance to awaiting_ci
     #
-    # Note: if `AGENT_RUNNER_DRY_RUN=1`, emit `{"no_op": true}` so the
-    # loop reaches a terminal phase without actually shelling out.
+    # Note: if ``AGENT_RUNNER_DRY_RUN=1``, emit ``{"no_op": true}`` so
+    # the loop reaches a terminal phase without actually shelling out.
 
     if [[ "$AGENT_RUNNER_DRY_RUN" == "1" ]]; then
         log "push_and_pr_dry_run"
@@ -1714,14 +1735,98 @@ handle_push_and_pr() {
     fi
 
     # Detect the #3039 no-op-SHIP guardrail: ralph's SHIP with a clean
-    # working tree means `origin/main..HEAD` is empty — there's nothing
-    # to push and no PR to open. Terminate as no_op so the transition
-    # shim flips the agent to `succeeded`.
+    # working tree means ``origin/main..HEAD`` is empty — there's
+    # nothing to push and no PR to open. Terminate as no_op so the
+    # transition shim flips the agent to ``succeeded``.
     _ahead_count=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
     if [[ "$_ahead_count" == "0" ]]; then
         log "push_and_pr_no_op" "reason=clean_worktree_on_ship"
         printf '{"no_op": true}'
         return 0
+    fi
+
+    # ── #3176: read summary skill output from dispatcher-output/ ──────
+    _summary_path="$REPO_ROOT/tmp/dispatcher-output/summary.json"
+    _pr_title=""
+    _pr_body_md=""
+    _commit_message=""
+    if [[ -s "$_summary_path" ]]; then
+        _pr_title=$(jq -r '.pr_title // ""' "$_summary_path" 2>/dev/null || printf '')
+        _pr_body_md=$(jq -r '.pr_body_md // ""' "$_summary_path" 2>/dev/null || printf '')
+        _commit_message=$(jq -r '.commit_message // ""' "$_summary_path" 2>/dev/null || printf '')
+        log "push_and_pr_summary_output_read" \
+            "has_title=$([[ -n "$_pr_title" ]] && printf 'true' || printf 'false')" \
+            "has_body=$([[ -n "$_pr_body_md" ]] && printf 'true' || printf 'false')" \
+            "has_commit=$([[ -n "$_commit_message" ]] && printf 'true' || printf 'false')"
+    else
+        log "push_and_pr_summary_output_missing" "path=$_summary_path"
+    fi
+
+    # ── #3176: amend ralph's placeholder commit with summary's
+    # conventional-commits message. Mirrors the daemon's
+    # ``git commit --amend -F <file>`` — see daemon.py ~L10914.
+    if [[ -n "$_commit_message" ]]; then
+        _commit_msg_path="$AGENT_WORKSPACE/commit_msg.txt"
+        printf '%s' "$_commit_message" > "$_commit_msg_path"
+        log "push_and_pr_commit_amend_begin"
+        set +e
+        git -C "$REPO_ROOT" commit --amend -F "$_commit_msg_path" \
+            > "$AGENT_WORKSPACE/git-commit-amend.stdout.log" \
+            2> "$AGENT_WORKSPACE/git-commit-amend.stderr.log"
+        _amend_rc=$?
+        set -e
+        log "push_and_pr_commit_amend_done" "exit_code=$_amend_rc"
+        if [[ "$_amend_rc" -ne 0 ]]; then
+            # Non-fatal: log + continue with ralph's original commit.
+            # A pre-push hook rejection is the common real-world
+            # failure here; proceeding with the unamended commit is
+            # a strictly better outcome than abandoning the PR.
+            log "push_and_pr_commit_amend_failed" "exit_code=$_amend_rc"
+        fi
+    fi
+
+    # ── #3176: pre-push rebase so we don't push a CONFLICTING branch.
+    # Mirrors the daemon-side behaviour (``git fetch origin main`` +
+    # ``git rebase origin/main``). On rebase conflict, abort and fail
+    # cleanly — the transition shim routes to the unrecognized branch
+    # and the agent terminates without opening an orphan PR.
+    log "push_and_pr_fetch_main_begin"
+    set +e
+    git -C "$REPO_ROOT" fetch origin main \
+        > "$AGENT_WORKSPACE/git-fetch-main.stdout.log" \
+        2> "$AGENT_WORKSPACE/git-fetch-main.stderr.log"
+    _fetch_rc=$?
+    set -e
+    log "push_and_pr_fetch_main_done" "exit_code=$_fetch_rc"
+    if [[ "$_fetch_rc" -eq 0 ]]; then
+        log "push_and_pr_rebase_begin"
+        set +e
+        git -C "$REPO_ROOT" rebase origin/main \
+            > "$AGENT_WORKSPACE/git-rebase.stdout.log" \
+            2> "$AGENT_WORKSPACE/git-rebase.stderr.log"
+        _rebase_rc=$?
+        set -e
+        log "push_and_pr_rebase_done" "exit_code=$_rebase_rc"
+        if [[ "$_rebase_rc" -ne 0 ]]; then
+            # Rebase conflict. Abort the in-progress rebase so the
+            # worktree returns to its pre-rebase state, log the
+            # failure, and emit the structured envelope.
+            set +e
+            git -C "$REPO_ROOT" rebase --abort \
+                > "$AGENT_WORKSPACE/git-rebase-abort.stdout.log" \
+                2> "$AGENT_WORKSPACE/git-rebase-abort.stderr.log"
+            set -e
+            log "push_and_pr_rebase_conflict" "exit_code=$_rebase_rc"
+            printf '{"no_op": false, "rebase_failed": true}'
+            return 0
+        fi
+    else
+        # Fetch failure is best-effort — the push below will fail with
+        # a network error we route through push_failed if it's a real
+        # network outage. A transient local-only fetch failure still
+        # lets the push succeed against whatever ``origin/main`` was
+        # at clone time.
+        log "push_and_pr_fetch_main_failed" "exit_code=$_fetch_rc"
     fi
 
     log "push_and_pr_push_begin" "branch=$BRANCH_NAME"
@@ -1740,20 +1845,33 @@ handle_push_and_pr() {
         return 0
     fi
 
-    # Open the PR against main. `gh pr create` auto-picks the current
-    # branch as head and --base main. The title comes from the last
-    # commit subject on the branch (Stage 2 will plumb the summary
-    # phase's pr_title through here; Stage 1b keeps it minimal).
+    # ── #3176: open the PR with summary's pr_title + pr_body_md when
+    # available. Fall back to ``--fill`` so a missing summary still
+    # produces a PR (degraded but not abandoned).
     log "push_and_pr_pr_create_begin"
+    _pr_body_path="$AGENT_WORKSPACE/pr_body.md"
     set +e
-    gh pr create \
-        --repo judgemind/judgemind \
-        --base main \
-        --head "$BRANCH_NAME" \
-        --fill \
-        > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
-        2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
-    _pr_rc=$?
+    if [[ -n "$_pr_title" && -n "$_pr_body_md" ]]; then
+        printf '%s' "$_pr_body_md" > "$_pr_body_path"
+        gh pr create \
+            --repo judgemind/judgemind \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --title "$_pr_title" \
+            --body-file "$_pr_body_path" \
+            > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
+            2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
+        _pr_rc=$?
+    else
+        gh pr create \
+            --repo judgemind/judgemind \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --fill \
+            > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
+            2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
+        _pr_rc=$?
+    fi
     set -e
     log "push_and_pr_pr_create_done" "exit_code=$_pr_rc"
     if [[ "$_pr_rc" -ne 0 ]]; then
@@ -1762,6 +1880,34 @@ handle_push_and_pr() {
         return 0
     fi
 
+    # ── #3176: parse PR number from ``gh pr create`` stdout and record
+    # on the agent row. ``gh pr create`` prints the PR URL on the last
+    # non-empty line: https://github.com/judgemind/judgemind/pull/<N>.
+    _pr_url=$(tail -n 20 "$AGENT_WORKSPACE/gh-pr-create.stdout.log" 2>/dev/null \
+        | grep -Eo 'https://github\.com/[^ ]+/pull/[0-9]+' \
+        | tail -n 1 \
+        || printf '')
+    _pr_number=""
+    if [[ -n "$_pr_url" ]]; then
+        _pr_number=$(printf '%s' "$_pr_url" | sed -E 's|.*/pull/([0-9]+).*|\1|')
+    fi
+    if [[ -n "$_pr_number" && "$_pr_number" =~ ^[0-9]+$ ]]; then
+        log "push_and_pr_pr_number_parsed" "pr_number=$_pr_number" "pr_url=$_pr_url"
+        # Best-effort — a DB failure here shouldn't abandon an
+        # already-opened PR. Mirrors daemon's pr_number write (daemon.py
+        # ~L11316, ``_mark_agent_terminal(..., pr_number=pr_number)``).
+        if ! db_exec "UPDATE dispatcher.agents
+                         SET pr_number = $_pr_number
+                       WHERE agent_id = '$AGENT_ID';" 2>/dev/null; then
+            log "push_and_pr_pr_number_persist_failed" "pr_number=$_pr_number"
+        else
+            log "push_and_pr_pr_number_persisted" "pr_number=$_pr_number"
+        fi
+        printf '{"no_op": false, "pr_number": %s}' "$_pr_number"
+        return 0
+    fi
+
+    log "push_and_pr_pr_number_parse_failed" "stdout_tail=$(tail -c 200 "$AGENT_WORKSPACE/gh-pr-create.stdout.log" 2>/dev/null | tr '\n' ' ')"
     printf '{"no_op": false}'
 }
 
@@ -2110,6 +2256,579 @@ mark_ended() {
     log "agent_ended"
 }
 
+# ── Post-PR mechanical phase handlers (#3176) ──────────────────────────────
+#
+# The subprocess-path daemon implements `awaiting_ci`, `merge`, and
+# `awaiting_deploy` inline via `_advance_awaiting_ci`,
+# `_merge_pr_and_advance`, and `_advance_awaiting_deploy` in daemon.py.
+# For ECS mode these were previously no-op stubs that raced through the
+# phase boundary in ~1s, producing orphan PRs. These handlers bring the
+# ECS entrypoint to parity: poll CI, merge on green, watch deploy
+# workflows, advance to verify.
+#
+# Design notes
+# ------------
+# * Each handler runs inside the per-agent Fargate task's ~2h wall
+#   time budget (``AGENT_RUNNER_*_TIMEOUT_SECONDS`` caps the polling so
+#   a stuck CI/deploy can't consume the whole budget).
+# * Polling uses foreground ``sleep`` (no backgrounded subshells) — the
+#   agent-runner container is single-purpose so blocking is fine.
+# * All polling intervals + timeouts are env-overridable so tests can
+#   run them with 0/1-second cadence against stubbed binaries.
+# * These handlers are distinct from the `run_claude_phase` flow; they
+#   do NOT call ``transition_for`` — the phase transition is
+#   hand-coded based on the observed outcome (green/red/merged/
+#   deploy_success/…) because `next_phase_from_verdict` is only wired
+#   for the verdict-driven (claude) phases, per phase_transitions.py
+#   comment "callers handle them explicitly because the input shape
+#   differs".
+
+# How often to re-poll PR status (CI + deploy). Defaults match the
+# subprocess daemon's supervisor tick (120s). Tests override to 0/1.
+CI_POLL_INTERVAL="${AGENT_RUNNER_CI_POLL_INTERVAL:-60}"
+DEPLOY_POLL_INTERVAL="${AGENT_RUNNER_DEPLOY_POLL_INTERVAL:-60}"
+
+# Hard timeouts. `awaiting_ci` = 60m matches the 60-min CI-watch ceiling
+# the subprocess daemon's scheduler enforces in practice. `awaiting_
+# deploy` = 30m matches deploy workflows' worst-case runtime.
+AWAITING_CI_TIMEOUT_SECONDS="${AGENT_RUNNER_AWAITING_CI_TIMEOUT_SECONDS:-3600}"
+AWAITING_DEPLOY_TIMEOUT_SECONDS="${AGENT_RUNNER_AWAITING_DEPLOY_TIMEOUT_SECONDS:-1800}"
+
+# Short grace period before declaring "no deploy workflows fired" on
+# the merge SHA. Deploy workflow triggers are eventually-consistent on
+# GitHub's side; a poll immediately after merge can see zero runs even
+# for a code PR that will deploy. Subprocess daemon works around this
+# by re-polling each supervisor tick; we mirror with a bounded grace.
+DEPLOY_GRACE_SECONDS="${AGENT_RUNNER_DEPLOY_GRACE_SECONDS:-90}"
+
+# Max attempts to auto-unstick a merge stale-rollup rejection (#3163).
+# Matches ``MERGE_UNSTICK_MAX_ATTEMPTS`` in daemon.py.
+MERGE_UNSTICK_MAX_ATTEMPTS="${AGENT_RUNNER_MERGE_UNSTICK_MAX_ATTEMPTS:-1}"
+
+# Stderr substring that indicates the #2641/#3163 stale-rollup branch-
+# protection rejection. Matches ``STALE_ROLLUP_STDERR_MARKER`` in
+# daemon.py.
+STALE_ROLLUP_MARKER="base branch policy prohibits the merge"
+
+# Deploy workflow filenames we watch on the merge SHA. Mirrors the
+# ``DEPLOY_WORKFLOW_NAMES`` frozenset in daemon.py (which reads
+# ``workflowName``); the entrypoint queries by workflow-file path
+# instead (``--workflow <file>.yml``) because bash stubs can match
+# file names more reliably than display names.
+DEPLOY_WORKFLOWS="${AGENT_RUNNER_DEPLOY_WORKFLOWS:-deploy-api.yml deploy-dispatcher.yml deploy-scraper.yml deploy-production.yml deploy-production-web.yml terraform.yml}"
+
+read_pr_number() {
+    # Query ``dispatcher.agents.pr_number`` for the current agent.
+    # Returns an empty string if NULL / missing (db_query_one emits
+    # the empty field for a NULL column with ``-At``).
+    db_query_one "SELECT pr_number
+                    FROM dispatcher.agents
+                   WHERE agent_id = '$AGENT_ID'
+                   LIMIT 1;"
+}
+
+classify_pr_rollup() {
+    # $1 = path to ``gh pr view --json ... ,statusCheckRollup,mergeable,
+    # mergeStateStatus`` stdout. Prints one of: green / red / pending /
+    # error. Mirrors ``_ci_rollup_state`` in phase_transitions.py so
+    # the ECS path uses the same merge gate as subprocess mode.
+    _status_file="$1"
+    if [[ ! -s "$_status_file" ]]; then
+        printf 'error'
+        return 0
+    fi
+    # Classify via a jq program rather than parsing in bash — keeps the
+    # logic declarative and bash-3.2 friendly.
+    _state=$(jq -r '
+        def classify:
+            (.statusCheckRollup // []) as $rollup
+            | ($rollup | map(select(type == "object"))) as $checks
+            | ([$checks[]
+                | (.status // "" | ascii_upcase) as $st
+                | (.conclusion // "" | ascii_upcase) as $co
+                | if $st == "COMPLETED" then
+                      if ($co == "FAILURE" or $co == "CANCELLED"
+                          or $co == "TIMED_OUT" or $co == "ACTION_REQUIRED"
+                          or $co == "STARTUP_FAILURE") then "red"
+                      elif ($co == "SUCCESS" or $co == "SKIPPED"
+                            or $co == "NEUTRAL" or $co == "STALE") then "ok"
+                      else "red" end
+                  else "pending" end]) as $outcomes
+            | if ($outcomes | index("red")) then "red"
+              elif ($outcomes | index("pending")) then "pending"
+              else
+                (.mergeable // "" | ascii_upcase) as $m
+                | (.mergeStateStatus // "" | ascii_upcase) as $ms
+                | if ($m == "MERGEABLE" and $ms == "CLEAN") then "green"
+                  else "pending" end
+              end;
+        classify
+    ' "$_status_file" 2>/dev/null || printf 'error')
+    if [[ -z "$_state" ]]; then
+        printf 'error'
+    else
+        printf '%s' "$_state"
+    fi
+}
+
+classify_deploy_runs() {
+    # $1 = path to ``gh run list --json status,conclusion,...`` stdout.
+    # Prints one of: success / failure / pending / none. Matches
+    # ``_classify_deploy_runs`` in daemon.py. ``none`` means no
+    # matching deploy runs — caller treats as "no deploy applicable".
+    _runs_file="$1"
+    if [[ ! -s "$_runs_file" ]]; then
+        printf 'none'
+        return 0
+    fi
+    _state=$(jq -r '
+        def classify:
+            if (type != "array" or length == 0) then "none"
+            else
+              ([.[]
+                | (.status // "" | ascii_upcase) as $st
+                | (.conclusion // "" | ascii_upcase) as $co
+                | if $st != "COMPLETED" then "pending"
+                  elif ($co == "SUCCESS" or $co == "SKIPPED" or $co == "NEUTRAL") then "ok"
+                  else "failure" end]) as $outcomes
+              | if ($outcomes | index("pending")) then "pending"
+                elif ($outcomes | index("failure")) then "failure"
+                else "success" end
+            end;
+        classify
+    ' "$_runs_file" 2>/dev/null || printf 'none')
+    if [[ -z "$_state" ]]; then
+        printf 'none'
+    else
+        printf '%s' "$_state"
+    fi
+}
+
+agent_runner_reaped_failure() {
+    # $1 = terminal phase (e.g. ``awaiting_ci_timeout``).
+    # $2 = category label (used only in the log line).
+    # $3 = stderr tail / reason (truncated to 200 chars).
+    #
+    # Mirrors the subprocess-daemon's ``_handle_agent_failure`` enough
+    # to drive an ECS agent to a terminal row: emit a structured log
+    # event, persist a phase_outputs row describing the failure, and
+    # UPDATE the agent row to ``status='failed' phase=$1``. Called
+    # from handle_awaiting_ci / handle_merge / handle_awaiting_deploy
+    # on their respective unrecoverable branches.
+    _term_phase="$1"
+    _category="$2"
+    _reason=$(printf '%s' "${3:-}" | head -c 200 | tr '\n' ' ')
+    log "agent_runner_reaped_failure" \
+        "terminal_phase=$_term_phase" \
+        "category=$_category" \
+        "reason=$_reason"
+    _escaped_reason=$(printf '%s' "$_reason" | sed "s/'/''/g")
+    db_exec "INSERT INTO dispatcher.phase_outputs
+               (agent_id, phase, output_json)
+             VALUES
+               ('$AGENT_ID', '$_term_phase',
+                '{\"category\": \"$_category\", \"reason\": \"$_escaped_reason\"}'::jsonb);" \
+        >/dev/null 2>&1 || true
+    db_exec "UPDATE dispatcher.agents
+                SET phase = '$_term_phase', status = 'failed'
+              WHERE agent_id = '$AGENT_ID';"
+    log "phase_advanced" "next_phase=$_term_phase" "status=failed"
+}
+
+fetch_pr_status() {
+    # $1 = pr_number. Writes the JSON response from
+    # ``gh pr view <N> --json statusCheckRollup,mergeable,
+    # mergeStateStatus,headRefOid,mergeCommit`` to
+    # ``$AGENT_WORKSPACE/pr-status.json`` and returns 0 on success,
+    # non-zero on gh failure. The caller reads the file.
+    _pr_num="$1"
+    _out_file="$AGENT_WORKSPACE/pr-status.json"
+    set +e
+    gh pr view "$_pr_num" \
+        --repo judgemind/judgemind \
+        --json statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit \
+        > "$_out_file" \
+        2> "$AGENT_WORKSPACE/gh-pr-view.stderr.log"
+    _gh_rc=$?
+    set -e
+    return $_gh_rc
+}
+
+handle_awaiting_ci() {
+    # Poll the PR's combined check rollup every CI_POLL_INTERVAL
+    # seconds until it classifies as green/red or the hard timeout
+    # elapses.
+    #
+    # Outcomes:
+    #   green → advance to ``merge`` (caller transitions).
+    #   red   → advance to ``fix_ci`` (Stage 2 will wire the fix-ci
+    #           skill; for now the dispatch case lets it route to the
+    #           claude-driven branch naturally).
+    #   timeout → agent_runner_reaped_failure + terminal
+    #             ``awaiting_ci_timeout``, agent exits.
+    log "awaiting_ci_begin"
+    _pr_number=$(read_pr_number)
+    log "awaiting_ci_pr_number_read" "pr_number=$_pr_number"
+    if [[ -z "$_pr_number" ]]; then
+        agent_runner_reaped_failure "awaiting_ci_failed" "missing_pr" "pr_number NULL on agent row"
+        printf '{"missing_pr": true}'
+        return 0
+    fi
+
+    _start_ts=$(date -u +%s)
+    _last_state=""
+    _poll_count=0
+    _max_polls="${AGENT_RUNNER_CI_MAX_POLLS:-100}"
+    while true; do
+        _poll_count=$((_poll_count + 1))
+        if [[ "$_poll_count" -gt "$_max_polls" ]]; then
+            log "awaiting_ci_max_polls_hit" "pr_number=$_pr_number" "poll_count=$_poll_count"
+            agent_runner_reaped_failure \
+                "awaiting_ci_timeout" \
+                "ci_max_polls" \
+                "pr=$_pr_number poll_count=$_poll_count last_state=$_last_state"
+            printf '{"timeout": true, "pr_number": %s, "max_polls": %s}' \
+                "$_pr_number" "$_poll_count"
+            return 0
+        fi
+        if fetch_pr_status "$_pr_number"; then
+            _state=$(classify_pr_rollup "$AGENT_WORKSPACE/pr-status.json")
+            _fetch_rc=0
+        else
+            _state="error"
+            _fetch_rc=1
+        fi
+        log "awaiting_ci_poll" "pr_number=$_pr_number" "rollup_state=$_state" "fetch_rc=$_fetch_rc"
+        if [[ "$_state" == "green" ]]; then
+            printf '{"rollup_state": "green", "pr_number": %s}' "$_pr_number"
+            return 0
+        fi
+        if [[ "$_state" == "red" ]]; then
+            printf '{"rollup_state": "red", "pr_number": %s}' "$_pr_number"
+            return 0
+        fi
+        # pending / error — keep polling until timeout.
+        _last_state="$_state"
+        _now_ts=$(date -u +%s)
+        _elapsed=$((_now_ts - _start_ts))
+        if [[ "$_elapsed" -ge "$AWAITING_CI_TIMEOUT_SECONDS" ]]; then
+            log "awaiting_ci_timeout" \
+                "pr_number=$_pr_number" \
+                "elapsed_s=$_elapsed" \
+                "last_state=$_last_state"
+            agent_runner_reaped_failure \
+                "awaiting_ci_timeout" \
+                "ci_timeout" \
+                "elapsed_s=$_elapsed last_state=$_last_state pr=$_pr_number"
+            printf '{"timeout": true, "pr_number": %s, "elapsed_s": %s}' \
+                "$_pr_number" "$_elapsed"
+            return 0
+        fi
+        sleep "$CI_POLL_INTERVAL"
+    done
+}
+
+extract_merge_sha() {
+    # Pull ``mergeCommit.oid`` from the current pr-status.json. Empty
+    # string if absent.
+    _status_file="$AGENT_WORKSPACE/pr-status.json"
+    if [[ ! -s "$_status_file" ]]; then
+        printf ''
+        return 0
+    fi
+    jq -r '.mergeCommit.oid // ""' "$_status_file" 2>/dev/null || printf ''
+}
+
+read_merge_unstick_attempts() {
+    # Column was added by the daemon's migration for #2641. Returns 0
+    # if the column is missing (older dev DB snapshots).
+    _val=$(db_query_one "SELECT COALESCE(merge_unstick_attempts, 0)
+                            FROM dispatcher.agents
+                           WHERE agent_id = '$AGENT_ID'
+                           LIMIT 1;" 2>/dev/null || printf '')
+    if [[ -z "$_val" ]] || ! [[ "$_val" =~ ^[0-9]+$ ]]; then
+        printf '0'
+    else
+        printf '%s' "$_val"
+    fi
+}
+
+increment_merge_unstick_attempts() {
+    # Best-effort; a lost increment at most burns one extra unstick
+    # before the daemon's ``FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED``
+    # path classifies the agent terminal.
+    db_exec "UPDATE dispatcher.agents
+                SET merge_unstick_attempts = COALESCE(merge_unstick_attempts, 0) + 1
+              WHERE agent_id = '$AGENT_ID';" \
+        >/dev/null 2>&1 || true
+}
+
+try_auto_unstick_merge() {
+    # Port of ``_try_auto_unstick_merge`` in daemon.py. Push an empty
+    # commit to the PR branch so GitHub re-evaluates the
+    # statusCheckRollup on a fresh SHA. Budget = MERGE_UNSTICK_MAX_
+    # ATTEMPTS. On exhaustion, route through agent_runner_reaped_
+    # failure and return 1 so the caller knows not to retry merge.
+    _pr_num="$1"
+    _attempts=$(read_merge_unstick_attempts)
+    log "merge_stale_rollup_detected" \
+        "pr_number=$_pr_num" \
+        "attempts_so_far=$_attempts"
+    if [[ "$_attempts" -ge "$MERGE_UNSTICK_MAX_ATTEMPTS" ]]; then
+        log "merge_unstick_exhausted" \
+            "pr_number=$_pr_num" \
+            "attempts_so_far=$_attempts"
+        agent_runner_reaped_failure \
+            "merge_failed" \
+            "merge_unstick_exhausted" \
+            "pr=$_pr_num attempts=$_attempts"
+        return 1
+    fi
+    log "merge_unstick_empty_commit_begin"
+    set +e
+    git -C "$REPO_ROOT" commit --allow-empty \
+        -m "ci: force fresh rollup evaluation (stale-ci-passed unstick, #2641)" \
+        > "$AGENT_WORKSPACE/merge-unstick-commit.stdout.log" \
+        2> "$AGENT_WORKSPACE/merge-unstick-commit.stderr.log"
+    _commit_rc=$?
+    set -e
+    if [[ "$_commit_rc" -ne 0 ]]; then
+        log "merge_unstick_commit_failed" "exit_code=$_commit_rc"
+        agent_runner_reaped_failure \
+            "merge_failed" \
+            "merge_unstick_exhausted" \
+            "pr=$_pr_num empty_commit_nonzero_exit=$_commit_rc"
+        return 1
+    fi
+    set +e
+    git -C "$REPO_ROOT" push origin "$BRANCH_NAME" \
+        > "$AGENT_WORKSPACE/merge-unstick-push.stdout.log" \
+        2> "$AGENT_WORKSPACE/merge-unstick-push.stderr.log"
+    _push_rc=$?
+    set -e
+    if [[ "$_push_rc" -ne 0 ]]; then
+        log "merge_unstick_push_failed" "exit_code=$_push_rc"
+        agent_runner_reaped_failure \
+            "merge_failed" \
+            "merge_unstick_exhausted" \
+            "pr=$_pr_num empty_commit_push_nonzero_exit=$_push_rc"
+        return 1
+    fi
+    increment_merge_unstick_attempts
+    log "merge_auto_unstick_empty_commit_pushed" \
+        "pr_number=$_pr_num" \
+        "new_attempts=$((_attempts + 1))"
+    return 0
+}
+
+handle_merge() {
+    # Squash-merge the PR with branch-delete. On stale-rollup stderr,
+    # attempt one auto-unstick (push empty commit, go back to
+    # awaiting_ci); on any other non-zero, route to
+    # agent_runner_reaped_failure. On success, record merge SHA and
+    # advance to awaiting_deploy.
+
+    _pr_number=$(read_pr_number)
+    if [[ -z "$_pr_number" ]]; then
+        agent_runner_reaped_failure "merge_failed" "missing_pr" "pr_number NULL on agent row"
+        printf '{"missing_pr": true}'
+        return 0
+    fi
+
+    log "merge_begin" "pr_number=$_pr_number"
+    set +e
+    gh pr merge "$_pr_number" \
+        --repo judgemind/judgemind \
+        --squash \
+        --delete-branch \
+        > "$AGENT_WORKSPACE/gh-pr-merge.stdout.log" \
+        2> "$AGENT_WORKSPACE/gh-pr-merge.stderr.log"
+    _merge_rc=$?
+    set -e
+    log "merge_done" "pr_number=$_pr_number" "exit_code=$_merge_rc"
+
+    if [[ "$_merge_rc" -eq 0 ]]; then
+        # Success — re-fetch PR status to extract the merge SHA.
+        if fetch_pr_status "$_pr_number"; then
+            _merge_sha=$(extract_merge_sha)
+        else
+            _merge_sha=""
+        fi
+        log "merge_succeeded" "pr_number=$_pr_number" "merge_sha=$_merge_sha"
+        printf '{"merged": true, "pr_number": %s, "merge_sha": "%s"}' \
+            "$_pr_number" "$_merge_sha"
+        return 0
+    fi
+
+    # Non-zero. Inspect stderr for the stale-rollup marker.
+    _stderr_text=""
+    if [[ -s "$AGENT_WORKSPACE/gh-pr-merge.stderr.log" ]]; then
+        _stderr_text=$(cat "$AGENT_WORKSPACE/gh-pr-merge.stderr.log" 2>/dev/null || printf '')
+    fi
+    # Case-insensitive match on the stale-rollup marker (gh output
+    # preserves case, but we compare lowercase for safety).
+    _stderr_lower=$(printf '%s' "$_stderr_text" | tr '[:upper:]' '[:lower:]')
+    if [[ "$_stderr_lower" == *"$STALE_ROLLUP_MARKER"* ]]; then
+        if try_auto_unstick_merge "$_pr_number"; then
+            # Budget left — go back to awaiting_ci for the next supervisor
+            # tick equivalent. Since we're inside one agent-runner
+            # process, advance the phase via the dispatch case's
+            # ``auto_unstick_retry`` signal.
+            printf '{"auto_unstick_retry": true, "pr_number": %s}' "$_pr_number"
+            return 0
+        fi
+        # try_auto_unstick_merge already called agent_runner_reaped_failure.
+        printf '{"merge_failed": true, "pr_number": %s}' "$_pr_number"
+        return 0
+    fi
+
+    # Any other non-zero exit — route to failure.
+    _stderr_tail=$(printf '%s' "$_stderr_text" | head -c 200 | tr '\n' ' ')
+    agent_runner_reaped_failure \
+        "merge_failed" \
+        "merge_nonzero_exit" \
+        "pr=$_pr_number exit=$_merge_rc stderr=$_stderr_tail"
+    printf '{"merge_failed": true, "pr_number": %s, "exit_code": %s}' \
+        "$_pr_number" "$_merge_rc"
+}
+
+find_deploy_runs() {
+    # $1 = merge SHA. Writes the JSON array response from
+    # ``gh run list --commit <sha> --workflow <w1> --workflow <w2> ...
+    # --json databaseId,workflowName,status,conclusion,createdAt``
+    # to ``$AGENT_WORKSPACE/deploy-runs.json``. On failure writes ``[]``.
+    _sha="$1"
+    _out_file="$AGENT_WORKSPACE/deploy-runs.json"
+    # Build the --workflow flag list from $DEPLOY_WORKFLOWS (space-
+    # separated file names). Bash 3.2: use positional args.
+    set --
+    for _w in $DEPLOY_WORKFLOWS; do
+        set -- "$@" --workflow "$_w"
+    done
+    set +e
+    gh run list \
+        --repo judgemind/judgemind \
+        --commit "$_sha" \
+        "$@" \
+        --json databaseId,workflowName,status,conclusion,createdAt \
+        --limit 20 \
+        > "$_out_file" \
+        2> "$AGENT_WORKSPACE/gh-run-list.stderr.log"
+    _gh_rc=$?
+    set -e
+    if [[ "$_gh_rc" -ne 0 ]]; then
+        printf '[]' > "$_out_file"
+    fi
+    return 0
+}
+
+handle_awaiting_deploy() {
+    # Poll the deploy-workflow runs for the merge SHA until at least
+    # one completes successfully, any fails, or the hard timeout
+    # elapses. If no deploy runs are observed within the short grace
+    # window, treat the PR as "no deploy applicable" (e.g. docs-only)
+    # and advance to verify. Mirrors daemon.py's
+    # ``_advance_awaiting_deploy``.
+    _pr_number=$(read_pr_number)
+    if [[ -z "$_pr_number" ]]; then
+        agent_runner_reaped_failure "awaiting_deploy_failed" "missing_pr" \
+            "pr_number NULL on agent row"
+        printf '{"missing_pr": true}'
+        return 0
+    fi
+
+    # Re-fetch PR status once to get the merge SHA.
+    if ! fetch_pr_status "$_pr_number"; then
+        # Treat as a transient GH failure — let the next supervisor
+        # tick equivalent try again. Since we're inside one process,
+        # sleep and retry the outer poll loop.
+        log "awaiting_deploy_pr_view_failed" "pr_number=$_pr_number"
+    fi
+    _merge_sha=$(extract_merge_sha)
+    if [[ -z "$_merge_sha" ]]; then
+        # A non-merged or still-propagating PR — treat as pending and
+        # poll-retry up to timeout.
+        log "awaiting_deploy_no_merge_sha" "pr_number=$_pr_number"
+    fi
+
+    _start_ts=$(date -u +%s)
+    _last_state=""
+    _poll_count=0
+    _max_polls="${AGENT_RUNNER_DEPLOY_MAX_POLLS:-60}"
+    while true; do
+        _poll_count=$((_poll_count + 1))
+        if [[ "$_poll_count" -gt "$_max_polls" ]]; then
+            log "awaiting_deploy_max_polls_hit" "pr_number=$_pr_number" "poll_count=$_poll_count"
+            agent_runner_reaped_failure \
+                "awaiting_deploy_timeout" \
+                "deploy_max_polls" \
+                "pr=$_pr_number poll_count=$_poll_count last_state=$_last_state"
+            printf '{"timeout": true, "pr_number": %s, "max_polls": %s}' \
+                "$_pr_number" "$_poll_count"
+            return 0
+        fi
+        if [[ -n "$_merge_sha" ]]; then
+            find_deploy_runs "$_merge_sha"
+            _state=$(classify_deploy_runs "$AGENT_WORKSPACE/deploy-runs.json")
+        else
+            _state="pending"
+        fi
+        log "awaiting_deploy_poll" \
+            "pr_number=$_pr_number" \
+            "merge_sha=$_merge_sha" \
+            "deploy_state=$_state"
+        if [[ "$_state" == "success" ]]; then
+            printf '{"deploy_state": "success", "merge_sha": "%s"}' "$_merge_sha"
+            return 0
+        fi
+        if [[ "$_state" == "failure" ]]; then
+            agent_runner_reaped_failure \
+                "awaiting_deploy_failed" \
+                "deploy_failed" \
+                "pr=$_pr_number sha=$_merge_sha"
+            printf '{"deploy_state": "failure", "merge_sha": "%s"}' "$_merge_sha"
+            return 0
+        fi
+        _now_ts=$(date -u +%s)
+        _elapsed=$((_now_ts - _start_ts))
+        # "No deploy runs" branch: once we're past the grace window
+        # and no matching run has appeared, treat as "no deploy
+        # applicable" and advance to verify.
+        if [[ "$_state" == "none" ]] && [[ "$_elapsed" -ge "$DEPLOY_GRACE_SECONDS" ]]; then
+            log "awaiting_deploy_no_runs" \
+                "pr_number=$_pr_number" \
+                "merge_sha=$_merge_sha" \
+                "grace_s=$DEPLOY_GRACE_SECONDS" \
+                "elapsed_s=$_elapsed"
+            printf '{"deploy_state": "none", "merge_sha": "%s", "elapsed_s": %s}' \
+                "$_merge_sha" "$_elapsed"
+            return 0
+        fi
+        _last_state="$_state"
+        if [[ "$_elapsed" -ge "$AWAITING_DEPLOY_TIMEOUT_SECONDS" ]]; then
+            log "awaiting_deploy_timeout" \
+                "pr_number=$_pr_number" \
+                "merge_sha=$_merge_sha" \
+                "elapsed_s=$_elapsed" \
+                "last_state=$_last_state"
+            agent_runner_reaped_failure \
+                "awaiting_deploy_timeout" \
+                "deploy_timeout" \
+                "pr=$_pr_number sha=$_merge_sha elapsed_s=$_elapsed"
+            printf '{"timeout": true, "merge_sha": "%s", "elapsed_s": %s}' \
+                "$_merge_sha" "$_elapsed"
+            return 0
+        fi
+        sleep "$DEPLOY_POLL_INTERVAL"
+        # Refresh merge SHA if we missed it the first time around.
+        if [[ -z "$_merge_sha" ]]; then
+            if fetch_pr_status "$_pr_number"; then
+                _merge_sha=$(extract_merge_sha)
+            fi
+        fi
+    done
+}
+
 # Check whether a phase is terminal per the shared Python module.
 # Uses a sibling one-line shim written alongside the transition shim
 # rather than an inline `python -c` heredoc (the preflight hook blocks
@@ -2306,16 +3025,94 @@ while true; do
                     ;;
             esac
             ;;
-        awaiting_ci|merge|awaiting_deploy|retro|setup)
-            # Mechanical phases the daemon handles inline today. Stage
-            # 1b stubs them: log + advance to the documented "next"
-            # phase on the happy path so the smoke test can reach
-            # `done` without a full daemon-integration.
+        awaiting_ci)
+            # #3176: real implementation — poll ``gh pr view`` rollup,
+            # advance to ``merge`` on green, ``fix_ci`` on red, exit
+            # with terminal failure on timeout.
+            _output=$(handle_awaiting_ci)
+            persist_phase_output "awaiting_ci" "$_output"
+            _rollup_state=$(printf '%s' "$_output" | jq -r '.rollup_state // ""' 2>/dev/null)
+            _timeout=$(printf '%s' "$_output" | jq -r '.timeout // false' 2>/dev/null)
+            if [[ "$_timeout" == "true" ]]; then
+                # agent_runner_reaped_failure already set the terminal
+                # phase + status in the DB; next tick will observe it
+                # as terminal and exit.
+                :
+            elif [[ "$_rollup_state" == "green" ]]; then
+                advance_phase "merge"
+            elif [[ "$_rollup_state" == "red" ]]; then
+                advance_phase "fix_ci"
+            else
+                # No recognizable state — shouldn't happen, but don't
+                # spin. Treat as failure to surface the bug.
+                log "awaiting_ci_unrecognized_output" "output=$_output"
+                agent_runner_reaped_failure \
+                    "awaiting_ci_failed" \
+                    "unrecognized_output" \
+                    "$_output"
+            fi
+            ;;
+        merge)
+            # #3176: real implementation — squash-merge with
+            # branch-delete, auto-unstick on stale-rollup (one-shot),
+            # terminal failure on other non-zero exits.
+            _output=$(handle_merge)
+            persist_phase_output "merge" "$_output"
+            _merged=$(printf '%s' "$_output" | jq -r '.merged // false' 2>/dev/null)
+            _auto_unstick=$(printf '%s' "$_output" | jq -r '.auto_unstick_retry // false' 2>/dev/null)
+            _merge_failed=$(printf '%s' "$_output" | jq -r '.merge_failed // false' 2>/dev/null)
+            if [[ "$_merged" == "true" ]]; then
+                # Mirror daemon's ``_merge_pr_and_advance``: flip
+                # status=succeeded the moment the squash-merge lands,
+                # advance phase to awaiting_deploy. A crash mid-write
+                # still leaves a ``status='succeeded' phase=merge``
+                # row recoverable by the next tick.
+                advance_phase "awaiting_deploy" "succeeded"
+            elif [[ "$_auto_unstick" == "true" ]]; then
+                # Go back to awaiting_ci so the next poll sees the
+                # post-empty-commit rollup.
+                advance_phase "awaiting_ci"
+            elif [[ "$_merge_failed" == "true" ]]; then
+                # agent_runner_reaped_failure already set terminal state.
+                :
+            else
+                log "merge_unrecognized_output" "output=$_output"
+                agent_runner_reaped_failure \
+                    "merge_failed" \
+                    "unrecognized_output" \
+                    "$_output"
+            fi
+            ;;
+        awaiting_deploy)
+            # #3176: real implementation — poll deploy workflows on
+            # the merge SHA, advance to verify on success / no-run
+            # grace, terminal failure on timeout / any deploy
+            # workflow failure.
+            _output=$(handle_awaiting_deploy)
+            persist_phase_output "awaiting_deploy" "$_output"
+            _deploy_state=$(printf '%s' "$_output" | jq -r '.deploy_state // ""' 2>/dev/null)
+            _timeout=$(printf '%s' "$_output" | jq -r '.timeout // false' 2>/dev/null)
+            if [[ "$_timeout" == "true" ]]; then
+                :
+            elif [[ "$_deploy_state" == "success" || "$_deploy_state" == "none" ]]; then
+                advance_phase "verify"
+            elif [[ "$_deploy_state" == "failure" ]]; then
+                :
+            else
+                log "awaiting_deploy_unrecognized_output" "output=$_output"
+                agent_runner_reaped_failure \
+                    "awaiting_deploy_failed" \
+                    "unrecognized_output" \
+                    "$_output"
+            fi
+            ;;
+        retro|setup)
+            # Remaining mechanical stubs — Stage 3+ will wire these to
+            # real implementations (retro posts the issue comment +
+            # closes the loop; setup is currently unreachable under the
+            # Stage 1b happy path).
             case "$_current" in
                 setup)            _next="ralph" ;;
-                awaiting_ci)      _next="merge" ;;
-                merge)            _next="awaiting_deploy" ;;
-                awaiting_deploy)  _next="verify" ;;
                 retro)            _next="retro_done" ;;
             esac
             log "mechanical_phase_stub" "phase=$_current" "next=$_next"

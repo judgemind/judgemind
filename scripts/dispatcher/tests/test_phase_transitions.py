@@ -586,6 +586,16 @@ class TestTerminalPhaseAndStatus:
         assert pt.is_terminal_phase(pt.PHASE_DAEMON_RESTART_ABANDONED) is True
         assert pt.is_terminal_phase(pt.PHASE_PAUSED_BY_KILLSWITCH) is True
 
+    def test_is_terminal_phase_true_for_agent_runner_post_pr_terminals(
+        self,
+    ) -> None:
+        """#3176 — agent-runner post-ralph failure terminals."""
+        assert pt.is_terminal_phase(pt.PHASE_AWAITING_CI_FAILED) is True
+        assert pt.is_terminal_phase(pt.PHASE_AWAITING_CI_TIMEOUT) is True
+        assert pt.is_terminal_phase(pt.PHASE_MERGE_FAILED) is True
+        assert pt.is_terminal_phase(pt.PHASE_AWAITING_DEPLOY_FAILED) is True
+        assert pt.is_terminal_phase(pt.PHASE_AWAITING_DEPLOY_TIMEOUT) is True
+
     def test_is_terminal_phase_false_for_intermediate(self) -> None:
         assert pt.is_terminal_phase(pt.PHASE_PLANNING) is False
         assert pt.is_terminal_phase(pt.PHASE_RALPH) is False
