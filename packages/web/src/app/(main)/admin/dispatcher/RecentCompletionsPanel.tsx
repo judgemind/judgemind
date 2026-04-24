@@ -3,6 +3,7 @@
 import type { CSSProperties } from 'react';
 import { SECTION_HEADING } from '@/lib/typography';
 import type { RecentCompletion } from '@/lib/dispatcher-queries';
+import { formatDurationMs } from './format-helpers';
 import { IssueLink, OutcomePill, PriorityBadge, PRLink } from './ui-primitives';
 
 interface RecentCompletionsPanelProps {
@@ -52,6 +53,13 @@ interface RecentCompletionsPanelProps {
  * ago" / "2 months ago"). Native `title` attribute exposes the full
  * datetime in Pacific time on hover. Operator gets at-a-glance "when
  * did this happen" without clicking into the agent detail page.
+ *
+ * #3024 extends the `title` tooltip to three lines — start time,
+ * duration, and end time — all in Pacific time. Today's investigations
+ * frequently need the exact wall-clock numbers ("when did this start",
+ * "how long did it run"), and surfacing them in the hover tooltip
+ * eliminates a database round-trip. The visible relative label
+ * ("5m ago") is unchanged — this is an additive enhancement.
  */
 export function RecentCompletionsPanel({
   completions,
@@ -99,11 +107,20 @@ function RecentCompletionRow({
   // prop so we fall back to `Date.now()`.
   const effectiveNowMs = nowMs ?? Date.now();
   const endedMs = Date.parse(completion.endedAt);
+  const startedMs = Date.parse(completion.startedAt);
   const relativeTime = Number.isFinite(endedMs)
     ? formatRelativeTime(endedMs, effectiveNowMs)
     : null;
+  // #3024: native `title` attribute carries a three-line tooltip with
+  // Start / Duration / End in Pacific time. The visible label still
+  // shows the relative "Nm ago" string — the tooltip is the precise
+  // overlay for operators who need the exact numbers during failure
+  // investigation. Falls back to a single-line PT end-time string when
+  // either timestamp is unparseable so we never render an empty tooltip.
   const pacificTitle = Number.isFinite(endedMs)
-    ? formatPacificDatetime(endedMs)
+    ? Number.isFinite(startedMs)
+      ? formatStartDurationEndTitle(startedMs, endedMs)
+      : formatPacificDatetime(endedMs)
     : '';
   // Magic Move (#2967): each completed row carries the agent identity
   // so that the inner `agent-X` wrapper of the matching Active row can
@@ -311,6 +328,39 @@ function formatPacificDatetime(timestampMs: number): string {
   );
 }
 
+/** Build the three-line "Start / Duration / End" tooltip body for the
+ * relative-time cell (#3024). All timestamps are formatted in Pacific
+ * time with an explicit `PDT` / `PST` suffix; the duration reuses
+ * `formatDurationMs` from `format-helpers.ts` so the dispatcher cockpit
+ * uses one consistent compact-duration style across panels.
+ *
+ * The native HTML `title` attribute renders embedded `\n` as line
+ * breaks across all browsers we target, so we hand back a single
+ * `\n`-joined string instead of structured lines. Field labels are
+ * column-padded with two spaces after the colon so the values align in
+ * the tooltip:
+ *
+ *     Start:    2026-04-22 09:41:16 PDT
+ *     Duration: 15m 17s
+ *     End:      2026-04-22 09:56:34 PDT
+ *
+ * The `Duration:` row drops the seconds component once the run is at
+ * least an hour long (`formatDurationMs` already does this) — the
+ * issue spec calls out `2h 3m` as acceptable when seconds are zero.
+ */
+function formatStartDurationEndTitle(
+  startedMs: number,
+  endedMs: number,
+): string {
+  const durationMs = endedMs - startedMs;
+  const start = formatPacificDatetime(startedMs);
+  const end = formatPacificDatetime(endedMs);
+  // Negative or NaN durations (clock skew, malformed timestamps) collapse
+  // to an em-dash via `formatDurationMs` so the tooltip stays readable.
+  const duration = formatDurationMs(durationMs);
+  return `Start:    ${start}\nDuration: ${duration}\nEnd:      ${end}`;
+}
+
 // Exported for unit testing; the helpers stay co-located with the
 // component because they are presentation-only and not reused elsewhere.
 // See ``__tests__/RecentCompletionsPanel.test.tsx``.
@@ -319,4 +369,5 @@ export {
   formatTokenCount,
   formatRelativeTime,
   formatPacificDatetime,
+  formatStartDurationEndTitle,
 };

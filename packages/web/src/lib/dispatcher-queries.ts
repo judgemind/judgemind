@@ -73,6 +73,7 @@ export const DISPATCHER_STATE_QUERY = gql`
         issueTitle
         priority
         status
+        startedAt
         endedAt
         prNumber
         totalTokens
@@ -209,6 +210,10 @@ export interface RecentCompletion {
   priority: string | null;
   /** One of `succeeded | failed | crashed`. */
   status: string;
+  /** Timestamp the agent claimed the issue (`dispatcher.agents.started_at`).
+   * Non-nullable on the API side. Issue #3024 — paired with `endedAt` for
+   * the Start/Duration/End hover tooltip in the Recently completed panel. */
+  startedAt: string;
   endedAt: string;
   prNumber: number | null;
   /** Sum of input+output tokens across every phase the agent ran

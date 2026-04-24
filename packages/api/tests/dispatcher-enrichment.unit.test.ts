@@ -182,6 +182,9 @@ describe('recentCompletionsToGraphQL', () => {
         // #2899 — priority is captured at claim time.
         priority: 'p2',
         status: 'succeeded',
+        // #3024 — started_at paired with ended_at so the admin cockpit
+        // tooltip can render Start/Duration/End.
+        started_at: '2026-04-18T11:50:00Z',
         ended_at: '2026-04-18T12:00:00Z',
         pr_number: 2824,
         total_tokens: 12345,
@@ -196,6 +199,7 @@ describe('recentCompletionsToGraphQL', () => {
         issueTitle: 'Fix the thing',
         priority: 'p2',
         status: 'succeeded',
+        startedAt: '2026-04-18T11:50:00Z',
         endedAt: '2026-04-18T12:00:00Z',
         prNumber: 2824,
         totalTokens: 12345,
@@ -211,6 +215,24 @@ describe('recentCompletionsToGraphQL', () => {
         retroedAt: null,
       },
     ]);
+  });
+
+  // #3024 — started_at passthrough.
+  it('#3024: passes ``started_at`` through verbatim for the Start/End tooltip', () => {
+    const rows = [
+      {
+        agent_id: 'uuid-3024',
+        issue_number: 3024,
+        issue_title: 'Tooltip test',
+        status: 'succeeded',
+        started_at: '2026-04-22T16:41:16Z',
+        ended_at: '2026-04-22T16:56:33Z',
+        pr_number: 3025,
+      },
+    ];
+    const result = recentCompletionsToGraphQL(rows);
+    expect(result[0].startedAt).toBe('2026-04-22T16:41:16Z');
+    expect(result[0].endedAt).toBe('2026-04-22T16:56:33Z');
   });
 
   // #2900: failure_summary passthrough + trimming/empty handling.
