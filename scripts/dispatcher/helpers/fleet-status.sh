@@ -110,144 +110,167 @@ else
     since_interval="make_interval(mins => ${since%m})"
 fi
 
-# ─── Single bundled query ───────────────────────────────────────────────
-# Keep each CTE's output small — no huge JSONB blobs (e.g. diagnosis.context)
-# in the result, because dev-db-query.sh streams over ECS-exec and the
-# session can close mid-stream on very large payloads (observed when
-# including diagnosis.context). Keep this fleet-wide and lightweight;
-# drill into details with agent-timeline.sh / diagnoses.sh / breaker.sh.
+# ─── Seven small queries, assembled locally ─────────────────────────────
+# Previously this helper bundled the whole fleet snapshot into a single
+# WITH-CTE query that emitted one `jsonb_build_object` row. That worked
+# when the dispatcher.agents / diagnoses tables were small, but once the
+# combined JSON grew past ~1 KB the SSM / ECS-exec transport started
+# truncating the stream mid-field and jq parse-errored even with retry
+# (#3195).  Rather than fight SSM's per-session output budget, we now run
+# seven small queries — each returns a tiny JSON payload that stays well
+# inside the transport's limits — and assemble the snapshot locally with
+# jq. Total round-trip time is 6–10 s (vs. 2–3 s for the bundled query)
+# but success rate is dramatically higher.
+#
+# Drill into details with agent-timeline.sh / diagnoses.sh / breaker.sh —
+# the per-CTE output caps here are intentionally conservative.
 
-sql="
-WITH
-  active AS (
-    SELECT COALESCE(jsonb_agg(a ORDER BY started_at), '[]'::jsonb) AS data FROM (
-      SELECT
-        agent_id::text AS agent_id,
-        issue_number,
-        phase,
-        status,
-        priority,
-        to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS started_utc,
-        to_char(started_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS started_pt,
-        to_char(now() - started_at, 'FMHH24:MI:SS') AS lifetime,
-        started_at
-      FROM dispatcher.agents
-      WHERE status IN ('running', 'claiming')
-      ORDER BY started_at
-    ) a
-  ),
-  terminals AS (
-    SELECT COALESCE(jsonb_agg(t ORDER BY ended_at DESC), '[]'::jsonb) AS data FROM (
-      SELECT
-        agent_id::text AS agent_id,
-        issue_number,
-        phase,
-        status,
-        pr_number,
-        -- Truncate to avoid the multi-line pre-push dumps bleeding into
-        -- the snapshot; operator can use agent-timeline.sh / CloudWatch
-        -- for the full text.
-        CASE WHEN failure_summary IS NULL THEN NULL
-             WHEN length(failure_summary) > 140
-               THEN regexp_replace(substring(failure_summary, 1, 137), E'\\\\s+', ' ', 'g') || '…'
-             ELSE regexp_replace(failure_summary, E'\\\\s+', ' ', 'g') END AS failure_summary,
-        to_char(ended_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ended_utc,
-        to_char(ended_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS ended_pt,
-        to_char(ended_at - started_at, 'FMHH24:MI:SS') AS lifetime,
-        ended_at
-      FROM dispatcher.agents
-      WHERE ended_at IS NOT NULL
-        AND ended_at > now() - ${since_interval}
-      ORDER BY ended_at DESC
-      LIMIT ${terminals_cap}
-    ) t
-  ),
-  config_row AS (
-    SELECT jsonb_build_object(
-      'cap',        (SELECT value::int FROM dispatcher.config WHERE key='concurrency_cap'),
-      'flipped_by', (SELECT value::text FROM dispatcher.config WHERE key='cap_flipped_by')
-    ) AS data
-  ),
-  diagnoses_recent AS (
-    SELECT COALESCE(jsonb_agg(d ORDER BY diagnosis_id DESC), '[]'::jsonb) AS data FROM (
-      SELECT
-        d.diagnosis_id,
-        d.agent_id::text AS agent_id,
-        a.issue_number,
-        d.status,
-        d.recommendation->>'action' AS action,
-        to_char(d.started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS started_utc,
-        to_char(d.started_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS started_pt
-      FROM dispatcher.diagnoses d
-      JOIN dispatcher.agents a ON a.agent_id = d.agent_id
-      WHERE d.started_at > now() - ${since_interval}
-      ORDER BY d.diagnosis_id DESC
-      LIMIT 10
-    ) d
-  ),
-  greens AS (
-    SELECT COALESCE(jsonb_agg(g ORDER BY merged_at DESC), '[]'::jsonb) AS data FROM (
-      SELECT
-        agent_id::text AS agent_id,
-        issue_number,
-        pr_number,
-        to_char(merged_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS merged_utc,
-        to_char(merged_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS merged_pt,
-        to_char(merged_at - started_at, 'FMHH24:MI:SS') AS lifetime,
-        issue_title,
-        merged_at
-      FROM dispatcher.agents
-      WHERE merged_at IS NOT NULL
-        AND merged_at > now() - ${since_interval}
-      ORDER BY merged_at DESC
-      LIMIT ${greens_cap}
-    ) g
-  ),
-  pending AS (
-    SELECT COALESCE(jsonb_agg(c ORDER BY issued_at), '[]'::jsonb) AS data FROM (
-      SELECT
-        command_id,
-        command,
-        issued_by,
-        to_char(issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS issued_utc,
-        payload,
-        issued_at
-      FROM dispatcher.commands
-      WHERE consumed_at IS NULL
-      ORDER BY issued_at
-    ) c
-  ),
-  totals AS (
-    SELECT jsonb_build_object(
-      'total_terminals_in_window',
-         (SELECT COUNT(*) FROM dispatcher.agents
-          WHERE ended_at IS NOT NULL AND ended_at > now() - ${since_interval}),
-      'total_greens_in_window',
-         (SELECT COUNT(*) FROM dispatcher.agents
-          WHERE merged_at IS NOT NULL AND merged_at > now() - ${since_interval}),
-      'total_diagnoses_in_window',
-         (SELECT COUNT(*) FROM dispatcher.diagnoses
-          WHERE started_at > now() - ${since_interval})
-    ) AS data
-  )
-SELECT jsonb_build_object(
-  'since',             '${since}',
-  'active',            (SELECT data FROM active),
-  'terminals',         (SELECT data FROM terminals),
-  'config',            (SELECT data FROM config_row),
-  'diagnoses_recent',  (SELECT data FROM diagnoses_recent),
-  'greens',            (SELECT data FROM greens),
-  'pending_commands',  (SELECT data FROM pending),
-  'totals',            (SELECT data FROM totals)
-) AS snapshot;
+q_active="
+SELECT
+    agent_id::text AS agent_id,
+    issue_number,
+    phase,
+    status,
+    priority,
+    to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS started_utc,
+    to_char(started_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS started_pt,
+    to_char(now() - started_at, 'FMHH24:MI:SS') AS lifetime
+FROM dispatcher.agents
+WHERE status IN ('running', 'claiming')
+ORDER BY started_at
+"
+
+# Terminals cap column length tight to reduce bytes — failure_summary is
+# the biggest byte-consumer in the fleet and occasionally blows past 140
+# chars even after substring. Cap at 80 chars for display; detail lives in
+# agent-timeline.sh.
+q_terminals="
+SELECT
+    agent_id::text AS agent_id,
+    issue_number,
+    phase,
+    status,
+    pr_number,
+    CASE WHEN failure_summary IS NULL THEN NULL
+         WHEN length(failure_summary) > 80
+           THEN regexp_replace(substring(failure_summary, 1, 77), E'\\\\s+', ' ', 'g') || '…'
+         ELSE regexp_replace(failure_summary, E'\\\\s+', ' ', 'g') END AS failure_summary,
+    to_char(ended_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ended_utc,
+    to_char(ended_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS ended_pt,
+    to_char(ended_at - started_at, 'FMHH24:MI:SS') AS lifetime
+FROM dispatcher.agents
+WHERE ended_at IS NOT NULL
+  AND ended_at > now() - ${since_interval}
+ORDER BY ended_at DESC
+LIMIT ${terminals_cap}
+"
+
+q_config="
+SELECT
+    (SELECT value::int FROM dispatcher.config WHERE key='concurrency_cap') AS cap,
+    (SELECT value::text FROM dispatcher.config WHERE key='cap_flipped_by') AS flipped_by
+"
+
+q_diagnoses="
+SELECT
+    d.diagnosis_id,
+    d.agent_id::text AS agent_id,
+    a.issue_number,
+    d.status,
+    d.recommendation->>'action' AS action,
+    to_char(d.started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS started_utc,
+    to_char(d.started_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS started_pt
+FROM dispatcher.diagnoses d
+JOIN dispatcher.agents a ON a.agent_id = d.agent_id
+WHERE d.started_at > now() - ${since_interval}
+ORDER BY d.diagnosis_id DESC
+LIMIT 10
+"
+
+# Truncate long issue titles so greens fit in SSM's budget even when a
+# spike of recent merges dumps long-titled PRs through the window.
+q_greens="
+SELECT
+    agent_id::text AS agent_id,
+    issue_number,
+    pr_number,
+    to_char(merged_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS merged_utc,
+    to_char(merged_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') AS merged_pt,
+    to_char(merged_at - started_at, 'FMHH24:MI:SS') AS lifetime,
+    CASE WHEN issue_title IS NULL THEN NULL
+         WHEN length(issue_title) > 100
+           THEN substring(issue_title, 1, 97) || '…'
+         ELSE issue_title END AS issue_title
+FROM dispatcher.agents
+WHERE merged_at IS NOT NULL
+  AND merged_at > now() - ${since_interval}
+ORDER BY merged_at DESC
+LIMIT ${greens_cap}
+"
+
+q_pending="
+SELECT
+    command_id,
+    command,
+    issued_by,
+    to_char(issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS issued_utc,
+    payload
+FROM dispatcher.commands
+WHERE consumed_at IS NULL
+ORDER BY issued_at
+"
+
+q_totals="
+SELECT
+    (SELECT COUNT(*) FROM dispatcher.agents
+       WHERE ended_at IS NOT NULL AND ended_at > now() - ${since_interval}) AS total_terminals_in_window,
+    (SELECT COUNT(*) FROM dispatcher.agents
+       WHERE merged_at IS NOT NULL AND merged_at > now() - ${since_interval}) AS total_greens_in_window,
+    (SELECT COUNT(*) FROM dispatcher.diagnoses
+       WHERE started_at > now() - ${since_interval}) AS total_diagnoses_in_window
 "
 
 if [[ "${FLEET_STATUS_DEBUG:-0}" == "1" ]]; then
-    echo "===== SQL =====" >&2
-    echo "$sql" >&2
+    echo "===== active =====" >&2
+    echo "$q_active" >&2
+    echo "===== terminals =====" >&2
+    echo "$q_terminals" >&2
 fi
-result=$(query "$sql")
-snapshot=$(echo "$result" | jq '.[0].snapshot')
+
+# Each query returns a JSON array.  For single-row queries (config,
+# totals) we take .[0]; for multi-row we keep the array.
+active_json=$(query "$q_active")
+terminals_json=$(query "$q_terminals")
+config_json=$(query "$q_config")
+diagnoses_json=$(query "$q_diagnoses")
+greens_json=$(query "$q_greens")
+pending_json=$(query "$q_pending")
+totals_json=$(query "$q_totals")
+
+# Assemble the snapshot shape the formatter expects. Defensive defaults:
+# empty arrays for missing collections and empty objects for missing
+# singletons, so a transient DB hiccup on one sub-query doesn't crash the
+# whole formatter. (That's also what the retry loop protects against — the
+# defaults are belt-and-suspenders.)
+snapshot=$(jq -n \
+    --argjson active "$active_json" \
+    --argjson terminals "$terminals_json" \
+    --argjson config "$config_json" \
+    --argjson diagnoses "$diagnoses_json" \
+    --argjson greens "$greens_json" \
+    --argjson pending "$pending_json" \
+    --argjson totals "$totals_json" \
+    --arg since "$since" \
+    '{
+        since: $since,
+        active: $active,
+        terminals: $terminals,
+        config: ($config[0] // {}),
+        diagnoses_recent: $diagnoses,
+        greens: $greens,
+        pending_commands: $pending,
+        totals: ($totals[0] // {})
+    }')
 
 # ─── Format ─────────────────────────────────────────────────────────────
 

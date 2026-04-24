@@ -158,8 +158,8 @@ if [[ "$rc" == "2" ]]; then
 else
     fail "bad numeric literal: expected rc=2, got rc=$rc" "out=$out err=$(cat "$TMPDIR_TEST/err.log" 2>/dev/null || echo '(no err)')"
 fi
-if grep -q "malformed JSON after 3 attempts" "$TMPDIR_TEST/err.log"; then
-    pass "bad numeric literal: stderr names the failure ('malformed JSON after 3 attempts')"
+if grep -q "malformed JSON after 5 attempts" "$TMPDIR_TEST/err.log"; then
+    pass "bad numeric literal: stderr names the failure ('malformed JSON after 5 attempts')"
 else
     fail "bad numeric literal: stderr missing expected diagnostic" "$(cat "$TMPDIR_TEST/err.log")"
 fi
@@ -210,7 +210,7 @@ if [[ "$rc" == "0" ]] && printf '%s' "$out" | jq -e '.[0].ok == true' >/dev/null
 else
     fail "transient failure" "rc=$rc out=$out err=$(cat "$TMPDIR_TEST/err.log")"
 fi
-if grep -q "malformed JSON on attempt 1/3 — retrying" "$TMPDIR_TEST/err.log"; then
+if grep -q "malformed JSON on attempt 1/5 — retrying" "$TMPDIR_TEST/err.log"; then
     pass "transient failure: retry warning logged to stderr"
 else
     fail "transient failure: missing retry warning" "$(cat "$TMPDIR_TEST/err.log")"
@@ -278,6 +278,87 @@ else
     else
         pass "post-JSON noise: library returned non-zero on bad payload (rc=$rc)"
     fi
+fi
+
+# ─── Test 8: Compact single-line JSON (runner's default after #3195) ───
+# The runner defaults to compact JSON so more bytes fit under SSM's
+# per-session output budget. _query_lib_json_only must handle the
+# single-line case — the legacy awk pattern expected `[` and `]` on
+# their own lines (pretty-printed only).
+make_stub "$(cat <<'EOF'
+Starting session with SessionId: ecs-execute-command-compact
+[{"agent_id":"abc","count":3},{"agent_id":"def","count":7}]
+
+Exiting session with sessionId: ecs-execute-command-compact
+EOF
+)"
+set +e
+out=$(run_lib "compact" 2>/dev/null)
+rc=$?
+set -e
+if [[ "$rc" == "0" ]] \
+    && printf '%s' "$out" | jq -e '.[0].agent_id == "abc"' >/dev/null 2>&1 \
+    && printf '%s' "$out" | jq -e '.[1].count == 7' >/dev/null 2>&1; then
+    pass "compact JSON (single line): library returns parseable result"
+else
+    fail "compact JSON (single line)" "rc=$rc out=$out"
+fi
+
+# ─── Test 9: Compact JSON with SSM chatter on the SAME line as JSON ─────
+# Real SSM sometimes emits the session trailer concatenated with the
+# final output chunk (no newline separator). dev-db-query.sh now strips
+# that at the script level, but the library's own filter is a secondary
+# guard — test that a same-line trailer concatenated to compact JSON
+# fails validation rather than returning corrupt output.
+make_stub "$(cat <<'EOF'
+Starting session with SessionId: ecs-execute-command-mixed
+[{"n":1}]Cannot perform start session: EOF
+EOF
+)"
+set +e
+out=$(run_lib "mixed" 2>"$TMPDIR_TEST/err.log")
+rc=$?
+set -e
+# Either: rc=0 with the JSON parseable (if the grep stripped the
+# trailer), or rc=2 (validator caught bad concatenation). Both are
+# acceptable — the important negative is rc=0 with corrupt output.
+if [[ "$rc" == "0" ]]; then
+    if printf '%s' "$out" | jq -e '.[0].n == 1' >/dev/null 2>&1; then
+        pass "same-line trailer: library returns clean parseable JSON"
+    else
+        fail "same-line trailer: library returned rc=0 with bad JSON" \
+            "out=$out"
+    fi
+elif [[ "$rc" == "2" ]]; then
+    pass "same-line trailer: validator rejected corrupt concatenation"
+else
+    fail "same-line trailer: unexpected rc=$rc" "out=$out"
+fi
+
+# ─── Test 10: Legacy pretty-printed output stays supported ──────────────
+# _query_lib.sh must continue to work if a caller passes pretty-printed
+# JSON (e.g. an operator explicitly invokes the runner with compact=0).
+make_stub "$(cat <<'EOF'
+Starting session with SessionId: ecs-execute-command-pretty
+[
+  {
+    "agent_id": "legacy-pretty",
+    "count": 99
+  }
+]
+
+Exiting session with sessionId: ecs-execute-command-pretty
+EOF
+)"
+set +e
+out=$(run_lib "pretty" 2>/dev/null)
+rc=$?
+set -e
+if [[ "$rc" == "0" ]] \
+    && printf '%s' "$out" | jq -e '.[0].agent_id == "legacy-pretty"' >/dev/null 2>&1; then
+    pass "legacy pretty-printed JSON still parses cleanly"
+else
+    fail "legacy pretty-printed JSON" "rc=$rc out=$out"
 fi
 
 # ─── Summary ────────────────────────────────────────────────────────────
