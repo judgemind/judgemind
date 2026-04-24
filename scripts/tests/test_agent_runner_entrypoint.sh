@@ -224,6 +224,12 @@ for arg in "$@"; do
     esac
 done
 
+# #3190: record the effective cwd inherited by each `claude -p`
+# invocation so tests can assert the entrypoint anchors cwd to
+# $REPO_ROOT before the call. One line per invocation; skill name
+# precedes the pwd so tests can filter by phase.
+printf '%s\t%s\n' "${skill:-unknown}" "$(pwd)" >> "$INVOCATIONS_DIR/claude-cwd.log"
+
 # Allow tests to inject a non-object `.result` (e.g. a plain string
 # "Unknown command: /task-v2-foo") to exercise the defensive shim.
 # Set CLAUDE_RESULT_OVERRIDE to the exact JSON payload to emit. Set
@@ -493,6 +499,7 @@ setup_fixtures() {
     # Shared state across the test invocation. Each test resets them.
     : > "$INVOCATIONS_DIR/psql.log"
     : > "$INVOCATIONS_DIR/claude.log"
+    : > "$INVOCATIONS_DIR/claude-cwd.log"
     : > "$INVOCATIONS_DIR/git.log"
     : > "$INVOCATIONS_DIR/gh.log"
 }
@@ -713,6 +720,43 @@ if grep -F "/task-v2-push_and_pr" "$INVOCATIONS_DIR/claude.log" >/dev/null 2>&1;
          "Found /task-v2-push_and_pr in claude log."
 else
     pass "entrypoint does not invoke /task-v2-push_and_pr (mechanical phase)"
+fi
+
+# #3190: every claude -p invocation must run with cwd == $REPO_ROOT
+# so the task-v2-* skills can resolve their
+# ``tmp/dispatcher-input/<phase>.json`` input bundle via the relative
+# path they use internally. The claude stub records its pwd per-call
+# in $INVOCATIONS_DIR/claude-cwd.log (skill<TAB>pwd, one line per
+# invocation). REPO_ROOT = $AGENT_WORKSPACE/repo; the t2 happy path
+# invokes claude for plan, ralph, summary, verify — every row must
+# have pwd = $t2_workspace/repo.
+t2_expected_repo_root="$t2_workspace/repo"
+t2_cwd_total=$(wc -l < "$INVOCATIONS_DIR/claude-cwd.log" | tr -d ' ')
+# Count lines whose second field (tab-separated) is NOT the expected
+# REPO_ROOT. Use `set +e; grep ... ; set -e` so grep-exit-1-no-match
+# doesn't propagate through $(...); we want the printed count either
+# way.
+set +e
+t2_cwd_mismatches=$(grep -cvF "	${t2_expected_repo_root}" "$INVOCATIONS_DIR/claude-cwd.log" 2>/dev/null)
+set -e
+t2_cwd_mismatches="${t2_cwd_mismatches:-0}"
+if [[ "$t2_cwd_total" -ge 1 && "$t2_cwd_mismatches" -eq 0 ]]; then
+    pass "#3190 — every claude -p invocation runs with cwd == \$REPO_ROOT"
+else
+    fail "#3190 — every claude -p invocation runs with cwd == \$REPO_ROOT" \
+         "expected all lines to end with '<TAB>$t2_expected_repo_root', total_lines=$t2_cwd_total, mismatches=$t2_cwd_mismatches, log: $(cat "$INVOCATIONS_DIR/claude-cwd.log")"
+fi
+
+# #3190 AC #2: claude_phase_begin log event includes cwd= field so the
+# next incident is self-diagnosing without needing an in-model `pwd &&
+# ls` (which the preflight-bash hook blocks anyway). The log emitter
+# produces a JSON object with a ``"cwd": "..."`` field, so match that
+# shape explicitly instead of the raw key=value kwarg style.
+if printf '%s' "$out" | grep -qE "claude_phase_begin.*\"cwd\": \"${t2_expected_repo_root}\""; then
+    pass "#3190 AC #2 — claude_phase_begin log event includes cwd=\$REPO_ROOT"
+else
+    fail "#3190 AC #2 — claude_phase_begin log event includes cwd=\$REPO_ROOT" \
+         "expected a claude_phase_begin line carrying cwd=$t2_expected_repo_root, out tail: $(printf '%s' "$out" | grep claude_phase_begin | head -5)"
 fi
 
 # Verify final phase is done.
