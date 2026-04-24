@@ -374,4 +374,4 @@ USER dispatcher
 # daemon's argv instead of python's.
 # ---------------------------------------------------------------------------
 ENTRYPOINT ["python", "-m", "scripts.dispatcher.daemon"]
-CMD []
+CMD ["--tick-scheduler-seconds", "5"]

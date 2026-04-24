@@ -245,6 +245,13 @@ QUEUE_SCAN_PAGE_LIMIT = 200
 #: anything over ~10s here would conflict with the next tick's own call.
 QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS = 10
 
+#: Throttle window for the per-tick `_scan_queue_and_snapshot` call.
+#: Decoupled from `tick_scheduler_seconds` so the tick can fire at 5s
+#: (fast state transitions) while the GitHub `gh issue list` queue scan
+#: stays at 30s — preserves daily GH API budget at higher cap values.
+#: Issue #2974.
+QUEUE_SCAN_INTERVAL_SECONDS = 30
+
 #: How often the blocked-list scan runs, expressed as scheduler ticks.
 #: With the 30s scheduler tick default, 4 ticks = 120s ≈ 2 minutes. The
 #: blocked list changes slowly (new blockers added when PRs gate work;
@@ -2165,6 +2172,7 @@ class DispatcherDaemon:
         # recovers (gap returns below warn threshold) or (b) the EXIT
         # threshold is hit and we call ``os._exit``.
         self._last_scheduler_tick_at: float = time.monotonic()
+        self._last_queue_scan: float = 0.0
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop: threading.Event = threading.Event()
         self._watchdog_warn_emitted_for_gap: bool = False
@@ -2589,7 +2597,12 @@ class DispatcherDaemon:
         # Failures here (rate limit, network, auth) log + return -1 but
         # do NOT raise — the daemon must survive GitHub API hiccups,
         # and the next tick will try again (§16).
-        queue_depth = self._scan_queue_and_snapshot()
+        now_for_queue_scan = time.monotonic()
+        if now_for_queue_scan - self._last_queue_scan >= QUEUE_SCAN_INTERVAL_SECONDS:
+            queue_depth = self._scan_queue_and_snapshot()
+            self._last_queue_scan = now_for_queue_scan
+        else:
+            queue_depth = -1  # sentinel: "queue scan throttled this tick"
         t_step = self._record_scheduler_step("scan_queue", t_step)
 
         # 3b. Scan the ``status/blocked`` list on a slower cadence
