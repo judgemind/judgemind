@@ -51,6 +51,13 @@ jobs:
           terraform -chdir=infra/terraform/environments/production init -backend=false
           terraform -chdir=infra/terraform/environments/production validate
 
+      # Precondition fixture test: verifies that the dispatcher-daemon module
+      # raises a plan-time error when desired_count > 0 and required secret
+      # ARNs are empty. Uses fake AWS credentials so no real API calls are made.
+      - name: Dispatcher precondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/dispatcher-daemon/tests/preconditions/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.

@@ -722,6 +722,17 @@ resource "aws_ecs_task_definition" "dispatcher" {
       }
     }
   ])
+
+  lifecycle {
+    precondition {
+      condition     = var.desired_count == 0 || var.anthropic_api_key_secret_arn != ""
+      error_message = "dispatcher-daemon: anthropic_api_key_secret_arn must be set when desired_count > 0 (phase 2+ needs anthropic_api_key to spawn claude -p)."
+    }
+    precondition {
+      condition     = var.desired_count == 0 || var.db_connection_secret_arn != ""
+      error_message = "dispatcher-daemon: db_connection_secret_arn must be set when desired_count > 0 (phase 2+ needs database_url to persist dispatcher.runs / dispatcher.queue_snapshots)."
+    }
+  }
 }
 
 # ─── ECS Service ────────────────────────────────────────────────────────────
