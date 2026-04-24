@@ -1534,16 +1534,33 @@ run_claude_phase() {
     # rather than a null-deref.
     write_phase_input "$_skill" || true
 
-    log "claude_phase_begin" "phase=$_phase" "skill=$_skill"
     # Do NOT fail the script on a non-zero exit — parse the envelope
     # and let the caller decide. Redirect stderr to a sibling file for
     # triage parity with the daemon.
+    #
+    # #3190: explicitly anchor cwd to $REPO_ROOT for the `claude -p`
+    # invocation. The task-v2-* skills look up their input bundle via
+    # the RELATIVE path ``tmp/dispatcher-input/<phase>.json`` — if the
+    # child process inherits a cwd that isn't the repo root, the
+    # lookup silently misses and the skill emits a string-shaped FAILED
+    # verdict, which the daemon classifies as
+    # ``verify_infra_failure_post_merge`` (silent no-op verify). The
+    # entrypoint runs `cd "$REPO_ROOT"` once at line 190, but wrapping
+    # the claude invocation in an explicit subshell is belt-and-
+    # suspenders: it guarantees the child process cwd regardless of
+    # what any intervening phase handler may have done, AND it gives
+    # the ``cwd=`` field on ``claude_phase_begin`` (logged inside the
+    # subshell) as a self-diagnosing artifact for the next incident.
     set +e
-    claude -p "/task-v2-$_skill $AGENT_ID" \
-        --output-format json \
-        --dangerously-skip-permissions \
-        > "$_out_file" \
-        2> "$AGENT_WORKSPACE/claude-p-$_phase.stderr.log"
+    (
+        cd "$REPO_ROOT" || exit 127
+        log "claude_phase_begin" "phase=$_phase" "skill=$_skill" "cwd=$(pwd)"
+        claude -p "/task-v2-$_skill $AGENT_ID" \
+            --output-format json \
+            --dangerously-skip-permissions \
+            > "$_out_file" \
+            2> "$AGENT_WORKSPACE/claude-p-$_phase.stderr.log"
+    )
     _rc=$?
     set -e
     log "claude_phase_done" "phase=$_phase" "exit_code=$_rc"
