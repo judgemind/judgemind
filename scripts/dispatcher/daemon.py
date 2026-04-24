@@ -18874,6 +18874,86 @@ class DispatcherDaemon:
         )
         return True
 
+    # ── tick cadence metric + slip warning (#2854) ────────────────────────
+
+    def _check_tick_cadence_slip(self, now: float, last_scheduler: float) -> None:
+        """Emit ``daemon.tick_cadence_slip`` WARNING when the scheduler
+        tick is more than 2× late.
+
+        No-ops on the bootstrap tick where ``last_scheduler == 0.0``.
+        No debounce — each late tick fires independently so CloudWatch
+        Insights can count occurrences and the operator can correlate with
+        other log events.
+
+        Args:
+            now: Current ``time.monotonic()`` value.
+            last_scheduler: ``time.monotonic()`` at the previous scheduler
+                tick.  ``0.0`` on the bootstrap tick (skip the check).
+        """
+        if last_scheduler == 0.0:
+            return
+        elapsed = now - last_scheduler
+        cadence = self._cfg.tick_scheduler_seconds
+        if elapsed > 2 * cadence:
+            self._log.warning(
+                "daemon.tick_cadence_slip",
+                extra={
+                    "event": "tick_cadence_slip",
+                    "run_id": self._run_id,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "cadence_seconds": cadence,
+                    "slip_multiple": 2,
+                },
+            )
+
+    def _emit_tick_cadence_metric(self, elapsed_seconds: float) -> bool:
+        """Publish ``TickCadenceSeconds`` to the configured CloudWatch namespace.
+
+        Returns True on success, False on failure.  Mirrors
+        :meth:`_emit_heartbeat_metric` — same lazy boto3 client, same
+        namespace, same ``Service`` dimension, same failure → log + reset
+        policy so a transient CloudWatch outage does not poison the daemon.
+
+        Args:
+            elapsed_seconds: Wall-clock seconds since the previous scheduler
+                tick.  Passed in by ``run_forever`` which already computed
+                ``now - last_scheduler``.
+        """
+        service_dim = self._cfg.dispatcher_service_name or self._cfg.host
+
+        try:
+            if self._cloudwatch_client is None:
+                self._cloudwatch_client = self._make_cloudwatch_client()
+            self._cloudwatch_client.put_metric_data(
+                Namespace=self._cfg.heartbeat_metric_namespace,
+                MetricData=[
+                    {
+                        "MetricName": "TickCadenceSeconds",
+                        "Dimensions": [
+                            {"Name": "Service", "Value": service_dim},
+                        ],
+                        "Value": elapsed_seconds,
+                        "Unit": "Seconds",
+                    }
+                ],
+            )
+        except Exception as exc:
+            # Reset the client so the next tick re-creates it — mirrors
+            # the heartbeat metric error path.
+            self._cloudwatch_client = None
+            self._log.warning(
+                "daemon.tick_cadence_metric_failed",
+                extra={
+                    "event": "tick_cadence_metric_failed",
+                    "run_id": self._run_id,
+                    "namespace": self._cfg.heartbeat_metric_namespace,
+                    "detail": str(exc),
+                },
+            )
+            return False
+
+        return True
+
     # ── per-agent ECS launcher + reaper (#3091 Stage 2) ─────────────────
     #
     # These methods wire the daemon to the ``judgemind-dispatcher-agent-
@@ -20165,6 +20245,17 @@ class DispatcherDaemon:
             now = time.monotonic()
             try:
                 if now - last_scheduler >= self._cfg.tick_scheduler_seconds:
+                    # #2854: emit cadence metric + slip warning before the
+                    # tick body.  Skip on the bootstrap tick (last_scheduler
+                    # is only 0.0 when we reach this branch via the seeded
+                    # ``last_scheduler = time.monotonic()`` from the boot
+                    # block, so by the time the main loop fires for the
+                    # first time ``last_scheduler > 0.0`` — still correct
+                    # to guard on the 0.0 sentinel for safety).
+                    if last_scheduler > 0.0:
+                        elapsed = now - last_scheduler
+                        self._check_tick_cadence_slip(now, last_scheduler)
+                        self._emit_tick_cadence_metric(elapsed)
                     self.scheduler_tick()
                     last_scheduler = now
                 if now - last_supervisor >= self._cfg.tick_supervisor_seconds:

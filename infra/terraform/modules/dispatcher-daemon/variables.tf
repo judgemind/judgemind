@@ -140,6 +140,12 @@ variable "heartbeat_stale_seconds" {
   default     = 300
 }
 
+variable "tick_cadence_slow_seconds" {
+  description = "Threshold for the scheduler tick cadence alarm. When the p95 TickCadenceSeconds metric exceeds this value over a 5-minute window, the alarm fires. Default 90 (1.5× the 60s default cadence). See issue #2854."
+  type        = number
+  default     = 90
+}
+
 # ─── Oneshot task launcher (scripts/ecs-run-task.sh) ────────────────────────
 # When these ARNs are wired, the daemon's task role gets the permission set
 # required by `scripts/ecs-run-task.sh` so ralph phases can launch data

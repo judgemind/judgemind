@@ -42,3 +42,8 @@ output "heartbeat_alarm_arn" {
   description = "ARN of the heartbeat staleness CloudWatch alarm (empty when enable_alerts is false)"
   value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.heartbeat_stale[0].arn : ""
 }
+
+output "scheduler_tick_cadence_alarm_arn" {
+  description = "ARN of the scheduler tick cadence CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.scheduler_tick_cadence_slow[0].arn : ""
+}

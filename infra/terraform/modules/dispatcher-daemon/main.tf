@@ -813,3 +813,38 @@ resource "aws_cloudwatch_metric_alarm" "heartbeat_stale" {
   alarm_actions = [var.alert_sns_topic_arn]
   ok_actions    = [var.alert_sns_topic_arn]
 }
+
+# ── scheduler tick cadence alarm (#2854) ──────────────────────────────────────
+#
+# Alarms when the p95 TickCadenceSeconds metric (emitted by the daemon just
+# before each scheduler_tick call) exceeds ``tick_cadence_slow_seconds``
+# over a 5-minute window.  Uses p95 so a single slow tick inside a healthy
+# window does not page; a persistently degraded loop will.
+#
+# ``treat_missing_data = "notBreaching"`` — the heartbeat alarm already
+# covers silence (daemon crashed / no metric at all).  This alarm
+# complements it: daemon is alive but ticking too slowly.
+
+resource "aws_cloudwatch_metric_alarm" "scheduler_tick_cadence_slow" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-scheduler-tick-cadence-slow"
+  alarm_description = "Dispatcher scheduler tick p95 cadence exceeded ${var.tick_cadence_slow_seconds}s over a 5-minute window (${var.environment}). The main loop is running slower than expected — check ${aws_cloudwatch_log_group.dispatcher.name} for daemon.tick_cadence_slip events. Issue #2854."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "TickCadenceSeconds"
+  extended_statistic = "p95"
+  dimensions = {
+    Service = local.service_name
+  }
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.tick_cadence_slow_seconds
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
