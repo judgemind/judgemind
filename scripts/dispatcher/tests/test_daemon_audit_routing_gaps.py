@@ -976,3 +976,193 @@ class TestVerifyFailedPostMergeCandidatePickup:
         assert cand["category"] == daemon.FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE
         assert cand["tier"] == 3
         assert cand["issue_number"] == 3071
+
+
+# ==========================================================================
+# #2966 — fix-ci force-with-lease and rebase_outcome log event
+# ==========================================================================
+
+
+class TestFixCiForceWithLease:
+    """Verify that ``_apply_fix_ci_patch`` pushes with ``--force-with-lease``.
+
+    After a rebase (Step 0 of the fix-ci skill), the branch's SHAs are
+    rewritten so a bare ``git push`` would be rejected. The daemon must
+    use ``--force-with-lease`` to allow the rebase-rewritten history
+    through while still guarding against concurrent remote writes.
+    """
+
+    def test_push_uses_force_with_lease(self, tmp_path: Path) -> None:
+        """The push command list in ``_apply_fix_ci_patch`` must include
+        ``--force-with-lease`` (AC2, issue #2966)."""
+        import subprocess as _subprocess  # noqa: PLC0415
+
+        d, _conn, _handler = _make_daemon(tmp_path, scope="fix_ci_fwl")
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "tmp").mkdir(parents=True, exist_ok=True)
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+            captured_cmds.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "ok"
+            result.stderr = ""
+            return result
+
+        orig_run = _subprocess.run
+
+        def fake_subprocess_with_retry(
+            cmd: list[str], *, event_name: str, **kwargs: Any
+        ) -> dict[str, Any]:
+            captured_cmds.append(list(cmd))
+            return {"ok": True}
+
+        d._subprocess_with_retry = fake_subprocess_with_retry  # type: ignore[method-assign]
+        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
+        d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
+        d._increment_retries_used = MagicMock()  # type: ignore[method-assign]
+
+        try:
+            _subprocess.run = fake_run  # type: ignore[assignment]
+            agent = {
+                "agent_id": "agent-fwl-test",
+                "worktree_path": str(worktree),
+                "retries_used": 0,
+                "issue_number": 2966,
+                "pr_number": 9966,
+            }
+            fix_ci_output = {
+                "verdict": "PATCHED",
+                "commit_message": "fix(ci): test force-with-lease — CI (#9966)",
+                "changed_files": ["foo.py"],
+                "rebase_outcome": "clean",
+            }
+            d._apply_fix_ci_patch(agent, fix_ci_output)
+        finally:
+            _subprocess.run = orig_run  # type: ignore[assignment]
+
+        # The git push command must contain --force-with-lease
+        push_cmds = [cmd for cmd in captured_cmds if "push" in cmd]
+        assert push_cmds, "Expected at least one push command to be issued"
+        push_cmd = push_cmds[-1]  # last push is the actual remote push
+        assert "--force-with-lease" in push_cmd, (
+            f"Expected --force-with-lease in push cmd, got: {push_cmd}"
+        )
+        # Must NOT use bare --force
+        assert "--force" not in [
+            arg for arg in push_cmd if arg != "--force-with-lease"
+        ], "push cmd must not use bare --force"
+
+
+class TestFixCiRebaseOutcomeLogEvent:
+    """Verify ``_run_fix_ci`` emits a ``daemon.fix_ci_rebase_outcome`` log
+    event unconditionally after parsing the fix-ci output JSON (AC6, issue
+    #2966).
+
+    Three parametrized cases: clean / resolved / conflict_unresolvable.
+    Also covers the None case (old skill payload without rebase_outcome).
+    """
+
+    def _patch(
+        self,
+        d: "daemon.DispatcherDaemon",
+        *,
+        fix_ci_output: dict[str, Any],
+    ) -> None:
+        d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
+        d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
+        d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
+        d._read_phase_output = MagicMock(return_value=fix_ci_output)  # type: ignore[method-assign]
+        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
+        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
+        d._extract_failing_jobs = MagicMock(return_value=[])  # type: ignore[method-assign]
+        d._fetch_pr_diff = MagicMock(return_value="")  # type: ignore[method-assign]
+        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
+        d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
+        d._apply_fix_ci_patch = MagicMock()  # type: ignore[method-assign]
+
+    def _run(
+        self, tmp_path: Path, *, scope: str, fix_ci_output: dict[str, Any]
+    ) -> "_CapturingLogHandler":
+        d, _conn, handler = _make_daemon(tmp_path, scope=scope)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        self._patch(d, fix_ci_output=fix_ci_output)
+        agent = {
+            "agent_id": f"agent-{scope}",
+            "pr_number": 9966,
+            "issue_number": 2966,
+            "worktree_path": str(worktree),
+            "retries_used": 0,
+        }
+        d._run_fix_ci(agent, {"statusCheckRollup": []})
+        return handler
+
+    def test_rebase_outcome_clean_logged(self, tmp_path: Path) -> None:
+        handler = self._run(
+            tmp_path,
+            scope="fci_ro_clean",
+            fix_ci_output={
+                "verdict": "PATCHED",
+                "commit_message": "fix(ci): clean rebase — CI (#9966)",
+                "changed_files": ["a.py"],
+                "rebase_outcome": "clean",
+            },
+        )
+        events = handler.events("fix_ci_rebase_outcome")
+        assert len(events) == 1, (
+            f"Expected 1 fix_ci_rebase_outcome event, got {len(events)}"
+        )
+        assert getattr(events[0], "rebase_outcome", None) == "clean"
+        assert getattr(events[0], "pr_number", None) == 9966
+
+    def test_rebase_outcome_resolved_logged(self, tmp_path: Path) -> None:
+        handler = self._run(
+            tmp_path,
+            scope="fci_ro_resolved",
+            fix_ci_output={
+                "verdict": "PATCHED",
+                "commit_message": "fix(ci): resolved rebase — CI (#9966)",
+                "changed_files": ["b.py"],
+                "rebase_outcome": "resolved",
+            },
+        )
+        events = handler.events("fix_ci_rebase_outcome")
+        assert len(events) == 1
+        assert getattr(events[0], "rebase_outcome", None) == "resolved"
+
+    def test_rebase_outcome_conflict_unresolvable_logged(self, tmp_path: Path) -> None:
+        handler = self._run(
+            tmp_path,
+            scope="fci_ro_unresolvable",
+            fix_ci_output={
+                "verdict": "BLOCKED",
+                "block_reason": "Semantic collision in foo.py vs main commit abc123",
+                "rebase_outcome": "conflict_unresolvable",
+                "changed_files": [],
+                "commit_message": "",
+            },
+        )
+        events = handler.events("fix_ci_rebase_outcome")
+        assert len(events) == 1
+        assert getattr(events[0], "rebase_outcome", None) == "conflict_unresolvable"
+
+    def test_rebase_outcome_none_logged_for_old_skills(self, tmp_path: Path) -> None:
+        """Old skill payloads without rebase_outcome log rebase_outcome=None —
+        they are trivially spottable in CloudWatch (issue #2966)."""
+        handler = self._run(
+            tmp_path,
+            scope="fci_ro_none",
+            fix_ci_output={
+                "verdict": "PATCHED",
+                "commit_message": "fix(ci): no rebase_outcome field — CI (#9966)",
+                "changed_files": ["c.py"],
+                # No rebase_outcome field
+            },
+        )
+        events = handler.events("fix_ci_rebase_outcome")
+        assert len(events) == 1
+        assert getattr(events[0], "rebase_outcome", "MISSING") is None

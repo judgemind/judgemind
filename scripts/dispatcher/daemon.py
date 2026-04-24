@@ -12961,6 +12961,17 @@ class DispatcherDaemon:
             log_text=self._read_full_phase_log(worktree, "fix-ci") or None,
             usage=self._parse_phase_usage(worktree, "fix-ci"),
         )
+        rebase_outcome = fix_ci_output.get("rebase_outcome")
+        self._log.info(
+            "daemon.fix_ci_rebase_outcome",
+            extra={
+                "event": "fix_ci_rebase_outcome",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "pr_number": pr_number,
+                "rebase_outcome": rebase_outcome,
+            },
+        )
         verdict = str(fix_ci_output.get("verdict") or "").upper()
 
         if verdict == "PATCHED":
@@ -13303,11 +13314,15 @@ class DispatcherDaemon:
         # Issue #3089: hot-path ``git push`` in fix-CI — retry
         # transient flakes before routing to the diagnoser. Same
         # rationale as ``_push_and_open_pr``'s push retry.
+        # Issue #2966: use --force-with-lease so post-rebase pushes
+        # succeed (rebase rewrites SHAs) while still guarding against
+        # concurrent remote writes.
         push_cmd = [
             "git",
             "-C",
             str(worktree),
             "push",
+            "--force-with-lease",
             "origin",
             branch,
         ]

@@ -510,3 +510,77 @@ class TestTaskV2RalphHeartbeats:
         so operators know where CloudWatch tagging happens."""
         content = _read(_TASK_V2_RALPH_SKILL)
         assert "stream_forwarder.py" in content or "stream-forwarder" in content
+
+
+# ------------------------------------------------------------------
+# Issue #2966 — task-v2-fix-ci: rebase-first step + force-with-lease
+# ------------------------------------------------------------------
+
+
+class TestTaskV2FixCiSkillContracts:
+    """Contract tests for ``.claude/skills/task-v2-fix-ci/SKILL.md``.
+
+    These grep-style assertions catch regressions where an edit removes
+    or renames a required marker introduced by issue #2966 (mandatory
+    rebase + force-with-lease push).
+    """
+
+    _SKILL_PATH = _REPO_ROOT / ".claude" / "skills" / "task-v2-fix-ci" / "SKILL.md"
+
+    def _content(self) -> str:
+        return _read(self._SKILL_PATH)
+
+    def test_rebase_first_step_present(self) -> None:
+        """Step 0 must document the mandatory fetch + rebase commands
+        (AC1, issue #2966).
+
+        The exact form is ``git -C <worktree_path> fetch origin main`` and
+        ``git -C <worktree_path> rebase origin/main`` — we check for the
+        distinctive ``fetch origin main`` and ``rebase origin/main``
+        substrings which are present in both the -C and plain forms.
+        """
+        content = self._content()
+        assert "fetch origin main" in content, (
+            "task-v2-fix-ci/SKILL.md must document a `fetch origin main` "
+            "command in Step 0 (issue #2966 AC1)"
+        )
+        assert "rebase origin/main" in content, (
+            "task-v2-fix-ci/SKILL.md must document a `rebase origin/main` "
+            "command in Step 0 (issue #2966 AC1)"
+        )
+
+    def test_force_with_lease_documented(self) -> None:
+        """The output contract must explain ``--force-with-lease`` semantics
+        (AC2, issue #2966)."""
+        content = self._content()
+        assert "--force-with-lease" in content, (
+            "task-v2-fix-ci/SKILL.md must document --force-with-lease "
+            "push semantics (issue #2966 AC2)"
+        )
+
+    def test_rebase_outcome_field_documented(self) -> None:
+        """The output contract must name the ``rebase_outcome`` field
+        (issue #2966)."""
+        content = self._content()
+        assert "rebase_outcome" in content, (
+            "task-v2-fix-ci/SKILL.md must document the rebase_outcome "
+            "output field (issue #2966)"
+        )
+
+    def test_conflict_unresolvable_enum_value_documented(self) -> None:
+        """The ``conflict_unresolvable`` enum value must appear in the
+        output contract (issue #2966)."""
+        content = self._content()
+        assert "conflict_unresolvable" in content, (
+            "task-v2-fix-ci/SKILL.md must document the conflict_unresolvable "
+            "rebase_outcome value (issue #2966)"
+        )
+
+    def test_fix_ci_rebase_outcome_heartbeat_documented(self) -> None:
+        """The skill must document the ``FIX_CI_REBASE_OUTCOME`` heartbeat
+        line (AC6 observability, issue #2966)."""
+        content = self._content()
+        assert "FIX_CI_REBASE_OUTCOME" in content, (
+            "task-v2-fix-ci/SKILL.md must document the FIX_CI_REBASE_OUTCOME "
+            "heartbeat echo line (issue #2966 AC6)"
+        )
