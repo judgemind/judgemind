@@ -141,6 +141,19 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
   // flows through the animation path without changing Apollo's cache
   // behaviour. On first paint we initialise synchronously — the very
   // first frame would have no "old" snapshot to animate from anyway.
+  //
+  // #3220: also bypass the wrapper while any cockpit dialog is open.
+  // #3206 stripped `viewTransitionName` from panel rows when a dialog is
+  // open, but `document.startViewTransition` *always* snapshots the root
+  // viewport into `::view-transition-*(root)` regardless of whether any
+  // named targets exist. Native scrollbars are browser UI — not DOM
+  // content — so they're not captured in the root snapshot and briefly
+  // disappear during the ~250ms cross-fade. On the dialog's
+  // `max-h-[60vh] overflow-y-auto` body, that produces a 2s on/off
+  // scrollbar flicker matching the poll cadence. Synchronous update
+  // while a dialog is open side-steps the root transition entirely.
+  // When the dialog closes, the next poll goes back through
+  // `startViewTransitionUpdate` and Magic Move resumes on the panels.
   const [renderedData, setRenderedData] = useState<DispatcherStateData | undefined>(
     data,
   );
@@ -151,13 +164,15 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     if (data === lastAppliedDataRef.current) return;
     const hasPrior = lastAppliedDataRef.current !== undefined;
     lastAppliedDataRef.current = data;
-    if (!hasPrior) {
+    if (!hasPrior || fullDialogKind !== null) {
       // First successful fetch — no prior frame to transition from.
+      // Dialog open (#3220) — skip the root view-transition to avoid
+      // scrollbar flicker on the dialog's scroll container.
       setRenderedData(data);
       return;
     }
     startViewTransitionUpdate(() => setRenderedData(data));
-  }, [data, startViewTransitionUpdate]);
+  }, [data, fullDialogKind, startViewTransitionUpdate]);
 
   const [dispatcherControl, { loading: controlLoading }] =
     useMutation<DispatcherControlData>(DISPATCHER_CONTROL_MUTATION);
