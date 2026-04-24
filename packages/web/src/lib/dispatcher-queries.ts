@@ -237,7 +237,7 @@ export interface QueueItem {
   title: string;
   priority: string | null;
   labels: string[];
-  createdAt: string;
+  createdAt: string | null;
   blockedBy: number[];
   /** Seconds left in the post-failure cooldown window. Null when no prior
    * attempt exists (never attempted) or when cooldown has elapsed.

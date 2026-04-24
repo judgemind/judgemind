@@ -52,7 +52,7 @@ interface SnapshotIssueRecord {
   number: number;
   title: string;
   labels: string[];
-  createdAt: string;
+  createdAt: string | null;
   /** Only populated for blocked snapshots (daemon omits on queue scan). */
   body?: string | null;
 }
@@ -370,7 +370,9 @@ function normalizeSnapshotJson(raw: unknown): SnapshotIssueRecord[] {
     if (typeof number !== 'number') continue;
     const title = typeof record.title === 'string' ? record.title : '';
     const createdAt =
-      typeof record.createdAt === 'string' ? record.createdAt : '';
+      typeof record.createdAt === 'string' && record.createdAt !== ''
+        ? record.createdAt
+        : null;
     const labelsRaw = Array.isArray(record.labels) ? record.labels : [];
     const labels = labelsRaw.filter((l): l is string => typeof l === 'string');
     const body =
@@ -647,8 +649,8 @@ function comparePriorityThenCreatedAtAsc(
   const ra = priorityRank(a.labels);
   const rb = priorityRank(b.labels);
   if (ra !== rb) return ra - rb;
-  const ca = a.createdAt || '';
-  const cb = b.createdAt || '';
+  const ca = a.createdAt ?? '';
+  const cb = b.createdAt ?? '';
   if (ca === cb) return 0;
   if (ca === '') return 1;
   if (cb === '') return -1;
