@@ -137,3 +137,7 @@ The GitHub API allows 5,000 requests per hour per authentication token. When mul
 
 - **Always use `--interval 60` with `gh run watch`.** The default poll interval is 3 seconds, which burns through API budget fast. Use `gh run watch <id> --repo judgemind/judgemind --interval 60 --exit-status --compact` as the standard CI/deploy watch command. This achieves the same rate savings as manual polling loops with simpler code.
 - **Never tight-loop on 403 errors.** If you get a rate limit response, always check the reset time via `gh api rate_limit` and sleep until it passes.
+
+## No API-side GitHub fetches
+
+`packages/api/src/` must not call GitHub's REST API directly. GitHub data enrichment belongs to the dispatcher daemon, which persists results to `dispatcher.*` tables for the API to read without burning the shared PAT budget. `GITHUB_TOKEN` has been removed from the API task-def (`infra/terraform/modules/api-service/main.tf`) — its absence is load-bearing. If a future feature needs GitHub data, the daemon is the only place that should be fetching it. Enforced by `scripts/check-no-api-github-fetch.sh` and the `no-api-github-fetch-check` CI job. See issue #2820.
