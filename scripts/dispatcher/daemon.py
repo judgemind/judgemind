@@ -8297,7 +8297,8 @@ class DispatcherDaemon:
         :data:`POST_MERGE_PHASES_USING_BASELINE_CWD`; the spawn code
         below inherits the correct cwd automatically.
         """
-        max_turns = PHASE_MAX_TURNS[phase]
+        overrides = self._read_max_turns_overrides()
+        max_turns = self._max_turns_for_phase(phase, overrides=overrides)
         model = self._model_for_phase(phase, agent_id)
         log_path = worktree / "tmp" / f"claude-p-{phase}.log"
         stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
@@ -15112,6 +15113,74 @@ class DispatcherDaemon:
                 cur.execute(
                     "SELECT value FROM dispatcher.config WHERE key = %s",
                     ("stuck_timeout_s_by_phase",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return {}
+        if row is None or row[0] is None:
+            return {}
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _max_turns_for_phase(
+        self, phase: str, *, overrides: dict[str, int] | None = None
+    ) -> int:
+        """Return the max_turns cap for a given phase.
+
+        Resolution order (first hit wins):
+
+        1. ``overrides`` argument (a pre-read JSONB object from
+           ``dispatcher.config.max_turns_by_phase`` — read once per
+           spawn call and passed in). Operators can live-edit any
+           phase's cap via this config row without a redeploy.
+        2. :data:`PHASE_MAX_TURNS` — module-level defaults.
+
+        Unknown phase raises ``KeyError`` (same contract as direct
+        ``PHASE_MAX_TURNS[phase]`` access — the dict is the source of
+        truth for valid phase names). Issue #2890.
+        """
+        key = (phase or "").strip()
+        if overrides and key and key in overrides:
+            try:
+                value = int(overrides[key])
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        return PHASE_MAX_TURNS[key]
+
+    def _read_max_turns_overrides(self) -> dict[str, int]:
+        """Read the live ``max_turns_by_phase`` config override.
+
+        Returns an empty dict on missing row, malformed JSON, or any
+        read error — the caller's fallback chain
+        (:meth:`_max_turns_for_phase`) picks up the module defaults
+        cleanly in that case.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("max_turns_by_phase",),
                 )
                 row = cur.fetchone()
             self._conn.commit()

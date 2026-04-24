@@ -1659,6 +1659,56 @@ class TestSpawnPhaseSubprocess:
                 f"phase={phase} cmd missing --dangerously-skip-permissions: {captured['cmd']}"
             )
 
+    def test_max_turns_override_wins_over_default(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Override from dispatcher.config takes precedence over PHASE_MAX_TURNS.
+
+        Issue #2890: when ``_read_max_turns_overrides`` returns a non-empty
+        dict with a key for the requested phase, ``_spawn_phase_subprocess``
+        must pass the override value to ``--max-turns`` instead of the
+        module default (500 for plan).
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        monkeypatch.setattr(d, "_read_max_turns_overrides", lambda: {"plan": 42})
+
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], _kwargs: dict[str, Any]) -> None:
+            captured["cmd"] = cmd
+
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
+        d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
+        assert "42" in captured["cmd"], f"expected '42' in cmd: {captured['cmd']}"
+        assert "500" not in captured["cmd"], (
+            f"module default '500' should not appear when override is active: {captured['cmd']}"
+        )
+
+    def test_max_turns_falls_back_to_module_default_when_override_absent(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Empty overrides dict falls through to PHASE_MAX_TURNS module default.
+
+        Issue #2890: when ``_read_max_turns_overrides`` returns an empty dict
+        (e.g. row absent from dispatcher.config), the plan default of 500 is
+        used for ``--max-turns``.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        monkeypatch.setattr(d, "_read_max_turns_overrides", lambda: {})
+
+        captured: dict[str, Any] = {}
+
+        def on_start(cmd: list[str], _kwargs: dict[str, Any]) -> None:
+            captured["cmd"] = cmd
+
+        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
+        d._spawn_phase_subprocess("plan", tmp_path, "agent-uuid")
+        assert "500" in captured["cmd"], (
+            f"expected plan default '500' in cmd: {captured['cmd']}"
+        )
+
 
 # --------------------------------------------------------------------------
 # _run_subprocess_or_fail — timeout, non-zero exit, missing claude
