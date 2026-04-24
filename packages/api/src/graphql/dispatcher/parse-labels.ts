@@ -92,6 +92,8 @@ export const PRIORITY_RANK_NO_LABEL = 4;
  * Tolerates non-array input (returns the no-label floor) and ignores
  * non-string entries, so a malformed ``issues_json`` row cannot crash
  * the sort.
+ *
+ * Cross-language contract: scripts/dispatcher/tests/fixtures/priority_rank_cases.json is the source of truth; Python mirror is _priority_rank in scripts/dispatcher/daemon.py.
  */
 export function priorityRank(labels: unknown): number {
   if (!Array.isArray(labels)) return PRIORITY_RANK_NO_LABEL;

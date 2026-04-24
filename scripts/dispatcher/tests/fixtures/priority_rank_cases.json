@@ -1,0 +1,42 @@
+[
+  {
+    "name": "p0",
+    "labels": ["priority/p0"],
+    "expected_rank": 0
+  },
+  {
+    "name": "p1",
+    "labels": ["priority/p1"],
+    "expected_rank": 1
+  },
+  {
+    "name": "p2",
+    "labels": ["priority/p2"],
+    "expected_rank": 2
+  },
+  {
+    "name": "p3",
+    "labels": ["priority/p3"],
+    "expected_rank": 3
+  },
+  {
+    "name": "unlabelled",
+    "labels": ["area/devops", "type/bug"],
+    "expected_rank": 4
+  },
+  {
+    "name": "empty",
+    "labels": [],
+    "expected_rank": 4
+  },
+  {
+    "name": "multi_pick_lowest",
+    "labels": ["priority/p2", "priority/p0"],
+    "expected_rank": 0
+  },
+  {
+    "name": "non_string_entries_ignored",
+    "labels": [{"name": "priority/p0"}, 42, null],
+    "expected_rank": 4
+  }
+]

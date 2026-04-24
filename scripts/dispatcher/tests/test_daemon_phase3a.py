@@ -66,6 +66,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -253,6 +255,15 @@ class TestFakeCursorDispatcher:
 # _priority_rank (issue #2835)
 # --------------------------------------------------------------------------
 
+# Cross-language contract: scripts/dispatcher/tests/fixtures/priority_rank_cases.json
+# is the shared source of truth for _priority_rank and its TS mirror priorityRank
+# in packages/api/src/graphql/dispatcher/parse-labels.ts.
+_PRIORITY_RANK_FIXTURE: list[dict] = json.loads(
+    (Path(__file__).parent / "fixtures" / "priority_rank_cases.json").read_text(
+        encoding="utf-8"
+    )
+)
+
 
 class TestPriorityRank:
     """``_priority_rank`` maps label lists to sort ranks (p0 → 0, ...)."""
@@ -307,6 +318,23 @@ class TestPriorityRank:
         ]
         assert ranks == sorted(ranks)
         assert ranks == [0, 1, 2, 3, daemon._PRIORITY_RANK_NO_LABEL]
+
+    @pytest.mark.parametrize(
+        "labels,expected_rank",
+        [(c["labels"], c["expected_rank"]) for c in _PRIORITY_RANK_FIXTURE],
+        ids=[c["name"] for c in _PRIORITY_RANK_FIXTURE],
+    )
+    def test_priority_rank_matches_shared_fixture(
+        self, labels: list, expected_rank: int
+    ) -> None:
+        """Shared cross-language fixture: if either side drifts, this test fails.
+
+        The fixture at scripts/dispatcher/tests/fixtures/priority_rank_cases.json
+        is the source of truth.  The TS mirror lives in
+        packages/api/tests/dispatcher-enrichment.unit.test.ts under
+        describe('priorityRank', ...).
+        """
+        assert daemon._priority_rank(labels) == expected_rank
 
 
 # --------------------------------------------------------------------------
