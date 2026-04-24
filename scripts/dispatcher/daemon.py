@@ -12205,6 +12205,9 @@ class DispatcherDaemon:
         supervisor tick re-attempts a second unstick instead of
         classifying as exhausted, which at most burns one extra empty
         commit before the real failure surfaces.
+
+        exec-mode-agnostic (#3158): merge-unstick counter bump;
+        mode-independent (merge is daemon-owned for both modes).
         """
         assert self._conn is not None, "connect() must run before update"
         try:
