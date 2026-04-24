@@ -64,6 +64,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import logging
 import os
@@ -72,6 +73,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -303,6 +305,27 @@ KILLSWITCH_TERMINAL_PHASE = "paused_by_killswitch"
 #: Used by :meth:`DispatcherDaemon._check_killswitch_and_abort` when
 #: :attr:`DispatcherDaemon._force_stop_requested` is set.
 FORCE_STOP_TERMINAL_PHASE = "force_stopped"
+
+#: #3184 — orphan orchestration thread recovery threshold.
+#:
+#: The 2026-04-24 08:03-08:26Z incident showed that a ``force_stop`` on a
+#: subprocess-mode agent could leave the orchestration worker thread
+#: ``is_alive() == True`` while the DB row was flipped to
+#: ``status='crashed'`` — wedging :meth:`DispatcherDaemon._maybe_spawn_orchestration_thread`
+#: indefinitely (every subsequent tick saw the live handle and bailed).
+#:
+#: The supervisor guard in :meth:`DispatcherDaemon.scheduler_tick` counts
+#: consecutive ticks where the thread is alive AND
+#: :meth:`DispatcherDaemon._has_active_agent` returns False. After this
+#: many consecutive orphan observations the daemon emits
+#: ``orchestration_orphaned`` and resets the thread handle so the next
+#: tick can spawn a fresh thread. Five ticks at the default 30s cadence
+#: is ~150s — well below the incident's 23min wedge, comfortably above
+#: the 60s AC target, and wide enough to tolerate transient mismatches
+#: between the DB row's terminal status write and the thread's actual
+#: exit (e.g. the thread takes one more DB round-trip to finish its
+#: phase-transitions write before returning).
+ORCHESTRATION_ORPHAN_TICK_THRESHOLD = 5
 
 #: Maximum time :meth:`DispatcherDaemon.run_forever` waits for the
 #: orchestration worker thread to exit during shutdown (#2847). If the
@@ -1987,6 +2010,39 @@ class DispatcherDaemon:
         # handler.
         self._graceful_stop_requested: bool = False
         self._force_stop_requested: bool = False
+        # #3184 — orphan-orchestration-thread recovery state.
+        #
+        # The 2026-04-24 incident showed ``force_stop`` on a subprocess-
+        # mode agent could leave the orchestration worker thread alive
+        # indefinitely; the supervisor guard in ``scheduler_tick``
+        # counts consecutive ticks where
+        # ``_orchestration_thread_alive() and not _has_active_agent()``,
+        # logs ``orchestration_orphaned`` on the
+        # :data:`ORCHESTRATION_ORPHAN_TICK_THRESHOLD`-th consecutive
+        # observation, and resets ``_orchestration_thread`` to None so
+        # the next tick can spawn a fresh thread. A tick that does NOT
+        # see the orphan state (e.g. an active agent appeared, or the
+        # thread handle was already cleared) resets the counter to 0 —
+        # the threshold is "consecutive," not "cumulative."
+        self._orchestration_orphan_tick_count: int = 0
+        # #3184 — instrumentation hooks for the force-stop wedge.
+        #
+        # Each ``force_stop`` command that targets a specific agent_id
+        # (subprocess or ECS) appends here. The first subsequent
+        # ``orchestration_in_progress`` observation (i.e. the helper
+        # sees a live thread from a prior tick and declines to spawn)
+        # emits a one-shot ``orchestration_thread_stuck_after_force_stop``
+        # event with a :mod:`faulthandler` all-thread traceback so the
+        # next wedge self-diagnoses in CloudWatch. The set is unbounded
+        # but entries are cheap (UUID strings); an operator-driven
+        # rate of force_stop is bounded by human reaction time so no
+        # pruning is needed for the daemon's lifetime.
+        self._force_stopped_agent_ids: set[str] = set()
+        # Tracks whether the one-shot dump has already fired for the
+        # *current* orchestration thread handle — cleared whenever
+        # ``_maybe_spawn_orchestration_thread`` swaps in a new thread
+        # so a fresh wedge on a fresh thread re-triggers the dump.
+        self._force_stop_wedge_dump_emitted: bool = False
         # Observation record: the most recent ``concurrency_cap`` value
         # read by scheduler_tick and when (monotonic seconds since
         # boot). Used by tests and by the ``daemon.scheduler_tick``
@@ -2464,6 +2520,13 @@ class DispatcherDaemon:
         # tick can try again. Worker-thread exceptions are caught in
         # ``_orchestration_worker_entry``.
         orchestration_attempted = False
+        # #3184 — capture the result of ``_has_active_agent`` when we
+        # call it inside the claim gate so the supervisor orphan check
+        # below can reuse it without a second DB round-trip. ``None``
+        # here means "not checked this tick" (rate-skipped or paused
+        # branches), which is also the signal for the orphan check to
+        # skip this tick and reset the counter.
+        has_active_agent_this_tick: bool | None = None
         rate_skip_active = self._gh_rate_skip_active()
         if rate_skip_active:
             self._log.info(
@@ -2480,25 +2543,73 @@ class DispatcherDaemon:
             concurrency_cap is not None
             and concurrency_cap > 0
             and not self._is_paused()
-            and not self._has_active_agent()
         ):
-            try:
-                orchestration_attempted = self._maybe_spawn_orchestration_thread()
-            except Exception:
-                # Daemon survival takes precedence over any single
-                # orchestration spawn. The helper logs specific failures
-                # internally; this is the belt-and-braces catch.
-                self._log.exception(
-                    "daemon.orchestration_spawn_failed",
-                    extra={
-                        "event": "orchestration_spawn_failed",
-                        "run_id": self._run_id,
-                    },
-                )
+            has_active_agent_this_tick = self._has_active_agent()
+            if not has_active_agent_this_tick:
+                try:
+                    orchestration_attempted = self._maybe_spawn_orchestration_thread()
+                except Exception:
+                    # Daemon survival takes precedence over any single
+                    # orchestration spawn. The helper logs specific failures
+                    # internally; this is the belt-and-braces catch.
+                    self._log.exception(
+                        "daemon.orchestration_spawn_failed",
+                        extra={
+                            "event": "orchestration_spawn_failed",
+                            "run_id": self._run_id,
+                        },
+                    )
 
         self._scheduler_ticks += 1
         orchestration_thread_alive = self._orchestration_thread_alive()
         pause_requested = self._pause_requested.is_set()
+        # #3184 — supervisor orphan detection. When a ``force_stop``
+        # leaves the orchestration thread stuck ``is_alive() == True``
+        # while the DB row has already flipped to a terminal status,
+        # this guard catches the mismatch and resets the thread handle
+        # so the next tick can spawn a fresh worker. The check is
+        # intentionally scoped to ticks where we ALSO verified
+        # ``_has_active_agent()`` this same tick — that is the only
+        # path where we have a consistent "thread alive AND no active
+        # agent" observation. Rate-skipped and paused ticks (where
+        # ``has_active_agent_this_tick is None``) fall through to the
+        # else branch and reset the counter — those ticks provide no
+        # evidence of the wedge in either direction.
+        if orchestration_thread_alive and has_active_agent_this_tick is False:
+            self._orchestration_orphan_tick_count += 1
+            if (
+                self._orchestration_orphan_tick_count
+                >= ORCHESTRATION_ORPHAN_TICK_THRESHOLD
+            ):
+                # Capture the wedged thread's name while the lock is
+                # held so the log event identifies exactly which
+                # thread got abandoned.
+                with self._orchestration_thread_lock:
+                    wedged = self._orchestration_thread
+                    wedged_name = wedged.name if wedged is not None else None
+                    self._orchestration_thread = None
+                self._log.warning(
+                    "daemon.orchestration_orphaned",
+                    extra={
+                        "event": "orchestration_orphaned",
+                        "run_id": self._run_id,
+                        "thread_name": wedged_name,
+                        "tick_count": self._orchestration_orphan_tick_count,
+                        "detail": (
+                            "orchestration thread alive but no active "
+                            "dispatcher.agents row; resetting handle so "
+                            "the next scheduler tick can spawn a fresh "
+                            "worker (see #3184)"
+                        ),
+                    },
+                )
+                # Reset observables — both the counter (consecutive-
+                # tick semantic) and the local snapshot that the
+                # log event below will emit.
+                self._orchestration_orphan_tick_count = 0
+                orchestration_thread_alive = False
+        else:
+            self._orchestration_orphan_tick_count = 0
         self._log.info(
             "daemon.scheduler_tick",
             extra={
@@ -2823,6 +2934,16 @@ class DispatcherDaemon:
                     # Foreign host pid — not an error either.
                     pass
 
+            # #3184 — record the force-stopped agent_id so the next
+            # ``orchestration_in_progress`` observation (if the worker
+            # thread doesn't exit promptly) can dump an all-thread
+            # traceback via :mod:`faulthandler`. Both subprocess and
+            # ECS branches land here. The set is cleared on natural
+            # thread exit (see _maybe_spawn_orchestration_thread dead-
+            # handle cleanup) so a well-behaved force_stop never emits
+            # the stuck event.
+            self._force_stopped_agent_ids.add(str(agent_id))
+
             self._log.info(
                 "daemon.command_force_stop_agent_applied",
                 extra={
@@ -3007,6 +3128,46 @@ class DispatcherDaemon:
                         "thread_name": thread.name,
                     },
                 )
+                # #3184 — one-shot wedge instrumentation. If a
+                # ``force_stop`` (per-agent) has fired but the worker
+                # thread is still alive, emit a faulthandler all-thread
+                # traceback so the next wedge self-diagnoses. Gated on
+                # ``_force_stop_wedge_dump_emitted`` so we log once per
+                # thread handle — the orphan recovery path clears the
+                # handle, which re-arms the flag on the next spawn.
+                if (
+                    self._force_stopped_agent_ids
+                    and not self._force_stop_wedge_dump_emitted
+                ):
+                    try:
+                        # ``faulthandler.dump_traceback`` requires a real
+                        # file descriptor (``fileno()``) — StringIO does
+                        # not satisfy that. A short-lived ``TemporaryFile``
+                        # captures the dump without leaking to disk.
+                        with tempfile.TemporaryFile(
+                            mode="w+", prefix="dispatcher-faulthandler-"
+                        ) as buf:
+                            faulthandler.dump_traceback(file=buf, all_threads=True)
+                            buf.seek(0)
+                            traceback_text = buf.read()
+                    except Exception:
+                        # Never let an instrumentation failure propagate
+                        # into the scheduler hot path. An empty tb is
+                        # still a signal that the wedge was observed.
+                        traceback_text = ""
+                    self._log.warning(
+                        "daemon.orchestration_thread_stuck_after_force_stop",
+                        extra={
+                            "event": "orchestration_thread_stuck_after_force_stop",
+                            "run_id": self._run_id,
+                            "thread_name": thread.name,
+                            "force_stopped_agent_ids": sorted(
+                                self._force_stopped_agent_ids
+                            ),
+                            "traceback": traceback_text,
+                        },
+                    )
+                    self._force_stop_wedge_dump_emitted = True
                 return False
             # Clean up any dead handle so next tick's ``is_alive`` check
             # does not re-log.
@@ -3019,6 +3180,14 @@ class DispatcherDaemon:
                 daemon=True,
             )
             self._orchestration_thread = new_thread
+            # #3184 — a fresh orchestration thread. Re-arm the one-shot
+            # wedge dump so a future force_stop + wedge on THIS thread
+            # will produce its own traceback. We also clear the
+            # recorded force_stopped agent_ids: the prior wedge (if any)
+            # is now resolved, and any future force_stop will re-populate
+            # the set before the next wedge observation.
+            self._force_stop_wedge_dump_emitted = False
+            self._force_stopped_agent_ids.clear()
 
         # Start the thread outside the lock — ``Thread.start`` is cheap
         # but we do not want to hold the handle lock across the actual
