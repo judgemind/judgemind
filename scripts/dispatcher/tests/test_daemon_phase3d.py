@@ -514,30 +514,23 @@ class TestSpawnDiagnoserSubprocess:
             captured["cmd"] = cmd
             captured["kwargs"] = kwargs
 
-        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(on_start=on_start))
-        exit_code, tail = d._spawn_diagnoser_subprocess(777)
-        assert exit_code == 0
-        assert tail == ""
+        monkeypatch.setattr(
+            subprocess, "Popen", make_popen_factory(on_start=on_start, pid=12345)
+        )
+        # #3376 — async fire-and-forget: returns the PID, not (exit, tail).
+        pid = d._spawn_diagnoser_subprocess(777)
+        assert pid == 12345
         assert captured["cmd"][0] == "claude"
         assert captured["cmd"][1] == "-p"
         assert "/diagnose-failure 777" in captured["cmd"][2]
         assert "--model" in captured["cmd"]
         model_idx = captured["cmd"].index("--model")
         assert captured["cmd"][model_idx + 1] == daemon.DIAGNOSER_MODEL
-        # Post-#3017 the diagnoser timeout is enforced via proc.wait(timeout=...),
-        # not subprocess.run(..., timeout=...). The kwargs captured here
-        # come from Popen() itself; the timeout is passed to proc.wait
-        # inside _spawn_diagnoser_subprocess. Verified indirectly via
-        # test_timeout_returns_none_exit below.
+        # #3376: Popen call sets start_new_session=True so the reaper's
+        # SIGTERM/SIGKILL targets the diagnoser's process group only.
+        assert captured["kwargs"].get("start_new_session") is True
 
-    def test_timeout_returns_none_exit(self, monkeypatch: Any, tmp_path: Path) -> None:
-        d, _conn, _handler = _make_daemon(tmp_path)
-
-        monkeypatch.setattr(subprocess, "Popen", make_popen_factory(timeout=True))
-        exit_code, _tail = d._spawn_diagnoser_subprocess(1)
-        assert exit_code is None
-
-    def test_binary_missing_returns_none_exit(
+    def test_binary_missing_returns_none(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
@@ -546,9 +539,9 @@ class TestSpawnDiagnoserSubprocess:
             raise FileNotFoundError("claude missing")
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
-        exit_code, tail = d._spawn_diagnoser_subprocess(1)
-        assert exit_code is None
-        assert "claude" in tail.lower() or "not found" in tail.lower()
+        # #3376 — async fire-and-forget: launch failure returns None (no PID).
+        pid = d._spawn_diagnoser_subprocess(1)
+        assert pid is None
 
     def test_command_includes_dangerously_skip_permissions_flag(
         self, monkeypatch: Any, tmp_path: Path
@@ -1054,12 +1047,18 @@ class TestRunDiagnoserPass:
         monkeypatch.setattr(d, "_find_diagnoser_candidates", lambda: [])
         assert d._run_diagnoser_pass() == 0
 
-    def test_subprocess_timeout_triggers_fallback(
+    def test_subprocess_launch_failure_triggers_fallback(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        d, _conn, handler = _make_daemon(tmp_path)
+        """#3376 — when ``_spawn_diagnoser_subprocess`` returns ``None``
+        (claude binary missing / Popen OSError) the spawn pass marks the
+        row failed and falls back to mechanical escalation immediately.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
 
         monkeypatch.setattr(d, "_diagnoser_enabled", lambda: True)
+        monkeypatch.setattr(d, "_max_concurrent_diagnoses", lambda: 5)
+        monkeypatch.setattr(d, "_count_pending_diagnoses_with_pid", lambda: 0)
         monkeypatch.setattr(
             d,
             "_find_diagnoser_candidates",
@@ -1076,7 +1075,9 @@ class TestRunDiagnoserPass:
         )
         monkeypatch.setattr(d, "_build_diagnoser_context", lambda _c: {})
         monkeypatch.setattr(d, "_insert_pending_diagnosis", lambda **_k: 999)
-        monkeypatch.setattr(d, "_spawn_diagnoser_subprocess", lambda _id: (None, ""))
+        # Async-spawn returns None on launch failure (#3376).
+        monkeypatch.setattr(d, "_spawn_diagnoser_subprocess", lambda _id: None)
+        monkeypatch.setattr(d, "_record_diagnoser_subprocess_pid", lambda *_a: None)
         fallback_called = {"n": 0}
 
         def fake_fallback(candidate: dict[str, Any]) -> None:
@@ -1091,17 +1092,22 @@ class TestRunDiagnoserPass:
 
         monkeypatch.setattr(d, "_mark_diagnosis_failed", fake_mark_failed)
 
+        # Async spawn pass returns 0 (no in-flight spawn); fallback ran.
         ran = d._run_diagnoser_pass()
-        assert ran == 1
+        assert ran == 0
         assert fallback_called["n"] == 1
         assert marked_failed["id"] == 999
-        assert "timeout" in marked_failed["reason"].lower()
+        assert marked_failed["reason"] == "subprocess_launch_failure"
 
-    def test_subprocess_nonzero_exit_triggers_fallback(
+    def test_async_spawn_records_pid_and_returns(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        d, _conn, handler = _make_daemon(tmp_path)
+        """#3376 — successful async spawn records the PID and increments
+        the in-flight counter without calling ``_consume_diagnosis``."""
+        d, _conn, _handler = _make_daemon(tmp_path)
         monkeypatch.setattr(d, "_diagnoser_enabled", lambda: True)
+        monkeypatch.setattr(d, "_max_concurrent_diagnoses", lambda: 5)
+        monkeypatch.setattr(d, "_count_pending_diagnoses_with_pid", lambda: 0)
         monkeypatch.setattr(
             d,
             "_find_diagnoser_candidates",
@@ -1118,30 +1124,35 @@ class TestRunDiagnoserPass:
         )
         monkeypatch.setattr(d, "_build_diagnoser_context", lambda _c: {})
         monkeypatch.setattr(d, "_insert_pending_diagnosis", lambda **_k: 888)
-        monkeypatch.setattr(d, "_spawn_diagnoser_subprocess", lambda _id: (1, "boom"))
-        fallback_called = {"n": 0}
-        monkeypatch.setattr(
-            d,
-            "_apply_mechanical_escalation",
-            lambda _c: fallback_called.__setitem__("n", fallback_called["n"] + 1),
-        )
-        marked: dict[str, Any] = {}
-        monkeypatch.setattr(
-            d,
-            "_mark_diagnosis_failed",
-            lambda did, reason: marked.update({"id": did, "reason": reason}),
-        )
+        monkeypatch.setattr(d, "_spawn_diagnoser_subprocess", lambda _id: 9999)
+
+        recorded: dict[str, Any] = {}
+
+        def fake_record(diagnosis_id: int, pid: int) -> None:
+            recorded["id"] = diagnosis_id
+            recorded["pid"] = pid
+
+        monkeypatch.setattr(d, "_record_diagnoser_subprocess_pid", fake_record)
+
+        # The spawn pass MUST NOT call _consume_diagnosis or
+        # _consume_next_directive — those are reaper responsibilities.
+        def boom_consume(*_a: Any, **_k: Any) -> str:
+            raise AssertionError("spawn pass must not consume (#3376 async)")
+
+        monkeypatch.setattr(d, "_consume_diagnosis", boom_consume)
+        monkeypatch.setattr(d, "_consume_next_directive", boom_consume)
+
         ran = d._run_diagnoser_pass()
         assert ran == 1
-        assert fallback_called["n"] == 1
-        assert marked["id"] == 888
-        assert handler.events("diagnoser_nonzero_exit")
+        assert recorded == {"id": 888, "pid": 9999}
 
     def test_insert_failure_still_runs_fallback(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
         monkeypatch.setattr(d, "_diagnoser_enabled", lambda: True)
+        monkeypatch.setattr(d, "_max_concurrent_diagnoses", lambda: 5)
+        monkeypatch.setattr(d, "_count_pending_diagnoses_with_pid", lambda: 0)
         monkeypatch.setattr(
             d,
             "_find_diagnoser_candidates",
@@ -1159,7 +1170,7 @@ class TestRunDiagnoserPass:
         monkeypatch.setattr(d, "_build_diagnoser_context", lambda _c: {})
         monkeypatch.setattr(d, "_insert_pending_diagnosis", lambda **_k: None)
 
-        def bad_spawn(_id: int) -> tuple[int | None, str]:
+        def bad_spawn(_id: int) -> int | None:
             raise AssertionError("must not spawn when insert failed")
 
         monkeypatch.setattr(d, "_spawn_diagnoser_subprocess", bad_spawn)
@@ -1196,6 +1207,7 @@ class TestSupervisorTickDiagnoserIntegration:
         d._check_diagnoser_circuit_breaker = lambda: (  # type: ignore[method-assign]
             called.__setitem__("breaker", called["breaker"] + 1) or False
         )
+        d._reap_diagnoser_subprocesses = lambda: 0  # type: ignore[method-assign]
         d._run_diagnoser_pass = lambda: (  # type: ignore[method-assign]
             called.__setitem__("pass", called["pass"] + 1) or 0
         )
@@ -1218,6 +1230,7 @@ class TestSupervisorTickDiagnoserIntegration:
             raise RuntimeError("breaker exploded")
 
         d._check_diagnoser_circuit_breaker = boom  # type: ignore[method-assign]
+        d._reap_diagnoser_subprocesses = lambda: 0  # type: ignore[method-assign]
         d._run_diagnoser_pass = lambda: 0  # type: ignore[method-assign]
         summary = d.supervisor_tick()
         assert handler.events("diagnoser_circuit_breaker_check_failed")
@@ -1233,6 +1246,7 @@ class TestSupervisorTickDiagnoserIntegration:
         d._process_retry_markers = lambda: 0  # type: ignore[method-assign]
         d._emit_heartbeat_metric = lambda: True  # type: ignore[method-assign]
         d._check_diagnoser_circuit_breaker = lambda: False  # type: ignore[method-assign]
+        d._reap_diagnoser_subprocesses = lambda: 0  # type: ignore[method-assign]
 
         def boom() -> int:
             raise RuntimeError("pass exploded")
