@@ -109,6 +109,38 @@ The dispatcher v2 daemon is an opt-in production replacement for the laptop-disp
 
 Spec: `docs/specs/dispatcher-v2-spec.md` §6 (state machine), §8 (failure taxonomy + diagnoser), §15 (Phase 3 gate).
 
+### How dispatcher-v2 skill changes propagate
+
+Skill files are read from the daemon's baseline clone at worktree-creation time — they are **never baked into the agent-runner image**. Merging a PR that touches only `.claude/skills/**` does not trigger an image rebuild; the new skill content is picked up automatically when the next worktree is created.
+
+**Propagation path:**
+
+1. PR merges to `main`.
+2. Before every `git worktree add`, the daemon calls `_baseline_fetch_origin_main` in `scripts/dispatcher/daemon.py` (~line 5562). This fast-forwards the baseline clone to `origin/main`.
+3. The new worktree is created from the freshly-fetched baseline, so its `.claude/skills/` tree contains the latest committed skill files.
+4. `scripts/dispatcher/agent-runner-entrypoint.sh` runs `cd "$REPO_ROOT"` (line 190, plus the per-phase wrapper at line 1785) before launching each `claude -p /task-v2-<phase>` subprocess — so the skill is resolved from the worktree filesystem, not from anywhere in the container image.
+
+**Why `.claude/skills/**` is absent from the deploy trigger:**
+
+`.github/workflows/deploy-agent-runner.yml` has an explicit `paths:` filter. It deliberately **excludes** `.claude/skills/**` because skill files are not `COPY`'d into the image. Inspecting `Dockerfile.dispatcher-agent-runner` (the COPY block at lines 147–151) confirms only these paths land in the image:
+
+- `scripts/dispatcher/`
+- `scripts/check-issue-author.sh`
+- `scripts/preflight.sh`
+- `scripts/preflight-bash-fargate.sh`
+- `.claude/hooks/preflight_cross_worktree.py`
+
+**What DOES trigger an image rebuild:**
+
+Changes to any of the paths listed above — plus `Dockerfile.dispatcher-agent-runner` or `deploy-agent-runner.yml` itself — fire the deploy workflow. Those changes are picked up by the next `ecs:RunTask` via the `:latest` tag. Changes to `scripts/dispatcher/helpers/`, `scripts/dispatcher/tests/`, or `*.md` files within `scripts/dispatcher/` do **not** trigger a rebuild (excluded by the paths filter).
+
+**Authoritative grep targets:**
+
+- `Dockerfile.dispatcher-agent-runner` — COPY block shows exactly what the image contains.
+- `.github/workflows/deploy-agent-runner.yml` — `paths:` block shows what triggers a rebuild.
+- `scripts/dispatcher/daemon.py` — search `_baseline_fetch_origin_main` for the fetch-before-worktree call.
+- `scripts/dispatcher/agent-runner-entrypoint.sh` — search `cd "$REPO_ROOT"` for the per-phase directory wrapper.
+
 ### Phase 3 cut-over: `concurrency_cap=0` → `1`
 
 **Prerequisites (all required):**
