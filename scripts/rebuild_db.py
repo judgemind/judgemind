@@ -991,6 +991,67 @@ def _resolve_county_court_ids(
         return [str(row[0]) for row in cur.fetchall()]
 
 
+def _resolve_court_code_to_id(
+    conn: psycopg.Connection,
+    court_code: str,
+) -> str:
+    """Look up ``derived.courts.id`` for a given court_code.
+
+    Match is case-insensitive on the stored ``court_code`` column so
+    "CA-Orange" and "ca-orange" both resolve.
+
+    Raises:
+        ValueError: if no court matches ``court_code``.  A typo must not
+            silently resolve to nothing and then delete nothing.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id
+              FROM derived.courts
+             WHERE LOWER(court_code) = LOWER(%s)
+            """,
+            (court_code,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError(
+            f"No court found in derived.courts for court_code={court_code!r}. "
+            "Refusing to reset to avoid silently deleting nothing."
+        )
+    return str(row[0])
+
+
+def _resolve_court_for_reset(
+    conn: psycopg.Connection,
+    court_code: str,
+) -> tuple[str, str, str, str]:
+    """Resolve court_code to (id, state, county, court_name) for the reset path.
+
+    Returns the four-tuple needed to scope both the DB reset and the
+    OpenSearch delete-by-query.
+
+    Raises:
+        ValueError: if court_code is not found in derived.courts.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, state, county, court_name
+              FROM derived.courts
+             WHERE LOWER(court_code) = LOWER(%s)
+            """,
+            (court_code,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError(
+            f"No court found in derived.courts for court_code={court_code!r}. "
+            "Refusing to reset to avoid silently deleting nothing."
+        )
+    return str(row[0]), str(row[1]), str(row[2]), str(row[3])
+
+
 def reset_derived_tables_for_county(
     conn: psycopg.Connection,
     state: str,
@@ -1142,6 +1203,136 @@ def reset_derived_tables_for_county(
     return deleted
 
 
+def reset_derived_tables_for_court(
+    conn: psycopg.Connection,
+    court_code: str,
+) -> dict[str, int]:
+    """Delete per-court rows from derived tables without touching other courts.
+
+    Scoped reset used when ``--reset`` is combined with ``--court <court_code>``.
+    See #3014.
+
+    Behaviour:
+    * Resolves the single ``derived.courts.id`` for ``court_code``.
+    * Logs a pre-delete row count for every affected table so operators can
+      eyeball the scope before DELETEs fire.
+    * Deletes in one transaction.  Join tables (``case_judges``,
+      ``case_parties``, ``case_attorneys``) are deleted first via
+      ``case_id IN (SELECT id FROM cases WHERE court_id = %s)`` so their
+      parent ``cases`` rows can be removed without relying on cascade.
+    * Then deletes rows keyed directly by ``court_id`` from ``documents``,
+      ``rulings``, ``cases``, and ``judges``.
+    * Does **not** touch ``derived.courts`` — the rebuild reseeds on
+      ``ON CONFLICT (court_code)`` and preserving these rows keeps UUIDs
+      stable for cross-schema references like ``telemetry.scraper_runs``.
+    * Does **not** touch county-agnostic entity tables (``attorneys``,
+      ``parties``, ``judge_aliases``, ``attorney_aliases``, ``party_aliases``).
+
+    Raises:
+        ValueError: if no court matches ``court_code``.  Silently
+            matching zero rows would let a typo nuke nothing and rebuild
+            nothing, which is worse than a hard error.
+
+    Returns:
+        ``{table_name: rows_deleted}`` for logging / test assertions.
+    """
+    court_id = _resolve_court_code_to_id(conn, court_code)
+
+    logger.info(
+        "Per-court reset — resolved court",
+        court_code=court_code,
+        court_id=court_id,
+    )
+
+    deleted: dict[str, int] = {}
+    # Wrap the reset in a single transaction: psycopg with ``autocommit=False``
+    # treats the whole block as one transaction and commits at the end.  A
+    # mid-DELETE failure rolls everything back so we can't land in a
+    # half-reset state.
+    with conn.cursor() as cur:
+        # Pre-delete row counts (what we're about to remove).
+        for table in _PER_COUNTY_CASE_JOIN_TABLES:
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM derived.{table} jt
+                  JOIN derived.cases c ON jt.case_id = c.id
+                 WHERE c.court_id = %s::uuid
+                """,
+                (court_id,),
+            )
+            count = cur.fetchone()[0]
+            deleted[table] = count
+            logger.info(
+                "Pre-delete row count",
+                table=f"derived.{table}",
+                rows=count,
+                court_id=court_id,
+            )
+
+        for table in _PER_COUNTY_COURT_ID_TABLES:
+            cur.execute(
+                f"SELECT COUNT(*) FROM derived.{table} WHERE court_id = %s::uuid",
+                (court_id,),
+            )
+            count = cur.fetchone()[0]
+            deleted[table] = count
+            logger.info(
+                "Pre-delete row count",
+                table=f"derived.{table}",
+                rows=count,
+                court_id=court_id,
+            )
+
+        # Actual deletes.  Order: join tables first (case-scoped), then
+        # court-scoped tables from most dependent to least dependent.
+        # ``rulings`` references ``documents`` AND ``cases`` AND ``judges``,
+        # so it must be deleted before any of those.
+        for table in _PER_COUNTY_CASE_JOIN_TABLES:
+            logger.info(
+                "Deleting rows",
+                table=f"derived.{table}",
+                rows=deleted[table],
+                court_id=court_id,
+            )
+            cur.execute(
+                f"""
+                DELETE FROM derived.{table}
+                 WHERE case_id IN (
+                    SELECT id FROM derived.cases WHERE court_id = %s::uuid
+                 )
+                """,
+                (court_id,),
+            )
+
+        # Order among the court-id-keyed tables:
+        #   rulings  → references documents, cases, judges
+        #   documents → references cases
+        #   cases    → referenced by rulings, documents, join tables
+        #   judges   → referenced by rulings (nullable FK) and case_judges
+        # We delete rulings first, then documents, then cases, then judges.
+        for table in ("rulings", "documents", "cases", "judges"):
+            logger.info(
+                "Deleting rows",
+                table=f"derived.{table}",
+                rows=deleted[table],
+                court_id=court_id,
+            )
+            cur.execute(
+                f"DELETE FROM derived.{table} WHERE court_id = %s::uuid",
+                (court_id,),
+            )
+
+    conn.commit()
+    logger.info(
+        "Per-court reset complete",
+        court_code=court_code,
+        court_id=court_id,
+        deleted=deleted,
+    )
+    return deleted
+
+
 def reset_opensearch_index(os_url: str) -> None:
     """Delete the OpenSearch tentative_rulings index so it's rebuilt from scratch."""
     from opensearchpy import OpenSearch
@@ -1214,6 +1405,79 @@ def delete_opensearch_docs_for_county(os_url: str, county: str) -> int:
         "Deleted per-county OpenSearch docs",
         index=index_name,
         county=county,
+        deleted=deleted,
+    )
+    return deleted
+
+
+def delete_opensearch_docs_for_court(
+    os_url: str,
+    state: str,
+    county: str,
+    court_name: str,
+) -> int:
+    """Delete OS docs for one court before per-court DB rebuild.
+
+    Pairs with reset_derived_tables_for_court(): the global OS index can't
+    be reset (would wipe other courts), and upsert-by-ruling_id only
+    refreshes content for ruling_ids that survive the rebuild.  Without
+    this, rulings dropped during rebuild remain as orphans in OS.  See #3014.
+
+    The filter uses the (state, county, court) triple because ``court`` is
+    not unique across counties — e.g. "Superior Court" appears in every
+    county.  The OS mapping has ``state``, ``county``, and ``court`` keyword
+    fields; there is no ``court_id`` field in the index.  See #3014.
+
+    Returns the number of OS docs deleted (0 if index missing).
+    """
+    from opensearchpy import OpenSearch
+
+    os_kwargs: dict = {
+        "hosts": [os_url],
+        "timeout": 30,
+        "max_retries": 3,
+        "retry_on_timeout": True,
+    }
+    os_user = os.environ.get("OPENSEARCH_USERNAME", "")
+    os_pass = os.environ.get("OPENSEARCH_PASSWORD", "")
+    if os_user and os_pass:
+        os_kwargs["http_auth"] = (os_user, os_pass)
+    client = OpenSearch(**os_kwargs)
+
+    index_name = "tentative_rulings_v1"
+    if not client.indices.exists(index=index_name):
+        logger.info(
+            "OpenSearch index does not exist, nothing to delete",
+            index=index_name,
+            state=state,
+            county=county,
+            court=court_name,
+        )
+        return 0
+
+    response = client.delete_by_query(
+        index=index_name,
+        body={
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"state": state}},
+                        {"term": {"county": county}},
+                        {"term": {"court": court_name}},
+                    ]
+                }
+            }
+        },
+        refresh=True,
+        conflicts="proceed",
+    )
+    deleted = int(response.get("deleted", 0)) if isinstance(response, dict) else 0
+    logger.info(
+        "Deleted per-court OpenSearch docs",
+        index=index_name,
+        state=state,
+        county=county,
+        court=court_name,
         deleted=deleted,
     )
     return deleted
@@ -1337,11 +1601,22 @@ def main() -> None:
         action="store_true",
         help="Truncate all derived tables and delete OpenSearch index before rebuilding",
     )
-    parser.add_argument(
+    _scope_group = parser.add_mutually_exclusive_group()
+    _scope_group.add_argument(
         "--county",
         type=str,
         default=None,
         help="Only process documents from this county (e.g. 'Ventura', 'Los Angeles')",
+    )
+    _scope_group.add_argument(
+        "--court",
+        type=str,
+        default=None,
+        help=(
+            "Only process documents from this court, identified by its court_code "
+            "(e.g. 'ca-orange').  Mutually exclusive with --county.  The court_code "
+            "is the operator-friendly slug stored in derived.courts.court_code."
+        ),
     )
     parser.add_argument(
         "--state",
@@ -1414,7 +1689,25 @@ def main() -> None:
     # path, so ``--reset --county`` on multi-case-PDF counties (Santa Clara,
     # Orange, Riverside, Fresno) is safe.
     if args.reset:
-        if args.county:
+        if args.court:
+            # Resolve the court row first so we can scope the OS delete by
+            # (state, county, court_name).  Delete OS docs FIRST — same
+            # fail-safe rationale as per-county: a delete-by-query failure
+            # aborts before we reset the DB and leave stale OS orphans.  See #3014.
+            _court_id, _court_state, _court_county, _court_name = (
+                _resolve_court_for_reset(conn, args.court)
+            )
+            if os_url:
+                delete_opensearch_docs_for_court(
+                    os_url, _court_state, _court_county, _court_name
+                )
+            else:
+                logger.info(
+                    "OPENSEARCH_URL not set — skipping per-court "
+                    "OpenSearch delete-by-query"
+                )
+            reset_derived_tables_for_court(conn, args.court)
+        elif args.county:
             # Delete the county's OS docs FIRST so a failure there aborts
             # before we reset the DB — otherwise we'd be left with a fresh
             # DB and stale OS orphans.  See #2568.
@@ -1464,10 +1757,23 @@ def main() -> None:
             )
 
         # Step 1: Discover keys (local cache or S3)
-        # Build S3 prefix — default "ca/", narrowed by --county if given.
+        # Build S3 prefix — default "ca/", narrowed by --county or --court if given.
+        # For --court, we derive the (state, county) from the resolved court row.
+        # Today every county has exactly one court_code, so the per-court prefix is
+        # identical to the per-county prefix.  When multi-court-per-county S3 paths
+        # are introduced, this will need a per-court sub-prefix.  See #3014.
         s3_prefix = f"{sluggify(args.state)}/"
         if args.county:
             s3_prefix = f"{sluggify(args.state)}/{sluggify(args.county)}/"
+        elif args.court:
+            # Resolve state+county from the court row to scope the S3 prefix.
+            # _resolve_court_for_reset was already called above (in the reset path);
+            # we call it again here because the reset branch may not have run
+            # (--court without --reset is valid for a scoped non-reset rebuild).
+            _c_id, _c_state, _c_county, _c_name = _resolve_court_for_reset(
+                conn, args.court
+            )
+            s3_prefix = f"{sluggify(_c_state)}/{sluggify(_c_county)}/"
         logger.info("Discovering S3 objects...", prefix=s3_prefix)
         if cache_dir:
             keys = list_local_keys(Path(cache_dir), prefix=s3_prefix)
