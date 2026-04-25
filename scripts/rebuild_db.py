@@ -590,6 +590,80 @@ def _query_connection_budget(dsn: str) -> tuple[int, int]:
         return (0, 0)
 
 
+def _group_validation_reasons(rows: list[tuple[str, str]]) -> list[tuple[str, int]]:
+    """Group fail-result reason fragments and return the top-3 by count.
+
+    Each ``reason`` column from ``validation_results`` may contain multiple
+    rule names concatenated with ``'; '`` (the pattern used by the
+    deterministic-validation worker).  This pure function splits each reason,
+    counts occurrences of each fragment across all ``fail`` rows, and returns
+    up to 3 ``(fragment, count)`` pairs sorted by count descending.
+
+    Only ``result == 'fail'`` rows are bucketed — ``pass``, ``flag``, and
+    ``error`` rows are ignored.  Pure: no I/O, no side effects.
+    """
+    counts: dict[str, int] = {}
+    for result, reason in rows:
+        if result != "fail":
+            continue
+        for fragment in reason.split("; "):
+            fragment = fragment.strip()
+            if fragment:
+                counts[fragment] = counts.get(fragment, 0) + 1
+    return sorted(counts.items(), key=lambda x: x[1], reverse=True)[:3]
+
+
+def _summarize_validation_results(conn: Any, started_at: datetime) -> dict[str, Any]:
+    """Query validation_results written since *started_at* and return a summary dict.
+
+    Returns::
+
+        {
+            'accepted': int,   # result == 'pass'
+            'flagged':  int,   # result == 'flag'
+            'rejected': int,   # result == 'fail'
+            'errors':   int,   # result == 'error'
+            'top_reasons': [(reason_fragment, count), ...],  # up to 3
+        }
+
+    Returns all-zero sentinel on any DB or cursor failure so a connectivity
+    issue does not block the rebuild exit path.  Never raises.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT result, reason FROM validation_results WHERE created_at >= %s",
+                (started_at,),
+            )
+            rows = cur.fetchall()
+        counts: dict[str, int] = {
+            "accepted": 0,
+            "flagged": 0,
+            "rejected": 0,
+            "errors": 0,
+        }
+        for result, reason in rows:
+            if result == "pass":
+                counts["accepted"] += 1
+            elif result == "flag":
+                counts["flagged"] += 1
+            elif result == "fail":
+                counts["rejected"] += 1
+            elif result == "error":
+                counts["errors"] += 1
+        top_reasons = _group_validation_reasons(rows)
+        return {**counts, "top_reasons": top_reasons}
+    except Exception:
+        logger.warning("Could not query validation_results — skipping summary")
+        return {
+            "accepted": 0,
+            "flagged": 0,
+            "rejected": 0,
+            "errors": 0,
+            "top_reasons": [],
+        }
+
+
 def _clamp_concurrency_to_budget(
     requested: int,
     max_connections: int,
@@ -1368,6 +1442,12 @@ def main() -> None:
     # rebuild raises before reaching the retry gate.  See #2572.
     retry_aborted_reason: str | None = None
 
+    # Initialize the validation-zero-pass reason outside the try block so it's
+    # always in scope for the post-finally exit check.  Mirrors
+    # retry_aborted_reason above.  Set when a county-scoped rebuild produces
+    # zero accepted/flagged validation results.
+    validation_zero_pass_reason: str | None = None
+
     # Wrap the rebuild in try/finally so the completion marker is always
     # written when --reset was used, even if the rebuild fails partway (#2222).
     try:
@@ -1471,6 +1551,13 @@ def main() -> None:
                 conn_used,
             )
         concurrency = clamped_concurrency
+
+        # Capture rebuild start time so the post-rebuild validation summary can
+        # scope its query to rows written during *this* run only.  Placed here
+        # (after seed_courts, after autoscale + connection-budget logging) so
+        # the timestamp covers all worker validation writes but excludes any
+        # earlier roster-fetch or reset activity.
+        rebuild_started_at = datetime.now(UTC)
 
         logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
@@ -1717,6 +1804,57 @@ def main() -> None:
                 hash_mismatch_warnings=hash_mismatch_warnings,
                 processed=processed,
             )
+
+        # Post-rebuild validation summary — queries validation_results for rows
+        # written since rebuild_started_at and emits a structured log so
+        # operators can quickly assess rule-failure rates without opening the
+        # DB.  Logged before conn.close() so we can reuse the open connection.
+        # The zero-pass county exit is deferred (mirroring retry_aborted_reason)
+        # until after conn.close() so the dev env returns to clean state first.
+        vs = _summarize_validation_results(conn, rebuild_started_at)
+        built = processed + errors
+        top_str = ", ".join(f"{r}: {c}" for r, c in vs["top_reasons"])
+        # Only consider zero-pass a hard failure when validation actually ran
+        # (i.e., at least one result row was written).  When the DB is
+        # unavailable or validation is not configured, all counts are zero —
+        # that is the sentinel path, not a real zero-pass.
+        validation_ran = (
+            vs["accepted"] + vs["flagged"] + vs["rejected"] + vs["errors"] > 0
+        )
+        if vs["accepted"] + vs["flagged"] == 0 and validation_ran and len(keys) > 0:
+            logger.error(
+                "Validation summary",
+                built=built,
+                accepted=vs["accepted"],
+                flagged=vs["flagged"],
+                rejected=vs["rejected"],
+                top_reasons=vs["top_reasons"],
+            )
+            if args.county:
+                validation_zero_pass_reason = (
+                    f"County-scoped rebuild produced 0 accepted/flagged rulings. "
+                    f"See telemetry.validation_results WHERE created_at >= "
+                    f"{rebuild_started_at.isoformat()} for details. "
+                    f"Top failure reasons: {top_str or 'none'}"
+                )
+        elif vs["rejected"] > 0:
+            logger.warning(
+                "Validation summary",
+                built=built,
+                accepted=vs["accepted"],
+                flagged=vs["flagged"],
+                rejected=vs["rejected"],
+                top_reasons=vs["top_reasons"],
+            )
+        else:
+            logger.info(
+                "Validation summary",
+                built=built,
+                accepted=vs["accepted"],
+                flagged=vs["flagged"],
+                rejected=vs["rejected"],
+                top_reasons=vs["top_reasons"],
+            )
     finally:
         # Clear the rebuild-in-progress marker so the data quality check
         # resumes normal P1 alerting.  Runs even if the rebuild fails
@@ -1737,6 +1875,21 @@ def main() -> None:
             retry_aborted_reason=retry_aborted_reason,
         )
         sys.exit(2)
+
+    # Propagate county-scoped zero-pass as a non-zero exit (code 3) so the
+    # ECS orchestrator surfaces the failure.  Deferred after conn.close() so
+    # the dev environment returns to a clean state before the task exits.
+    # Exit code 3 is distinct from 1 (missing DATABASE_URL / no keys) and
+    # 2 (retry-cap abort).  Only fires for county-scoped runs; a full rebuild
+    # with zero validation passes is unusual but not immediately actionable.
+    if validation_zero_pass_reason is not None:
+        logger.error(
+            "Exiting non-zero because county-scoped rebuild produced 0 "
+            "accepted/flagged rulings — see telemetry.validation_results for "
+            "details.",
+            validation_zero_pass_reason=validation_zero_pass_reason,
+        )
+        sys.exit(3)
 
 
 if __name__ == "__main__":

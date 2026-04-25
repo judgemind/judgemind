@@ -2457,6 +2457,250 @@ class TestClampConcurrencyToBudget:
         assert reason == "clamped_to_budget"
 
 
+class TestValidationSummary:
+    """Tests for _group_validation_reasons, _summarize_validation_results, and
+    main() integration of the post-rebuild validation summary (#2607)."""
+
+    # ------------------------------------------------------------------
+    # Pure-function tests
+    # ------------------------------------------------------------------
+
+    def test_group_validation_reasons_splits_concatenated_reasons(self) -> None:
+        """Reasons joined by '; ' are split and counted individually."""
+        rows = [
+            ("fail", "reason A; reason B"),
+            ("fail", "reason A"),
+        ]
+        result = rebuild_db._group_validation_reasons(rows)
+        assert result[0] == ("reason A", 2), f"expected reason A:2 first, got {result}"
+        assert result[1] == ("reason B", 1), f"expected reason B:1 second, got {result}"
+
+    def test_group_validation_reasons_only_buckets_fail_rows(self) -> None:
+        """pass, flag, and error rows must not contribute to the reason bucket."""
+        rows = [
+            ("pass", "should be ignored"),
+            ("flag", "also ignored"),
+            ("error", "error ignored"),
+            ("fail", "only this counts"),
+        ]
+        result = rebuild_db._group_validation_reasons(rows)
+        assert len(result) == 1
+        assert result[0][0] == "only this counts"
+
+    def test_group_validation_reasons_caps_top_3(self) -> None:
+        """Only the top 3 distinct reason fragments are returned."""
+        rows = [("fail", f"reason_{i}") for i in range(10)]
+        result = rebuild_db._group_validation_reasons(rows)
+        assert len(result) == 3, f"expected at most 3 reasons, got {len(result)}: {result}"
+
+    def test_group_validation_reasons_empty(self) -> None:
+        """Empty input returns an empty list without error."""
+        assert rebuild_db._group_validation_reasons([]) == []
+
+    def test_group_validation_reasons_no_fail_rows(self) -> None:
+        """When no fail rows exist, returns empty list."""
+        rows = [("pass", "all good"), ("flag", "minor issue")]
+        assert rebuild_db._group_validation_reasons(rows) == []
+
+    # ------------------------------------------------------------------
+    # DB-read helper tests
+    # ------------------------------------------------------------------
+
+    def test_summarize_validation_results_aggregates_counts_by_result(self) -> None:
+        """Returns correct accepted/flagged/rejected/errors counts from DB rows."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = [
+            ("pass", ""),
+            ("pass", ""),
+            ("flag", "minor"),
+            ("fail", "check_no_html_in_ruling_text"),
+            ("fail", "check_no_html_in_ruling_text; check_ruling_text_length"),
+            ("error", "exception"),
+        ]
+
+        from datetime import UTC, datetime
+
+        result = rebuild_db._summarize_validation_results(mock_conn, datetime.now(UTC))
+
+        assert result["accepted"] == 2
+        assert result["flagged"] == 1
+        assert result["rejected"] == 2
+        assert result["errors"] == 1
+        assert len(result["top_reasons"]) <= 3
+        # check_no_html_in_ruling_text appears in both fail rows → count 2
+        top_reason_names = [r for r, _ in result["top_reasons"]]
+        assert "check_no_html_in_ruling_text" in top_reason_names
+
+    def test_summarize_validation_results_returns_sentinel_on_failure(self) -> None:
+        """When the DB query raises, returns all-zero sentinel without raising."""
+        mock_conn = MagicMock()
+        mock_conn.cursor.side_effect = Exception("DB exploded")
+
+        from datetime import UTC, datetime
+
+        result = rebuild_db._summarize_validation_results(mock_conn, datetime.now(UTC))
+
+        assert result == {
+            "accepted": 0,
+            "flagged": 0,
+            "rejected": 0,
+            "errors": 0,
+            "top_reasons": [],
+        }
+
+    # ------------------------------------------------------------------
+    # main() integration tests
+    # ------------------------------------------------------------------
+
+    def _run_main_with_mocks(
+        self,
+        tmp_path: Any,
+        *,
+        county: str | None = None,
+        validation_summary: dict[str, Any],
+    ) -> tuple[MagicMock, SystemExit | None]:
+        """Run main() with controlled mocks and return (mock_logger, exit_exc).
+
+        Returns (logger_mock, None) if main() completed without sys.exit.
+        Returns (logger_mock, SystemExit_exc) if sys.exit was called.
+        """
+        import sys as _sys
+
+        # Create a minimal local cache with one HTML key.
+        key = "ca/orange/superior_court/raw/abc123.html"
+        html_dir = tmp_path / "cache" / "ca" / "orange" / "superior_court" / "raw"
+        html_dir.mkdir(parents=True)
+        (html_dir / "abc123.html").write_bytes(b"<html>Date: 03/15/2026 ruling text</html>")
+        cache_dir = str(tmp_path / "cache")
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = {
+            "status": "ok",
+            "content_format": "html",
+            "had_hearing_date": True,
+            "hash_mismatch": False,
+        }
+
+        mock_pool = MagicMock()
+        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
+        mock_pool.__exit__ = MagicMock(return_value=False)
+        mock_pool.submit.return_value = mock_future
+
+        mock_logger = MagicMock()
+
+        argv = ["rebuild_db.py"]
+        if county:
+            argv += ["--county", county]
+
+        exit_exc: SystemExit | None = None
+        with (
+            patch("rebuild_db.make_s3_client", return_value=MagicMock()),
+            patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
+            patch("rebuild_db.list_local_keys", return_value=[key]),
+            patch("rebuild_db.seed_courts", return_value={}),
+            patch("rebuild_db._fetch_rosters"),
+            patch(
+                "rebuild_db._summarize_validation_results",
+                return_value=validation_summary,
+            ),
+            patch(
+                "concurrent.futures.ProcessPoolExecutor",
+                return_value=mock_pool,
+            ),
+            patch(
+                "concurrent.futures.as_completed",
+                return_value=iter([mock_future]),
+            ),
+            patch.dict(
+                _sys.modules,
+                {},
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://test",
+                    "S3_CACHE_DIR": cache_dir,
+                },
+            ),
+            patch("sys.argv", argv),
+            patch.object(rebuild_db, "logger", mock_logger),
+        ):
+            try:
+                rebuild_db.main()
+            except SystemExit as exc:
+                exit_exc = exc
+
+        return mock_logger, exit_exc
+
+    def test_main_county_zero_accepted_exits_nonzero(self, tmp_path: Any) -> None:
+        """County-scoped run with 0 accepted + 0 flagged exits with code 3."""
+        vs = {
+            "accepted": 0,
+            "flagged": 0,
+            "rejected": 15,
+            "errors": 0,
+            "top_reasons": [("check_no_html", 15)],
+        }
+        mock_logger, exit_exc = self._run_main_with_mocks(
+            tmp_path, county="Orange", validation_summary=vs
+        )
+
+        assert exit_exc is not None, "expected sys.exit to be called"
+        assert exit_exc.code == 3, f"expected exit code 3, got {exit_exc.code!r}"
+
+        # The error-level log must include the reject hint
+        err_calls = mock_logger.error.call_args_list
+        summary_errors = [c for c in err_calls if c.args and c.args[0] == "Validation summary"]
+        assert len(summary_errors) == 1, (
+            f"expected 1 'Validation summary' error log, got: {err_calls}"
+        )
+        assert summary_errors[0].kwargs.get("rejected") == 15
+
+    def test_main_no_county_zero_accepted_does_not_exit_nonzero(self, tmp_path: Any) -> None:
+        """Full (non-county) rebuild with 0 accepted does NOT exit non-zero."""
+        vs = {"accepted": 0, "flagged": 0, "rejected": 100, "errors": 0, "top_reasons": []}
+        mock_logger, exit_exc = self._run_main_with_mocks(
+            tmp_path, county=None, validation_summary=vs
+        )
+
+        # Should complete without raising SystemExit (or exit 0 is fine)
+        assert exit_exc is None, (
+            f"non-county run with zero accepted must not exit non-zero, got {exit_exc!r}"
+        )
+
+    def test_main_county_with_accepted_exits_zero(self, tmp_path: Any) -> None:
+        """County run with accepted=10 must not raise and must log the summary."""
+        vs = {
+            "accepted": 10,
+            "flagged": 2,
+            "rejected": 2,
+            "errors": 0,
+            "top_reasons": [("check_x", 2)],
+        }
+        mock_logger, exit_exc = self._run_main_with_mocks(
+            tmp_path, county="Ventura", validation_summary=vs
+        )
+
+        assert exit_exc is None, f"expected clean exit, got {exit_exc!r}"
+
+        # Validation summary must have been logged (info or warning level)
+        all_info = mock_logger.info.call_args_list
+        all_warning = mock_logger.warning.call_args_list
+        summary_logs = [
+            c for c in all_info + all_warning if c.args and c.args[0] == "Validation summary"
+        ]
+        assert len(summary_logs) == 1, f"expected 1 Validation summary log, got: {summary_logs}"
+        kwargs = summary_logs[0].kwargs
+        assert "built" in kwargs
+        assert "accepted" in kwargs
+        assert "rejected" in kwargs
+        assert "top_reasons" in kwargs
+
+
 class TestQueryConnectionBudget:
     """Tests for _query_connection_budget() I/O wrapper."""
 
