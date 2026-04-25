@@ -127,7 +127,7 @@ class TestMaxConcurrentDiagnosesReader:
         assert d._max_concurrent_diagnoses() == daemon.DEFAULT_MAX_CONCURRENT_DIAGNOSES
 
     def test_default_constant_is_two(self) -> None:
-        # Sanity check — the default cap matches migration 49's seed.
+        # Sanity check — the default cap matches migration 47's seed.
         assert daemon.DEFAULT_MAX_CONCURRENT_DIAGNOSES == 2
 
 
