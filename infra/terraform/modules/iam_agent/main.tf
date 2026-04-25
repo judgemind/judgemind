@@ -20,7 +20,7 @@ resource "aws_iam_role" "agent" {
   description = "Assumed by the Claude Code agent via sts:AssumeRole for dev ECS/CloudWatch/S3 operations"
 
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Effect    = "Allow"
@@ -39,7 +39,7 @@ resource "aws_iam_policy" "ecs_dev_only" {
   description = "Allows the agent to run, describe, list, and update ECS resources in the dev cluster"
 
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Sid      = "EcsDevCluster"
@@ -78,7 +78,7 @@ resource "aws_iam_policy" "logs_dev_groups" {
   description = "Allows the agent to read CloudWatch log groups for dev ECS tasks"
 
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Sid      = "LogsDevGroups"
@@ -113,7 +113,7 @@ resource "aws_iam_policy" "s3_staging_prefixes" {
   description = "Allows the agent to read, write, and delete S3 objects under staging/ and spotcheck/ prefixes"
 
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Sid      = "AllowObjectOps"
@@ -154,7 +154,7 @@ resource "aws_iam_policy" "secrets_judgemind" {
   description = "Allows the agent to read Secrets Manager secrets under the judgemind/ prefix"
 
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Sid      = "SecretsJudgemind"
@@ -179,7 +179,7 @@ resource "aws_iam_policy" "pass_role_narrow_scraper" {
   description = "Allows the agent to pass the scraper IAM role when launching ECS tasks"
 
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Sid      = "PassRoleScraper"
@@ -205,7 +205,7 @@ resource "aws_iam_policy" "pass_role_narrow_maintenance" {
   description = "Allows the agent to pass the maintenance IAM role when launching ECS tasks"
 
   policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
         Sid      = "PassRoleMaintenance"
