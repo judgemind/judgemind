@@ -1559,7 +1559,7 @@ def _write_rebuild_marker(
             )
         conn.commit()
         status = "started" if in_progress else "completed"
-        logger.info("Rebuild marker written: %s", status)
+        logger.info("rebuild_marker_written", status=status)
     except Exception:
         logger.warning(
             "Failed to write rebuild marker — data quality alerts may fire "
@@ -1849,12 +1849,11 @@ def main() -> None:
         )
         if budget_reason == "clamped_to_budget":
             logger.warning(
-                "Clamping --concurrency from %d to %d "
-                "(max_connections=%d, currently_used=%d)",
-                concurrency,
-                clamped_concurrency,
-                max_conn,
-                conn_used,
+                "clamping_concurrency_to_db_budget",
+                requested=concurrency,
+                effective=clamped_concurrency,
+                max_connections=max_conn,
+                currently_used=conn_used,
             )
         concurrency = clamped_concurrency
 
