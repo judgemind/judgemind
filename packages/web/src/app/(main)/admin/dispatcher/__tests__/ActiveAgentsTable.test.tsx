@@ -145,6 +145,37 @@ describe('ActiveAgentsTable — Magic Move view-transition names (#2967)', () =>
   });
 });
 
+describe('ActiveAgentsTable — final-attempt Opus marker (#3021)', () => {
+  it('renders (opus) in chip text and Final attempt in tooltip when retriesUsed=2 and phase=ralph', () => {
+    const agent = makeAgent({ phase: 'ralph', retriesUsed: 2 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const chip = screen.getByTestId(`active-agent-phase-${agent.id}`);
+    expect(chip.textContent).toContain('(opus)');
+    expect(chip.getAttribute('title')).toContain('Final attempt');
+  });
+
+  it('does NOT render (opus) when retriesUsed=0 and phase=ralph', () => {
+    const agent = makeAgent({ phase: 'ralph', retriesUsed: 0 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const chip = screen.getByTestId(`active-agent-phase-${agent.id}`);
+    expect(chip.textContent).toBe('ralph');
+    expect(chip.getAttribute('title')).not.toContain('Final attempt');
+  });
+
+  it('does NOT render (opus) on a non-ralph phase even when retriesUsed=2', () => {
+    const agent = makeAgent({ phase: 'planning', retriesUsed: 2 });
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const chip = screen.getByTestId(`active-agent-phase-${agent.id}`);
+    expect(chip.textContent).toBe('planning');
+  });
+});
+
 describe('ActiveAgentsTable — #3206 view-transition gate while dialog open', () => {
   it('drops view-transition-name on BOTH wrappers when dialogOpen=true', () => {
     const agent = makeAgent({ id: 'agent-42', issueNumber: 3206 });
