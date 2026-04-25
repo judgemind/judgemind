@@ -409,7 +409,7 @@ class TestPushAndPrMaterializesFromDB:
         )
 
         # Stub subprocesses: rev-list says 1 ahead, then commit, show,
-        # push, and gh pr create all succeed.
+        # fetch+rebase (#2964), push, and gh pr create all succeed.
         import unittest.mock
 
         with unittest.mock.patch(
@@ -423,6 +423,18 @@ class TestPushAndPrMaterializesFromDB:
                 ),
                 subprocess.CompletedProcess(
                     ["git", "show"], returncode=0, stdout="", stderr=""
+                ),
+                subprocess.CompletedProcess(
+                    ["git", "fetch", "origin", "main"],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["git", "rebase", "origin/main"],
+                    returncode=0,
+                    stdout="Current branch is up to date.",
+                    stderr="",
                 ),
                 subprocess.CompletedProcess(
                     ["git", "push"], returncode=0, stdout="", stderr=""
@@ -480,6 +492,18 @@ class TestPushAndPrMaterializesFromDB:
                 ),
                 subprocess.CompletedProcess(
                     ["git", "show"], returncode=0, stdout="", stderr=""
+                ),
+                subprocess.CompletedProcess(
+                    ["git", "fetch", "origin", "main"],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["git", "rebase", "origin/main"],
+                    returncode=0,
+                    stdout="Current branch is up to date.",
+                    stderr="",
                 ),
                 subprocess.CompletedProcess(
                     ["git", "push"], returncode=0, stdout="", stderr=""
