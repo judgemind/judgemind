@@ -157,26 +157,48 @@ class TestSpawnDiagnoserAddsOutputFormatJsonFlag:
 
 
 class TestSpawnDiagnoserWritesStdoutFile:
-    """``_spawn_diagnoser_subprocess`` must write the diagnoser stdout to
-    ``{repo_root}/tmp/claude-p-diagnose-<id>.stdout.json``."""
+    """``_spawn_diagnoser_subprocess`` must open the diagnoser stdout
+    file at ``{repo_root}/tmp/claude-p-diagnose-<id>.stdout.json`` so
+    the (real) child writes its JSON envelope there.
 
-    def test_stdout_file_written_to_repo_root_tmp(
+    Issue #3376: under async fire-and-forget, the file FD is opened in
+    the parent and dup'd to the child via Popen ``stdout=``. The
+    parent's copy is closed immediately after Popen returns; the child
+    writes directly. Tests use an in-memory ``StringIO`` fake that
+    doesn't actually receive the dup, so we can only assert that the
+    file was created (not its content) at the unit-test level. The
+    metering parser tests (``TestParseDiagnoserUsage``) cover the
+    content-shape side of the contract.
+    """
+
+    def test_stdout_file_created_in_repo_root_tmp(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, _conn, _handler = _make_daemon(tmp_path)
 
-        stdout_payload = '{"usage":{"input_tokens":10},"total_cost_usd":0.01}\n'
+        captured: dict[str, Any] = {}
+
+        def on_start(_cmd: list[str], kwargs: dict[str, Any]) -> None:
+            captured["kwargs"] = kwargs
+
         monkeypatch.setattr(
             subprocess,
             "Popen",
-            make_popen_factory(stdout_chunks=[stdout_payload]),
+            make_popen_factory(on_start=on_start),
         )
         d._spawn_diagnoser_subprocess(99)
 
+        # The file is opened (so the FD exists for Popen to dup) and
+        # the parent then closes its copy. The empty file lands at the
+        # canonical path.
         stdout_path = tmp_path / "tmp" / "claude-p-diagnose-99.stdout.json"
         assert stdout_path.exists(), f"Expected stdout file at {stdout_path}"
-        content = stdout_path.read_text(encoding="utf-8")
-        assert '"input_tokens"' in content
+        # Popen received a real file handle (not subprocess.PIPE) for
+        # stdout. This is the structural guarantee that the child can
+        # write to the file directly without parent threads.
+        assert "stdout" in captured["kwargs"]
+        # IO objects don't compare as ints; just verify it isn't PIPE.
+        assert captured["kwargs"]["stdout"] != subprocess.PIPE
 
 
 # --------------------------------------------------------------------------
@@ -397,12 +419,16 @@ def _setup_run_diagnoser_pass(
     pass  # monkeypatching done inline in each test
 
 
-class TestRunDiagnoserPassPersistsOnTimeout:
-    """When ``_spawn_diagnoser_subprocess`` returns ``(None, tail)`` (timeout),
-    the persist path must still fire."""
+class TestReapPersistMeteringOnTimeout:
+    """Issue #3376 — under async fire-and-forget spawn, metering happens
+    in the reaper (``_reap_persist_metering``), not the spawn pass.
+    When the reaper SIGTERM/SIGKILLs a timed-out diagnoser, the persist
+    path must still fire so opus-cost-vs-savings is recorded."""
 
-    def test_persist_called_on_timeout(self, monkeypatch: Any, tmp_path: Path) -> None:
-        d, conn, _handler = _make_daemon(tmp_path)
+    def test_persist_called_on_reaper_timeout(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        d, _conn, _handler = _make_daemon(tmp_path)
 
         # Pre-write a stdout file so _parse_diagnoser_usage can succeed.
         stdout_path = tmp_path / "tmp" / "claude-p-diagnose-42.stdout.json"
@@ -428,41 +454,34 @@ class TestRunDiagnoserPassPersistsOnTimeout:
                 }
             )
 
-        monkeypatch.setattr(d, "_diagnoser_enabled", lambda: True)
-        monkeypatch.setattr(
-            d, "_find_diagnoser_candidates", lambda: [dict(_FAKE_CANDIDATE)]
-        )
-        monkeypatch.setattr(d, "_build_diagnoser_context", lambda c: {})
-        monkeypatch.setattr(d, "_insert_pending_diagnosis", lambda **_kw: 42)
-        # Simulate timeout: exit_code=None
-        monkeypatch.setattr(
-            d,
-            "_spawn_diagnoser_subprocess",
-            lambda _id: (None, "timeout-tail"),
-        )
         monkeypatch.setattr(d, "_persist_diagnoser_phase_output", fake_persist)
-        monkeypatch.setattr(d, "_mark_diagnosis_failed", lambda *_a, **_kw: None)
-        monkeypatch.setattr(d, "_apply_mechanical_escalation", lambda *_a: None)
 
-        ran = d._run_diagnoser_pass()
+        row = {
+            "diagnosis_id": 42,
+            "subprocess_pid": 1234,
+            "agent_id": _FAKE_CANDIDATE["agent_id"],
+            "category": _FAKE_CANDIDATE["category"],
+            "issue_number": 999,
+            "details": {},
+            "failure_id": _FAKE_CANDIDATE["failure_id"],
+        }
+        d._reap_persist_metering(row)
 
-        assert ran == 1
-        assert len(persisted) == 1, "persist must fire even on timeout"
+        assert len(persisted) == 1, "persist must fire even on reaper timeout"
         assert persisted[0]["diagnosis_id"] == 42
         assert persisted[0]["agent_id"] == _FAKE_CANDIDATE["agent_id"]
 
 
-class TestRunDiagnoserPassPersistsOnNonzeroExit:
-    """When ``_spawn_diagnoser_subprocess`` returns non-zero exit code,
-    the persist path must still fire."""
+class TestReapPersistMeteringOnExit:
+    """Issue #3376 — when the reaper observes an exited subprocess
+    (process gone, recommendation read), metering also persists."""
 
-    def test_persist_called_on_nonzero_exit(
+    def test_persist_called_on_reaper_exit(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        d, conn, _handler = _make_daemon(tmp_path)
+        d, _conn, _handler = _make_daemon(tmp_path)
 
-        # Pre-write a stdout file (diagnoser may emit partial JSON even on
-        # non-zero exit).
+        # Pre-write a stdout file (diagnoser emitted partial JSON).
         stdout_path = tmp_path / "tmp" / "claude-p-diagnose-43.stdout.json"
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stdout_path.write_text(
@@ -480,24 +499,18 @@ class TestRunDiagnoserPassPersistsOnNonzeroExit:
         ) -> None:
             persisted.append({"diagnosis_id": diagnosis_id})
 
-        monkeypatch.setattr(d, "_diagnoser_enabled", lambda: True)
-        monkeypatch.setattr(
-            d, "_find_diagnoser_candidates", lambda: [dict(_FAKE_CANDIDATE)]
-        )
-        monkeypatch.setattr(d, "_build_diagnoser_context", lambda c: {})
-        monkeypatch.setattr(d, "_insert_pending_diagnosis", lambda **_kw: 43)
-        # Simulate non-zero exit.
-        monkeypatch.setattr(
-            d,
-            "_spawn_diagnoser_subprocess",
-            lambda _id: (1, "error-tail"),
-        )
         monkeypatch.setattr(d, "_persist_diagnoser_phase_output", fake_persist)
-        monkeypatch.setattr(d, "_mark_diagnosis_failed", lambda *_a, **_kw: None)
-        monkeypatch.setattr(d, "_apply_mechanical_escalation", lambda *_a: None)
 
-        ran = d._run_diagnoser_pass()
+        row = {
+            "diagnosis_id": 43,
+            "subprocess_pid": 5678,
+            "agent_id": _FAKE_CANDIDATE["agent_id"],
+            "category": _FAKE_CANDIDATE["category"],
+            "issue_number": None,
+            "details": {},
+            "failure_id": _FAKE_CANDIDATE["failure_id"],
+        }
+        d._reap_persist_metering(row)
 
-        assert ran == 1
-        assert len(persisted) == 1, "persist must fire even on non-zero exit"
+        assert len(persisted) == 1, "persist must fire on reaper exit branch"
         assert persisted[0]["diagnosis_id"] == 43

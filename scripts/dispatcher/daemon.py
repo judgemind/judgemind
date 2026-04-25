@@ -1577,10 +1577,33 @@ STUCK_TIMEOUT_ALERT_WINDOW_SECONDS = 600
 #: take materially longer than the pre-#3366 read-only reasoning. The
 #: timeout is bumped to 90 minutes to accommodate sub-skill
 #: invocations (``/task-v2-fix-conflict``, ``/tdd``, ``/ralph``) and
-#: real diagnostic work (commit a fix, file a prerequisite). Daemon
-#: still surfaces long-running diagnoses via the structured-log stream
-#: for operator visibility but does not kill them within reason.
+#: real diagnostic work (commit a fix, file a prerequisite).
+#:
+#: Issue #3376: with the async fire-and-forget spawn, this is
+#: enforced by the supervisor-tick reaper (``_reap_diagnoser_subprocesses``)
+#: instead of by ``proc.wait(timeout=...)`` — the reaper SIGTERM/SIGKILLs
+#: any diagnoser whose ``started_at`` is older than this budget and
+#: marks the row failed with reason ``diagnoser_timeout``.
 DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS = 90 * 60
+
+#: Grace period between SIGTERM and SIGKILL when reaping a timed-out
+#: diagnoser (#3376). Short enough that ``_kill_diagnoser_process`` can
+#: be called from ``supervisor_tick`` without re-introducing the
+#: watchdog cascade — the reaper must complete well under the
+#: ``EXIT_THRESHOLD=120s`` watchdog budget.
+DIAGNOSER_REAP_GRACE_SECONDS = 3.0
+
+#: Default cap on concurrent diagnoser subprocesses (#3376). Read from
+#: ``dispatcher.config.max_concurrent_diagnoses`` at supervisor-tick
+#: time; this constant is the fallback when the config row is missing
+#: / malformed / non-positive. Two concurrent Opus-driven diagnoser
+#: runs is the smallest meaningful parallelism (one mid-skill, one
+#: picking up a freshly emitted failure) without unbounded token
+#: spend. Operators tune live via:
+#:
+#:     UPDATE dispatcher.config SET value = '5'
+#:     WHERE key = 'max_concurrent_diagnoses';
+DEFAULT_MAX_CONCURRENT_DIAGNOSES = 2
 
 #: ``--max-turns`` value for the diagnoser. Issue #3366 lifted the
 #: pre-existing 30-turn cap because the empowered diagnoser may need
@@ -18290,27 +18313,39 @@ class DispatcherDaemon:
             },
         )
 
-    def _spawn_diagnoser_subprocess(self, diagnosis_id: int) -> tuple[int | None, str]:
-        """Spawn ``claude -p /diagnose-failure <diagnosis_id>`` synchronously.
+    def _spawn_diagnoser_subprocess(self, diagnosis_id: int) -> int | None:
+        """Spawn ``claude -p /diagnose-failure <diagnosis_id>`` async (#3376).
 
-        Returns ``(exit_code, stderr_tail)``. ``exit_code=None`` means
-        the subprocess timed out or could not be launched. Isolated
-        here so tests can monkeypatch ``subprocess.Popen`` without
-        touching the surrounding DB-write logic.
+        Returns the subprocess's PID, or ``None`` if the launch
+        failed (e.g. ``claude`` binary not found). The caller is
+        responsible for persisting the PID to
+        ``dispatcher.diagnoses.subprocess_pid`` and reaping the
+        subprocess on a later supervisor tick.
 
-        **Real-time stream forwarding (#3017).** Like
-        :meth:`_spawn_phase_subprocess`, every stdout/stderr line from
-        the diagnoser is structured-logged and mirrored to
-        ``{repo_root}/tmp/.dispatcher/diagnose-<diagnosis_id>.jsonl`` so
-        a malformed-JSON diagnoser recommendation (see
-        ``recommendation_missing_or_malformed_json`` in
-        :meth:`_consume_diagnosis`) has a triageable trail. ``agent_id``
-        is logged as ``f"diagnose-{diagnosis_id}"`` so CloudWatch Log
-        Insights can group diagnoser output alongside the failed agent
-        it was diagnosing.
+        **Async fire-and-forget (#3376).** Pre-#3376 this method
+        called ``proc.wait()`` synchronously in the supervisor-tick
+        path. With the empowered diagnoser's 90-min wall-clock
+        budget, any run exceeding the watchdog's 120-s exit
+        threshold killed the daemon for ``scheduler_tick_stalled``
+        and orphaned the diagnosis row at ``status='pending'``
+        forever (three observed kills 20:14–20:34Z 2026-04-25).
 
-        The diagnoser runs at the repo root (no per-agent worktree) so
-        the JSONL mirror goes under ``{repo_root}/tmp/.dispatcher/``.
+        The fix turns spawn into fire-and-forget: open stdout/stderr
+        files, hand the FDs to ``Popen``, close the parent's FDs
+        immediately. The child writes directly to the files in its
+        own address space — no parent threads, no
+        :func:`stream_subprocess_output_async`. The reaper pass
+        (:meth:`_reap_diagnoser_subprocesses`) reads the stdout file
+        on a later tick once the process has exited.
+
+        Trade-off vs. pre-#3376: we lose real-time CloudWatch
+        streaming of diagnoser output (the per-line
+        :func:`stream_subprocess_output_async` logging). The output
+        is still on disk at
+        ``{repo_root}/tmp/claude-p-diagnose-<id>.stdout.json`` and
+        ``...stderr.log`` for post-hoc inspection. The compelling
+        upside: the daemon never blocks on a long-running diagnoser
+        again.
 
         **Cwd must be the baseline clone (#3033).** The dispatcher
         Fargate image's ``WORKDIR`` is ``/app``, which does NOT contain
@@ -18322,11 +18357,15 @@ class DispatcherDaemon:
         ``/var/lib/dispatcher/repo``). Without ``cwd=`` set, the
         ``claude`` CLI inherits ``/app`` as cwd and exits in <11s with
         a NULL recommendation because the ``/diagnose-failure`` skill
-        isn't discoverable — the exact symptom documented on #3033
-        (five consecutive failures with sub-11s durations and NULL
-        recommendation). The same cwd anchor is applied to the JSONL
-        mirror path so the triage trail lands alongside the phase
-        spawns' own ``tmp/.dispatcher/`` files.
+        isn't discoverable.
+
+        **Detached process group.** ``start_new_session=True`` puts
+        the child in its own process group so a SIGTERM/SIGKILL from
+        the reaper hits only the diagnoser tree, not any operator-
+        attached terminal. Also ensures the child survives an
+        operator Ctrl-C on the daemon (in local dev) — the daemon's
+        own signal handler decides what to do with in-flight
+        diagnoses; Ctrl-C should not orphan them mid-run.
         """
         cmd = [
             "claude",
@@ -18349,27 +18388,11 @@ class DispatcherDaemon:
         ]
 
         repo_root = self._repo_root_for_notify_script()
-        jsonl_path = (
-            repo_root / "tmp" / ".dispatcher" / f"diagnose-{diagnosis_id}.jsonl"
-        )
         stdout_path = (
             repo_root / "tmp" / f"claude-p-diagnose-{diagnosis_id}.stdout.json"
         )
+        stderr_path = repo_root / "tmp" / f"claude-p-diagnose-{diagnosis_id}.stderr.log"
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        stderr_buf: list[str] = []
-
-        class _ListSink:
-            """File-like sink that appends each write to ``buf``."""
-
-            def __init__(self, buf: list[str]) -> None:
-                self._buf = buf
-
-            def write(self, data: str) -> int:
-                self._buf.append(data)
-                return len(data)
-
-            def flush(self) -> None:
-                return None
 
         # Issue #3366 — set the diagnoser sentinel env var so the
         # PreToolUse hook (``.claude/hooks/preflight-bash.sh``) can
@@ -18381,49 +18404,96 @@ class DispatcherDaemon:
         # operator session leaves it unset.
         diagnoser_env = dict(os.environ)
         diagnoser_env["JUDGEMIND_DIAGNOSER_RUN"] = "1"
+
+        # Open stdout/stderr files BEFORE Popen so we can hand the FDs
+        # in. Popen dups the FDs into the child; we close the parent's
+        # copies immediately after Popen returns so only the child
+        # holds them. The child writes directly into the files —
+        # no parent thread is involved, which is the entire point of
+        # the async refactor.
+        try:
+            stdout_file = stdout_path.open("w", encoding="utf-8")
+        except OSError:
+            self._log.exception(
+                "daemon.diagnoser_spawn_stdout_open_failed",
+                extra={
+                    "event": "diagnoser_spawn_stdout_open_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "stdout_path": str(stdout_path),
+                },
+            )
+            return None
+        try:
+            stderr_file = stderr_path.open("w", encoding="utf-8")
+        except OSError:
+            stdout_file.close()
+            self._log.exception(
+                "daemon.diagnoser_spawn_stderr_open_failed",
+                extra={
+                    "event": "diagnoser_spawn_stderr_open_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "stderr_path": str(stderr_path),
+                },
+            )
+            return None
+
         try:
             proc: subprocess.Popen[str] = subprocess.Popen(  # noqa: S603 — literal trusted cmd
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=stdout_file,
+                stderr=stderr_file,
                 text=True,
-                bufsize=1,
                 cwd=str(repo_root),
                 env=diagnoser_env,
+                # Detach into its own process group so the reaper's
+                # SIGTERM/SIGKILL targets only the diagnoser tree.
+                # Cross-platform safe: ``start_new_session`` is a
+                # no-op on platforms that don't support setsid.
+                start_new_session=True,
             )
         except FileNotFoundError:
-            return None, "claude binary not found"
-
-        stdout_file = stdout_path.open("w", encoding="utf-8")
-        threads = stream_subprocess_output_async(
-            proc,
-            agent_id=f"diagnose-{diagnosis_id}",
-            issue_number=None,
-            phase="diagnose",
-            logger=self._log,
-            jsonl_path=jsonl_path,
-            stdout_sink=stdout_file,
-            stderr_sink=_ListSink(stderr_buf),
-        )
-        try:
-            returncode = proc.wait(timeout=DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:  # pragma: no cover
-                pass
-            threads.join(timeout=10)
-            stdout_file.flush()
             stdout_file.close()
-            tail = ("".join(stderr_buf))[-500:]
-            return None, tail
+            stderr_file.close()
+            self._log.error(
+                "daemon.diagnoser_spawn_failed",
+                extra={
+                    "event": "diagnoser_spawn_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "reason": "claude_binary_not_found",
+                },
+            )
+            return None
+        except OSError:
+            stdout_file.close()
+            stderr_file.close()
+            self._log.exception(
+                "daemon.diagnoser_spawn_failed",
+                extra={
+                    "event": "diagnoser_spawn_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "reason": "popen_oserror",
+                },
+            )
+            return None
 
-        threads.join(timeout=10)
-        stdout_file.flush()
-        stdout_file.close()
-        stderr_tail = ("".join(stderr_buf))[-500:]
-        return returncode, stderr_tail
+        # Close the parent's copy of the FDs — the child holds its
+        # own dup. Tests use io.StringIO sinks (see the _FakePopen
+        # helper) which support close() but ignore subsequent writes,
+        # so this is safe in unit tests too.
+        try:
+            stdout_file.close()
+        except Exception:  # pragma: no cover — defensive
+            pass
+        try:
+            stderr_file.close()
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        return int(proc.pid)
 
     def _read_recommendation(self, diagnosis_id: int) -> dict[str, Any] | None:
         """Read ``dispatcher.diagnoses.recommendation`` for the given row.
@@ -19839,14 +19909,30 @@ class DispatcherDaemon:
         return {"ok": True, "is_open": state == "OPEN"}
 
     def _run_diagnoser_pass(self) -> int:
-        """Find tier-2/3 candidates, spawn diagnosers, consume recommendations.
+        """Find tier-2/3 candidates and spawn diagnosers async (#3376).
 
-        Returns the number of diagnoses that ran this tick (regardless
-        of action). Called from the supervisor tick. Gated on
-        ``dispatcher.config.diagnoser_enabled = true`` at the top —
-        a tripped circuit breaker short-circuits the whole pass. Each
-        candidate is handled independently so a bad subprocess crash
-        on one cannot stall the others.
+        Returns the number of diagnoses spawned this tick (regardless
+        of subsequent reap outcome). Called from the supervisor tick.
+        Gated on ``dispatcher.config.diagnoser_enabled = true`` at the
+        top — a tripped circuit breaker short-circuits the whole pass.
+
+        **Async fire-and-forget (#3376).** This pass NO LONGER calls
+        ``proc.wait()``. It only:
+          1. Inserts the ``dispatcher.diagnoses`` pending row.
+          2. Calls :meth:`_spawn_diagnoser_subprocess` (returns PID).
+          3. Persists the PID to ``subprocess_pid``.
+
+        Recommendation parsing, directive consumption, and metering
+        all happen in :meth:`_reap_diagnoser_subprocesses` once the
+        subprocess has exited on a later supervisor tick. Decoupling
+        spawn from consume is what prevents the daemon's watchdog
+        from killing the supervisor thread on a long diagnoser run.
+
+        Concurrency cap: at most
+        :meth:`_max_concurrent_diagnoses` pending-with-PID rows at
+        once. When at cap, defer new spawns until the reaper drains
+        completed runs. Prevents an unbounded backlog if many failures
+        arrive in a short window.
         """
         if not self._diagnoser_enabled():
             return 0
@@ -19855,8 +19941,27 @@ class DispatcherDaemon:
         if not candidates:
             return 0
 
+        cap = self._max_concurrent_diagnoses()
+        in_flight = self._count_pending_diagnoses_with_pid()
+
         ran = 0
         for candidate in candidates:
+            if in_flight >= cap:
+                self._log.info(
+                    "daemon.diagnoser_spawn_deferred_cap_reached",
+                    extra={
+                        "event": "diagnoser_spawn_deferred_cap_reached",
+                        "run_id": self._run_id,
+                        "in_flight": in_flight,
+                        "cap": cap,
+                        "deferred_failure_id": candidate.get("failure_id"),
+                        "deferred_agent_id": candidate.get("agent_id"),
+                    },
+                )
+                # Stop scanning further candidates this tick — the
+                # cap is global and we'd just defer all of them.
+                break
+
             try:
                 context = self._build_diagnoser_context(candidate)
                 diagnosis_id = self._insert_pending_diagnosis(
@@ -19884,61 +19989,43 @@ class DispatcherDaemon:
                     },
                 )
 
-                exit_code, stderr_tail = self._spawn_diagnoser_subprocess(diagnosis_id)
+                pid = self._spawn_diagnoser_subprocess(diagnosis_id)
+
+                if pid is None:
+                    # Subprocess could not be launched (claude binary
+                    # missing, OS error). Mark the row failed + fall
+                    # back to mechanical escalation so the agent
+                    # doesn't sit in a zombie state.
+                    self._mark_diagnosis_failed(
+                        diagnosis_id, reason="subprocess_launch_failure"
+                    )
+                    self._apply_mechanical_escalation(candidate)
+                    continue
+
+                # Persist the PID so the reaper can find it later.
+                # This is the linchpin of the async architecture —
+                # without the PID, the reaper can't tell live runs
+                # from completed ones.
+                self._record_diagnoser_subprocess_pid(diagnosis_id, pid)
+
+                self._log.info(
+                    "daemon.diagnoser_spawned_async",
+                    extra={
+                        "event": "diagnoser_spawned_async",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "agent_id": candidate["agent_id"],
+                        "issue_number": candidate.get("issue_number"),
+                        "category": candidate["category"],
+                        "tier": candidate["tier"],
+                        "subprocess_pid": pid,
+                        "in_flight": in_flight + 1,
+                        "cap": cap,
+                    },
+                )
+
                 ran += 1
-
-                # Parse + persist metering before any branch — records
-                # cost even when the diagnoser timed out or exited
-                # non-zero (that's when opus-cost-vs-savings matters
-                # most). Issue #2881.
-                diag_usage = self._parse_diagnoser_usage(diagnosis_id)
-                self._persist_diagnoser_phase_output(
-                    agent_id=candidate["agent_id"],
-                    diagnosis_id=diagnosis_id,
-                    usage=diag_usage,
-                    log_text=stderr_tail if stderr_tail else None,
-                )
-
-                if exit_code is None:
-                    # Timeout or subprocess could not be launched.
-                    self._mark_diagnosis_failed(
-                        diagnosis_id,
-                        reason="subprocess_timeout_or_launch_failure",
-                    )
-                    self._apply_mechanical_escalation(candidate)
-                    continue
-                if exit_code != 0:
-                    self._log.warning(
-                        "daemon.diagnoser_nonzero_exit",
-                        extra={
-                            "event": "diagnoser_nonzero_exit",
-                            "run_id": self._run_id,
-                            "diagnosis_id": diagnosis_id,
-                            "exit_code": exit_code,
-                            "stderr_tail": stderr_tail,
-                        },
-                    )
-                    self._mark_diagnosis_failed(
-                        diagnosis_id, reason="subprocess_nonzero_exit"
-                    )
-                    self._apply_mechanical_escalation(candidate)
-                    continue
-
-                # Exit 0 — read the recommendation and consume it.
-                consumed_action = self._consume_diagnosis(diagnosis_id, candidate)
-                # Issue #3366 — read the explicit ``next_directive``
-                # column AFTER the recommendation has been consumed.
-                # On ``respawn_at`` the consumer relaunches the
-                # agent-runner ECS task with ``START_PHASE`` set; on
-                # ``terminal`` the slot is freed cleanly; on absence
-                # the consumer logs ``diagnoser_did_not_complete``
-                # for operator visibility (the recommendation-driven
-                # path has already run, so no double-escalate).
-                self._consume_next_directive(
-                    diagnosis_id=diagnosis_id,
-                    candidate=candidate,
-                    consumed_action=consumed_action,
-                )
+                in_flight += 1
             except Exception:
                 self._log.exception(
                     "daemon.diagnoser_pass_iteration_failed",
@@ -19963,6 +20050,557 @@ class DispatcherDaemon:
                     )
 
         return ran
+
+    # ── async diagnoser reaper (#3376) ────────────────────────────────
+
+    def _max_concurrent_diagnoses(self) -> int:
+        """Read ``dispatcher.config.max_concurrent_diagnoses`` (#3376).
+
+        Returns the configured cap, or :data:`DEFAULT_MAX_CONCURRENT_DIAGNOSES`
+        on missing row, malformed JSON, non-integer value, or value
+        ≤ 0 (a non-positive cap would silently disable the diagnoser
+        entirely; default in that case rather than fail-closed).
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("max_concurrent_diagnoses",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return DEFAULT_MAX_CONCURRENT_DIAGNOSES
+
+        if row is None or row[0] is None:
+            return DEFAULT_MAX_CONCURRENT_DIAGNOSES
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return DEFAULT_MAX_CONCURRENT_DIAGNOSES
+        try:
+            cap = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_CONCURRENT_DIAGNOSES
+        if cap <= 0:
+            return DEFAULT_MAX_CONCURRENT_DIAGNOSES
+        return cap
+
+    def _count_pending_diagnoses_with_pid(self) -> int:
+        """Return the count of in-flight diagnoses (#3376).
+
+        "In-flight" = ``status='pending'`` AND ``subprocess_pid IS
+        NOT NULL``. Used by the spawn pass to gate against the
+        :meth:`_max_concurrent_diagnoses` cap. Pending rows without
+        a PID are mid-spawn (between INSERT and the PID UPDATE) and
+        deliberately excluded — the spawn loop is sequential within
+        a tick so there's no race window worth budgeting for.
+        """
+        assert self._conn is not None, "connect() must run before pending count"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM dispatcher.diagnoses "
+                    "WHERE status = 'pending' AND subprocess_pid IS NOT NULL"
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
+    def _record_diagnoser_subprocess_pid(self, diagnosis_id: int, pid: int) -> None:
+        """UPDATE ``dispatcher.diagnoses.subprocess_pid`` (#3376).
+
+        Called by the spawn pass immediately after ``Popen()`` returns.
+        DB errors are logged + swallowed because the subprocess is
+        already running — the worst-case downstream effect is the
+        reaper can't find the PID and the row eventually times out
+        via the supervisor's pending-row sweep. The diagnoser still
+        runs, writes its recommendation/directive, and exits; the
+        next daemon boot's orphan-reap will catch it. So a missing
+        PID write is recoverable.
+        """
+        assert self._conn is not None, "connect() must run before pid update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.diagnoses "
+                    "SET subprocess_pid = %s "
+                    "WHERE diagnosis_id = %s",
+                    (pid, diagnosis_id),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_pid_persist_failed",
+                extra={
+                    "event": "diagnoser_pid_persist_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "subprocess_pid": pid,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
+    def _list_pending_diagnoses_for_reap(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Return pending diagnoses with a PID, joined with failure context (#3376).
+
+        Each dict contains:
+          * ``diagnosis_id`` — int
+          * ``subprocess_pid`` — int
+          * ``started_at`` — datetime (UTC)
+          * ``failure_id`` — int
+          * ``agent_id`` — str (UUID)
+          * ``category`` — str
+          * ``details`` — dict (parsed from ``failures.details`` JSONB)
+          * ``issue_number`` — int | None (extracted from details)
+
+        The reaper uses these to call
+        :meth:`_consume_diagnosis` / :meth:`_consume_next_directive`
+        / :meth:`_apply_mechanical_escalation` — same input shape
+        these methods previously got from a fresh
+        :meth:`_find_diagnoser_candidates` candidate dict (minus the
+        ``tier`` field which the consumers don't use).
+        """
+        assert self._conn is not None, "connect() must run before reap list"
+        out: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT d.diagnosis_id, d.subprocess_pid, d.started_at, "
+                    "       d.failure_id, d.agent_id, "
+                    "       f.category, f.details "
+                    "FROM dispatcher.diagnoses d "
+                    "JOIN dispatcher.failures f "
+                    "    ON f.failure_id = d.failure_id "
+                    "WHERE d.status = 'pending' "
+                    "  AND d.subprocess_pid IS NOT NULL "
+                    "ORDER BY d.started_at ASC"
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_reap_list_failed",
+                extra={
+                    "event": "diagnoser_reap_list_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return []
+
+        for row in rows:
+            details = row[6] or {}
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except json.JSONDecodeError:
+                    details = {}
+            issue_number: int | None = None
+            if isinstance(details, dict):
+                raw_issue = details.get("issue_number")
+                if raw_issue is not None:
+                    try:
+                        issue_number = int(raw_issue)
+                    except (TypeError, ValueError):
+                        issue_number = None
+            out.append(
+                {
+                    "diagnosis_id": int(row[0]),
+                    "subprocess_pid": int(row[1]),
+                    "started_at": row[2],
+                    "failure_id": int(row[3]),
+                    "agent_id": str(row[4]),
+                    "category": str(row[5]),
+                    "details": details if isinstance(details, dict) else {},
+                    "issue_number": issue_number,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        """Return True if the OS process ``pid`` exists (#3376).
+
+        ``os.kill(pid, 0)`` is the canonical "is this PID alive"
+        check on POSIX — sends signal 0 (no-op) which still triggers
+        the kernel's permission check. ``ProcessLookupError`` (errno
+        ESRCH) means the process is gone. ``PermissionError`` means
+        the process exists but we can't signal it — treat as alive
+        (defensive: better to wait one more tick than to misclassify
+        a still-running diagnoser as completed).
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _kill_diagnoser_process(self, pid: int) -> None:
+        """Send SIGTERM, then SIGKILL after a short grace period (#3376).
+
+        Used by the reaper when a diagnoser exceeds its 90-min
+        budget. SIGTERM gives the diagnoser a chance to write a
+        partial recommendation/directive + close GH/git resources
+        cleanly; SIGKILL is the backstop. Errors are logged + swallowed
+        — the reaper has already decided this run is dead, the worst
+        case from a swallowed error is the next tick re-tries the
+        kill on the same pid.
+        """
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # already gone — nothing to do
+        except Exception:  # pragma: no cover — defensive
+            self._log.exception(
+                "daemon.diagnoser_sigterm_failed",
+                extra={
+                    "event": "diagnoser_sigterm_failed",
+                    "run_id": self._run_id,
+                    "subprocess_pid": pid,
+                },
+            )
+
+        # Give the child a chance to handle SIGTERM, then escalate.
+        # The grace is short (3s) because the reaper runs from
+        # supervisor_tick — we can't block longer than the watchdog
+        # threshold without re-introducing the bug we're fixing.
+        deadline = time.monotonic() + DIAGNOSER_REAP_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if not self._process_alive(pid):
+                return
+            time.sleep(0.1)
+
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except Exception:  # pragma: no cover — defensive
+            self._log.exception(
+                "daemon.diagnoser_sigkill_failed",
+                extra={
+                    "event": "diagnoser_sigkill_failed",
+                    "run_id": self._run_id,
+                    "subprocess_pid": pid,
+                },
+            )
+
+    def _read_diagnoser_stderr_tail(self, diagnosis_id: int) -> str | None:
+        """Read the tail of the diagnoser's stderr log file (#3376).
+
+        Returns the last 500 chars or ``None`` if the file is missing
+        / unreadable. Pre-#3376 the daemon had this in memory via the
+        stream-forwarder ``_ListSink``; post-#3376 the child writes
+        directly to a file and the parent reads it lazily on reap.
+        """
+        repo_root = self._repo_root_for_notify_script()
+        path = repo_root / "tmp" / f"claude-p-diagnose-{diagnosis_id}.stderr.log"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not text:
+            return None
+        return text[-500:]
+
+    def _reap_diagnoser_subprocesses(self) -> int:
+        """Reap completed/timed-out async diagnosers (#3376).
+
+        Called from :meth:`supervisor_tick` after the spawn pass.
+        Iterates pending diagnoses with a PID:
+
+          * **Process gone** — diagnoser exited; parse usage,
+            persist phase output, then run the same recommendation
+            + directive consumer logic that pre-#3376
+            ``_run_diagnoser_pass`` ran inline. On exit-code-unknown
+            the reaper treats the run as "completed" and reads the
+            recommendation; if the recommendation is missing/malformed
+            the existing ``_consume_diagnosis`` parse-fail path falls
+            back to mechanical escalation. We can't observe the
+            actual exit code from a detached PID — the recommendation
+            JSONB row is the source of truth.
+          * **Alive past 90-min budget** — SIGTERM, then SIGKILL;
+            mark ``failed`` with reason ``diagnoser_timeout``;
+            mechanical escalation.
+          * **Alive within budget** — leave; check next tick.
+
+        Returns the number of reaped (terminal-this-tick) rows for
+        log/test correlation.
+        """
+        rows = self._list_pending_diagnoses_for_reap()
+        if not rows:
+            return 0
+
+        reaped = 0
+        now = datetime.now(UTC)
+        for row in rows:
+            diagnosis_id = row["diagnosis_id"]
+            pid = row["subprocess_pid"]
+            started_at = row["started_at"]
+            try:
+                if self._process_alive(pid):
+                    elapsed = self._diagnoser_elapsed_seconds(started_at, now)
+                    if elapsed >= DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS:
+                        self._log.warning(
+                            "daemon.diagnoser_timeout_killing",
+                            extra={
+                                "event": "diagnoser_timeout_killing",
+                                "run_id": self._run_id,
+                                "diagnosis_id": diagnosis_id,
+                                "subprocess_pid": pid,
+                                "elapsed_seconds": elapsed,
+                                "budget_seconds": (
+                                    DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS
+                                ),
+                            },
+                        )
+                        self._kill_diagnoser_process(pid)
+                        # Persist metering best-effort even on
+                        # timeout — same rationale as pre-#3376.
+                        self._reap_persist_metering(row)
+                        self._mark_diagnosis_failed(
+                            diagnosis_id, reason="diagnoser_timeout"
+                        )
+                        self._apply_mechanical_escalation(row)
+                        reaped += 1
+                    # else: still within budget; check next tick.
+                    continue
+
+                # Process is gone — read recommendation + consume.
+                self._reap_persist_metering(row)
+                consumed_action = self._consume_diagnosis(diagnosis_id, row)
+                self._consume_next_directive(
+                    diagnosis_id=diagnosis_id,
+                    candidate=row,
+                    consumed_action=consumed_action,
+                )
+                reaped += 1
+            except Exception:
+                self._log.exception(
+                    "daemon.diagnoser_reap_iteration_failed",
+                    extra={
+                        "event": "diagnoser_reap_iteration_failed",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "subprocess_pid": pid,
+                    },
+                )
+                # Best-effort fallback so one bad reap doesn't stall
+                # later ones. Mark failed + escalate so the agent
+                # doesn't sit pending forever.
+                try:
+                    self._mark_diagnosis_failed(
+                        diagnosis_id, reason="reap_iteration_failed"
+                    )
+                    self._apply_mechanical_escalation(row)
+                except Exception:
+                    self._log.exception(
+                        "daemon.diagnoser_reap_fallback_failed",
+                        extra={
+                            "event": "diagnoser_reap_fallback_failed",
+                            "run_id": self._run_id,
+                            "diagnosis_id": diagnosis_id,
+                        },
+                    )
+                reaped += 1
+
+        return reaped
+
+    def _reap_persist_metering(self, row: dict[str, Any]) -> None:
+        """Parse usage + persist phase output for a reaped diagnosis (#3376).
+
+        Wrapper that mirrors the pre-#3376 inline metering block in
+        ``_run_diagnoser_pass``. Best-effort — failures are caught by
+        the surrounding try/except in :meth:`_reap_diagnoser_subprocesses`.
+        """
+        diagnosis_id = row["diagnosis_id"]
+        agent_id = row["agent_id"]
+        usage = self._parse_diagnoser_usage(diagnosis_id)
+        stderr_tail = self._read_diagnoser_stderr_tail(diagnosis_id)
+        self._persist_diagnoser_phase_output(
+            agent_id=agent_id,
+            diagnosis_id=diagnosis_id,
+            usage=usage,
+            log_text=stderr_tail,
+        )
+
+    @staticmethod
+    def _diagnoser_elapsed_seconds(started_at: Any, now: datetime) -> float:
+        """Return seconds elapsed since ``started_at`` (#3376).
+
+        ``started_at`` comes from psycopg as a tz-aware UTC datetime.
+        Defensive coercion: if it's somehow naïve or a string, return
+        0.0 so the reaper leaves the row alone (the next tick will
+        re-evaluate). Better to mis-classify a timed-out run as still-
+        running for one tick than to mis-classify a healthy run as
+        timed-out.
+        """
+        if not isinstance(started_at, datetime):
+            return 0.0
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        return max(0.0, (now - started_at).total_seconds())
+
+    def _reap_orphaned_diagnoses_on_boot(self) -> int:
+        """Reap diagnoses orphaned by a daemon restart (#3376).
+
+        Called once at daemon startup, after :meth:`recover_abandoned_agents`.
+        Iterates rows with ``status='pending' AND subprocess_pid IS
+        NOT NULL`` left behind by a previous daemon. For each:
+
+          * If the PID is still alive AND ``started_at`` predates
+            the current daemon's run-registration timestamp — the
+            diagnoser process is unrelated to the new daemon's
+            spawn (the previous daemon's PID has been recycled by
+            the OS). Mark ``failed`` with reason
+            ``diagnoser_orphaned_by_daemon_restart`` (does NOT
+            kill the process — the new daemon doesn't own it).
+          * If the PID is dead — mark ``failed`` for the same
+            reason. The recommendation + directive may still be
+            on-disk but we don't trust it: the previous daemon
+            crashed mid-consume, so consuming now would be a race
+            against the corrupt state.
+
+        Plus orphans without PIDs: pending rows whose ``started_at``
+        predates the current daemon (i.e. their parent daemon
+        crashed before the PID UPDATE landed). Same treatment.
+
+        Returns the number of orphans reaped. Always non-fatal —
+        DB errors are logged and the daemon continues. The supervisor
+        tick's reaper is the backstop for any orphans this misses.
+        """
+        assert self._conn is not None, "connect() must run before orphan reap"
+        assert self._run_id is not None, "register run before orphan reap"
+
+        # Read this run's started_at to compare against orphans.
+        # Anything started BEFORE this row is by definition from
+        # a prior run (the lease check guarantees we are the only
+        # active daemon).
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT started_at FROM dispatcher.runs WHERE run_id = %s",
+                    (self._run_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_orphan_reap_run_lookup_failed",
+                extra={
+                    "event": "diagnoser_orphan_reap_run_lookup_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+
+        if row is None or row[0] is None:
+            return 0
+        run_started_at = row[0]
+
+        # Find all pending diagnoses whose started_at predates this
+        # run. The PID column is read for log visibility; orphans
+        # without a PID are still orphaned (their parent crashed
+        # before the PID UPDATE).
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT diagnosis_id, subprocess_pid, started_at "
+                    "FROM dispatcher.diagnoses "
+                    "WHERE status = 'pending' "
+                    "  AND started_at < %s",
+                    (run_started_at,),
+                )
+                orphans = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_orphan_reap_scan_failed",
+                extra={
+                    "event": "diagnoser_orphan_reap_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+
+        reaped = 0
+        for orphan_row in orphans:
+            diagnosis_id = int(orphan_row[0])
+            pid_raw = orphan_row[1]
+            orphan_started_at = orphan_row[2]
+            pid = int(pid_raw) if pid_raw is not None else None
+
+            self._log.warning(
+                "daemon.diagnoser_orphaned_by_daemon_restart",
+                extra={
+                    "event": "diagnoser_orphaned_by_daemon_restart",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "subprocess_pid": pid,
+                    "orphan_started_at": str(orphan_started_at),
+                    "this_run_started_at": str(run_started_at),
+                },
+            )
+            try:
+                self._mark_diagnosis_failed(
+                    diagnosis_id,
+                    reason="diagnoser_orphaned_by_daemon_restart",
+                )
+            except Exception:
+                self._log.exception(
+                    "daemon.diagnoser_orphan_reap_mark_failed",
+                    extra={
+                        "event": "diagnoser_orphan_reap_mark_failed",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                    },
+                )
+                continue
+            reaped += 1
+
+        if reaped:
+            self._log.info(
+                "daemon.diagnoser_orphan_reap_complete",
+                extra={
+                    "event": "diagnoser_orphan_reap_complete",
+                    "run_id": self._run_id,
+                    "orphans_reaped": reaped,
+                },
+            )
+        return reaped
 
     # ── supervisor tick (every ``tick_supervisor_seconds``) ─────────────
 
@@ -20120,6 +20758,23 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        # Issue #3376: reap completed/timed-out async diagnosers
+        # FIRST so the slot count is current before the spawn pass
+        # checks the cap. The reaper is the consumer side of the
+        # async fire-and-forget architecture — it reads
+        # recommendation/directive from completed runs and
+        # SIGTERM/SIGKILLs runs that blew their 90-min budget.
+        diagnoses_reaped = 0
+        try:
+            diagnoses_reaped = self._reap_diagnoser_subprocesses()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_reap_pass_failed",
+                extra={
+                    "event": "diagnoser_reap_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
         diagnoses_ran = 0
         try:
             diagnoses_ran = self._run_diagnoser_pass()
@@ -20155,6 +20810,7 @@ class DispatcherDaemon:
                 "retry_markers_processed": retry_processed,
                 "rate_skip_active": rate_skip_active,
                 "diagnoses_ran": diagnoses_ran,
+                "diagnoses_reaped": diagnoses_reaped,
             },
         )
         return {
@@ -20165,6 +20821,7 @@ class DispatcherDaemon:
             "retry_markers_processed": retry_processed,
             "rate_skip_active": 1 if rate_skip_active else 0,
             "diagnoses_ran": diagnoses_ran,
+            "diagnoses_reaped": diagnoses_reaped,
         }
 
     # ── heartbeat metric emission (supervisor-tick step 3) ──────────────
@@ -22293,6 +22950,24 @@ def main(argv: list[str] | None = None) -> int:
         log.exception(
             "daemon.recover_abandoned_agents_failed",
             extra={"event": "recover_abandoned_agents_failed"},
+        )
+
+    # Issue #3376: reap diagnoses orphaned by a prior daemon's
+    # crash/restart. Pre-#3376 a synchronous-spawn diagnoser running
+    # at watchdog-kill time left its dispatcher.diagnoses row at
+    # status='pending' forever (the parent daemon died mid-wait).
+    # Now any pending row whose started_at predates the current
+    # daemon's started_at is marked failed with reason
+    # ``diagnoser_orphaned_by_daemon_restart``. Also handles the
+    # post-#3376 case where a daemon crashes between Popen() and the
+    # subprocess_pid UPDATE, or between UPDATE and the next reap
+    # tick. Non-fatal — the supervisor tick's reaper is the backstop.
+    try:
+        daemon._reap_orphaned_diagnoses_on_boot()
+    except Exception:
+        log.exception(
+            "daemon.diagnoser_orphan_reap_failed",
+            extra={"event": "diagnoser_orphan_reap_failed"},
         )
 
     # Bootstrap the baseline git clone before the first scheduler tick

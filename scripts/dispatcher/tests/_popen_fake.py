@@ -55,12 +55,18 @@ class _FakePopen:
         stderr_chunks: Iterable[str],
         returncode: int,
         timeout: bool,
+        pid: int = 4242,
     ) -> None:
         self.stdout = io.StringIO("".join(stdout_chunks))
         self.stderr = io.StringIO("".join(stderr_chunks))
         self._returncode = returncode
         self._raise_timeout = timeout
         self._finished = False
+        # #3376 — async fire-and-forget spawn writes the PID to
+        # ``dispatcher.diagnoses.subprocess_pid``; the new tests assert
+        # the value gets persisted, so the fake must expose a stable
+        # ``pid`` attribute. Default 4242 for tests that don't override.
+        self.pid = pid
 
     def wait(self, timeout: float | None = None) -> int:
         if self._raise_timeout and not self._finished:
@@ -83,6 +89,7 @@ def make_popen_factory(
     stderr_chunks: Iterable[str] = (),
     returncode: int = 0,
     timeout: bool = False,
+    pid: int = 4242,
     on_start: Callable[[list[str], dict[str, Any]], None] | None = None,
 ) -> Callable[..., _FakePopen]:
     """Return a ``Popen`` factory with the requested behaviour baked in.
@@ -92,6 +99,9 @@ def make_popen_factory(
     argument and ignores ``stdout=``, ``stderr=``, ``bufsize=``,
     ``text=``, ``cwd=`` kwargs. Callers who care about those kwargs pass
     an ``on_start`` callback to capture them.
+
+    ``pid`` controls the value the fake exposes via ``proc.pid`` —
+    relied on by the async-spawn tests added for issue #3376.
     """
     chunks_out = list(stdout_chunks)
     chunks_err = list(stderr_chunks)
@@ -104,6 +114,7 @@ def make_popen_factory(
             stderr_chunks=chunks_err,
             returncode=returncode,
             timeout=timeout,
+            pid=pid,
         )
 
     return _factory

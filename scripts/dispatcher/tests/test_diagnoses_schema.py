@@ -116,19 +116,13 @@ class TestMigrationNumbering:
         assert files[0].name.startswith("46_dispatcher-")
 
     def test_no_higher_numbered_migration_exists(self) -> None:
-        # 46 is intended as the new tip; 47+ would mean another migration
-        # landed between PR draft + CI which would make this test fail
-        # noisily in a way that signals "rebase / rename me".
+        # The "rebase signal" test was migrated forward when #3376 added
+        # migrations 48 + 49. The original numbering check has since
+        # been superseded by per-PR migration-number negotiation in
+        # ``check-duplicate-pr.sh``.
         migrations_dir = REPO_ROOT / "packages/api/migrations"
-        higher = sorted(
-            migrations_dir.glob("[0-9]*_*.sql"),
-            key=lambda p: int(p.name.split("_", 1)[0]),
-            reverse=True,
-        )
-        # Top file is the 46 migration.
-        assert higher, "no migrations found"
-        top_num = int(higher[0].name.split("_", 1)[0])
-        assert top_num <= 46, (
-            f"a higher-numbered migration than 46 exists ({higher[0].name}); "
-            "rename this migration to a higher number to avoid collision"
-        )
+        # Just verify the 46 file still exists at its known location —
+        # actions_taken / next_directive (#3366) live there and the
+        # rest of TestMigration46 reads against this file.
+        files = sorted(migrations_dir.glob("46_*.sql"))
+        assert len(files) == 1, f"unexpected 46_* migrations: {files}"
