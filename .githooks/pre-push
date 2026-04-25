@@ -80,19 +80,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
 
-    # If this is a new branch (remote_sha is all zeros), diff against the
-    # merge-base with origin/main so we check all new commits.
+    # If this is a new branch (remote_sha is all zeros), mark it for the
+    # PR-creation reminder at the end of the hook.
     if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
         push_is_new_branch=true
-        # Fetch main to make sure we have it
-        git fetch "$remote" main --quiet 2>/dev/null || true
-        merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
-        if [ -z "$merge_base" ]; then
-            echo "pre-push: could not determine merge-base with $remote/main; skipping checks" >&2
-            continue
-        fi
-        remote_sha="$merge_base"
     fi
+
+    # Always diff against merge-base with origin/main. For new-branch pushes
+    # this was already the behaviour; for force-pushes after rebase it ensures
+    # rebased-in commits (from other merged PRs) are excluded from the diff,
+    # so only packages touched by this branch's own commits are checked (#3228).
+    git fetch "$remote" main --quiet 2>/dev/null || true
+    merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
+    if [ -z "$merge_base" ]; then
+        echo "pre-push: could not determine merge-base with $remote/main; skipping checks" >&2
+        continue
+    fi
+    remote_sha="$merge_base"
 
     # Get list of changed files
     changed_files=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)

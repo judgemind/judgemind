@@ -611,6 +611,82 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 14: Rebase + force-push ignores rebased-in packages (#3228)
+# ───────────────────────────────────────────────────────────────────────
+# After `git rebase main`, the feature branch contains commits originally
+# authored on main (sibling PR merge). A force-push with-lease passes
+# remote_sha=<pre-rebase tip> (the old branch tip, not the zero SHA), so
+# the old code diffed against that stale ref and included every rebased-in
+# package. With the fix the hook uses merge-base(local, origin/main)
+# instead, so only packages touched by this branch's own commits are checked.
+echo "[scenario 14] rebase+force-push — rebased-in packages must NOT fire"
+init_workspace
+
+# Step 1: create webpkg on a feature branch and push it
+git -C "$WORK" checkout --quiet -b feature-rebase-test
+mkdir -p "$WORK/packages/webpkg/src"
+cat > "$WORK/packages/webpkg/pyproject.toml" <<'PYPROJ'
+[project]
+name = "webpkg"
+version = "0.0.1"
+PYPROJ
+cat > "$WORK/packages/webpkg/src/foo.py" <<'PY'
+"""webpkg module."""
+
+
+def hello() -> str:
+    """Return hello."""
+    return "hello"
+PY
+git -C "$WORK" add packages/webpkg
+git -C "$WORK" commit --quiet -m "feat: add webpkg"
+original_feature_tip="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" push --quiet origin feature-rebase-test
+
+# Step 2: merge a sibling commit into main that touches apipkg
+git -C "$WORK" checkout --quiet main
+mkdir -p "$WORK/packages/apipkg/src"
+cat > "$WORK/packages/apipkg/pyproject.toml" <<'PYPROJ'
+[project]
+name = "apipkg"
+version = "0.0.1"
+PYPROJ
+cat > "$WORK/packages/apipkg/src/bar.py" <<'PY'
+"""apipkg module."""
+
+
+def world() -> str:
+    """Return world."""
+    return "world"
+PY
+git -C "$WORK" add packages/apipkg
+git -C "$WORK" commit --quiet -m "feat: add apipkg (simulates sibling PR merge)"
+git -C "$WORK" push --quiet origin main
+
+# Step 3: rebase feature-rebase-test onto updated main
+git -C "$WORK" checkout --quiet feature-rebase-test
+git -C "$WORK" rebase --quiet main
+rebased_tip="$(git -C "$WORK" rev-parse HEAD)"
+
+# Step 4: run hook simulating a force-push-with-lease
+# remote_sha = original_feature_tip (the pre-rebase ref, NOT zero SHA)
+run_hook "refs/heads/feature-rebase-test $rebased_tip refs/heads/feature-rebase-test $original_feature_tip"
+
+if echo "$hook_out" | grep -q "checking Python package 'apipkg'"; then
+    report_fail "rebased-in package 'apipkg' must NOT fire on force-push after rebase (#3228)" "$hook_out"
+elif echo "$hook_out" | grep -q "checking Python package 'webpkg'"; then
+    report_pass "force-push after rebase: only branch-owned 'webpkg' fires, 'apipkg' ignored (#3228)"
+else
+    # webpkg not detected either — could be a missing ruff warning (acceptable)
+    # Confirm apipkg definitely didn't fire (the primary AC)
+    if ! echo "$hook_out" | grep -q "checking Python package 'apipkg'"; then
+        report_pass "force-push after rebase: 'apipkg' correctly ignored (#3228 AC1)"
+    else
+        report_fail "unexpected output for scenario 14" "$hook_out"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
