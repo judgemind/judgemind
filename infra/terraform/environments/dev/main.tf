@@ -60,6 +60,14 @@ module "iam_scraper" {
   document_archive_bucket_arn = module.document_archive.bucket_arn
 }
 
+module "iam_agent" {
+  source = "../../modules/iam_agent"
+
+  environment                 = "dev"
+  document_archive_bucket_arn = module.document_archive.bucket_arn
+  scraper_role_arn            = module.iam_scraper.role_arn
+}
+
 module "database" {
   source = "../../modules/database"
 
@@ -447,6 +455,11 @@ output "document_archive_arn" {
 output "scraper_role_arn" {
   description = "Dev scraper IAM role ARN"
   value       = module.iam_scraper.role_arn
+}
+
+output "agent_role_arn" {
+  description = "Dev agent IAM role ARN — copy into ~/.aws/config as role_arn for the judgemind-agent profile"
+  value       = module.iam_agent.role_arn
 }
 
 output "scraper_instance_profile_arn" {

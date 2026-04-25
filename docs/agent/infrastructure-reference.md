@@ -481,7 +481,7 @@ Best practices:
 
 1. **Find the task ARN.** Preferred: `mcp__awslabs_ecs-mcp-server__ecs_resource_management` with `api_operation: "ListTasks"`, `api_params: {"cluster": "judgemind-dev", "desiredStatus": "RUNNING"}`. CLI fallback: `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING --region us-west-2`.
 2. **Confirm it's the oneshot and check `startedAt` vs now.** Preferred: `ecs_resource_management` with `api_operation: "DescribeTasks"`, `api_params: {"cluster": "judgemind-dev", "tasks": ["<arn>"]}`. CLI fallback: `aws ecs describe-tasks --cluster judgemind-dev --tasks <arn> --region us-west-2`.
-3. **Stop the task** — sends SIGTERM then SIGKILL. The MCP `StopTask` is gated behind Phase B (`ALLOW_WRITE`), so this step stays on the CLI: `aws ecs stop-task --cluster judgemind-dev --task <arn> --reason "zombie retry-loop (#2572)" --region us-west-2`.
+3. **Stop the task** — sends SIGTERM then SIGKILL. MCP-first: `mcp__awslabs_ecs-mcp-server__ecs_resource_management` with `api_operation: "StopTask"` and `api_params: {"cluster": "judgemind-dev", "task": "<arn>", "reason": "zombie retry-loop (#2572)"}`. CLI fallback: `aws ecs stop-task --cluster judgemind-dev --task <arn> --reason "zombie retry-loop (#2572)" --region us-west-2`.
 4. Wait for the task to fully STOP (connection slots release as psycopg closes).  Verify with `scripts/dev-db-query.sh "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE '%rebuild%'"`.
 5. Diagnose the root cause before re-running — if connection exhaustion, confirm no other rebuild is running; if OOM, bump `--memory`; if the retry cap was tripped, consult the crashed-key sample in the CloudWatch logs.
 

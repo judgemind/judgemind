@@ -2,7 +2,7 @@
 
 > **When to read this:** you are writing or editing a skill, agent doc, or CLAUDE.md section that interacts with AWS (ECS, CloudWatch Logs, S3, Secrets Manager) and need to choose between an `mcp__awslabs_*` MCP tool, the `aws` CLI, and the existing `scripts/ecs-*.sh` wrappers.
 >
-> **TL;DR:** prefer MCP for ad-hoc structured reads (ECS DescribeServices/DescribeTasks/ListTasks, CloudWatch Logs Insights queries). Keep the `scripts/ecs-*.sh` wrappers for the full launch-and-stream-logs workflow. Keep the `aws` CLI for writes, for live log tailing, and for anything in the Gap rows of `docs/agent/aws-to-mcp-migration.md`.
+> **TL;DR:** prefer MCP for all ad-hoc ECS and CloudWatch reads and writes (Phase B: `ALLOW_WRITE=true` is set, IAM role scoped to dev only). Keep the `scripts/ecs-*.sh` wrappers for the full launch-and-stream-logs and rollout-wait workflows. Keep the `aws` CLI for S3, secrets, live log tailing, and anything inside `scripts/`/`.github/`.
 
 ## Why this doc exists
 
@@ -14,14 +14,47 @@ Agents historically used the `aws` CLI for every AWS operation, which produced a
 
 The two AWS Labs MCP servers expose the underlying AWS APIs as typed tools — region, service identifiers, and JSON params are passed structurally and the response is parsed JSON. For ad-hoc reads from inside a Claude Code session this is a clear win.
 
-## What is installed (Phase A — read-only)
+## What is installed (Phase B — scoped write access)
 
 Two MCP servers are configured in `~/.claude.json` at `local` scope:
 
 - **`awslabs.cloudwatch-mcp-server`** — actively maintained by AWS Labs. Covers Logs Insights queries, log-group discovery, metric data, alarm history. Does **not** cover live-tail (`FilterLogEvents` streaming).
-- **`awslabs.ecs-mcp-server`** — flagged by its own README as "legacy, no more updates" but the `ecs_resource_management` dispatcher is a thin boto3 shim over the ECS API. Configured with `ALLOW_WRITE` unset (read-only) — Phase A constrains us to `Describe*`, `List*`, and `Get*` calls.
+- **`awslabs.ecs-mcp-server`** — flagged by its own README as "legacy, no more updates" but the `ecs_resource_management` dispatcher is a thin boto3 shim over the ECS API. Configured with `ALLOW_WRITE=true` — Phase B unlocks write operations (`RunTask`, `UpdateService`, `StopTask`, `RegisterTaskDefinition`) via the scoped `judgemind-agent-dev` IAM role.
 
-Both servers use ambient AWS credentials via boto3 — same `~/.aws/credentials` or env vars as the `aws` CLI uses today. Phase B (issue filed, blocked by Phase A) will introduce a scoped `iam_agent` Terraform role and flip `ALLOW_WRITE=true` once the IAM boundary is in place.
+Both servers use the `judgemind-agent` AWS profile (`AWS_PROFILE=judgemind-agent`), which assumes the `judgemind-agent-dev` IAM role via `sts:AssumeRole`. The role is scoped to dev-only resources — no prod cluster, no prod log groups, S3 limited to `staging/` and `spotcheck/` prefixes only.
+
+## Operator setup
+
+After `terraform apply` in `environments/dev`, run `terraform output agent_role_arn` to get the role ARN, then add this profile to `~/.aws/config`:
+
+```ini
+[profile judgemind-agent]
+role_arn = <agent_role_arn from terraform output>
+source_profile = default
+region = us-west-2
+```
+
+Then add `AWS_PROFILE` and `ALLOW_WRITE` to the MCP server env blocks in `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "awslabs.ecs-mcp-server": {
+      "env": {
+        "AWS_PROFILE": "judgemind-agent",
+        "ALLOW_WRITE": "true"
+      }
+    },
+    "awslabs.cloudwatch-mcp-server": {
+      "env": {
+        "AWS_PROFILE": "judgemind-agent"
+      }
+    }
+  }
+}
+```
+
+After editing `~/.claude.json`, quit and relaunch the CLI (see §"CLI relaunch requirement" below).
 
 ## Decision rule
 
@@ -33,36 +66,41 @@ Both servers use ambient AWS credentials via boto3 — same `~/.aws/credentials`
 | Run a Logs Insights query against an ECS log group (e.g. count errors in last 30 min, find recent successful processing line) | **MCP** (`mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query`) | Returns parsed result rows; no millisecond-epoch math, no JSON parsing. |
 | Discover available log groups before querying | **MCP** (`mcp__awslabs_cloudwatch-mcp-server__describe_log_groups`) | |
 | Inspect active CloudWatch alarms or alarm history | **MCP** (`get_active_alarms`, `get_alarm_history`) | |
-| **Launch a oneshot Fargate task and stream its logs to the agent's terminal** | **`scripts/ecs-run-task.sh`** | The script handles task-definition resolution, network config, log-stream waiting, and exit-code propagation. The MCP `RunTask` exists but is gated behind Phase B (`ALLOW_WRITE`) and would not include the stream-logs convenience. |
+| **Ad-hoc `RunTask` — launch a task without needing streamed logs** | **MCP** (`ecs_resource_management` with `api_operation: "RunTask"`) | Phase B: `ALLOW_WRITE=true` is set and the scoped role permits `ecs:RunTask` on the dev cluster. Use for quick one-shots where you'll poll `DescribeTasks` for status. |
+| **Launch a oneshot Fargate task and stream its logs to the agent's terminal** | **`scripts/ecs-run-task.sh`** | The script handles task-definition resolution, network config, log-stream waiting, and exit-code propagation. MCP `RunTask` does not include the stream-logs convenience — script stays for all launch-and-stream-logs flows. |
+| **Force a service redeploy (ad-hoc one-shot)** | **MCP** (`ecs_resource_management` with `api_operation: "UpdateService"`) | Phase B: `ALLOW_WRITE=true` is set. Use for quick ad-hoc redeployments; use `scripts/ecs-redeploy.sh` for rollout-wait flows. |
 | Quick SQL against the dev DB (SELECT, EXPLAIN) | **`scripts/dev-db-query.sh`** | Uses interactive ECS Exec via `session-manager-plugin`. MCP cannot replicate the interactive SSM stream. |
 | Interactive shell into the ingestion worker for ad-hoc debugging | **`scripts/ecs-run.sh`** | Same — interactive Exec is not MCP-replicable. |
 | Live tail (`tail -f`) of an ECS log group | **`scripts/ecs-logs.sh --follow`** | CloudWatch MCP has no streaming tool; polling-based Insights queries would add latency and per-query cost. |
-| Force a service redeploy (new task definition, kick the deployment) | **`scripts/ecs-redeploy.sh`** | Wraps `RegisterTaskDefinition` + `UpdateService` and waits for rollout. MCP write path is Phase B. |
-| Download an object from S3 (e.g. spotcheck artifacts, raw PDFs) | **`aws s3 cp`** | Neither MCP server covers S3. The `aws-api-mcp-server` (generic CLI wrapper) is being held until Phase B. |
+| Full service redeploy with rollout-wait (new task definition, kick the deployment) | **`scripts/ecs-redeploy.sh`** | Wraps `RegisterTaskDefinition` + `UpdateService` and waits for rollout; MCP has no rollout-wait convenience. |
+| Download an object from S3 (e.g. spotcheck artifacts, raw PDFs) | **`aws s3 cp`** | Neither MCP server covers S3. `awslabs.aws-api-mcp-server` is deferred to Phase C — see §"Write-path note" below. |
 | Read a Secrets Manager secret value into an env var | **`scripts/with-secret.sh`** | Wraps `aws secretsmanager get-secret-value` and pipes into the child process's env without writing the value to disk or to chat output. Never call `aws secretsmanager get-secret-value` directly. |
 | Anything inside `scripts/`, `.github/workflows/`, or `.githooks/` | **`aws` CLI** | MCP runs inside Claude Code and is not reachable from shell scripts that execute outside the agent context. |
 
-## The write-path note (read this before adopting MCP for anything that mutates AWS)
+## The write-path note (Phase B state — scoped writes enabled)
 
-`awslabs.ecs-mcp-server` is configured with `ALLOW_WRITE` unset — the server refuses all mutating operations (`RunTask`, `RegisterTaskDefinition`, `UpdateService`, `StopTask`, `CreateService`, `DeleteService`). This is intentional: in Phase A the server uses ambient credentials, which today means full admin in the dev account. Without an IAM boundary, an LLM-driven write call could in principle modify production resources.
+`awslabs.ecs-mcp-server` is configured with `ALLOW_WRITE=true` (Phase B). The server now accepts mutating ECS operations (`RunTask`, `RegisterTaskDefinition`, `UpdateService`, `StopTask`). These are safe because the MCP servers assume the `judgemind-agent-dev` IAM role, which is scoped to:
 
-Phase B (follow-up issue, blocked by the Phase A issue) will:
+- **ECS:** dev cluster only (`judgemind-dev`) — no prod cluster ARN granted
+- **CloudWatch Logs:** `/ecs/judgemind-*-dev` groups only — prod groups (`*-production`) are not matched
+- **S3:** `staging/*` and `spotcheck/*` prefixes only — no access to `raw/`, `derived/`, or the Terraform state bucket
+- **Secrets Manager:** `judgemind/*` prefix only
+- **IAM PassRole:** scraper role ARN only (maintenance role if wired)
 
-1. Define a new `iam_agent` Terraform module with a scoped role: `ecs:Run/Describe/ListTask*`, `logs:Get/Describe/FilterLogEvents`, `s3:GetObject/PutObject/DeleteObject/ListBucket` on staging prefixes only, `secretsmanager:GetSecretValue` on `judgemind/*`, `iam:PassRole` narrow to scraper/maintenance task roles.
-2. Configure both MCP servers to assume the role via `AWS_PROFILE` with `role_arn` + `source_profile`.
-3. Flip `ALLOW_WRITE=true` on the ECS MCP server once the IAM boundary is in place.
-4. Migrate the small set of write callsites in skills (e.g. ad-hoc `RunTask` for a quick verification job) to MCP.
+**`awslabs.aws-api-mcp-server` is deferred to Phase C.** Even with the scoped IAM role in place, `aws-api-mcp-server` exposes the entire AWS API surface — including IAM list-write paths the current role does not grant. A Phase C follow-up should enumerate the specific S3/Secrets Manager reads worth migrating (e.g. `s3:GetObject` for spotcheck artifact download, `secretsmanager:GetSecretValue` for ad-hoc debugging) before enabling it. Until then, S3 and Secrets Manager operations stay on `aws` CLI and `scripts/with-secret.sh`.
 
-Until Phase B lands: writes stay on `aws` CLI and the `scripts/ecs-*.sh` wrappers. The wrappers will not migrate even after Phase B — they encapsulate non-MCP value (network config, log streaming, exit-code propagation, deployment rollout waits).
+The `scripts/ecs-*.sh` wrappers are **not removed** — they encapsulate non-MCP value (network config, log streaming, exit-code propagation, deployment rollout waits) that the MCP tools do not replicate.
 
 ## CLI relaunch requirement
 
 Same gotcha as the GitHub MCP server (#2658): when `~/.claude.json` is edited to add or change an `mcpServers` entry, **subagents launched before the relaunch will not see the new tools**. The dispatcher and any in-flight `/task` subagents must be restarted after the edit. The smoke-test pattern is:
 
-1. Edit `~/.claude.json`.
+1. Edit `~/.claude.json` with `AWS_PROFILE=judgemind-agent` and `ALLOW_WRITE=true` per §"Operator setup" above.
 2. Quit and relaunch the CLI.
-3. Run a CLI-level smoke test (`ToolSearch query="select:mcp__awslabs_ecs-mcp-server__ecs_resource_management"` then a `DescribeServices` call against the dev cluster).
-4. Spawn a minimal subagent that does the same call, to confirm the tools propagated to the subagent context too.
+3. **Smoke test 1 (read still works):** `ToolSearch query="select:mcp__awslabs_ecs-mcp-server__ecs_resource_management"` then `ecs_resource_management` with `api_operation: "DescribeServices"` against `judgemind-ingestion-worker-dev` — confirm it returns the service descriptor.
+4. **Smoke test 2 (write unblocked):** `ecs_resource_management` with `api_operation: "UpdateService"` and a no-op payload (e.g. `forceNewDeployment: false` with the current task definition) — confirm it succeeds without an `ALLOW_WRITE` refusal error.
+5. **Smoke test 3 (negative — prod boundary holds):** `ecs_resource_management` with `api_operation: "DescribeServices"` against a production cluster (e.g. `judgemind-prod`) — confirm the call is denied by IAM, not by the MCP server's `ALLOW_WRITE` guard. The IAM role's `Resource` list does not include any prod cluster ARN.
+6. Spawn a minimal subagent that repeats smoke test 1, to confirm the tools propagated to the subagent context too.
 
 ## How to load a deferred MCP tool
 
