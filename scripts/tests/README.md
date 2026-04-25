@@ -110,3 +110,32 @@ import my_script  # noqa: E402
   all of these at the top level.
 - **`test_dev_db_query_runner.py`** — Function-level `patch.dict(sys.modules, ...)`
   for psycopg, because the script uses a lazy import inside `run_query()`.
+
+## Test durations baseline
+
+Baseline captured 2026-04-25 via `pytest --durations=20 scripts/tests/`.
+
+### Pytest shard durations
+
+Top-5 slowest tests (all at 0.30s; total suite wall-clock ~6.3s across 737 passed, 23 skipped):
+
+| Duration | Test |
+|---|---|
+| 0.30s | `scripts/tests/test_agent_status.py::TestParseNdjsonFile::test_multiple_tool_calls` |
+| 0.30s | `scripts/tests/test_agent_status.py::TestParseNdjsonFile::test_duration_computed` |
+| 0.30s | `scripts/tests/test_agent_status.py::TestParseNdjsonFile::test_tool_use_extracted` |
+| 0.30s | `scripts/tests/test_agent_status.py::TestParseNdjsonFile::test_deduplicates_tool_use_ids` |
+| 0.30s | `scripts/tests/test_agent_status.py::TestParseNdjsonFile::test_token_usage_accumulated` |
+
+### Shell shard durations
+
+The shell shard (~410-450s total) is dominated by two tests:
+`test_agent_runner_entrypoint.sh` (~275s) and
+`test_check_dispatcher_image_versions.sh` (~58s). These are integration tests
+that should keep gating PRs. The sharding rationale (splitting the original
+single `scripts-tests` job that exceeded 600s) is captured in
+`.github/workflows/ci.yml` lines 596-602 and issue #3307.
+
+If a future `/audit` flags `scripts-tests` again, re-run
+`pytest --durations=20 scripts/tests/` and compare against this baseline to
+identify which tests regressed.
