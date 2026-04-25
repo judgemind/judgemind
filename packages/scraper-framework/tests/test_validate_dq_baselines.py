@@ -23,6 +23,7 @@ validate_reasonable_expectations = vdqb.validate_reasonable_expectations
 validate_required_fc_fields = vdqb.validate_required_fc_fields
 validate_county_config = vdqb.validate_county_config
 validate_expected_null_rates = vdqb.validate_expected_null_rates
+validate_scraper_schedules = vdqb.validate_scraper_schedules
 load_baselines_json = vdqb.load_baselines_json
 main = vdqb.main
 
@@ -607,3 +608,83 @@ class TestMainFunction:
         p.write_text(json.dumps(data))
         monkeypatch.setattr("sys.argv", ["validate-dq-baselines.py", "--path", str(p)])
         assert main() == 1
+
+
+class TestValidateScraperSchedules:
+    """Tests for the scraper_schedules section validation (#2981)."""
+
+    def test_empty_section_no_errors(self) -> None:
+        errors = validate_scraper_schedules({})
+        assert errors == []
+
+    def test_metadata_keys_skipped(self) -> None:
+        """Keys starting with _ are metadata and should be skipped."""
+        errors = validate_scraper_schedules({"_note": "some note"})
+        assert errors == []
+
+    def test_valid_entry_known_scraper_id_passes(self) -> None:
+        """A known scraper ID with a valid cron passes."""
+        errors = validate_scraper_schedules(
+            {"ca-oc-tentatives": {"cron": "0 6,14,18 * * *", "timezone": "America/Los_Angeles"}}
+        )
+        assert errors == []
+
+    def test_unknown_scraper_id_fails(self) -> None:
+        """An unknown scraper ID should produce a validation error."""
+        errors = validate_scraper_schedules({"totally-unknown-scraper": {"cron": "0 6 * * *"}})
+        assert len(errors) == 1
+        assert "totally-unknown-scraper" in errors[0]
+        assert "not a known scraper ID" in errors[0]
+
+    def test_malformed_cron_fails(self) -> None:
+        """A malformed cron expression should produce a validation error."""
+        errors = validate_scraper_schedules({"ca-oc-tentatives": {"cron": "not-a-valid-cron"}})
+        assert len(errors) >= 1
+        assert any("ca-oc-tentatives" in e for e in errors)
+
+    def test_valid_cron_no_errors(self) -> None:
+        """A syntactically valid cron expression passes."""
+        errors = validate_scraper_schedules({"ca-oc-tentatives": {"cron": "0 6 * * *"}})
+        assert errors == []
+
+    def test_entry_without_cron_passes(self) -> None:
+        """An entry with no cron key (fire always) is valid."""
+        errors = validate_scraper_schedules(
+            {"ca-oc-tentatives": {"timezone": "America/Los_Angeles"}}
+        )
+        assert errors == []
+
+    def test_non_dict_entry_flagged(self) -> None:
+        """Non-dict entry should be flagged."""
+        errors = validate_scraper_schedules({"ca-oc-tentatives": "not-a-dict"})
+        assert len(errors) == 1
+        assert "must be a dict" in errors[0]
+
+    def test_real_baselines_scraper_schedules_valid(self) -> None:
+        """The actual data-quality-baselines.json scraper_schedules section passes."""
+        baselines_path = _REPO_ROOT / "data-quality-baselines.json"
+        if not baselines_path.exists():
+            return  # Skip if running outside repo context
+        data = load_baselines_json(baselines_path)
+        schedules = data.get("scraper_schedules") or {}
+        errors = validate_scraper_schedules(schedules)
+        assert errors == [], f"scraper_schedules has errors: {errors}"
+
+    def test_full_validate_with_valid_schedules(self) -> None:
+        """validate() on a baselines dict with valid scraper_schedules passes."""
+        data = _valid_baselines()
+        data["scraper_schedules"] = {
+            "_note": "test",
+            "ca-oc-tentatives": {"cron": "0 6 * * *"},
+        }
+        errors = validate(data)
+        assert errors == []
+
+    def test_full_validate_catches_invalid_schedules(self) -> None:
+        """validate() surfaces scraper_schedules errors."""
+        data = _valid_baselines()
+        data["scraper_schedules"] = {
+            "totally-fake-scraper-xyz": {"cron": "0 6 * * *"},
+        }
+        errors = validate(data)
+        assert any("totally-fake-scraper-xyz" in e for e in errors)

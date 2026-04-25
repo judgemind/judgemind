@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "packages/api/**"
+      - "data-quality-baselines.json"
       - ".github/workflows/deploy-api.yml"
       - ".github/actions/ecs-deploy/**"
       - ".github/actions/ecs-oneshot/**"
@@ -79,7 +80,7 @@ jobs:
             TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
           fi
 
-          docker build "${TAGS[@]}" packages/api/
+          docker build "${TAGS[@]}" -f packages/api/Dockerfile .
           docker push "$IMAGE_BASE" --all-tags
 
           echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
