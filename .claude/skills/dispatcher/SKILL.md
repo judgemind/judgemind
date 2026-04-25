@@ -663,7 +663,6 @@ Inspect the changed file paths to decide which environment directories need an a
 | `infra/terraform/environments/dev/` | `environments/dev` |
 | `infra/terraform/environments/dns/` | `environments/dns` (requires Cloudflare secret) |
 | `infra/terraform/environments/hosting/` | `environments/hosting` (requires Cloudflare secret) |
-| `infra/terraform/environments/staging/` | `environments/staging` |
 | `infra/terraform/environments/production/` | **Skip** — production is human-only |
 | `infra/terraform/modules/` or root `infra/terraform/*.tf` | `environments/dev` (modules are consumed by environments) |
 
