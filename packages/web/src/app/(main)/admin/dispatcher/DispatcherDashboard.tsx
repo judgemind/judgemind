@@ -28,7 +28,6 @@ import { DiagnoserEffectivenessPanel } from './DiagnoserEffectivenessPanel';
 import { ConfigPanel } from './ConfigPanel';
 import { ConfirmDialog, type ConfirmableCommand } from './ConfirmDialog';
 import { QueueFullDialog } from './QueueFullDialog';
-import { IssueLink } from './ui-primitives';
 
 /**
  * Polling interval for `dispatcherState`. Per spec §11, the daemon runs on
@@ -467,12 +466,6 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
             <DiagnoserEffectivenessPanel />
           </div>
 
-          <p className="mt-4 text-xs text-muted-foreground">
-            Daemon command handlers tracked in{' '}
-            <IssueLink number={2801} />
-            . Control buttons write to <code className="font-mono">dispatcher.commands</code>{' '}
-            today; daemon-side handlers land with that issue.
-          </p>
         </>
       )}
 

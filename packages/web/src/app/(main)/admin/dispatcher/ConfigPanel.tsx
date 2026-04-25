@@ -29,7 +29,15 @@ interface ConfigPanelProps {
  * Compact editable config strip (#2805 §1.6). Replaces the two-column
  * `<dl>` with a single horizontal row:
  *
- *   cap [ 1 ]   backoff [ 300s ]   idle [ on ▾ ]   spawn frozen: —
+ *   cap [ 1 ]   backoff [ 300s ]
+ *
+ * When the spawn-frozen back-pressure gate is active:
+ *
+ *   cap [ 1 ]   backoff [ 300s ]   new agents paused for ~N min
+ *   cap [ 1 ]   backoff [ 300s ]   new agents paused until H:MM AM/PM PT
+ *
+ * The freeze label is structurally hidden when inactive (not visibility:hidden
+ * or opacity:0 — it is simply not rendered). See #2990.
  *
  * Borderless. Sits beneath the main two-column grid.
  *
@@ -39,7 +47,7 @@ interface ConfigPanelProps {
  *     ConfirmDialog for destructive transitions).
  *   - Escape → cancel.
  *
- * Non-editable display-only: `spawn_frozen_until` (monospace timestamp).
+ * Non-editable display-only: `spawn_frozen_until` (when active).
  */
 export function ConfigPanel({
   entries,
@@ -49,6 +57,7 @@ export function ConfigPanel({
   busyKey,
 }: ConfigPanelProps) {
   const entryByKey = new Map(entries.map((e) => [e.key, e] as const));
+  const freezeLabel = buildFreezeLabel(spawnFrozenUntil);
 
   return (
     <section
@@ -74,13 +83,17 @@ export function ConfigPanel({
           busy={busyKey === 'backoff_seconds'}
           onCommit={(value) => onCommitEdit('backoff_seconds', value)}
         />
-        <span aria-hidden="true" className="text-muted-foreground">&middot;</span>
-        <span className="text-muted-foreground">
-          spawn frozen:{' '}
-          <span className="text-foreground" title={spawnFrozenUntil ?? ''}>
-            {spawnFrozenUntil ?? '—'}
-          </span>
-        </span>
+        {freezeLabel !== null && (
+          <>
+            <span aria-hidden="true" className="text-muted-foreground">&middot;</span>
+            <span
+              className="text-foreground"
+              title={freezeLabel.tooltip}
+            >
+              {freezeLabel.text}
+            </span>
+          </>
+        )}
       </div>
       {errorMessage && (
         <p
@@ -93,6 +106,59 @@ export function ConfigPanel({
       )}
     </section>
   );
+}
+
+/**
+ * Formats a Pacific Time clock string from a Date, e.g. "9:42 PM PT".
+ */
+function formatPacificTime(date: Date): string {
+  return (
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(date) + ' PT'
+  );
+}
+
+/**
+ * Computes the display text and tooltip for the spawn-frozen label.
+ * Returns null when the freeze is inactive (null or in the past).
+ *
+ * - ≤15 min remaining → `new agents paused for ~N min`
+ * - >15 min remaining → `new agents paused until H:MM AM/PM PT`
+ *
+ * Tooltip: `Resumes {H:MM AM/PM PT}.`
+ */
+function buildFreezeLabel(
+  spawnFrozenUntil: string | null,
+): { text: string; tooltip: string } | null {
+  if (spawnFrozenUntil === null) return null;
+
+  const until = new Date(spawnFrozenUntil);
+  const now = Date.now();
+  const remainingMs = until.getTime() - now;
+
+  // Past or exactly now → hide.
+  if (remainingMs <= 0) return null;
+
+  const resumeTime = formatPacificTime(until);
+  const tooltip = `Resumes ${resumeTime}.`;
+
+  const remainingMinutes = Math.max(1, Math.round(remainingMs / 60_000));
+
+  if (remainingMinutes <= 15) {
+    return {
+      text: `new agents paused for ~${remainingMinutes} min`,
+      tooltip,
+    };
+  }
+
+  return {
+    text: `new agents paused until ${resumeTime}`,
+    tooltip,
+  };
 }
 
 interface EditableNumberFieldProps {
