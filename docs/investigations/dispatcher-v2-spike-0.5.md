@@ -160,11 +160,11 @@ Recommended spec edits are minor and included as a follow-up item rather than in
 
 ## Cleanup
 
-The throwaway `spike-hello` skill and its symlink are left in place as a reproducible artifact per the issue instructions. A follow-up issue will track their removal so this investigation note remains reproducible in the interim.
+The throwaway `spike-hello` skill (`.claude/skills/spike-hello/`) and its symlink (`.agents/skills/spike-hello`) were created inside the spike's worktree (`.claude/worktrees/agent-a78236f1`) and were never committed to `main`. No removal was needed: #2692 confirmed non-existence on `main` and closed as a no-op.
 
 ## Follow-ups
 
-See #2692 (cleanup issue filed as part of this investigation): remove `.claude/skills/spike-hello/` and the `.agents/skills/spike-hello` symlink.
+#2692 (cleanup issue filed as part of this investigation) was resolved as a no-op: the artifacts were never committed to `main`, so no files needed removal.
 
 Optional follow-ups to consider later (not filed as issues, for maintainer decision):
 
