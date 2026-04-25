@@ -373,5 +373,5 @@ class TestStreamMaxlen:
         assert call_args.kwargs["maxlen"] == 5000
 
     def test_default_stream_maxlen_value(self) -> None:
-        """The default MAXLEN should be 10_000."""
-        assert DEFAULT_STREAM_MAXLEN == 10_000
+        """The default MAXLEN should be 50_000."""
+        assert DEFAULT_STREAM_MAXLEN == 50_000

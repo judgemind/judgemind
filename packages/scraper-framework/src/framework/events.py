@@ -15,10 +15,12 @@ logger = logging.getLogger(__name__)
 STREAM_DOCUMENT_CAPTURED = "document.captured"
 STREAM_SCRAPER_HEALTH = "scraper.health"
 
-#: Default maximum stream length.  Each event is ~2–5 KB, so 10 000 entries
-#: ≈ 20–50 MB — well within the 512 MB available on cache.t4g.micro.
+#: Default maximum stream length.  At ~5 KB/event, 50 000 entries ≈ 250 MB —
+#: well within the 512 MB available on cache.t4g.micro.  Raised from 10 000 to
+#: provide ~5× burst headroom for re-run scenarios (e.g. Santa Clara / Orange
+#: simultaneous re-ingestion; see docs/investigations/correctly-labeled-s3-orphans-2026-04.md).
 #: Override at runtime with the ``STREAM_MAXLEN`` environment variable.
-DEFAULT_STREAM_MAXLEN = 10_000
+DEFAULT_STREAM_MAXLEN = 50_000
 
 
 def _stream_maxlen() -> int:
