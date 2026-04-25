@@ -86,17 +86,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         push_is_new_branch=true
     fi
 
-    # Always diff against merge-base with origin/main. For new-branch pushes
-    # this was already the behaviour; for force-pushes after rebase it ensures
-    # rebased-in commits (from other merged PRs) are excluded from the diff,
-    # so only packages touched by this branch's own commits are checked (#3228).
-    git fetch "$remote" main --quiet 2>/dev/null || true
-    merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
-    if [ -z "$merge_base" ]; then
-        echo "pre-push: could not determine merge-base with $remote/main; skipping checks" >&2
-        continue
+    # For new branches and force-pushes after rebase, diff against merge-base
+    # with origin/main so only this branch's own commits are checked (#3228).
+    # For normal existing-branch pushes (remote_sha is a valid ancestor of
+    # local_sha), keep remote_sha so only the newly-added commits are in scope.
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] || \
+       ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+        git fetch "$remote" main --quiet 2>/dev/null || true
+        merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
+        if [ -z "$merge_base" ]; then
+            echo "pre-push: could not determine merge-base with $remote/main; skipping checks" >&2
+            continue
+        fi
+        remote_sha="$merge_base"
     fi
-    remote_sha="$merge_base"
 
     # Get list of changed files
     changed_files=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)
