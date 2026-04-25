@@ -143,7 +143,7 @@ output "ses_notifications_topic_arn" {
 }
 
 output "ses_dkim_tokens" {
-  description = "Production DKIM CNAME tokens — add each as <token>._domainkey.judgemind.org CNAME <token>.dkim.amazonses.com"
+  description = "Production DKIM CNAME tokens -- add each as <token>._domainkey.judgemind.org CNAME <token>.dkim.amazonses.com"
   value       = module.ses.dkim_tokens
 }
 

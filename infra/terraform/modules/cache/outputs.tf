@@ -9,6 +9,6 @@ output "redis_port" {
 }
 
 output "security_group_id" {
-  description = "Security group ID — grant ingress from other resources that need Redis access"
+  description = "Security group ID -- grant ingress from other resources that need Redis access"
   value       = aws_security_group.redis.id
 }

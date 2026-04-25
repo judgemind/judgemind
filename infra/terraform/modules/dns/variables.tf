@@ -11,7 +11,7 @@ variable "ses_verification_token" {
 }
 
 variable "ses_dkim_tokens" {
-  description = "SES DKIM CNAME tokens — list of 3 (from ses module output)"
+  description = "SES DKIM CNAME tokens -- list of 3 (from ses module output)"
   type        = list(string)
   default     = []
 }

@@ -24,7 +24,7 @@ variable "ecs_cluster_arn" {
 }
 
 variable "ecr_repository_url" {
-  description = "ECR repository URL that will host the dispatcher image (populated by sub-task C, #2729). Placeholder until then — the service runs at desired_count=0 so the image tag is not resolved."
+  description = "ECR repository URL that will host the dispatcher image (populated by sub-task C, #2729). Placeholder until then -- the service runs at desired_count=0 so the image tag is not resolved."
   type        = string
 }
 
@@ -35,7 +35,7 @@ variable "image_tag" {
 }
 
 variable "desired_count" {
-  description = "Number of dispatcher task replicas. Phase 1 keeps this at 0 (inert); Phase 2 flips to 1 (shadow mode); never >1 (the dispatcher is a singleton — overlapping instances would double-spawn agents)."
+  description = "Number of dispatcher task replicas. Phase 1 keeps this at 0 (inert); Phase 2 flips to 1 (shadow mode); never >1 (the dispatcher is a singleton -- overlapping instances would double-spawn agents)."
   type        = number
   default     = 0
 
@@ -46,19 +46,19 @@ variable "desired_count" {
 }
 
 variable "task_cpu" {
-  description = "CPU units for the Fargate task (1024 = 1 vCPU, per §14 of the spec)"
+  description = "CPU units for the Fargate task (1024 = 1 vCPU, per Section 14 of the spec)"
   type        = number
   default     = 1024
 }
 
 variable "task_memory" {
-  description = "Memory (MiB) for the Fargate task (2048 = 2 GB, per §14 of the spec)"
+  description = "Memory (MiB) for the Fargate task (2048 = 2 GB, per Section 14 of the spec)"
   type        = number
   default     = 2048
 }
 
 variable "ephemeral_storage_gib" {
-  description = "Ephemeral storage (GiB) for the Fargate task. 50 GiB per spike 0.6 findings (docs/investigations/dispatcher-v2-spike-0.6.md): realistic 5-concurrent-worktree peak is ~10 GB, so 50 GiB gives 5× headroom."
+  description = "Ephemeral storage (GiB) for the Fargate task. 50 GiB per spike 0.6 findings (docs/investigations/dispatcher-v2-spike-0.6.md): realistic 5-concurrent-worktree peak is ~10 GB, so 50 GiB gives 5x headroom."
   type        = number
   default     = 50
 
@@ -89,7 +89,7 @@ variable "anthropic_api_key_secret_arn" {
 }
 
 variable "db_connection_secret_arn" {
-  description = "Secrets Manager ARN for the dispatcher-role DATABASE_URL (JSON key: url). Sub-task A (#2727) creates the `judgemind_dispatcher` role and its connection secret; until A merges, callers can pass the main `judgemind` role secret — safe while desired_count=0."
+  description = "Secrets Manager ARN for the dispatcher-role DATABASE_URL (JSON key: url). Sub-task A (#2727) creates the `judgemind_dispatcher` role and its connection secret; until A merges, callers can pass the main `judgemind` role secret -- safe while desired_count=0."
   type        = string
   default     = ""
 }
@@ -107,7 +107,7 @@ variable "telegram_bot_token_secret_arn" {
 }
 
 variable "gemini_api_key_secret_arn" {
-  description = "Secrets Manager ARN for GEMINI_API_KEY. Only required if `runner_by_phase` / `runner_shadow` routes to the Gemini runner (see spec §14 / spike 0.4)."
+  description = "Secrets Manager ARN for GEMINI_API_KEY. Only required if `runner_by_phase` / `runner_shadow` routes to the Gemini runner (see spec Section 14 / spike 0.4)."
   type        = string
   default     = ""
 }
@@ -135,13 +135,13 @@ variable "alert_sns_topic_arn" {
 }
 
 variable "heartbeat_stale_seconds" {
-  description = "Threshold for the heartbeat staleness alarm. Per §14, default 300 (5 min)."
+  description = "Threshold for the heartbeat staleness alarm. Per Section 14, default 300 (5 min)."
   type        = number
   default     = 300
 }
 
 variable "stuck_timeout_repeated_window_seconds" {
-  description = "CloudWatch alarm period (seconds) for the stuck_timeout_repeated alarm. The alarm fires when at least one stuck_timeout_repeated event is observed in this window. Default 600 (10 min) per §15 of the spec."
+  description = "CloudWatch alarm period (seconds) for the stuck_timeout_repeated alarm. The alarm fires when at least one stuck_timeout_repeated event is observed in this window. Default 600 (10 min) per Section 15 of the spec."
   type        = number
   default     = 600
 }
@@ -189,13 +189,13 @@ variable "oneshot_maintenance_task_role_arn" {
 }
 
 variable "oneshot_script_bucket_arn" {
-  description = "ARN of the S3 bucket where scripts/ecs-run-task.sh uploads scripts larger than the 8KB command-override limit (typically judgemind-assets-<env>). When set, the daemon task role is granted PutObject/DeleteObject under oneshot-scripts/*. Empty disables S3 uploads — scripts under ~6KB still work inline."
+  description = "ARN of the S3 bucket where scripts/ecs-run-task.sh uploads scripts larger than the 8KB command-override limit (typically judgemind-assets-<env>). When set, the daemon task role is granted PutObject/DeleteObject under oneshot-scripts/*. Empty disables S3 uploads -- scripts under ~6KB still work inline."
   type        = string
   default     = ""
 }
 
 variable "oneshot_ecr_scraper_repository_arn" {
-  description = "ARN of the ECR repository that hosts the scraper/ingestion-worker image (used by scripts/ecs-run-task.sh to resolve image digests). When set, the daemon task role is granted ecr:DescribeImages on that repo. Empty disables — ecs-run-task.sh still works using the service image without the digest-check step."
+  description = "ARN of the ECR repository that hosts the scraper/ingestion-worker image (used by scripts/ecs-run-task.sh to resolve image digests). When set, the daemon task role is granted ecr:DescribeImages on that repo. Empty disables -- ecs-run-task.sh still works using the service image without the digest-check step."
   type        = string
   default     = ""
 }
@@ -214,7 +214,7 @@ variable "oneshot_ecr_scraper_repository_arn" {
 # inert behind the `agent_execution_mode='subprocess'` default.
 
 variable "agent_runner_task_definition_family" {
-  description = "Family name of the dispatcher-agent-runner task definition (e.g. `judgemind-dispatcher-agent-runner-<env>`). Wired from the dispatcher-agent-runner module's `task_definition_family` output. When set alongside the two role ARNs below, the daemon's task role gains ecs:RunTask / ecs:DescribeTasks / ecs:StopTask scoped to this family. Empty disables — Stage 2 launcher falls back to the subprocess path."
+  description = "Family name of the dispatcher-agent-runner task definition (e.g. `judgemind-dispatcher-agent-runner-<env>`). Wired from the dispatcher-agent-runner module's `task_definition_family` output. When set alongside the two role ARNs below, the daemon's task role gains ecs:RunTask / ecs:DescribeTasks / ecs:StopTask scoped to this family. Empty disables -- Stage 2 launcher falls back to the subprocess path."
   type        = string
   default     = ""
 }
@@ -232,7 +232,7 @@ variable "agent_runner_task_role_arn" {
 }
 
 variable "agent_runner_subnet_ids" {
-  description = "Private subnet IDs the agent-runner tasks launch into. Typically the same list as the daemon's `private_subnet_ids`. Threaded into the dispatcher container as AGENT_RUNNER_SUBNET_IDS (comma-separated) for the Stage 2 launcher's network_configuration. Empty list disables the env var — daemon falls back to subprocess mode."
+  description = "Private subnet IDs the agent-runner tasks launch into. Typically the same list as the daemon's `private_subnet_ids`. Threaded into the dispatcher container as AGENT_RUNNER_SUBNET_IDS (comma-separated) for the Stage 2 launcher's network_configuration. Empty list disables the env var -- daemon falls back to subprocess mode."
   type        = list(string)
   default     = []
 }
@@ -246,7 +246,7 @@ variable "agent_runner_security_group_id" {
 # ─── Document-archive S3 census access (#3050) ──────────────────────────────
 
 variable "document_archive_bucket_arn" {
-  description = "ARN of the document-archive S3 bucket. When set, the daemon task role is granted `s3:ListBucket` so data-task agents can run census queries (e.g. pre/post rebuild counts). Empty disables the policy — safe for staging / throwaway stacks."
+  description = "ARN of the document-archive S3 bucket. When set, the daemon task role is granted `s3:ListBucket` so data-task agents can run census queries (e.g. pre/post rebuild counts). Empty disables the policy -- safe for staging / throwaway stacks."
   type        = string
   default     = ""
 }

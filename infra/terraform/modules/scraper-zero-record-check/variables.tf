@@ -44,7 +44,7 @@ variable "github_token_secret_arn" {
 }
 
 variable "telegram_secret_arn" {
-  description = "ARN of the Secrets Manager secret for Telegram notifications (judgemind/telegram/bot). Empty string disables task-role access — the runner still falls back to the execution role if the script can reach Secrets Manager another way, but best practice is to provide this ARN."
+  description = "ARN of the Secrets Manager secret for Telegram notifications (judgemind/telegram/bot). Empty string disables task-role access -- the runner still falls back to the execution role if the script can reach Secrets Manager another way, but best practice is to provide this ARN."
   type        = string
   default     = ""
 }

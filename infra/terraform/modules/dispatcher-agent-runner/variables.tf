@@ -24,19 +24,19 @@ variable "ecr_repository_url" {
 }
 
 variable "image_tag" {
-  description = "Container image tag to run. Safe to leave at `latest` for Stage 1b — daemon picks the pinned SHA at RunTask time in Stage 2."
+  description = "Container image tag to run. Safe to leave at `latest` for Stage 1b -- daemon picks the pinned SHA at RunTask time in Stage 2."
   type        = string
   default     = "latest"
 }
 
 variable "task_cpu" {
-  description = "CPU units for the Fargate task (256 = 0.25 vCPU, 512 = 0.5 vCPU, 1024 = 1 vCPU, 4096 = 4 vCPU). Default is 4096 to match the subprocess-daemon envelope — ralph workload under the 512-baseline saturated CPU at 509/512 for extended bursts (#3153)."
+  description = "CPU units for the Fargate task (256 = 0.25 vCPU, 512 = 0.5 vCPU, 1024 = 1 vCPU, 4096 = 4 vCPU). Default is 4096 to match the subprocess-daemon envelope -- ralph workload under the 512-baseline saturated CPU at 509/512 for extended bursts (#3153)."
   type        = number
   default     = 4096
 }
 
 variable "task_memory" {
-  description = "Memory (MiB) for the Fargate task. Default is 16384 (16 GiB) to match the subprocess-daemon envelope — ralph pegged memory at 1022/1024 MB for hours under the 1024-baseline (#3153). Fargate valid pair: 4096 CPU / 16384 MB."
+  description = "Memory (MiB) for the Fargate task. Default is 16384 (16 GiB) to match the subprocess-daemon envelope -- ralph pegged memory at 1022/1024 MB for hours under the 1024-baseline (#3153). Fargate valid pair: 4096 CPU / 16384 MB."
   type        = number
   default     = 16384
 }

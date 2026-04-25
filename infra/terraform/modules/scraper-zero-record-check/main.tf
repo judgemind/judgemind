@@ -27,7 +27,7 @@ resource "aws_cloudwatch_log_group" "zero_record_check" {
 
 resource "aws_security_group" "zero_record_check" {
   name        = "judgemind-zero-record-check-${var.environment}"
-  description = "Zero-record check ECS task — outbound HTTPS and Postgres"
+  description = "Zero-record check ECS task -- outbound HTTPS and Postgres"
   vpc_id      = var.vpc_id
 
   egress {
@@ -54,7 +54,7 @@ resource "aws_security_group" "zero_record_check" {
 
 resource "aws_iam_role" "task_role" {
   name        = "judgemind-zero-record-check-task-${var.environment}"
-  description = "Task role for the zero-record streak check — Telegram secret read"
+  description = "Task role for the zero-record streak check -- Telegram secret read"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
