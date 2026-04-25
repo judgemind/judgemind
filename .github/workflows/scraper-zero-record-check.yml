@@ -1,12 +1,10 @@
 name: Scraper Zero-Record Streak Check
 
+# The daily schedule has moved to EventBridge (infra/terraform/modules/scraper-zero-record-check).
+# This workflow is kept as a manual debug / verification tool only.
+# See https://github.com/judgemind/judgemind/issues/2677.
+
 on:
-  schedule:
-    # Daily at 14:30 UTC (07:30 PT) — after California tentative-ruling
-    # scrapers have had the overnight window to produce data. Offset from
-    # data-quality (:15) and api-error (:45) so schedules do not collide.
-    - cron: '30 14 * * *'
-  # Allow manual trigger for debugging / issue verification.
   workflow_dispatch:
     inputs:
       threshold:

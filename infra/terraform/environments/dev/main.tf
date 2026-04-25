@@ -474,6 +474,50 @@ output "scraper_security_group_id" {
   value       = module.compute.security_group_id
 }
 
+# ─── Scraper zero-record check (EventBridge, #2677) ──────────────────────────
+# Replaces the GH Actions cron scraper-zero-record-check.yml with an
+# EventBridge-scheduled ECS one-shot task. The Python runner
+# scripts/check-scraper-zero-record-runner.py handles issue creation, dedup,
+# update, auto-close, and Telegram notification entirely inside the container.
+#
+# GITHUB_TOKEN reuses the existing dispatcher PAT
+# (judgemind/dispatcher/github-token) that already has issues:write per #2700.
+# Telegram wiring is left empty until the judgemind/telegram/bot secret ARN is
+# plumbed through (follow-up — telegram_secret_arn defaults to "" so the task
+# still runs without it, falling back to the CLI path inside the container).
+module "scraper_zero_record_check" {
+  source = "../../modules/scraper-zero-record-check"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  ecs_cluster_arn    = module.compute.cluster_arn
+
+  ecr_repository_url      = module.ecr.repository_url
+  task_execution_role_arn = module.compute.task_execution_role_arn
+  db_connection_secret_arn = module.database.db_connection_secret_arn
+
+  # Reuse the dispatcher PAT — already has issues:write per #2700.
+  github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+
+  # Telegram secret not yet plumbed in dev (follow-up).
+  telegram_secret_arn = ""
+
+  gh_repo            = "judgemind/judgemind"
+  log_retention_days = 14
+  schedule_enabled   = true
+}
+
+output "zero_record_check_log_group" {
+  description = "Dev CloudWatch log group for zero-record check output"
+  value       = module.scraper_zero_record_check.log_group_name
+}
+
+output "zero_record_check_schedule_arn" {
+  description = "Dev EventBridge schedule ARN for the zero-record streak check"
+  value       = module.scraper_zero_record_check.schedule_arn
+}
+
 output "scraper_log_group" {
   description = "Dev CloudWatch log group for scraper output"
   value       = module.compute.log_group_name
