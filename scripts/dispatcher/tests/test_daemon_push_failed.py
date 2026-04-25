@@ -652,12 +652,16 @@ def _make_push_and_pr_base(
     worktree.mkdir()
     (worktree / "tmp").mkdir()
 
-    d._agent_summary_output = {  # type: ignore[attr-defined]
-        "commit_message": "feat: test commit",
-        "pr_title": "Test PR",
-        "pr_body_md": "body",
-    }
-    d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+    # _push_and_open_pr now reads summary output from DB via _fetch_phase_output (#2975).
+    d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "commit_message": "feat: test commit",
+            "pr_title": "Test PR",
+            "pr_body_md": "body",
+            "unmet_criteria": [],
+        }
+    )
+    d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
