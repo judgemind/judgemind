@@ -333,6 +333,40 @@ Example hint:
 
 ---
 
+---
+
+## Per-category guidance — pre-push rebase conflict (issue #2964)
+
+### `merge_conflict_at_push` — daemon-side pre-push rebase hit a conflict
+
+This category is set by the daemon's `_push_and_open_pr` method when:
+
+1. `git fetch origin main` succeeded (or was skipped on network failure), AND
+2. `git rebase origin/main` returned a non-zero exit code (conflicts detected).
+
+The rebase was immediately aborted (`git rebase --abort`), leaving the worktree in its pre-rebase state. **No push was attempted. No PR exists.** The issue is still `status/in-progress`.
+
+**Context bundle extras.** In addition to the shared bundle shape, the `push_and_pr` phase_outputs row carries:
+
+- `conflict_files` (list of str) — paths with unresolved conflicts at abort time (from `git diff --name-only --diff-filter=U`).
+- `event` = `"merge_conflict_at_push"` — identifier for log queries.
+
+The `log_text` column contains the rebase stderr followed by `--- conflict files ---` and the newline-separated file paths.
+
+**Default action selection:**
+
+| Situation | Action | Why |
+|---|---|---|
+| Conflicting files suggest a **sibling PR landed** on main that overlaps with this agent's changes (parallel feature work, shared module refactor) | **`block_and_comment`** | Post a comment on the issue explaining the conflict files and the likely competing PR. Ask the operator to rebase manually or wait until the sibling PR is merged and re-queue. No auto-retry path exists yet. |
+| Conflicting files suggest a **structural dependency** — e.g. this PR depends on a schema or API contract that was changed on main without this agent's knowledge | **`file_prerequisite_task`** | The conflict signals that a prerequisite change must land on main first. File a blocking prerequisite issue; the operator can unblock once the dependency is resolved. |
+| Conflicting files look like **routine import / whitespace / trivial rebase noise** (e.g. only lock files or auto-generated code) | **`block_and_comment`** | Still no auto-retry, but a short comment indicating the conflict looks mechanical and should resolve with a fresh rebase is useful. |
+
+**There is NO auto-retry path for this category.** A mechanical retry would immediately hit the same conflict. The proper resolution path — LLM-assisted conflict resolution via `/task-v2-fix-conflict` — is a follow-up issue (#2964 notes). Until that path exists, the operator must rebase manually or the daemon must be extended.
+
+**Do NOT pick `retry` or `retry_with_hint` for this category.** A fresh agent starting from `origin/main` would not reproduce the conflict (it would already be on the updated base), but it would also lose the agent's implementation work. The correct resolution is to rebase the existing worktree branch, not spawn a new agent.
+
+**Do NOT pick `close` for this category** — a merge conflict is not evidence the issue is invalid.
+
 ## Per-category guidance — post-merge verify failure (issue #3071)
 
 ### `verify_failed_post_merge` — post-merge regression signal
