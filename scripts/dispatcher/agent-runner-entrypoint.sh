@@ -3948,7 +3948,7 @@ while true; do
                             advance_phase "$_bn"
                         else
                             log "ralph_baseline_transition_unrecognized" "action=$_ba"
-                            advance_phase "daemon_restart_abandoned" "crashed"
+                            advance_phase "agent_runner_route_stub" "crashed"
                         fi
                         continue
                     fi
@@ -4049,7 +4049,7 @@ while true; do
                     ;;
                 *)
                     log "push_and_pr_transition_unrecognized" "action=$_action"
-                    advance_phase "daemon_restart_abandoned" "crashed"
+                    advance_phase "agent_runner_route_stub" "crashed"
                     ;;
             esac
             ;;
@@ -4210,7 +4210,7 @@ while true; do
             ;;
         *)
             log "phase_unknown" "phase=$_current"
-            advance_phase "daemon_restart_abandoned" "crashed"
+            advance_phase "agent_runner_route_stub" "crashed"
             ;;
     esac
 done
