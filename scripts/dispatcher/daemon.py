@@ -11537,7 +11537,13 @@ class DispatcherDaemon:
                 + "\n"
             )
 
-        if not commit_message or not pr_title or not pr_body_md:
+        # Issue #3303 — reject titles that start with "WIP" (the ralph
+        # placeholder message that summary should always replace). Use
+        # ``lstrip().upper().startswith`` so "wip:", "  WIP draft", etc.
+        # all match, but mid-string occurrences ("feat: wipe token") do not.
+        title_is_wip = pr_title.lstrip().upper().startswith("WIP")
+
+        if not commit_message or not pr_title or not pr_body_md or title_is_wip:
             self._log.warning(
                 "daemon.summary_output_incomplete",
                 extra={
@@ -11547,6 +11553,8 @@ class DispatcherDaemon:
                     "has_commit": bool(commit_message),
                     "has_pr_title": bool(pr_title),
                     "has_pr_body": bool(pr_body_md),
+                    "title_is_wip": title_is_wip,
+                    "pr_title_preview": pr_title[:80],
                 },
             )
             # Issue #3062 — summary phase exited 0 but returned an output
@@ -11559,19 +11567,24 @@ class DispatcherDaemon:
             # Pre-#3062 this path only wrote ``status='failed'`` with no
             # failure row, so the diagnoser never picked it up and
             # operators had to read CloudWatch to know what broke.
+            # Issue #3303 — extend details to include wip-title trigger.
+            details: dict[str, object] = {
+                "missing_phase_output": "summary",
+                "has_commit": bool(commit_message),
+                "has_pr_title": bool(pr_title),
+                "has_pr_body": bool(pr_body_md),
+                "title_is_wip": title_is_wip,
+                "issue_number": issue_number,
+            }
+            if title_is_wip:
+                details["sub_reason"] = "wip_title"
             self._handle_agent_failure(
                 agent_id=agent_id,
                 phase="push_and_pr",
                 category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
                 stderr_tail="",
                 exit_code=None,
-                details={
-                    "missing_phase_output": "summary",
-                    "has_commit": bool(commit_message),
-                    "has_pr_title": bool(pr_title),
-                    "has_pr_body": bool(pr_body_md),
-                    "issue_number": issue_number,
-                },
+                details=details,
                 issue_number=issue_number,
             )
             return

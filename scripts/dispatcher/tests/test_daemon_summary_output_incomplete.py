@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -312,3 +314,141 @@ class TestRegressionGuards:
         d._mark_agent_terminal.assert_called_once()  # type: ignore[union-attr]
         call_kwargs = d._mark_agent_terminal.call_args.kwargs  # type: ignore[union-attr]
         assert call_kwargs["status"] == "succeeded"
+
+
+# --------------------------------------------------------------------------
+# WIP-title guard (Issue #3303)
+# --------------------------------------------------------------------------
+
+
+class _SentinelError(BaseException):
+    """Raised by a monkeypatched stub to short-circuit execution past the guard.
+
+    Inherits from ``BaseException`` (not ``Exception``) so it propagates
+    through ``except Exception`` blocks in ``_push_and_open_pr`` without
+    being swallowed by the git-commit exception handler.
+    """
+
+
+class TestWipTitleGuard:
+    def test_wip_prefix_title_routes_through_handle_agent_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """``pr_title="WIP: ralph output"`` with valid commit_message and
+        pr_body_md must route to ``_handle_agent_failure`` with
+        ``category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING``,
+        ``details["sub_reason"]=="wip_title"``, and
+        ``details["title_is_wip"] is True``.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        _patch_push_and_open_pr_helpers(
+            d,
+            summary_output={
+                "commit_message": "feat(foo): bar (#3303)",
+                "pr_title": "WIP: ralph output",
+                "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3303",
+            },
+        )
+
+        d._push_and_open_pr("agent-wip-title", 3303, worktree)
+
+        d._handle_agent_failure.assert_called_once()  # type: ignore[union-attr]
+        kwargs = d._handle_agent_failure.call_args.kwargs  # type: ignore[union-attr]
+        assert kwargs["agent_id"] == "agent-wip-title"
+        assert kwargs["phase"] == "push_and_pr"
+        assert kwargs["category"] == daemon.FAILURE_CATEGORY_PHASE_OUTPUT_MISSING
+        assert kwargs["issue_number"] == 3303
+        details = kwargs["details"]
+        assert details["sub_reason"] == "wip_title"
+        assert details["title_is_wip"] is True
+
+        d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
+
+    def test_wip_lowercase_title_also_routes(self, tmp_path: Path) -> None:
+        """``pr_title="wip: foo"`` (lower-case) must also be caught."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        _patch_push_and_open_pr_helpers(
+            d,
+            summary_output={
+                "commit_message": "feat(foo): bar (#3303)",
+                "pr_title": "wip: foo",
+                "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3303",
+            },
+        )
+
+        d._push_and_open_pr("agent-wip-lower", 3303, worktree)
+
+        d._handle_agent_failure.assert_called_once()  # type: ignore[union-attr]
+        details = d._handle_agent_failure.call_args.kwargs["details"]  # type: ignore[union-attr]
+        assert details["sub_reason"] == "wip_title"
+        assert details["title_is_wip"] is True
+
+        d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
+
+    def test_wip_with_leading_whitespace_routes(self, tmp_path: Path) -> None:
+        """``pr_title="  WIP draft"`` (leading whitespace) must also be caught."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        _patch_push_and_open_pr_helpers(
+            d,
+            summary_output={
+                "commit_message": "feat(foo): bar (#3303)",
+                "pr_title": "  WIP draft",
+                "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3303",
+            },
+        )
+
+        d._push_and_open_pr("agent-wip-whitespace", 3303, worktree)
+
+        d._handle_agent_failure.assert_called_once()  # type: ignore[union-attr]
+        details = d._handle_agent_failure.call_args.kwargs["details"]  # type: ignore[union-attr]
+        assert details["sub_reason"] == "wip_title"
+        assert details["title_is_wip"] is True
+
+        d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
+
+    def test_substring_wip_does_not_trigger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``pr_title="feat(web): wipe stale token"`` must NOT be caught by
+        the WIP guard (substring match, not a prefix). The test
+        short-circuits execution past the guard by patching
+        ``daemon.subprocess.run`` to raise ``_SentinelError`` — the absence
+        of ``_handle_agent_failure`` being called is the assertion.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        _patch_push_and_open_pr_helpers(
+            d,
+            summary_output={
+                "commit_message": "feat(web): wipe stale token (#3303)",
+                "pr_title": "feat(web): wipe stale token (#3303)",
+                "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3303",
+            },
+        )
+
+        # Short-circuit past the guard so the test doesn't need real git/gh.
+        # The first real operation after the guard is subprocess.run for
+        # ``git commit --amend`` — raise a sentinel so the test terminates
+        # without needing a real git worktree.
+        monkeypatch.setattr(
+            daemon.subprocess,
+            "run",
+            lambda *_a, **_kw: (_ for _ in ()).throw(_SentinelError("short-circuit")),
+        )
+
+        with pytest.raises(_SentinelError):
+            d._push_and_open_pr("agent-substring-wip", 3303, worktree)
+
+        # The guard did NOT fire — _handle_agent_failure was not called.
+        d._handle_agent_failure.assert_not_called()  # type: ignore[union-attr]
