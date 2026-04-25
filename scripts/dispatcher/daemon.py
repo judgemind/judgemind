@@ -20266,6 +20266,47 @@ class DispatcherDaemon:
             return True
         return True
 
+    @staticmethod
+    def _diagnoser_cmdline_matches(pid: int) -> bool | None:
+        """Return True if ``pid`` is a ``claude -p /diagnose-failure`` process.
+
+        Reads ``/proc/<pid>/cmdline`` (NUL-separated argv on Linux) and
+        checks that argv[0] ends with ``claude`` AND one of the subsequent
+        tokens starts with ``/diagnose-failure``.
+
+        Returns:
+          * ``True``  — cmdline read and matches the expected diagnoser argv.
+          * ``False`` — cmdline read but does NOT match (recycled PID running
+            a different process).
+          * ``None``  — ``/proc/<pid>/cmdline`` could not be read (race
+            condition where the process exited between the liveness check
+            and the cmdline read, or non-Linux platform). Callers should
+            treat ``None`` conservatively (do not signal).
+
+        This is a boot-time-only helper (#3384) — the in-session reaper
+        (:meth:`_reap_diagnoser_subprocesses`) already owns the PID it
+        spawned, so it has no recycled-PID risk and does not need this
+        check.
+        """
+        try:
+            cmdline_bytes = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return None
+        if not cmdline_bytes:
+            return None
+        argv = cmdline_bytes.rstrip(b"\x00").split(b"\x00")
+        if not argv:
+            return None
+        # argv[0] must end with 'claude' (covers /usr/bin/claude, .venv/bin/claude, etc.)
+        executable = argv[0].decode("utf-8", errors="replace")
+        if not (executable == "claude" or executable.endswith("/claude")):
+            return False
+        # One of the remaining tokens must start with '/diagnose-failure'
+        rest = [tok.decode("utf-8", errors="replace") for tok in argv[1:]]
+        if any(tok.startswith("/diagnose-failure") for tok in rest):
+            return True
+        return False
+
     def _kill_diagnoser_process(self, pid: int) -> None:
         """Send SIGTERM, then SIGKILL after a short grace period (#3376).
 
@@ -20472,32 +20513,52 @@ class DispatcherDaemon:
         return max(0.0, (now - started_at).total_seconds())
 
     def _reap_orphaned_diagnoses_on_boot(self) -> int:
-        """Reap diagnoses orphaned by a daemon restart (#3376).
+        """Reap diagnoses orphaned by a daemon restart (#3376, #3384).
 
         Called once at daemon startup, after :meth:`recover_abandoned_agents`.
-        Iterates rows with ``status='pending' AND subprocess_pid IS
-        NOT NULL`` left behind by a previous daemon. For each:
+        Iterates ``dispatcher.diagnoses`` rows with ``status='pending'``
+        whose ``started_at`` predates this run's ``started_at``, which means
+        they were spawned by a *previous* daemon that crashed or restarted.
 
-          * If the PID is still alive AND ``started_at`` predates
-            the current daemon's run-registration timestamp — the
-            diagnoser process is unrelated to the new daemon's
-            spawn (the previous daemon's PID has been recycled by
-            the OS). Mark ``failed`` with reason
-            ``diagnoser_orphaned_by_daemon_restart`` (does NOT
-            kill the process — the new daemon doesn't own it).
-          * If the PID is dead — mark ``failed`` for the same
-            reason. The recommendation + directive may still be
-            on-disk but we don't trust it: the previous daemon
-            crashed mid-consume, so consuming now would be a race
-            against the corrupt state.
+        For each orphan row the method branches on PID liveness and cmdline
+        identity (via :meth:`_diagnoser_cmdline_matches`) BEFORE marking the
+        row terminal:
 
-        Plus orphans without PIDs: pending rows whose ``started_at``
-        predates the current daemon (i.e. their parent daemon
-        crashed before the PID UPDATE landed). Same treatment.
+          * **No PID** (``subprocess_pid IS NULL``) — the previous daemon
+            crashed before the PID UPDATE landed.  Log
+            ``diagnoser_orphan_pid_dead`` (no kill possible), mark failed.
+          * **PID dead** (``_process_alive`` returns ``False``) — the
+            diagnoser process has already exited.  Log
+            ``diagnoser_orphan_pid_dead``, mark failed.
+          * **PID alive, cmdline matches** (``_diagnoser_cmdline_matches``
+            returns ``True``) — the previous daemon's diagnoser subprocess
+            is still running and IS confirmed to be a ``claude -p
+            /diagnose-failure`` invocation.  The new daemon shares the same
+            DB row and GitHub credentials so it IS responsible for this
+            process.  Log ``diagnoser_orphan_killed``, call
+            :meth:`_kill_diagnoser_process` (SIGTERM → grace →
+            SIGKILL), then mark failed.
+          * **PID alive, cmdline mismatched / unreadable** (``False`` or
+            ``None``) — the OS has recycled the old PID and the slot now
+            belongs to an unrelated process.  Log
+            ``diagnoser_orphan_pid_recycled``, do NOT signal the unrelated
+            process, mark failed.
 
-        Returns the number of orphans reaped. Always non-fatal —
-        DB errors are logged and the daemon continues. The supervisor
-        tick's reaper is the backstop for any orphans this misses.
+        **Rationale for killing (#3384).** The prior design said "do NOT
+        kill — the new daemon doesn't own it."  That was correct for the
+        recycled-PID case but wrong for the still-running-diagnoser case.
+        A diagnoser that survived the previous daemon crash continues to
+        hold the ``diagnosis_id`` DB row in ``status='pending'`` and may
+        still be writing to GitHub/disk using shared credentials.  Killing
+        it (with cmdline verification) is the safe path — the row will be
+        marked failed and the task's failure will be re-evaluated on the
+        next supervisor tick.  The ``DIAGNOSER_REAP_GRACE_SECONDS`` constant
+        governs the SIGTERM grace window (same as the supervisor-tick reaper,
+        PR #3378 lineage).
+
+        Returns the number of orphans reaped.  Always non-fatal — DB errors
+        are logged and the daemon continues.  The supervisor tick's reaper is
+        the backstop for any orphans this misses.
         """
         assert self._conn is not None, "connect() must run before orphan reap"
         assert self._run_id is not None, "register run before orphan reap"
@@ -20568,17 +20629,57 @@ class DispatcherDaemon:
             orphan_started_at = orphan_row[2]
             pid = int(pid_raw) if pid_raw is not None else None
 
-            self._log.warning(
-                "daemon.diagnoser_orphaned_by_daemon_restart",
-                extra={
-                    "event": "diagnoser_orphaned_by_daemon_restart",
-                    "run_id": self._run_id,
-                    "diagnosis_id": diagnosis_id,
-                    "subprocess_pid": pid,
-                    "orphan_started_at": str(orphan_started_at),
-                    "this_run_started_at": str(run_started_at),
-                },
-            )
+            if pid is None:
+                # No PID — parent crashed before the PID UPDATE landed.
+                self._log.warning(
+                    "daemon.diagnoser_orphan_pid_dead",
+                    extra={
+                        "event": "diagnoser_orphan_pid_dead",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "subprocess_pid": None,
+                        "orphan_started_at": str(orphan_started_at),
+                    },
+                )
+            elif self._process_alive(pid) is False:
+                # PID is already gone — nothing to kill.
+                self._log.warning(
+                    "daemon.diagnoser_orphan_pid_dead",
+                    extra={
+                        "event": "diagnoser_orphan_pid_dead",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "subprocess_pid": pid,
+                        "orphan_started_at": str(orphan_started_at),
+                    },
+                )
+            elif self._diagnoser_cmdline_matches(pid) is True:
+                # Alive AND confirmed to be a diagnoser — kill it (#3384).
+                self._log.warning(
+                    "daemon.diagnoser_orphan_killed",
+                    extra={
+                        "event": "diagnoser_orphan_killed",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "subprocess_pid": pid,
+                        "orphan_started_at": str(orphan_started_at),
+                    },
+                )
+                self._kill_diagnoser_process(pid)
+            else:
+                # Alive but cmdline does not match — recycled PID.
+                # Do NOT signal the unrelated process.
+                self._log.warning(
+                    "daemon.diagnoser_orphan_pid_recycled",
+                    extra={
+                        "event": "diagnoser_orphan_pid_recycled",
+                        "run_id": self._run_id,
+                        "diagnosis_id": diagnosis_id,
+                        "subprocess_pid": pid,
+                        "orphan_started_at": str(orphan_started_at),
+                    },
+                )
+
             try:
                 self._mark_diagnosis_failed(
                     diagnosis_id,
