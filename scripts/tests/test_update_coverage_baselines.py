@@ -20,6 +20,7 @@ parse_cobertura_xml_lines = update_coverage_baselines.parse_cobertura_xml_lines
 merge_cobertura_coverage = update_coverage_baselines.merge_cobertura_coverage
 parse_lcov = update_coverage_baselines.parse_lcov
 main = update_coverage_baselines.main
+find_stale_sources = update_coverage_baselines.find_stale_sources
 
 
 # -- Cobertura XML fixtures --
@@ -491,3 +492,234 @@ class TestBaselineKeyOverride:
         updated = json.loads(baselines_path.read_text(encoding="utf-8"))
         assert updated["packages/scraper-framework:framework-only"] == 75.0
         assert updated["packages/scraper-framework"] == 80.0
+
+
+class TestFreshnessGate:
+    """Tests for the --source-dir freshness gate in update-coverage-baselines.py."""
+
+    def _make_baselines(self, tmp_path: Path, baseline: float = 80.0) -> Path:
+        baselines = {"packages/test-pkg": baseline}
+        p = tmp_path / "coverage-baselines.json"
+        p.write_text(json.dumps(baselines), encoding="utf-8")
+        return p
+
+    def test_stale_source_triggers_warning_and_exits_zero(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A source file newer than the coverage report exits 0 with a warning."""
+        # Create coverage.xml first (older timestamp)
+        cov_path = _make_cobertura_xml(
+            tmp_path,
+            "coverage.xml",
+            {"src/mod.py": [(1, 1), (2, 0)]},  # 50% coverage
+        )
+        baselines_path = self._make_baselines(tmp_path, baseline=80.0)
+
+        # Create src dir with a source file that is newer than the coverage file
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        source_file = src_dir / "mod.py"
+
+        # Write the source file, then nudge its mtime to be 2s in the future
+        source_file.write_text("x = 1\n", encoding="utf-8")
+        future_time = cov_path.stat().st_mtime + 2
+        import os
+
+        os.utime(source_file, (future_time, future_time))
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/test-pkg",
+                "--coverage-file",
+                str(cov_path),
+                "--baselines-file",
+                str(baselines_path),
+                "--source-dir",
+                str(src_dir),
+                "--dry-run",
+            ],
+        )
+
+        # Should exit 0 (warning, not failure) despite coverage < baseline
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+
+        captured = capsys.readouterr()
+        assert "stale" in captured.err
+
+    def test_fresh_sources_runs_normal_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When coverage is newer than all source files, normal floor check runs."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        source_file = src_dir / "mod.py"
+        source_file.write_text("x = 1\n", encoding="utf-8")
+
+        # Make coverage.xml newer than the source file
+        cov_path = _make_cobertura_xml(
+            tmp_path,
+            "coverage.xml",
+            {"src/mod.py": [(1, 1), (2, 1)]},  # 100% coverage
+        )
+        import os
+
+        future_time = source_file.stat().st_mtime + 2
+        os.utime(cov_path, (future_time, future_time))
+
+        # Baseline at 80% — 100% coverage should pass
+        baselines_path = self._make_baselines(tmp_path, baseline=80.0)
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/test-pkg",
+                "--coverage-file",
+                str(cov_path),
+                "--baselines-file",
+                str(baselines_path),
+                "--source-dir",
+                str(src_dir),
+                "--dry-run",
+            ],
+        )
+
+        # Should proceed to normal check and succeed (100% >= 80%)
+        main()
+
+    def test_multiple_source_dirs_repeatable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Two --source-dir args: stale file in either dir fires the gate."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+
+        # Source file in src (fresh — older than coverage)
+        src_file = src_dir / "mod.py"
+        src_file.write_text("x = 1\n", encoding="utf-8")
+
+        # Create coverage
+        cov_path = _make_cobertura_xml(
+            tmp_path,
+            "coverage.xml",
+            {"src/mod.py": [(1, 1), (2, 0)]},  # 50% coverage
+        )
+        baselines_path = self._make_baselines(tmp_path, baseline=80.0)
+
+        # Make src_file older than coverage (so src is fresh)
+        import os
+
+        past_time = cov_path.stat().st_mtime - 2
+        os.utime(src_file, (past_time, past_time))
+
+        # Test file in tests (stale — newer than coverage)
+        test_file = tests_dir / "test_mod.py"
+        test_file.write_text("def test_x(): pass\n", encoding="utf-8")
+        future_time = cov_path.stat().st_mtime + 2
+        os.utime(test_file, (future_time, future_time))
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/test-pkg",
+                "--coverage-file",
+                str(cov_path),
+                "--baselines-file",
+                str(baselines_path),
+                "--source-dir",
+                str(src_dir),
+                "--source-dir",
+                str(tests_dir),
+                "--dry-run",
+            ],
+        )
+
+        # Stale file in tests_dir should still trigger the gate
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+
+        captured = capsys.readouterr()
+        assert "stale" in captured.err
+
+    def test_no_source_dir_disables_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without --source-dir, no freshness check runs (CI mode unchanged)."""
+        # Create a coverage file at 50% — would normally trigger freshness warning
+        # if a newer source file existed — but without --source-dir, the gate is off
+        cov_path = _make_cobertura_xml(
+            tmp_path,
+            "coverage.xml",
+            {"src/mod.py": [(1, 1), (2, 1)]},  # 100% coverage
+        )
+        baselines_path = self._make_baselines(tmp_path, baseline=80.0)
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "update-coverage-baselines.py",
+                "--package",
+                "packages/test-pkg",
+                "--coverage-file",
+                str(cov_path),
+                "--baselines-file",
+                str(baselines_path),
+                "--dry-run",
+            ],
+        )
+
+        # No --source-dir: no freshness gate, normal floor check (100% >= 80% passes)
+        main()
+
+    def test_find_stale_sources_returns_files(self, tmp_path: Path) -> None:
+        """Unit test for the find_stale_sources helper directly."""
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+
+        # Create coverage file
+        cov_path = tmp_path / "coverage.xml"
+        cov_path.write_text("<coverage/>", encoding="utf-8")
+
+        # Create a stale source file (newer than coverage)
+        stale_file = src_dir / "module.py"
+        stale_file.write_text("x = 1\n", encoding="utf-8")
+        import os
+
+        future_time = cov_path.stat().st_mtime + 2
+        os.utime(stale_file, (future_time, future_time))
+
+        # Create a fresh source file (older than coverage)
+        fresh_file = src_dir / "other.py"
+        fresh_file.write_text("y = 2\n", encoding="utf-8")
+        past_time = cov_path.stat().st_mtime - 2
+        os.utime(fresh_file, (past_time, past_time))
+
+        # Non-source file should be ignored even if newer
+        txt_file = src_dir / "README.txt"
+        txt_file.write_text("docs\n", encoding="utf-8")
+        os.utime(txt_file, (future_time, future_time))
+
+        result = find_stale_sources(str(cov_path), [str(src_dir)])
+        assert len(result) == 1
+        assert "module.py" in result[0]

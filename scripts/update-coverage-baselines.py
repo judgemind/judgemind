@@ -34,6 +34,14 @@ Example:
         --baseline-key packages/scraper-framework:framework-only \
         --coverage-file coverage-artifacts/coverage-scraper-framework/coverage.xml \
         --coverage-file coverage-artifacts/coverage-scraper-ingestion/coverage.xml
+
+    # Pre-push freshness gate: skip floor check if coverage is stale vs sources:
+    scripts/update-coverage-baselines.py \
+        --package packages/scraper-framework \
+        --coverage-file packages/scraper-framework/coverage.xml \
+        --source-dir packages/scraper-framework/src \
+        --source-dir packages/scraper-framework/tests \
+        --dry-run
 """
 # permanent: true
 
@@ -44,6 +52,43 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+
+_SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx"}
+
+
+def find_stale_sources(coverage_path: str, source_dirs: list[str]) -> list[str]:
+    """Return relative paths of source files newer than the coverage report.
+
+    Walks each directory in source_dirs looking for files with extensions in
+    _SOURCE_EXTENSIONS. Returns up to 5 paths (relative to cwd) of files whose
+    mtime is newer than the coverage report's mtime.  Returns an empty list when
+    the coverage file does not exist or no stale files are found.
+    """
+    cov = Path(coverage_path)
+    if not cov.exists():
+        return []
+
+    cov_mtime = cov.stat().st_mtime
+    stale: list[str] = []
+
+    for source_dir in source_dirs:
+        src = Path(source_dir)
+        if not src.is_dir():
+            continue
+        for f in src.rglob("*"):
+            if f.suffix not in _SOURCE_EXTENSIONS:
+                continue
+            if not f.is_file():
+                continue
+            if f.stat().st_mtime > cov_mtime:
+                try:
+                    stale.append(str(f.relative_to(Path.cwd())))
+                except ValueError:
+                    stale.append(str(f))
+                if len(stale) >= 5:
+                    return stale
+
+    return stale
 
 
 def parse_cobertura_xml(path: str) -> float:
@@ -160,7 +205,36 @@ def main() -> None:
         action="store_true",
         help="Print what would change without writing",
     )
+    parser.add_argument(
+        "--source-dir",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Directory to walk for source files when checking freshness of the "
+        "coverage report (repeatable). When supplied, the script exits 0 with a "
+        "warning if any source file is newer than the coverage report — indicating "
+        "that the last test run was scoped. When omitted (CI default), no freshness "
+        "check is performed.",
+    )
     args = parser.parse_args()
+
+    # Freshness gate: only runs when --source-dir is supplied (pre-push mode).
+    # CI omits --source-dir because it always runs the full suite first.
+    if args.source_dir:
+        # Find the first existing coverage file to check against
+        first_cov = next((cf for cf in args.coverage_file if Path(cf).exists()), None)
+        if first_cov:
+            stale = find_stale_sources(first_cov, args.source_dir)
+            if stale:
+                pkg_key = args.baseline_key if args.baseline_key else args.package
+                print(
+                    f"WARNING: {first_cov} is stale (source file {stale[0]} is newer).\n"
+                    "The last test run was likely scoped — coverage figures don't reflect the\n"
+                    "full suite. Run the full coverage command before pushing. Skipping floor\n"
+                    f"check for {pkg_key}.",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
 
     # Filter to only coverage files that actually exist
     existing_files = []
