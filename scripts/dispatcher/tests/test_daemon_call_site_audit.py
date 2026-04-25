@@ -189,6 +189,38 @@ class DispatcherDaemon:
         )
 
 
+# ---------------------------------------------------------------------------
+# AC #2 of #2975: in-memory phase-output instance vars must be absent
+# ---------------------------------------------------------------------------
+
+_REMOVED_INSTANCE_VARS = [
+    "_agent_plan_output",
+    "_agent_ralph_output",
+    "_agent_summary_output",
+    "_agent_unmet_criteria",
+    "_materialize_plan_output",
+]
+
+
+@pytest.mark.parametrize("var_name", _REMOVED_INSTANCE_VARS)
+class TestRemovedPhaseOutputInstanceVarsAbsent:
+    """#2975 AC #2 — the in-memory phase-output instance variables that were
+    replaced by unconditional DB reads must not appear anywhere in daemon.py.
+
+    Absence here guarantees no spawn site can accidentally fall back to an
+    in-memory cache instead of reading from ``dispatcher.phase_outputs``.
+    """
+
+    def test_instance_var_not_present_in_daemon_source(self, var_name: str) -> None:
+        daemon_source_file = inspect.getsourcefile(daemon)
+        assert daemon_source_file is not None, "Could not resolve daemon.py path"
+        source = Path(daemon_source_file).read_text(encoding="utf-8")
+        assert var_name not in source, (
+            f"Removed instance var {var_name!r} still appears in daemon.py. "
+            "All phase-output reads must go through _fetch_phase_output(agent_id, phase)."
+        )
+
+
 @pytest.mark.parametrize("method_name", _HOT_PATH_METHODS)
 class TestMarkAgentTerminalIssueNumberAudit:
     """AC #2 + AC #5: one test per hot-path method, all green on current main.

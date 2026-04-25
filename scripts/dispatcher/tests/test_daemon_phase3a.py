@@ -1964,6 +1964,14 @@ class TestHappyPathOrchestration:
         # subprocess lane regardless of DEFAULT_AGENT_EXECUTION_MODE (#3093).
         monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
+        # _fetch_phase_output (#2975): spawn sites read from DB unconditionally.
+        # The fake cursor's fetchone() can't distinguish between phase args,
+        # so mock _fetch_phase_output to return the right fixture per phase.
+        def fake_fetch_phase_output(agent_id: str, phase: str) -> dict[str, Any] | None:
+            return phase_outputs.get(phase)
+
+        monkeypatch.setattr(d, "_fetch_phase_output", fake_fetch_phase_output)
+
         # Run orchestration.
         d._claim_and_orchestrate_one()
 
@@ -3456,6 +3464,14 @@ class TestNeedsReviewOrchestration:
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
         monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
+        # _fetch_phase_output (#2975): return the right fixture per phase.
+        def fake_fetch_phase_output_unmet(
+            agent_id: str, phase: str
+        ) -> dict[str, Any] | None:
+            return phase_outputs.get(phase)
+
+        monkeypatch.setattr(d, "_fetch_phase_output", fake_fetch_phase_output_unmet)
+
         d._claim_and_orchestrate_one()
 
         # --- AC1: draft flag present on gh pr create ---
@@ -3588,6 +3604,16 @@ class TestNeedsReviewOrchestration:
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
         monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
+
+        # _fetch_phase_output (#2975): return the right fixture per phase.
+        def fake_fetch_phase_output_comment_fail(
+            agent_id: str, phase: str
+        ) -> dict[str, Any] | None:
+            return phase_outputs.get(phase)
+
+        monkeypatch.setattr(
+            d, "_fetch_phase_output", fake_fetch_phase_output_comment_fail
+        )
 
         d._claim_and_orchestrate_one()
 

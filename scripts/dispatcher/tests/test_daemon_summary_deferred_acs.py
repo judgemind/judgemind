@@ -161,12 +161,17 @@ class TestSummaryDeferredAcsPersisted:
         d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._write_failure = MagicMock()  # type: ignore[method-assign]
-        d._agent_ralph_output = {
-            "verdict": "SHIP",
-            "summary": "…",
-            "changed_files": ["scripts/foo.py"],
-        }
-        d._agent_plan_output = {"acceptance_criteria": [], "scope_check": []}
+        # Mock _fetch_phase_output to return DB-backed predecessor outputs.
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda agent_id, phase: {
+                "ralph": {
+                    "verdict": "SHIP",
+                    "summary": "…",
+                    "changed_files": ["scripts/foo.py"],
+                },
+                "plan": {"acceptance_criteria": [], "scope_check": []},
+            }.get(phase)
+        )
         d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
             return_value={
                 "issue_number": 3010,
@@ -225,12 +230,13 @@ class TestSummaryDeferredAcsPersisted:
         d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
         d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
         d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._agent_ralph_output = {
-            "verdict": "SHIP",
-            "summary": "",
-            "changed_files": [],
-        }
-        d._agent_plan_output = {"acceptance_criteria": [], "scope_check": []}
+        # Mock _fetch_phase_output to return DB-backed predecessor outputs.
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda agent_id, phase: {
+                "ralph": {"verdict": "SHIP", "summary": "", "changed_files": []},
+                "plan": {"acceptance_criteria": [], "scope_check": []},
+            }.get(phase)
+        )
         d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
             return_value={
                 "issue_number": 3010,

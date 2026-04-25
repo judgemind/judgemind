@@ -2237,20 +2237,6 @@ class DispatcherDaemon:
         # boto3 clients are thread-safe; reuse across scheduler + reap
         # paths avoids redundant credential lookups.
         self._ecs_client: Any | None = None
-        # Phase 3A: within-tick handoff between phase helpers. Reset at
-        # the start of each orchestration run so a previous failure's
-        # partial state cannot leak into the next attempt.
-        self._agent_plan_output: dict[str, Any] | None = None
-        self._agent_ralph_output: dict[str, Any] | None = None
-        self._agent_summary_output: dict[str, Any] | None = None
-        #: Summary-phase ``unmet_criteria`` list. Populated by
-        #: :meth:`_run_summary_phase` when the summary skill flagged
-        #: criteria the ralph diff did not satisfy (#2856). When
-        #: non-empty, :meth:`_push_and_open_pr` opens a DRAFT PR with
-        #: the unmet list in the body and the agent terminates as
-        #: ``status='needs_review'`` rather than ``succeeded``. Reset
-        #: at the start of each orchestration run.
-        self._agent_unmet_criteria: list[str] | None = None
         # Phase 3C: GitHub rate-limit skip window. When set, ``now() <
         # self._gh_rate_skip_until`` → scheduler + supervisor ticks both
         # skip their hot paths. Cleared by
@@ -8950,14 +8936,6 @@ class DispatcherDaemon:
         the "3A's claim path catches it next tick" half of the retry
         loop — without this, the retrying row would sit idle forever.
         """
-        # Reset within-tick handoff so a prior run's partial state
-        # cannot leak into the next attempt (defense-in-depth; the
-        # scheduler only enters this path when no agent is active).
-        self._agent_plan_output = None
-        self._agent_ralph_output = None
-        self._agent_summary_output = None
-        self._agent_unmet_criteria = None
-
         # Phase 3C resume-retry path: pick up any retrying agent first.
         # If one exists, re-orchestrate it on a fresh worktree instead
         # of claiming a new issue. Returning after a resume means this
@@ -10173,24 +10151,6 @@ class DispatcherDaemon:
 
         return prior_output, prior_ts_str
 
-    def _materialize_plan_output(
-        self,
-        worktree: Path,
-        plan_output: dict[str, Any],
-    ) -> None:
-        """Write a reused plan to ``{worktree}/tmp/dispatcher-output/plan.json``.
-
-        Mirrors the artifact that the real plan subprocess produces so
-        any downstream code that reads the file directly (e.g. scripts,
-        admin tooling) sees an identical structure regardless of whether
-        the plan was freshly generated or reused from a prior agent's
-        run (#2937).
-        """
-        output_dir = worktree / "tmp" / "dispatcher-output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / "plan.json"
-        output_path.write_text(json.dumps(plan_output, indent=2, default=str))
-
     def _fetch_prior_attempts(self, issue_number: int) -> list[dict[str, Any]]:
         """Return up to 3 prior non-infra-preempted failed agents for *issue_number*.
 
@@ -10494,7 +10454,6 @@ class DispatcherDaemon:
                 log_text="<reused from prior plan>",
                 usage=None,
             )
-            self._materialize_plan_output(worktree, reused)
             self._log.info(
                 "daemon.plan_reused",
                 extra={
@@ -10505,7 +10464,6 @@ class DispatcherDaemon:
                     "prior_plan_output_ts": prior_ts_str,
                 },
             )
-            self._agent_plan_output = reused
             return True
         # ── end plan-reuse ─────────────────────────────────────────────────
 
@@ -10629,8 +10587,6 @@ class DispatcherDaemon:
                 )
             return False
 
-        # Stash plan output on the agent for ralph + summary to reuse.
-        self._agent_plan_output = plan_output
         return True
 
     def _run_ralph_phase(
@@ -10692,7 +10648,7 @@ class DispatcherDaemon:
         )
         # ── end prior-attempt context ──────────────────────────────────────
 
-        plan_output = self._agent_plan_output or {}
+        plan_output = self._fetch_phase_output(agent_id, "plan") or {}
         ralph_input = {
             "agent_id": agent_id,
             "issue_number": issue_number,
@@ -10881,7 +10837,6 @@ class DispatcherDaemon:
         self._capture_and_persist_ralph_patch(agent_id, issue_number, worktree)
         # ── end SHIP patch persist ─────────────────────────────────────────
 
-        self._agent_ralph_output = ralph_output
         return True
 
     def _run_summary_phase(
@@ -10915,7 +10870,7 @@ class DispatcherDaemon:
         except Exception:  # pragma: no cover — defensive; not asserted in unit tests
             git_diff = ""
 
-        ralph_output = self._agent_ralph_output or {}
+        ralph_output = self._fetch_phase_output(agent_id, "ralph") or {}
         changed_files = ralph_output.get("changed_files", []) or []
         # Fall back to a git-state read if ralph didn't populate
         # changed_files (non-testable short-circuit path).
@@ -10961,7 +10916,7 @@ class DispatcherDaemon:
                 "parent_issue": None,
             }
 
-        plan_output = self._agent_plan_output or {}
+        plan_output = self._fetch_phase_output(agent_id, "plan") or {}
         # Branch name matches ``_create_worktree``'s naming convention.
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         branch = f"agent/{short_id}"
@@ -11123,12 +11078,6 @@ class DispatcherDaemon:
                     "terminal_status": "needs_review",
                 },
             )
-            # Coerce to list[str] so downstream rendering is total on
-            # malformed skill output (non-string entries get stringified
-            # rather than crashing the orchestration).
-            self._agent_unmet_criteria = [str(u) for u in unmet]
-
-        self._agent_summary_output = summary_output
         return True
 
     def _run_subprocess_or_fail(
@@ -11763,17 +11712,17 @@ class DispatcherDaemon:
         success (criteria all met), ``phase='awaiting_ci'`` so Phase 3B
         knows where to pick up, and ``status`` stays ``running``.
 
-        **needs_review branch (#2856):** when
-        :attr:`_agent_unmet_criteria` is non-empty (set by
-        :meth:`_run_summary_phase`), the PR is opened as a DRAFT with
-        an ``⚠️ Unmet acceptance criteria`` section appended to the
-        body, an issue comment is posted linking the draft + listing
-        the unmet criteria, and the agent terminates as
-        ``status='needs_review', phase='needs_review'`` with
-        ``ended_at`` set. The draft PR is NOT picked up by Phase 3B
-        (``needs_review`` is outside the ``_list_advanceable_agents``
-        SELECT), so auto-merge cannot touch it — the operator reviews,
-        marks ready + merges, or closes.
+        **needs_review branch (#2856):** when the summary phase's
+        ``unmet_criteria`` list is non-empty (fetched from
+        ``dispatcher.phase_outputs`` via :meth:`_fetch_phase_output`),
+        the PR is opened as a DRAFT with an ``⚠️ Unmet acceptance
+        criteria`` section appended to the body, an issue comment is
+        posted linking the draft + listing the unmet criteria, and the
+        agent terminates as ``status='needs_review',
+        phase='needs_review'`` with ``ended_at`` set. The draft PR is
+        NOT picked up by Phase 3B (``needs_review`` is outside the
+        ``_list_advanceable_agents`` SELECT), so auto-merge cannot touch
+        it — the operator reviews, marks ready + merges, or closes.
         """
         self._update_agent_phase(agent_id, "push_and_pr")
 
@@ -11836,10 +11785,9 @@ class DispatcherDaemon:
             )
             return
 
-        unmet_criteria = self._agent_unmet_criteria or []
+        summary_output = self._fetch_phase_output(agent_id, "summary") or {}
+        unmet_criteria = [str(u) for u in (summary_output.get("unmet_criteria") or [])]
         is_needs_review = bool(unmet_criteria)
-
-        summary_output = self._agent_summary_output or {}
         commit_message = summary_output.get("commit_message") or ""
         pr_title = summary_output.get("pr_title") or ""
         pr_body_md = summary_output.get("pr_body_md") or ""

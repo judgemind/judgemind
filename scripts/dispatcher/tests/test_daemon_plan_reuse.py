@@ -11,8 +11,6 @@ Covers:
   helper: None when no qualifying row exists, None when go=False, None
   when the issue was edited after the prior plan ran, and the parsed
   output_json dict on a valid hit.
-* :meth:`daemon.DispatcherDaemon._materialize_plan_output` — writes
-  ``{worktree}/tmp/dispatcher-output/plan.json``.
 * :meth:`daemon.DispatcherDaemon._run_plan_phase` — the short-circuit
   branch: subprocess NOT spawned when a reusable plan exists (AC #1),
   subprocess IS spawned when no prior plan exists (AC #2), subprocess IS
@@ -21,6 +19,10 @@ Covers:
   ``issue_number`` (AC #4).
 * Cost impact: ``_persist_phase_output`` called with ``usage=None`` so
   no Opus cost entry is written for the reused copy (AC #5).
+* DB-source-of-truth: ``_run_ralph_phase`` fetches plan output from DB
+  via ``_fetch_phase_output`` rather than an in-memory instance var,
+  so a daemon restart between plan and ralph resumes cleanly (AC #4 of
+  #2975).
 """
 
 from __future__ import annotations
@@ -260,36 +262,6 @@ class TestTryReusePriorPlan:
 
 
 # --------------------------------------------------------------------------
-# _materialize_plan_output — writes plan.json to the worktree
-# --------------------------------------------------------------------------
-
-
-class TestMaterializePlanOutput:
-    def test_writes_plan_json_to_dispatcher_output_dir(self, tmp_path: Path) -> None:
-        d, _conn, _handler = _make_daemon(tmp_path)
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-
-        d._materialize_plan_output(worktree, _GOOD_PLAN_OUTPUT)
-
-        plan_path = worktree / "tmp" / "dispatcher-output" / "plan.json"
-        assert plan_path.exists(), "plan.json must be written to dispatcher-output/"
-        written = json.loads(plan_path.read_text())
-        assert written["go"] is True
-        assert written["plan"] == "Implement feature X"
-
-    def test_creates_parent_dirs(self, tmp_path: Path) -> None:
-        d, _conn, _handler = _make_daemon(tmp_path)
-        worktree = tmp_path / "worktree"
-        # Do NOT mkdir worktree — _materialize_plan_output must create dirs.
-
-        d._materialize_plan_output(worktree, _GOOD_PLAN_OUTPUT)
-
-        plan_path = worktree / "tmp" / "dispatcher-output" / "plan.json"
-        assert plan_path.exists()
-
-
-# --------------------------------------------------------------------------
 # _run_plan_phase integration — subprocess short-circuit
 # --------------------------------------------------------------------------
 
@@ -341,9 +313,6 @@ class TestPlanReuse:
         # Capture _persist_phase_output calls.
         d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
 
-        # Capture _materialize_plan_output calls.
-        d._materialize_plan_output = MagicMock()  # type: ignore[method-assign]
-
         # Subprocess spawn should NOT be called.
         d._run_subprocess_or_fail = MagicMock(  # type: ignore[method-assign]
             return_value=0
@@ -368,11 +337,15 @@ class TestPlanReuse:
         log_text_arg = call_kwargs[1].get("log_text") or call_kwargs[0][3]
         assert "reused" in str(log_text_arg)
 
-        # _materialize_plan_output was called.
-        d._materialize_plan_output.assert_called_once_with(worktree, _GOOD_PLAN_OUTPUT)
-
-        # _agent_plan_output is set from the reused plan.
-        assert d._agent_plan_output == _GOOD_PLAN_OUTPUT
+        # _persist_phase_output was called with the new agent_id (AC #4 of #2975:
+        # the DB row is the authoritative source for downstream phases).
+        d._persist_phase_output.assert_called_once_with(
+            "agent-new",
+            "plan",
+            _GOOD_PLAN_OUTPUT,
+            log_text="<reused from prior plan>",
+            usage=None,
+        )
 
         # Observability: daemon.plan_reused event logged (AC #4).
         reused_events = handler.events("plan_reused")
@@ -600,3 +573,68 @@ class TestTryReusePriorPlanTimestampEdgeCases:
         assert plan_output["go"] is True
         # Datetime was converted to ISO string.
         assert "2026-04-19" in prior_ts_str
+
+
+# --------------------------------------------------------------------------
+# AC #4 of #2975: _run_ralph_phase reads plan output from DB unconditionally
+# --------------------------------------------------------------------------
+
+
+class TestPhaseInputBuiltFromDbRow:
+    """_run_ralph_phase must fetch plan output from dispatcher.phase_outputs,
+    not from an in-memory instance variable (#2975 AC #4).
+
+    Simulates a daemon restart between plan and ralph: there is no in-memory
+    state at all, but the DB has a ``phase_outputs`` row for the plan phase.
+    The ralph spawn's input bundle must carry the plan content from the DB.
+    """
+
+    def test_ralph_spawn_input_built_from_db_row_not_instance_var(
+        self, tmp_path: Path
+    ) -> None:
+        """_fetch_phase_output("plan") drives ralph's input, not an instance var."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        # Simulate DB returning the plan row.
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            return_value=_GOOD_PLAN_OUTPUT
+        )
+
+        # Capture the input written to ralph.
+        written_inputs: list[dict] = []
+
+        def _capture_write(wt: Path, phase: str, data: dict) -> None:  # type: ignore[override]
+            if phase == "ralph":
+                written_inputs.append(data)
+
+        d._write_phase_input = _capture_write  # type: ignore[method-assign]
+
+        # Stub all other helpers so _run_ralph_phase runs its full flow.
+        ralph_output = {"verdict": "SHIP", "summary": "done", "changed_files": []}
+        d._apply_prior_ralph_patch = MagicMock(return_value=None)  # type: ignore[method-assign]
+        d._materialize_prior_attempts = MagicMock(return_value=0)  # type: ignore[method-assign]
+        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
+        d._read_phase_output = MagicMock(return_value=ralph_output)  # type: ignore[method-assign]
+        d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
+        d._capture_and_persist_ralph_patch = MagicMock()  # type: ignore[method-assign]
+        d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
+        d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
+        d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        ok = d._run_ralph_phase("agent-abc", 42, worktree)
+
+        assert ok is True
+        # _fetch_phase_output was called for the "plan" phase.
+        d._fetch_phase_output.assert_any_call("agent-abc", "plan")
+
+        # The ralph input bundle carries the plan content from the DB row.
+        assert written_inputs, "ralph input must have been written"
+        ralph_input = written_inputs[0]
+        assert ralph_input["plan"] == _GOOD_PLAN_OUTPUT, (
+            "ralph input 'plan' key must equal the DB-fetched plan output"
+        )
+        assert ralph_input["dependencies_installed"] == [], (
+            "dependencies_installed must be derived from the DB-fetched plan"
+        )
