@@ -18,8 +18,10 @@
 #   scripts/dispatcher/helpers/diagnoses.sh --issue 3008      # all for #3008
 #   scripts/dispatcher/helpers/diagnoses.sh --agent 7c8269af  # all for agent prefix
 #   scripts/dispatcher/helpers/diagnoses.sh --json            # raw JSON (pipe to jq)
+#   scripts/dispatcher/helpers/diagnoses.sh --full-reasoning  # don't truncate reasoning
 #
 # Options can be combined; --json applies on top of any filter.
+# In --json mode, full_recommendation is fetched per-row and merged back in.
 #
 # Exit codes:
 #   0  — printed successfully.
@@ -59,6 +61,7 @@ recent_n="20"
 filter_issue=""
 filter_agent=""
 want_json="0"
+full_reasoning="0"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -88,6 +91,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --json)
             want_json="1"
+            shift
+            ;;
+        --full-reasoning)
+            full_reasoning="1"
             shift
             ;;
         -h|--help)
@@ -132,6 +139,14 @@ if [[ -n "$filter_issue" ]]; then
     limit_clause=""
 fi
 
+# ─── Build reasoning SQL fragment (truncated by default) ────────────────
+
+if [[ "$full_reasoning" == "1" ]]; then
+    reasoning_sql="d.recommendation->>'reasoning'"
+else
+    reasoning_sql="CASE WHEN length(d.recommendation->>'reasoning') > 800 THEN substring(d.recommendation->>'reasoning', 1, 797) || '…' ELSE d.recommendation->>'reasoning' END"
+fi
+
 # ─── Query ──────────────────────────────────────────────────────────────
 
 sql="
@@ -148,8 +163,8 @@ SELECT jsonb_agg(row ORDER BY diagnosis_id DESC) AS rows FROM (
     CASE WHEN d.completed_at IS NULL THEN NULL
          ELSE to_char(d.completed_at - d.started_at, 'FMHH24:MI:SS') END AS duration,
     d.recommendation->>'action' AS action,
-    d.recommendation->>'reasoning' AS reasoning,
-    d.recommendation AS full_recommendation,
+    ${reasoning_sql} AS reasoning,
+    (d.recommendation - 'action' - 'reasoning') AS extras,
     d.outcome,
     d.failure_id AS failure_id,
     f.category AS failure_category
@@ -186,8 +201,23 @@ if [[ "$(echo "$rows" | jq 'length')" == "0" ]]; then
 fi
 
 if [[ "$want_json" == "1" ]]; then
-    # Machine-readable: preserve full context + recommendation.
-    echo "$rows" | jq '.'
+    # Machine-readable: fetch full recommendation per-row and merge back.
+    # Each per-row query stays well inside the SSM byte budget (#3203).
+    enriched="$rows"
+    count=$(echo "$rows" | jq 'length')
+    idx=0
+    while (( idx < count )); do
+        diag_id=$(echo "$rows" | jq -r ".[$idx].diagnosis_id")
+        rec_sql="SELECT recommendation FROM dispatcher.diagnoses WHERE diagnosis_id = ${diag_id};"
+        rec_result=$(query "$rec_sql")
+        rec_value=$(echo "$rec_result" | jq '.[0].recommendation // null')
+        enriched=$(printf '%s' "$enriched" | jq \
+            --argjson rec "$rec_value" \
+            --argjson i "$idx" \
+            'to_entries | map(if .key == $i then .value + {full_recommendation: $rec} else .value end)')
+        idx=$(( idx + 1 ))
+    done
+    echo "$enriched" | jq '.'
     exit 0
 fi
 
@@ -196,10 +226,8 @@ fi
 echo "$rows" | jq -r '
   reverse  # oldest first so causality reads top-down
   | .[] as $d
-  # Extract non-action, non-reasoning fields from the recommendation payload.
-  | ($d.full_recommendation // {}
-      | to_entries
-      | map(select(.key != "action" and .key != "reasoning"))) as $extras
+  # extras is already filtered server-side: (recommendation - "action" - "reasoning")
+  | ($d.extras // {} | to_entries) as $extras
   | [
       "── diagnosis #\($d.diagnosis_id) ──",
       "  agent:    \($d.agent_id[:8])   issue: #\($d.issue_number)",
