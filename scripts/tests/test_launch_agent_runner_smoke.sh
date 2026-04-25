@@ -491,6 +491,149 @@ else
     fail "test4: exactly one ecs:RunTask after wiring resolution" "run-task count was $run_task_count4"
 fi
 
+# ── Test 5: AGENT_ID with single quote → exit non-zero, no INSERT, no RunTask ──
+#
+# A single quote embedded in AGENT_ID would break the SQL string literal and
+# could be used to inject arbitrary SQL. The script must reject it before any
+# DB or ECS call.
+
+reset_invocations
+AGENT_ID_5="aaaaaaaa-0001-0001-0001-000000000001'; DROP TABLE"
+
+set +e
+"$PATCHED_SCRIPT" "$AGENT_ID_5" \
+    > /dev/null 2>&1
+exit_code5=$?
+set -e
+
+if [[ $exit_code5 -ne 0 ]]; then
+    pass "test5: AGENT_ID with single-quote exits non-zero"
+else
+    fail "test5: AGENT_ID with single-quote exits non-zero" "exit code was $exit_code5"
+fi
+
+insert_count5=$(count_insert_calls)
+if [[ "$insert_count5" -eq 0 ]]; then
+    pass "test5: no INSERT for single-quote AGENT_ID"
+else
+    fail "test5: no INSERT for single-quote AGENT_ID" "insert count was $insert_count5"
+fi
+
+run_task_count5=$(count_aws_subcommand "run-task")
+if [[ "$run_task_count5" -eq 0 ]]; then
+    pass "test5: no ecs:RunTask for single-quote AGENT_ID"
+else
+    fail "test5: no ecs:RunTask for single-quote AGENT_ID" "run-task count was $run_task_count5"
+fi
+
+# ── Test 6: AGENT_ID with semicolon → exit non-zero, no INSERT, no RunTask ────
+#
+# A semicolon embedded in AGENT_ID would terminate the SQL statement early.
+
+reset_invocations
+AGENT_ID_6="aaaaaaaa-0001-0001-0001-00000000000;1"
+
+set +e
+"$PATCHED_SCRIPT" "$AGENT_ID_6" \
+    > /dev/null 2>&1
+exit_code6=$?
+set -e
+
+if [[ $exit_code6 -ne 0 ]]; then
+    pass "test6: AGENT_ID with semicolon exits non-zero"
+else
+    fail "test6: AGENT_ID with semicolon exits non-zero" "exit code was $exit_code6"
+fi
+
+insert_count6=$(count_insert_calls)
+if [[ "$insert_count6" -eq 0 ]]; then
+    pass "test6: no INSERT for semicolon AGENT_ID"
+else
+    fail "test6: no INSERT for semicolon AGENT_ID" "insert count was $insert_count6"
+fi
+
+run_task_count6=$(count_aws_subcommand "run-task")
+if [[ "$run_task_count6" -eq 0 ]]; then
+    pass "test6: no ecs:RunTask for semicolon AGENT_ID"
+else
+    fail "test6: no ecs:RunTask for semicolon AGENT_ID" "run-task count was $run_task_count6"
+fi
+
+# ── Test 7: AGENT_ID with embedded newline → exit non-zero, no INSERT, no RunTask
+#
+# An embedded newline could break SQL or shell argument handling.
+
+reset_invocations
+AGENT_ID_7="$(printf 'aaaaaaaa-0001-0001-0001-000000000001\nDROP TABLE')"
+
+set +e
+"$PATCHED_SCRIPT" "$AGENT_ID_7" \
+    > /dev/null 2>&1
+exit_code7=$?
+set -e
+
+if [[ $exit_code7 -ne 0 ]]; then
+    pass "test7: AGENT_ID with embedded newline exits non-zero"
+else
+    fail "test7: AGENT_ID with embedded newline exits non-zero" "exit code was $exit_code7"
+fi
+
+insert_count7=$(count_insert_calls)
+if [[ "$insert_count7" -eq 0 ]]; then
+    pass "test7: no INSERT for newline AGENT_ID"
+else
+    fail "test7: no INSERT for newline AGENT_ID" "insert count was $insert_count7"
+fi
+
+run_task_count7=$(count_aws_subcommand "run-task")
+if [[ "$run_task_count7" -eq 0 ]]; then
+    pass "test7: no ecs:RunTask for newline AGENT_ID"
+else
+    fail "test7: no ecs:RunTask for newline AGENT_ID" "run-task count was $run_task_count7"
+fi
+
+# ── Test 8: ISSUE_NUMBER non-numeric → exit non-zero, no INSERT, no RunTask ───
+#
+# A non-numeric ISSUE_NUMBER is interpolated directly into SQL without quotes.
+# Injecting e.g. "1; DROP" would execute as a second SQL statement.
+
+reset_invocations
+AGENT_ID_8="aaaaaaaa-0008-0008-0008-000000000008"
+
+set +e
+PATH="$STUB_BIN:$PATH" \
+INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+ECS_CLUSTER="judgemind-dev" \
+AGENT_RUNNER_TASK_DEFINITION_FAMILY="judgemind-dispatcher-agent-runner-dev" \
+AGENT_RUNNER_SUBNET_IDS="subnet-aaa111,subnet-bbb222" \
+AGENT_RUNNER_SECURITY_GROUP_ID="sg-deadbeef" \
+REGION="us-west-2" \
+AGENT_ROW_EXISTS="0" \
+"$PATCHED_SCRIPT" "$AGENT_ID_8" "1; DROP" \
+    > /dev/null 2>&1
+exit_code8=$?
+set -e
+
+if [[ $exit_code8 -ne 0 ]]; then
+    pass "test8: non-numeric ISSUE_NUMBER exits non-zero"
+else
+    fail "test8: non-numeric ISSUE_NUMBER exits non-zero" "exit code was $exit_code8"
+fi
+
+insert_count8=$(count_insert_calls)
+if [[ "$insert_count8" -eq 0 ]]; then
+    pass "test8: no INSERT for non-numeric ISSUE_NUMBER"
+else
+    fail "test8: no INSERT for non-numeric ISSUE_NUMBER" "insert count was $insert_count8"
+fi
+
+run_task_count8=$(count_aws_subcommand "run-task")
+if [[ "$run_task_count8" -eq 0 ]]; then
+    pass "test8: no ecs:RunTask for non-numeric ISSUE_NUMBER"
+else
+    fail "test8: no ecs:RunTask for non-numeric ISSUE_NUMBER" "run-task count was $run_task_count8"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""
