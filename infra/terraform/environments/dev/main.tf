@@ -362,6 +362,13 @@ module "dispatcher_agent_runner" {
 
   github_repo = "judgemind/judgemind"
   repo_url    = "https://github.com/judgemind/judgemind.git"
+
+  # Fatal-event alarm wired to the shared SNS topic (#3093). Mirrors the
+  # same wiring on the dispatcher_daemon module (lines 317-318).
+  # `treat_missing_data = notBreaching` on the alarm keeps it quiet when
+  # no agent-runner tasks have fired yet.
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
 }
 
 output "ecr_repository_url" {

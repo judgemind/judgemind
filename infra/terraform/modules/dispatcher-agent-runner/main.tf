@@ -249,6 +249,54 @@ resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
   })
 }
 
+# ─── CloudWatch: agent_runner.fatal alarm (#3093) ─────────────────────────
+#
+# Fires when the agent-runner entrypoint emits an ``agent_runner.fatal``
+# structured-log event — the ``die()`` helper in
+# ``scripts/dispatcher/agent-runner-entrypoint.sh`` writes this on any
+# non-recoverable error (corrupt repo state, missing required env var,
+# irrecoverable phase failure). A single fatal event in a 5-minute window
+# is enough signal — there is no "expected" fatal rate.
+#
+# Mirrors the ``stuck_timeout_repeated`` filter + alarm pair in the
+# dispatcher-daemon module (``dispatcher-daemon/main.tf``).
+
+resource "aws_cloudwatch_log_metric_filter" "agent_runner_fatal" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.task_family}-agent-runner-fatal"
+  pattern        = "{ $.event = \"agent_runner.fatal\" }"
+  log_group_name = aws_cloudwatch_log_group.agent_runner.name
+
+  metric_transformation {
+    name          = "AgentRunnerFatalCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "agent_runner_fatal" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.task_family}-agent-runner-fatal"
+  alarm_description = "An agent-runner task emitted agent_runner.fatal in the last 5 minutes (${var.environment}). A non-recoverable entrypoint error occurred — check ${aws_cloudwatch_log_group.agent_runner.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "AgentRunnerFatalCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
 # ─── ECS Task Definition ───────────────────────────────────────────────────
 #
 # CPU / memory: 4096 / 16384 to match the subprocess-daemon envelope —
