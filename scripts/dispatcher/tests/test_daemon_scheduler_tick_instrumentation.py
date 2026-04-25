@@ -2,11 +2,6 @@
 
 Covers the diagnostic-first changes added to :mod:`scripts.dispatcher.daemon`:
 
-* Every ``subprocess.run`` / ``subprocess.Popen`` call site in
-  ``daemon.py`` uses a ``timeout=`` kwarg (AST-level scan). An unbounded
-  ``gh`` / ``git`` subprocess was the prime hypothesis for the #3205
-  silent-daemon wedge; this test locks in the no-unbounded-subprocess
-  invariant for future edits.
 * The per-step instrumentation inside :meth:`scheduler_tick` emits
   ``daemon.scheduler_tick_slow_<step>`` WARNING events when a
   sub-step's elapsed wall-clock exceeds
@@ -17,12 +12,16 @@ Covers the diagnostic-first changes added to :mod:`scripts.dispatcher.daemon`:
   multiple times, and honours the
   ``JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER`` opt-out.
 
+Note: AST-level coverage of ``subprocess.run`` timeout kwargs (formerly
+``TestSubprocessTimeoutCoverage``) has been moved to the
+``scripts/check-subprocess-timeouts.sh`` hygiene guard (#3213), which
+covers all of ``scripts/**/*.py`` rather than just ``daemon.py``.
+
 No real subprocess is spawned. No real CloudWatch / ECS is reached.
 """
 
 from __future__ import annotations
 
-import ast
 import logging
 import sys
 import time
@@ -38,9 +37,6 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
-
-
-DAEMON_PATH = Path(daemon.__file__)
 
 
 # --------------------------------------------------------------------------
@@ -133,70 +129,16 @@ def _make_daemon(
 
 
 # --------------------------------------------------------------------------
-# AC #1 — every ``subprocess.run`` / ``subprocess.Popen`` call site in
-# daemon.py uses a ``timeout=`` kwarg.
+# AC #1 — ``QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS`` is sane.
 #
-# An unbounded ``gh`` / ``git`` subprocess call in the scheduler_tick
-# reachable path was the prime hypothesis for the #3205 silent wedge
-# (issue body §Hypothesis). This AST-level scan locks in the invariant
-# for the whole module — any future addition that forgets ``timeout=``
-# fails this test at author time rather than wedging the daemon in
-# production.
+# The AST-level scan that verified every ``subprocess.run`` call site in
+# daemon.py has a ``timeout=`` kwarg has been moved to the broader
+# ``scripts/check-subprocess-timeouts.sh`` hygiene guard (#3213), which
+# covers all of ``scripts/**/*.py`` rather than just ``daemon.py``.
 # --------------------------------------------------------------------------
 
 
-def _collect_subprocess_run_sites() -> list[tuple[int, bool]]:
-    """Return (lineno, has_timeout_kw) for every ``subprocess.run`` call.
-
-    Walks ``daemon.py`` at parse time. ``subprocess.Popen`` calls are
-    deliberately excluded — ``Popen`` itself returns immediately, and
-    the daemon bounds Popen-based subprocesses via a subsequent
-    ``proc.wait(timeout=...)`` call (see the ``claude -p`` orchestration
-    spawn at line ~8252 and the diagnoser spawn at line ~17320). The
-    scheduler_tick wedge class the #3205 instrumentation targets is
-    specifically an unbounded blocking ``subprocess.run`` — those are
-    the calls that tie up the MainThread indefinitely.
-
-    ``has_timeout_kw`` is True iff the call passes ``timeout=...`` —
-    either inline or via ``**kwargs`` (we treat ``**kwargs`` as a
-    pass-through and accept it, relying on the wrapper's own check).
-    """
-    source = DAEMON_PATH.read_text()
-    tree = ast.parse(source)
-    sites: list[tuple[int, bool]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not isinstance(func, ast.Attribute):
-            continue
-        if not (
-            isinstance(func.value, ast.Name)
-            and func.value.id == "subprocess"
-            and func.attr == "run"
-        ):
-            continue
-        has_timeout = any(
-            kw.arg == "timeout" or kw.arg is None  # kw.arg None == **kwargs splat
-            for kw in node.keywords
-        )
-        sites.append((node.lineno, has_timeout))
-    return sites
-
-
 class TestSubprocessTimeoutCoverage:
-    def test_every_subprocess_run_call_has_timeout_kwarg(self) -> None:
-        sites = _collect_subprocess_run_sites()
-        assert sites, "expected at least one subprocess.run call site in daemon.py"
-        missing = [lineno for lineno, ok in sites if not ok]
-        assert missing == [], (
-            "subprocess.run call sites without ``timeout=`` kwarg (daemon.py "
-            f"line numbers): {missing!r}. Every blocking subprocess.run in the "
-            "scheduler_tick-reachable path must be bounded to avoid the #3205 "
-            "silent-daemon wedge class. If you need an unbounded subprocess, "
-            "use subprocess.Popen + proc.wait(timeout=...) instead."
-        )
-
     def test_queue_scan_timeout_constant_is_bounded(self) -> None:
         """The shared ``QUEUE_SCAN_SUBPROCESS_TIMEOUT_SECONDS`` drives
         the hot-path ``gh issue list`` calls. Keep it well below the

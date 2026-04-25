@@ -169,6 +169,7 @@ def fetch_runs_via_gh(limit: int) -> list[dict[str, Any]]:
         capture_output=True,
         text=True,
         check=True,
+        timeout=120,
     )
     runs_meta = json.loads(list_proc.stdout)
     results: list[dict[str, Any]] = []
@@ -188,6 +189,7 @@ def fetch_runs_via_gh(limit: int) -> list[dict[str, Any]]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=120,
         )
         detail = json.loads(view_proc.stdout)
         results.append(

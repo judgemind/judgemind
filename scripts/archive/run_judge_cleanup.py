@@ -71,7 +71,7 @@ def run_script(script_name: str, dry_run: bool) -> int:
         cmd.append("--dry-run")
 
     logger.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, env=os.environ)
+    result = subprocess.run(cmd, env=os.environ, timeout=120)
     return result.returncode
 
 

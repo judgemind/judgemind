@@ -140,7 +140,9 @@ class Job:
     name: str
     start_line: int  # 1-indexed, line of the `<name>:` header
     end_line: int  # 1-indexed, last line of the job body
-    if_gate_filter: str | None  # e.g. "scripts" if gated on detect-changes.outputs.scripts
+    if_gate_filter: (
+        str | None
+    )  # e.g. "scripts" if gated on detect-changes.outputs.scripts
 
 
 @dataclass
@@ -288,14 +290,10 @@ def _extract_filters(lines: list[str], jobs: list[Job]) -> dict[str, list[str]]:
     if filter_name_indent is None:
         return {}
 
-    filter_name_re = re.compile(
-        rf"^ {{{filter_name_indent}}}([A-Za-z0-9_\-]+):\s*$"
-    )
+    filter_name_re = re.compile(rf"^ {{{filter_name_indent}}}([A-Za-z0-9_\-]+):\s*$")
     # Glob entries are lines more deeply indented than the filter name,
     # starting with `- '...'`.
-    glob_entry_re = re.compile(
-        rf"^ {{{filter_name_indent + 2},}}-\s*(.+?)\s*$"
-    )
+    glob_entry_re = re.compile(rf"^ {{{filter_name_indent + 2},}}-\s*(.+?)\s*$")
 
     filters: dict[str, list[str]] = {}
     current_filter: str | None = None
@@ -457,6 +455,7 @@ def get_diff_from_git(base_ref: str, repo_root: Path) -> str:
         ["git", "-C", str(repo_root), "merge-base", "HEAD", base_ref],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if mb.returncode == 0 and mb.stdout.strip():
         base = mb.stdout.strip()
@@ -467,6 +466,7 @@ def get_diff_from_git(base_ref: str, repo_root: Path) -> str:
         ["git", "-C", str(repo_root), "diff", f"{base}...HEAD", "--unified=3"],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -596,6 +596,7 @@ def main() -> int:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
             repo_root = Path(r.stdout.strip())
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
