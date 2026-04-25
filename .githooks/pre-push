@@ -440,6 +440,21 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         else
             echo "  WARNING: terraform not found — skipping fmt check" >&2
         fi
+
+        # Empty-resource risk check: IAM resources with compact([var.*])
+        # Resource lists that lack a count/for_each guard (#2739).
+        echo "pre-push: checking for unguarded compact([var.*]) Resource lists..." >&2
+        if [ -x scripts/check-terraform-empty-resource-risk.sh ]; then
+            if ! run_check "terraform" "check-terraform-empty-resource-risk" scripts/check-terraform-empty-resource-risk.sh; then
+                echo "  An IAM resource uses compact([var.*]) for a Resource list" >&2
+                echo "  without a count or for_each guard. See issue #2739." >&2
+                echo "  Fix or add a waiver to:" >&2
+                echo "    scripts/check-terraform-empty-resource-allowlist.txt" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: scripts/check-terraform-empty-resource-risk.sh not found or not executable — skipping" >&2
+        fi
     fi
 
 done

@@ -1,0 +1,17 @@
+# check-terraform-empty-resource-allowlist.txt
+#
+# Temporary waivers for pre-existing compact([var.*]) Resource lists that lack
+# a count/for_each guard.  Each entry is:
+#
+#   <absolute-or-relative-path>:<resource_type>:<resource_name>  # issue #NNNN
+#
+# The path is compared against the scanned file path as reported by
+# check-terraform-empty-resource-risk.sh (absolute).  Use the absolute path
+# from the repo root as returned by the script's --list output.
+#
+# Add an entry here only while a fix is pending.  Remove the entry when the
+# corresponding issue is resolved.
+
+# Pre-existing latent #2739 pattern — fix tracked in follow-up issues
+infra/terraform/modules/api-service/main.tf:aws_iam_role_policy:api_secrets  # issue #2741 follow-up
+infra/terraform/modules/scraper-zero-record-check/main.tf:aws_iam_role_policy:execution_secrets  # issue #2741 follow-up
