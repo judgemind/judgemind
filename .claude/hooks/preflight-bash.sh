@@ -324,5 +324,91 @@ if echo "$STRIPPED_COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+stash\s+(pop|app
     fi
 fi
 
+# ── Diagnoser bright lines (issue #3366) ─────────────────────────────
+#
+# When the daemon spawns ``/diagnose-failure`` it sets
+# ``JUDGEMIND_DIAGNOSER_RUN=1`` on the subprocess env. The diagnoser is
+# now a peer agent with the same authority surface as a /task agent —
+# it can commit/push to the failed agent's branch, file issues, comment,
+# edit labels. The four bright lines below are policy that bound that
+# authority:
+#
+#   13. No production deploy (``terraform apply environments/production``,
+#       ECS service writes against ``*-production`` clusters).
+#   14. No PAT rotation (``gh auth switch``).
+#   15. No force-push to main / amending merged commits.
+#   16. No recursive ``/diagnose-failure`` invocation (depth-1 cap).
+#
+# These checks are inert when ``JUDGEMIND_DIAGNOSER_RUN`` is unset — every
+# other Bash invocation in the daemon / agent-runner / interactive
+# operator session is unaffected. The daemon is the only caller that sets
+# the env var.
+
+if [ "${JUDGEMIND_DIAGNOSER_RUN:-0}" = "1" ]; then
+    # 13. No production deploy.
+    #     Catches: terraform ... apply against environments/production,
+    #              aws ecs update-service / register-task-definition / etc.
+    #              against any cluster name containing -production.
+    if echo "$COMMAND" | grep -qE '\bterraform\b' ; then
+        if echo "$COMMAND" | grep -qE '\b(apply|destroy)\b' ; then
+            if echo "$COMMAND" | grep -qE 'environments/production' ; then
+                echo "BLOCKED [diagnoser bright line]: terraform apply/destroy against environments/production is human-only. Default to 'escalate' instead. See .claude/skills/diagnose-failure/SKILL.md §Bright lines." >&2
+                exit 2
+            fi
+        fi
+    fi
+    # ECS service writes against a *-production cluster.
+    if echo "$COMMAND" | grep -qE '\baws\s+ecs\b' ; then
+        if echo "$COMMAND" | grep -qE '\b(update-service|register-task-definition|create-service|delete-service|run-task)\b' ; then
+            if echo "$COMMAND" | grep -qE '\-production\b' ; then
+                echo "BLOCKED [diagnoser bright line]: ECS service writes against *-production clusters are human-only. Default to 'escalate' instead. See .claude/skills/diagnose-failure/SKILL.md §Bright lines." >&2
+                exit 2
+            fi
+        fi
+    fi
+
+    # 14. No PAT rotation / `gh auth switch`.
+    if echo "$COMMAND" | grep -qE '\bgh\s+auth\s+switch\b' ; then
+        echo "BLOCKED [diagnoser bright line]: 'gh auth switch' is operator-only — never run from the diagnoser. PAT rotation is human-only. Default to 'escalate' instead. See .claude/skills/diagnose-failure/SKILL.md §Bright lines." >&2
+        exit 2
+    fi
+
+    # 15. No force-push to main, no amending merged commits.
+    #     The push-to-main check (#0 above) already covers the "git push
+    #     ... main" / "git push ... master" case. This adds the force-flag
+    #     coverage so a force-push to main is blocked even from the
+    #     diagnoser context — and blocks any --force / --force-with-lease
+    #     push when the target branch is main/master.
+    if echo "$COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+push\b' ; then
+        if echo "$COMMAND" | grep -qE '(\-\-force|\-\-force-with-lease|\-f\b)' ; then
+            if echo "$COMMAND" | grep -qE '\b(main|master)\b' ; then
+                echo "BLOCKED [diagnoser bright line]: force-push to main/master is destructive across all agents and is never allowed from the diagnoser. Default to 'escalate' instead. See .claude/skills/diagnose-failure/SKILL.md §Bright lines." >&2
+                exit 2
+            fi
+        fi
+    fi
+    # 15b. No `git commit --amend` from the diagnoser context. Amending
+    #      a commit that has already merged rewrites history shared with
+    #      every other agent — even an unmerged amend on the failed
+    #      agent's branch can race the daemon's rebase logic. Default to
+    #      a fresh commit on top.
+    if echo "$STRIPPED_COMMAND" | grep -qE '\bgit\b(\s+-C\s+\S+)?\s+commit\b' ; then
+        if echo "$STRIPPED_COMMAND" | grep -qE '\-\-amend\b' ; then
+            echo "BLOCKED [diagnoser bright line]: 'git commit --amend' is not allowed from the diagnoser. Create a fresh commit on top of the existing branch instead. See .claude/skills/diagnose-failure/SKILL.md §Bright lines." >&2
+            exit 2
+        fi
+    fi
+
+    # 16. No recursive `/diagnose-failure` invocation.
+    #     Catches: claude -p '/diagnose-failure ...' or claude -p
+    #     "/diagnose-failure ..." or claude --print /diagnose-failure ...
+    if echo "$COMMAND" | grep -qE '\bclaude\b' ; then
+        if echo "$COMMAND" | grep -qE '/diagnose-failure\b' ; then
+            echo "BLOCKED [diagnoser bright line]: recursive '/diagnose-failure' invocation is not allowed (depth-1 cap). If a sub-action fails, escalate via the recommendation field. See .claude/skills/diagnose-failure/SKILL.md §Bright lines." >&2
+            exit 2
+        fi
+    fi
+fi
+
 # All checks passed
 exit 0

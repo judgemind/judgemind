@@ -285,7 +285,9 @@ class TestDeployWorkflowNamesContents:
             "Deploy Production (Web)",
             "Terraform",
         ):
-            assert name in daemon.DEPLOY_WORKFLOW_NAMES, f"{name!r} missing from DEPLOY_WORKFLOW_NAMES"
+            assert name in daemon.DEPLOY_WORKFLOW_NAMES, (
+                f"{name!r} missing from DEPLOY_WORKFLOW_NAMES"
+            )
 
 
 # --------------------------------------------------------------------------

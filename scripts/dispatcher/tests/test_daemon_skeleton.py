@@ -204,17 +204,17 @@ class TestSchedulerTick:
         # Config SELECT fired (step 2 of scheduler_tick).
         # The SQL reads "SELECT value FROM dispatcher.config WHERE key = %s"
         # with ("concurrency_cap",) as the bound parameter.
-        assert any(
-            "FROM dispatcher.config" in sql for sql, _ in executed
-        ), "config SELECT (dispatcher.config) must fire"
+        assert any("FROM dispatcher.config" in sql for sql, _ in executed), (
+            "config SELECT (dispatcher.config) must fire"
+        )
         # Infra-preemption retry-marker SELECT fired (#2949 pre-scan drain).
-        assert any(
-            "FROM dispatcher.retry_markers" in sql for sql, _ in executed
-        ), "retry_markers SELECT must fire before queue scan"
+        assert any("FROM dispatcher.retry_markers" in sql for sql, _ in executed), (
+            "retry_markers SELECT must fire before queue scan"
+        )
         # Per-agent ECS reap SELECT fired (#3091).
-        assert any(
-            "agent_task_arn IS NOT NULL" in sql for sql, _ in executed
-        ), "ECS reap SELECT (agent_task_arn) must fire"
+        assert any("agent_task_arn IS NOT NULL" in sql for sql, _ in executed), (
+            "ECS reap SELECT (agent_task_arn) must fire"
+        )
         # queue_snapshots INSERT fired (Phase 2 addition, #2768).
         assert any(
             "INSERT INTO dispatcher.queue_snapshots" in sql for sql, _ in executed

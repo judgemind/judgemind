@@ -477,8 +477,16 @@ CREATE TABLE dispatcher.diagnoses (
     recommendation jsonb,
     outcome jsonb,
     started_at timestamp with time zone DEFAULT now() NOT NULL,
-    completed_at timestamp with time zone
+    completed_at timestamp with time zone,
+    actions_taken jsonb,
+    next_directive text
 );
+
+
+COMMENT ON COLUMN dispatcher.diagnoses.actions_taken IS 'Structured action log written by the empowered diagnoser (issue #3366). One entry per side-effect: git_commit, git_push, gh_issue_create, gh_issue_edit, gh_issue_comment, skill_invoke, bash_run (non-trivial). Operator audit trail; daemon never reads.';
+
+
+COMMENT ON COLUMN dispatcher.diagnoses.next_directive IS '3-state daemon-consumed directive (issue #3366). Values: "respawn_at=<phase>" — daemon spawns a new agent-runner with START_PHASE=<phase>; "terminal" — diagnoser explicitly done, free the slot; NULL — diagnoser did not complete, fall back to escalate AND emit diagnoser_did_not_complete. Distinguishable from terminal is the key invariant.';
 
 
 CREATE SEQUENCE dispatcher.diagnoses_diagnosis_id_seq

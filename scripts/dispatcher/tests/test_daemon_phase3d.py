@@ -1344,6 +1344,10 @@ class TestConstants:
             == frozenset()
         )
 
-    def test_diagnoser_timeout_is_five_minutes(self) -> None:
-        # Spec §8 "5-min hard wall-clock timeout on the diagnoser subprocess".
-        assert daemon.DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS == 5 * 60
+    def test_diagnoser_timeout_is_at_least_an_hour(self) -> None:
+        # Issue #3366 elevated the diagnoser to a peer-agent with full
+        # toolset; the pre-#3366 5-minute cap is too tight for sub-skill
+        # invocations and real diagnostic work. Sanity floor: 60+ min.
+        # Sanity ceiling: < 4h so a runaway loop still surfaces eventually.
+        assert daemon.DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS >= 60 * 60
+        assert daemon.DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS <= 4 * 60 * 60

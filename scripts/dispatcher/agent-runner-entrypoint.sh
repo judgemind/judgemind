@@ -144,6 +144,38 @@ if [[ -z "$DATABASE_URL" ]]; then
     die "DATABASE_URL_unset"
 fi
 
+# ── START_PHASE early validation (#3366) ───────────────────────────────────
+#
+# Fast-fail validation BEFORE the clone / git fetch so an invalid
+# value never gets the chance to run any side effects. The main-loop
+# block below still re-reads START_PHASE and writes to the agent row,
+# but the kept-here early reject is what scripts/tests can drive without
+# needing the full git/gh/psql stub harness.
+#
+# Whitespace-separated list; mirror of
+# ``daemon.AGENT_RUNNER_VALID_START_PHASES``. The two sides are tested
+# for parity by ``scripts/tests/test_agent_runner_start_phase.sh``.
+AGENT_RUNNER_VALID_START_PHASES="planning setup ralph summary push_and_pr awaiting_ci fix_ci merge awaiting_deploy verify"
+
+if [[ -n "${START_PHASE:-}" ]]; then
+    _start_phase_valid=0
+    for _vp in $AGENT_RUNNER_VALID_START_PHASES; do
+        if [[ "$START_PHASE" == "$_vp" ]]; then
+            _start_phase_valid=1
+            break
+        fi
+    done
+    if [[ "$_start_phase_valid" -ne 1 ]]; then
+        log "start_phase_override_invalid" \
+            "requested=$START_PHASE" \
+            "valid_phases=$AGENT_RUNNER_VALID_START_PHASES"
+        printf '[agent-runner-entrypoint] START_PHASE=%s is not in the valid set: %s\n' \
+            "$START_PHASE" "$AGENT_RUNNER_VALID_START_PHASES" >&2
+        exit 1
+    fi
+    log "start_phase_override" "start_phase=$START_PHASE"
+fi
+
 # Derive a short id for branch naming (first 8 chars of the agent uuid).
 SHORT_ID=$(printf '%s' "$AGENT_ID" | cut -c1-8)
 if [[ -z "$BRANCH_NAME" ]]; then
@@ -3821,6 +3853,27 @@ if [[ "${AGENT_RUNNER_WATCHER_TEST_MODE:-0}" == "1" ]]; then
     stop_ralph_head_watcher
     log "watcher_test_mode_end"
     exit 0
+fi
+
+# ── START_PHASE row update (#3366) ─────────────────────────────────────────
+#
+# Validation already ran early (before clone). Here, on the path that
+# made it through the clone + branch + ralph-patch stages, write the
+# resume phase to the agent row defensively. The daemon's directive
+# consumer already ran an equivalent UPDATE, but a respawn can race
+# the row-update on a stale-DB-cache view, and an operator hand-
+# launching the task with START_PHASE=foo expects the agent row to
+# reflect foo. Idempotent — UPDATE only when the row's phase doesn't
+# already match.
+
+if [[ -n "${START_PHASE:-}" ]]; then
+    db_exec "UPDATE dispatcher.agents
+                SET phase = '$START_PHASE'
+              WHERE agent_id = '$AGENT_ID'
+                AND phase IS DISTINCT FROM '$START_PHASE';" \
+        > "$AGENT_WORKSPACE/start-phase-update.stdout.log" \
+        2> "$AGENT_WORKSPACE/start-phase-update.stderr.log" \
+        || true
 fi
 
 # ── Main phase loop ---------------------------------------------------------
