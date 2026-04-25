@@ -364,6 +364,13 @@ module "dispatcher_agent_runner" {
 
   github_repo = "judgemind/judgemind"
   repo_url    = "https://github.com/judgemind/judgemind.git"
+
+  # Error alarm wired to the shared SNS topic (same as the daemon and
+  # scraper modules). Stage 4 (#3093) — fires on any ERROR/FATAL log
+  # event emitted by an agent-runner task before the daemon reap pass
+  # observes the STOPPED state.
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
 }
 
 output "ecr_repository_url" {
