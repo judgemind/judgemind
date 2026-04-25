@@ -803,12 +803,14 @@ class TestPushAndOpenPrDeletesRalphPatch:
         agent_id = "aaaabbbb-0000-0000-0000-000000000111"
 
         # Stub the DB methods _push_and_open_pr touches.
-        d._agent_summary_output = {  # type: ignore[attr-defined]
-            "commit_message": "feat(dispatcher): ralph patches (#3012)",
-            "pr_title": "feat(dispatcher): ralph patches (#3012)",
-            "pr_body_md": "body",
-        }
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "commit_message": "feat(dispatcher): ralph patches (#3012)",
+                "pr_title": "feat(dispatcher): ralph patches (#3012)",
+                "pr_body_md": "body",
+                "unmet_criteria": [],
+            }
+        )
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
@@ -877,12 +879,14 @@ class TestPushAndOpenPrDeletesRalphPatch:
         d, _conn, _handler = _make_daemon(tmp_path)
         agent_id = "aaaabbbb-0000-0000-0000-000000000222"
 
-        d._agent_summary_output = {  # type: ignore[attr-defined]
-            "commit_message": "c",
-            "pr_title": "t",
-            "pr_body_md": "b",
-        }
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "commit_message": "c",
+                "pr_title": "t",
+                "pr_body_md": "b",
+                "unmet_criteria": [],
+            }
+        )
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]

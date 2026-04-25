@@ -141,12 +141,15 @@ def _make_daemon(
     # Supply the summary output so the non-no-op path has everything it
     # needs to run (defensive — individual tests only exercise the no-op
     # path where this data is never read).
-    d._agent_summary_output = {  # type: ignore[attr-defined]
-        "commit_message": "feat(dispatcher): test (#3039)",
-        "pr_title": "feat(dispatcher): test (#3039)",
-        "pr_body_md": "body",
-    }
-    d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+    # _push_and_open_pr reads summary output from DB via _fetch_phase_output.
+    d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "commit_message": "feat(dispatcher): test (#3039)",
+            "pr_title": "feat(dispatcher): test (#3039)",
+            "pr_body_md": "body",
+            "unmet_criteria": [],
+        }
+    )
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]

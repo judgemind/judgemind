@@ -133,6 +133,7 @@ def _patch_ralph_helpers(
     real subprocesses, DB, or filesystem state."""
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._materialize_prior_attempts = MagicMock(return_value=0)  # type: ignore[method-assign]
+    d._apply_prior_ralph_patch = MagicMock(return_value=None)  # type: ignore[method-assign]
     d._write_phase_input = MagicMock()  # type: ignore[method-assign]
     d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
     d._read_phase_output = MagicMock(return_value=ralph_output)  # type: ignore[method-assign]
@@ -146,6 +147,9 @@ def _patch_ralph_helpers(
     # (SHIP, AC_INFEASIBLE) can still be asserted.
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._write_failure = MagicMock()  # type: ignore[method-assign]
+    # _fetch_phase_output is called at the start of _run_ralph_phase to
+    # read the plan output from DB (#2975: DB-source-of-truth).
+    d._fetch_phase_output = MagicMock(return_value={})  # type: ignore[method-assign]
 
 
 # --------------------------------------------------------------------------
@@ -358,9 +362,11 @@ class TestRegressionGuards:
         d._handle_agent_failure.assert_not_called()  # type: ignore[union-attr]
         d._write_failure.assert_not_called()  # type: ignore[union-attr]
         d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
-        # SHIP path stashes output for summary.
-        assert d._agent_ralph_output is not None
-        assert d._agent_ralph_output.get("verdict") == "SHIP"
+        # SHIP path persists ralph output to DB for summary to fetch.
+        d._persist_phase_output.assert_called_once()  # type: ignore[union-attr]
+        persisted_args = d._persist_phase_output.call_args.args  # type: ignore[union-attr]
+        assert persisted_args[1] == "ralph"
+        assert persisted_args[2].get("verdict") == "SHIP"
 
     def test_ac_infeasible_verdict_still_uses_ac_infeasible_path(
         self, tmp_path: Path

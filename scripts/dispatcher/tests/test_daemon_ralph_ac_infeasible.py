@@ -127,6 +127,7 @@ def _patch_ralph_helpers(
     real subprocesses, DB, or filesystem state."""
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._materialize_prior_attempts = MagicMock(return_value=0)  # type: ignore[method-assign]
+    d._apply_prior_ralph_patch = MagicMock(return_value=None)  # type: ignore[method-assign]
     d._write_phase_input = MagicMock()  # type: ignore[method-assign]
     d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
     d._read_phase_output = MagicMock(return_value=ralph_output)  # type: ignore[method-assign]
@@ -135,6 +136,8 @@ def _patch_ralph_helpers(
     d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._write_failure = MagicMock()  # type: ignore[method-assign]
+    # _fetch_phase_output is called to read plan output from DB (#2975).
+    d._fetch_phase_output = MagicMock(return_value={})  # type: ignore[method-assign]
 
 
 # --------------------------------------------------------------------------
@@ -254,9 +257,11 @@ class TestRunRalphPhaseAcInfeasible:
         # No failure row written, no terminal mark.
         d._write_failure.assert_not_called()  # type: ignore[union-attr]
         d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
-        # Ralph output stashed for summary phase.
-        assert d._agent_ralph_output is not None
-        assert d._agent_ralph_output.get("verdict") == "SHIP"
+        # SHIP path persists ralph output to DB for summary to fetch.
+        d._persist_phase_output.assert_called_once()  # type: ignore[union-attr]
+        persisted_args = d._persist_phase_output.call_args.args  # type: ignore[union-attr]
+        assert persisted_args[1] == "ralph"
+        assert persisted_args[2].get("verdict") == "SHIP"
 
     def test_blocked_verdict_does_not_write_ac_infeasible_failure(
         self, tmp_path: Path
