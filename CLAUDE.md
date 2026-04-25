@@ -110,8 +110,8 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/ralph`** — Iterative work-review loop. Spawns worker (TDD) and reviewer subagents. Called by `/task` automatically for testable code tasks.
 - **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
 - **`/dispatcher`** — Opt-in autonomous work queue manager. See `.claude/skills/dispatcher/SKILL.md`.
-- **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
-- **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings.
+- **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Spawned by the daemon every `dispatcher.config.idle_audit_every_n_prs` successful merges (default 20), or invoked manually.
+- **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings. Spawned by the daemon on the schedule defined by `dispatcher.config.idle_spotcheck_cron` (default `0 14 * * *` — 14:00 UTC daily), or invoked manually.
 
 ### Worktree setup
 
