@@ -476,6 +476,7 @@ def _build_filters(
     orphaned_only: bool = False,
     case_number_like: str | None = None,
     filter_null_outcome: bool = False,
+    department_in: list[str] | None = None,
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and params for the document query."""
     clauses = []
@@ -509,6 +510,12 @@ def _build_filters(
         clauses.append(
             "AND NOT EXISTS (SELECT 1 FROM rulings r WHERE r.document_id = d.id)"
         )
+    if department_in:
+        clauses.append(
+            "AND EXISTS (SELECT 1 FROM rulings r"
+            " WHERE r.document_id = d.id AND r.department = ANY(%s))"
+        )
+        params.append(department_in)
     return " ".join(clauses), params
 
 
@@ -3210,6 +3217,7 @@ def run_reingest(
     force_retranscribe: bool = False,
     filter_null_outcome: bool = False,
     bust_llm_cache: bool = False,
+    department_in: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run the full reingest. Returns summary stats including cost.
 
@@ -3237,6 +3245,7 @@ def run_reingest(
         orphaned_only=orphaned_only,
         case_number_like=case_number_like,
         filter_null_outcome=filter_null_outcome,
+        department_in=department_in,
     )
 
     s3_client = boto3.client("s3")
@@ -3683,6 +3692,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--department-in",
+        nargs="+",
+        type=str,
+        default=None,
+        dest="department_in",
+        help=(
+            "Only re-ingest documents whose latest ruling has a department "
+            "matching one of these values. Values must match rulings.department "
+            "exactly (case-sensitive). Useful for targeting specific courtrooms "
+            "without processing the entire county, e.g. "
+            "--department-in C11 C20 C32. Applies an EXISTS subquery against "
+            "the rulings table."
+        ),
+    )
+    parser.add_argument(
         "--force-retranscribe",
         action="store_true",
         help=(
@@ -3755,6 +3779,7 @@ def main() -> None:
         force_retranscribe=args.force_retranscribe,
         filter_null_outcome=args.filter_null_outcome,
         bust_llm_cache=args.bust_llm_cache,
+        department_in=args.department_in,
     )
 
     logger.info(
