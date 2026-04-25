@@ -370,6 +370,104 @@ class TestCircuitBreaker:
         assert d._check_diagnoser_circuit_breaker() is False
         assert handler.events("diagnoser_circuit_breaker_scan_failed")
 
+    def test_breaker_query_excludes_orphaned_status(self, tmp_path: Path) -> None:
+        """Issue #3383: the breaker COUNT aggregation must filter out
+        ``status='orphaned'`` rows from BOTH numerator AND denominator.
+        Pre-fix, a daemon-restart cascade that orphaned 7 rows
+        (transitioned to ``'failed'`` by the boot reaper) inflated
+        the breaker to 7/7=100% fallback rate and tripped at 0.30."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [
+            ("0.30",),
+            (0, 0),  # COUNT aggregation: 0 failed, 0 total (after exclusion)
+        ]
+        d._check_diagnoser_circuit_breaker()
+        # Find the breaker's COUNT aggregation SQL.
+        breaker_sql = [
+            sql
+            for sql, _ in conn.cursor_instance.executed
+            if "FROM dispatcher.diagnoses" in sql and "COUNT(*)" in sql
+        ]
+        assert breaker_sql, "expected the breaker COUNT aggregation SQL"
+        # The exclusion clause must be present.
+        assert any("status <> 'orphaned'" in sql for sql in breaker_sql), (
+            "breaker must exclude status='orphaned' from its 24h fallback "
+            "calculation (#3383); SQL was: " + repr(breaker_sql)
+        )
+
+    def test_breaker_does_not_trip_with_only_orphans_and_no_real_failures(
+        self, tmp_path: Path
+    ) -> None:
+        """Simulate the 2026-04-25 cascade: 10+ orphans, 0 real
+        diagnoser failures. The breaker query EXCLUDES orphans, so
+        the COUNT result is (0, 0) and the breaker stays armed
+        (``failed_count=0``, ``total_count=0`` < ``MIN_DIAGNOSES``)."""
+        d, conn, handler = _make_daemon(tmp_path)
+        # The DB returns the post-exclusion counts. With 10 orphans
+        # and zero non-orphan rows, the query produces (0, 0).
+        conn.cursor_instance.fetch_queue = [
+            ("0.30",),
+            (0, 0),
+        ]
+        tripped = d._check_diagnoser_circuit_breaker()
+        assert tripped is False
+        assert not handler.events("diagnoser_circuit_breaker_tripped")
+        # No UPDATE fired against diagnoser_enabled.
+        updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+        ]
+        assert updates == []
+
+
+# --------------------------------------------------------------------------
+# _mark_diagnosis_orphaned (#3383)
+# --------------------------------------------------------------------------
+
+
+class TestMarkDiagnosisOrphaned:
+    """Issue #3383: the boot reaper writes ``status='orphaned'`` (not
+    ``'failed'``) so the circuit breaker doesn't count infrastructure
+    artifacts as diagnoser-decision failures."""
+
+    def test_writes_status_orphaned(self, tmp_path: Path) -> None:
+        d, conn, _handler = _make_daemon(tmp_path)
+        d._mark_diagnosis_orphaned(42, reason="diagnoser_orphaned_by_daemon_restart")
+        update_sql = [
+            (sql, params)
+            for sql, params in conn.cursor_instance.executed
+            if "UPDATE dispatcher.diagnoses" in sql
+        ]
+        assert update_sql, "expected an UPDATE against dispatcher.diagnoses"
+        sql, params = update_sql[0]
+        assert "status = 'orphaned'" in sql
+        # CRITICAL: must NOT write status='failed' — that path is
+        # reserved for real diagnoser-run failures (#3383).
+        assert "status = 'failed'" not in sql
+        assert params == (42,)
+        assert conn.commits >= 1
+
+    def test_emits_diagnosis_marked_orphaned_log(self, tmp_path: Path) -> None:
+        d, _conn, handler = _make_daemon(tmp_path)
+        d._mark_diagnosis_orphaned(42, reason="diagnoser_orphaned_by_daemon_restart")
+        events = handler.events("diagnosis_marked_orphaned")
+        assert events, "expected daemon.diagnosis_marked_orphaned log event"
+        # Should NOT emit diagnoser_fallback — that's reserved for
+        # real fallback paths counted by the breaker.
+        assert not handler.events("diagnoser_fallback")
+
+    def test_db_error_does_not_crash(self, tmp_path: Path) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+
+        def boom(sql: str, params: Any = None) -> None:
+            raise RuntimeError("db lost")
+
+        conn.cursor_instance.execute = boom  # type: ignore[method-assign]
+        # Must not raise.
+        d._mark_diagnosis_orphaned(42, reason="test")
+        assert handler.events("diagnosis_mark_orphaned_failed")
+
 
 # --------------------------------------------------------------------------
 # Tier detection

@@ -1,4 +1,4 @@
-"""Daemon-boot reap of orphaned async diagnoses (#3376, #3384).
+"""Daemon-boot reap of orphaned async diagnoses (#3376, #3383, #3384).
 
 When the previous daemon crashed (watchdog kill, panic, etc.) leaving
 ``dispatcher.diagnoses`` rows at ``status='pending'``, the new daemon's
@@ -9,19 +9,27 @@ boot path must:
   3. For each orphan row, branch on PID liveness and cmdline identity:
 
      * No PID (crashed before PID UPDATE) → log ``diagnoser_orphan_pid_dead``,
-       mark failed.
-     * PID dead → log ``diagnoser_orphan_pid_dead``, mark failed.
+       mark orphaned.
+     * PID dead → log ``diagnoser_orphan_pid_dead``, mark orphaned.
      * PID alive AND cmdline matches ``claude -p /diagnose-failure`` →
        log ``diagnoser_orphan_killed``, KILL the process (SIGTERM →
-       grace → SIGKILL), mark failed.
+       grace → SIGKILL), mark orphaned.
      * PID alive but cmdline mismatched (recycled PID) → log
-       ``diagnoser_orphan_pid_recycled``, do NOT signal, mark failed.
+       ``diagnoser_orphan_pid_recycled``, do NOT signal, mark orphaned.
 
-  4. Return count of rows marked failed.
+  4. Return count of rows marked orphaned.
 
 The cmdline-verification step (#3384) is the safe path: it confirms the
 alive PID actually belongs to a prior-daemon diagnoser before signalling,
 preventing accidental kill of an unrelated OS process that recycled the PID.
+
+Status note (issue #3383): pre-fix, the boot reaper wrote orphans as
+``status='failed'``. The diagnoser circuit breaker counts ``'failed'``
+rows in its 24h fallback-rate calculation, so a daemon-restart
+cascade (7 orphans on 2026-04-25) inflated the breaker to 100%
+fallback rate and structurally disabled the diagnoser. Orphans now
+write ``status='orphaned'``, which the breaker excludes from both
+the failed-count numerator AND the total-count denominator.
 """
 
 from __future__ import annotations
@@ -104,8 +112,10 @@ def _make_daemon(tmp_path: Path) -> daemon.DispatcherDaemon:
 
 
 class TestOrphanReap:
-    def test_marks_orphan_rows_failed(self, monkeypatch: Any, tmp_path: Path) -> None:
-        """All orphan rows are marked failed; alive+matching PID gets SIGTERM."""
+    def test_marks_orphan_rows_orphaned(self, monkeypatch: Any, tmp_path: Path) -> None:
+        """All orphan rows are marked ``status='orphaned'`` (#3383, NOT
+        ``'failed'`` — the breaker excludes orphans from its 24h
+        fallback-rate calc); alive+matching PID gets SIGTERM (#3384)."""
         d = _make_daemon(tmp_path)
         conn = d._conn  # type: ignore[assignment]
         run_started = datetime.now(daemon.UTC)
@@ -121,11 +131,16 @@ class TestOrphanReap:
                 (24, 33333, old2),
             ]
         ]
-        marked: list[dict[str, Any]] = []
+        marked_orphaned: list[dict[str, Any]] = []
+        marked_failed: list[dict[str, Any]] = []
+
+        def fake_mark_orphaned(diagnosis_id: int, reason: str) -> None:
+            marked_orphaned.append({"id": diagnosis_id, "reason": reason})
 
         def fake_mark_failed(diagnosis_id: int, reason: str) -> None:
-            marked.append({"id": diagnosis_id, "reason": reason})
+            marked_failed.append({"id": diagnosis_id, "reason": reason})
 
+        monkeypatch.setattr(d, "_mark_diagnosis_orphaned", fake_mark_orphaned)
         monkeypatch.setattr(d, "_mark_diagnosis_failed", fake_mark_failed)
 
         # Make PID 11111 alive+matching, PID 33333 dead.
@@ -155,10 +170,13 @@ class TestOrphanReap:
 
         reaped = d._reap_orphaned_diagnoses_on_boot()
         assert reaped == 3
-        assert {m["id"] for m in marked} == {22, 23, 24}
-        for m in marked:
+        assert {m["id"] for m in marked_orphaned} == {22, 23, 24}
+        for m in marked_orphaned:
             assert m["reason"] == "diagnoser_orphaned_by_daemon_restart"
-        # PID 11111 is alive+matching — must have been signalled (SIGTERM at minimum).
+        # CRITICAL (#3383): must NOT call _mark_diagnosis_failed — orphans
+        # are NOT diagnoser-run failures.
+        assert marked_failed == []
+        # PID 11111 is alive+matching — must have been signalled (SIGTERM at minimum) per #3384.
         sigtermed_pids = [a[0] for a in kills if len(a) > 1 and a[1] == signal.SIGTERM]
         assert 11111 in sigtermed_pids, (
             f"expected SIGTERM to alive+matching PID 11111; kills={kills}"
@@ -197,7 +215,7 @@ class TestOrphanReap:
         conn.cursor_instance.fetchall_queue = [  # type: ignore[union-attr]
             [(99, 4444, old)]
         ]
-        monkeypatch.setattr(d, "_mark_diagnosis_failed", lambda *_a, **_kw: None)
+        monkeypatch.setattr(d, "_mark_diagnosis_orphaned", lambda *_a, **_kw: None)
         # PID 4444 is dead.
         monkeypatch.setattr(
             daemon.DispatcherDaemon,
