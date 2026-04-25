@@ -379,6 +379,16 @@ describe('OutcomePill', () => {
       );
       expect(INFRA_PREEMPTED_CATEGORIES.has('paused_by_killswitch')).toBe(true);
     });
+
+    it('does NOT contain agent_runner_route_stub (#3300)', () => {
+      // agent_runner_route_stub is a phase terminal, not a failure
+      // category — it must NOT be in INFRA_PREEMPTED_CATEGORIES so
+      // the cockpit renders it as a red ✗ rather than a gray ↺.
+      // See phase_transitions.py:262–264 docstring.
+      expect(INFRA_PREEMPTED_CATEGORIES.has('agent_runner_route_stub')).toBe(
+        false,
+      );
+    });
   });
 
   // #2953: milestone-completeness glyph + colour logic. A merged row

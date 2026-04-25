@@ -984,6 +984,7 @@ STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
     "force_stopped": 60,  # 1 min — #2884 operator force_stop terminal phase
     "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
+    "agent_runner_route_stub": 60,  # 1 min — terminal phase from unrecognized route/transition
 }
 
 #: Terminal statuses on ``dispatcher.agents.status`` — the worker thread

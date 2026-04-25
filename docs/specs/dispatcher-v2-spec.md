@@ -316,7 +316,7 @@ Note: `enableExecuteCommand` only takes effect on freshly-launched tasks. Tasks 
 
 #### Known gaps
 
-- `daemon_restart_abandoned` is used by the entrypoint as a generic failed-terminal — it's a category error when the failure isn't actually from a daemon restart. Tracked as #3137.
+- ~~`daemon_restart_abandoned` is used by the entrypoint as a generic failed-terminal — it's a category error when the failure isn't actually from a daemon restart.~~ Resolved: PR #3277 + #3300 renamed the stub-terminal callsites to `agent_runner_route_stub`, closing #3137. Legitimate `daemon_restart_abandoned` references (restart-recovery path) remain unchanged.
 - No `launch-agent-runner-smoke.sh` DX helper yet — Stage 3 smokes were run by hand. Tracked as #3138.
 - ECS agent-runner has no equivalent of the daemon's `CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS`. If claude hangs inside a phase, the task runs indefinitely. Needs a wall-clock timeout per-phase or per-task.
 

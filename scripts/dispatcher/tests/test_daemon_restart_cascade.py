@@ -770,6 +770,8 @@ class TestPerPhaseStuckTimeout:
         # Restart-recovery "terminal" phases have a tight window so a
         # daemon that crashes mid-reclaim is picked up quickly.
         assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["daemon_restart_abandoned"] == 60
+        # Route-stub terminal phases also get a tight window (#3300).
+        assert daemon.STUCK_TIMEOUT_SECONDS_BY_PHASE["agent_runner_route_stub"] == 60
 
 
 # --------------------------------------------------------------------------
