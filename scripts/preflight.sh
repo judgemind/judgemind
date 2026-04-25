@@ -134,7 +134,6 @@ preflight_tf_not_root() {
         echo "  The root directory does not track deployed resources." >&2
         echo "  Use an environment-specific path instead:" >&2
         echo "    infra/terraform/environments/dev/" >&2
-        echo "    infra/terraform/environments/staging/" >&2
         echo "    infra/terraform/environments/production/" >&2
         echo "" >&2
         echo "  Example: terraform -chdir=infra/terraform/environments/dev apply" >&2

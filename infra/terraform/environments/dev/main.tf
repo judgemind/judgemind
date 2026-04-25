@@ -301,12 +301,6 @@ module "dispatcher_daemon" {
   # data-script execution stays human-gated.
   oneshot_source_task_role_arn      = module.iam_scraper.role_arn
   oneshot_source_execution_role_arn = module.compute.task_execution_role_arn
-  # `oneshot_maintenance_task_role_arn` stays empty — the
-  # `iam_maintenance` module is declared but not instantiated in dev. If
-  # a follow-up wires the module, plumb `module.iam_maintenance.role_arn`
-  # through here so `scripts/ecs-run-task.sh --role judgemind-maintenance-dev`
-  # also works from the daemon context.
-  oneshot_maintenance_task_role_arn = ""
   # The `judgemind-assets-dev` bucket is provisioned outside Terraform
   # (legacy). ARN pattern is deterministic — S3 bucket ARNs don't have a
   # region or account-id segment, so hard-coding is safe here.

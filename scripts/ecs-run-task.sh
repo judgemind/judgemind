@@ -35,9 +35,9 @@
 #   --cpu <units>       CPU units for the task (default: 1024). Valid: 256, 512, 1024, 2048, 4096.
 #   --memory <mb>       Memory in MB for the task (default: 4096). Must be valid for the CPU value.
 #   --role <name>       Override the ECS task role. Resolves the IAM role ARN
-#                       from the given role name (e.g. judgemind-maintenance-dev).
-#                       Useful for maintenance scripts that need permissions
-#                       beyond the default scraper role (e.g. s3:DeleteObject).
+#                       from the given role name (e.g. judgemind-<custom>-<env>).
+#                       Useful for scripts that need permissions beyond the
+#                       default scraper role (e.g. s3:DeleteObject).
 #   --latest-image      Use the latest image from ECR (this is now the default when
 #                       the service image differs from the latest; kept for compatibility)
 #   --service-image     Use the running service's image even if it differs from
@@ -66,7 +66,7 @@
 #   scripts/ecs-run-task.sh scripts/backfill_ruling_html.py -- --dry-run
 #   scripts/ecs-run-task.sh scripts/backfill_summaries.py
 #   scripts/ecs-run-task.sh --timeout 3600 scripts/backfill_summaries.py
-#   scripts/ecs-run-task.sh --role judgemind-maintenance-dev scripts/migrate_s3_keys.py -- --cleanup-orphans
+#   scripts/ecs-run-task.sh --role judgemind-<custom>-dev scripts/migrate_s3_keys.py -- --cleanup-orphans
 #   scripts/ecs-run-task.sh --detach scripts/reingest_from_s3.py -- --all
 #   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 
