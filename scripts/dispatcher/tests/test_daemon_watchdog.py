@@ -5,12 +5,14 @@ that records ``time.monotonic()`` of each ``scheduler_tick`` entry to
 ``self._last_scheduler_tick_at`` and fires two tiers of alarm when the
 gap exceeds configurable thresholds:
 
-* ``SCHEDULER_TICK_STALL_WARN_SECONDS`` (default 300s) — WARNING
-  ``scheduler_tick_stalled`` with a bounded thread dump. Debounced so
-  duplicate warnings don't spam CloudWatch while the stall persists.
-* ``SCHEDULER_TICK_STALL_EXIT_SECONDS`` (default 3000s) — ERROR
-  ``scheduler_tick_stalled_exiting`` with a final thread dump followed
-  by ``os._exit(137)`` so ECS restarts the task.
+* ``SCHEDULER_TICK_STALL_WARN_SECONDS`` (default 60s, post-#3344) —
+  WARNING ``scheduler_tick_stalled`` with a bounded thread dump.
+  Debounced so duplicate warnings don't spam CloudWatch while the stall
+  persists.
+* ``SCHEDULER_TICK_STALL_EXIT_SECONDS`` (default 120s, post-#3344) —
+  ERROR ``scheduler_tick_stalled_exiting`` with a final thread dump
+  followed by ``os._exit(137)`` so ECS restarts the task. The MTTR
+  ceiling matches the #3344 target — under 2 min from wedge to restart.
 
 Tests cover:
 
@@ -156,19 +158,31 @@ def _make_daemon(
 
 
 class TestModuleConstants:
-    def test_warn_default_is_300(self) -> None:
-        assert daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS == 300
+    def test_warn_default_is_60(self) -> None:
+        # #3344 — tightened from 300s to 60s so a wedge surfaces in
+        # CloudWatch Insights within ~1-2 poll cycles instead of 5 min.
+        assert daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS == 60
 
-    def test_exit_default_is_3000(self) -> None:
-        assert daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS == 3000
+    def test_exit_default_is_120(self) -> None:
+        # #3344 — tightened from 3000s (50 min) to 120s. The 2026-04-25
+        # reaper wedge ran >12 min silent under the old 50 min ceiling
+        # before manual force-redeploy. New ceiling is the MTTR target.
+        assert daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS == 120
 
-    def test_exit_is_10x_warn(self) -> None:
-        """#3097 design — exit threshold is 10× warn so a transient
-        slowdown is caught loudly (WARN) but not escalated to a
-        process restart until the gap becomes catastrophic."""
+    def test_exit_within_2min_target(self) -> None:
+        """#3344 design — EXIT threshold must be ≤120s so a wedged
+        daemon auto-restarts in ECS in under 2 min instead of waiting
+        for an operator to notice and force-redeploy.
+
+        The original #3097 design set EXIT = 10× WARN; #3344 trades that
+        ratio for the tighter MTTR target. WARN remains < EXIT so the
+        WARN tier still fires first, but the multiplier is now 2× rather
+        than 10×.
+        """
+        assert daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS <= 120
         assert (
-            daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
-            == 10 * daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+            daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+            < daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
         )
 
     def test_poll_interval_is_positive(self) -> None:
@@ -416,16 +430,21 @@ class TestWatchdogLoopBehaviour:
     def test_warning_fires_when_elapsed_exceeds_warn_threshold(
         self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
-        """AC #2 — a mocked monotonic that simulates a 301s stall
-        against a 300s threshold triggers exactly one WARNING."""
+        """AC #2 — a stall above WARN but below EXIT triggers exactly
+        one WARNING (no os._exit)."""
         d, conn, handler = _make_daemon(tmp_path)
 
         # Shrink poll interval so the loop spins fast.
         monkeypatch.setattr(daemon, "WATCHDOG_POLL_INTERVAL_SECONDS", 0)
 
-        # Control time. Start at 1000.0; tick was at 1000.0. Then
-        # advance to 1301.0 so elapsed = 301 > 300 (warn) but
-        # < 3000 (exit).
+        # Control time. Start at 1000.0; tick was at 1000.0. Then advance
+        # to a value > WARN but < EXIT so only the WARN tier fires. With
+        # the post-#3344 defaults that's WARN=60s, EXIT=120s — pick 90s.
+        warn_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+        exit_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
+        elapsed = (warn_s + exit_s) / 2.0  # midway between WARN and EXIT
+        assert warn_s < elapsed < exit_s, (warn_s, elapsed, exit_s)
+
         clock = _TickClock(start=1000.0)
         d._last_scheduler_tick_at = 1000.0
         monkeypatch.setattr(daemon.time, "monotonic", clock)
@@ -441,13 +460,16 @@ class TestWatchdogLoopBehaviour:
         # Stub psycopg.connect so the watchdog's DB setup path is inert.
         psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
-        clock.advance(301.0)
+        clock.advance(elapsed)
         t = self._run_loop_in_thread(d)
         try:
             rec = self._wait_for_event(handler, "scheduler_tick_stalled")
             assert rec is not None, "expected a scheduler_tick_stalled WARNING"
             assert rec.levelno == logging.WARNING
-            assert getattr(rec, "elapsed_seconds", 0) >= 300
+            assert getattr(rec, "elapsed_seconds", 0) >= warn_s
+            # Must NOT have escalated to EXIT — elapsed is below the
+            # exit threshold.
+            assert handler.events("scheduler_tick_stalled_exiting") == []
         finally:
             d._watchdog_stop.set()
             t.join(timeout=2.0)
@@ -457,8 +479,8 @@ class TestWatchdogLoopBehaviour:
     def test_exit_fires_when_elapsed_exceeds_exit_threshold(
         self, tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
     ) -> None:
-        """AC #3 — a 3001s stall against a 3000s threshold triggers
-        ``os._exit(137)`` with an ERROR log.
+        """AC #3 — a stall above EXIT triggers ``os._exit(137)`` with
+        an ERROR log.
 
         The fake ``os._exit`` raises ``_ExitCalled`` (a BaseException
         subclass) from the watchdog thread — pytest captures that as
@@ -468,6 +490,9 @@ class TestWatchdogLoopBehaviour:
         """
         d, conn, handler = _make_daemon(tmp_path)
         monkeypatch.setattr(daemon, "WATCHDOG_POLL_INTERVAL_SECONDS", 0)
+
+        exit_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
+        elapsed = exit_s + 1.0  # one second past EXIT — minimum trigger.
 
         clock = _TickClock(start=5000.0)
         d._last_scheduler_tick_at = 5000.0
@@ -488,7 +513,7 @@ class TestWatchdogLoopBehaviour:
 
         monkeypatch.setattr(daemon.os, "_exit", fake_exit)
 
-        clock.advance(3001.0)
+        clock.advance(elapsed)
         t = self._run_loop_in_thread(d)
         try:
             rec = self._wait_for_event(handler, "scheduler_tick_stalled_exiting")
@@ -521,8 +546,9 @@ class TestWatchdogLoopBehaviour:
         )
         psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
-        # Only advance 30s — well below the 300s WARN threshold.
-        clock.advance(30.0)
+        # Advance to half the WARN threshold — well below it.
+        warn_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+        clock.advance(warn_s / 2.0)
         t = self._run_loop_in_thread(d)
         try:
             # Let the loop run a few polls.
@@ -551,8 +577,12 @@ class TestWatchdogLoopBehaviour:
         )
         psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
-        # Advance into the WARN zone but not the EXIT zone.
-        clock.advance(500.0)
+        # Advance into the WARN zone but not the EXIT zone — pick the
+        # midpoint so the test is robust to threshold tuning.
+        warn_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+        exit_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
+        elapsed = (warn_s + exit_s) / 2.0
+        clock.advance(elapsed)
         t = self._run_loop_in_thread(d)
         try:
             rec = self._wait_for_event(handler, "scheduler_tick_stalled")
@@ -583,8 +613,15 @@ class TestWatchdogLoopBehaviour:
         )
         psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
 
+        # Both stalls land between WARN and EXIT so we exercise WARN
+        # debounce/rearm without escalating to EXIT (which would kill
+        # the process under test).
+        warn_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+        exit_s = daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
+        warn_zone_elapsed = (warn_s + exit_s) / 2.0
+
         # Step 1: stall → WARN.
-        clock.advance(500.0)
+        clock.advance(warn_zone_elapsed)
         t = self._run_loop_in_thread(d)
         try:
             rec1 = self._wait_for_event(handler, "scheduler_tick_stalled")
@@ -600,8 +637,8 @@ class TestWatchdogLoopBehaviour:
                 time.sleep(0.01)
             assert not d._watchdog_warn_emitted_for_gap
 
-            # Step 3: stall again.
-            clock.advance(500.0)
+            # Step 3: stall again — advance again into WARN zone.
+            clock.advance(warn_zone_elapsed)
             deadline = time.monotonic() + 2.0
             while (
                 len(handler.events("scheduler_tick_stalled")) < 2

@@ -141,32 +141,39 @@ DEFAULT_SUPERVISOR_TICK_SECONDS = 120
 #: heartbeat. Issue #2778 (closes the TODO in migration 24).
 DEFAULT_HOUSEKEEPING_TICK_SECONDS = 3600
 
-#: Scheduler-tick stall watchdog thresholds (#3097). The supervisor
-#: watchdog thread (:meth:`DispatcherDaemon._watchdog_loop`) observes
+#: Scheduler-tick stall watchdog thresholds (#3097, tightened in #3344).
+#: The supervisor watchdog thread
+#: (:meth:`DispatcherDaemon._watchdog_loop`) observes
 #: ``self._last_scheduler_tick_at`` and fires two tiers of alarm when
 #: the main scheduler loop goes silent:
 #:
-#: * ``DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS`` (300 = 5 min) —
-#:   WARNING ``scheduler_tick_stalled`` with a bounded thread dump.
-#:   This is ~10× the default scheduler cadence, so a transient GitHub
-#:   or DB slowdown does not trigger a false positive while a real
-#:   wedge (30+ min observed silence on #3097 reproductions) is
-#:   caught well before the exit threshold.
-#: * ``DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS`` (3000 = 50 min) —
-#:   ERROR ``scheduler_tick_stalled_exiting`` with a final thread dump
-#:   followed by ``os._exit(137)``. ECS restarts the task. 50 min is
-#:   the MTTR ceiling the issue targets (vs. ~30 min of operator-
-#:   notice + ~5 min of manual ``update-service --force-new-deployment``
-#:   today). Exit code 137 mirrors the kernel's 128+SIGKILL convention
-#:   for operator-legible logs.
+#: * ``DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS`` (60s) — WARNING
+#:   ``scheduler_tick_stalled`` with a bounded thread dump. Roughly 2×
+#:   the default scheduler cadence (30s), so a transient GitHub or DB
+#:   slowdown does not trigger a false positive while a real wedge is
+#:   surfaced loudly well before the exit threshold.
+#: * ``DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS`` (120s) — ERROR
+#:   ``scheduler_tick_stalled_exiting`` with a final thread dump followed
+#:   by ``os._exit(137)``. ECS restarts the task. 120s is the MTTR
+#:   ceiling the #3344 issue targets (vs. >12 min of operator-visible
+#:   silence observed on the 2026-04-25 wedge that exposed the
+#:   stale-ARN cascade). Exit code 137 mirrors the kernel's 128+SIGKILL
+#:   convention for operator-legible logs.
 #:
 #: Both thresholds are operator-tunable via
 #: ``dispatcher.config.scheduler_tick_stall_warn_seconds`` /
 #: ``scheduler_tick_stall_exit_seconds`` (read through
 #: :meth:`DispatcherDaemon._cb_config_int`, which fails closed to the
 #: default on any DB / parse error).
-DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS = 300
-DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS = 3000
+#:
+#: History: #3097 set these to 300 / 3000 (5 min WARN, 50 min EXIT).
+#: That EXIT ceiling failed to catch the 2026-04-25 reaper wedge — the
+#: daemon went >12 min silent and required manual force-redeploy. #3344
+#: drops EXIT to 120s and WARN to 60s so a recurrence auto-restarts in
+#: under 2 min and the WARN tier surfaces the wedge in CloudWatch
+#: Insights well before the EXIT path runs.
+DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS = 60
+DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS = 120
 
 #: Watchdog poll cadence. The watchdog thread wakes every 30s to check
 #: the elapsed-since-last-tick gap against the thresholds above. Small
@@ -195,11 +202,11 @@ WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD = 20
 #: ``daemon.scheduler_tick_slow_<step>`` WARNING with the measured
 #: elapsed seconds. Chosen to be comfortably above normal execution
 #: (single-digit ms for DB hits, low-hundreds-of-ms for ``gh`` calls)
-#: while still firing well before the #3097 watchdog's 300s wedge
-#: threshold — a 5s step repeated N times is the cheap path for us to
-#: pinpoint which helper owns the wedge BEFORE the main loop goes
-#: silent. Not operator-tunable today; flip to a config key if we end
-#: up needing per-environment overrides.
+#: while still firing well before the #3097 watchdog's wedge threshold
+#: (60s WARN / 120s EXIT post-#3344) — a 5s step repeated N times is
+#: the cheap path for us to pinpoint which helper owns the wedge
+#: BEFORE the main loop goes silent. Not operator-tunable today; flip
+#: to a config key if we end up needing per-environment overrides.
 SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS = 5.0
 
 #: Periodic faulthandler stderr-dump cadence (#3205). At daemon startup
@@ -209,9 +216,13 @@ SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS = 5.0
 #: state. This is the "nuclear option" — if the watchdog thread itself
 #: is wedged (e.g. GIL starved, psycopg-deadlocked), the faulthandler
 #: timer fires from the C-level SIGALRM handler and produces a stack
-#: dump anyway. Matches the #3097 watchdog's WARN threshold so the two
-#: reliability nets share the same "something is wrong" cadence. Can
-#: be disabled in tests / local dev via the
+#: dump anyway. Held at 300s as an independent diagnostic cadence —
+#: pre-#3344 this was tied to the watchdog WARN threshold (then 300s),
+#: but #3344 tightened WARN to 60s and coupling faulthandler to that
+#: would spray a dump every minute. The watchdog already produces its
+#: own thread dump on WARN/EXIT, so faulthandler exists only as the
+#: deeper safety net for the case where the Python-level watchdog is
+#: itself wedged. Can be disabled in tests / local dev via the
 #: ``JUDGEMIND_DISPATCHER_DISABLE_FAULTHANDLER_TIMER=1`` env var so a
 #: pytest run doesn't spray tracebacks at the terminal every 5 min.
 FAULTHANDLER_DUMP_INTERVAL_SECONDS = 300
@@ -2620,6 +2631,7 @@ class DispatcherDaemon:
             "reaped_success": 0,
             "reaped_failure": 0,
             "still_running": 0,
+            "reaped_untracked": 0,
         }
         try:
             reap_summary = self._reap_completed_agent_tasks()
@@ -2835,6 +2847,11 @@ class DispatcherDaemon:
                 "reap_success": reap_summary["reaped_success"],
                 "reap_failure": reap_summary["reaped_failure"],
                 "reap_still_running": reap_summary["still_running"],
+                # #3344: count of rows finalized via the untracked-ARN
+                # branch (DescribeTasks returned no entry, or returned an
+                # entry with empty lastStatus). Non-zero on the recovery
+                # tick after a redeploy when the stale-ARN backlog drains.
+                "reap_untracked": reap_summary.get("reaped_untracked", 0),
                 # #3199: concurrency-cap gate denominator so CloudWatch
                 # Insights can self-diagnose "why didn't the daemon
                 # spawn a second agent when cap=2?". ``None`` on ticks
@@ -2876,6 +2893,8 @@ class DispatcherDaemon:
             "reap_success": reap_summary["reaped_success"],
             "reap_failure": reap_summary["reaped_failure"],
             "reap_still_running": reap_summary["still_running"],
+            # #3344 — untracked-ARN counter.
+            "reap_untracked": reap_summary.get("reaped_untracked", 0),
         }
 
     # ── command consumption (#2801) ────────────────────────────────────
@@ -20017,6 +20036,7 @@ class DispatcherDaemon:
                 "reaped_success": 0,
                 "reaped_failure": 0,
                 "still_running": 0,
+                "reaped_untracked": 0,
             }
 
         if not rows:
@@ -20025,6 +20045,7 @@ class DispatcherDaemon:
                 "reaped_success": 0,
                 "reaped_failure": 0,
                 "still_running": 0,
+                "reaped_untracked": 0,
             }
 
         # Can't reap without cluster + ECS client. The wiring may be
@@ -20044,6 +20065,7 @@ class DispatcherDaemon:
                 "reaped_success": 0,
                 "reaped_failure": 0,
                 "still_running": 0,
+                "reaped_untracked": 0,
             }
 
         arns = [row[2] for row in rows if row[2]]
@@ -20073,12 +20095,71 @@ class DispatcherDaemon:
                 "reaped_success": 0,
                 "reaped_failure": 0,
                 "still_running": 0,
+                "reaped_untracked": 0,
             }
 
         tasks = response.get("tasks") or []
         reaped_success = 0
         reaped_failure = 0
         still_running = 0
+        reaped_untracked = 0
+
+        # Issue #3344: any ARN we sent that ECS does NOT return is a
+        # "terminal-untrackable" row — the task left the Fargate stopped-
+        # task retention window (~1h) and DescribeTasks no longer has
+        # metadata for it. Pre-#3344 those rows stayed in the SELECT
+        # forever (zero forward progress every tick) and eventually
+        # wedged the daemon. We treat them as terminal: run the same
+        # finalize sequence (label strip + merged_at stamp + ARN clear)
+        # so the row drops out of the next tick's SELECT. ARNs returned
+        # WITH metadata (any non-empty lastStatus) follow the regular
+        # STOPPED / RUNNING / etc. branches below; ARNs returned with an
+        # EMPTY lastStatus are also treated as untracked because Fargate
+        # occasionally returns a stub entry that conveys no useful state.
+        returned_arns_with_status: set[str] = set()
+        returned_arns_empty_status: set[str] = set()
+        for task in tasks:
+            task_arn = task.get("taskArn", "")
+            if not task_arn:
+                continue
+            if task.get("lastStatus"):
+                returned_arns_with_status.add(task_arn)
+            else:
+                returned_arns_empty_status.add(task_arn)
+
+        sent_arns: set[str] = set(arns)
+        # Untracked = sent but missing from response, OR returned with
+        # no usable lastStatus.
+        untracked_arns = (
+            sent_arns - returned_arns_with_status
+        ) | returned_arns_empty_status
+        for untracked_arn in untracked_arns:
+            row = arn_to_row.get(untracked_arn)
+            if row is None:
+                continue
+            u_agent_id, u_issue_number, _u_arn, _u_phase, _u_status = row
+            self._log.info(
+                "daemon.agent_runner_reaped_arn_untracked",
+                extra={
+                    "event": "agent_runner_reaped_arn_untracked",
+                    "run_id": self._run_id,
+                    "agent_id": u_agent_id,
+                    "issue_number": u_issue_number,
+                    "task_arn": untracked_arn,
+                    "reason": (
+                        "empty_last_status"
+                        if untracked_arn in returned_arns_empty_status
+                        else "not_in_describe_tasks_response"
+                    ),
+                },
+            )
+            # Reuse the success-branch finalize: label strip (best-effort),
+            # merged_at stamp (idempotent + gated by pr_number IS NOT NULL),
+            # agent_task_arn clear. The merged_at WHERE filter handles the
+            # no-PR case naturally — the UPDATE is a no-op when there is
+            # no PR row.
+            self._reap_finalize_ecs_success(u_agent_id, u_issue_number)
+            reaped_untracked += 1
 
         for task in tasks:
             task_arn = task.get("taskArn", "")
@@ -20091,6 +20172,12 @@ class DispatcherDaemon:
             ]
             row = arn_to_row.get(task_arn)
             if row is None:
+                continue
+            # Issue #3344: rows with empty lastStatus were already
+            # finalized as untracked above — skip the regular branches
+            # so we don't double-count or fight ourselves on idempotent
+            # SQL.
+            if not last_status:
                 continue
             agent_id, issue_number, _arn, phase, status = row
 
@@ -20301,6 +20388,7 @@ class DispatcherDaemon:
             "reaped_success": reaped_success,
             "reaped_failure": reaped_failure,
             "still_running": still_running,
+            "reaped_untracked": reaped_untracked,
         }
 
     def _reap_finalize_ecs_success(

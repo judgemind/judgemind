@@ -385,12 +385,23 @@ class TestModuleConstants:
             < daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
         )
 
-    def test_faulthandler_interval_matches_watchdog_warn(self) -> None:
-        """The faulthandler periodic stderr dump uses the same cadence
-        as the #3097 watchdog so both reliability nets share the same
-        'something is wrong' threshold."""
+    def test_faulthandler_interval_is_a_diagnostic_cadence(self) -> None:
+        """The faulthandler periodic stderr dump is a fixed-interval
+        observability tool — independent of the #3097 watchdog WARN
+        threshold.
+
+        Pre-#3344 the two were bound to the same value (300s). #3344
+        tightened the watchdog WARN to 60s; coupling faulthandler to
+        that new cadence would spray a full thread dump to stderr every
+        60s, which is too noisy. Faulthandler stays at its independent
+        cadence (300s — operator-tunable in the constants module if
+        needed). The bound to enforce here is just "positive and not
+        smaller than the EXIT threshold" — by the time EXIT fires the
+        watchdog has already produced a dump, so faulthandler is the
+        deeper-cadence safety net only.
+        """
         assert daemon.FAULTHANDLER_DUMP_INTERVAL_SECONDS > 0
         assert (
             daemon.FAULTHANDLER_DUMP_INTERVAL_SECONDS
-            == daemon.DEFAULT_SCHEDULER_TICK_STALL_WARN_SECONDS
+            >= daemon.DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS
         )
