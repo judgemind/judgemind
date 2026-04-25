@@ -2131,6 +2131,44 @@ class TestBuildFilters:
         assert "r.motion_type IS NULL" in clauses
         assert params == []
 
+    def test_department_in_adds_clause(self) -> None:
+        """Passing a non-empty department_in list emits the EXISTS subquery and
+        appends the list as the corresponding param."""
+        depts = ["C32", "C11"]
+        clauses, params = reingest._build_filters(None, None, None, department_in=depts)
+        assert "AND EXISTS" in clauses
+        assert "r.department = ANY(%s)" in clauses
+        assert depts in params
+
+    def test_department_in_none_no_clause(self) -> None:
+        """Passing department_in=None emits no clause."""
+        clauses, params = reingest._build_filters(None, None, None, department_in=None)
+        assert "department" not in clauses
+        assert params == []
+
+    def test_department_in_empty_list_no_clause(self) -> None:
+        """Passing an empty department_in list emits no clause."""
+        clauses, params = reingest._build_filters(None, None, None, department_in=[])
+        assert "department" not in clauses
+        assert params == []
+
+    def test_department_in_with_county_and_case_number_like(self) -> None:
+        """Combined county + case_number_like + department_in; params must be
+        ordered [county, case_number_like, dept_list] matching insertion order."""
+        depts = ["C32", "C11"]
+        pattern = "UNKNOWN-%"
+        clauses, params = reingest._build_filters(
+            "Orange",
+            None,
+            None,
+            case_number_like=pattern,
+            department_in=depts,
+        )
+        assert "AND ct.county = %s" in clauses
+        assert "AND c.case_number LIKE %s" in clauses
+        assert "r.department = ANY(%s)" in clauses
+        assert params == ["Orange", pattern, depts]
+
 
 # ---------------------------------------------------------------------------
 # Cursor minimum values
