@@ -785,13 +785,13 @@ describe('DispatcherDashboard — #2812 Phase 2 polish', () => {
     expect(right.className).toMatch(/gap-4/);
   });
 
-  it('§2.5 — #2801 issue reference is a hot link via IssueLink', () => {
+  it('§2.5 — #2990: stale #2801 footnote has been removed', () => {
+    // The footnote "Daemon command handlers tracked in #2801…" was removed
+    // in #2990 because #2801 closed on 2026-04-19 when PR #2858 landed
+    // the daemon-side handlers. The disclaimer was wrong and misleading.
     renderDashboard();
-    expect(screen.getByTestId('issue-link-2801')).toBeInTheDocument();
-    expect(screen.getByTestId('issue-link-2801')).toHaveAttribute(
-      'href',
-      'https://github.com/judgemind/judgemind/issues/2801',
-    );
+    expect(screen.queryByTestId('issue-link-2801')).toBeNull();
+    expect(screen.queryByText(/daemon command handlers/i)).toBeNull();
   });
 });
 
