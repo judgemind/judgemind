@@ -36,6 +36,7 @@ import respx
 from courts.ca.pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
 from courts.ca.riverside_tentatives import (
     _CASE_NUMBER_RE,
+    _LINK_TEXT_RE,
     INDEX_URL,
     RiversideTentativeRulingsScraper,
     _is_no_tentative_rulings,
@@ -50,8 +51,9 @@ pytestmark = pytest.mark.regression
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 # Expected number of PDF links processed from riv_page.html after filtering.
-# The fixture has 17 links; 1 is excluded by ``link_text_re`` (#1845), leaving 16.
-_RIV_EXPECTED_PROCESSED_PDFS = 16
+# The fixture has 17 links; with the loosened regex (#2603), all 17 pass
+# (Department 260 no longer filtered out).
+_RIV_EXPECTED_PROCESSED_PDFS = 17
 
 
 def _load_html(name: str) -> str:
@@ -207,7 +209,7 @@ def test_riv_courthouse_known_prefixes() -> None:
     """Known department prefixes map to correct courthouses."""
     assert _riv_courthouse("PS1") == "Palm Springs Courthouse"
     assert _riv_courthouse("MV1") == "Moreno Valley Courthouse"
-    assert _riv_courthouse("M205") == "Murrieta Courthouse"
+    assert _riv_courthouse("M205") == "Menifee Justice Center"
     assert _riv_courthouse("C1") == "Corona Courthouse"
     assert _riv_courthouse("05") == "Hall of Justice"
 
@@ -304,6 +306,98 @@ class TestCaseNumberRegexExpanded:
 
 
 # ---------------------------------------------------------------------------
+# _LINK_TEXT_RE — unit tests (#2603)
+# ---------------------------------------------------------------------------
+
+
+class TestLinkTextRe:
+    """Verify _LINK_TEXT_RE matches all three real-world link-text shapes."""
+
+    def test_standard_with_honorable(self) -> None:
+        """Standard form: 'Department 04 - Honorable Daniel A. Ottolia'."""
+        m = _LINK_TEXT_RE.search("Department 04 - Honorable Daniel A. Ottolia")
+        assert m is not None
+        assert m.group("department") == "04"
+        assert m.group("judge_name") == "Daniel A. Ottolia"
+
+    def test_without_honorable_prefix(self) -> None:
+        """Non-standard judge label without 'Honorable': 'Department 01 - Assigned Judge'."""
+        m = _LINK_TEXT_RE.search("Department 01 - Assigned Judge")
+        assert m is not None
+        assert m.group("department") == "01"
+        assert m.group("judge_name") == "Assigned Judge"
+
+    def test_no_dash_no_judge(self) -> None:
+        """No judge suffix at all: 'Department 260'."""
+        m = _LINK_TEXT_RE.search("Department 260")
+        assert m is not None
+        assert m.group("department") == "260"
+        assert m.group("judge_name") is None
+
+    def test_ps1_existing_passes(self) -> None:
+        """Existing PS1 format still matches after regex loosening."""
+        m = _LINK_TEXT_RE.search("Department PS1 - Honorable Arthur Hester III")
+        assert m is not None
+        assert m.group("department") == "PS1"
+        assert m.group("judge_name") == "Arthur Hester III"
+
+
+# ---------------------------------------------------------------------------
+# Regression test — all three link-text shapes flow through fetch_documents
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_riv_all_link_text_shapes_processed() -> None:
+    """Regression: all three link-text shapes produce documents (#2603).
+
+    Verifies:
+    - Standard form ('Department 04 - Honorable Daniel A. Ottolia') → judge populated
+    - No-Honorable form ('Department 01 - Assigned Judge') → judge populated
+    - No-dash form ('Department 260') → department='260', judge_name=None
+    """
+    html = (
+        "<html><body>"
+        '<a href="/system/files/2026-02/04ruling.pdf">'
+        "Department 04 - Honorable Daniel A. Ottolia</a>"
+        '<a href="/system/files/2026-02/01ruling.pdf">'
+        "Department 01 - Assigned Judge</a>"
+        '<a href="/system/files/2023-10/260ruling.pdf">'
+        "Department 260</a>"
+        "</body></html>"
+    )
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    docs = scraper.fetch_documents()
+
+    # All three links should produce documents (no filtering)
+    assert len(docs) == 3
+
+    dept_map = {d.department: d for d in docs}
+
+    # Standard form — judge name populated from link text
+    assert "04" in dept_map
+    assert dept_map["04"].judge_name == "Daniel A. Ottolia"
+    assert dept_map["04"].courthouse == "Hall of Justice"
+
+    # No-Honorable form — judge name still populated
+    assert "01" in dept_map
+    assert dept_map["01"].judge_name == "Assigned Judge"
+
+    # No-dash form — department set, judge_name is None (fallback may fill later)
+    assert "260" in dept_map
+    assert dept_map["260"].department == "260"
+    assert dept_map["260"].judge_name is None or dept_map["260"].judge_name == ""
+
+
+# ---------------------------------------------------------------------------
 # Full scraper run — hearing_date populated
 # ---------------------------------------------------------------------------
 
@@ -374,7 +468,7 @@ def test_riv_run_returns_one_doc_per_pdf() -> None:
 
     docs = scraper.fetch_documents()
     # One doc per PDF link — no splitting
-    # (1 of 17 links filtered by link_text_re, #1845)
+    # (all 17 links pass with loosened link_text_re, #2603)
     assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
 
     # Documents should NOT have pre_split flag (scraper does not split)
@@ -689,7 +783,7 @@ def test_riv_fetch_documents_pdf_extraction_failure() -> None:
 
     docs = scraper.fetch_documents()
     # Despite extraction failures, docs are still returned (one per PDF link)
-    # (1 of 17 links filtered by link_text_re, #1845)
+    # (all 17 links pass with loosened link_text_re, #2603)
     assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
 
 

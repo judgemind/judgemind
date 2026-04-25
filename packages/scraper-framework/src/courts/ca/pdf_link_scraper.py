@@ -236,7 +236,7 @@ class PdfLinkScraper(BaseScraper):
         if m:
             gd = m.groupdict()
             department = gd.get("department", "").strip()
-            raw_name = gd.get("judge_name", "").strip()
+            raw_name = (gd.get("judge_name") or "").strip()
             # Normalize whitespace
             judge_name = " ".join(raw_name.split()) if raw_name else None
             if department and pc.courthouse_from_dept:
