@@ -134,7 +134,7 @@ Before validating against the diff, determine whether the criterion can be valid
 
 1. **Marker — authoritative.** If the AC's `Verify:` line begins with `(post-deploy)` (exact literal, case-sensitive), mark it deferred with `reason="marker"`. Stop here — do NOT run the validate or unmet steps for this AC.
 2. **Heuristic — for pre-convention issues without the marker.** If the `Verify:` line references a dev/prod artifact, mark it deferred with `reason="heuristic"`. Stop here. Non-exhaustive heuristic tokens (match any of these, case-insensitive):
-   - `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh`, `ecs-logs.sh`
+   - `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh`, `ecs-logs.sh` <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
    - `scripts/dev-db-query.sh`, `dev-db-query.sh`
    - `curl dev.api.judgemind.org`, `curl https://dev.api.`, `curl https://dev.judgemind.org`
    - `dev.judgemind.org/` (any path), `dev.api.judgemind.org/` (any path)

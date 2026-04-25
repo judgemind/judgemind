@@ -65,6 +65,8 @@ The spotcheck script (`scripts/spotcheck/run_spotcheck.py`) runs on ECS and does
 scripts/ecs-run-task.sh scripts/spotcheck/run_spotcheck.py -- --n 10
 ```
 
+<!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
+
 Use `timeout: 1200000` — this queries every county.
 
 The script prints a compact summary to stdout (visible in the task logs) and writes the full result to S3. The last line of stderr contains the S3 path.
@@ -280,7 +282,7 @@ After writing the report, **write status: `phase: done`, `summary: Spotcheck com
 - **Do not set `priority/p0`.** Human-only.
 - **Do not modify source files.** Read and report only.
 - **Do not screenshot production.** Only `dev.judgemind.org`.
-- **Do not use `dev-db-query.sh` in scripts.** Use `ecs-run-task.sh` for all DB queries.
+- **Do not use `dev-db-query.sh` in scripts.** Use `ecs-run-task.sh` for all DB queries. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
 - **Large PDFs:** Read tool max is 20 pages per request. For PDFs over 20 pages, make multiple reads (`pages: "1-20"`, then `pages: "21-40"`).
 
 ---
@@ -290,7 +292,7 @@ After writing the report, **write status: `phase: done`, `summary: Spotcheck com
 - **No `$()` in Bash.** Separate tool calls for dynamic values.
 - **No heredocs or `python -c`.** Write scripts to files first.
 - **All temp files in `{worktree}/tmp/`**, not `/tmp/`.
-- **`timeout: 1200000`** on `ecs-run-task.sh` commands.
+- **`timeout: 1200000`** on `ecs-run-task.sh` commands. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
 - **Judge name: `judges.canonical_name`**, not `name`.
 - **S3 bucket: `judgemind-document-archive-dev`**.
 - **S3 prefix: lowercase with underscores** (`ca/orange/`, not `CA/Orange/`).

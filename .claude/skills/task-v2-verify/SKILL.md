@@ -90,7 +90,7 @@ Use `change_type` to pick the verification strategy:
 | `ingestion` | Read ECS logs via MCP CloudWatch against `/ecs/judgemind-ingestion-worker-dev` | log lines showing successful document processing (plus sample downstream DB query confirming the row) |
 | `web` | Fetch a rendered page from `https://dev.judgemind.org/<path>`, or screenshot via `scripts/run-py.sh scripts/screenshot.py <url>` | rendered HTML or screenshot filepath |
 | `db_migration` | `scripts/dev-db-query.sh` to confirm the column/table/constraint exists and the schema matches | DB query output |
-| `backfill_script` | The daemon or prior step ran the script via `scripts/ecs-run-task.sh`. Verify row counts / sample records via `scripts/dev-db-query.sh` | before/after row counts, or sample rows |
+| `backfill_script` | The daemon or prior step ran the script via `scripts/ecs-run-task.sh`. Verify row counts / sample records via `scripts/dev-db-query.sh` | before/after row counts, or sample rows | <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
 | `dx_tooling` | Run the tool in a representative scenario (e.g. invoke the new script on a known input) | command output demonstrating expected behavior |
 | `docs` | No functional verification possible. `verdict=SKIPPED` with reason. Optional: confirm `scripts/check-markdown-links.sh` passed in CI | n/a |
 | `agent_skill` | No runtime verification. Confirm the skill file is present on `main`, has production-ready frontmatter (not a stub marker), and (if feasible) a dry `claude -p /<skill> <fixture>` produces non-empty output | file-presence + content-shape check |
