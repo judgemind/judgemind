@@ -3185,7 +3185,7 @@ STALE_ROLLUP_MARKER="base branch policy prohibits the merge"
 # ``workflowName``); the entrypoint queries by workflow-file path
 # instead (``--workflow <file>.yml``) because bash stubs can match
 # file names more reliably than display names.
-DEPLOY_WORKFLOWS="${AGENT_RUNNER_DEPLOY_WORKFLOWS:-deploy-api.yml deploy-dispatcher.yml deploy-scraper.yml deploy-production.yml deploy-production-web.yml terraform.yml}"
+DEPLOY_WORKFLOWS="${AGENT_RUNNER_DEPLOY_WORKFLOWS:-deploy-api.yml deploy-dispatcher.yml deploy-scraper.yml deploy-production.yml deploy-production-web.yml terraform.yml deploy-agent-runner.yml}"
 
 read_pr_number() {
     # Query ``dispatcher.agents.pr_number`` for the current agent.

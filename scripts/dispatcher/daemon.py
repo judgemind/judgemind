@@ -609,6 +609,7 @@ DEPLOY_WORKFLOW_NAMES = frozenset(
         "Deploy Production",
         "Deploy Production (Web)",
         "Terraform",
+        "Deploy Agent Runner",
     }
 )
 
