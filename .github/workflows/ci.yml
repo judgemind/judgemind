@@ -674,6 +674,16 @@ jobs:
       - name: Verify every subprocess.run call in scripts has timeout= or **kwargs
         if: matrix.shard == 'python'
         run: scripts/check-subprocess-timeouts.sh
+      # Issue #3356: every IO call site under scripts/dispatcher/
+      # (boto3.client, psycopg.connect, subprocess.run/Popen/check_*,
+      # requests.*, urllib.request.urlopen, socket.create_connection,
+      # http.client.HTTP{S,}Connection) must carry a bounded timeout.
+      # The 2026-04-25 cascade was caused by a single unbounded
+      # boto3.client("ecs", ...); PR #3353 fixed that one site. This
+      # AST-based check enforces the structural invariant going forward.
+      - name: Check no unbounded timeouts in dispatcher
+        if: matrix.shard == 'python'
+        run: scripts/check-no-unbounded-timeouts.py
       # Issue #3158: every ``UPDATE dispatcher.agents`` /
       # ``SELECT ... FROM dispatcher.agents`` line in
       # ``scripts/dispatcher/daemon.py`` must either mention

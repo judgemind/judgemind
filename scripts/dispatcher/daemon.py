@@ -202,6 +202,26 @@ ECS_CLIENT_CONNECT_TIMEOUT_SECONDS = 5
 ECS_CLIENT_READ_TIMEOUT_SECONDS = 10
 ECS_CLIENT_MAX_ATTEMPTS = 2
 
+#: boto3 CloudWatch client socket timeouts (#3356). Same shape and
+#: rationale as the ECS_CLIENT_* constants above — a hung
+#: ``cloudwatch:PutMetricData`` from ``_emit_heartbeat_metric`` (called
+#: every supervisor tick, every ~120s) would otherwise wedge the
+#: scheduler thread the same way ``ecs:DescribeTasks`` did in the
+#: 2026-04-25 cascade. Values match the ECS budget so the worst-case
+#: total per call stays under the watchdog WARN tier.
+CLOUDWATCH_CLIENT_CONNECT_TIMEOUT_SECONDS = 5
+CLOUDWATCH_CLIENT_READ_TIMEOUT_SECONDS = 10
+CLOUDWATCH_CLIENT_MAX_ATTEMPTS = 2
+
+#: ``options`` payload for every ``psycopg.connect(...)`` site in the
+#: dispatcher (#3356). Bounds per-query wall clock at 30s — long enough
+#: for the daemon's heaviest analytics queries, short enough that a
+#: runaway lock or replica failover doesn't wedge the scheduler. The
+#: ``connect_timeout`` kwarg already bounds the libpq handshake; this
+#: bounds every query on the open connection. Format is the libpq
+#: server-side option string accepted by psycopg's ``options=`` kwarg.
+PSYCOPG_STATEMENT_TIMEOUT_OPTIONS = "-c statement_timeout=30000"
+
 #: Max stack frames per thread emitted in the stall thread dump. Each
 #: frame renders as ``file:line (function)`` — ~60-120 chars per frame.
 #: With ~10 threads (main + scheduler + ralph head-watcher + CloudWatch
@@ -2290,7 +2310,11 @@ class DispatcherDaemon:
                 "database_url_set": bool(self._cfg.database_url),
             },
         )
-        self._conn = psycopg.connect(self._cfg.database_url, connect_timeout=10)
+        self._conn = psycopg.connect(
+            self._cfg.database_url,
+            connect_timeout=10,
+            options=PSYCOPG_STATEMENT_TIMEOUT_OPTIONS,
+        )
         # Autocommit off — every daemon step is one small transaction.
         self._conn.autocommit = False
 
@@ -3484,7 +3508,11 @@ class DispatcherDaemon:
 
         worker_conn: Connection[Any] | None = None
         try:
-            worker_conn = psycopg.connect(self._cfg.database_url, connect_timeout=10)
+            worker_conn = psycopg.connect(
+                self._cfg.database_url,
+                connect_timeout=10,
+                options=PSYCOPG_STATEMENT_TIMEOUT_OPTIONS,
+            )
             worker_conn.autocommit = False
             self._thread_state.conn = worker_conn
             self._claim_and_orchestrate_one()
@@ -6914,7 +6942,9 @@ class DispatcherDaemon:
         try:
             try:
                 watcher_conn = psycopg.connect(
-                    self._cfg.database_url, connect_timeout=10
+                    self._cfg.database_url,
+                    connect_timeout=10,
+                    options=PSYCOPG_STATEMENT_TIMEOUT_OPTIONS,
                 )
                 watcher_conn.autocommit = False
             except Exception as exc:
@@ -19468,10 +19498,34 @@ class DispatcherDaemon:
 
         Lazy import of boto3 mirrors psycopg — tests that do not exercise
         the heartbeat path should not have to install boto3.
+
+        #3356: applies an explicit :class:`botocore.config.Config` so a
+        hung ``cloudwatch:PutMetricData`` from ``_emit_heartbeat_metric``
+        cannot block the supervisor thread indefinitely. boto3's defaults
+        leave ``read_timeout`` effectively unbounded; a hung call would
+        wedge the GIL via urllib3's blocking ``recv()`` the same way the
+        2026-04-25 cascade demonstrated for the ECS client (#3351). The
+        constants :data:`CLOUDWATCH_CLIENT_CONNECT_TIMEOUT_SECONDS`,
+        :data:`CLOUDWATCH_CLIENT_READ_TIMEOUT_SECONDS`, and
+        :data:`CLOUDWATCH_CLIENT_MAX_ATTEMPTS` document the chosen
+        budget — same values as the ECS client.
         """
         import boto3  # noqa: PLC0415  — lazy import
+        import botocore.config  # noqa: PLC0415 — lazy import, mirrors boto3
 
-        return boto3.client("cloudwatch", region_name=self._cfg.aws_region)
+        cw_cfg = botocore.config.Config(
+            connect_timeout=CLOUDWATCH_CLIENT_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=CLOUDWATCH_CLIENT_READ_TIMEOUT_SECONDS,
+            retries={
+                "max_attempts": CLOUDWATCH_CLIENT_MAX_ATTEMPTS,
+                "mode": "standard",
+            },
+        )
+        return boto3.client(
+            "cloudwatch",
+            region_name=self._cfg.aws_region,
+            config=cw_cfg,
+        )
 
     def _emit_heartbeat_metric(self) -> bool:
         """Publish ``HeartbeatAge=0`` to the configured CloudWatch namespace.
@@ -20953,7 +21007,11 @@ class DispatcherDaemon:
 
         watcher_conn: Connection[Any] | None = None
         try:
-            watcher_conn = psycopg.connect(self._cfg.database_url, connect_timeout=10)
+            watcher_conn = psycopg.connect(
+                self._cfg.database_url,
+                connect_timeout=10,
+                options=PSYCOPG_STATEMENT_TIMEOUT_OPTIONS,
+            )
             watcher_conn.autocommit = False
             self._thread_state.conn = watcher_conn
         except Exception as exc:
