@@ -58,6 +58,7 @@ LOCAL_ONLY=(
     "check-aws-bool-flags.sh"
     "check-hardcoded-colors.sh"
     "check-migration-files.sh"
+    "check-no-unbounded-timeouts.py"
     # Developer/dispatcher tooling — only run locally
     "dispatcher-request.py"
     "phase_timer.py"
