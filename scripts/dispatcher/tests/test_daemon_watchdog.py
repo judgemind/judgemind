@@ -719,3 +719,128 @@ class TestStartWatchdog:
             d._watchdog_stop.set()
             if d._watchdog_thread is not None:
                 d._watchdog_thread.join(timeout=2.0)
+
+
+# --------------------------------------------------------------------------
+# #3351 — watchdog starts BEFORE the first scheduler tick
+#
+# Pre-#3351 the watchdog was started AFTER ``self.scheduler_tick()`` in
+# ``run_forever``, so an initial-tick wedge (e.g. a hung
+# ``ecs:DescribeTasks`` in the reaper) blocked the daemon forever with
+# no observer running. The fix moves ``_start_watchdog`` ahead of the
+# initial tick so even a boot-time wedge triggers the EXIT path.
+# --------------------------------------------------------------------------
+
+
+class TestWatchdogStartsBeforeFirstTick:
+    """Regression guard for #3351 — the watchdog must observe the first
+    scheduler tick, not just subsequent ones."""
+
+    def test_run_forever_starts_watchdog_before_initial_tick(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Capture the order in which ``_start_watchdog`` and the first
+        ``scheduler_tick`` fire inside ``run_forever``. Pre-#3351 the
+        watchdog came second; post-#3351 it must come first so an
+        initial-tick wedge is observable."""
+        d, conn, _handler = _make_daemon(tmp_path)
+        # _stop set immediately so run_forever exits after the initial
+        # tick pair without the polling loop running.
+        d._stop.set()
+
+        order: list[str] = []
+
+        def stub_scheduler_tick() -> None:
+            order.append("scheduler_tick")
+
+        def stub_supervisor_tick() -> None:
+            order.append("supervisor_tick")
+
+        def stub_start_watchdog() -> None:
+            order.append("start_watchdog")
+
+        monkeypatch.setattr(d, "scheduler_tick", stub_scheduler_tick)
+        monkeypatch.setattr(d, "supervisor_tick", stub_supervisor_tick)
+        monkeypatch.setattr(d, "_start_watchdog", stub_start_watchdog)
+
+        exit_code = d.run_forever()
+
+        assert exit_code == 0
+        # The fix's invariant: watchdog spins up FIRST.
+        assert order, "expected at least one event to fire"
+        assert order[0] == "start_watchdog", (
+            f"watchdog must start before any tick (got order={order!r}); "
+            "pre-#3351 the watchdog was started AFTER the initial tick, "
+            "so a wedge inside the first reap was unobservable."
+        )
+        assert "scheduler_tick" in order
+        assert "supervisor_tick" in order
+
+
+# --------------------------------------------------------------------------
+# #3351 — _emit_scheduler_stall_exit calls os._exit (not sys.exit)
+#
+# os._exit is uncatchable; sys.exit raises SystemExit which can be
+# swallowed by ``try/except`` in main loops or held up by GIL contention.
+# This test belt-and-suspenders the existing exit-path coverage by
+# explicitly asserting we did NOT use sys.exit.
+# --------------------------------------------------------------------------
+
+
+class TestExitUsesOsExitNotSysExit:
+    def test_emit_exit_uses_os_exit_not_sys_exit(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Patch BOTH ``os._exit`` and ``sys.exit``; confirm only
+        ``os._exit`` is invoked. ``sys.exit`` raises ``SystemExit``
+        which the watchdog's defensive ``except Exception`` could
+        swallow during a wedge — exactly the hit-rate-25% behaviour
+        observed in production before #3351."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        os_exit_calls: list[int] = []
+        sys_exit_calls: list[int] = []
+
+        def fake_os_exit(code: int) -> None:
+            os_exit_calls.append(code)
+            raise _ExitCalled(code)
+
+        def fake_sys_exit(code: int = 0) -> None:
+            sys_exit_calls.append(int(code))
+            # Mirror SystemExit semantics so the test fails loudly if
+            # we accidentally invoke it.
+            raise SystemExit(code)
+
+        monkeypatch.setattr(daemon.os, "_exit", fake_os_exit)
+        monkeypatch.setattr(daemon.sys, "exit", fake_sys_exit)
+
+        with pytest.raises(_ExitCalled):
+            d._emit_scheduler_stall_exit(elapsed_seconds=200.0)
+
+        assert os_exit_calls == [137], (
+            f"expected exactly one os._exit(137); got {os_exit_calls!r}"
+        )
+        assert sys_exit_calls == [], (
+            f"sys.exit must NEVER be called from the watchdog exit path "
+            f"(SystemExit can be swallowed); got {sys_exit_calls!r}"
+        )
+
+    def test_emit_exit_called_with_code_137(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Sanity: the watchdog uses 128+SIGKILL (137) so ECS console
+        and operator runbooks can recognise it as a forced kill."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        recorded: list[int] = []
+
+        def fake_exit(code: int) -> None:
+            recorded.append(code)
+            raise _ExitCalled(code)
+
+        monkeypatch.setattr(daemon.os, "_exit", fake_exit)
+
+        with pytest.raises(_ExitCalled):
+            d._emit_scheduler_stall_exit(elapsed_seconds=999.0)
+
+        assert recorded == [137]
