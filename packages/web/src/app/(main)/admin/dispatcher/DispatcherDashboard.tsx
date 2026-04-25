@@ -129,6 +129,15 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     },
   );
 
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => {
+        window.location.reload();
+      }, 60000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
   // Magic Move wiring (#2967). Apollo's `useQuery` pushes poll results
   // straight into `data`, but Magic Move needs the DOM mutation to happen
   // *inside* a `document.startViewTransition` callback so the browser

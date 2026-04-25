@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
 // ---------------------------------------------------------------------------
@@ -358,5 +358,67 @@ describe('DispatcherDashboard', () => {
     expect(screen.queryByTestId('dispatcher-stale-indicator')).not.toBeInTheDocument();
     // Dashboard is still rendered and there was no retry click.
     expect(screen.getByRole('heading', { level: 1, name: /Dispatcher/i })).toBeInTheDocument();
+  });
+
+  describe('Safety timeout (#3360)', () => {
+    let originalLocation: Location;
+    let reloadMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      originalLocation = window.location;
+      // @ts-expect-error - overriding read-only location for testing
+      delete window.location;
+      reloadMock = vi.fn();
+      window.location = { ...originalLocation, reload: reloadMock } as any;
+    });
+
+    afterEach(() => {
+      window.location = originalLocation as any;
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('starts a 60s timer when error becomes truthy and reloads window', () => {
+      // First render: no error
+      mockQueryResult.data = makeActiveState();
+      mockQueryResult.loading = false;
+      mockQueryResult.error = undefined;
+      const { rerender } = render(<DispatcherDashboard />);
+      expect(reloadMock).not.toHaveBeenCalled();
+
+      // Second render: error appears
+      mockQueryResult.error = new Error('network blip');
+      rerender(<DispatcherDashboard />);
+
+      // Advance timers by 59s
+      vi.advanceTimersByTime(59000);
+      expect(reloadMock).not.toHaveBeenCalled();
+
+      // Advance remaining 1s
+      vi.advanceTimersByTime(1000);
+      expect(reloadMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears the timer if error goes away before 60s', () => {
+      // First render: error
+      mockQueryResult.data = makeActiveState();
+      mockQueryResult.loading = false;
+      mockQueryResult.error = new Error('network blip');
+      const { rerender } = render(<DispatcherDashboard />);
+
+      // Advance timers by 30s
+      vi.advanceTimersByTime(30000);
+      expect(reloadMock).not.toHaveBeenCalled();
+
+      // Rerender with no error
+      mockQueryResult.error = undefined;
+      rerender(<DispatcherDashboard />);
+
+      // Advance timers by another 30s
+      vi.advanceTimersByTime(30000);
+      expect(reloadMock).not.toHaveBeenCalled();
+    });
   });
 });
