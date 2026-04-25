@@ -117,6 +117,10 @@ from .phase_transitions import (  # noqa: E402
     transition_from_summary,
     transition_from_verify,
 )
+from .scheduled_skills import (  # noqa: E402  — issue #3374
+    CronParseError,
+    should_fire_cron,
+)
 
 
 # --------------------------------------------------------------------------
@@ -20784,6 +20788,30 @@ class DispatcherDaemon:
                 "daemon.diagnoser_pass_failed",
                 extra={
                     "event": "diagnoser_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Issue #3374 — generalized scheduled-skills tick. Iterates
+        # ``dispatcher.scheduled_skills`` and fires due skills (audit,
+        # spotcheck, future periodic skills). The pass owns its own
+        # exception handling per row; this outer try/except is a
+        # belt-and-braces catch so a daemon-level bug never breaks the
+        # supervisor heartbeat below.
+        scheduled_skills_summary: dict[str, int] = {
+            "rows_scanned": 0,
+            "fires_succeeded": 0,
+            "fires_skipped_cap": 0,
+            "fires_skipped_collision": 0,
+            "fires_failed": 0,
+        }
+        try:
+            scheduled_skills_summary = self._scheduled_skills_tick()
+        except Exception:
+            self._log.exception(
+                "daemon.scheduled_skills_tick_failed",
+                extra={
+                    "event": "scheduled_skills_tick_failed",
                     "run_id": self._run_id,
                 },
             )
