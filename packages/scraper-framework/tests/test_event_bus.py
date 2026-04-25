@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import pytest
 import redis
 
 from framework import CapturedDocument, ContentFormat, ScraperHealthEvent
@@ -375,3 +376,55 @@ class TestStreamMaxlen:
     def test_default_stream_maxlen_value(self) -> None:
         """The default MAXLEN should be 50_000."""
         assert DEFAULT_STREAM_MAXLEN == 50_000
+
+    @pytest.mark.parametrize(
+        "maxlen_str,expected",
+        [("1", 1), ("100", 100), ("5000", 5000), ("12345", 12345), ("50000", 50000)],
+    )
+    def test_stream_maxlen_env_var_parametrized(self, maxlen_str: str, expected: int) -> None:
+        """STREAM_MAXLEN env var override works for each parametrized value."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+
+        with patch.dict(os.environ, {"STREAM_MAXLEN": maxlen_str}):
+            bus = EventBus(mock_redis)
+
+        doc = _make_doc()
+        bus.emit_document_captured(doc, producer_id="test")
+
+        assert mock_redis.xadd.call_args.kwargs["maxlen"] == expected
+
+    @pytest.mark.parametrize(
+        "maxlen,expected",
+        [(1, 1), (100, 100), (5000, 5000), (12345, 12345), (50000, 50000)],
+    )
+    def test_stream_maxlen_constructor_parametrized(self, maxlen: int, expected: int) -> None:
+        """EventBus constructor maxlen= arg works for each parametrized value."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis, maxlen=maxlen)
+
+        doc = _make_doc()
+        bus.emit_document_captured(doc, producer_id="test")
+
+        assert mock_redis.xadd.call_args.kwargs["maxlen"] == expected
+
+    def test_stream_maxlen_emit_document_propagates_xadd_exception(self) -> None:
+        """Raw EventBus does not swallow xadd exceptions for document.captured."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.side_effect = redis.ConnectionError("Lost connection")
+        bus = EventBus(mock_redis)
+
+        doc = _make_doc()
+        with pytest.raises(redis.ConnectionError):
+            bus.emit_document_captured(doc, producer_id="test")
+
+    def test_stream_maxlen_emit_health_propagates_xadd_exception(self) -> None:
+        """Raw EventBus does not swallow xadd exceptions for scraper.health."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.side_effect = redis.ConnectionError("Lost connection")
+        bus = EventBus(mock_redis)
+
+        health = _make_health()
+        with pytest.raises(redis.ConnectionError):
+            bus.emit_health(health)
