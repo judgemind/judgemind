@@ -4006,12 +4006,12 @@ while true; do
                             "fix_conflict skill returned unresolvable or budget exhausted"
                     else
                         log "diagnoser_route_stub" "hint=$_hint"
-                        advance_phase "daemon_restart_abandoned" "failed"
+                        advance_phase "agent_runner_route_stub" "failed"
                     fi
                     ;;
                 unrecognized|*)
                     log "transition_unrecognized" "phase=$_current" "action=$_action"
-                    advance_phase "daemon_restart_abandoned" "crashed"
+                    advance_phase "agent_runner_route_stub" "crashed"
                     ;;
             esac
             ;;

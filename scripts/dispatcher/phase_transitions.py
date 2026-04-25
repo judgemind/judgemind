@@ -255,6 +255,17 @@ PHASE_FIX_CI_FAILED = "fix_ci_failed"
 #: ``FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE``.
 PHASE_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 
+#: #3137 — Stage 1b stub terminal set by the agent-runner entrypoint when
+#: the phase-transition shim routes to diagnoser or returns an unrecognized
+#: action (the ``diagnoser_route_stub`` and ``transition_unrecognized``
+#: branches inside the main claude-phase dispatch case). Represents a real
+#: failure (ralph REVISE-exhausted, worker-STUCK) — intentionally NOT added
+#: to INFRA_PREEMPTED_CATEGORIES so it counts toward the circuit breaker and
+#: renders as a red ✗ in the admin cockpit. Stage 2 (#3091) will replace
+#: this stub with real diagnoser routing writing to dispatcher.failures and
+#: advancing to the appropriate diagnoser-decided terminal phase.
+PHASE_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
+
 # ---------------------------------------------------------------------------
 # Verdict constants — the string values produced by the phase-output JSONs.
 # ---------------------------------------------------------------------------
@@ -354,6 +365,8 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_CONFLICT_UNRESOLVABLE,
         # #3245 — fix_ci terminal for the ECS agent-runner path.
         PHASE_FIX_CI_FAILED,
+        # #3137 — agent-runner route stub terminal (Stage 1b).
+        PHASE_AGENT_RUNNER_ROUTE_STUB,
     }
 )
 
@@ -1180,6 +1193,7 @@ __all__ = [
     "PHASE_AWAITING_DEPLOY_TIMEOUT",
     "PHASE_CONFLICT_UNRESOLVABLE",
     "PHASE_FIX_CI_FAILED",
+    "PHASE_AGENT_RUNNER_ROUTE_STUB",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",
