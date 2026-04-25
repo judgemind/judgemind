@@ -42,6 +42,18 @@ resource "aws_iam_policy" "ecs_dev_only" {
     Version = "2012-10-17"
     Statement = [
       {
+        # AWS requires Resource = "*" for RegisterTaskDefinition — the API does
+        # not accept ARN scoping. DescribeTaskDefinition has the same constraint.
+        # See infra/terraform/modules/dispatcher-daemon/main.tf for precedent.
+        Sid    = "EcsTaskDefinitionGlobal"
+        Effect = "Allow"
+        Action = [
+          "ecs:RegisterTaskDefinition",
+          "ecs:DescribeTaskDefinition"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "EcsDevCluster"
         Effect = "Allow"
         Action = [
@@ -50,9 +62,7 @@ resource "aws_iam_policy" "ecs_dev_only" {
           "ecs:ListTasks",
           "ecs:DescribeServices",
           "ecs:ListServices",
-          "ecs:UpdateService",
-          "ecs:DescribeTaskDefinition",
-          "ecs:RegisterTaskDefinition"
+          "ecs:UpdateService"
         ]
         Resource = [
           "arn:aws:ecs:us-west-2:${var.dev_account_id}:cluster/judgemind-dev",
@@ -135,7 +145,7 @@ resource "aws_iam_policy" "s3_staging_prefixes" {
         Resource = var.document_archive_bucket_arn
         Condition = {
           StringLike = {
-            "s3:prefix" = ["staging/", "staging", "spotcheck/", "spotcheck"]
+            "s3:prefix" = ["staging/*", "spotcheck/*", "staging", "spotcheck"]
           }
         }
       }
