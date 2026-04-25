@@ -56,6 +56,31 @@ assert_content() {
     fi
 }
 
+assert_file_missing() {
+    local file="$1"
+    local msg="$2"
+    if [ ! -f "$file" ]; then
+        echo "PASS: $msg"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $msg (file exists but should be missing)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_stderr_contains() {
+    local stderr_text="$1"
+    local pattern="$2"
+    local msg="$3"
+    if echo "$stderr_text" | grep -q "$pattern"; then
+        echo "PASS: $msg"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $msg (stderr did not contain '$pattern')"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 # --- Test 1: Overwriting an executable file preserves the executable bit ---
 echo "--- Test 1: Overwriting executable file preserves +x ---"
 echo "#!/bin/bash" > "$TEST_DIR/dst_exec.sh"
@@ -108,6 +133,42 @@ echo "nested" > "$TEST_DIR/src5.txt"
 "$SCRIPT" "$TEST_DIR/src5.txt" "$TEST_DIR/sub/dir/dst5.txt"
 
 assert_content "$TEST_DIR/sub/dir/dst5.txt" "nested" "File created in nested directory"
+
+# --- Test 6: Worktree cwd rejects main-repo destination ---
+echo "--- Test 6: Worktree cwd rejects main-repo destination ---"
+mkdir -p "$TEST_DIR/fake-repo/.claude/worktrees/agent-test"
+echo "test content" > "$TEST_DIR/src6.txt"
+set +e
+STDERR6=$(WRITE_CLAUDE_CWD="$TEST_DIR/fake-repo/.claude/worktrees/agent-test" \
+    "$SCRIPT" "$TEST_DIR/src6.txt" "$TEST_DIR/fake-repo/.claude/skills/foo/SKILL.md" 2>&1 >/dev/null)
+RC6=$?
+set -e
+# Assert non-zero exit
+if [ "$RC6" -ne 0 ]; then
+    echo "PASS: Non-zero exit on main-repo destination from worktree"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: Expected non-zero exit, got 0"
+    FAIL=$((FAIL + 1))
+fi
+assert_file_missing "$TEST_DIR/fake-repo/.claude/skills/foo/SKILL.md" "File not created at main-repo destination"
+assert_stderr_contains "$STDERR6" "BLOCKED" "Stderr contains BLOCKED"
+assert_stderr_contains "$STDERR6" "agent-test" "Stderr mentions worktree path"
+
+# --- Test 7: Worktree cwd accepts worktree-prefixed destination ---
+echo "--- Test 7: Worktree cwd accepts worktree-prefixed destination ---"
+echo "worktree content" > "$TEST_DIR/src7.txt"
+WRITE_CLAUDE_CWD="$TEST_DIR/fake-repo/.claude/worktrees/agent-test" \
+    "$SCRIPT" "$TEST_DIR/src7.txt" \
+    "$TEST_DIR/fake-repo/.claude/worktrees/agent-test/.claude/skills/foo/SKILL.md"
+assert_content "$TEST_DIR/fake-repo/.claude/worktrees/agent-test/.claude/skills/foo/SKILL.md" \
+    "worktree content" "File created at correct worktree destination"
+
+# --- Test 8: Non-worktree cwd allows any destination ---
+echo "--- Test 8: Non-worktree cwd allows any destination ---"
+echo "plain content" > "$TEST_DIR/src8.txt"
+"$SCRIPT" "$TEST_DIR/src8.txt" "$TEST_DIR/dst8.txt"
+assert_content "$TEST_DIR/dst8.txt" "plain content" "Non-worktree cwd allows write to any path"
 
 # --- Summary ---
 echo ""
