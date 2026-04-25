@@ -126,6 +126,19 @@ if [[ -z "$AGENT_ID" ]]; then
     exit 1
 fi
 
+# Validate AGENT_ID is a strict UUID (prevents SQL injection via string interpolation)
+if [[ ! "$AGENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "Error: AGENT_ID '$AGENT_ID' is not a valid UUID" >&2
+    exit 1
+fi
+
+# Validate ISSUE_NUMBER is a non-negative integer when set
+if [[ -n "$ISSUE_NUMBER" ]] && [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+    echo "Error: ISSUE_NUMBER '$ISSUE_NUMBER' is not a non-negative integer" >&2
+    exit 1
+fi
+# WORKTREE_PATH is derived as /tmp/agent-runner-smoke/${AGENT_ID} — safe by construction once AGENT_ID is validated above
+
 # ── Resolve ECS wiring from environment or dispatcher service ─────────────────
 #
 # When AGENT_RUNNER_SUBNET_IDS / AGENT_RUNNER_SECURITY_GROUP_ID are unset,
