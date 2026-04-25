@@ -242,8 +242,8 @@ Model selection at the CLI: Claude uses `--model <alias\|id>` (aliases `opus`/`s
 
 `dispatcher.config.agent_execution_mode` controls how the daemon spawns agents, orthogonal to runner choice (§6b):
 
-- `'subprocess'` (historical default): daemon forks the runner (e.g. `claude -p /task-v2-<phase>`) as a child process inside its own ECS task. Each daemon redeploy SIGKILLs all child processes, abandoning in-flight agents.
-- `'ecs'` (Option A, #3086/#3078): daemon calls `ecs:RunTask` to launch a dedicated per-agent task from the `judgemind-dispatcher-agent-runner-dev` task-definition family. The agent-runner task is independent of the daemon task — daemon redeploys no longer kill agents.
+- `'ecs'` (default since #3093, Option A from #3086/#3078): daemon calls `ecs:RunTask` to launch a dedicated per-agent task from the `judgemind-dispatcher-agent-runner-dev` task-definition family. The agent-runner task is independent of the daemon task — daemon redeploys no longer kill agents.
+- `'subprocess'` (legacy fallback — retained for #3093 AC 3): daemon forks the runner (e.g. `claude -p /task-v2-<phase>`) as a child process inside its own ECS task. Each daemon redeploy SIGKILLs all child processes, abandoning in-flight agents. Operators can force this mode via a `dispatcher.config` row write without a code deploy.
 
 The config flag is stored on the agent row at claim-time (`dispatcher.agents.execution_mode`) and is immutable for that agent's lifetime.
 

@@ -91,3 +91,17 @@ variable "repo_url" {
   type        = string
   default     = "https://github.com/judgemind/judgemind.git"
 }
+
+# ─── Alerts ──────────────────────────────────────────────────────────────
+
+variable "enable_alerts" {
+  description = "Whether to create CloudWatch alarms for the dispatcher agent-runner. Set false when no SNS topic is available yet."
+  type        = bool
+  default     = false
+}
+
+variable "alert_sns_topic_arn" {
+  description = "ARN of the SNS topic for alarm notifications (email + Telegram). Required when enable_alerts is true."
+  type        = string
+  default     = ""
+}

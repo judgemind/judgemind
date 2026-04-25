@@ -329,12 +329,13 @@ DEFAULT_HEARTBEAT_METRIC_NAMESPACE = "Judgemind/Dispatcher"
 DEFAULT_AWS_REGION = "us-west-2"
 
 #: Default value for ``dispatcher.config.agent_execution_mode`` when the
-#: row is missing or malformed. ``'subprocess'`` keeps the pre-#3091
-#: behaviour — the daemon spawns per-phase ``claude -p`` subprocesses
-#: inside its own container — and is the safe default until Stage 3
-#: smoke (#3092) confirms the ECS path end-to-end and Stage 4 (#3093)
-#: flips this default.
-DEFAULT_AGENT_EXECUTION_MODE = "subprocess"
+#: row is missing or malformed. Flipped to ``'ecs'`` in #3093 (Stage 4
+#: of the #3086 per-agent-ECS migration) after Stage 3 smoke (#3092)
+#: confirmed the ECS path end-to-end. New agents now default to
+#: per-agent Fargate tasks; ``'subprocess'`` is retained as a named
+#: legacy fallback (AC 3) — operators can force it via a
+#: ``dispatcher.config`` row write without a code deploy.
+DEFAULT_AGENT_EXECUTION_MODE = "ecs"
 
 #: Valid values for ``dispatcher.config.agent_execution_mode``. Anything
 #: outside this set falls back to :data:`DEFAULT_AGENT_EXECUTION_MODE`
