@@ -132,6 +132,10 @@ class TestReapCompletedAgentTasks:
         # Third cursor: _reap_finalize_ecs_success merged_at UPDATE.
         finalize_cur = _FakeCursor()
         conn.queue_cursor(finalize_cur)
+        # Fourth cursor: _reap_finalize_ecs_success agent_task_arn UPDATE
+        # (Issue #3329 — clear the ARN so the next tick excludes the row).
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
 
         fake_client = MagicMock()
         fake_client.describe_tasks.return_value = {
@@ -173,6 +177,12 @@ class TestReapCompletedAgentTasks:
         assert "pr_number IS NOT NULL" in merged_at_sql
         params = [params for _, params in finalize_cur.executed]
         assert params == [("agent-ok",)]
+        # Issue #3329: success path must also clear ``agent_task_arn``
+        # so the next reaper tick's SELECT (now keyed solely on
+        # ``agent_task_arn IS NOT NULL``) skips this row.
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+        assert [params for _, params in arn_clear_cur.executed] == [("agent-ok",)]
 
     def test_stopped_success_already_terminal_idempotent_re_reap(
         self, caplog: Any
@@ -204,6 +214,8 @@ class TestReapCompletedAgentTasks:
         conn.queue_cursor(status_cur)
         finalize_cur = _FakeCursor()
         conn.queue_cursor(finalize_cur)
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
 
         fake_client = MagicMock()
         fake_client.describe_tasks.return_value = {
@@ -222,16 +234,14 @@ class TestReapCompletedAgentTasks:
         ):
             d._reap_completed_agent_tasks()
 
-        # Exactly one UPDATE issued. The WHERE filter (asserted above)
-        # makes the SQL itself a no-op when merged_at is already set —
-        # the DB does the idempotence; the helper just always issues
-        # the same statement.
-        update_sqls = [
-            sql for sql, _ in finalize_cur.executed if "UPDATE dispatcher.agents" in sql
-        ]
-        assert len(update_sqls) == 1, update_sqls
-        assert "merged_at IS NULL" in update_sqls[0]
-        assert "pr_number IS NOT NULL" in update_sqls[0]
+        # Exactly one merged_at UPDATE issued. The WHERE filter
+        # (asserted above) makes the SQL itself a no-op when merged_at
+        # is already set — the DB does the idempotence; the helper just
+        # always issues the same statement.
+        merged_at_sqls = [sql for sql, _ in finalize_cur.executed if "merged_at" in sql]
+        assert len(merged_at_sqls) == 1, merged_at_sqls
+        assert "merged_at IS NULL" in merged_at_sqls[0]
+        assert "pr_number IS NOT NULL" in merged_at_sqls[0]
 
     def test_stopped_success_row_gap_marks_succeeded(self, caplog: Any) -> None:
         """Container exited 0 but DB row still ``running`` -> daemon closes the gap."""
@@ -349,6 +359,11 @@ class TestReapCompletedAgentTasks:
         # Agent-runner wrote ``failed`` before exiting.
         status_cur.fetchone_queue = [("failed", "ralph")]
         conn.queue_cursor(status_cur)
+        # Issue #3329: failure-already-terminal branch also issues the
+        # ``agent_task_arn = NULL`` UPDATE to take the row out of the
+        # next reaper SELECT.
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
 
         fake_client = MagicMock()
         fake_client.describe_tasks.return_value = {
@@ -377,6 +392,12 @@ class TestReapCompletedAgentTasks:
         remove_labels_mock.assert_called_once_with(
             300, [daemon.STATUS_IN_PROGRESS_LABEL]
         )
+        # Issue #3329: ``agent_task_arn`` must be cleared on the
+        # failure path too, otherwise the row stays in the SELECT
+        # forever now that the status filter is gone.
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+        assert [params for _, params in arn_clear_cur.executed] == [("agent-done",)]
 
     def test_running_task_is_noop(self) -> None:
         d, conn = _make_daemon()
@@ -527,3 +548,218 @@ class TestReapGuards:
         assert summary["reaped_success"] == 0
         events = [getattr(r, "event", None) for r in caplog.records]
         assert "reap_agent_tasks_describe_failed" in events
+
+
+# --------------------------------------------------------------------------
+# Issue #3329 — SELECT must NOT filter on ``status`` (the agent-runner
+# entrypoint writes its terminal status BEFORE ECS marks the task STOPPED,
+# so a status filter excludes every real ECS-mode terminal). The fix:
+# - drop the ``status IN ('running', 'retrying')`` filter from the SELECT,
+# - clear ``agent_task_arn`` after success/failure finalize so the next
+#   tick excludes the row instead.
+# --------------------------------------------------------------------------
+
+
+class TestReapSelectScope:
+    def test_select_query_does_not_filter_by_status(self) -> None:
+        """The SELECT must key on ``agent_task_arn IS NOT NULL`` alone.
+
+        Pre-fix the WHERE clause had ``AND status IN ('running',
+        'retrying')``. The agent-runner (#3158) writes its own terminal
+        ``status='succeeded'`` row before exit, which transitions out of
+        the filter window before the ECS task transitions to STOPPED —
+        so the rows were excluded and the success/failure already-
+        terminal branches never fired in production. This test pins
+        the SELECT shape against regression.
+        """
+        d, conn = _make_daemon()
+        select_cur = _FakeCursor(rows=[])
+        conn.queue_cursor(select_cur)
+        with patch.object(d, "_make_ecs_client"):
+            d._reap_completed_agent_tasks()
+
+        assert len(select_cur.executed) == 1
+        sql, _params = select_cur.executed[0]
+        assert "FROM dispatcher.agents" in sql
+        assert "agent_task_arn IS NOT NULL" in sql
+        # Regression guard: the status filter must stay gone (#3329).
+        assert "status IN" not in sql, sql
+        assert "running" not in sql, sql
+        assert "retrying" not in sql, sql
+
+    def test_terminal_status_row_is_still_reaped(self, caplog: Any) -> None:
+        """A row whose ``status`` is already terminal but still has
+        ``agent_task_arn`` set MUST be picked up by the reaper. This is
+        the production-realistic shape — the agent-runner writes
+        ``status='succeeded'`` before the ECS task STOPS, so the row is
+        ALREADY terminal by the time the daemon's reaper SELECTs it.
+
+        Pre-fix this row was excluded by the ``status IN ('running',
+        'retrying')`` filter. Post-fix the daemon describes the task,
+        sees STOPPED+exit0, and runs the success-already-terminal
+        finalize branch (label strip + merged_at + agent_task_arn
+        clear).
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+        select_cur = _FakeCursor(
+            rows=[
+                (
+                    "agent-already-succeeded",
+                    501,
+                    "arn:aws:ecs:us-west-2:123:task/jm/already",
+                    "done",
+                    # Production-realistic: status is already terminal
+                    # by the time this SELECT runs.
+                    "succeeded",
+                ),
+            ]
+        )
+        conn.queue_cursor(select_cur)
+        status_cur = _FakeCursor()
+        status_cur.fetchone_queue = [("succeeded", "done")]
+        conn.queue_cursor(status_cur)
+        finalize_cur = _FakeCursor()
+        conn.queue_cursor(finalize_cur)
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": "arn:aws:ecs:us-west-2:123:task/jm/already",
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 0}],
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["reaped_success"] == 1
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_reaped_success" in events
+        # Label stripped, merged_at stamped, agent_task_arn cleared.
+        remove_labels_mock.assert_called_once_with(
+            501, [daemon.STATUS_IN_PROGRESS_LABEL]
+        )
+        merged_sqls = [sql for sql, _ in finalize_cur.executed if "merged_at" in sql]
+        assert merged_sqls and "merged_at IS NULL" in merged_sqls[0]
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+
+    def test_failed_status_row_is_still_reaped(self, caplog: Any) -> None:
+        """Mirror of the success case for the failure path.
+
+        A row already in ``status='failed'`` but with ``agent_task_arn``
+        still set must be picked up; the reaper should strip the label
+        and clear ``agent_task_arn``. No ``merged_at`` stamp on the
+        failure path.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+        select_cur = _FakeCursor(
+            rows=[
+                (
+                    "agent-already-failed",
+                    777,
+                    "arn:aws:ecs:us-west-2:123:task/jm/failterm",
+                    "ralph",
+                    # Production-realistic: status is already terminal.
+                    "failed",
+                ),
+            ]
+        )
+        conn.queue_cursor(select_cur)
+        status_cur = _FakeCursor()
+        status_cur.fetchone_queue = [("failed", "ralph")]
+        conn.queue_cursor(status_cur)
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": "arn:aws:ecs:us-west-2:123:task/jm/failterm",
+                    # Issue scenario in the spec writeup:
+                    # ECS reports STOPPED+exit0 even though the agent
+                    # row is ``failed``. The exit-code-zero +
+                    # status-is-terminal combination is treated as a
+                    # success-already-terminal in the reaper logic
+                    # (the agent-runner wrote its own terminal). This
+                    # variant uses a non-zero stop_code to force the
+                    # failure branch instead.
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 1}],  # non-zero → failure path
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_handle_agent_failure") as fail_mock,
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["reaped_failure"] == 1
+        # Already-terminal branch — must NOT route through
+        # _handle_agent_failure (would double-insert a failures row).
+        fail_mock.assert_not_called()
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_reaped_failure_already_terminal" in events
+        remove_labels_mock.assert_called_once_with(
+            777, [daemon.STATUS_IN_PROGRESS_LABEL]
+        )
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+        assert [params for _, params in arn_clear_cur.executed] == [
+            ("agent-already-failed",)
+        ]
+
+
+class TestReapArnClearIdempotence:
+    def test_arn_null_row_is_not_reselected(self) -> None:
+        """After finalize clears ``agent_task_arn``, the next reaper tick
+        must skip the row entirely — no ECS DescribeTasks call, no
+        UPDATEs, no log spam. The SELECT's ``agent_task_arn IS NOT NULL``
+        clause is the gate, so an empty fetchall() simulates the
+        post-finalize state.
+        """
+        d, conn = _make_daemon()
+        # Empty result set models the post-clear DB state for any agent
+        # already finalized: ``agent_task_arn IS NOT NULL`` excludes it.
+        select_cur = _FakeCursor(rows=[])
+        conn.queue_cursor(select_cur)
+
+        with (
+            patch.object(d, "_make_ecs_client") as mock_make_client,
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+            patch.object(d, "_mark_agent_terminal") as mark_mock,
+            patch.object(d, "_handle_agent_failure") as fail_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        # Zero-work early return: no ECS client built, no GH calls,
+        # no terminal-marking, no failure routing.
+        mock_make_client.assert_not_called()
+        remove_labels_mock.assert_not_called()
+        mark_mock.assert_not_called()
+        fail_mock.assert_not_called()
+        assert summary == {
+            "active": 0,
+            "reaped_success": 0,
+            "reaped_failure": 0,
+            "still_running": 0,
+        }
+        # The SELECT ran exactly once with the post-#3329 WHERE shape.
+        assert len(select_cur.executed) == 1
+        sql, _params = select_cur.executed[0]
+        assert "agent_task_arn IS NOT NULL" in sql
+        assert "status IN" not in sql
