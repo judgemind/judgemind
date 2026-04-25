@@ -51,9 +51,9 @@ pytestmark = pytest.mark.regression
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 
 # Expected number of PDF links processed from riv_page.html after filtering.
-# The fixture has 17 links; 1 is excluded by ``link_text_re`` (#1845), leaving 16.
+# The fixture has 17 links; with the loosened regex (#2603), all 17 pass.
 # Mirrors _RIV_EXPECTED_PROCESSED_PDFS in test_riverside_tentatives.py — keep in sync.
-_RIV_EXPECTED_PROCESSED_PDFS = 16
+_RIV_EXPECTED_PROCESSED_PDFS = 17
 
 
 def _load_html(name: str) -> str:
@@ -255,9 +255,9 @@ def test_riv_courthouse_palm_springs() -> None:
     assert _riv_courthouse("PS2") == "Palm Springs Courthouse"
 
 
-def test_riv_courthouse_murrieta() -> None:
-    assert _riv_courthouse("M205") == "Murrieta Courthouse"
-    assert _riv_courthouse("M301") == "Murrieta Courthouse"
+def test_riv_courthouse_menifee() -> None:
+    assert _riv_courthouse("M205") == "Menifee Justice Center"
+    assert _riv_courthouse("M301") == "Menifee Justice Center"
 
 
 def test_riv_courthouse_moreno_valley() -> None:
@@ -527,13 +527,12 @@ def test_link_text_filter_logs_warning_for_skipped_links(caplog: pytest.LogCaptu
 
 
 @respx.mock
-def test_riv_filters_non_matching_dept_260_link() -> None:
-    """Riverside 'Department 260' link (no judge name) is filtered out (#1845).
+def test_riv_dept_260_no_judge_link_processed() -> None:
+    """Riverside 'Department 260' link (no judge) is now processed, not filtered (#2603).
 
-    The riv_page.html fixture contains 17 PDF links, but 'Department 260'
-    does not match the Riverside link_text_re pattern because it lacks
-    '- Honorable <name>'.  It should be skipped, leaving
-    ``_RIV_EXPECTED_PROCESSED_PDFS`` links.
+    The loosened link_text_re makes the judge-name suffix optional, so
+    'Department 260' (no dash, no judge name) is now included in the output.
+    The riv_page.html fixture has 17 links; all 17 should produce documents.
     """
     html = _load_html("riv_page.html")
     pdf_bytes = _load_bytes("riv_ps1.pdf")
@@ -546,11 +545,13 @@ def test_riv_filters_non_matching_dept_260_link() -> None:
     scraper = RiversideTentativeRulingsScraper(config=config)
     docs = scraper.fetch_documents()
 
-    # One document per PDF (no scraper-level splitting)
+    # All 17 PDF links should produce documents (no link_text_re filtering)
     assert len(docs) == _RIV_EXPECTED_PROCESSED_PDFS
-    # Verify no document has a null department (all matched the regex)
-    assert all(d.department is not None for d in docs)
-    assert all(d.department != "" for d in docs)
+    # Dept 260 document should be present with department set and no judge name
+    dept260_docs = [d for d in docs if d.department == "260"]
+    assert len(dept260_docs) == 1
+    assert dept260_docs[0].department == "260"
+    assert not dept260_docs[0].judge_name  # None or empty — judge-name suffix absent
 
 
 @respx.mock
@@ -585,6 +586,61 @@ def test_riv_escheat_style_link_filtered() -> None:
     assert len(docs) == 1  # 1 doc per PDF (no scraper-level splitting)
     assert all(d.department == "PS1" for d in docs)
     assert all("Hester" in (d.judge_name or "") for d in docs)
+
+
+# ---------------------------------------------------------------------------
+# _fetch_one_pdf — None judge_name does not raise AttributeError (#2603)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fetch_one_pdf_none_judge_name_no_error() -> None:
+    """When link_text_re matches but judge_name group is None, no AttributeError (#2603).
+
+    The loosened Riverside regex makes judge_name optional.  _fetch_one_pdf
+    must not call .strip() on None — it must use (value or '').strip().
+    """
+    import re
+
+    from courts.ca.pdf_link_scraper import PdfLinkConfig, PdfLinkScraper
+    from framework import ScraperConfig
+
+    # Regex where judge_name is optional (like the loosened Riverside regex)
+    loosened_re = re.compile(
+        r"Department\s+(?P<department>\S+)"
+        r"(?:\s*-\s*(?:Honorable\s+)?(?P<judge_name>.+))?",
+        re.IGNORECASE,
+    )
+
+    html = (
+        '<html><body><a href="/system/files/2023-10/260ruling.pdf">Department 260</a></body></html>'
+    )
+    pdf_bytes = b"%PDF-1.4 fake pdf bytes"
+
+    config = ScraperConfig(
+        scraper_id="test",
+        state="CA",
+        county="Test",
+        court="Superior Court",
+        target_urls=["http://example.com"],
+        request_delay_seconds=0,
+        s3_bucket="",
+    )
+    pdf_config = PdfLinkConfig(
+        index_url="http://example.com/rulings",
+        pdf_base_url="http://example.com/rulings",
+        link_text_re=loosened_re,
+    )
+    scraper = PdfLinkScraper(config=config, pdf_config=pdf_config)
+
+    respx.get("http://example.com/rulings").mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    # This must not raise AttributeError: 'NoneType' object has no attribute 'strip'
+    docs = scraper.fetch_documents()
+    assert len(docs) == 1
+    assert docs[0].department == "260"
+    assert docs[0].judge_name is None
 
 
 # ---------------------------------------------------------------------------

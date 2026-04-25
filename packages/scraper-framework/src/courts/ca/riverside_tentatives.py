@@ -8,6 +8,8 @@ Verified against live site 2026-03-02:
 Link text format: "Department {CODE} - Honorable {Firstname Lastname [Suffix]}"
   e.g. "Department PS1 - Honorable Arthur Hester III"
   e.g. "Department M205 - Honorable Belinda Handy"
+  e.g. "Department 01 - Assigned Judge"  (no Honorable prefix)
+  e.g. "Department 260"  (no judge suffix at all)
 
 PDF URL pattern: /system/files/{YYYY-MM}/{CODE}ruling{MMDDYY}.pdf
   Resolved against BASE_URL.
@@ -27,7 +29,7 @@ Ruling splitting:
 
 Courthouse mapping (best-effort — Riverside has many locations):
   PS*  → Palm Springs Courthouse
-  M*   → Murrieta Courthouse (mid-county)
+  M*   → Menifee Justice Center
   MV*  → Moreno Valley Courthouse
   C*   → Corona Courthouse
   01–15 (numbered) → Hall of Justice (Riverside)
@@ -51,9 +53,13 @@ logger = structlog.get_logger(__name__)
 INDEX_URL = "https://www.riverside.courts.ca.gov/online-services/tentative-rulings"
 BASE_URL = "https://www.riverside.courts.ca.gov"
 
-# Link text: "Department PS1 - Honorable Arthur Hester III"
+# Link text shapes (#2603 — judge suffix is optional):
+#   "Department PS1 - Honorable Arthur Hester III"  (standard)
+#   "Department 01 - Assigned Judge"                (no Honorable prefix)
+#   "Department 260"                                (no dash, no judge)
 _LINK_TEXT_RE = re.compile(
-    r"Department\s+(?P<department>\S+)\s*-\s*Honorable\s+(?P<judge_name>.+)",
+    r"Department\s+(?P<department>\S+)"
+    r"(?:\s*-\s*(?:Honorable\s+)?(?P<judge_name>.+))?",
     re.IGNORECASE,
 )
 
@@ -126,7 +132,7 @@ def _riv_courthouse(dept: str) -> str | None:
     if dept_upper.startswith("MV"):
         return "Moreno Valley Courthouse"
     if dept_upper.startswith("M"):
-        return "Murrieta Courthouse"
+        return "Menifee Justice Center"
     if dept_upper.startswith("C"):
         return "Corona Courthouse"
     # Numbered departments (01–15): Hall of Justice in Riverside
