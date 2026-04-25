@@ -588,6 +588,19 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard python: both pytest suites + all 11 inline shell guards.
+          # pytest-xdist (-n auto) parallelises the 73-file dispatcher suite
+          # (~292s sequential → ~150-200s). Estimated wall-clock ~200s.
+          - shard: python
+          # Shard shell: scripts/run-scripts-tests.sh only.
+          # Dominated by test_agent_runner_entrypoint.sh (~275s) and
+          # test_check_dispatcher_image_versions.sh (~58s).
+          # Estimated wall-clock ~395s. See issue #3307.
+          - shard: shell
     env:
       PYTHONPATH: scripts
     steps:
@@ -599,24 +612,32 @@ jobs:
         with:
           node-version: '24'
       - name: Install test dependencies
-        run: pip install pytest boto3 -e packages/judgemind-config
+        run: pip install pytest pytest-xdist boto3 -e packages/judgemind-config
       - name: Install Node.js test dependencies
         run: npm install --no-save graphql@^16.8
       - name: Test
+        if: matrix.shard == 'python'
         run: pytest scripts/tests/ -v --tb=short
       # Dispatcher v2 daemon skeleton tests (scripts/dispatcher/tests/).
       # Separate invocation because these live in their own package dir
       # (scripts/dispatcher/tests/) rather than under scripts/tests/.
       # Mocks psycopg — no DB required in CI. See issue #2729.
+      # -n auto: mocks + tmp_path/monkeypatch make the suite xdist-safe
+      # (no os.chdir, only mocked sleeps). See issue #3307.
       - name: Test dispatcher daemon skeleton
-        run: pytest scripts/dispatcher/tests/ -v --tb=short -m "not integration"
+        if: matrix.shard == 'python'
+        run: pytest scripts/dispatcher/tests/ -v --tb=short -n auto -m "not integration"
       - name: Check AWS CLI boolean flag usage
+        if: matrix.shard == 'python'
         run: scripts/check-aws-bool-flags.sh
       - name: Check for forbidden ECS services-stable waiter usage
+        if: matrix.shard == 'python'
         run: scripts/check-no-ecs-wait-services-stable.sh
       - name: Check workflows use the extracted ECS post-deploy healthcheck
+        if: matrix.shard == 'python'
         run: scripts/check-no-inline-ecs-healthcheck.sh
       - name: Check docs describe the actual rebuild_db.py CLI
+        if: matrix.shard == 'python'
         run: scripts/check-no-rebuild-db-skip-reset.sh
       # Cross-checks every non-stdlib import under scripts/dispatcher/ against
       # the pip install step in Dockerfile.dispatcher. Motivated by the #2773
@@ -624,6 +645,7 @@ jobs:
       # add boto3 to Dockerfile.dispatcher, and no test caught it because the
       # daemon tests mock the client by method assignment.
       - name: Verify dispatcher image installs every Python import used by the daemon
+        if: matrix.shard == 'python'
         run: scripts/check-dispatcher-image-deps.sh
       # Issues #3062 (audit) + #3072 (this check): every
       # ``self._mark_agent_terminal`` call site in
@@ -633,6 +655,7 @@ jobs:
       # This would have caught the #3054 ralph_not_ship bug at author
       # time.
       - name: Verify every daemon terminal site has a ROUTING comment
+        if: matrix.shard == 'python'
         run: scripts/check-terminal-routing-comments.sh
       # Issue #3089: every ``subprocess.run([... "git" | "gh" ...])``
       # call site in ``scripts/dispatcher/daemon.py`` must either route
@@ -641,6 +664,7 @@ jobs:
       # #3053/#3085 class of single-transient-failure bug from creeping
       # back in.
       - name: Verify every daemon git/gh subprocess site has retry or cold-path annotation
+        if: matrix.shard == 'python'
         run: scripts/check-git-gh-retries.sh
       # Issue #3213: every ``subprocess.run(...)`` call site in
       # ``scripts/**/*.py`` (excluding ``scripts/**/tests/**``) must have
@@ -648,6 +672,7 @@ jobs:
       # subprocess.run was the prime hypothesis for the #3205 silent-daemon
       # wedge class. This check prevents regression.
       - name: Verify every subprocess.run call in scripts has timeout= or **kwargs
+        if: matrix.shard == 'python'
         run: scripts/check-subprocess-timeouts.sh
       # Issue #3158: every ``UPDATE dispatcher.agents`` /
       # ``SELECT ... FROM dispatcher.agents`` line in
@@ -657,6 +682,7 @@ jobs:
       # nearby. Prevents the #3091-draft / #3128-era / #3152 class of
       # silent-ECS-agent-loss bug from creeping back in.
       - name: Verify every dispatcher.agents SQL site is execution_mode-aware
+        if: matrix.shard == 'python'
         run: scripts/check-dispatcher-execution-mode-aware.sh
       # Issue #2829: every ``subprocess.run([... "git" ...])`` call site in
       # ``scripts/dispatcher/daemon.py`` whose first positional arg resolves
@@ -665,7 +691,7 @@ jobs:
       # returns ``/app`` (no ``.git`` directory). The correct anchor is
       # ``_git_parent_root()``.
       - name: Verify no git subprocess in daemon.py anchors at self._repo_root()
-        if: needs.detect-changes.outputs.scripts == 'true'
+        if: matrix.shard == 'python'
         run: bash scripts/check-no-git-repo-root-anchor.sh
       # Issue #3082: operator laptops run macOS's stock bash 3.2.
       # Shell scripts under scripts/**/*.sh must stick to the bash 3.2
@@ -676,6 +702,7 @@ jobs:
       # silently exited 127 on the operator's laptop. See
       # docs/agent/code-standards.md §macOS bash 3.2 compatibility.
       - name: Verify scripts stay within the bash 3.2 feature subset
+        if: matrix.shard == 'python'
         run: scripts/check-bash-compat.sh
       # Auto-discover and run every executable shell test under
       # scripts/tests/*.sh. Replaces the old per-script listing (#2505) so
@@ -702,6 +729,7 @@ jobs:
       #                              the duration regression this skip
       #                              addresses (+34s, +112%).
       - name: Run all scripts/tests shell tests
+        if: matrix.shard == 'shell'
         shell: bash
         env:
           # Whitespace-separated list of test paths to defer to their own
