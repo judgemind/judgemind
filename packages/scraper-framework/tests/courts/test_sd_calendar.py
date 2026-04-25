@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+import structlog.testing
 
 from courts.ca.sd_calendar import (
     CALENDAR_BASE_URL,
@@ -492,6 +493,42 @@ class TestSDCalendarScraper:
         docs = scraper.fetch_documents()
         # Central has 7 motion events, fetched twice = 14
         assert len(docs) == 14
+
+    @respx.mock
+    def test_empty_calendar_logs_warning_and_skips(self) -> None:
+        """fetch_documents() should skip empty pages and emit a warning log per division."""
+        config = _make_config()
+        scraper = SDCalendarScraper(config, day_numbers=[1])
+
+        empty_html = _load_html("sd_calendar_empty.html")
+
+        # All 4 division URLs return an empty calendar page
+        respx.get(f"{CALENDAR_BASE_URL}/f_svcal1.html").mock(
+            return_value=httpx.Response(200, text=empty_html)
+        )
+        respx.get(f"{CALENDAR_BASE_URL}/F_VVCAL1.html").mock(
+            return_value=httpx.Response(200, text=empty_html)
+        )
+        respx.get(f"{CALENDAR_BASE_URL}/F_EVCAL1.html").mock(
+            return_value=httpx.Response(200, text=empty_html)
+        )
+        respx.get(f"{CALENDAR_BASE_URL}/F_BVCAL1.html").mock(
+            return_value=httpx.Response(200, text=empty_html)
+        )
+
+        with structlog.testing.capture_logs() as cap_logs:
+            docs = scraper.fetch_documents()
+
+        assert docs == []
+
+        warning_events = [e for e in cap_logs if e.get("event") == "Skipping empty calendar page"]
+        # One warning per division URL (4 divisions, 1 day each)
+        assert len(warning_events) == 4
+        # Each warning carries division and url keys
+        for entry in warning_events:
+            assert entry.get("log_level") == "warning"
+            assert "division" in entry
+            assert "url" in entry
 
     def test_parse_document_passthrough_with_ruling_text(self) -> None:
         """parse_document should not overwrite existing ruling_text."""
