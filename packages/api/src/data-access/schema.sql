@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 48 migrations.
+-- Generated from 49 migrations.
 
 
 
@@ -345,7 +345,7 @@ CREATE TABLE dispatcher.agents (
     agent_id uuid DEFAULT gen_random_uuid() NOT NULL,
     parent_run_id uuid,
     kind text DEFAULT 'task'::text NOT NULL,
-    issue_number integer NOT NULL,
+    issue_number integer,
     worktree_path text NOT NULL,
     phase text DEFAULT 'claiming'::text NOT NULL,
     status text DEFAULT 'running'::text NOT NULL,
@@ -373,6 +373,9 @@ CREATE TABLE dispatcher.agents (
 
 
 COMMENT ON TABLE dispatcher.agents IS 'One row per /task (or audit/spotcheck/security-review) agent invocation.';
+
+
+COMMENT ON COLUMN dispatcher.agents.issue_number IS 'GitHub issue number for issue-driven agents. NULL for synthetic agents (kind=''scheduled_skill'') that have no issue context — the skill itself decides what to act on. See #3374 / #3380.';
 
 
 COMMENT ON COLUMN dispatcher.agents.runner_override IS 'Per-agent override of dispatcher.config.runner_by_phase; NULL = use config default.';
