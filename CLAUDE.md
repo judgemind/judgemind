@@ -50,6 +50,8 @@ scripts/preflight/no-duplicate-pr.sh N # Check if open PR already exists for iss
 scripts/preflight/rate-budget.sh       # Warn if GitHub API rate budget < 100 remaining
 ```
 
+`scripts/preflight.sh` is the umbrella runner / sourceable function library; the per-check wrappers under `scripts/preflight/` (in-worktree.sh, not-on-main.sh, etc.) each invoke one library function for use under permission rules that block `source ... && fn`.
+
 ## Project Context
 
 Judgemind is a free, open-source legal research platform replacing Trellis.law. Read the specs in `docs/specs/` for full context. The key things to know:
@@ -88,28 +90,7 @@ Consult these docs before making changes in their domain:
 | `docs/agent/gh-to-mcp-migration.md` | Full tool-by-tool `gh` → `mcp__github__*` mapping, including the known gaps |
 | `docs/agent/aws-api-access.md` | When to use the AWS MCP servers vs the `aws` CLI vs `scripts/ecs-*.sh` — MCP-first for ECS/CloudWatch reads, scripts for launch-and-stream, CLI for writes/S3/secrets |
 | `docs/agent/aws-to-mcp-migration.md` | Full tool-by-tool `aws` → `mcp__awslabs_*` mapping, including the known gaps |
-
-### Writing Specs and Long-Lived Design Docs
-
-Every architecture or product spec separates **Today** (implemented and running) from **Direction** (aspirational, not yet built). Readers must never have to guess whether a component, API, schema, or feature actually exists.
-
-Structure every new spec as:
-
-```
-# 1. Principles           (cross-cutting, stable)
-# 2. System Overview      (describes current reality, not aspiration)
-# 3. Today                (everything below here is implemented and running)
-#     3.x subsystems...
-# 4. Direction            (everything below here is not yet built)
-#     4.x planned items...
-```
-
-Rules:
-- **Don't mix.** A Today section describes only what exists. A Direction section describes only what doesn't. No "partially implemented" hedge prose — if it's partial, name the shipped part in Today and the unbuilt part in Direction.
-- **Speculative ideas** go in Direction or a separate roadmap doc. Never in Today.
-- **Principles and cross-cutting constraints** stay in §1.
-
-`docs/specs/architecture-spec-v1.md` and `docs/data-flow.md` are the reference patterns.
+| `docs/agent/spec-authoring.md` | Authoring or restructuring a spec/design doc — Today vs. Direction split rules |
 
 ## Starting a New Session
 
@@ -144,7 +125,7 @@ scripts/install-package-venv.sh <pkg>     # e.g. scraper-framework, nlp-pipeline
 
 The raw equivalent: `python3.12 -m venv packages/<pkg>/.venv`, install `packages/judgemind-config` first if `<pkg>` depends on it, then `pip install -e "packages/<pkg>[dev]"`. Plain `pip install -e ".[dev]"` **fails** for `scraper-framework` and `nlp-pipeline` because `judgemind-config` is an unpublished local sibling (see #2491).
 
-### Step 3 — Pick up a task
+### Pick up a task
 
 Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrapers`.
 
@@ -163,10 +144,7 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 - **Zoom out before planning: root cause vs. symptom.** Before generating a plan or filing issues, ask: do these share a root cause? Would a structural fix prevent the entire class of problem?
 - **Root Cause Over Symptoms** (triage, spotcheck, investigation). Before filing a symptom-level ticket, look one level deeper. File one root-cause issue, not three symptom issues.
 - **Investigations go to root cause.** When asked to investigate — or when you autonomously decide to — take it all the way down. Build a chain of verified evidence (code read, log line, query result, git history), not supposition. Hold multiple hypotheses in parallel and disprove them with evidence; don't anchor on the first plausible one. Stop only when the chain bottoms out in something concrete.
-- **Instrument before you guess.** When a failure's root cause isn't obvious, the first move is to make the failure self-diagnosing — add structured logging, capture the raw state the process actually saw, re-trigger — not to patch the top hypothesis.
-  - **What agents get wrong:** anchoring on the first plausible hypothesis. An unconfirmed-guess fix burns a full cycle and often hides the real mechanism behind defensive handling. Instrumentation PRs are cheap; wrong-fix rollbacks aren't.
-  - **How to apply:** write instrumentation first when a failure is reproducible but the mechanism isn't clear — log what the process *actually* saw (stderr tail, response bytes, DOM state, SQL executed, last N inputs), not what you think it saw. Don't ship a fix based on a hypothesis you haven't confirmed with a captured artifact. Defensive coercion (`coerce to {} on non-dict`, swallow on parse error) is fine to prevent crashes but must not hide the underlying signal — keep the raw data on disk or in a log event.
-  - Applies everywhere: scraping ("no records" → log what matched), NLP ("wrong extraction" → capture model I/O before changing prompts), CI flakes → capture reproduction artifacts before adding retries, infra timeouts → log operation timeline before tuning limits, frontend/data-quality anomalies, etc.
+- **Instrument before you guess.** When a failure's root cause isn't obvious, the first move is to make the failure self-diagnosing — add structured logging, capture the raw state the process actually saw, re-trigger — not to patch the top hypothesis. See docs/agent/investigation-patterns.md for the full pattern.
 
 ## PR Workflow
 
@@ -242,7 +220,7 @@ See **`docs/agent/task-dependencies.md`** and **`docs/agent/issue-authoring.md`*
 - **Sub-tasks:** reference the parent as `Parent: #N`; each sub-task should be independently pickup-able.
 - **Acceptance criteria:** concrete and machine-checkable. Each criterion has at least one `Verify:` line. **Data cleanup on `derived.*` defaults to `rebuild_db.py --county <name>`** — surgical scripts are a last resort.
 - **Investigation tasks:** produce documentation and file follow-up issues for every actionable finding, then close.
-- **Priority:** p1 = time-sensitive or workflow accelerators. p2 = most user-facing bugs, backfills, refactoring. p3 = large slow work. p0 is human-only.
+- **Priority:** p1 = time-sensitive or workflow accelerators. p2 = most user-facing bugs, backfills, refactoring. p3 = large slow work. p0 is reserved for true emergencies; agents may set it only when explicitly told by a human.
 
 ## Ingestion Pipeline & Scraper Development
 
