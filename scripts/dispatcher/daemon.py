@@ -19791,8 +19791,8 @@ class DispatcherDaemon:
     # These methods wire the daemon to the ``judgemind-dispatcher-agent-
     # runner-<env>`` Fargate task definition shipped in Stage 1b (#3090).
     # Gated behind ``dispatcher.config.agent_execution_mode == 'ecs'``
-    # which defaults to ``'subprocess'`` — until Stage 4 (#3093) flips
-    # the default the methods below are cold in production.
+    # which now defaults to ``'ecs'`` (Stage 4, #3093). The methods below
+    # are active in production as of the #3093 merge.
     #
     # Why this matters for #3078 Option A
     # -----------------------------------
