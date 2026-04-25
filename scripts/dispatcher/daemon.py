@@ -19931,9 +19931,8 @@ class DispatcherDaemon:
         """Observe lifecycle of active per-agent ECS tasks (#3091).
 
         Runs on every :meth:`scheduler_tick`. Fetches every
-        ``dispatcher.agents`` row where ``agent_task_arn IS NOT NULL``
-        and ``status IN ('running', 'retrying')``, calls
-        ``ecs:DescribeTasks`` once for up to 100 ARNs (the ECS
+        ``dispatcher.agents`` row where ``agent_task_arn IS NOT NULL``,
+        calls ``ecs:DescribeTasks`` once for up to 100 ARNs (the ECS
         page-size cap — more than we'll ever reap in one tick on a
         concurrency_cap<=5 cluster), and acts on the returned
         ``lastStatus``:
@@ -19974,6 +19973,21 @@ class DispatcherDaemon:
         # matches the ECS ``DescribeTasks`` page-size cap. For
         # concurrency_cap<=5 dev this is always one call; a future
         # production cap>5 would need pagination here.
+        #
+        # Issue #3329: the SELECT used to filter on
+        # ``status IN ('running', 'retrying')`` but the agent-runner
+        # entrypoint (#3158) writes its own terminal status row BEFORE
+        # the ECS task transitions to STOPPED. That ordering meant rows
+        # were excluded from this SELECT before the daemon ever called
+        # ``ecs:DescribeTasks``, so the success/failure already-terminal
+        # branches below were unreachable in production — leaking the
+        # ``status/in-progress`` label and skipping the ``merged_at``
+        # stamp. We now key off ``agent_task_arn IS NOT NULL`` alone,
+        # and the success/failure finalize paths CLEAR ``agent_task_arn``
+        # to mark the row as no-longer-needing-ECS-observation. The
+        # column is the canonical "this row still owes an ECS reap"
+        # signal — pre-#3091 rows never set it, so dropping the status
+        # filter does not pull in legacy work.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -19981,7 +19995,6 @@ class DispatcherDaemon:
                     "       phase, status "
                     "FROM dispatcher.agents "
                     "WHERE agent_task_arn IS NOT NULL "
-                    "  AND status IN ('running', 'retrying') "
                     "LIMIT 100"
                 )
                 rows = cur.fetchall()
@@ -20214,6 +20227,35 @@ class DispatcherDaemon:
                                     "branch": "failure_already_terminal",
                                 },
                             )
+                    # Issue #3329: clear ``agent_task_arn`` so the
+                    # next reaper tick excludes this row. Mirror of
+                    # the success-path clear in
+                    # ``_reap_finalize_ecs_success`` — same rationale,
+                    # same idempotence story.
+                    try:
+                        with self._conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE dispatcher.agents "
+                                "SET agent_task_arn = NULL "
+                                "WHERE agent_id = %s",
+                                (agent_id,),
+                            )
+                        self._conn.commit()
+                    except Exception:
+                        self._log.exception(
+                            "daemon.agent_runner_reaped_arn_clear_failed",
+                            extra={
+                                "event": "agent_runner_reaped_arn_clear_failed",
+                                "run_id": self._run_id,
+                                "agent_id": agent_id,
+                                "issue_number": issue_number,
+                                "branch": "failure_already_terminal",
+                            },
+                        )
+                        try:
+                            self._conn.rollback()
+                        except Exception:  # pragma: no cover — defensive
+                            pass
                     reaped_failure += 1
                     continue
                 # Real failure — agent-runner died before it could write
@@ -20332,6 +20374,38 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+        # Issue #3329: clear ``agent_task_arn`` so the next reaper tick
+        # excludes this row from the SELECT. Without this clear, the
+        # SELECT (now keyed solely on ``agent_task_arn IS NOT NULL``)
+        # would re-observe the same already-finalized row forever and
+        # the daemon would re-call ``ecs:DescribeTasks`` for it on
+        # every tick. Idempotent — if the column is already NULL the
+        # UPDATE is a no-op. Best-effort: a DB hiccup here just defers
+        # the cleanup to the next successful tick.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET agent_task_arn = NULL "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.agent_runner_reaped_arn_clear_failed",
+                extra={
+                    "event": "agent_runner_reaped_arn_clear_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "branch": "success_already_terminal",
                 },
             )
             try:
