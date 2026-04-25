@@ -9080,6 +9080,7 @@ class DispatcherDaemon:
                     stdout=stdout_fh,
                     stderr=stderr_fh,
                     cwd=str(worktree),
+                    timeout=CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS,
                 )
                 returncode = proc.returncode
         except Exception:

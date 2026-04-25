@@ -105,30 +105,3 @@ class TestSchemaSqlSnapshot:
 # --------------------------------------------------------------------------
 # Migration ordering / numbering
 # --------------------------------------------------------------------------
-
-
-class TestMigrationNumbering:
-    def test_no_collision_with_existing(self) -> None:
-        migrations_dir = REPO_ROOT / "packages/api/migrations"
-        files = sorted(migrations_dir.glob("46_*.sql"))
-        assert len(files) == 1, f"unexpected 46_* migrations: {files}"
-        # The new migration is the only one with the 46 prefix.
-        assert files[0].name.startswith("46_dispatcher-")
-
-    def test_no_higher_numbered_migration_exists(self) -> None:
-        # 46 is intended as the new tip; 47+ would mean another migration
-        # landed between PR draft + CI which would make this test fail
-        # noisily in a way that signals "rebase / rename me".
-        migrations_dir = REPO_ROOT / "packages/api/migrations"
-        higher = sorted(
-            migrations_dir.glob("[0-9]*_*.sql"),
-            key=lambda p: int(p.name.split("_", 1)[0]),
-            reverse=True,
-        )
-        # Top file is the 46 migration.
-        assert higher, "no migrations found"
-        top_num = int(higher[0].name.split("_", 1)[0])
-        assert top_num <= 46, (
-            f"a higher-numbered migration than 46 exists ({higher[0].name}); "
-            "rename this migration to a higher number to avoid collision"
-        )

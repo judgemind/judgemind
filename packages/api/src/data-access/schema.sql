@@ -524,6 +524,25 @@ CREATE SEQUENCE dispatcher.failures_failure_id_seq
 ALTER SEQUENCE dispatcher.failures_failure_id_seq OWNED BY dispatcher.failures.failure_id;
 
 
+CREATE TABLE dispatcher.idle_hooks_state (
+    hook_name text NOT NULL,
+    last_run_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_run_agent_id uuid
+);
+
+
+COMMENT ON TABLE dispatcher.idle_hooks_state IS 'Tracks last run time and agent for each idle-triggered hook (audit, spotcheck).';
+
+
+COMMENT ON COLUMN dispatcher.idle_hooks_state.hook_name IS 'Hook identifier: ''audit'' or ''spotcheck''.';
+
+
+COMMENT ON COLUMN dispatcher.idle_hooks_state.last_run_at IS 'Timestamp of most recent spawn. Seeded to now() to suppress first-tick fires.';
+
+
+COMMENT ON COLUMN dispatcher.idle_hooks_state.last_run_agent_id IS 'FK to dispatcher.agents row for the most recent synthetic agent spawn; NULL before first run.';
+
+
 CREATE TABLE dispatcher.notifications (
     notification_id bigint NOT NULL,
     kind text NOT NULL,
@@ -1070,6 +1089,10 @@ ALTER TABLE ONLY dispatcher.failures
     ADD CONSTRAINT failures_pkey PRIMARY KEY (failure_id);
 
 
+ALTER TABLE ONLY dispatcher.idle_hooks_state
+    ADD CONSTRAINT idle_hooks_state_pkey PRIMARY KEY (hook_name);
+
+
 ALTER TABLE ONLY dispatcher.notifications
     ADD CONSTRAINT notifications_pkey PRIMARY KEY (notification_id);
 
@@ -1480,6 +1503,10 @@ ALTER TABLE ONLY dispatcher.diagnoses
 
 ALTER TABLE ONLY dispatcher.failures
     ADD CONSTRAINT failures_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.idle_hooks_state
+    ADD CONSTRAINT idle_hooks_state_last_run_agent_id_fkey FOREIGN KEY (last_run_agent_id) REFERENCES dispatcher.agents(agent_id);
 
 
 ALTER TABLE ONLY dispatcher.phase_outputs
