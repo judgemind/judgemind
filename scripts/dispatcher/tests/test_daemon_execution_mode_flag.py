@@ -131,6 +131,10 @@ class TestReadAgentExecutionMode:
         d = _make_daemon(value="ecs")
         assert d._read_agent_execution_mode() == "ecs"
 
+    def test_recognizes_subprocess(self) -> None:
+        d = _make_daemon(value="subprocess")
+        assert d._read_agent_execution_mode() == "subprocess"
+
     def test_unrecognized_falls_back_with_warning(self, caplog: Any) -> None:
         d = _make_daemon(value="docker")
         caplog.set_level(logging.WARNING, logger="test.daemon_execution_mode")
