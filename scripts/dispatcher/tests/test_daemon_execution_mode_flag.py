@@ -8,7 +8,7 @@ Coverage:
 * ``_read_agent_execution_mode`` returns the stored value when it's
   one of the recognized modes (``'subprocess'`` / ``'ecs'``), falls
   back to the default with a warning on an unrecognized value, and
-  defaults to ``'subprocess'`` when the row is missing.
+  defaults to ``'ecs'`` when the row is missing.
 * Claim-time dispatch branches on the read mode: ``'ecs'`` calls
   ``_launch_agent_ecs_task`` and skips ``_run_orchestration_phases``;
   ``'subprocess'`` takes the legacy path.
@@ -123,9 +123,9 @@ class TestCBConfigStr:
 
 
 class TestReadAgentExecutionMode:
-    def test_default_is_subprocess(self) -> None:
+    def test_default_is_ecs(self) -> None:
         d = _make_daemon(value=_MISSING)
-        assert d._read_agent_execution_mode() == "subprocess"
+        assert d._read_agent_execution_mode() == "ecs"
 
     def test_recognizes_ecs(self) -> None:
         d = _make_daemon(value="ecs")
@@ -134,7 +134,7 @@ class TestReadAgentExecutionMode:
     def test_unrecognized_falls_back_with_warning(self, caplog: Any) -> None:
         d = _make_daemon(value="docker")
         caplog.set_level(logging.WARNING, logger="test.daemon_execution_mode")
-        assert d._read_agent_execution_mode() == "subprocess"
+        assert d._read_agent_execution_mode() == "ecs"
         events = [getattr(r, "event", None) for r in caplog.records]
         assert "agent_execution_mode_unrecognized" in events
 
@@ -274,9 +274,9 @@ class TestExecutionModePersistenceAtomicClaim:
         # The last param should be 'ecs'.
         assert params[-1] == "ecs"
 
-    def test_atomic_claim_default_mode_is_subprocess(self) -> None:
+    def test_atomic_claim_default_mode_is_ecs(self) -> None:
         """Callers that don't pass execution_mode get the module-level
-        default — preserving pre-#3091 behaviour.
+        default — now 'ecs' since Stage 4 (#3093).
         """
         d = _make_daemon()
         with patch.object(d, "_gh_issue_add_labels"):
@@ -286,4 +286,4 @@ class TestExecutionModePersistenceAtomicClaim:
                 worktree_path="/tmp/wt",
             )
         _sql, params = d._main_conn.cursor_obj.executed[0]  # type: ignore[attr-defined]
-        assert params[-1] == "subprocess"
+        assert params[-1] == "ecs"
