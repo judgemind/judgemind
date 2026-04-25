@@ -127,7 +127,15 @@ def _insert(
     """Run the single INSERT. Psycopg is imported lazily."""
     import psycopg
 
-    with psycopg.connect(database_url, connect_timeout=10) as conn:
+    # #3356: bound per-query wall clock at 30s in addition to
+    # ``connect_timeout`` so a runaway lock or replica failover can't
+    # wedge the agent-runner-entrypoint subprocess. Mirror constant from
+    # daemon.py inline so this module stays import-free of daemon.py.
+    with psycopg.connect(
+        database_url,
+        connect_timeout=10,
+        options="-c statement_timeout=30000",
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"INSERT INTO {table} "
