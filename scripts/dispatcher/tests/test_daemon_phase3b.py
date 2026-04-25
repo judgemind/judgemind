@@ -268,6 +268,27 @@ class TestClassifyDeployRuns:
 
 
 # --------------------------------------------------------------------------
+# DEPLOY_WORKFLOW_NAMES contents — regression guard (#3185)
+# --------------------------------------------------------------------------
+
+
+class TestDeployWorkflowNamesContents:
+    def test_deploy_agent_runner_present(self) -> None:
+        assert "Deploy Agent Runner" in daemon.DEPLOY_WORKFLOW_NAMES
+
+    def test_existing_entries_present(self) -> None:
+        for name in (
+            "Deploy API",
+            "Deploy Dispatcher",
+            "Deploy Scraper",
+            "Deploy Production",
+            "Deploy Production (Web)",
+            "Terraform",
+        ):
+            assert name in daemon.DEPLOY_WORKFLOW_NAMES, f"{name!r} missing from DEPLOY_WORKFLOW_NAMES"
+
+
+# --------------------------------------------------------------------------
 # _extract_merge_sha
 # --------------------------------------------------------------------------
 

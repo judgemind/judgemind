@@ -4632,6 +4632,17 @@ else
          "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# DEPLOY_WORKFLOWS default — static regression guard (#3185)
+# ══════════════════════════════════════════════════════════════════════════
+
+if grep -qE '^DEPLOY_WORKFLOWS=.*deploy-agent-runner\.yml' "$ENTRYPOINT"; then
+    pass "#3185 — DEPLOY_WORKFLOWS default includes deploy-agent-runner.yml"
+else
+    fail "#3185 — DEPLOY_WORKFLOWS default includes deploy-agent-runner.yml" \
+         "deploy-agent-runner.yml not found in DEPLOY_WORKFLOWS default in $ENTRYPOINT"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
