@@ -80,11 +80,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
 
-    # If this is a new branch (remote_sha is all zeros), diff against the
-    # merge-base with origin/main so we check all new commits.
+    # If this is a new branch (remote_sha is all zeros), mark it for the
+    # PR-creation reminder at the end of the hook.
     if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
         push_is_new_branch=true
-        # Fetch main to make sure we have it
+    fi
+
+    # For new branches and force-pushes after rebase, diff against merge-base
+    # with origin/main so only this branch's own commits are checked (#3228).
+    # For normal existing-branch pushes (remote_sha is a valid ancestor of
+    # local_sha), keep remote_sha so only the newly-added commits are in scope.
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] || \
+       ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
         git fetch "$remote" main --quiet 2>/dev/null || true
         merge_base=$(git merge-base "$local_sha" "$remote/main" 2>/dev/null || echo "")
         if [ -z "$merge_base" ]; then
