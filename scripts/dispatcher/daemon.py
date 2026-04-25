@@ -11855,6 +11855,8 @@ class DispatcherDaemon:
         rebase_outcome: str = "skipped"
         conflict_paths: list[str] = []
         try:
+            # cold-path (#3089): non-blocking best-effort fetch; failure falls
+            # through to the push unchanged — no retry loop needed here.
             fetch_result = subprocess.run(
                 ["git", "-C", str(worktree), "fetch", "origin", "main"],
                 capture_output=True,
@@ -11878,6 +11880,8 @@ class DispatcherDaemon:
                 )
             else:
                 # Fetch succeeded; attempt the rebase.
+                # cold-path (#3089): local rebase op; conflicts abort cleanly;
+                # retry cannot resolve a conflict — outcome routes to failure.
                 rebase_result = subprocess.run(
                     ["git", "-C", str(worktree), "rebase", "origin/main"],
                     capture_output=True,
@@ -11901,6 +11905,8 @@ class DispatcherDaemon:
                     # Rebase conflict — capture conflicting files, abort,
                     # and fail the phase.
                     rebase_outcome = "conflict"
+                    # cold-path (#3089): local diff to enumerate conflict files;
+                    # no network; result used for diagnostics only.
                     diff_result = subprocess.run(
                         [
                             "git",
@@ -11918,6 +11924,8 @@ class DispatcherDaemon:
                     conflict_paths = [
                         p for p in diff_result.stdout.splitlines() if p.strip()
                     ]
+                    # cold-path (#3089): local cleanup (rebase --abort);
+                    # no network; idempotent — retry adds no value.
                     subprocess.run(
                         ["git", "-C", str(worktree), "rebase", "--abort"],
                         capture_output=True,
