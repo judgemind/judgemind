@@ -1,4 +1,12 @@
 {
+  "scraper_schedules": {
+    "_note": "Optional per-scraper cron overrides. Absent → always run (default). Timezone field is informational; cron is evaluated in UTC. sweep_interval default: 12h (matches EventBridge twice-daily cadence).",
+    "ca-oc-tentatives": {
+      "cron": "0 6,14,18 * * *",
+      "timezone": "America/Los_Angeles",
+      "_note": "OC posts cluster in the afternoons. 3x/day UTC (06, 14, 18) covers 11 PM, 7 AM, 11 AM PT. Smoke test entry for #2981."
+    }
+  },
   "counties": {
     "Los Angeles": {
       "expected_daily_rulings": 50,
@@ -8,7 +16,9 @@
     "Orange": {
       "expected_daily_rulings": 20,
       "schedule_type": "daily",
-      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"]
+      "posting_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+      "max_expected_gap_hours": 48,
+      "_note": "OC scraper now runs 3x/day (see scraper_schedules). Threshold raised to 48h to accommodate the less frequent cadence and OC's variable posting schedule."
     },
     "Santa Clara": {
       "expected_daily_rulings": 0.1,

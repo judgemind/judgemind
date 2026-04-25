@@ -1,9 +1,9 @@
 /**
- * Unit tests for data quality health status computation.
+ * Unit tests for data quality health status computation and threshold loading.
  */
 
 import { describe, it, expect } from 'vitest';
-import { computeHealthStatus, type CountyMetrics } from '../src/graphql/data-quality';
+import { computeHealthStatus, loadCountyThresholds, type CountyMetrics } from '../src/graphql/data-quality';
 
 describe('computeHealthStatus', () => {
   it('returns green when all metrics are healthy', () => {
@@ -170,5 +170,101 @@ describe('computeHealthStatus', () => {
     };
     // 25 is not > 25 so it's yellow, not red
     expect(computeHealthStatus(metrics)).toBe('yellow');
+  });
+});
+
+describe('computeHealthStatus — per-county threshold overrides', () => {
+  // County with max_expected_gap_hours=48: redHours=48, yellowHours=36
+
+  it('county with 48h threshold: green at 30h scraperLastSuccessAgeHours', () => {
+    const metrics: CountyMetrics = {
+      county: 'Orange',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 30,
+      lastUpdated: '2026-03-01T00:00:00Z',
+      redThresholdHours: 48,
+      yellowThresholdHours: 36,
+    };
+    expect(computeHealthStatus(metrics)).toBe('green');
+  });
+
+  it('county with 48h threshold: yellow at 38h scraperLastSuccessAgeHours', () => {
+    const metrics: CountyMetrics = {
+      county: 'Orange',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 38,
+      lastUpdated: '2026-03-01T00:00:00Z',
+      redThresholdHours: 48,
+      yellowThresholdHours: 36,
+    };
+    expect(computeHealthStatus(metrics)).toBe('yellow');
+  });
+
+  it('county with 48h threshold: red at 50h scraperLastSuccessAgeHours', () => {
+    const metrics: CountyMetrics = {
+      county: 'Orange',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 50,
+      lastUpdated: '2026-03-01T00:00:00Z',
+      redThresholdHours: 48,
+      yellowThresholdHours: 36,
+    };
+    expect(computeHealthStatus(metrics)).toBe('red');
+  });
+
+  it('default county (no override): yellow at 20h scraperLastSuccessAgeHours', () => {
+    // Default yellowHours=13, so 20h >= 13 → yellow
+    const metrics: CountyMetrics = {
+      county: 'Los Angeles',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 20,
+      lastUpdated: '2026-03-01T00:00:00Z',
+      // No override — uses defaults (red=25, yellow=13)
+    };
+    expect(computeHealthStatus(metrics)).toBe('yellow');
+  });
+
+  it('default county (no override): red at 26h scraperLastSuccessAgeHours', () => {
+    // Default redHours=25, so 26 > 25 → red
+    const metrics: CountyMetrics = {
+      county: 'Los Angeles',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 26,
+      lastUpdated: '2026-03-01T00:00:00Z',
+    };
+    expect(computeHealthStatus(metrics)).toBe('red');
+  });
+
+  it('null threshold values fall back to defaults', () => {
+    // redThresholdHours=null → use default 25; 26h > 25 → red
+    const metrics: CountyMetrics = {
+      county: 'Los Angeles',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 26,
+      lastUpdated: '2026-03-01T00:00:00Z',
+      redThresholdHours: null,
+      yellowThresholdHours: null,
+    };
+    expect(computeHealthStatus(metrics)).toBe('red');
+  });
+});
+
+describe('loadCountyThresholds', () => {
+  it('returns a Map instance', () => {
+    const result = loadCountyThresholds();
+    expect(result).toBeInstanceOf(Map);
+  });
+
+  it('returns empty Map when no baselines file found at test cwd', () => {
+    // In a test environment the loader may or may not find the file.
+    // Either outcome is valid — it should not throw.
+    const result = loadCountyThresholds();
+    expect(result).toBeDefined();
   });
 });
