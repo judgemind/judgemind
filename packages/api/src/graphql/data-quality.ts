@@ -67,10 +67,13 @@ interface CountyMetrics {
 /**
  * Compute health status from the latest metrics for a county.
  *
+ * Thresholds are calibrated against the twice-daily scraper schedule (6:15 AM
+ * and 6:15 PM PT) plus a 1-hour slack for FlexibleTimeWindow and runtime:
+ *
  * - Green: ruling_count_24h > 0 AND field_completeness_pct >= 90
- *          AND scraper_last_success_age_hours < 6
- * - Yellow: any metric slightly degraded (completeness 70-90%, scraper age 6-24h)
- * - Red: scraper down > 24h OR completeness < 70% OR zero rulings when expected
+ *          AND scraper_last_success_age_hours < 13
+ * - Yellow: any metric slightly degraded (completeness 70-90%, scraper age 13-25h)
+ * - Red: scraper down > 25h OR completeness < 70% OR zero rulings when expected
  */
 export function computeHealthStatus(metrics: CountyMetrics): string {
   const { rulingCount24h, fieldCompletenessPct, scraperLastSuccessAgeHours } = metrics;
@@ -81,19 +84,19 @@ export function computeHealthStatus(metrics: CountyMetrics): string {
   }
 
   // Check for red conditions
-  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours > 24) return 'red';
+  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours > 25) return 'red';
   if (fieldCompletenessPct !== null && fieldCompletenessPct < 70) return 'red';
   if (rulingCount24h !== null && rulingCount24h === 0) return 'red';
 
   // Check for yellow conditions
   if (fieldCompletenessPct !== null && fieldCompletenessPct < 90) return 'yellow';
-  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours >= 6) return 'yellow';
+  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours >= 13) return 'yellow';
 
   // Check for green: all available metrics look good
   const isGreen =
     (rulingCount24h === null || rulingCount24h > 0) &&
     (fieldCompletenessPct === null || fieldCompletenessPct >= 90) &&
-    (scraperLastSuccessAgeHours === null || scraperLastSuccessAgeHours < 6);
+    (scraperLastSuccessAgeHours === null || scraperLastSuccessAgeHours < 13);
 
   return isGreen ? 'green' : 'yellow';
 }

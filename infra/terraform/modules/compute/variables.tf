@@ -47,7 +47,7 @@ variable "task_memory" {
 }
 
 variable "schedule_expression" {
-  description = "EventBridge schedule expression — rate (e.g. rate(1 day)) or cron (e.g. cron(0 13 * * ? *) for 6 AM PT)"
+  description = "EventBridge schedule expression — rate (e.g. rate(1 day)) or cron (e.g. cron(15 6,18 * * ? *) for 6:15 AM/PM PT)"
   type        = string
   default     = "rate(1 day)"
 }

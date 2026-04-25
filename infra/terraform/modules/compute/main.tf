@@ -199,7 +199,7 @@ resource "aws_ecs_task_definition" "scraper" {
 }
 
 # ─── EventBridge Scheduler ──────────────────────────────────────────────────
-# Runs the scraper task on a daily schedule. EventBridge Scheduler replaces
+# Runs the scraper task on a twice-daily schedule. EventBridge Scheduler replaces
 # the legacy CloudWatch Events / EventBridge Rules pattern and supports
 # native ECS RunTask targets without a Lambda intermediary.
 

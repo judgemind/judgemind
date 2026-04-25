@@ -3,8 +3,8 @@
 # Manages networking, storage, IAM, compute, and email for the production
 # environment.
 #
-# The compute schedule is enabled. The EventBridge Scheduler triggers a daily
-# scraper run at 6 AM PT.
+# The compute schedule is enabled. The EventBridge Scheduler triggers a
+# twice-daily scraper run at 6:15 AM and 6:15 PM PT.
 
 # Look up secrets so we can pass their ARNs to the compute module
 # without hardcoding the random Secrets Manager suffix.
@@ -72,10 +72,10 @@ module "compute" {
   courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
   capsolver_api_key_secret_arn       = data.aws_secretsmanager_secret.capsolver_api_key.arn
 
-  # Production: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
+  # Production: 1 vCPU, 2 GB RAM, twice-daily schedule at 6:15 AM and 6:15 PM PT
   task_cpu            = 1024
   task_memory         = 2048
-  schedule_expression = "cron(0 6 * * ? *)"
+  schedule_expression = "cron(15 6,18 * * ? *)"
   schedule_timezone   = "America/Los_Angeles"
   schedule_enabled    = true
   log_retention_days  = 30
