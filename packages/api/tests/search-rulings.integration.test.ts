@@ -2,7 +2,8 @@
  * Integration tests for the searchRulings GraphQL query.
  *
  * Requires both PostgreSQL and OpenSearch to be running locally.
- * OpenSearch must be accessible at http://localhost:9200 (or OPENSEARCH_URL).
+ * OpenSearch must be accessible at TEST_OPENSEARCH_URL (see setup-opensearch.ts
+ * for why this is distinct from the operational OPENSEARCH_URL).
  * PostgreSQL must be accessible at TEST_DATABASE_URL (see #3006 for why this
  * is distinct from the operational DATABASE_URL).
  *
@@ -21,6 +22,7 @@ import { Client } from '@opensearch-project/opensearch';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { applyMigrations } from './setup-db';
+import { getTestOpenSearchUrl } from './setup-opensearch';
 import { TEST_COUNTY_REGISTRY } from './test-counties';
 
 // Extract county/court_code from registry for compile-time enforcement
@@ -43,7 +45,7 @@ const pool = new Pool({
 });
 
 const osClient = new Client({
-  node: process.env.OPENSEARCH_URL ?? 'http://localhost:9200',
+  node: getTestOpenSearchUrl(),
   ssl: { rejectUnauthorized: false },
 });
 
