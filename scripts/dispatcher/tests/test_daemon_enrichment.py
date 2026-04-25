@@ -935,7 +935,7 @@ class TestFetchIssuesTitleCap:
     def test_cap_limits_gh_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When >MAX_BLOCKER_TITLE_FETCH unique blockers are passed, only the
         first MAX_BLOCKER_TITLE_FETCH are fetched; the rest are absent."""
-        from scripts.dispatcher.daemon import MAX_BLOCKER_TITLE_FETCH
+        from dispatcher.daemon import MAX_BLOCKER_TITLE_FETCH
 
         d, _conn, _handler = _make_daemon_with_capture()
 
