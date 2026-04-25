@@ -18447,6 +18447,7 @@ class DispatcherDaemon:
                 text=True,
                 cwd=str(repo_root),
                 env=diagnoser_env,
+                # noqa: timeout-required: issue-3376-fire-and-forget-reaper-enforces-90min-budget
                 # Detach into its own process group so the reaper's
                 # SIGTERM/SIGKILL targets only the diagnoser tree.
                 # Cross-platform safe: ``start_new_session`` is a
