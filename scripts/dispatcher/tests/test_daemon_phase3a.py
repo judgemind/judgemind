@@ -1190,10 +1190,10 @@ class TestAtomicClaim:
             if "INSERT INTO dispatcher.agents" in e[0]
         ]
         _sql, params = inserts[0]
-        # Priority = NULL (second-to-last); execution_mode = 'subprocess'
-        # (last, migration 41 / #3091 default).
+        # Priority = NULL (second-to-last); execution_mode = 'ecs'
+        # (last, DEFAULT_AGENT_EXECUTION_MODE flipped to 'ecs' by #3093).
         assert params[-2] is None
-        assert params[-1] == "subprocess"
+        assert params[-1] == "ecs"
 
     def test_unique_violation_returns_false(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
@@ -1960,6 +1960,9 @@ class TestHappyPathOrchestration:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        # Force subprocess mode so this legacy-path test exercises the
+        # subprocess lane regardless of DEFAULT_AGENT_EXECUTION_MODE (#3093).
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         # Run orchestration.
         d._claim_and_orchestrate_one()
@@ -2110,6 +2113,7 @@ class TestPlanGoFalse:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 
@@ -2203,6 +2207,7 @@ class TestPlanGoFalse:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 
@@ -2739,6 +2744,7 @@ class TestPlanBlockedHandler:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 
@@ -2820,6 +2826,7 @@ class TestRalphBlocked:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 
@@ -2891,6 +2898,7 @@ class TestSubprocessNonZeroExit:
             return 1, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 
@@ -3446,6 +3454,7 @@ class TestNeedsReviewOrchestration:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 
@@ -3578,6 +3587,7 @@ class TestNeedsReviewOrchestration:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         d._claim_and_orchestrate_one()
 

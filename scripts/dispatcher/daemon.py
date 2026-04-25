@@ -349,12 +349,12 @@ DEFAULT_HEARTBEAT_METRIC_NAMESPACE = "Judgemind/Dispatcher"
 DEFAULT_AWS_REGION = "us-west-2"
 
 #: Default value for ``dispatcher.config.agent_execution_mode`` when the
-#: row is missing or malformed. ``'subprocess'`` keeps the pre-#3091
-#: behaviour — the daemon spawns per-phase ``claude -p`` subprocesses
-#: inside its own container — and is the safe default until Stage 3
-#: smoke (#3092) confirms the ECS path end-to-end and Stage 4 (#3093)
-#: flips this default.
-DEFAULT_AGENT_EXECUTION_MODE = "subprocess"
+#: row is missing or malformed. Flipped to ``'ecs'`` by Stage 4 (#3093)
+#: after Stage 3 smoke (#3092) confirmed the ECS path end-to-end. New
+#: agents claim with ``execution_mode='ecs'`` (per-agent Fargate task via
+#: ``ecs:RunTask``) unless overridden via ``dispatcher.config``. The
+#: subprocess code path remains reachable via an explicit config row.
+DEFAULT_AGENT_EXECUTION_MODE = "ecs"
 
 #: Valid values for ``dispatcher.config.agent_execution_mode``. Anything
 #: outside this set falls back to :data:`DEFAULT_AGENT_EXECUTION_MODE`
@@ -5021,10 +5021,14 @@ class DispatcherDaemon:
                 )
                 for row in cur.fetchall():
                     raw_mode = row[3] if len(row) > 3 else None
+                    # NULL execution_mode means a pre-migration-41 row —
+                    # it was always a subprocess agent. Explicitly default
+                    # to 'subprocess' here (not DEFAULT_AGENT_EXECUTION_MODE)
+                    # so new rows that happen to be NULL (migration hiccup,
+                    # hand-edit) still take the legacy abandon path rather
+                    # than the ECS-survival path. See #3152 / #3093.
                     mode = (
-                        str(raw_mode).lower()
-                        if raw_mode is not None
-                        else DEFAULT_AGENT_EXECUTION_MODE
+                        str(raw_mode).lower() if raw_mode is not None else "subprocess"
                     )
                     raw_arn = row[4] if len(row) > 4 else None
                     task_arn = str(raw_arn) if raw_arn is not None else None
@@ -12675,12 +12679,14 @@ class DispatcherDaemon:
                                 if len(row) > 7 and row[7] is not None
                                 else 0
                             ),
-                            # #3196: default to 'subprocess' if COALESCE
+                            # #3196: fall back to 'subprocess' if COALESCE
                             # in the SELECT is stripped by a fake cursor
-                            # in tests. Also defaults to 'subprocess'
-                            # when the column is absent (pre-#3091
-                            # migration rows); the subprocess lane is
-                            # the legacy/safe default.
+                            # in tests, or when the column is absent on
+                            # pre-#3091 migration rows. Those rows were
+                            # claimed under subprocess mode — preserving
+                            # 'subprocess' here keeps them on the legacy
+                            # lane for their lifetime. New agents use
+                            # DEFAULT_AGENT_EXECUTION_MODE ('ecs', #3093).
                             "execution_mode": (
                                 str(row[8]) if len(row) > 8 and row[8] else "subprocess"
                             ),

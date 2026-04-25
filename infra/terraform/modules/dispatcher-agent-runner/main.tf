@@ -329,3 +329,53 @@ resource "aws_ecs_task_definition" "agent_runner" {
     }
   ])
 }
+
+# ── Agent-runner error alarm (#3093) ─────────────────────────────────────────
+# Fires when any ERROR or FATAL structured-log event is emitted by an
+# agent-runner task. A single unhandled exception inside a phase
+# (unrecognized exit code, missing env var, AWS throttle) appears here
+# before the daemon reap pass has a chance to notice the STOPPED task,
+# giving operators an early signal.
+#
+# Gated behind enable_alerts (default false) so non-prod environments
+# stay quiet. Wire enable_alerts = true in the dev module block once
+# the SNS topic ARN is available (mirrors the dispatcher-daemon pattern).
+#
+# Mirrors the filter/alarm shape at
+# infra/terraform/modules/dispatcher-daemon/main.tf (stuck_timeout_repeated).
+
+resource "aws_cloudwatch_log_metric_filter" "agent_runner_errors" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.task_family}-errors"
+  pattern        = "{ $.level = \"ERROR\" || $.level = \"FATAL\" }"
+  log_group_name = aws_cloudwatch_log_group.agent_runner.name
+
+  metric_transformation {
+    name          = "AgentRunnerErrorCount"
+    namespace     = "Judgemind/AgentRunner"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "agent_runner_errors" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.task_family}-errors"
+  alarm_description = "An agent-runner task emitted an ERROR or FATAL log event (${var.environment}). A phase may have crashed before the daemon reap pass observed a STOPPED task — check ${aws_cloudwatch_log_group.agent_runner.name}."
+
+  namespace   = "Judgemind/AgentRunner"
+  metric_name = "AgentRunnerErrorCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
