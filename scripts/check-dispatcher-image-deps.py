@@ -104,6 +104,14 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 IMPORT_TO_PACKAGE: dict[str, str] = {
     "boto3": "boto3",
+    # ``botocore`` is a hard transitive dependency of ``boto3`` — pip
+    # always installs it alongside ``boto3``, so mapping the import to
+    # the ``boto3`` pip name keeps the check honest without requiring a
+    # redundant ``botocore`` pip-install line in Dockerfile.dispatcher.
+    # The dispatcher daemon imports ``botocore.config`` lazily inside
+    # :meth:`DispatcherDaemon._make_ecs_client` to set explicit
+    # connect/read timeouts (#3351).
+    "botocore": "boto3",
     "psycopg": "psycopg",
     "yaml": "PyYAML",
 }
