@@ -893,6 +893,10 @@ class TestTerminalPhaseAndStatus:
         """#3225 — fix_conflict budget-exhausted / unresolvable terminal."""
         assert pt.is_terminal_phase(pt.PHASE_CONFLICT_UNRESOLVABLE) is True
 
+    def test_is_terminal_phase_true_for_agent_runner_route_stub(self) -> None:
+        """#3137 — agent-runner route stub terminal (Stage 1b)."""
+        assert pt.is_terminal_phase(pt.PHASE_AGENT_RUNNER_ROUTE_STUB) is True
+
     def test_fix_conflict_is_intermediate_not_terminal(self) -> None:
         """#3225 — fix_conflict is active, not terminal (it advances)."""
         assert pt.is_terminal_phase(pt.PHASE_FIX_CONFLICT) is False
