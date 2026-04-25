@@ -42,9 +42,9 @@ resource "aws_iam_policy" "ecs_dev_only" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "EcsDevCluster"
-        Effect = "Allow"
-        Action = [
+        Sid      = "EcsDevCluster"
+        Effect   = "Allow"
+        Action   = [
           "ecs:RunTask",
           "ecs:DescribeTasks",
           "ecs:ListTasks",
@@ -81,9 +81,9 @@ resource "aws_iam_policy" "logs_dev_groups" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "LogsDevGroups"
-        Effect = "Allow"
-        Action = [
+        Sid      = "LogsDevGroups"
+        Effect   = "Allow"
+        Action   = [
           "logs:GetLogEvents",
           "logs:DescribeLogGroups",
           "logs:DescribeLogStreams",
@@ -116,9 +116,9 @@ resource "aws_iam_policy" "s3_staging_prefixes" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "AllowObjectOps"
-        Effect = "Allow"
-        Action = [
+        Sid      = "AllowObjectOps"
+        Effect   = "Allow"
+        Action   = [
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject"
@@ -129,10 +129,10 @@ resource "aws_iam_policy" "s3_staging_prefixes" {
         ]
       },
       {
-        Sid    = "AllowListBucket"
-        Effect = "Allow"
-        Action = "s3:ListBucket"
-        Resource = var.document_archive_bucket_arn
+        Sid       = "AllowListBucket"
+        Effect    = "Allow"
+        Action    = "s3:ListBucket"
+        Resource  = var.document_archive_bucket_arn
         Condition = {
           StringLike = {
             "s3:prefix" = ["staging/", "staging", "spotcheck/", "spotcheck"]
