@@ -1190,10 +1190,10 @@ class TestAtomicClaim:
             if "INSERT INTO dispatcher.agents" in e[0]
         ]
         _sql, params = inserts[0]
-        # Priority = NULL (second-to-last); execution_mode = 'subprocess'
-        # (last, migration 41 / #3091 default).
+        # Priority = NULL (second-to-last); execution_mode = 'ecs'
+        # (last, #3093 default flip).
         assert params[-2] is None
-        assert params[-1] == "subprocess"
+        assert params[-1] == "ecs"
 
     def test_unique_violation_returns_false(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
@@ -1864,6 +1864,7 @@ class TestHappyPathOrchestration:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         # Named fetch_responses dispatcher (issue #2793) — robust against
         # positional reordering of DB calls.
@@ -2059,6 +2060,7 @@ class TestPlanGoFalse:
         infrastructure/subprocess failures.
         """
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
@@ -2144,6 +2146,7 @@ class TestPlanGoFalse:
         and no labels are swapped — the agent simply exits cleanly.
         """
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
@@ -2682,6 +2685,7 @@ class TestPlanBlockedHandler:
         the cooldown loop would not trip the stale-agent cleaner.
         """
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
@@ -2765,6 +2769,7 @@ class TestPlanBlockedHandler:
 class TestRalphBlocked:
     def test_ralph_blocked_marks_failed(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
@@ -2848,6 +2853,7 @@ class TestSubprocessNonZeroExit:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         # Fetches in order: (1) Phase 3C resume-retry SELECT — no
         # retrying agent; (2) latest queue_snapshot issue_numbers;
         # (3) _issue_already_attempted SELECT — not attempted.
@@ -3377,6 +3383,7 @@ class TestNeedsReviewOrchestration:
         and the PR body contains the ⚠️ Unmet AC section.
         """
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         # (1) Phase 3C resume — no retrying; (2) queue snapshot; (3) not-attempted.
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
@@ -3521,6 +3528,7 @@ class TestNeedsReviewOrchestration:
         supervisor + admin cockpit see it consistently.
         """
         d, conn, handler = _make_daemon(tmp_path)
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)

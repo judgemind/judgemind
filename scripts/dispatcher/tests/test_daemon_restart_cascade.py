@@ -167,9 +167,9 @@ class TestRecoverAbandonedAgents:
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
 
-        # One abandoned agent from a prior run.
+        # One abandoned agent from a prior run (subprocess mode — takes the abandon path).
         conn.cursor_instance.fetchall_queue = [
-            [("agent-abandoned", 2807, "ralph")],
+            [("agent-abandoned", 2807, "ralph", "subprocess", None)],
         ]
         # _write_failure → _mark_agent_terminal → _create_retry_marker
         # reads nothing via fetchone in the write path except the
