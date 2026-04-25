@@ -827,6 +827,13 @@ GH_AUTH_SETUP_GIT_TIMEOUT_SECONDS = 10
 #: timeout fallback of 30 min in :data:`STUCK_TIMEOUT_SECONDS`.
 GIT_PUSH_TIMEOUT_SECONDS = 1800
 
+#: Timeout for the pre-push ``git rebase origin/main`` inserted by
+#: :meth:`DispatcherDaemon._push_and_open_pr` (issue #2964). The rebase
+#: replays a small number of commits against a fast-forward base; 300 s
+#: (5 min) is clearly sufficient while still catching a genuinely-stuck
+#: rebase process.
+GIT_REBASE_TIMEOUT_SECONDS = 300
+
 #: Per-issue cooldown — skip an issue from candidate selection if its
 #: most recent ``dispatcher.agents`` row (any status) was created
 #: within this many seconds. Prevents a systemically-broken issue from
@@ -1228,6 +1235,11 @@ FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED = "merge_unstick_exhausted"
 #: rebase today — but when it is added it must route here.
 FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 
+#: daemon-side ``_push_and_open_pr`` pre-push rebase against ``origin/main``
+#: hit a conflict; rebase was aborted and worktree restored. No mechanical
+#: retry — proper LLM-resolution path is the follow-up issue. Tier-3.
+FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH = "merge_conflict_at_push"
+
 #: GitHub's rejection stderr fragment when branch protection's
 #: statusCheckRollup evaluator still sees a stale FAILURE check_run
 #: from an earlier CI attempt even though the *latest* ci-passed
@@ -1502,6 +1514,11 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         # from the phase_outputs row and picks AC_INFEASIBLE vs
         # retry_with_hint based on the semantic-collision signal.
         FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
+        # #2964: pre-push rebase in _push_and_open_pr detected a conflict;
+        # rebase was aborted and the worktree was restored. No auto-retry
+        # path — the diagnoser picks block_and_comment or
+        # file_prerequisite_task based on the conflict files.
+        FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH,
     }
 )
 
@@ -11809,9 +11826,186 @@ class DispatcherDaemon:
                 },
             )
 
-        # git push -u origin <branch>
+        # Compute branch name here so it is available for the pre-push
+        # rebase structured log (issue #2964) as well as the push command.
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         branch = f"agent/{short_id}"
+
+        # Issue #2964: pre-push rebase — bring the branch up-to-date with
+        # origin/main before pushing, so a fast-forward push is possible
+        # and merge conflicts are caught locally (with a meaningful error)
+        # rather than manifesting as a CI failure or post-merge regression.
+        #
+        # Flow:
+        #   1. ``git fetch origin main`` — update the local tracking ref.
+        #      Non-blocking: fetch failure (network, DNS) is logged as a
+        #      warning and we fall through to the push unchanged.
+        #   2. ``git rebase origin/main`` — replay the agent's commits on
+        #      top of the updated main. Three outcomes:
+        #      a. rc==0 (clean or already-up-to-date): proceed to push.
+        #      b. rc!=0 (conflict): capture conflicting files, abort the
+        #         rebase, persist a phase_outputs row, call
+        #         ``_handle_agent_failure`` with
+        #         ``FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH``, and return.
+        #         Push does NOT happen.
+        #   3. Always emit a ``daemon.push_and_pr_pre_push_rebase``
+        #      structured log event with ``fetch_ok``, ``rebase_outcome``,
+        #      and ``conflict_files_count`` for CloudWatch metric queries.
+        fetch_ok: bool = True
+        rebase_outcome: str = "skipped"
+        conflict_paths: list[str] = []
+        try:
+            # cold-path (#3089): non-blocking best-effort fetch; failure falls
+            # through to the push unchanged — no retry loop needed here.
+            fetch_result = subprocess.run(
+                ["git", "-C", str(worktree), "fetch", "origin", "main"],
+                capture_output=True,
+                text=True,
+                timeout=BASELINE_FETCH_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if fetch_result.returncode != 0:
+                fetch_ok = False
+                self._log.warning(
+                    "daemon.push_and_pr_fetch_failed",
+                    extra={
+                        "event": "push_and_pr_fetch_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "branch": branch,
+                        "exit_code": fetch_result.returncode,
+                        "stderr_tail": _stderr_tail(fetch_result.stderr),
+                    },
+                )
+            else:
+                # Fetch succeeded; attempt the rebase.
+                # cold-path (#3089): local rebase op; conflicts abort cleanly;
+                # retry cannot resolve a conflict — outcome routes to failure.
+                rebase_result = subprocess.run(
+                    ["git", "-C", str(worktree), "rebase", "origin/main"],
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_REBASE_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if rebase_result.returncode == 0:
+                    rebase_outcome = "clean"
+                    self._log.info(
+                        "daemon.push_and_pr_rebase_done",
+                        extra={
+                            "event": "push_and_pr_rebase_done",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "branch": branch,
+                        },
+                    )
+                else:
+                    # Rebase conflict — capture conflicting files, abort,
+                    # and fail the phase.
+                    rebase_outcome = "conflict"
+                    # cold-path (#3089): local diff to enumerate conflict files;
+                    # no network; result used for diagnostics only.
+                    diff_result = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(worktree),
+                            "diff",
+                            "--name-only",
+                            "--diff-filter=U",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    conflict_paths = [
+                        p for p in diff_result.stdout.splitlines() if p.strip()
+                    ]
+                    # cold-path (#3089): local cleanup (rebase --abort);
+                    # no network; idempotent — retry adds no value.
+                    subprocess.run(
+                        ["git", "-C", str(worktree), "rebase", "--abort"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    log_text = (
+                        rebase_result.stderr
+                        + "\n--- conflict files ---\n"
+                        + "\n".join(conflict_paths)
+                    )
+                    self._persist_phase_output(
+                        agent_id,
+                        phase="push_and_pr",
+                        output_json={
+                            "event": "merge_conflict_at_push",
+                            "conflict_files": conflict_paths,
+                        },
+                        log_text=log_text,
+                    )
+                    # Emit the observability event before returning so the
+                    # CloudWatch filter can see both paths.
+                    self._log.info(
+                        "daemon.push_and_pr_pre_push_rebase",
+                        extra={
+                            "event": "push_and_pr_pre_push_rebase",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "branch": branch,
+                            "fetch_ok": fetch_ok,
+                            "rebase_outcome": rebase_outcome,
+                            "conflict_files_count": len(conflict_paths),
+                        },
+                    )
+                    self._handle_agent_failure(
+                        agent_id=agent_id,
+                        phase="push_and_pr",
+                        category=FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH,
+                        stderr_tail=_stderr_tail(rebase_result.stderr),
+                        exit_code=rebase_result.returncode,
+                        details={
+                            "conflict_files": conflict_paths,
+                            "rebase_outcome": "conflict",
+                        },
+                        issue_number=issue_number,
+                    )
+                    return
+        except subprocess.TimeoutExpired:
+            fetch_ok = False
+            self._log.warning(
+                "daemon.push_and_pr_fetch_failed",
+                extra={
+                    "event": "push_and_pr_fetch_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "branch": branch,
+                    "exit_code": None,
+                    "stderr_tail": "TimeoutExpired",
+                },
+            )
+
+        # Always emit the observability event (non-conflict paths).
+        self._log.info(
+            "daemon.push_and_pr_pre_push_rebase",
+            extra={
+                "event": "push_and_pr_pre_push_rebase",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "branch": branch,
+                "fetch_ok": fetch_ok,
+                "rebase_outcome": rebase_outcome,
+                "conflict_files_count": len(conflict_paths),
+            },
+        )
+
+        # git push -u origin <branch>
         push_cmd = [
             "git",
             "-C",

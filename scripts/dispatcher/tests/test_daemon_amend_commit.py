@@ -166,12 +166,24 @@ class TestPushAndOpenPrUsesAmend:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
+        # Issue #2964: pre-push fetch+rebase inserted before git push.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         with patch(
             "subprocess.run",
             side_effect=[
                 rev_list_ahead,
                 commit_ok,
                 git_show_empty,
+                fetch_ok,
+                rebase_ok,
                 push_ok,
                 pr_create_ok,
             ],
@@ -246,12 +258,24 @@ class TestPushAndOpenPrUsesAmend:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
+        # Issue #2964: pre-push fetch+rebase inserted before git push.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         with patch(
             "subprocess.run",
             side_effect=[
                 rev_list_ahead,
                 commit_ok,
                 git_show_empty,
+                fetch_ok,
+                rebase_ok,
                 push_ok,
                 pr_create_ok,
             ],
@@ -303,12 +327,24 @@ class TestPushAndOpenPrUsesAmend:
         rev_list_ahead = subprocess.CompletedProcess(
             args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
         )
+        # Issue #2964: pre-push fetch+rebase inserted before git push.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         with patch(
             "subprocess.run",
             side_effect=[
                 rev_list_ahead,
                 commit_ok,
                 git_show_empty,
+                fetch_ok,
+                rebase_ok,
                 push_ok,
                 pr_create_ok,
             ],

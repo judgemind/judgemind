@@ -43,8 +43,12 @@ from dispatcher import daemon  # noqa: E402  — sys.path mutation above
 from dispatcher.daemon import (  # noqa: E402
     AUTO_RETRY_CATEGORIES,
     FAILURE_CATEGORY_GIT_PUSH_NETWORK,
+    FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH,
     FAILURE_CATEGORY_PRE_PUSH_HOOK_REJECTED,
     FAILURE_CATEGORY_PUSH_FAILED,
+    TIER_2_FIRST_OCCURRENCE_CATEGORIES,
+    TIER_2_RECURRENCE_CATEGORIES,
+    TIER_3_CATEGORIES,
     _classify_push_failure,
 )
 
@@ -303,6 +307,16 @@ class TestGitPushFailedWritesFailureRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        # Issue #2964: pre-push fetch+rebase inserted before git push.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         # Issue #3089: ``git push`` now routes through the shared
         # 3-attempt retry helper, so the failing push consumes 3
         # ``subprocess.run`` calls instead of 1. ``time.sleep`` is
@@ -311,6 +325,8 @@ class TestGitPushFailedWritesFailureRow:
             rev_list_ahead,
             commit_ok,
             git_show_empty,
+            fetch_ok,
+            rebase_ok,
             push_fail,
             push_fail,
             push_fail,
@@ -385,6 +401,16 @@ class TestGitPushFailedWritesFailureRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        # Issue #2964: pre-push fetch+rebase inserted before git push.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         # Issue #3089: 3-attempt retry — 3 push_fail results needed.
         with (
             patch(
@@ -393,6 +419,8 @@ class TestGitPushFailedWritesFailureRow:
                     rev_list_ahead,
                     commit_ok,
                     git_show_empty,
+                    fetch_ok,
+                    rebase_ok,
                     push_fail,
                     push_fail,
                     push_fail,
@@ -459,6 +487,16 @@ class TestGitPushFailedWritesPhaseOutputRow:
         git_show_empty = subprocess.CompletedProcess(
             args=["git", "show"], returncode=0, stdout="", stderr=""
         )
+        # Issue #2964: pre-push fetch+rebase inserted before git push.
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
         # Issue #3089: 3-attempt retry — 3 push_fail results needed.
         with (
             patch(
@@ -467,6 +505,8 @@ class TestGitPushFailedWritesPhaseOutputRow:
                     rev_list_ahead,
                     commit_ok,
                     git_show_empty,
+                    fetch_ok,
+                    rebase_ok,
                     push_fail,
                     push_fail,
                     push_fail,
@@ -572,4 +612,411 @@ class TestGitPushFailedSummaryTooltip:
         assert "(git push failed)" in summary, f"Unexpected summary: {summary!r}"
         assert "push_failed" not in summary, (
             f"Raw category token leaked into summary: {summary!r}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Pre-push rebase block (issue #2964)
+# --------------------------------------------------------------------------
+
+
+def _make_push_and_pr_base(
+    tmp_path: Path,
+    *,
+    agent_id: str = "aaaabbbb-0000-0000-0000-000000000010",
+    worktree_name: str = "wt",
+) -> tuple[
+    daemon.DispatcherDaemon,
+    _FakeConnection,
+    _CapturingLogHandler,
+    Path,
+    str,
+]:
+    """Return a daemon + conn + handler + worktree + agent_id tuple.
+
+    The daemon's summary output and phase-update mocks are pre-wired for
+    the happy path.  Tests that need different setup override after calling
+    this helper.
+    """
+    d, conn, handler = _make_daemon(tmp_path)
+    worktree = tmp_path / worktree_name
+    worktree.mkdir()
+    (worktree / "tmp").mkdir()
+
+    d._agent_summary_output = {  # type: ignore[attr-defined]
+        "commit_message": "feat: test commit",
+        "pr_title": "Test PR",
+        "pr_body_md": "body",
+    }
+    d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+    d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
+    d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
+    d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
+    return d, conn, handler, worktree, agent_id
+
+
+class TestPrePushRebase:
+    """Issue #2964 — pre-push fetch+rebase block in _push_and_open_pr."""
+
+    def test_rebase_conflict_writes_failure_row_with_category(
+        self, tmp_path: Path
+    ) -> None:
+        """Rebase conflict writes a failures row with merge_conflict_at_push
+        category, does NOT call git push, and calls git rebase --abort."""
+        d, conn, _handler, worktree, agent_id = _make_push_and_pr_base(
+            tmp_path, worktree_name="wt_conflict"
+        )
+
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
+        commit_ok = subprocess.CompletedProcess(
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
+        )
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_conflict = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=1,
+            stdout="",
+            stderr="CONFLICT (content): Merge conflict in packages/api/foo.py",
+        )
+        diff_conflict_files = subprocess.CompletedProcess(
+            args=["git", "diff"],
+            returncode=0,
+            stdout="packages/api/foo.py\n",
+            stderr="",
+        )
+        rebase_abort_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "--abort"], returncode=0, stdout="", stderr=""
+        )
+
+        run_side_effects = [
+            rev_list_ahead,
+            commit_ok,
+            git_show_empty,
+            fetch_ok,
+            rebase_conflict,
+            diff_conflict_files,
+            rebase_abort_ok,
+        ]
+        with patch("subprocess.run", side_effect=run_side_effects) as run_mock:
+            d._push_and_open_pr(
+                agent_id=agent_id,
+                issue_number=2964,
+                worktree=worktree,
+            )
+
+        # Assert: dispatcher.failures INSERT has category == merge_conflict_at_push.
+        failure_inserts = [
+            (sql, params)
+            for sql, params in conn.cursor_instance.executed
+            if "dispatcher.failures" in sql and "INSERT" in sql
+        ]
+        assert failure_inserts, (
+            f"Expected INSERT into dispatcher.failures; executed: {conn.cursor_instance.executed}"
+        )
+        _sql, params = failure_inserts[0]
+        assert params[1] == FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH, (
+            f"Expected merge_conflict_at_push category; got {params[1]!r}"
+        )
+
+        # Assert: git push was NOT called.
+        all_argv = [call.args[0] for call in run_mock.call_args_list]
+        push_calls = [
+            argv for argv in all_argv if "push" in argv and "--abort" not in argv
+        ]
+        assert not push_calls, (
+            f"git push should NOT be called on conflict; calls: {push_calls}"
+        )
+
+        # Assert: git rebase --abort was called.
+        abort_calls = [
+            argv for argv in all_argv if "rebase" in argv and "--abort" in argv
+        ]
+        assert abort_calls, "git rebase --abort was not called"
+
+    def test_rebase_conflict_log_text_includes_conflict_files(
+        self, tmp_path: Path
+    ) -> None:
+        """The phase_outputs log_text contains the conflicting file paths."""
+        d, conn, _handler, worktree, agent_id = _make_push_and_pr_base(
+            tmp_path, worktree_name="wt_conflict2"
+        )
+
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
+        commit_ok = subprocess.CompletedProcess(
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
+        )
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_conflict = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=1,
+            stdout="",
+            stderr="CONFLICT: merge conflict",
+        )
+        diff_conflict_files = subprocess.CompletedProcess(
+            args=["git", "diff"],
+            returncode=0,
+            stdout="packages/api/foo.py\npackages/web/bar.tsx\n",
+            stderr="",
+        )
+        rebase_abort_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "--abort"], returncode=0, stdout="", stderr=""
+        )
+
+        run_side_effects = [
+            rev_list_ahead,
+            commit_ok,
+            git_show_empty,
+            fetch_ok,
+            rebase_conflict,
+            diff_conflict_files,
+            rebase_abort_ok,
+        ]
+        with patch("subprocess.run", side_effect=run_side_effects):
+            d._push_and_open_pr(
+                agent_id=agent_id,
+                issue_number=2964,
+                worktree=worktree,
+            )
+
+        # Find the phase_outputs INSERT for push_and_pr.
+        phase_inserts = [
+            (sql, params)
+            for sql, params in conn.cursor_instance.executed
+            if "dispatcher.phase_outputs" in sql and "INSERT" in sql
+        ]
+        assert phase_inserts, (
+            f"Expected INSERT into dispatcher.phase_outputs; executed: {conn.cursor_instance.executed}"
+        )
+        _sql, params = phase_inserts[0]
+        assert params[1] == "push_and_pr"
+        log_text = params[3]
+        assert "packages/api/foo.py" in log_text, (
+            f"log_text missing packages/api/foo.py: {log_text!r}"
+        )
+        assert "packages/web/bar.tsx" in log_text, (
+            f"log_text missing packages/web/bar.tsx: {log_text!r}"
+        )
+
+    def test_fetch_failure_does_not_block_push(self, tmp_path: Path) -> None:
+        """Fetch returning non-zero rc is non-blocking — push still proceeds."""
+        d, conn, handler, worktree, agent_id = _make_push_and_pr_base(
+            tmp_path, worktree_name="wt_fetch_fail"
+        )
+
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
+        commit_ok = subprocess.CompletedProcess(
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
+        )
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        fetch_fail = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"],
+            returncode=128,
+            stdout="",
+            stderr="fatal: Could not resolve host: github.com",
+        )
+        push_ok = subprocess.CompletedProcess(
+            args=["git", "push"], returncode=0, stdout="", stderr=""
+        )
+        pr_create_ok = subprocess.CompletedProcess(
+            args=["gh", "pr", "create"],
+            returncode=0,
+            stdout="https://github.com/x/y/pull/2964\n",
+            stderr="",
+        )
+
+        run_side_effects = [
+            rev_list_ahead,
+            commit_ok,
+            git_show_empty,
+            fetch_fail,
+            push_ok,
+            pr_create_ok,
+        ]
+        with patch("subprocess.run", side_effect=run_side_effects) as run_mock:
+            d._push_and_open_pr(
+                agent_id=agent_id,
+                issue_number=2964,
+                worktree=worktree,
+            )
+
+        # Assert: git push WAS called downstream.
+        all_argv = [call.args[0] for call in run_mock.call_args_list]
+        push_calls = [
+            argv for argv in all_argv if "push" in argv and "--abort" not in argv
+        ]
+        assert push_calls, (
+            f"git push should be called after fetch failure; calls: {all_argv}"
+        )
+
+        # Assert: structured log event has fetch_ok=False, rebase_outcome="skipped".
+        rebase_events = handler.events("push_and_pr_pre_push_rebase")
+        assert rebase_events, "Expected push_and_pr_pre_push_rebase event"
+        ev = rebase_events[0]
+        assert ev.fetch_ok is False, f"Expected fetch_ok=False; got {ev.fetch_ok!r}"
+        assert ev.rebase_outcome == "skipped", (
+            f"Expected rebase_outcome='skipped'; got {ev.rebase_outcome!r}"
+        )
+
+    def test_fetch_timeout_does_not_block_push(self, tmp_path: Path) -> None:
+        """Fetch raising TimeoutExpired is non-blocking — push still proceeds."""
+        d, conn, handler, worktree, agent_id = _make_push_and_pr_base(
+            tmp_path, worktree_name="wt_fetch_timeout"
+        )
+
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
+        commit_ok = subprocess.CompletedProcess(
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
+        )
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        push_ok = subprocess.CompletedProcess(
+            args=["git", "push"], returncode=0, stdout="", stderr=""
+        )
+        pr_create_ok = subprocess.CompletedProcess(
+            args=["gh", "pr", "create"],
+            returncode=0,
+            stdout="https://github.com/x/y/pull/2964\n",
+            stderr="",
+        )
+
+        remaining = [rev_list_ahead, commit_ok, git_show_empty, push_ok, pr_create_ok]
+        fetch_raised = [False]
+
+        def ordered_side_effect(
+            *args: Any, **kwargs: Any
+        ) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
+            argv = args[0] if args else []
+            if "fetch" in argv and not fetch_raised[0]:
+                fetch_raised[0] = True
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=120)
+            return remaining.pop(0)
+
+        with patch("subprocess.run", side_effect=ordered_side_effect) as run_mock:
+            d._push_and_open_pr(
+                agent_id=agent_id,
+                issue_number=2964,
+                worktree=worktree,
+            )
+
+        # Assert: git push WAS called downstream.
+        all_argv = [call.args[0] for call in run_mock.call_args_list]
+        push_calls = [
+            argv for argv in all_argv if "push" in argv and "--abort" not in argv
+        ]
+        assert push_calls, (
+            f"git push should be called after fetch timeout; calls: {all_argv}"
+        )
+
+        # Assert: structured log event has fetch_ok=False.
+        rebase_events = handler.events("push_and_pr_pre_push_rebase")
+        assert rebase_events, "Expected push_and_pr_pre_push_rebase event"
+        ev = rebase_events[0]
+        assert ev.fetch_ok is False, f"Expected fetch_ok=False; got {ev.fetch_ok!r}"
+
+    def test_clean_rebase_emits_observability_log(self, tmp_path: Path) -> None:
+        """Happy path: clean rebase emits push_and_pr_pre_push_rebase with
+        fetch_ok=True, rebase_outcome='clean'."""
+        d, _conn, handler, worktree, agent_id = _make_push_and_pr_base(
+            tmp_path, worktree_name="wt_clean"
+        )
+
+        rev_list_ahead = subprocess.CompletedProcess(
+            args=["git", "rev-list"], returncode=0, stdout="1\n", stderr=""
+        )
+        commit_ok = subprocess.CompletedProcess(
+            args=["git", "commit", "--amend"], returncode=0, stdout="", stderr=""
+        )
+        git_show_empty = subprocess.CompletedProcess(
+            args=["git", "show"], returncode=0, stdout="", stderr=""
+        )
+        fetch_ok = subprocess.CompletedProcess(
+            args=["git", "fetch", "origin", "main"], returncode=0, stdout="", stderr=""
+        )
+        rebase_ok = subprocess.CompletedProcess(
+            args=["git", "rebase", "origin/main"],
+            returncode=0,
+            stdout="Current branch is up to date.",
+            stderr="",
+        )
+        push_ok = subprocess.CompletedProcess(
+            args=["git", "push"], returncode=0, stdout="", stderr=""
+        )
+        pr_create_ok = subprocess.CompletedProcess(
+            args=["gh", "pr", "create"],
+            returncode=0,
+            stdout="https://github.com/x/y/pull/2964\n",
+            stderr="",
+        )
+
+        run_side_effects = [
+            rev_list_ahead,
+            commit_ok,
+            git_show_empty,
+            fetch_ok,
+            rebase_ok,
+            push_ok,
+            pr_create_ok,
+        ]
+        with patch("subprocess.run", side_effect=run_side_effects):
+            d._push_and_open_pr(
+                agent_id=agent_id,
+                issue_number=2964,
+                worktree=worktree,
+            )
+
+        # Assert: push_and_pr_pre_push_rebase event has fetch_ok=True,
+        # rebase_outcome='clean'.
+        rebase_events = handler.events("push_and_pr_pre_push_rebase")
+        assert rebase_events, "Expected push_and_pr_pre_push_rebase event"
+        ev = rebase_events[0]
+        assert ev.fetch_ok is True, f"Expected fetch_ok=True; got {ev.fetch_ok!r}"
+        assert ev.rebase_outcome == "clean", (
+            f"Expected rebase_outcome='clean'; got {ev.rebase_outcome!r}"
+        )
+
+
+# --------------------------------------------------------------------------
+# FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH category wiring (issue #2964)
+# --------------------------------------------------------------------------
+
+
+class TestMergeConflictCategoryWiring:
+    """AC#4 — category membership assertions for merge_conflict_at_push."""
+
+    def test_in_tier3(self) -> None:
+        assert FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH in TIER_3_CATEGORIES
+
+    def test_not_in_auto_retry(self) -> None:
+        assert FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH not in AUTO_RETRY_CATEGORIES
+
+    def test_not_in_tier2_first_occurrence(self) -> None:
+        assert (
+            FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH
+            not in TIER_2_FIRST_OCCURRENCE_CATEGORIES
+        )
+
+    def test_not_in_tier2_recurrence(self) -> None:
+        assert (
+            FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH not in TIER_2_RECURRENCE_CATEGORIES
         )
