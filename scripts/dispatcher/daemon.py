@@ -103,6 +103,7 @@ if TYPE_CHECKING:  # pragma: no cover — types only
 # ``scripts/check-dispatcher-image-deps.py`` CI guard flags as a
 # missing pip dep (the fallback top-level ``dispatcher`` is not a pip
 # package — it is a sibling module).
+from .cron import cron_matches  # noqa: E402
 from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
 from .phase_transitions import (  # noqa: E402
     FAILURE_HINT_RALPH_AC_INFEASIBLE,
@@ -718,6 +719,33 @@ STATUS_IN_PROGRESS_LABEL = "status/in-progress"
 #: distinguishing ``already_claimed_by_task`` structured log — useful
 #: for identifying subagent↔daemon races in CloudWatch Logs Insights.
 TASK_SKILL_KIND = "task-skill"
+
+# ── Idle-hook constants (#2864) ───────────────────────────────────────────
+
+#: Sentinel ``issue_number`` for synthetic audit agents.  Negative so it
+#: can never collide with a real GitHub issue number.  The partial UNIQUE
+#: INDEX on ``dispatcher.agents (issue_number) WHERE status IN
+#: ('running','retrying')`` therefore still prevents double-spawning a
+#: second audit agent while one is already running.
+IDLE_HOOK_AUDIT_ISSUE_NUMBER: int = -1
+
+#: Sentinel ``issue_number`` for synthetic spotcheck agents.  Negative for
+#: the same reason as :data:`IDLE_HOOK_AUDIT_ISSUE_NUMBER`.
+IDLE_HOOK_SPOTCHECK_ISSUE_NUMBER: int = -2
+
+#: ``dispatcher.agents.kind`` value written for audit synthetic agents.
+IDLE_HOOK_KIND_AUDIT: str = "audit"
+
+#: ``dispatcher.agents.kind`` value written for spotcheck synthetic agents.
+IDLE_HOOK_KIND_SPOTCHECK: str = "spotcheck"
+
+#: Default audit-threshold if ``dispatcher.config.idle_audit_every_n_prs``
+#: is not set.
+IDLE_HOOK_AUDIT_DEFAULT_THRESHOLD: int = 20
+
+#: Default spotcheck cron expression if
+#: ``dispatcher.config.idle_spotcheck_cron`` is not set.
+IDLE_HOOK_SPOTCHECK_DEFAULT_CRON: str = "0 14 * * *"
 
 #: Sentinel HTML comment embedded as line 1 of the automated
 #: "plan returned go=false" issue comment. Lets the daemon detect that
@@ -2348,6 +2376,13 @@ class DispatcherDaemon:
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop: threading.Event = threading.Event()
         self._watchdog_warn_emitted_for_gap: bool = False
+        # Idle-hook synthetic-agent pending slot (#2864).  Written by
+        # :meth:`_maybe_trigger_idle_hooks` (main thread) before spawning the
+        # orchestration thread; read and cleared by
+        # :meth:`_orchestration_worker_entry` at thread entry.  ``None``
+        # means "no synthetic agent this tick" and the worker falls back to
+        # the normal :meth:`_claim_and_orchestrate_one` path.
+        self._synthetic_agent_pending: tuple[str, str] | None = None
 
     # ------------------------------------------------------------------
     # Thread-aware connection accessor (#2847).
@@ -2871,6 +2906,24 @@ class DispatcherDaemon:
             has_active_agent_this_tick = active_agent_count > 0
             gate_blocked_on_cap = active_agent_count >= concurrency_cap
             if active_agent_count < concurrency_cap:
+                # Issue #2864: check idle hooks first.  If a synthetic agent
+                # (audit or spotcheck) is due, _maybe_trigger_idle_hooks
+                # claims it and sets _synthetic_agent_pending so the
+                # orchestration worker thread runs it instead of the regular
+                # task-agent claim.  _maybe_spawn_orchestration_thread is
+                # always called below — both paths use the same thread spawn.
+                try:
+                    self._maybe_trigger_idle_hooks(active_agent_count, concurrency_cap)
+                except Exception:
+                    self._log.exception(
+                        "daemon.idle_hook_spawn_failed",
+                        extra={
+                            "event": "idle_hook_spawn_failed",
+                            "run_id": self._run_id,
+                        },
+                    )
+                t_step = self._record_scheduler_step("idle_hooks", t_step)
+
                 try:
                     orchestration_attempted = self._maybe_spawn_orchestration_thread()
                 except Exception:
@@ -3587,6 +3640,12 @@ class DispatcherDaemon:
         """
         import psycopg  # noqa: PLC0415 — lazy import; matches ``connect()``
 
+        # Drain the synthetic-agent slot set by _maybe_trigger_idle_hooks.
+        # The main thread writes this before spawning us; we clear it on
+        # entry so a later tick starts clean regardless of what happens.
+        synthetic_pending = self._synthetic_agent_pending
+        self._synthetic_agent_pending = None
+
         worker_conn: Connection[Any] | None = None
         try:
             worker_conn = psycopg.connect(
@@ -3596,7 +3655,11 @@ class DispatcherDaemon:
             )
             worker_conn.autocommit = False
             self._thread_state.conn = worker_conn
-            self._claim_and_orchestrate_one()
+            if synthetic_pending is not None:
+                agent_id, kind = synthetic_pending
+                self._run_synthetic_agent(agent_id, kind)
+            else:
+                self._claim_and_orchestrate_one()
         except Exception:
             # Never let a thread crash leak out silently — emitting a
             # structured event here makes the failure observable in
@@ -8920,6 +8983,404 @@ class DispatcherDaemon:
             repo_root / "tmp" / f"claude-p-diagnose-{diagnosis_id}.stdout.json"
         )
         return self._parse_usage_envelope(stdout_path, DIAGNOSER_MODEL)
+
+    # ── Idle-hook methods (#2864) ─────────────────────────────────────────
+
+    def _claim_synthetic_agent(self, kind: str, issue_number: int) -> str | None:
+        """INSERT a synthetic agent row; return ``agent_id`` or ``None`` on race.
+
+        Analogous to :meth:`_atomic_claim` but for audit/spotcheck agents.
+        ``kind`` is ``'audit'`` or ``'spotcheck'``; ``issue_number`` is the
+        negative sentinel (:data:`IDLE_HOOK_AUDIT_ISSUE_NUMBER` or
+        :data:`IDLE_HOOK_SPOTCHECK_ISSUE_NUMBER`).
+
+        The partial UNIQUE INDEX on ``dispatcher.agents (issue_number)
+        WHERE status IN ('running','retrying')`` turns a second concurrent
+        spawn attempt into a ``UniqueViolation``, returning ``None`` to
+        the caller so it skips the hook this tick.
+
+        Synthetic agents are always ``execution_mode='subprocess'``.
+        They do not have a real GitHub issue, so ``_gh_issue_add_labels``
+        is NOT called here.
+        """
+        assert self._conn is not None, "connect() must run before claiming"
+        import psycopg  # noqa: PLC0415 — lazy import
+
+        agent_id = str(__import__("uuid").uuid4())
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.agents "
+                    "    (agent_id, parent_run_id, kind, issue_number, "
+                    "     worktree_path, phase, status, execution_mode) "
+                    "VALUES (%s, %s, %s, %s, '', 'running', 'running', 'subprocess')",
+                    (
+                        agent_id,
+                        self._run_id,
+                        kind,
+                        issue_number,
+                    ),
+                )
+            self._conn.commit()
+        except psycopg.errors.UniqueViolation:
+            self._conn.rollback()
+            self._log.info(
+                "daemon.idle_hook_already_running",
+                extra={
+                    "event": "idle_hook_already_running",
+                    "run_id": self._run_id,
+                    "kind": kind,
+                    "issue_number": issue_number,
+                },
+            )
+            return None
+        return agent_id
+
+    def _run_synthetic_skill_subprocess(
+        self, agent_id: str, kind: str, worktree: Path
+    ) -> int:
+        """Run ``claude -p '/<kind>'`` for a synthetic audit/spotcheck agent.
+
+        Analogous to :meth:`_spawn_phase_subprocess` but without phase
+        output JSON or a model flag.  Captures stdout/stderr to
+        ``{worktree}/tmp/claude-p-{kind}.{stdout.json,stderr.log}``.
+
+        Returns the subprocess exit code.
+        """
+        stdout_path = worktree / "tmp" / f"claude-p-{kind}.stdout.json"
+        stderr_path = worktree / "tmp" / f"claude-p-{kind}.stderr.log"
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "claude",
+            "-p",
+            f"/{kind}",
+            "--max-turns",
+            "200",
+            "--dangerously-skip-permissions",
+        ]
+
+        self._log.info(
+            "daemon.synthetic_agent_started",
+            extra={
+                "event": "synthetic_agent_started",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "kind": kind,
+            },
+        )
+
+        try:
+            with (
+                open(stdout_path, "w", encoding="utf-8") as stdout_fh,
+                open(stderr_path, "w", encoding="utf-8") as stderr_fh,
+            ):
+                proc = subprocess.run(
+                    cmd,
+                    stdout=stdout_fh,
+                    stderr=stderr_fh,
+                    cwd=str(worktree),
+                )
+                returncode = proc.returncode
+        except Exception:
+            self._log.exception(
+                "daemon.synthetic_agent_subprocess_error",
+                extra={
+                    "event": "synthetic_agent_subprocess_error",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "kind": kind,
+                },
+            )
+            returncode = 1
+
+        self._log.info(
+            "daemon.synthetic_agent_finished",
+            extra={
+                "event": "synthetic_agent_finished",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "kind": kind,
+                "exit_code": returncode,
+            },
+        )
+        return returncode
+
+    def _run_synthetic_agent(self, agent_id: str, kind: str) -> None:
+        """Orchestrate a synthetic audit or spotcheck agent end-to-end.
+
+        Steps:
+        1. UPDATE ``idle_hooks_state.last_run_at`` **before** spawning
+           so a crash during spawn does not refire the hook on the next tick.
+        2. Create a fresh worktree off ``origin/main``.
+        3. Invoke :meth:`_run_synthetic_skill_subprocess`.
+        4. Mark the agent terminal (``succeeded`` / ``failed``).
+
+        ``_mark_agent_terminal`` normally removes the ``status/in-progress``
+        label; synthetic agents have no real issue, so we pass
+        ``issue_number=None`` to skip label removal.
+        """
+        # 1. Stamp last_run_at before spawn (crash-safe).
+        assert self._conn is not None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.idle_hooks_state "
+                    "SET last_run_at = now(), last_run_agent_id = %s "
+                    "WHERE hook_name = %s",
+                    (agent_id, kind),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.idle_hook_state_update_failed",
+                extra={
+                    "event": "idle_hook_state_update_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "kind": kind,
+                },
+            )
+
+        # 2. Create worktree.
+        worktree = self._create_worktree(agent_id)
+
+        # 3. Update worktree_path in the agents row now that we have it.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents SET worktree_path = %s "
+                    "WHERE agent_id = %s",
+                    (str(worktree), agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.synthetic_agent_worktree_path_update_failed",
+                extra={
+                    "event": "synthetic_agent_worktree_path_update_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "kind": kind,
+                },
+            )
+
+        # 4. Run the skill subprocess.
+        exit_code = self._run_synthetic_skill_subprocess(agent_id, kind, worktree)
+
+        # 5. Mark terminal.  Gate label removal on issue_number > 0 so we
+        #    don't try to remove a label from a non-existent issue.
+        terminal_status = "succeeded" if exit_code == 0 else "failed"
+        self._mark_agent_terminal(
+            agent_id,
+            status=terminal_status,
+            phase=kind,
+            exit_code=exit_code,
+            issue_number=None,  # sentinel: no real issue → skip label removal
+        )
+
+    def _maybe_trigger_idle_hooks(
+        self,
+        active_agent_count: int,
+        concurrency_cap: int,
+    ) -> bool:
+        """Check audit + spotcheck thresholds and spawn a synthetic agent if due.
+
+        Called from :meth:`scheduler_tick` inside the ``active_agent_count <
+        concurrency_cap`` branch (already gated on ``cap > 0`` and ``not
+        _is_paused()``).  Claims the synthetic agent row and sets
+        :attr:`_synthetic_agent_pending` so the orchestration worker thread
+        dispatches to :meth:`_run_synthetic_agent` instead of the regular
+        :meth:`_claim_and_orchestrate_one` path.
+
+        Returns ``True`` iff a synthetic agent was claimed this tick.
+
+        **Concurrency gate.** If ``active_agent_count >= concurrency_cap``,
+        defers both hooks and returns ``False``.  This guard covers the case
+        where the caller computed ``active_agent_count`` before calling us but
+        a race increased the count (rare, belt-and-suspenders).
+
+        **Pause check.** Uses the in-memory :attr:`_pause_requested` event
+        (set by the scheduler tick when ``cap=0`` is observed) rather than
+        a DB ``_is_paused()`` call.  This avoids an extra ``fetchone()`` that
+        would displace positional ``fetch_queue`` entries in existing
+        scheduler-tick unit tests.
+
+        **Order.** Audit is checked first (cheaper SQL — just a count query),
+        then spotcheck.  At most one synthetic agent is spawned per tick.
+        """
+        if self._pause_requested.is_set():
+            return False
+        if active_agent_count >= concurrency_cap:
+            self._log.info(
+                "daemon.idle_hook_deferred_for_cap",
+                extra={
+                    "event": "idle_hook_deferred_for_cap",
+                    "run_id": self._run_id,
+                    "active_agent_count": active_agent_count,
+                    "concurrency_cap": concurrency_cap,
+                },
+            )
+            return False
+
+        # ── Audit branch ──────────────────────────────────────────────────
+        try:
+            if self._should_trigger_audit():
+                agent_id = self._claim_synthetic_agent(
+                    IDLE_HOOK_KIND_AUDIT, IDLE_HOOK_AUDIT_ISSUE_NUMBER
+                )
+                if agent_id is not None:
+                    self._synthetic_agent_pending = (agent_id, IDLE_HOOK_KIND_AUDIT)
+                    # The caller (scheduler_tick) will spawn the orchestration
+                    # thread via _maybe_spawn_orchestration_thread.  We just
+                    # return True so the caller knows to skip the regular
+                    # task-agent claim.
+                    return True
+        except Exception:
+            self._log.exception(
+                "daemon.idle_hook_audit_check_failed",
+                extra={
+                    "event": "idle_hook_audit_check_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # ── Spotcheck branch ──────────────────────────────────────────────
+        try:
+            if self._should_trigger_spotcheck():
+                agent_id = self._claim_synthetic_agent(
+                    IDLE_HOOK_KIND_SPOTCHECK, IDLE_HOOK_SPOTCHECK_ISSUE_NUMBER
+                )
+                if agent_id is not None:
+                    self._synthetic_agent_pending = (
+                        agent_id,
+                        IDLE_HOOK_KIND_SPOTCHECK,
+                    )
+                    return True
+        except Exception:
+            self._log.exception(
+                "daemon.idle_hook_spotcheck_check_failed",
+                extra={
+                    "event": "idle_hook_spotcheck_check_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        return False
+
+    def _should_trigger_audit(self) -> bool:
+        """Return True iff the audit threshold has been reached.
+
+        Reads ``idle_audit_every_n_prs`` from ``dispatcher.config``
+        (default: :data:`IDLE_HOOK_AUDIT_DEFAULT_THRESHOLD`).
+        Then counts ``dispatcher.agents`` rows where
+        ``kind = 'task' AND status = 'succeeded' AND pr_number IS NOT NULL
+        AND ended_at > last_run_at``.  Returns True iff that count >=
+        threshold.
+
+        Uses ``fetchall()`` throughout so this method does NOT consume
+        entries from the ``fetch_queue`` used by unit tests that set up
+        positional responses for the standard scheduler-tick DB calls.
+        """
+        assert self._conn is not None
+        with self._conn.cursor() as cur:
+            # Read threshold from config (returns at most one row).
+            cur.execute(
+                "SELECT value FROM dispatcher.config WHERE key = %s",
+                ("idle_audit_every_n_prs",),
+            )
+            cfg_rows = cur.fetchall()
+            threshold = (
+                int(cfg_rows[0][0])
+                if cfg_rows and cfg_rows[0][0] is not None
+                else IDLE_HOOK_AUDIT_DEFAULT_THRESHOLD
+            )
+
+            # Read last_run_at for the audit hook.
+            cur.execute(
+                "SELECT last_run_at FROM dispatcher.idle_hooks_state "
+                "WHERE hook_name = %s",
+                ("audit",),
+            )
+            state_rows = cur.fetchall()
+            if not state_rows:
+                # No state row yet — treat as "never run"; use epoch.
+                last_run_at_clause = "ended_at > '1970-01-01'::timestamptz"
+                params: tuple[object, ...] = ()
+            else:
+                last_run_at_clause = "ended_at > %s"
+                params = (state_rows[0][0],)
+
+            cur.execute(
+                "SELECT COUNT(*) FROM dispatcher.agents "
+                "WHERE kind = 'task' AND status = 'succeeded' "
+                "  AND pr_number IS NOT NULL "
+                f"  AND {last_run_at_clause}",
+                params,
+            )
+            count_rows = cur.fetchall()
+            count = int(count_rows[0][0]) if count_rows and count_rows[0] else 0
+        self._conn.commit()
+        return count >= threshold
+
+    def _should_trigger_spotcheck(self) -> bool:
+        """Return True iff the spotcheck cron expression matches right now.
+
+        Reads ``idle_spotcheck_cron`` from ``dispatcher.config``
+        (default: :data:`IDLE_HOOK_SPOTCHECK_DEFAULT_CRON`).
+        Evaluates the expression against the current UTC minute.
+        Guards against same-minute refire by comparing ``last_run_at``
+        against the truncated-to-minute current time.
+
+        Uses ``fetchall()`` throughout so this method does NOT consume
+        entries from the ``fetch_queue`` used by unit tests that set up
+        positional responses for the standard scheduler-tick DB calls.
+        """
+        from datetime import timezone  # noqa: PLC0415 — stdlib
+
+        assert self._conn is not None
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM dispatcher.config WHERE key = %s",
+                ("idle_spotcheck_cron",),
+            )
+            cfg_rows = cur.fetchall()
+            if cfg_rows and cfg_rows[0][0] is not None:
+                raw = cfg_rows[0][0]
+                # JSONB strings come back unwrapped from psycopg3.
+                if isinstance(raw, str):
+                    cron_expr = raw
+                else:
+                    import json  # noqa: PLC0415 — stdlib
+
+                    cron_expr = json.loads(str(raw))
+            else:
+                cron_expr = IDLE_HOOK_SPOTCHECK_DEFAULT_CRON
+
+            # Read last_run_at for the spotcheck hook.
+            cur.execute(
+                "SELECT last_run_at FROM dispatcher.idle_hooks_state "
+                "WHERE hook_name = %s",
+                ("spotcheck",),
+            )
+            state_rows = cur.fetchall()
+
+        self._conn.commit()
+
+        now = datetime.now(timezone.utc)
+        # Truncate to minute for within-minute idempotence.
+        now_minute = now.replace(second=0, microsecond=0)
+
+        if state_rows:
+            last_run_at = state_rows[0][0]
+            # Make timezone-aware for comparison if needed.
+            if hasattr(last_run_at, "tzinfo") and last_run_at.tzinfo is None:
+                last_run_at = last_run_at.replace(tzinfo=timezone.utc)
+            if last_run_at >= now_minute:
+                # Already ran this minute — suppress refire.
+                return False
+
+        return cron_matches(cron_expr, now_minute)
 
     def _claim_and_orchestrate_one(self) -> None:
         """Claim one issue and run the plan → ralph → summary → PR flow.
