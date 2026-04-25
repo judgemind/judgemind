@@ -159,6 +159,7 @@ class TestReapCompletedAgentTasks:
             "reaped_success": 1,
             "reaped_failure": 0,
             "still_running": 0,
+            "reaped_untracked": 0,
         }
         events = [getattr(r, "event", None) for r in caplog.records]
         assert "agent_runner_reaped_success" in events
@@ -438,6 +439,7 @@ class TestReapCompletedAgentTasks:
             "reaped_success": 0,
             "reaped_failure": 0,
             "still_running": 1,
+            "reaped_untracked": 0,
         }
 
 
@@ -511,6 +513,7 @@ class TestReapGuards:
             "reaped_success": 0,
             "reaped_failure": 0,
             "still_running": 0,
+            "reaped_untracked": 0,
         }
 
     def test_missing_cluster_logs_and_returns(self, caplog: Any) -> None:
@@ -757,9 +760,268 @@ class TestReapArnClearIdempotence:
             "reaped_success": 0,
             "reaped_failure": 0,
             "still_running": 0,
+            "reaped_untracked": 0,
         }
         # The SELECT ran exactly once with the post-#3329 WHERE shape.
         assert len(select_cur.executed) == 1
         sql, _params = select_cur.executed[0]
         assert "agent_task_arn IS NOT NULL" in sql
         assert "status IN" not in sql
+
+
+# --------------------------------------------------------------------------
+# Issue #3344 — untracked-ARN handling.
+#
+# After #3329 the SELECT picks up every row with a non-NULL ARN. But ECS
+# Fargate retains stopped-task metadata for ~1h; rows older than that
+# return NO entry from DescribeTasks (or return one with empty
+# lastStatus). Pre-#3344 those rows stayed in the SELECT forever (zero
+# forward progress per tick) and eventually wedged the daemon.
+#
+# The fix: detect ARNs we sent vs ARNs returned with usable metadata,
+# and run the same finalize sequence (label strip + merged_at stamp +
+# ARN clear) on the difference. Verified by:
+# - 5 sent, 2 returned -> 3 untracked finalize sequences fire.
+# - 1 returned with empty lastStatus -> treated as untracked.
+# - re-running with all rows ARN-cleared -> SELECT empty, zero work.
+# --------------------------------------------------------------------------
+
+
+class TestReapUntrackedArns:
+    """Stale-ARN cascade fix (#3344)."""
+
+    def _queue_per_row_finalize_cursors(
+        self, conn: _FakeConn, rows_count: int
+    ) -> list[_FakeCursor]:
+        """Per untracked row, ``_reap_finalize_ecs_success`` issues two
+        UPDATEs (merged_at gated, then ARN clear). Queue the cursors so
+        the test can assert on each.
+        """
+        cursors: list[_FakeCursor] = []
+        for _ in range(rows_count):
+            merged_at_cur = _FakeCursor()
+            arn_clear_cur = _FakeCursor()
+            conn.queue_cursor(merged_at_cur)
+            conn.queue_cursor(arn_clear_cur)
+            cursors.extend([merged_at_cur, arn_clear_cur])
+        return cursors
+
+    def test_three_of_five_arns_missing_runs_untracked_finalize(
+        self, caplog: Any
+    ) -> None:
+        """SELECT returns 5 ARNs; DescribeTasks returns only 2.
+
+        The 3 missing rows must:
+        - emit ``agent_runner_reaped_arn_untracked`` (one per row).
+        - run the finalize sequence (label strip + merged_at stamp gated
+          by ``pr_number IS NOT NULL`` + ``agent_task_arn = NULL``).
+        - drop out of the next tick's SELECT (verified by the ARN-clear
+          UPDATE).
+        - increment ``reaped_untracked``; not ``still_running``.
+
+        The 2 returned rows follow the regular STOPPED-success path.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+
+        all_arns = [f"arn:aws:ecs:us-west-2:123:task/jm/{i}" for i in range(5)]
+        rows = [
+            (f"agent-{i}", 1000 + i, all_arns[i], "done", "succeeded") for i in range(5)
+        ]
+        select_cur = _FakeCursor(rows=rows)
+        conn.queue_cursor(select_cur)
+
+        # ECS retention has dropped the first 3 ARNs entirely; only the
+        # last 2 come back in the response.
+        returned_arns = all_arns[3:]
+        missing_arns = all_arns[:3]
+
+        # Per untracked row: 2 cursors (merged_at + ARN clear).
+        untracked_cursors = self._queue_per_row_finalize_cursors(
+            conn, rows_count=len(missing_arns)
+        )
+
+        # The 2 returned rows take the STOPPED-success-already-terminal
+        # path. Each needs: status read, finalize merged_at, ARN clear.
+        for i in range(3, 5):
+            status_cur = _FakeCursor()
+            status_cur.fetchone_queue = [("succeeded", "done")]
+            conn.queue_cursor(status_cur)
+            finalize_cur = _FakeCursor()
+            conn.queue_cursor(finalize_cur)
+            arn_clear_cur = _FakeCursor()
+            conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": arn,
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 0}],
+                }
+                for arn in returned_arns
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["active"] == 5
+        assert summary["reaped_untracked"] == 3
+        # The 2 returned rows ran the success-already-terminal path.
+        assert summary["reaped_success"] == 2
+        assert summary["reaped_failure"] == 0
+        assert summary["still_running"] == 0
+
+        # Three untracked-ARN events, one per missing row.
+        events = [getattr(r, "event", None) for r in caplog.records]
+        untracked_events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "agent_runner_reaped_arn_untracked"
+        ]
+        assert len(untracked_events) == 3
+        # Each event names the untracked ARN + agent_id + issue_number.
+        evt_arns = {getattr(r, "task_arn", None) for r in untracked_events}
+        assert evt_arns == set(missing_arns)
+        evt_agents = {getattr(r, "agent_id", None) for r in untracked_events}
+        assert evt_agents == {f"agent-{i}" for i in range(3)}
+        evt_issues = {getattr(r, "issue_number", None) for r in untracked_events}
+        assert evt_issues == {1000, 1001, 1002}
+        # Reason indicates the missing-from-response cause.
+        assert all(
+            getattr(r, "reason", None) == "not_in_describe_tasks_response"
+            for r in untracked_events
+        )
+
+        # Label strip called for the 3 untracked + 2 returned = 5 total.
+        # Each call uses STATUS_IN_PROGRESS_LABEL.
+        assert remove_labels_mock.call_count == 5
+        all_label_args = [c.args[1] for c in remove_labels_mock.call_args_list]
+        assert all(args == [daemon.STATUS_IN_PROGRESS_LABEL] for args in all_label_args)
+
+        # All three untracked rows issued a merged_at UPDATE (gated by
+        # ``pr_number IS NOT NULL`` so it's a no-op when no PR exists)
+        # AND an ARN-clear UPDATE. The cursor ordering interleaves
+        # (merged_at, arn_clear, merged_at, arn_clear, merged_at,
+        # arn_clear) per row.
+        for i in range(3):
+            merged_cur = untracked_cursors[i * 2]
+            arn_cur = untracked_cursors[i * 2 + 1]
+            merged_sqls = [s for s, _ in merged_cur.executed]
+            assert any("merged_at" in s for s in merged_sqls), merged_sqls
+            assert any("merged_at IS NULL" in s for s in merged_sqls)
+            assert any("pr_number IS NOT NULL" in s for s in merged_sqls)
+            arn_sqls = [s for s, _ in arn_cur.executed]
+            assert any("SET agent_task_arn = NULL" in s for s in arn_sqls), arn_sqls
+
+        # ``still_running`` did not absorb any of the untracked rows —
+        # this is the regression bar pre-#3344 was missing.
+        assert "agent_runner_reaped_arn_untracked" in events
+
+    def test_empty_last_status_treated_as_untracked(self, caplog: Any) -> None:
+        """Fargate occasionally returns an entry with empty lastStatus
+        — it counts as no usable metadata, same as missing entirely.
+
+        SELECT returns 1 ARN; DescribeTasks returns it but with
+        ``lastStatus`` empty. The row must be reaped via the untracked
+        path (label strip + merged_at + ARN clear), NOT carried as
+        ``still_running``.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+
+        arn = "arn:aws:ecs:us-west-2:123:task/jm/empty-status"
+        select_cur = _FakeCursor(rows=[("agent-empty", 4242, arn, "done", "succeeded")])
+        conn.queue_cursor(select_cur)
+        # Per-untracked finalize cursors.
+        merged_cur = _FakeCursor()
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(merged_cur)
+        conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    # Returned, but ``lastStatus`` empty — Fargate stub
+                    # response shape that conveys no useful state.
+                    "taskArn": arn,
+                    "lastStatus": "",
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+            patch.object(d, "_handle_agent_failure") as fail_mock,
+            patch.object(d, "_mark_agent_terminal") as mark_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["reaped_untracked"] == 1
+        assert summary["still_running"] == 0
+        assert summary["reaped_success"] == 0
+        assert summary["reaped_failure"] == 0
+        # Untracked path does not route via _handle_agent_failure or
+        # _mark_agent_terminal — it relies on the agent-runner having
+        # already written its terminal row (or accepts the row as gone).
+        fail_mock.assert_not_called()
+        mark_mock.assert_not_called()
+        # Label stripped, merged_at gated, ARN cleared.
+        remove_labels_mock.assert_called_once_with(
+            4242, [daemon.STATUS_IN_PROGRESS_LABEL]
+        )
+        merged_sqls = [s for s, _ in merged_cur.executed]
+        assert any("merged_at" in s for s in merged_sqls)
+        arn_sqls = [s for s, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in s for s in arn_sqls)
+        # Event reason should indicate empty lastStatus.
+        evts = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "agent_runner_reaped_arn_untracked"
+        ]
+        assert len(evts) == 1
+        assert getattr(evts[0], "reason", None) == "empty_last_status"
+
+    def test_idempotence_after_arn_clear_select_empty(self) -> None:
+        """After a tick clears all 5 ARNs via the untracked path, the
+        next reaper tick's SELECT (gated by ``agent_task_arn IS NOT
+        NULL``) returns zero rows — no ECS calls, no UPDATEs, no log
+        spam.
+
+        This pins the cascade exit: an empty result set is the desired
+        steady state once the stale-ARN backlog drains.
+        """
+        d, conn = _make_daemon()
+        # Empty result set models the post-clear DB state — every row
+        # the previous tick finalized via untracked has ``agent_task_arn
+        # = NULL`` and is excluded from the WHERE clause.
+        select_cur = _FakeCursor(rows=[])
+        conn.queue_cursor(select_cur)
+
+        with (
+            patch.object(d, "_make_ecs_client") as mock_make_client,
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+            patch.object(d, "_mark_agent_terminal") as mark_mock,
+            patch.object(d, "_handle_agent_failure") as fail_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        # Zero-work early return — same shape as TestReapArnClearIdempotence.
+        mock_make_client.assert_not_called()
+        remove_labels_mock.assert_not_called()
+        mark_mock.assert_not_called()
+        fail_mock.assert_not_called()
+        assert summary == {
+            "active": 0,
+            "reaped_success": 0,
+            "reaped_failure": 0,
+            "still_running": 0,
+            "reaped_untracked": 0,
+        }
