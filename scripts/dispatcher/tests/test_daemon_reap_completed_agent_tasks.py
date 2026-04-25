@@ -129,6 +129,9 @@ class TestReapCompletedAgentTasks:
         status_cur = _FakeCursor()
         status_cur.fetchone_queue = [("succeeded", "done")]
         conn.queue_cursor(status_cur)
+        # Third cursor: _reap_finalize_ecs_success merged_at UPDATE.
+        finalize_cur = _FakeCursor()
+        conn.queue_cursor(finalize_cur)
 
         fake_client = MagicMock()
         fake_client.describe_tasks.return_value = {
@@ -141,7 +144,10 @@ class TestReapCompletedAgentTasks:
                 }
             ]
         }
-        with patch.object(d, "_make_ecs_client", return_value=fake_client):
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+        ):
             summary = d._reap_completed_agent_tasks()
 
         assert summary == {
@@ -152,6 +158,80 @@ class TestReapCompletedAgentTasks:
         }
         events = [getattr(r, "event", None) for r in caplog.records]
         assert "agent_runner_reaped_success" in events
+        # Issue #3324: success-already-terminal must strip
+        # ``status/in-progress`` (claim-interlock teardown) and stamp
+        # ``merged_at`` (fleet-status visibility).
+        remove_labels_mock.assert_called_once_with(
+            101, [daemon.STATUS_IN_PROGRESS_LABEL]
+        )
+        # The merged_at UPDATE must be issued and gated by the
+        # idempotence WHERE filters.
+        sqls = [sql for sql, _ in finalize_cur.executed]
+        assert any("UPDATE dispatcher.agents" in sql for sql in sqls)
+        merged_at_sql = next(sql for sql in sqls if "merged_at" in sql)
+        assert "merged_at IS NULL" in merged_at_sql
+        assert "pr_number IS NOT NULL" in merged_at_sql
+        params = [params for _, params in finalize_cur.executed]
+        assert params == [("agent-ok",)]
+
+    def test_stopped_success_already_terminal_idempotent_re_reap(
+        self, caplog: Any
+    ) -> None:
+        """Issue #3324: a second reap on an already-merged_at row must NOT
+        bump the timestamp.
+
+        The helper relies on the WHERE filter (``merged_at IS NULL AND
+        pr_number IS NOT NULL``) to make the UPDATE a no-op when the row
+        is already finalized; we assert the WHERE clause is present so
+        a future refactor can't silently strip it.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+        select_cur = _FakeCursor(
+            rows=[
+                (
+                    "agent-rerun",
+                    102,
+                    "arn:aws:ecs:us-west-2:123:task/jm/rerun",
+                    "done",
+                    "running",
+                ),
+            ]
+        )
+        conn.queue_cursor(select_cur)
+        status_cur = _FakeCursor()
+        status_cur.fetchone_queue = [("succeeded", "done")]
+        conn.queue_cursor(status_cur)
+        finalize_cur = _FakeCursor()
+        conn.queue_cursor(finalize_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": "arn:aws:ecs:us-west-2:123:task/jm/rerun",
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 0}],
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels"),
+        ):
+            d._reap_completed_agent_tasks()
+
+        # Exactly one UPDATE issued. The WHERE filter (asserted above)
+        # makes the SQL itself a no-op when merged_at is already set —
+        # the DB does the idempotence; the helper just always issues
+        # the same statement.
+        update_sqls = [
+            sql for sql, _ in finalize_cur.executed if "UPDATE dispatcher.agents" in sql
+        ]
+        assert len(update_sqls) == 1, update_sqls
+        assert "merged_at IS NULL" in update_sqls[0]
+        assert "pr_number IS NOT NULL" in update_sqls[0]
 
     def test_stopped_success_row_gap_marks_succeeded(self, caplog: Any) -> None:
         """Container exited 0 but DB row still ``running`` -> daemon closes the gap."""
@@ -284,12 +364,19 @@ class TestReapCompletedAgentTasks:
         with (
             patch.object(d, "_make_ecs_client", return_value=fake_client),
             patch.object(d, "_handle_agent_failure") as fail_mock,
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
         ):
             summary = d._reap_completed_agent_tasks()
         assert summary["reaped_failure"] == 1
         fail_mock.assert_not_called()
         events = [getattr(r, "event", None) for r in caplog.records]
         assert "agent_runner_reaped_failure_already_terminal" in events
+        # Issue #3324: failure-already-terminal must also strip
+        # ``status/in-progress`` (mirrors subprocess-mode failure
+        # teardown). No ``merged_at`` stamp on the failure path.
+        remove_labels_mock.assert_called_once_with(
+            300, [daemon.STATUS_IN_PROGRESS_LABEL]
+        )
 
     def test_running_task_is_noop(self) -> None:
         d, conn = _make_daemon()
