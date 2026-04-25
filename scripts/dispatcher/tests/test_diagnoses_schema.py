@@ -1,7 +1,7 @@
 """Issue #3366 — schema-level assertions for the new ``dispatcher.diagnoses``
 columns.
 
-Two columns added in migration 49:
+Two columns added in migration 50:
 
 * ``actions_taken`` JSONB — append-only audit log written by the
   empowered diagnoser. Schema is the array-of-{ts, type, ...} shape
@@ -23,9 +23,9 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MIGRATION_49 = (
+MIGRATION_50 = (
     REPO_ROOT
-    / "packages/api/migrations/49_dispatcher-diagnoses-actions-and-directive.sql"
+    / "packages/api/migrations/50_dispatcher-diagnoses-actions-and-directive.sql"
 )
 SCHEMA_SQL = REPO_ROOT / "packages/api/src/data-access/schema.sql"
 
@@ -35,17 +35,17 @@ SCHEMA_SQL = REPO_ROOT / "packages/api/src/data-access/schema.sql"
 # --------------------------------------------------------------------------
 
 
-class TestMigration49Exists:
+class TestMigration50Exists:
     def test_file_exists(self) -> None:
-        assert MIGRATION_49.is_file(), f"missing: {MIGRATION_49}"
+        assert MIGRATION_50.is_file(), f"missing: {MIGRATION_50}"
 
     def test_has_up_and_down_sections(self) -> None:
-        text = MIGRATION_49.read_text()
+        text = MIGRATION_50.read_text()
         assert "-- Up Migration" in text
         assert "-- Down Migration" in text
 
     def test_up_adds_actions_taken_jsonb(self) -> None:
-        text = MIGRATION_49.read_text()
+        text = MIGRATION_50.read_text()
         # ALTER TABLE dispatcher.diagnoses ... ADD COLUMN actions_taken JSONB
         # split into Up + Down — confirm the up section has the ADD.
         up = text.split("-- Down Migration")[0]
@@ -54,20 +54,20 @@ class TestMigration49Exists:
         )
 
     def test_up_adds_next_directive_text(self) -> None:
-        text = MIGRATION_49.read_text()
+        text = MIGRATION_50.read_text()
         up = text.split("-- Down Migration")[0]
         assert re.search(r"ADD COLUMN next_directive\s+TEXT", up, re.IGNORECASE), (
             "Up section must add next_directive TEXT column"
         )
 
     def test_down_drops_both_columns(self) -> None:
-        text = MIGRATION_49.read_text()
+        text = MIGRATION_50.read_text()
         down = text.split("-- Down Migration")[1]
         assert re.search(r"DROP COLUMN IF EXISTS next_directive", down, re.IGNORECASE)
         assert re.search(r"DROP COLUMN IF EXISTS actions_taken", down, re.IGNORECASE)
 
     def test_includes_column_comments(self) -> None:
-        text = MIGRATION_49.read_text()
+        text = MIGRATION_50.read_text()
         assert "COMMENT ON COLUMN dispatcher.diagnoses.actions_taken" in text
         assert "COMMENT ON COLUMN dispatcher.diagnoses.next_directive" in text
 
@@ -110,13 +110,13 @@ class TestSchemaSqlSnapshot:
 class TestMigrationNumbering:
     def test_no_collision_with_existing(self) -> None:
         migrations_dir = REPO_ROOT / "packages/api/migrations"
-        files = sorted(migrations_dir.glob("49_*.sql"))
-        assert len(files) == 1, f"unexpected 49_* migrations: {files}"
-        # The new migration is the only one with the 49 prefix.
-        assert files[0].name.startswith("49_dispatcher-")
+        files = sorted(migrations_dir.glob("50_*.sql"))
+        assert len(files) == 1, f"unexpected 50_* migrations: {files}"
+        # The new migration is the only one with the 50 prefix.
+        assert files[0].name.startswith("50_dispatcher-")
 
     def test_no_higher_numbered_migration_exists(self) -> None:
-        # 49 is intended as the new tip; 50+ would mean another migration
+        # 50 is intended as the new tip; 51+ would mean another migration
         # landed between PR draft + CI which would make this test fail
         # noisily in a way that signals "rebase / rename me".
         migrations_dir = REPO_ROOT / "packages/api/migrations"
@@ -125,10 +125,10 @@ class TestMigrationNumbering:
             key=lambda p: int(p.name.split("_", 1)[0]),
             reverse=True,
         )
-        # Top file is the 49 migration.
+        # Top file is the 50 migration.
         assert higher, "no migrations found"
         top_num = int(higher[0].name.split("_", 1)[0])
-        assert top_num <= 49, (
-            f"a higher-numbered migration than 49 exists ({higher[0].name}); "
+        assert top_num <= 50, (
+            f"a higher-numbered migration than 50 exists ({higher[0].name}); "
             "rename this migration to a higher number to avoid collision"
         )
