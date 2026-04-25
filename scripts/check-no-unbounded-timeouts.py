@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# venv: none
+# permanent: true
 """check-no-unbounded-timeouts.py — Fail if any IO call site under
 ``scripts/dispatcher/`` (excluding ``scripts/dispatcher/tests/``) lacks
 a bounded timeout.
@@ -67,9 +69,6 @@ Exit codes
 
 Tracking: issue #3356.
 """
-
-# venv: none
-# permanent: true
 
 from __future__ import annotations
 
