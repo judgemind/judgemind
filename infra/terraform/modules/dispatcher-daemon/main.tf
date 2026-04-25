@@ -435,6 +435,40 @@ resource "aws_iam_role_policy" "task_run_oneshot" {
   })
 }
 
+# ─── Document-archive S3 census access (#3050) ──────────────────────────────
+#
+# Grants `s3:ListBucket` on the document-archive bucket so the daemon
+# container can run pre-run/post-run census queries (e.g.
+# `aws s3api list-objects-v2 --bucket judgemind-document-archive-dev
+#   --prefix ca/santa_clara/ --query length(Contents)`).
+#
+# Note: the `iam_scraper` role already grants ListBucket for in-task use
+# (rebuild_db.py runs inside the oneshot ECS task under `iam_scraper`).
+# This policy is specifically for the daemon-container context — the
+# daemon is NOT the iam_scraper role, so it needs its own grant.
+#
+# Disabled (count=0) when `document_archive_bucket_arn` is empty — safe
+# for staging / throwaway stacks that don't provision the archive bucket.
+
+resource "aws_iam_role_policy" "task_s3_archive_list" {
+  count = var.document_archive_bucket_arn != "" ? 1 : 0
+
+  name = "${local.service_name}-task-s3-archive-list"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowListDocumentArchiveBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = var.document_archive_bucket_arn
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
   name = "${local.service_name}-task-ecs-exec-ssm"
   role = aws_iam_role.task.id

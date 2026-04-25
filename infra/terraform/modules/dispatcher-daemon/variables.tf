@@ -242,3 +242,11 @@ variable "agent_runner_security_group_id" {
   type        = string
   default     = ""
 }
+
+# ─── Document-archive S3 census access (#3050) ──────────────────────────────
+
+variable "document_archive_bucket_arn" {
+  description = "ARN of the document-archive S3 bucket. When set, the daemon task role is granted `s3:ListBucket` so data-task agents can run census queries (e.g. pre/post rebuild counts). Empty disables the policy — safe for staging / throwaway stacks."
+  type        = string
+  default     = ""
+}
