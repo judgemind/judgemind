@@ -56,6 +56,14 @@ interface SnapshotIssueRecord {
   createdAt: string | null;
   /** Only populated for blocked snapshots (daemon omits on queue scan). */
   body?: string | null;
+  /**
+   * Enriched blocker refs written by the daemon's
+   * `_fetch_issue_titles_for_blockers` helper (issue #2989). Optional
+   * so that pre-#2989 snapshots (which only carried `body`) still
+   * parse cleanly via the backward-compat shim in
+   * `queueItemFromSnapshot`.
+   */
+  blockedBy?: Array<{ number: number; title: string | null }>;
 }
 
 // Minimal Context subset the dispatcher resolvers read.
@@ -435,8 +443,24 @@ function normalizeSnapshotJson(raw: unknown): SnapshotIssueRecord[] {
         : record.body === null
           ? null
           : undefined;
+    // Parse blockedBy: Array<{number, title}> defensively. Malformed
+    // entries (non-object, missing numeric `number`) are silently dropped
+    // so a corrupt snapshot row can't crash the resolver. Issue #2989.
+    let blockedBy: Array<{ number: number; title: string | null }> | undefined;
+    if (Array.isArray(record.blockedBy)) {
+      const parsedBlockers: Array<{ number: number; title: string | null }> = [];
+      for (const entry of record.blockedBy) {
+        if (!entry || typeof entry !== 'object') continue;
+        const e = entry as Record<string, unknown>;
+        if (typeof e.number !== 'number') continue;
+        const entryTitle = typeof e.title === 'string' ? e.title : null;
+        parsedBlockers.push({ number: e.number, title: entryTitle });
+      }
+      blockedBy = parsedBlockers;
+    }
     const out: SnapshotIssueRecord = { number, title, labels, createdAt };
     if (body !== undefined) out.body = body;
+    if (blockedBy !== undefined) out.blockedBy = blockedBy;
     result.push(out);
   }
   return result;
@@ -717,13 +741,35 @@ function queueItemFromSnapshot(
   includeBlockedBy: boolean,
   cooldownSecondsRemaining: number | null = null,
 ): Record<string, unknown> {
+  let blockedBy: Array<{ number: number; title: string | null }> = [];
+  if (includeBlockedBy) {
+    if (issue.blockedBy !== undefined) {
+      // Fast path: new daemon snapshot carries blockedBy: BlockerRef[].
+      // Back-compat shim: if the stored value is an array of plain
+      // numbers (pre-#2989 daemon write), wrap each as {number, title: null}.
+      blockedBy = (issue.blockedBy as Array<unknown>).map((entry) => {
+        if (typeof entry === 'number') {
+          return { number: entry, title: null };
+        }
+        // Already a {number, title} object (post-#2989 shape).
+        const e = entry as { number: number; title: string | null };
+        return { number: e.number, title: e.title ?? null };
+      });
+    } else {
+      // Legacy path: blockedBy not in snapshot → parse from body.
+      blockedBy = parseBlockedBy(issue.body).map((n) => ({
+        number: n,
+        title: null,
+      }));
+    }
+  }
   return {
     issueNumber: issue.number,
     title: issue.title,
     priority: extractPriority(issue.labels),
     labels: issue.labels,
     createdAt: issue.createdAt,
-    blockedBy: includeBlockedBy ? parseBlockedBy(issue.body) : [],
+    blockedBy,
     cooldownSecondsRemaining,
   };
 }

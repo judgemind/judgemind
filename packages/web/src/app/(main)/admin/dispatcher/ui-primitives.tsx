@@ -48,8 +48,14 @@ const REPO = 'judgemind/judgemind';
 const BRAND_LINK_CLASSES =
   'font-mono text-brand-accent dark:text-brand-accent-light underline-offset-2 hover:underline';
 
-/** Hot link to a GitHub issue. Opens in a new tab. */
-export function IssueLink({ number, className }: { number: number; className?: string }) {
+/** Hot link to a GitHub issue. Opens in a new tab.
+ *
+ * Optional `title` prop is forwarded to the anchor's native `title`
+ * attribute for a browser tooltip — used by `QueueRow` to surface
+ * blocker details on the `#NNNN` link in the Queue: Blocked panel
+ * (issue #2989). Pass `undefined` (or omit) for no tooltip.
+ */
+export function IssueLink({ number, className, title }: { number: number; className?: string; title?: string }) {
   const href = `https://github.com/${REPO}/issues/${number}`;
   return (
     <a
@@ -58,6 +64,7 @@ export function IssueLink({ number, className }: { number: number; className?: s
       rel="noopener noreferrer"
       className={`${BRAND_LINK_CLASSES} ${className ?? ''}`}
       data-testid={`issue-link-${number}`}
+      title={title}
     >
       #{number}
     </a>

@@ -298,6 +298,10 @@ class TestScanBlockedAndSnapshot:
                 "body": None,
             },
         ]
+        # Issue #2989: mock title lookup so the test is deterministic.
+        d._fetch_issue_titles_for_blockers = lambda numbers: {  # type: ignore[method-assign]
+            n: f"Title for #{n}" for n in numbers
+        }
 
         depth = d._scan_blocked_and_snapshot()
 
@@ -320,8 +324,10 @@ class TestScanBlockedAndSnapshot:
             "labels": ["status/blocked"],
             "createdAt": "2026-04-18T12:00:00Z",
             "body": "Blocked by #42\n",
+            "blockedBy": [{"number": 42, "title": "Title for #42"}],
         }
         assert enriched[1]["body"] is None
+        assert enriched[1]["blockedBy"] == []  # no blocked-by lines in body=None
         assert params[3] == "test-run-id"
         assert conn.commits == 1
 
@@ -360,6 +366,8 @@ class TestScanBlockedAndSnapshot:
                 "body": None,
             },
         ]
+        # body=None → empty blocker set → no gh calls needed; still mock for safety.
+        d._fetch_issue_titles_for_blockers = lambda numbers: {}  # type: ignore[method-assign]
 
         original_execute = conn.cursor_instance.execute
 
@@ -565,6 +573,8 @@ class TestSchedulerTickBlockedWiring:
                 "body": None,
             },
         ]
+        # body=None → empty blocker set → no gh calls; mock for determinism (#2989).
+        d._fetch_issue_titles_for_blockers = lambda numbers: {}  # type: ignore[method-assign]
 
         summary = d.scheduler_tick()
         assert summary["blocked_depth"] == 1
@@ -596,3 +606,368 @@ class TestSchedulerTickBlockedWiring:
         # Sentinel is emitted in the scheduler_tick log.
         ticks = handler.events("scheduler_tick")
         assert ticks[0].blocked_depth == -1
+
+
+# --------------------------------------------------------------------------
+# _fetch_issue_titles_for_blockers — new helper (issue #2989)
+# --------------------------------------------------------------------------
+
+
+class TestFetchIssueTitlesForBlockers:
+    """New helper that batch-fetches blocker titles from ``gh issue view``."""
+
+    def test_returns_title_for_each_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d, _conn, _handler = _make_daemon_with_capture()
+
+        call_log: list[list[str]] = []
+
+        def fake_retry(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict | None = None,
+        ) -> dict:
+            call_log.append(cmd)
+            number_str = cmd[cmd.index("view") + 1]
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = json.dumps(
+                {"number": int(number_str), "title": f"Title for #{number_str}"}
+            )
+            return {"ok": True, "result": result, "attempts": 1}
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+
+        titles = d._fetch_issue_titles_for_blockers({42, 100})
+
+        assert titles[42] == "Title for #42"
+        assert titles[100] == "Title for #100"
+        # One gh call per unique number.
+        assert len(call_log) == 2
+
+    def test_returns_none_on_subprocess_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d, _conn, handler = _make_daemon_with_capture()
+
+        def fake_retry(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict | None = None,
+        ) -> dict:
+            return {
+                "ok": False,
+                "reason": "nonzero_exit",
+                "stderr_tail": "404",
+                "exit_code": 1,
+                "attempts": 3,
+            }
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+
+        titles = d._fetch_issue_titles_for_blockers({99})
+        assert titles[99] is None
+        # Warning logged at WARNING level.
+        warn_events = [
+            r
+            for r in handler.records
+            if r.levelno == logging.WARNING
+            and getattr(r, "event", None) == "blocker_title_fetch_exhausted"
+        ]
+        assert len(warn_events) == 1
+
+    def test_empty_set_returns_empty_dict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d, _conn, _handler = _make_daemon_with_capture()
+        calls: list = []
+
+        def fake_retry(*_a: object, **_kw: object) -> dict:  # pragma: no cover
+            calls.append(1)
+            return {"ok": True, "result": MagicMock(), "attempts": 1}
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+
+        titles = d._fetch_issue_titles_for_blockers(set())
+        assert titles == {}
+        assert calls == []
+
+    def test_deduplicates_blocker_numbers_within_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One gh issue view per distinct blocker number across the whole tick."""
+        d, _conn, _handler = _make_daemon_with_capture()
+
+        call_log: list[str] = []
+
+        def fake_retry(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict | None = None,
+        ) -> dict:
+            number_str = cmd[cmd.index("view") + 1]
+            call_log.append(number_str)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = json.dumps(
+                {"number": int(number_str), "title": f"T#{number_str}"}
+            )
+            return {"ok": True, "result": result, "attempts": 1}
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+
+        # Pass a set — duplicates are already deduplicated by set semantics.
+        # This verifies we only make one call even when the same number
+        # appears in multiple blocked issues' bodies.
+        titles = d._fetch_issue_titles_for_blockers({42, 42, 100})
+        # Set deduplicated to {42, 100} — only 2 calls.
+        assert len(call_log) == 2
+        assert sorted(call_log) == ["100", "42"]
+        assert titles[42] == "T#42"
+
+
+# --------------------------------------------------------------------------
+# _normalize_issue_enrichment with blocker_title_lookup (issue #2989)
+# --------------------------------------------------------------------------
+
+
+class TestNormalizeIssueEnrichmentWithBlockers:
+    """blockedBy field is populated from the lookup dict when include_body=True."""
+
+    def test_populate_blocker_refs_from_lookup(self) -> None:
+        raw = {
+            "number": 500,
+            "title": "Blocked A",
+            "labels": [{"name": "status/blocked"}],
+            "createdAt": "2026-04-18T12:00:00Z",
+            "body": "Some context.\nBlocked by #42\nBlocked by #100\n",
+        }
+        lookup = {42: "The forty-two issue", 100: None}
+        result = daemon._normalize_issue_enrichment(
+            raw, include_body=True, blocker_title_lookup=lookup
+        )
+        assert result["blockedBy"] == [
+            {"number": 42, "title": "The forty-two issue"},
+            {"number": 100, "title": None},
+        ]
+
+    def test_no_lookup_omits_blockedby(self) -> None:
+        """Without a lookup the field is absent (backward-compat path)."""
+        raw = {
+            "number": 500,
+            "title": "Blocked A",
+            "labels": [],
+            "createdAt": "",
+            "body": "Blocked by #42\n",
+        }
+        result = daemon._normalize_issue_enrichment(raw, include_body=True)
+        assert "blockedBy" not in result
+
+    def test_blockedby_absent_when_body_has_no_blocked_lines(self) -> None:
+        raw = {
+            "number": 501,
+            "title": "Blocked B",
+            "labels": [],
+            "createdAt": "",
+            "body": "No blocked lines here.",
+        }
+        lookup: dict[int, str | None] = {}
+        result = daemon._normalize_issue_enrichment(
+            raw, include_body=True, blocker_title_lookup=lookup
+        )
+        assert result["blockedBy"] == []
+
+    def test_blockedby_not_present_when_include_body_false(self) -> None:
+        raw = {
+            "number": 501,
+            "title": "Ready issue",
+            "labels": [],
+            "createdAt": "",
+        }
+        lookup = {42: "Title"}
+        result = daemon._normalize_issue_enrichment(
+            raw, include_body=False, blocker_title_lookup=lookup
+        )
+        # include_body=False → no blockedBy even if a lookup was passed.
+        assert "blockedBy" not in result
+
+
+# --------------------------------------------------------------------------
+# _scan_blocked_and_snapshot with blocker-title enrichment (issue #2989)
+# --------------------------------------------------------------------------
+
+
+class TestScanBlockedAndSnapshotWithTitles:
+    """Verifies dedup and None-fallthrough in the full scan path."""
+
+    def test_blocker_title_fetch_dedupes_within_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC1: one gh issue view per distinct blocker number, regardless of
+        how many blocked issues share that blocker."""
+        d, conn, _handler = _make_daemon_with_capture()
+
+        d._fetch_blocked_issues = lambda: [  # type: ignore[method-assign]
+            {
+                "number": 500,
+                "title": "Blocked A",
+                "labels": [{"name": "status/blocked"}],
+                "createdAt": "2026-04-18T12:00:00Z",
+                "body": "Blocked by #42\n",
+            },
+            {
+                "number": 501,
+                "title": "Blocked B",
+                "labels": [{"name": "status/blocked"}],
+                "createdAt": "2026-04-18T13:00:00Z",
+                "body": "Blocked by #42\nBlocked by #100\n",
+            },
+        ]
+
+        fetch_calls: list[int] = []
+
+        def fake_fetch_titles(numbers: set[int]) -> dict[int, str | None]:
+            fetch_calls.extend(sorted(numbers))
+            return {n: f"Title for #{n}" for n in numbers}
+
+        monkeypatch.setattr(d, "_fetch_issue_titles_for_blockers", fake_fetch_titles)
+
+        depth = d._scan_blocked_and_snapshot()
+        assert depth == 2
+
+        # The deduped set {42, 100} was passed to the fetcher exactly once.
+        assert sorted(fetch_calls) == [42, 100]
+
+        # Check persisted JSON includes blockedBy.
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.blocked_snapshots" in e[0]
+        ]
+        assert len(inserts) == 1
+        enriched = json.loads(inserts[0][1][2])
+        # Issue 500: only blocked by #42.
+        assert enriched[0]["blockedBy"] == [{"number": 42, "title": "Title for #42"}]
+        # Issue 501: blocked by #42 and #100.
+        assert enriched[1]["blockedBy"] == [
+            {"number": 42, "title": "Title for #42"},
+            {"number": 100, "title": "Title for #100"},
+        ]
+
+    def test_null_title_fallthrough_on_subprocess_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC: when the title fetch fails for a blocker, title=None, no crash."""
+        d, conn, _handler = _make_daemon_with_capture()
+
+        d._fetch_blocked_issues = lambda: [  # type: ignore[method-assign]
+            {
+                "number": 500,
+                "title": "Blocked A",
+                "labels": [],
+                "createdAt": "",
+                "body": "Blocked by #42\n",
+            },
+        ]
+
+        def fake_fetch_titles(numbers: set[int]) -> dict[int, str | None]:
+            # Simulate failure → title is None.
+            return {n: None for n in numbers}
+
+        monkeypatch.setattr(d, "_fetch_issue_titles_for_blockers", fake_fetch_titles)
+
+        depth = d._scan_blocked_and_snapshot()
+        assert depth == 1
+
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.blocked_snapshots" in e[0]
+        ]
+        enriched = json.loads(inserts[0][1][2])
+        assert enriched[0]["blockedBy"] == [{"number": 42, "title": None}]
+
+    def test_blocker_title_fetch_exception_falls_back_to_empty_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exception in _fetch_issue_titles_for_blockers must not propagate;
+        _scan_blocked_and_snapshot should still succeed with title=None."""
+        d, conn, _handler = _make_daemon_with_capture()
+
+        d._fetch_blocked_issues = lambda: [  # type: ignore[method-assign]
+            {
+                "number": 500,
+                "title": "Blocked A",
+                "labels": [],
+                "createdAt": "",
+                "body": "Blocked by #42\n",
+            },
+        ]
+
+        def raising_fetch(numbers: set[int]) -> dict[int, str | None]:
+            raise RuntimeError("unexpected internal error")
+
+        monkeypatch.setattr(d, "_fetch_issue_titles_for_blockers", raising_fetch)
+
+        depth = d._scan_blocked_and_snapshot()
+        assert depth == 1
+
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.blocked_snapshots" in e[0]
+        ]
+        enriched = json.loads(inserts[0][1][2])
+        # title is None because the lookup fell back to {}
+        assert enriched[0]["blockedBy"] == [{"number": 42, "title": None}]
+
+
+class TestFetchIssuesTitleCap:
+    """MAX_BLOCKER_TITLE_FETCH cap bounds the number of gh calls."""
+
+    def test_cap_limits_gh_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When >MAX_BLOCKER_TITLE_FETCH unique blockers are passed, only the
+        first MAX_BLOCKER_TITLE_FETCH are fetched; the rest are absent."""
+        from dispatcher.daemon import MAX_BLOCKER_TITLE_FETCH
+
+        d, _conn, _handler = _make_daemon_with_capture()
+
+        call_count = 0
+
+        def fake_subprocess_with_retry(
+            cmd: list[str],
+            event_name: str,
+            timeout: int = 30,
+            extra_log_fields: dict | None = None,
+        ) -> dict:
+            nonlocal call_count
+            call_count += 1
+            # cmd = ["gh", "issue", "view", "<N>", "--repo", ...]
+            number = int(cmd[3])
+            return {
+                "ok": True,
+                "result": type(
+                    "CP",
+                    (),
+                    {"stdout": f'{{"number": {number}, "title": "T{number}"}}'},
+                )(),
+            }
+
+        # Build a set with MAX_BLOCKER_TITLE_FETCH + 5 unique numbers.
+        big_set: set[int] = set(range(1, MAX_BLOCKER_TITLE_FETCH + 6))
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess_with_retry)
+        result = d._fetch_issue_titles_for_blockers(big_set)
+
+        # Only MAX_BLOCKER_TITLE_FETCH calls should have been made.
+        assert call_count == MAX_BLOCKER_TITLE_FETCH
+        # All fetched numbers have a title.
+        assert len(result) == MAX_BLOCKER_TITLE_FETCH
+        assert all(v is not None for v in result.values())

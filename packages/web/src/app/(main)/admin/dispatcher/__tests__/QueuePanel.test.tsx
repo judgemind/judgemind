@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { RenderOptions } from '@testing-library/react';
 import type { ReactElement } from 'react';
-import { QueueBlockedPanel, QueuePanel, QueueReadyPanel, QueueRow } from '../QueuePanel';
+import { QueueBlockedPanel, QueuePanel, QueueReadyPanel, QueueRow, formatBlockerTooltip } from '../QueuePanel';
 import { formatCooldown } from '../QueuePanel';
 import type { QueueItem } from '@/lib/dispatcher-queries';
+import type { BlockerRef } from '@/lib/dispatcher-queries';
 import { TooltipProvider } from '@/components/ui/tooltip';
 
 const now = Date.parse('2026-04-18T12:00:00Z');
@@ -29,6 +30,11 @@ function item(overrides: Partial<QueueItem>): QueueItem {
     cooldownSecondsRemaining: null,
     ...overrides,
   };
+}
+
+/** Build a BlockerRef for tests. */
+function blocker(number: number, title: string | null = null): BlockerRef {
+  return { number, title };
 }
 
 describe('QueuePanel', () => {
@@ -59,7 +65,7 @@ describe('QueuePanel', () => {
 
   it('renders blocked rows with the issue link and title only', () => {
     const blocked = [
-      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
+      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [blocker(2500), blocker(2600)] }),
     ];
     renderWithTooltip(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
     expect(screen.getByTestId('issue-link-2500')).toBeInTheDocument();
@@ -80,7 +86,7 @@ describe('QueuePanel', () => {
 
   it('#2818: strips the [N] blocked-by count column from the blocked side', () => {
     const blocked = [
-      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
+      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [blocker(2500), blocker(2600)] }),
     ];
     renderWithTooltip(<QueuePanel queueReady={[]} queueBlocked={blocked} nowMs={now} />);
     expect(screen.queryByText('[2]')).not.toBeInTheDocument();
@@ -135,7 +141,7 @@ describe('QueuePanel', () => {
 
   it('#2886: blocked panel header renders `{shown} / {total}` when total provided', () => {
     const blocked = [
-      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [2500, 2600] }),
+      item({ issueNumber: 2500, title: 'blocked issue', blockedBy: [blocker(2500), blocker(2600)] }),
     ];
     renderWithTooltip(
       <QueuePanel
@@ -342,16 +348,21 @@ describe('QueuePanel — #3159 clickable count', () => {
   });
 });
 
-// --- #2812 — blocker tooltip hot links on blocked rows.
-describe('QueuePanel — #2812 blocker tooltip', () => {
-  it('renders blocker numbers as hot links inside the blocked-row tooltip', async () => {
+// --- #2989 — native title tooltip on IssueLink for blocked rows.
+// Replaces the #2812 Radix Tooltip approach. The tooltip is now a native
+// browser `title` attribute on the `#NNNN` IssueLink.
+describe('QueuePanel — #2989 blocker native title tooltip', () => {
+  it('AC5: IssueLink for a blocked row carries a title starting with "Blocked by:"', () => {
     const blockedItem: QueueItem = {
       issueNumber: 9001,
       title: 'blocked issue with two blockers',
       priority: 'p2',
       labels: ['priority/p2', 'status/blocked'],
       createdAt: '2026-04-18T11:00:00Z',
-      blockedBy: [2500, 2600],
+      blockedBy: [
+        blocker(2500, 'The first blocker'),
+        blocker(2600, 'The second blocker'),
+      ],
       cooldownSecondsRemaining: null,
     };
     render(
@@ -359,37 +370,62 @@ describe('QueuePanel — #2812 blocker tooltip', () => {
         <QueueRow item={blockedItem} />
       </TooltipProvider>,
     );
-    // The tooltip trigger should be present for rows with blockers.
-    const trigger = screen.getByTestId('blocker-tooltip-trigger-9001');
-    expect(trigger).toBeInTheDocument();
-    // Fire pointerMove to begin the tooltip open sequence (Radix opens on
-    // pointerMove). Then advance all timers (even delayDuration=0 uses setTimeout).
-    vi.useFakeTimers();
-    try {
-      act(() => {
-        fireEvent.pointerMove(trigger);
-        vi.runAllTimers();
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-    // Tooltip content renders the blocker links.
-    const link2500 = screen.getAllByTestId('issue-link-2500')[0];
-    const link2600 = screen.getAllByTestId('issue-link-2600')[0];
-    expect(link2500).toBeInTheDocument();
-    expect(link2600).toBeInTheDocument();
-    // Check the links have the correct hrefs.
-    expect(link2500).toHaveAttribute(
-      'href',
-      'https://github.com/judgemind/judgemind/issues/2500',
-    );
-    expect(link2600).toHaveAttribute(
-      'href',
-      'https://github.com/judgemind/judgemind/issues/2600',
-    );
+    const link = screen.getByTestId('issue-link-9001');
+    const titleAttr = link.getAttribute('title');
+    expect(titleAttr).toBeTruthy();
+    expect(titleAttr).toMatch(/^Blocked by:/);
   });
 
-  it('suppresses the blocker tooltip when blockedBy is empty', () => {
+  it('AC5: tooltip includes both blocker numbers and titles', () => {
+    const blockedItem: QueueItem = {
+      issueNumber: 9001,
+      title: 'blocked issue',
+      priority: 'p2',
+      labels: ['priority/p2', 'status/blocked'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [
+        blocker(2500, 'The first blocker'),
+        blocker(2600, 'The second blocker'),
+      ],
+      cooldownSecondsRemaining: null,
+    };
+    render(
+      <TooltipProvider>
+        <QueueRow item={blockedItem} />
+      </TooltipProvider>,
+    );
+    const link = screen.getByTestId('issue-link-9001');
+    const titleAttr = link.getAttribute('title') ?? '';
+    expect(titleAttr).toContain('2500');
+    expect(titleAttr).toContain('The first blocker');
+    expect(titleAttr).toContain('2600');
+    expect(titleAttr).toContain('The second blocker');
+  });
+
+  it('AC6: tooltip falls back to #N alone when a blocker title is null', () => {
+    const blockedItem: QueueItem = {
+      issueNumber: 9003,
+      title: 'blocked issue with null title',
+      priority: 'p2',
+      labels: ['priority/p2', 'status/blocked'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [blocker(42, null)],
+      cooldownSecondsRemaining: null,
+    };
+    render(
+      <TooltipProvider>
+        <QueueRow item={blockedItem} />
+      </TooltipProvider>,
+    );
+    const link = screen.getByTestId('issue-link-9003');
+    const titleAttr = link.getAttribute('title') ?? '';
+    // For null title the line must be "#42" only (no extra text after it).
+    expect(titleAttr).toContain('#42');
+    // Must NOT contain stray "null" string.
+    expect(titleAttr).not.toContain('null');
+  });
+
+  it('AC7: ready row IssueLink has no title attribute (no blockers)', () => {
     const readyItem: QueueItem = {
       issueNumber: 9002,
       title: 'ready issue no blockers',
@@ -404,8 +440,28 @@ describe('QueuePanel — #2812 blocker tooltip', () => {
         <QueueRow item={readyItem} />
       </TooltipProvider>,
     );
-    // No tooltip trigger for rows without blockers.
-    expect(screen.queryByTestId('blocker-tooltip-trigger-9002')).toBeNull();
+    const link = screen.getByTestId('issue-link-9002');
+    // Ready rows have no blocker tooltip.
+    expect(link.getAttribute('title')).toBeNull();
+  });
+
+  it('no Radix blocker-tooltip-trigger on blocked rows (replaced by native title)', () => {
+    const blockedItem: QueueItem = {
+      issueNumber: 9004,
+      title: 'blocked issue',
+      priority: 'p2',
+      labels: ['priority/p2', 'status/blocked'],
+      createdAt: '2026-04-18T11:00:00Z',
+      blockedBy: [blocker(42, 'Some title')],
+      cooldownSecondsRemaining: null,
+    };
+    render(
+      <TooltipProvider>
+        <QueueRow item={blockedItem} />
+      </TooltipProvider>,
+    );
+    // The old Radix trigger testid must be gone — replaced by native title.
+    expect(screen.queryByTestId('blocker-tooltip-trigger-9004')).toBeNull();
   });
 });
 
@@ -421,5 +477,80 @@ describe('formatCooldown', () => {
     expect(formatCooldown(300)).toBe('5m');
     expect(formatCooldown(3540)).toBe('59m');
     expect(formatCooldown(3600)).toBe('60m');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatBlockerTooltip — pure helper (issue #2989)
+// ---------------------------------------------------------------------------
+describe('formatBlockerTooltip', () => {
+  it('returns a string starting with "Blocked by:"', () => {
+    const refs: BlockerRef[] = [blocker(42, 'Do the thing')];
+    expect(formatBlockerTooltip(refs)).toMatch(/^Blocked by:/);
+  });
+
+  it('renders each blocker on its own line with "#N title"', () => {
+    const refs: BlockerRef[] = [
+      blocker(42, 'First blocker'),
+      blocker(100, 'Second blocker'),
+    ];
+    const result = formatBlockerTooltip(refs);
+    const lines = result.split('\n');
+    // First line is "Blocked by:"
+    expect(lines[0]).toBe('Blocked by:');
+    expect(lines).toContainEqual(expect.stringContaining('#42'));
+    expect(lines).toContainEqual(expect.stringContaining('First blocker'));
+    expect(lines).toContainEqual(expect.stringContaining('#100'));
+    expect(lines).toContainEqual(expect.stringContaining('Second blocker'));
+  });
+
+  it('AC6: null title renders as "#N" only with no stray "null"', () => {
+    const refs: BlockerRef[] = [blocker(42, null)];
+    const result = formatBlockerTooltip(refs);
+    expect(result).toContain('#42');
+    expect(result).not.toContain('null');
+  });
+
+  it('truncates at 6 entries and appends "(+M more)"', () => {
+    const refs: BlockerRef[] = Array.from({ length: 9 }, (_, i) =>
+      blocker(100 + i, `Title ${i}`),
+    );
+    const result = formatBlockerTooltip(refs);
+    // 9 blockers → show 6, append "(+3 more)"
+    expect(result).toContain('(+3 more)');
+    // Entries 7-9 (numbers 106-108) must NOT appear.
+    expect(result).not.toContain('#106');
+    expect(result).not.toContain('#107');
+    expect(result).not.toContain('#108');
+  });
+
+  it('does NOT append "(+M more)" when 6 or fewer', () => {
+    const refs: BlockerRef[] = Array.from({ length: 6 }, (_, i) =>
+      blocker(100 + i, `Title ${i}`),
+    );
+    const result = formatBlockerTooltip(refs);
+    expect(result).not.toContain('more');
+  });
+
+  it('caps individual title at ~80 chars with ellipsis', () => {
+    const longTitle = 'A'.repeat(90);
+    const refs: BlockerRef[] = [blocker(42, longTitle)];
+    const result = formatBlockerTooltip(refs);
+    // Title must be truncated; ellipsis appended.
+    expect(result).toContain('\u2026');
+    // The line with the blocker must not contain the full 90-char title.
+    const lines = result.split('\n');
+    const blockerLine = lines.find((l) => l.includes('#42')) ?? '';
+    // Line format: "  #42 <title>" — check that the title portion is capped.
+    // Strip leading spaces and "#42 " to isolate the title portion.
+    const titlePart = blockerLine.trimStart().replace(/^#\d+\s/, '');
+    // Title should be at most 81 chars (80 + ellipsis).
+    expect(titlePart.length).toBeLessThanOrEqual(81);
+    // Must not contain the full 90-char title.
+    expect(titlePart).not.toBe(longTitle);
+  });
+
+  it('returns just "Blocked by:" header for empty input', () => {
+    expect(formatBlockerTooltip([])).toBe('Blocked by:');
   });
 });

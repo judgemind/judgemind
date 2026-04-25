@@ -56,7 +56,10 @@ export const DISPATCHER_STATE_QUERY = gql`
         priority
         labels
         createdAt
-        blockedBy
+        blockedBy {
+          number
+          title
+        }
         cooldownSecondsRemaining
       }
       queueBlocked {
@@ -65,7 +68,10 @@ export const DISPATCHER_STATE_QUERY = gql`
         priority
         labels
         createdAt
-        blockedBy
+        blockedBy {
+          number
+          title
+        }
       }
       recentCompletions {
         agentId
@@ -120,7 +126,10 @@ export const DISPATCHER_QUEUE_FULL_QUERY = gql`
         priority
         labels
         createdAt
-        blockedBy
+        blockedBy {
+          number
+          title
+        }
         cooldownSecondsRemaining
       }
       completions {
@@ -232,13 +241,31 @@ export interface DispatcherFailure {
   issueNumber: number | null;
 }
 
+/**
+ * A blocker reference — the issue number and optional title of an issue
+ * that is blocking a `status/blocked` queue item. Title is populated by the
+ * daemon's `_fetch_issue_titles_for_blockers` helper (issue #2989) and may
+ * be null when the title fetch failed (404, rate-limit, etc.).
+ *
+ * Apollo `keyFields: ['number']` is registered in `apollo-client.ts` so
+ * Apollo normalises distinct BlockerRef entries correctly.
+ */
+export interface BlockerRef {
+  number: number;
+  title: string | null;
+}
+
 export interface QueueItem {
   issueNumber: number;
   title: string;
   priority: string | null;
   labels: string[];
   createdAt: string | null;
-  blockedBy: number[];
+  /** Blocker references for this issue. Issue #2989: now `BlockerRef[]`
+   * instead of `number[]`. Each entry carries the blocker issue number
+   * and optional title (null when the daemon's title fetch failed).
+   * Empty for queueReady items. */
+  blockedBy: BlockerRef[];
   /** Seconds left in the post-failure cooldown window. Null when no prior
    * attempt exists (never attempted) or when cooldown has elapsed.
    * Positive when the issue is still cooling down after a recent failure.
