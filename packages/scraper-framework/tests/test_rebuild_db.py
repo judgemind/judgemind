@@ -568,6 +568,7 @@ class TestMainSummary:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=[
@@ -1054,6 +1055,7 @@ class TestMainPerCountyResetDispatch:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
@@ -1099,6 +1101,7 @@ class TestMainPerCountyResetDispatch:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
@@ -1166,6 +1169,7 @@ class TestMainPerCountyResetDispatch:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
@@ -1201,6 +1205,7 @@ class TestMainPerCountyResetDispatch:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
@@ -1411,6 +1416,7 @@ class TestForceSplitChildLossDeprecated:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=["ca/santa_clara/superior_court/raw/abc123.html"],
@@ -1501,6 +1507,7 @@ class TestRebuildSummaryHashMismatchCounter:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=[
@@ -1703,6 +1710,7 @@ class TestAutoscaleLogging:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch("rebuild_db.list_local_keys", return_value=keys),
             patch("rebuild_db.seed_courts", return_value={}),
             patch("rebuild_db._fetch_rosters"),
@@ -1962,6 +1970,7 @@ class TestMainPoolBreakHandling:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=keys,
@@ -2067,6 +2076,7 @@ class TestMainPoolBreakHandling:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=keys,
@@ -2160,6 +2170,7 @@ class TestMaxWorkerMemoryCLI:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=keys,
@@ -2236,6 +2247,7 @@ class TestMaxWorkerMemoryCLI:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=keys,
@@ -2309,6 +2321,7 @@ class TestMaxWorkerMemoryCLI:
         with (
             patch("rebuild_db.make_s3_client", return_value=MagicMock()),
             patch("psycopg.connect", return_value=MagicMock()),
+            patch("rebuild_db._query_connection_budget", return_value=(0, 0)),
             patch(
                 "rebuild_db.list_local_keys",
                 return_value=keys,
@@ -2347,3 +2360,143 @@ class TestMaxWorkerMemoryCLI:
             rebuild_db.main()
 
         assert captured_max_workers[0] == 4
+
+
+# ---------------------------------------------------------------------------
+# Connection-budget pre-flight — #2575
+# ---------------------------------------------------------------------------
+
+
+class TestClampConcurrencyToBudget:
+    """Tests for _clamp_concurrency_to_budget() pure function."""
+
+    def test_budget_ok_when_plentiful(self) -> None:
+        """172 max_connections, 5 used, 64 requested → no clamp (budget_ok).
+
+        available = int((172-5) * 0.8) = int(133.6) = 133
+        133 >= 64 + 1 = 65 → no clamp
+        """
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=64, max_connections=172, used=5
+        )
+        assert effective == 64
+        assert reason == "budget_ok"
+
+    def test_clamps_when_budget_tight(self) -> None:
+        """20 max_connections, 2 used, 64 requested → clamp to 13.
+
+        available = int((20-2) * 0.8) = int(14.4) = 14
+        14 < 64 + 1 = 65 → clamp to max(4, 14-1) = 13
+        """
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=64, max_connections=20, used=2
+        )
+        assert effective == 13
+        assert reason == "clamped_to_budget"
+
+    def test_floor_of_four(self) -> None:
+        """20 max_connections, 18 used, 64 requested → floor clamps to 4.
+
+        available = int((20-18) * 0.8) = int(1.6) = 1
+        1 < 65 → clamp to max(4, 1-1) = max(4, 0) = 4
+        """
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=64, max_connections=20, used=18
+        )
+        assert effective == 4
+        assert reason == "clamped_to_budget"
+
+    def test_max_connections_zero_returns_budget_unknown(self) -> None:
+        """max_connections=0 → (requested, budget_unknown) — skip clamping."""
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=64, max_connections=0, used=0
+        )
+        assert effective == 64
+        assert reason == "budget_unknown"
+
+    def test_max_connections_negative_returns_budget_unknown(self) -> None:
+        """Negative max_connections also returns budget_unknown."""
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=64, max_connections=-1, used=0
+        )
+        assert effective == 64
+        assert reason == "budget_unknown"
+
+    def test_no_clamp_at_boundary(self) -> None:
+        """Clamp triggers only when available < requested + 1.
+
+        When available == requested + 1, the condition is false → budget_ok.
+        Example: max=100, used=0, headroom_pct=0.0 →
+          available = int((100-0)*(1-0.0)) = 100
+          requested = 99 → 100 >= 99+1=100 → not clamped
+        """
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=99, max_connections=100, used=0, headroom_pct=0.0
+        )
+        assert effective == 99
+        assert reason == "budget_ok"
+
+    def test_clamp_at_exact_boundary(self) -> None:
+        """When available == requested, the condition fires → clamped.
+
+        available = int((100-0)*(1-0.0)) = 100
+        requested = 100 → 100 < 100+1=101 → clamped to max(4, 100-1)=99
+        """
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=100, max_connections=100, used=0, headroom_pct=0.0
+        )
+        assert effective == 99
+        assert reason == "clamped_to_budget"
+
+    def test_custom_floor(self) -> None:
+        """floor parameter overrides the default of 4."""
+        effective, reason = rebuild_db._clamp_concurrency_to_budget(
+            requested=64, max_connections=20, used=18, floor=2
+        )
+        assert effective == 2
+        assert reason == "clamped_to_budget"
+
+
+class TestQueryConnectionBudget:
+    """Tests for _query_connection_budget() I/O wrapper."""
+
+    def test_issues_expected_sql(self) -> None:
+        """Issues the two expected SQL queries and returns (max, used) tuple."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # fetchone() is called twice: once for max_connections, once for used
+        mock_cur.fetchone.side_effect = [(172,), (5,)]
+
+        with patch("psycopg.connect", return_value=mock_conn):
+            result = rebuild_db._query_connection_budget("postgres://test")
+
+        assert result == (172, 5)
+        # Verify both SQL strings were issued
+        execute_calls = [call[0][0] for call in mock_cur.execute.call_args_list]
+        assert any("max_connections" in sql for sql in execute_calls), (
+            f"expected max_connections query in {execute_calls!r}"
+        )
+        assert any("pg_stat_activity" in sql for sql in execute_calls), (
+            f"expected pg_stat_activity query in {execute_calls!r}"
+        )
+
+    def test_failure_returns_zero_zero_and_logs_warning(self) -> None:
+        """Connection failure returns (0, 0) and logs a warning — does not raise."""
+        mock_logger = MagicMock()
+
+        with (
+            patch("psycopg.connect", side_effect=Exception("connection refused")),
+            patch.object(rebuild_db, "logger", mock_logger),
+        ):
+            result = rebuild_db._query_connection_budget("postgres://test")
+
+        assert result == (0, 0)
+        # Must have logged a warning — not raised
+        calls = mock_logger.warning.call_args_list
+        assert mock_logger.warning.called, (
+            f"expected warning log on connection failure; got {calls!r}"
+        )

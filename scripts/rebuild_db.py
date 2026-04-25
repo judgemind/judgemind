@@ -555,6 +555,71 @@ def _autoscale_concurrency(
     )
 
 
+def _query_connection_budget(dsn: str) -> tuple[int, int]:
+    """Return (max_connections, currently_used) from the target database.
+
+    Opens a short-lived connection, runs two queries:
+    - ``SELECT setting::int FROM pg_settings WHERE name='max_connections'``
+    - ``SELECT count(*) FROM pg_stat_activity``
+
+    Returns ``(0, 0)`` on any failure so a permission or connectivity issue
+    does not block the rebuild — the caller treats ``(0, 0)`` as
+    "budget unknown" and skips clamping.  Never raises.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT setting::int FROM pg_settings WHERE name='max_connections'"
+                )
+                row = cur.fetchone()
+                max_connections = int(row[0]) if row else 0
+
+                cur.execute("SELECT count(*) FROM pg_stat_activity")
+                row = cur.fetchone()
+                used = int(row[0]) if row else 0
+
+        return (max_connections, used)
+    except Exception:
+        logger.warning(
+            "Could not query connection budget — skipping clamp",
+            dsn=dsn,
+        )
+        return (0, 0)
+
+
+def _clamp_concurrency_to_budget(
+    requested: int,
+    max_connections: int,
+    used: int,
+    headroom_pct: float = 0.20,
+    floor: int = 4,
+) -> tuple[int, str]:
+    """Clamp ``requested`` concurrency to the database connection budget.
+
+    Computes ``available = int((max_connections - used) * (1 - headroom_pct))``.
+    Returns a ``(effective, reason)`` tuple:
+
+    - If ``max_connections <= 0``: ``(requested, "budget_unknown")`` — the
+      I/O layer failed, skip clamping.
+    - If ``available < requested + 1``: ``(max(floor, available - 1),
+      "clamped_to_budget")`` — too few slots, apply the floor.
+    - Otherwise: ``(requested, "budget_ok")`` — budget is plentiful.
+
+    The floor (default 4) ensures the rebuild always makes forward progress
+    even when the DB is nearly saturated.  Pure function — no I/O.
+    """
+    if max_connections <= 0:
+        return (requested, "budget_unknown")
+
+    available = int((max_connections - used) * (1 - headroom_pct))
+    if available < requested + 1:
+        return (max(floor, available - 1), "clamped_to_budget")
+    return (requested, "budget_ok")
+
+
 def _should_abort_retry_pass(
     crashed_count: int,
     total_count: int,
@@ -1380,6 +1445,33 @@ def main() -> None:
                 requested_concurrency=concurrency_requested,
                 effective_concurrency=concurrency,
             )
+
+        # Connection-budget pre-flight: clamp the autoscaled concurrency so we
+        # never exhaust the DB connection pool (#2575).  Runs after autoscale so
+        # both memory and connection budgets compose (the tighter limit wins).
+        max_conn, conn_used = _query_connection_budget(database_url)
+        clamped_concurrency, budget_reason = _clamp_concurrency_to_budget(
+            concurrency, max_conn, conn_used
+        )
+        logger.info(
+            "Connection budget decision",
+            max_connections=max_conn,
+            currently_used=conn_used,
+            requested=concurrency,
+            effective=clamped_concurrency,
+            reason=budget_reason,
+        )
+        if budget_reason == "clamped_to_budget":
+            logger.warning(
+                "Clamping --concurrency from %d to %d "
+                "(max_connections=%d, currently_used=%d)",
+                concurrency,
+                clamped_concurrency,
+                max_conn,
+                conn_used,
+            )
+        concurrency = clamped_concurrency
+
         logger.info("Processing documents", concurrency=concurrency, total=len(keys))
 
         # Step 4: Process documents concurrently using processes (not threads).
