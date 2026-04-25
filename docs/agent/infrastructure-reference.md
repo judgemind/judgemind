@@ -368,6 +368,20 @@ scripts/ecs-run-task.sh --cpu 2048 --memory 8192 scripts/rebuild_db.py -- --coun
 
 Smaller counties (a few hundred documents or fewer) run fine at the 1024/4096 default.
 
+### Output-size limits via SSM / ECS Exec
+
+`scripts/dev-db-query.sh` occasionally truncates large query results mid-field. The root cause is the SSM output budget — the SSM / ECS Exec per-session output byte cap (~1 KB effective, varies with task load), not a timing race or psql buffering issue. See #3195.
+
+Three mitigations were landed in #3195 / PR #3201:
+
+- **Compact JSON default** in `scripts/dev_db_query_runner.py` (`json.dumps(..., separators=(",", ":"))`) so the payload is as small as possible before it hits the transport layer.
+- **SSM chatter stripping** in `scripts/dev-db-query.sh` (the `grep -Ev` filter against `Starting session…` / `Exiting session…` / `Cannot perform start session: EOF` / `The Session Manager plugin was installed…`) so SSM banner lines do not contaminate JSON consumers.
+- **5-attempt retry loop** in `scripts/dispatcher/helpers/_query_lib.sh` (`_query_lib_run`) that re-executes the query and re-validates with `jq -e .` until the captured output parses as valid JSON.
+
+**Architectural escape hatch.** When the caller actually needs more than ~1 KB of structured output, run the work as a oneshot ECS task via `scripts/ecs-run-task.sh` and read results from CloudWatch Logs (or write them to S3). That path does not use SSM, so there is no per-session output cap.
+
+**Rule of thumb:** if you expect more than ~1 KB of JSON from a single helper query, split the query, narrow the `SELECT`, or use `scripts/ecs-run-task.sh` instead of `scripts/dev-db-query.sh`.
+
 ### Container Insights (per-task CPU/memory/network visibility)
 
 Container Insights is **enabled** on the `judgemind-dev` ECS cluster (see `aws_ecs_cluster.main` in `infra/terraform/modules/compute/main.tf`). Under the `enabled` tier — which is what's live — CloudWatch emits metrics in the `ECS/ContainerInsights` namespace at these dimension levels:
