@@ -20,7 +20,7 @@ resource "aws_iam_role" "agent" {
   description = "Assumed by the Claude Code agent via sts:AssumeRole for dev ECS/CloudWatch/S3 operations"
 
   assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
         Effect    = "Allow"
@@ -39,12 +39,12 @@ resource "aws_iam_policy" "ecs_dev_only" {
   description = "Allows the agent to run, describe, list, and update ECS resources in the dev cluster"
 
   policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "EcsDevCluster"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "EcsDevCluster"
+        Effect = "Allow"
+        Action = [
           "ecs:RunTask",
           "ecs:DescribeTasks",
           "ecs:ListTasks",
@@ -78,12 +78,12 @@ resource "aws_iam_policy" "logs_dev_groups" {
   description = "Allows the agent to read CloudWatch log groups for dev ECS tasks"
 
   policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "LogsDevGroups"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "LogsDevGroups"
+        Effect = "Allow"
+        Action = [
           "logs:GetLogEvents",
           "logs:DescribeLogGroups",
           "logs:DescribeLogStreams",
@@ -113,12 +113,12 @@ resource "aws_iam_policy" "s3_staging_prefixes" {
   description = "Allows the agent to read, write, and delete S3 objects under staging/ and spotcheck/ prefixes"
 
   policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "AllowObjectOps"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "AllowObjectOps"
+        Effect = "Allow"
+        Action = [
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject"
@@ -129,10 +129,10 @@ resource "aws_iam_policy" "s3_staging_prefixes" {
         ]
       },
       {
-        Sid       = "AllowListBucket"
-        Effect    = "Allow"
-        Action    = "s3:ListBucket"
-        Resource  = var.document_archive_bucket_arn
+        Sid      = "AllowListBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = var.document_archive_bucket_arn
         Condition = {
           StringLike = {
             "s3:prefix" = ["staging/", "staging", "spotcheck/", "spotcheck"]
@@ -154,7 +154,7 @@ resource "aws_iam_policy" "secrets_judgemind" {
   description = "Allows the agent to read Secrets Manager secrets under the judgemind/ prefix"
 
   policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
         Sid      = "SecretsJudgemind"
@@ -179,7 +179,7 @@ resource "aws_iam_policy" "pass_role_narrow_scraper" {
   description = "Allows the agent to pass the scraper IAM role when launching ECS tasks"
 
   policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
         Sid      = "PassRoleScraper"
@@ -205,7 +205,7 @@ resource "aws_iam_policy" "pass_role_narrow_maintenance" {
   description = "Allows the agent to pass the maintenance IAM role when launching ECS tasks"
 
   policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [
       {
         Sid      = "PassRoleMaintenance"
