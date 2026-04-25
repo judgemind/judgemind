@@ -284,6 +284,35 @@ The adoption-to-merge path should be the common case when this check fires — i
 
 ---
 
+### Step 4b — Verify gap is real (current state probe)
+
+**Trigger condition:** Run this step when the issue title or body contains any of the following gap-assertion verbs — "enable", "add", "introduce", "expose", "document" — OR when the issue carries a `type/dx` or `type/infra` label. Issues with no gap-assertion signal (e.g. pure bug fixes, investigation tasks, refactoring) skip this step entirely.
+
+**What to do:** Pick the probe pattern that matches the issue's verb (see `docs/agent/issue-authoring.md §Verify the gap exists before filing` for the full probe catalog) and run it as a single tool call:
+
+- *"Enable AWS setting Y"* → `aws ecs describe-clusters --include SETTINGS` or grep `infra/terraform/` for the Terraform attribute.
+- *"Add metric / alarm"* → `aws cloudwatch list-metrics --namespace <ns>` / `aws cloudwatch describe-alarms --alarm-name-prefix <prefix>`.
+- *"Add / document X"* → `grep -r "X" docs/ .claude/skills/ CLAUDE.md` or `mcp__github__search_code` for the concept.
+- *"Fix code bug / introduce helper"* → grep for the function name or error-message string across `packages/`.
+
+**Decision tree:**
+
+- **Gap confirmed real** (the setting is off, the metric does not exist, the doc is absent, the bug is still present): continue to Path A / Path B as usual.
+- **Gap already satisfied** (probe output shows the state already matches the issue's goal): do NOT abandon the task. Post a comment on the issue quoting the probe output and proposing a reduced scope — typically a docs-only PR that documents the current state and cites the prior PR / Terraform attribute that already shipped it. Write the comment to `{worktree}/tmp/gap_probe_comment.txt`, post it, then continue with the reduced docs-only scope:
+  ```
+  gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/gap_probe_comment.txt
+  ```
+  The docs delta is worth producing — the AC's intent usually has a residual: "confirm and document that this already works." Complete that as a minimal PR before proceeding to merge.
+- **Probe ambiguous** (e.g. the AWS API returns unexpected output, the grep hits unrelated files, the state is partially configured): treat as "gap real" and continue to Path A.
+
+Exit codes:
+
+- **Gap real or ambiguous** → continue to Path A / Path B.
+- **Gap already satisfied** → post comment, pivot to reduced (docs-only) scope, continue as Path A with the reduced scope.
+
+---
+
+
 ### Path A: Implementation task (feature, bug fix, refactor)
 
 Follow the full PR Workflow defined in CLAUDE.md. **All commits must be on the worktree branch — never on `main`.** Summary of required substeps:
