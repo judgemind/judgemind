@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { SECTION_HEADING } from '@/lib/typography';
 import type { DispatcherAgent } from '@/lib/dispatcher-queries';
 import { tooltipText } from '@/lib/dispatcher-phase-flow';
+import { isFinalRalphAttempt } from '@/lib/dispatcher-ralph-model';
 import { formatUptime, shortAgentId, worktreeLogsUrl } from './format-helpers';
 import { IssueLink, PriorityBadge } from './ui-primitives';
 
@@ -92,7 +93,16 @@ function ActiveAgentRow({
   const elapsed = formatUptime(agent.startedAt, nowMs);
   // Build the phase tooltip from the shared canonical constant so
   // future phase additions propagate automatically (#2899).
-  const phaseTooltip = tooltipText(agent.phase);
+  let phaseTooltip = tooltipText(agent.phase);
+  // Final-attempt Opus escalation marker (#3021 / #2955): when the agent
+  // is on a ralph phase AND has exhausted all-but-last retries, annotate
+  // the chip text and tooltip so operators know this is the Opus run.
+  const isFinalOpusRalph =
+    agent.phase === 'ralph' && isFinalRalphAttempt(agent.retriesUsed);
+  if (isFinalOpusRalph) {
+    phaseTooltip += '\n\nFinal attempt — Opus escalation (#2955)';
+  }
+  const phaseChipText = isFinalOpusRalph ? 'ralph (opus)' : agent.phase;
   // Magic Move wiring (#2967). The outer <li> carries the issue identity
   // (`issue-N`) so the row Magic Moves between Queue and Active when the
   // agent is claimed, retried, or released. The inner wrapper carries
@@ -155,7 +165,7 @@ function ActiveAgentRow({
           data-testid={`active-agent-phase-${agent.id}`}
           title={phaseTooltip}
         >
-          {agent.phase}
+          {phaseChipText}
         </span>
         <span className="flex-shrink-0 text-xs">
           {logsHref ? (
