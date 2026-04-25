@@ -75,6 +75,7 @@ LOCAL_ONLY=(
 #   2. Add the filename and document the fallback mechanism.
 VALIDATED=(
     "data-quality-check.py"  # --baselines-base64 / --baselines-json CLI args bypass file path (#1225)
+    "check-scraper-zero-record-runner.py"  # Runs in dedicated ECS task (EventBridge, not ecs-run-task.sh); scripts/ dir is baked into the Docker image (#2677)
 )
 
 # ─── Helper: is the file in a skip list? ──────────────────────────────────────

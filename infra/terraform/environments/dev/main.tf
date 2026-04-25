@@ -493,8 +493,8 @@ module "scraper_zero_record_check" {
   private_subnet_ids = module.networking.private_subnet_ids
   ecs_cluster_arn    = module.compute.cluster_arn
 
-  ecr_repository_url      = module.ecr.repository_url
-  task_execution_role_arn = module.compute.task_execution_role_arn
+  ecr_repository_url       = module.ecr.repository_url
+  task_execution_role_arn  = module.compute.task_execution_role_arn
   db_connection_secret_arn = module.database.db_connection_secret_arn
 
   # Reuse the dispatcher PAT — already has issues:write per #2700.
