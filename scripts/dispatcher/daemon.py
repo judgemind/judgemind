@@ -9147,6 +9147,8 @@ class DispatcherDaemon:
         worktree = self._create_worktree(agent_id)
 
         # 3. Update worktree_path in the agents row now that we have it.
+        # exec-mode-agnostic (#3158): synthetic agents always run as local
+        # subprocesses; there is no ECS task_arn to track for this row.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -9171,6 +9173,8 @@ class DispatcherDaemon:
 
         # 5. Mark terminal.  Gate label removal on issue_number > 0 so we
         #    don't try to remove a label from a non-existent issue.
+        # ROUTING (#3062): NOT routed through _handle_agent_failure — synthetic
+        # agents have no real issue or PR; there is nothing to diagnose or escalate.
         terminal_status = "succeeded" if exit_code == 0 else "failed"
         self._mark_agent_terminal(
             agent_id,
@@ -9312,6 +9316,8 @@ class DispatcherDaemon:
                 last_run_at_clause = "ended_at > %s"
                 params = (state_rows[0][0],)
 
+            # exec-mode-agnostic (#3158): counting succeeded tasks across all
+            # execution modes; the audit threshold is mode-independent.
             cur.execute(
                 "SELECT COUNT(*) FROM dispatcher.agents "
                 "WHERE kind = 'task' AND status = 'succeeded' "
