@@ -446,7 +446,7 @@ Best practices:
 1. Never launch a rebuild while another rebuild or large backfill is already running against dev. Check first — preferred path: `mcp__awslabs_ecs-mcp-server__ecs_resource_management` with `api_operation: "ListTasks"`, `api_params: {"cluster": "judgemind-dev", "desiredStatus": "RUNNING"}`. CLI fallback: `aws ecs list-tasks --cluster judgemind-dev --desired-status RUNNING`. (See `docs/agent/aws-api-access.md`.)
 2. If you see `rds_reserved` errors, first check for runaway oneshot tasks (preferred: MCP `ListTasks` + `DescribeTasks` as above; CLI: `aws ecs list-tasks` then `aws ecs describe-tasks`) and stop any that are stuck retrying — each zombie task holds N connections until it exits.
 3. When iterating locally, prefer `scripts/rebuild_db.sh` against the Docker Compose Postgres rather than dev.
-4. If you *must* run rebuild with aggressive concurrency on dev, drop `--concurrency` to match the headroom (e.g. `--concurrency 32` leaves ~100 connections free for other callers).
+4. If you *must* run rebuild with aggressive concurrency on dev, drop `--concurrency` to match the headroom (e.g. `--concurrency 32` leaves ~100 connections free for other callers). Note: as of #2575, `rebuild_db.py` queries `max_connections` and `pg_stat_activity` at startup and self-clamps `--concurrency` to stay within the 80% connection headroom — manual tuning is a fallback, not a requirement.
 
 **History.** The instance was bumped from `db.t4g.micro` (max_connections ≈ 84) to `db.t4g.small` in #2549 after rebuild + backfill contention reliably triggered connection-slot exhaustion.
 
