@@ -298,7 +298,8 @@ class TestPhaseOutputMissingPreview:
                 "parent_issue": None,
             }
         )
-        d._agent_ralph_output = {"summary": "", "changed_files": []}
+        d._fetch_phase_output = MagicMock(return_value={})  # type: ignore[method-assign]
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         d._run_summary_phase("agent-123", 1, worktree)
 
@@ -333,6 +334,8 @@ class TestPhaseOutputMissingPreview:
         d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
+        d._fetch_phase_output = MagicMock(return_value={})  # type: ignore[method-assign]
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         d._run_fix_ci(agent, pr_status)
 

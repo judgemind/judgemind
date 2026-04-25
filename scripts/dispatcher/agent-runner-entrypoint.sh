@@ -1056,18 +1056,6 @@ def _touched_services_from_runs(deploy_runs: list[dict]) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _read_prior_output(repo_root: Path, phase: str) -> dict:
-    """Read ``{repo_root}/tmp/dispatcher-output/<phase>.json`` if present."""
-    path = repo_root / "tmp" / "dispatcher-output" / f"{phase}.json"
-    if not path.exists():
-        return {}
-    try:
-        parsed = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _git_diff(repo_root: Path) -> str:
     """``git diff origin/main...HEAD`` from the repo root. Empty on failure."""
     try:
@@ -1190,8 +1178,8 @@ def _build_summary_input(
 ) -> dict:
     """Match DispatcherDaemon._run_summary_phase's summary_input shape."""
     bundle = _fetch_issue_bundle(github_repo, issue_number)
-    plan = _read_prior_output(repo_root, "plan")
-    ralph = _read_prior_output(repo_root, "ralph")
+    plan = _db_fetch_phase_output(agent_id, "plan")
+    ralph = _db_fetch_phase_output(agent_id, "ralph")
     # The daemon prefers ralph's own ``changed_files`` list if populated;
     # falls back to a git diff read against HEAD. We match, except we
     # fall back to ``origin/main...HEAD`` instead of ``HEAD`` because
@@ -1231,7 +1219,7 @@ def _build_fix_ci_input(
     # what shipped (matches daemon behaviour). Fall back to local
     # ``git diff`` if gh is unreachable.
     git_diff = _fetch_pr_diff(github_repo, pr_number) or _git_diff(repo_root)
-    plan = _read_prior_output(repo_root, "plan")
+    plan = _db_fetch_phase_output(agent_id, "plan")
     branch = _git_current_branch(repo_root)
     return {
         "agent_id": agent_id,
@@ -1266,7 +1254,7 @@ def _build_verify_input(
     # back to extracting from the issue body via the same regex the
     # daemon uses. If both are empty the verify skill tolerates that
     # with a FAILED verdict.
-    plan = _read_prior_output(repo_root, "plan")
+    plan = _db_fetch_phase_output(agent_id, "plan")
     acceptance_criteria = plan.get("acceptance_criteria") or []
     if not acceptance_criteria:
         acceptance_criteria = _extract_acceptance_criteria(bundle.get("issue_body") or "")
@@ -1317,7 +1305,7 @@ def _build_retro_input(
     if ci_attempts < 1:
         ci_attempts = 1
     total_duration_s = _db_fetch_agent_total_duration_s(agent_id)
-    plan = _read_prior_output(repo_root, "plan")
+    plan = _db_fetch_phase_output(agent_id, "plan")
     scope_check_followups: list[str] = []
     plan_follow_ups: list[str] = []
     if isinstance(plan, dict):
@@ -1595,7 +1583,7 @@ def _build_input(
         bundle = _fetch_issue_bundle(github_repo, issue_number)
         return {**base, **bundle}
     if phase == "ralph":
-        plan = _read_prior_output(repo_root, "plan")
+        plan = _db_fetch_phase_output(agent_id, "plan")
         return {
             **base,
             "plan": plan,

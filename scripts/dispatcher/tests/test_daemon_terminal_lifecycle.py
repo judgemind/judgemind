@@ -129,7 +129,9 @@ def _make_daemon(
 _SENTINEL = object()  # used to detect "no change" vs None
 
 
-def _apply_executed_to_row(row: dict[str, Any], executed: list[tuple[str, Any]]) -> None:
+def _apply_executed_to_row(
+    row: dict[str, Any], executed: list[tuple[str, Any]]
+) -> None:
     """Walk ``cursor.executed`` in order and apply each recognized UPDATE shape.
 
     Mutates ``row`` in place.  Unrecognized SQL is silently ignored (e.g.
@@ -260,8 +262,12 @@ class TestRetryRecoveryLifecycleFinalRowState:
         _apply_executed_to_row(row, executed_before_reset)
 
         # Intermediate: row should be crashed with failure_summary populated
-        assert row["status"] == "crashed", f"Expected crashed after first terminal, got {row['status']}"
-        assert row["ended_at"] is not None, "ended_at must be set after crashed terminal"
+        assert row["status"] == "crashed", (
+            f"Expected crashed after first terminal, got {row['status']}"
+        )
+        assert row["ended_at"] is not None, (
+            "ended_at must be set after crashed terminal"
+        )
         assert row["failure_summary"] is not None, (
             "failure_summary must be populated after crashed terminal"
         )
@@ -281,7 +287,9 @@ class TestRetryRecoveryLifecycleFinalRowState:
         conn.cursor_instance.execute(reset_sql, ("agent-lifecycle",))
         _apply_executed_to_row(row, conn.cursor_instance.executed[pos_before_reset:])
 
-        assert row["status"] == "retrying", f"Expected retrying after reset, got {row['status']}"
+        assert row["status"] == "retrying", (
+            f"Expected retrying after reset, got {row['status']}"
+        )
         assert row["exit_code"] is None, "exit_code must be cleared by retry-reset"
         assert row["ended_at"] is None, "ended_at must be cleared by retry-reset"
         # failure_summary is NOT cleared by retry-reset (that's the succeeded terminal's job)
@@ -299,9 +307,13 @@ class TestRetryRecoveryLifecycleFinalRowState:
         )
         _apply_executed_to_row(row, conn.cursor_instance.executed[pos_before_running:])
 
-        assert row["status"] == "running", f"Expected running after non-terminal, got {row['status']}"
+        assert row["status"] == "running", (
+            f"Expected running after non-terminal, got {row['status']}"
+        )
         assert row["phase"] == "awaiting_ci"
-        assert row["pr_number"] == 9999, "pr_number must be set via COALESCE on non-terminal"
+        assert row["pr_number"] == 9999, (
+            "pr_number must be set via COALESCE on non-terminal"
+        )
         assert row["ended_at"] is None, "Non-terminal must NOT set ended_at"
         # failure_summary must still be untouched by non-terminal UPDATE
         assert row["failure_summary"] is not None, (
@@ -317,7 +329,9 @@ class TestRetryRecoveryLifecycleFinalRowState:
             exit_code=0,
             pr_number=9999,
         )
-        _apply_executed_to_row(row, conn.cursor_instance.executed[pos_before_succeeded:])
+        _apply_executed_to_row(
+            row, conn.cursor_instance.executed[pos_before_succeeded:]
+        )
 
         # ── Step 6: final row assertions (AC-1 verify-line) ──────────────
         assert row["status"] == "succeeded", (

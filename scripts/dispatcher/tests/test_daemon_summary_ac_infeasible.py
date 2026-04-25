@@ -117,9 +117,9 @@ def _patch_summary_helpers(
     d: daemon.DispatcherDaemon, *, summary_output: dict[str, Any]
 ) -> None:
     """Stub the helpers _run_summary_phase relies on so the test doesn't
-    need a real subprocess or issue-bundle fetch. The ralph-side output
-    stash (``_agent_ralph_output``) is set to a minimal SHIP dict so
-    the summary phase sees the expected predecessor state."""
+    need a real subprocess or issue-bundle fetch. Mocks ``_fetch_phase_output``
+    to return a minimal SHIP dict for ralph and an empty plan dict so the
+    summary phase sees the expected predecessor state."""
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._write_phase_input = MagicMock()  # type: ignore[method-assign]
     d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
@@ -130,14 +130,24 @@ def _patch_summary_helpers(
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._write_failure = MagicMock()  # type: ignore[method-assign]
     # Pretend ralph shipped so the summary phase has the expected
-    # precursor state. The real summary_input build reads
-    # ``_agent_ralph_output.summary`` and ``changed_files`` from here.
-    d._agent_ralph_output = {
+    # precursor state. The real summary_input build reads from
+    # _fetch_phase_output for ralph and plan.
+    _ralph_output = {
         "verdict": "SHIP",
         "summary": "ralph shipped something",
         "changed_files": ["scripts/foo.py"],
     }
-    d._agent_plan_output = {"acceptance_criteria": [], "scope_check": []}
+    _plan_output: dict[str, Any] = {"acceptance_criteria": [], "scope_check": []}
+    d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda _aid, phase: (
+            _ralph_output
+            if phase == "ralph"
+            else _plan_output
+            if phase == "plan"
+            else None
+        )
+    )
+    d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
     # Issue bundle fetch — short-circuit.
     d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
         return_value={
@@ -300,8 +310,11 @@ class TestRunSummaryPhaseAcInfeasible:
         assert ok is True
         d._write_failure.assert_not_called()  # type: ignore[union-attr]
         d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
-        assert d._agent_summary_output is not None
-        assert str(d._agent_summary_output.get("verdict")).upper() == "OK"
+        # Summary output was persisted to DB via _persist_phase_output.
+        d._persist_phase_output.assert_called_once()  # type: ignore[union-attr]
+        persisted_args = d._persist_phase_output.call_args.args  # type: ignore[union-attr]
+        assert persisted_args[1] == "summary"
+        assert str(persisted_args[2].get("verdict")).upper() == "OK"
 
     def test_ok_with_unmet_takes_needs_review_path_not_ac_infeasible(
         self, tmp_path: Path
@@ -334,7 +347,13 @@ class TestRunSummaryPhaseAcInfeasible:
         # (the draft-PR flow).
         assert ok is True
         d._write_failure.assert_not_called()  # type: ignore[union-attr]
-        assert d._agent_unmet_criteria == ["shape-mismatch AC"]
+        # unmet_criteria is carried in the persisted summary output and
+        # read by _push_and_open_pr via _fetch_phase_output — not in a
+        # local instance variable (#2975).
+        d._persist_phase_output.assert_called_once()  # type: ignore[union-attr]
+        persisted_args = d._persist_phase_output.call_args.args  # type: ignore[union-attr]
+        assert persisted_args[1] == "summary"
+        assert persisted_args[2].get("unmet_criteria") == ["shape-mismatch AC"]
 
     def test_build_diagnoser_context_bundles_summary_extras(
         self, tmp_path: Path
