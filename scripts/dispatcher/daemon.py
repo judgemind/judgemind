@@ -4863,7 +4863,7 @@ class DispatcherDaemon:
                     mode = (
                         str(raw_mode).lower()
                         if raw_mode is not None
-                        else DEFAULT_AGENT_EXECUTION_MODE
+                        else "subprocess"
                     )
                     raw_arn = row[4] if len(row) > 4 else None
                     task_arn = str(raw_arn) if raw_arn is not None else None

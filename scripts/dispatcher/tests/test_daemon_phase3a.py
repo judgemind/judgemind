@@ -1144,10 +1144,10 @@ class TestAtomicClaim:
             if "INSERT INTO dispatcher.agents" in e[0]
         ]
         _sql, params = inserts[0]
-        # Priority = NULL (second-to-last); execution_mode = 'subprocess'
-        # (last, migration 41 / #3091 default).
+        # Priority = NULL (second-to-last); execution_mode = 'ecs'
+        # (last, migration 41 / #3091; default flipped to 'ecs' in #3093).
         assert params[-2] is None
-        assert params[-1] == "subprocess"
+        assert params[-1] == "ecs"
 
     def test_unique_violation_returns_false(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
@@ -1847,6 +1847,8 @@ class TestHappyPathOrchestration:
 
         # Repo root = tmp_path so worktrees land under it.
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
 
         # Track subprocess calls to assert the sequence.
         call_log: list[list[str]] = []
@@ -2022,6 +2024,8 @@ class TestPlanGoFalse:
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
@@ -2106,6 +2110,8 @@ class TestPlanGoFalse:
         # the raw issue_numbers array (issue #2835).
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
@@ -2639,6 +2645,8 @@ class TestPlanBlockedHandler:
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
@@ -2727,6 +2735,8 @@ class TestRalphBlocked:
         # the raw issue_numbers array (issue #2835).
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
@@ -2810,6 +2820,8 @@ class TestSubprocessNonZeroExit:
         # the raw issue_numbers array (issue #2835).
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
@@ -3335,6 +3347,8 @@ class TestNeedsReviewOrchestration:
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
@@ -3478,6 +3492,8 @@ class TestNeedsReviewOrchestration:
         conn.cursor_instance.fetch_queue = [None, (None, [42]), None]
 
         monkeypatch.setattr(d, "_repo_root", lambda: tmp_path)
+        # Force subprocess path — default flipped to 'ecs' in #3093.
+        monkeypatch.setattr(d, "_read_agent_execution_mode", lambda: "subprocess")
         fixed = uuid_mod.UUID("aabbccdd-eeff-0011-2233-445566778899")
         monkeypatch.setattr(daemon.uuid, "uuid4", lambda: fixed)
 
