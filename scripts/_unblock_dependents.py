@@ -17,7 +17,7 @@ import sys
 
 def gh(*args: str) -> str | None:
     """Run a gh CLI command and return stdout, or None on error."""
-    r = subprocess.run(["gh", *args], capture_output=True, text=True)  # noqa: S603, S607
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)  # noqa: S603, S607
     if r.returncode != 0:
         print(f"  gh error: {r.stderr.strip()}", file=sys.stderr)
         return None
@@ -128,8 +128,15 @@ def main() -> None:
 
             # Update labels
             gh(
-                "issue", "edit", str(n), "--repo", repo,
-                "--remove-label", "status/blocked", "--add-label", "agent/ready",
+                "issue",
+                "edit",
+                str(n),
+                "--repo",
+                repo,
+                "--remove-label",
+                "status/blocked",
+                "--add-label",
+                "agent/ready",
             )
             print("  Labels updated: -status/blocked, +agent/ready.")
 
@@ -139,7 +146,9 @@ def main() -> None:
     # Summary
     print("---")
     if dry_run:
-        print(f"[DRY RUN] Would unblock {unblocked_count} issue(s), skipped {skipped_count}.")
+        print(
+            f"[DRY RUN] Would unblock {unblocked_count} issue(s), skipped {skipped_count}."
+        )
     else:
         print(f"Unblocked {unblocked_count} issue(s), skipped {skipped_count}.")
 

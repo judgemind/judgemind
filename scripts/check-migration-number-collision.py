@@ -245,12 +245,14 @@ def get_diff_from_git(base_ref: str, repo_root: Path) -> str:
         ["git", "-C", str(repo_root), "merge-base", "HEAD", base_ref],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     base = mb.stdout.strip() if (mb.returncode == 0 and mb.stdout.strip()) else base_ref
     result = subprocess.run(
         ["git", "-C", str(repo_root), "diff", f"{base}...HEAD", "--unified=0"],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -274,6 +276,7 @@ def get_latest_migration_number_on_base(base_ref: str, repo_root: Path) -> int |
         ],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if result.returncode != 0:
         return None
@@ -305,7 +308,7 @@ def get_open_prs_via_gh(repo: str | None) -> str:
     ]
     if repo:
         cmd += ["--repo", repo]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(
             f"gh pr list failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -334,6 +337,7 @@ def detect_current_pr_number(repo_root: Path) -> int | None:
             capture_output=True,
             text=True,
             cwd=str(repo_root),
+            timeout=30,
         )
     except FileNotFoundError:
         return None
@@ -431,6 +435,7 @@ def main() -> int:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
             repo_root = Path(r.stdout.strip())
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:

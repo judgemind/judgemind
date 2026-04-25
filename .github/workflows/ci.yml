@@ -642,6 +642,13 @@ jobs:
       # back in.
       - name: Verify every daemon git/gh subprocess site has retry or cold-path annotation
         run: scripts/check-git-gh-retries.sh
+      # Issue #3213: every ``subprocess.run(...)`` call site in
+      # ``scripts/**/*.py`` (excluding ``scripts/**/tests/**``) must have
+      # a ``timeout=`` kwarg or a ``**kwargs`` splat. An unbounded blocking
+      # subprocess.run was the prime hypothesis for the #3205 silent-daemon
+      # wedge class. This check prevents regression.
+      - name: Verify every subprocess.run call in scripts has timeout= or **kwargs
+        run: scripts/check-subprocess-timeouts.sh
       # Issue #3158: every ``UPDATE dispatcher.agents`` /
       # ``SELECT ... FROM dispatcher.agents`` line in
       # ``scripts/dispatcher/daemon.py`` must either mention
