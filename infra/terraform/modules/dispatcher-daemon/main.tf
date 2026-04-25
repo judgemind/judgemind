@@ -746,23 +746,22 @@ resource "aws_ecs_task_definition" "dispatcher" {
         ] : [],
       )
 
+      # #3357 (reverts #3351): drop the awslogs async-drop delivery options
+      # (``mode = "non-blocking"`` and ``max-buffer-size``) and revert to the
+      # driver default (synchronous / blocking delivery). The revert is safe
+      # because #3356 (commit ceed892) bounded every IO call site in the daemon
+      # with per-call timeouts, eliminating the back-pressure-wedge surface that
+      # motivated the async-drop switch. Blocking awslogs is safe ONLY while
+      # that invariant holds — any future unbounded IO path on the daemon's main
+      # thread re-justifies switching back. Cost recovered: the 4 MB async-drop
+      # buffer was silently discarding ``scheduler_tick`` events under the
+      # daemon's 5 s cadence, causing operator-triage confusion (2026-04-25).
       logConfiguration = {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.dispatcher.name
           "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "dispatcher"
-          # #3351: switch the awslogs driver to non-blocking delivery
-          # so a CloudWatch slowdown cannot block the daemon's stdout
-          # (which would itself wedge the Python process — the same
-          # GIL-held / silent-for-30+-min failure mode observed in
-          # the 2026-04-25 cascade). With ``mode = non-blocking`` the
-          # driver buffers up to ``max-buffer-size`` and drops oldest
-          # events on overflow rather than back-pressuring the
-          # container. 4MB is the AWS-recommended floor — smaller
-          # values throttle awslogs internally.
-          "mode"            = "non-blocking"
-          "max-buffer-size" = "4m"
         }
       }
     }
