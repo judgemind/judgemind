@@ -8,8 +8,11 @@ optional cron override in ``scraper_schedules``.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import patch
 
-from framework.runner import _should_fire
+import framework.runner as runner_module
+from framework.runner import _load_scraper_schedules, _resolve_baselines_path, _should_fire
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -156,3 +159,105 @@ class TestMalformedCron:
         """None cron value should be treated as no override."""
         schedules = {"ca-oc-tentatives": {"cron": None}}
         assert _should_fire("ca-oc-tentatives", schedules, _now_aligned()) is True
+
+
+# ---------------------------------------------------------------------------
+# _resolve_baselines_path — docker and neither-exists fallbacks
+# ---------------------------------------------------------------------------
+
+
+class TestResolveBaselinesPath:
+    def test_falls_back_to_docker_path(self, tmp_path: Path) -> None:
+        """Falls back to docker path when default does not exist."""
+        repo_path = tmp_path / "nonexistent" / "data-quality-baselines.json"
+        docker_path = tmp_path / "docker" / "data-quality-baselines.json"
+        docker_path.parent.mkdir(parents=True)
+        docker_path.write_text("{}")
+
+        with (
+            patch.object(runner_module, "_DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(runner_module, "_DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = _resolve_baselines_path()
+        assert result == docker_path
+
+    def test_returns_default_when_neither_exists(self, tmp_path: Path) -> None:
+        """Returns default path when neither path exists (so callers get a useful error)."""
+        repo_path = tmp_path / "nonexistent1" / "data-quality-baselines.json"
+        docker_path = tmp_path / "nonexistent2" / "data-quality-baselines.json"
+
+        with (
+            patch.object(runner_module, "_DEFAULT_BASELINES_PATH", repo_path),
+            patch.object(runner_module, "_DOCKER_BASELINES_PATH", docker_path),
+        ):
+            result = _resolve_baselines_path()
+        assert result == repo_path
+
+
+# ---------------------------------------------------------------------------
+# _load_scraper_schedules — exception path
+# ---------------------------------------------------------------------------
+
+
+class TestLoadScraperSchedules:
+    def test_returns_none_on_io_error(self, tmp_path: Path) -> None:
+        """Returns None (and logs a warning) when the baselines file cannot be read."""
+        missing = tmp_path / "no-such-file.json"
+        with patch.object(runner_module, "_DEFAULT_BASELINES_PATH", missing):
+            with patch.object(runner_module, "_DOCKER_BASELINES_PATH", missing):
+                result = _load_scraper_schedules()
+        assert result is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
+        """Returns None when the baselines file contains invalid JSON."""
+        bad_file = tmp_path / "data-quality-baselines.json"
+        bad_file.write_text("not-valid-json{{{")
+        with patch.object(runner_module, "_DEFAULT_BASELINES_PATH", bad_file):
+            result = _load_scraper_schedules()
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# run_scrapers — cadence-skip branch (line 475)
+# ---------------------------------------------------------------------------
+
+
+class TestRunScrapersCadenceSkip:
+    def test_scraper_skipped_by_cadence_is_excluded(self) -> None:
+        """When _should_fire returns False, the scraper is excluded from the run."""
+        from framework import ScraperConfig
+        from framework.base import BaseScraper
+        from framework.runner import run_scrapers
+
+        class _NopScraper(BaseScraper):
+            ran = False
+
+            def fetch_documents(self) -> list:
+                _NopScraper.ran = True
+                return []
+
+            def parse_document(self, doc: object) -> object:  # type: ignore[override]
+                return doc
+
+        cfg = ScraperConfig(
+            scraper_id="ca-oc-tentatives",
+            state="CA",
+            county="OC",
+            court="Superior Court",
+            target_urls=["https://example.com"],
+            s3_bucket="",
+        )
+        entries = [("ca-oc-tentatives", _NopScraper, lambda: cfg)]
+
+        # Schedule that forces ca-oc-tentatives to be skipped
+        schedules = {"ca-oc-tentatives": {"cron": "0 6 * * *"}}
+
+        with (
+            patch("framework.runner._build_registry", return_value=entries),
+            patch("framework.runner._load_scraper_schedules", return_value=schedules),
+            patch("framework.runner._should_fire", return_value=False),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 0
+        assert not _NopScraper.ran
