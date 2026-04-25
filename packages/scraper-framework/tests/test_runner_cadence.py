@@ -7,9 +7,12 @@ optional cron override in ``scraper_schedules``.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import patch
 
-from framework.runner import _should_fire
+from framework.runner import _load_scraper_schedules, _resolve_baselines_path, _should_fire
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -156,3 +159,71 @@ class TestMalformedCron:
         """None cron value should be treated as no override."""
         schedules = {"ca-oc-tentatives": {"cron": None}}
         assert _should_fire("ca-oc-tentatives", schedules, _now_aligned()) is True
+
+
+# ---------------------------------------------------------------------------
+# _resolve_baselines_path — path fallback branches
+# ---------------------------------------------------------------------------
+
+
+class TestResolveBaselinesPath:
+    def test_returns_docker_path_when_only_docker_exists(self, tmp_path: Path) -> None:
+        """When default path absent but docker path exists, returns docker path."""
+        docker_file = tmp_path / "data-quality-baselines.json"
+        docker_file.write_text("{}")
+        with (
+            patch("framework.runner._DEFAULT_BASELINES_PATH", tmp_path / "nonexistent.json"),
+            patch("framework.runner._DOCKER_BASELINES_PATH", docker_file),
+        ):
+            result = _resolve_baselines_path()
+        assert result == docker_file
+
+    def test_returns_default_path_when_neither_exists(self, tmp_path: Path) -> None:
+        """When neither path exists, falls back to default path."""
+        default = tmp_path / "nonexistent-default.json"
+        docker = tmp_path / "nonexistent-docker.json"
+        with (
+            patch("framework.runner._DEFAULT_BASELINES_PATH", default),
+            patch("framework.runner._DOCKER_BASELINES_PATH", docker),
+        ):
+            result = _resolve_baselines_path()
+        assert result == default
+
+
+# ---------------------------------------------------------------------------
+# _load_scraper_schedules — exception / missing-file branch
+# ---------------------------------------------------------------------------
+
+
+class TestLoadScraperSchedules:
+    def test_returns_none_on_missing_file(self, tmp_path: Path) -> None:
+        """When the baselines file doesn't exist, returns None (no throw)."""
+        missing = tmp_path / "no-such-file.json"
+        with (
+            patch("framework.runner._DEFAULT_BASELINES_PATH", missing),
+            patch("framework.runner._DOCKER_BASELINES_PATH", missing),
+        ):
+            result = _load_scraper_schedules()
+        assert result is None
+
+    def test_returns_schedules_dict_when_present(self, tmp_path: Path) -> None:
+        """When file is valid and key present, returns the schedules dict."""
+        f = tmp_path / "data-quality-baselines.json"
+        f.write_text(json.dumps({"scraper_schedules": {"ca-oc-tentatives": {"cron": "0 6 * * *"}}}))
+        with (
+            patch("framework.runner._DEFAULT_BASELINES_PATH", f),
+            patch("framework.runner._DOCKER_BASELINES_PATH", tmp_path / "nope.json"),
+        ):
+            result = _load_scraper_schedules()
+        assert result == {"ca-oc-tentatives": {"cron": "0 6 * * *"}}
+
+    def test_returns_none_when_key_absent(self, tmp_path: Path) -> None:
+        """When file is valid but scraper_schedules key absent, returns None."""
+        f = tmp_path / "data-quality-baselines.json"
+        f.write_text(json.dumps({"counties": {}}))
+        with (
+            patch("framework.runner._DEFAULT_BASELINES_PATH", f),
+            patch("framework.runner._DOCKER_BASELINES_PATH", tmp_path / "nope.json"),
+        ):
+            result = _load_scraper_schedules()
+        assert result is None
