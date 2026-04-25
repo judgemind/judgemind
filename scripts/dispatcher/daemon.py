@@ -17325,6 +17325,8 @@ class DispatcherDaemon:
         # Fetch agent row for display fields. Fail-closed: on any DB
         # error an empty dict is used and the message falls back to
         # "?" / "(no title)" placeholders.
+        # exec-mode-agnostic (#3158): display-only read for Telegram
+        # message body; no execution-mode branching needed.
         agent_row: dict[str, Any] = {}
         if self._conn is not None:
             try:
@@ -17460,6 +17462,8 @@ class DispatcherDaemon:
             return
 
         # Also read queue depth.
+        # exec-mode-agnostic (#3158): aggregate count for Telegram
+        # digest display; not branching on per-row execution_mode.
         queue_depth = -1
         try:
             with self._conn.cursor() as cur:
