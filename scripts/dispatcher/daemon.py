@@ -9170,6 +9170,15 @@ class DispatcherDaemon:
 
         # 5. Mark terminal.  Gate label removal on issue_number > 0 so we
         #    don't try to remove a label from a non-existent issue.
+        # ROUTING (#3062): NOT routed through ``_handle_agent_failure`` —
+        # synthetic audit/spotcheck agents are infra-spawned hooks (no
+        # GitHub issue, no PR, no /task pipeline). They produce side
+        # effects by filing their own issues from inside the skill, so
+        # there is no agent-level remediation a diagnoser could
+        # recommend on failure beyond "rerun the cron tick" — which is
+        # what the next supervisor_tick will do automatically once the
+        # cron interval elapses again. Both ``succeeded`` and ``failed``
+        # are correct-outcome terminals for this code path.
         terminal_status = "succeeded" if exit_code == 0 else "failed"
         self._mark_agent_terminal(
             agent_id,
