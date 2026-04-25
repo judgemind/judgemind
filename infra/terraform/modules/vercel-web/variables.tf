@@ -25,6 +25,6 @@ variable "graphql_url" {
 }
 
 variable "site_url" {
-  description = "Value for NEXT_PUBLIC_SITE_URL — used as metadataBase for OG image URLs (e.g. https://dev.judgemind.org)"
+  description = "Value for NEXT_PUBLIC_SITE_URL -- used as metadataBase for OG image URLs (e.g. https://dev.judgemind.org)"
   type        = string
 }

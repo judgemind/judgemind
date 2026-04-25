@@ -39,6 +39,12 @@ jobs:
       - name: Terraform Format Check
         run: terraform fmt -check -recursive infra/terraform/
 
+      # Hygiene check: AWS rejects non-ASCII bytes in `description` fields
+      # for several resource types (security groups, IAM roles, IAM policies)
+      # at apply time. terraform validate does NOT catch this. See #3321.
+      - name: Check no non-ASCII in tf descriptions
+        run: scripts/check-no-nonascii-tf-descriptions.sh
+
       # Validate each environment. Uses -backend=false so no AWS credentials
       # are required for syntax and config validation.
       - name: Validate dev

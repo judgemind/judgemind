@@ -9,7 +9,7 @@ output "domain_arn" {
 }
 
 output "security_group_id" {
-  description = "Security group ID — grant ingress from other resources that need OpenSearch access"
+  description = "Security group ID -- grant ingress from other resources that need OpenSearch access"
   value       = aws_security_group.opensearch.id
 }
 

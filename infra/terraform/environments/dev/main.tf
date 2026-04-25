@@ -388,7 +388,7 @@ output "dispatcher_agent_runner_log_group" {
 }
 
 output "dispatcher_agent_runner_task_role_arn" {
-  description = "Dev dispatcher agent-runner task role ARN (narrow: DB + PAT secret read, log-group scoped log writes — no RunTask, no ECS Exec)"
+  description = "Dev dispatcher agent-runner task role ARN (narrow: DB + PAT secret read, log-group scoped log writes -- no RunTask, no ECS Exec)"
   value       = module.dispatcher_agent_runner.task_role_arn
 }
 
@@ -438,7 +438,7 @@ output "ses_notifications_topic_arn" {
 }
 
 output "ses_dkim_tokens" {
-  description = "Dev DKIM CNAME tokens — add each as <token>._domainkey.judgemind.org CNAME <token>.dkim.amazonses.com"
+  description = "Dev DKIM CNAME tokens -- add each as <token>._domainkey.judgemind.org CNAME <token>.dkim.amazonses.com"
   value       = module.ses.dkim_tokens
 }
 
@@ -458,7 +458,7 @@ output "scraper_role_arn" {
 }
 
 output "agent_role_arn" {
-  description = "Dev agent IAM role ARN — copy into ~/.aws/config as role_arn for the judgemind-agent profile"
+  description = "Dev agent IAM role ARN -- copy into ~/.aws/config as role_arn for the judgemind-agent profile"
   value       = module.iam_agent.role_arn
 }
 
@@ -607,7 +607,7 @@ output "api_log_group" {
 }
 
 output "api_acm_validation" {
-  description = "Dev API ACM certificate DNS validation records — create these in Cloudflare"
+  description = "Dev API ACM certificate DNS validation records -- create these in Cloudflare"
   value       = module.api_service.acm_domain_validation_options
 }
 

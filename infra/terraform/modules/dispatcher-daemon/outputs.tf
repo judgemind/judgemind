@@ -29,7 +29,7 @@ output "execution_role_arn" {
 }
 
 output "task_role_arn" {
-  description = "ARN of the dispatcher task role (assumed by the container at runtime — grants ecs:RunTask self-invocation, ECS Exec SSM, and cloudwatch:PutMetricData)"
+  description = "ARN of the dispatcher task role (assumed by the container at runtime -- grants ecs:RunTask self-invocation, ECS Exec SSM, and cloudwatch:PutMetricData)"
   value       = aws_iam_role.task.arn
 }
 
