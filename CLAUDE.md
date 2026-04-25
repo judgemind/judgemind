@@ -24,7 +24,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Never create additional worktrees from inside a worktree via `git worktree add`. Fix bad state with `git checkout -- .` / `git clean -fd` rather than creating a new worktree.
 - Never close a task or remove a worktree without posting a verification evidence comment on the issue. See §A.8 Step 3.
 - Never merge user-visible affordances that haven't been exercised end-to-end. "The page renders" / "the service returns 200" is not evidence. Half-built behind a flag is fine; half-built and reachable by users is the bug.
-- Never bypass a safety check with `--force` or a manual workaround. When a check blocks you, trust it.
+- Never use `--force` (or `--force-with-lease`) to bypass a failing CI check or pre-push hook. `--force-with-lease` IS allowed after an intentional rebase of your own branch — see the `/task` skill A.4.
 - Never run `gh auth switch` without an explicit user instruction.
 
 ### ALWAYS — Before Acting
