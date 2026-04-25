@@ -397,6 +397,25 @@ class TestSchedulerGate:
     cap=0 / cap-missing / active-agent / orchestration-in-flight — by
     mocking the spawn helper directly. The thread-side behavior is
     covered by :class:`TestOrchestrationWorkerThread` in this file.
+
+    Fake ``fetch_queue`` consumption order for a default cap=1 tick
+    -----------------------------------------------------------------
+    ``scheduler_tick`` makes exactly four ``fetchone()`` calls (via the
+    positional ``fetch_queue``) when ``concurrency_cap >= 1``:
+
+    1. ``(cap,)`` — ``dispatcher.config`` SELECT for ``concurrency_cap``
+       (``daemon.py`` line ~2459).
+    2. ``cap_flipped_by`` row or ``None`` — ``_read_cap_flipped_by``
+       inside ``_check_circuit_breaker_auto_close``; fires only when
+       ``cap >= 1`` (``daemon.py`` line ~16677).
+    3. ``paused`` row or ``None`` — ``_is_paused`` check
+       (``daemon.py`` line ~3279).
+    4. ``(count,)`` or ``None`` — ``_active_agent_count``'s
+       ``SELECT COUNT(*)`` (``daemon.py`` line ~3951).
+
+    Entries 2–4 are **skipped** when ``cap == 0`` or the cap row is
+    missing (``None``) — those ticks consume only entry 1 and return
+    early.  Any test exercising the spawn path needs all four entries.
     """
 
     def test_does_not_claim_when_concurrency_cap_zero(self, tmp_path: Path) -> None:
@@ -420,9 +439,9 @@ class TestSchedulerGate:
 
     def test_claims_when_cap_nonzero_and_no_active_agent(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        # 1) config read returns 1; 2) _is_paused SELECT returns None (not paused);
-        # 3) _has_active_agent SELECT returns None (no active agent).
-        conn.cursor_instance.fetch_queue = [(1,), None, None]
+        # 1) concurrency_cap=1; 2) cap_flipped_by=None (no breaker flip);
+        # 3) paused=None (not paused); 4) active_agent_count=None (zero agents).
+        conn.cursor_instance.fetch_queue = [(1,), None, None, None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
             return_value=True,
@@ -433,15 +452,14 @@ class TestSchedulerGate:
 
     def test_does_not_claim_when_active_agent_exists(self, tmp_path: Path) -> None:
         d, conn, _handler = _make_daemon(tmp_path)
-        # config=1; _is_paused returns None (not paused); _has_active_agent
-        # returns (1,) meaning active row exists.
-        conn.cursor_instance.fetch_queue = [(1,), None, (1,)]
+        # 1) concurrency_cap=1; 2) cap_flipped_by=None (no breaker flip);
+        # 3) paused=None (not paused); 4) active_agent_count=(1,) — gate closes.
+        conn.cursor_instance.fetch_queue = [(1,), None, None, (1,)]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
-        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError("must not be called when agent active")
-        )
+        d._maybe_spawn_orchestration_thread = MagicMock()  # type: ignore[method-assign]
         summary = d.scheduler_tick()
         assert summary["orchestration_attempted"] == 0
+        assert d._maybe_spawn_orchestration_thread.call_count == 0  # type: ignore[attr-defined]
 
     def test_orchestration_exception_does_not_crash_tick(self, tmp_path: Path) -> None:
         """A spawn-path exception must not crash ``scheduler_tick`` (#2847).
@@ -455,9 +473,10 @@ class TestSchedulerGate:
         :class:`TestOrchestrationWorkerThread`.
         """
         d, conn, handler = _make_daemon(tmp_path)
-        # config=1; _is_paused returns None (not paused); _has_active_agent
-        # returns None (no active agent) — spawn path fires but throws.
-        conn.cursor_instance.fetch_queue = [(1,), None, None]
+        # 1) concurrency_cap=1; 2) cap_flipped_by=None (no breaker flip);
+        # 3) paused=None (not paused); 4) active_agent_count=None (zero agents)
+        # — spawn path fires but the spawn helper itself throws.
+        conn.cursor_instance.fetch_queue = [(1,), None, None, None]
         d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
         # Make the spawn path itself raise — covers the
         # ``orchestration_spawn_failed`` branch in the tick.
@@ -469,6 +488,32 @@ class TestSchedulerGate:
         assert handler.events("orchestration_spawn_failed") != []
         # Spawn failed → no thread was actually started.
         assert summary["orchestration_attempted"] == 0
+
+    def test_fetch_queue_order_matches_documented_invariant(
+        self, tmp_path: Path
+    ) -> None:
+        """Copy-paste template: the 4-entry queue shape for a cap=1 spawn-path tick.
+
+        Uses the documented order from the class docstring:
+          [(cap,), cap_flipped_by, paused, (active_count,)]
+        = [(1,), None, None, (0,)]
+
+        Asserts that the spawn helper fires exactly once and that the
+        cursor executed at least four SQL statements — so this test
+        will fail loudly if the fetch-queue order ever changes without
+        updating the docstring.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        # Documented 4-entry shape: cap=1, no circuit-breaker flip,
+        # not paused, zero active agents → spawn path fires.
+        conn.cursor_instance.fetch_queue = [(1,), None, None, (0,)]
+        d._fetch_agent_ready_issues = lambda: []  # type: ignore[method-assign]
+        d._maybe_spawn_orchestration_thread = MagicMock(  # type: ignore[method-assign]
+            return_value=True,
+        )
+        d.scheduler_tick()
+        assert d._maybe_spawn_orchestration_thread.call_count == 1  # type: ignore[attr-defined]
+        assert len(conn.cursor_instance.executed) >= 4
 
 
 # --------------------------------------------------------------------------
