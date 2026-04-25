@@ -230,6 +230,15 @@ Operator laptops run macOS, which ships with bash 3.2.57 (Apple has frozen the O
 
 **`scripts/check-bash-compat.sh` enforces this**, scanning every `scripts/**/*.sh` file for the forbidden constructs below and exiting non-zero on a match. It is wired into the `scripts-tests` CI job (same path filter as the other hygiene checks). Comment lines are exempted, so prose referencing a forbidden token (e.g., "we avoid `mapfile` because...") is fine.
 
+#### `scripts-tests` matrix shards
+
+The `scripts-tests` CI job runs two parallel matrix shards to keep wall-clock time under 600 s (issue #3307):
+
+- **`python` shard** — both `pytest` suites (`scripts/tests/` and `scripts/dispatcher/tests/`) plus all 11 inline shell hygiene guards (`check-aws-bool-flags.sh`, `check-bash-compat.sh`, etc.). The dispatcher daemon suite uses `pytest-xdist` (`-n auto`) because all tests are `monkeypatch`/`tmp_path`-based and contain no `os.chdir` calls. Estimated wall-clock ~200 s.
+- **`shell` shard** — `scripts/run-scripts-tests.sh` only (60 shell tests auto-discovered under `scripts/tests/*.sh`). Dominated by `test_agent_runner_entrypoint.sh` (~275 s) and `test_check_dispatcher_image_versions.sh` (~58 s). Estimated wall-clock ~395 s.
+
+Both shards inherit the same `needs: detect-changes` / `scripts == 'true'` path filter. GH Actions aggregates the two matrix expansions under the single `scripts-tests` name, so the `ci-passed` `needs:` list does not need updating.
+
 **Forbidden constructs** (each has a bash 3.2-compatible rewrite):
 
 | Construct | Bash 3.2 behaviour | Use instead |
