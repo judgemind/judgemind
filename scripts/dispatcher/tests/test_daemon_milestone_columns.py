@@ -291,6 +291,7 @@ class TestWriteMilestoneStamps:
         assert "phase" not in sql
         assert "ended_at" not in sql
         assert params == ("aaaa-bbbb",)
+        # Single atomic milestone write: exactly one commit.
         assert conn.commits == 1
 
     def test_write_retroed_at_sets_only_that_column(self, tmp_path: Path) -> None:

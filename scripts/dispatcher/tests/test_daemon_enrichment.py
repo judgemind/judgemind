@@ -329,6 +329,7 @@ class TestScanBlockedAndSnapshot:
         assert enriched[1]["body"] is None
         assert enriched[1]["blockedBy"] == []  # no blocked-by lines in body=None
         assert params[3] == "test-run-id"
+        # Single atomic scan-and-insert: exactly one commit.
         assert conn.commits == 1
 
         scans = handler.events("blocked_scan")

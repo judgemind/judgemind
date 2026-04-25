@@ -616,7 +616,7 @@ class TestIncrementMergeUnstickAttempts:
         assert "merge_unstick_attempts + 1" in updates[0][0]
         # Parameterized by agent_id.
         assert updates[0][1] == ("agent-xyz",)
-        # Committed.
+        # Single atomic UPDATE: exactly one commit is the contract (see #2797 for context).
         assert conn.commits == 1
 
     def test_update_failure_rolls_back_and_logs(self, tmp_path: Path) -> None:
@@ -630,7 +630,7 @@ class TestIncrementMergeUnstickAttempts:
         # Must not raise.
         d._increment_merge_unstick_attempts("agent-xyz")
 
-        # Rollback fired.
+        # Failure path opens one transaction and rolls back exactly once: contract (#2797).
         assert conn.rollbacks == 1
         # Structured log event emitted.
         failed = handler.events("increment_merge_unstick_attempts_failed")

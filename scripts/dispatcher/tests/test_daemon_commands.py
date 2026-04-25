@@ -593,6 +593,7 @@ class TestConsumeCommands:
         count = d._consume_commands()
 
         assert count == 0
+        # Empty-pending fast path opens no transaction; no rollback is the contract (#2797).
         assert conn.rollbacks == 0
 
 
