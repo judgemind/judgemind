@@ -53,8 +53,43 @@ Design principles
    list used by the admin UI). This module imports those constants
    rather than re-declaring them.
 
+Adding a new phase
+------------------
+
+When the dispatcher gains a new pipeline phase, three steps are required:
+
+1. **Append the phase constant and transition function here.**  Add a
+   ``PHASE_<NAME>`` string constant in the "Phase name constants" section,
+   and a corresponding ``transition_from_<name>(output)`` function that
+   returns a :class:`PhaseTransition`.  Register the function in
+   :data:`_VERDICT_DRIVEN_TRANSITIONS` if the phase is verdict-driven; for
+   non-verdict phases (e.g. those driven by a subprocess exit code or an
+   external poll) the caller invokes ``transition_from_<name>`` directly.
+   Add the constant to :data:`ACTIVE_PHASES` and, if terminal, to
+   :data:`TERMINAL_PHASES`.  Export both from :data:`__all__`.
+
+2. **Wire the matching subprocess handler in daemon.py.**  Create a
+   ``_run_<name>_phase`` (or ``_advance_<name>``) method in
+   :class:`DispatcherDaemon` that (a) stamps entry via
+   ``_update_agent_phase(agent_id, "<name>")`` at the top, (b) runs any
+   subprocess or poll, (c) calls ``transition_from_<name>(output)``, and
+   (d) dispatches on ``transition.action`` using the existing
+   ADVANCE / ADVANCE_WITH_STATUS / ROUTE_TO_DIAGNOSER / UNRECOGNIZED
+   pattern established by the existing ``_run_*_phase`` methods.
+
+3. **Add parameterized tests in
+   ``scripts/dispatcher/tests/test_phase_transitions.py``.**  Add one
+   test class ``TestTransitionFrom<Name>`` covering every branch
+   (happy path, each failure path, None output, lowercase verdict).
+   Verify the full :class:`PhaseTransition` shape — ``action``,
+   ``next_phase``, ``terminal_status``, ``failure_hint``, ``context``
+   fields — not just the happy path.
+
+See ``docs/agent/infrastructure-reference.md`` for a cross-reference
+from the dispatcher infrastructure overview to this procedure.
+
 What this module does NOT cover
--------------------------------
+--------------------------------
 
 * **Retry / backoff scheduling.** The daemon's retry-marker processor
   (``_process_retry_markers`` + friends) owns when a ``crashed`` or

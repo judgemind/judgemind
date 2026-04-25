@@ -225,7 +225,7 @@ Nonsensical values (threshold ≤ 0, window_size ≤ 0) are treated as "breaker 
 | `cleanup_blocked` | `succeeded` | Final terminal state — `cleanup_worktree.sh` refused (locked / no session log); operator sweep needed. |
 | `awaiting_*` / `claiming` | `crashed` / `failed` | Supervisor flipped status; phase preserved for diagnostics. |
 
-The daemon validates phase strings via the `PHASE_*` constants — adding a new phase value requires a code change but no migration. See `scripts/dispatcher/daemon.py` constants section for the canonical list.
+The daemon validates phase strings via the `PHASE_*` constants — adding a new phase value requires a code change but no migration. The **canonical list of phase constants and all phase-transition logic** lives in `scripts/dispatcher/phase_transitions.py`. For the step-by-step procedure to add a new phase (constant + transition function + daemon handler + tests), see the `## Adding a new phase` section in that module's docstring.
 
 ### Dispatcher v2 — per-phase token + cost telemetry (#2869)
 

@@ -104,6 +104,19 @@ if TYPE_CHECKING:  # pragma: no cover — types only
 # missing pip dep (the fallback top-level ``dispatcher`` is not a pip
 # package — it is a sibling module).
 from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
+from .phase_transitions import (  # noqa: E402
+    FAILURE_HINT_RALPH_AC_INFEASIBLE,
+    TransitionAction,
+    transition_from_awaiting_ci,
+    transition_from_awaiting_deploy,
+    transition_from_fix_ci,
+    transition_from_plan,
+    transition_from_push_and_pr,
+    transition_from_ralph,
+    transition_from_retro,
+    transition_from_summary,
+    transition_from_verify,
+)
 
 
 # --------------------------------------------------------------------------
@@ -10307,17 +10320,38 @@ class DispatcherDaemon:
                 # work. Each side-effect is individually wrapped so a
                 # failure of one does not prevent the others.
                 self._handle_plan_blocked(agent_id, issue_number, reason, worktree)
-            # ROUTING (#3062): correct-outcome terminals (``succeeded``
-            # for "no work needed" / ``plan_blocked`` for "plan declined
-            # to proceed"). Not failure paths — ``_handle_agent_failure``
-            # is not applicable.
-            self._mark_agent_terminal(
-                agent_id,
-                status=status,
-                phase="planning",
-                exit_code=exit_code,
-                issue_number=issue_number,
-            )
+                # Use transition_from_plan for the plan_blocked decision path
+                # (#2976). Synthesize a verdict field from the plan's go/
+                # block_reason convention so the pure function sees the
+                # canonical BLOCKED signal. The "no work needed" path
+                # (go=False, no block_reason → status=succeeded) is a
+                # correct-outcome terminal that doesn't map to the pure
+                # function's output contract and is handled below.
+                transition = transition_from_plan({**plan_output, "verdict": "BLOCKED"})
+                # transition.action == ADVANCE_WITH_STATUS; terminal_status == "plan_blocked"
+                self._mark_agent_terminal(
+                    agent_id,
+                    status=transition.terminal_status or status,
+                    phase="planning",
+                    exit_code=exit_code,
+                    issue_number=issue_number,
+                )
+            else:
+                # "no work needed" — no transition_from_plan call; this path
+                # is a correct-outcome succeeded terminal not covered by the
+                # pure function's output contract (go=False with no
+                # block_reason is daemon-specific, not a verdict shape).
+                # ROUTING (#3062): correct-outcome terminals (``succeeded``
+                # for "no work needed" / ``plan_blocked`` for "plan declined
+                # to proceed"). Not failure paths — ``_handle_agent_failure``
+                # is not applicable.
+                self._mark_agent_terminal(
+                    agent_id,
+                    status=status,
+                    phase="planning",
+                    exit_code=exit_code,
+                    issue_number=issue_number,
+                )
             return False
 
         # Stash plan output on the agent for ralph + summary to reuse.
@@ -10446,71 +10480,81 @@ class DispatcherDaemon:
             },
         )
 
-        if verdict == "AC_INFEASIBLE":
-            # Issue #3010 — ralph surfaced a structurally-impossible AC.
-            # Route to the diagnoser (Tier 3) immediately; no summary,
-            # no push_and_pr, no mechanical retry. Ralph's worktree
-            # diff (if any) is discarded on diagnoser handoff.
-            infeasible_acs = ralph_output.get("infeasible_acs") or []
-            # Normalize to a list of dicts with int-coerced indices so
-            # the diagnoser's context bundle has a clean shape even if
-            # the skill emitted strings or a single dict.
-            normalized_infeasible: list[dict[str, Any]] = []
-            if isinstance(infeasible_acs, list):
-                for entry in infeasible_acs:
-                    if not isinstance(entry, dict):
-                        continue
-                    idx = entry.get("index")
-                    try:
-                        idx_int = int(idx) if idx is not None else None
-                    except (TypeError, ValueError):
-                        idx_int = None
-                    evidence = entry.get("evidence")
-                    normalized_infeasible.append(
-                        {
-                            "index": idx_int,
-                            "evidence": str(evidence) if evidence is not None else "",
-                        }
-                    )
-            self._log.info(
-                "daemon.ralph_ac_infeasible",
-                extra={
-                    "event": "ralph_ac_infeasible",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "infeasible_acs_count": len(normalized_infeasible),
-                },
-            )
-            self._write_failure(
-                agent_id=agent_id,
-                category=FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
-                detected_by="ralph_output_parse",
-                details={
-                    "infeasible_acs": normalized_infeasible,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                },
-            )
-            # ROUTING (#3062): failure row written above with a
-            # tier-3 category → diagnoser picks it up on the next
-            # supervisor tick. Inline ``_write_failure`` +
-            # ``_mark_agent_terminal`` pattern (not
-            # ``_handle_agent_failure``) is intentional here — the
-            # ``infeasible_acs`` shape pre-dates the unified helper
-            # and the ac-infeasible-specific ``detected_by`` marker
-            # is preserved. Effect is identical to routing through
-            # ``_handle_agent_failure``.
-            self._mark_agent_terminal(
-                agent_id,
-                status="failed",
-                phase="ralph",
-                exit_code=exit_code,
-                issue_number=issue_number,
-            )
-            return False
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # All side-effect logic (infeasible_acs normalization, logging
+        # events, failure-row writes) is preserved verbatim below; only
+        # the DECISION about which path to take is driven by the
+        # transition function.
+        ralph_transition = transition_from_ralph(ralph_output)
 
-        if verdict != "SHIP":
+        if ralph_transition.action == TransitionAction.ROUTE_TO_DIAGNOSER:
+            if ralph_transition.failure_hint == FAILURE_HINT_RALPH_AC_INFEASIBLE:
+                # Issue #3010 — ralph surfaced a structurally-impossible AC.
+                # Route to the diagnoser (Tier 3) immediately; no summary,
+                # no push_and_pr, no mechanical retry. Ralph's worktree
+                # diff (if any) is discarded on diagnoser handoff.
+                infeasible_acs = ralph_output.get("infeasible_acs") or []
+                # Normalize to a list of dicts with int-coerced indices so
+                # the diagnoser's context bundle has a clean shape even if
+                # the skill emitted strings or a single dict.
+                normalized_infeasible: list[dict[str, Any]] = []
+                if isinstance(infeasible_acs, list):
+                    for entry in infeasible_acs:
+                        if not isinstance(entry, dict):
+                            continue
+                        idx = entry.get("index")
+                        try:
+                            idx_int = int(idx) if idx is not None else None
+                        except (TypeError, ValueError):
+                            idx_int = None
+                        evidence = entry.get("evidence")
+                        normalized_infeasible.append(
+                            {
+                                "index": idx_int,
+                                "evidence": str(evidence)
+                                if evidence is not None
+                                else "",
+                            }
+                        )
+                self._log.info(
+                    "daemon.ralph_ac_infeasible",
+                    extra={
+                        "event": "ralph_ac_infeasible",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "infeasible_acs_count": len(normalized_infeasible),
+                    },
+                )
+                self._write_failure(
+                    agent_id=agent_id,
+                    category=FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+                    detected_by="ralph_output_parse",
+                    details={
+                        "infeasible_acs": normalized_infeasible,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                    },
+                )
+                # ROUTING (#3062): failure row written above with a
+                # tier-3 category → diagnoser picks it up on the next
+                # supervisor tick. Inline ``_write_failure`` +
+                # ``_mark_agent_terminal`` pattern (not
+                # ``_handle_agent_failure``) is intentional here — the
+                # ``infeasible_acs`` shape pre-dates the unified helper
+                # and the ac-infeasible-specific ``detected_by`` marker
+                # is preserved. Effect is identical to routing through
+                # ``_handle_agent_failure``.
+                self._mark_agent_terminal(
+                    agent_id,
+                    status="failed",
+                    phase="ralph",
+                    exit_code=exit_code,
+                    issue_number=issue_number,
+                )
+                return False
+
+            # FAILURE_HINT_RALPH_NOT_SHIP — verdict != "SHIP" and not AC_INFEASIBLE.
             # Issue #3054 — ralph terminated cleanly with a non-SHIP
             # verdict (REVISE-exhausted or worker-STUCK twice). Route
             # through the unified failure handler so the diagnoser
@@ -10712,8 +10756,14 @@ class DispatcherDaemon:
             },
         )
 
-        summary_verdict = str(summary_output.get("verdict") or "").upper()
-        if summary_verdict == "AC_INFEASIBLE":
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # Side-effect logic (infeasible_acs normalization, failure-row
+        # writes) is preserved verbatim; only the DECISION about which
+        # path to take is driven by transition_from_summary.
+        summary_transition = transition_from_summary(summary_output)
+
+        if summary_transition.action == TransitionAction.ROUTE_TO_DIAGNOSER:
+            # summary_transition.failure_hint == FAILURE_HINT_SUMMARY_AC_INFEASIBLE
             # Issue #3010 — summary found a structurally-impossible AC
             # after ralph already shipped. Ralph's diff is discarded;
             # daemon writes a failure row and routes to the diagnoser
@@ -10773,6 +10823,7 @@ class DispatcherDaemon:
                 issue_number=issue_number,
             )
             return False
+        # summary_transition.action == ADVANCE → proceed to push_and_pr
 
         unmet = summary_output.get("unmet_criteria") or []
         if unmet:
@@ -11324,7 +11375,17 @@ class DispatcherDaemon:
         # ``status='succeeded' phase=PHASE_NO_OP`` and emit
         # :event:`daemon.push_and_pr_skipped_no_op`. No amend, no
         # push, no PR. Ralph's issue comment is the deliverable.
+        # Issue #3039: ralph §2.5d "no-op guardrail" SHIP detection.
+        # Synthesize the push_and_pr output envelope and dispatch
+        # through the pure phase-transition catalog (#2976). For the
+        # no-op path we emit {"no_op": True}; for the normal path we
+        # emit None (PR creation hasn't happened yet so the output
+        # is synthesized post-success at the bottom of this method).
         if self._is_noop_ship(worktree):
+            push_and_pr_output_noop = {"no_op": True}
+            noop_transition = transition_from_push_and_pr(push_and_pr_output_noop)
+            # noop_transition.action == ADVANCE_WITH_STATUS;
+            # next_phase == PHASE_NO_OP; terminal_status == "succeeded"
             self._log.info(
                 "daemon.push_and_pr_skipped_no_op",
                 extra={
@@ -11342,8 +11403,8 @@ class DispatcherDaemon:
             # for a clean no-op SHIP). Not a failure path.
             self._mark_agent_terminal(
                 agent_id,
-                status="succeeded",
-                phase=PHASE_NO_OP,
+                status=noop_transition.terminal_status or "succeeded",
+                phase=noop_transition.next_phase or PHASE_NO_OP,
                 exit_code=0,
                 issue_number=issue_number,
             )
@@ -11829,6 +11890,12 @@ class DispatcherDaemon:
             )
             return
 
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # Synthesize the output envelope for the "PR opened" case.
+        push_and_pr_output_normal = {}  # no_op=False, no rebase_failed
+        normal_transition = transition_from_push_and_pr(push_and_pr_output_normal)
+        # normal_transition.action == ADVANCE; next_phase == PHASE_AWAITING_CI
+
         # Final state: keep status=running so Phase 3B picks it up.
         # ROUTING (#3062): non-terminal phase transition (``status``
         # stays ``running`` while the PR awaits CI). Not a failure
@@ -11837,7 +11904,7 @@ class DispatcherDaemon:
         self._mark_agent_terminal(
             agent_id,
             status="running",
-            phase="awaiting_ci",
+            phase=normal_transition.next_phase or "awaiting_ci",
             exit_code=None,
             pr_number=pr_number,
             issue_number=issue_number,
@@ -12253,7 +12320,23 @@ class DispatcherDaemon:
             # terminal transition; the agent keeps its awaiting_ci phase.
             return
 
-        rollup_state = self._classify_check_rollup(pr_status)
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # transition_from_awaiting_ci encapsulates the rollup-state
+        # classification (via _ci_rollup_state from phase_transitions.py)
+        # and returns the canonical next-phase decision. This replaces
+        # the inline _classify_check_rollup call — the two classifiers
+        # are functionally equivalent; the pure-module version also
+        # handles StatusContext (__typename=STATUSCONTEXT) entries
+        # that the legacy path overlooked (#3200).
+        awaiting_ci_transition = transition_from_awaiting_ci(pr_status)
+        # Derive rollup_state from the transition reason for the ci_poll
+        # log event. Reason strings are "CI green" / "CI red" / "CI pending".
+        _reason_to_state = {
+            "CI green": "green",
+            "CI red": "red",
+            "CI pending": "pending",
+        }
+        rollup_state = _reason_to_state.get(awaiting_ci_transition.reason, "pending")
         self._log.info(
             "daemon.ci_poll",
             extra={
@@ -12267,14 +12350,15 @@ class DispatcherDaemon:
             },
         )
 
-        if rollup_state == "pending":
+        if awaiting_ci_transition.next_phase == "awaiting_ci":
+            # Pending — re-check next tick.
             return
 
-        if rollup_state == "green":
+        if awaiting_ci_transition.next_phase == "merge":
             self._merge_pr_and_advance(agent, pr_status)
             return
 
-        # rollup_state == "red"
+        # awaiting_ci_transition.next_phase == "fix_ci" (CI red)
         self._run_fix_ci(agent, pr_status)
 
     def _fetch_pr_status(self, pr_number: int) -> dict[str, Any] | None:
@@ -12987,12 +13071,19 @@ class DispatcherDaemon:
         )
         verdict = str(fix_ci_output.get("verdict") or "").upper()
 
-        if verdict == "PATCHED":
-            self._apply_fix_ci_patch(agent, fix_ci_output)
-            return
-        if verdict == "FLAKY":
-            # No code change. Next tick will re-poll; GitHub's flaky
-            # re-run path or a manual nudge resolves eventually.
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # All side-effect logic (logging events, apply-patch call,
+        # failure-row writes) is preserved verbatim; only the DECISION
+        # about which path to take is driven by transition_from_fix_ci.
+        fix_ci_transition = transition_from_fix_ci(fix_ci_output)
+
+        if fix_ci_transition.action == TransitionAction.ADVANCE:
+            if fix_ci_transition.context.get("patch_applied"):
+                # verdict == "PATCHED" — apply the patch and return;
+                # phase stays awaiting_ci, next tick re-polls.
+                self._apply_fix_ci_patch(agent, fix_ci_output)
+                return
+            # verdict == "FLAKY" — no code change; next tick re-polls.
             self._log.info(
                 "daemon.fix_ci_flaky",
                 extra={
@@ -13004,6 +13095,8 @@ class DispatcherDaemon:
                 },
             )
             return
+
+        # fix_ci_transition.action == ROUTE_TO_DIAGNOSER
         # verdict == "BLOCKED" or unrecognized
         block_reason = fix_ci_output.get("block_reason")
         self._log.warning(
@@ -13551,7 +13644,22 @@ class DispatcherDaemon:
         )
         if deploy_state == "pending":
             return
-        if deploy_state == "failure":
+
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # transition_from_awaiting_deploy(deploy_succeeded) drives the
+        # next-phase DECISION; all side-effect logic (logging, failure-
+        # row writes) is preserved verbatim.
+        deploy_succeeded = deploy_state in ("success", "none")
+        # Read verify_skip_reason to carry is_self_deploy flag through
+        # the transition function (set at push_and_pr time — #2953).
+        _skip_reason = self._read_verify_skip_reason(agent_id)
+        _is_self_deploy = _skip_reason == VERIFY_SKIP_REASON_SELF_DEPLOY
+        deploy_transition = transition_from_awaiting_deploy(
+            deploy_succeeded, is_self_deploy=_is_self_deploy
+        )
+
+        if deploy_transition.action == TransitionAction.ROUTE_TO_DIAGNOSER:
+            # deploy_state == "failure"
             self._log.warning(
                 "daemon.deploy_failed",
                 extra={
@@ -13588,7 +13696,9 @@ class DispatcherDaemon:
             )
             return
 
-        # deploy_state in ("success", "none") — run verify.
+        # deploy_transition.action == ADVANCE
+        # deploy_state in ("success", "none") — run verify (or skip
+        # to done for self-deploy, handled inside _run_verify_and_complete).
         self._run_verify_and_complete(agent, pr_status, merge_sha, deploy_runs)
 
     def _find_deploy_runs(self, merge_sha: str) -> list[dict[str, Any]]:
@@ -13955,8 +14065,16 @@ class DispatcherDaemon:
                 },
             )
 
+        # Dispatch through the pure phase-transition catalog (#2976).
+        # Side-effect logic (logging events, failure-row writes) is
+        # preserved verbatim; only the DECISION about which path to take
+        # is driven by transition_from_verify.
+        # Keep the verdict string for the daemon.agent_completed log event below.
         verdict = str(verify_output.get("verdict") or "").upper()
-        if verdict == "FAILED":
+        verify_transition = transition_from_verify(verify_output)
+
+        if verify_transition.action == TransitionAction.ROUTE_TO_DIAGNOSER:
+            # verify_transition.failure_hint == FAILURE_HINT_VERIFY_FAILED_POST_MERGE
             failure_reason = verify_output.get("failure_reason")
             self._log.warning(
                 "daemon.verify_failed",
@@ -14001,12 +14119,13 @@ class DispatcherDaemon:
             )
             return
 
+        # verify_transition.action == ADVANCE, next_phase == "done"
         # VERIFIED or SKIPPED — stamp ``verified_at`` and advance phase
         # so the retro phase picks up the row next tick. ``status`` is
         # already ``succeeded`` from merge-time; no re-flip needed
         # (issue #2953).
         self._write_verified_at(agent_id)
-        self._update_agent_phase(agent_id, "done")
+        self._update_agent_phase(agent_id, verify_transition.next_phase or "done")
         self._log.info(
             "daemon.agent_completed",
             extra={
@@ -14265,7 +14384,11 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_timeout", extra=extra)
-            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            # transition_from_retro(False) → next_phase == PHASE_RETRO_FAILED
+            retro_failed_transition = transition_from_retro(False)
+            self._update_agent_phase(
+                agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
+            )
             return
         except (FileNotFoundError, OSError) as exc:
             extra = {
@@ -14278,7 +14401,10 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_subprocess_error", extra=extra)
-            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            retro_failed_transition = transition_from_retro(False)
+            self._update_agent_phase(
+                agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
+            )
             return
 
         if exit_code != 0:
@@ -14293,7 +14419,10 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_nonzero_exit", extra=extra)
-            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            retro_failed_transition = transition_from_retro(False)
+            self._update_agent_phase(
+                agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
+            )
             return
 
         retro_output = self._read_phase_output(worktree, "retro")
@@ -14307,7 +14436,10 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_output_missing", extra=extra)
-            self._update_agent_phase(agent_id, PHASE_RETRO_FAILED)
+            retro_failed_transition = transition_from_retro(False)
+            self._update_agent_phase(
+                agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
+            )
             return
 
         # Persist the retro output to dispatcher.phase_outputs +
@@ -14353,8 +14485,13 @@ class DispatcherDaemon:
         # even if the phase advance failed. Paired reads of
         # ``phase=retro_done`` and ``retroed_at IS NOT NULL`` are both
         # authoritative (post this fix).
+        # Dispatch through the pure phase-transition catalog (#2976).
+        retro_done_transition = transition_from_retro(True)
+        # retro_done_transition.next_phase == PHASE_RETRO_DONE
         self._write_retroed_at(agent_id)
-        self._update_agent_phase(agent_id, PHASE_RETRO_DONE)
+        self._update_agent_phase(
+            agent_id, retro_done_transition.next_phase or PHASE_RETRO_DONE
+        )
         self._log.info(
             "daemon.retro_done",
             extra={
