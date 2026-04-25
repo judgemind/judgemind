@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# check-subprocess-timeouts.sh — Every ``subprocess.run(...)`` call site in
-# ``scripts/**/*.py`` (excluding any path with a ``tests/`` segment) must
-# have either a ``timeout=`` keyword argument OR a ``**kwargs`` splat
-# (treated as a transparent pass-through that delegates timeout
-# responsibility to the caller).
+# check-subprocess-timeouts.sh — Every ``subprocess.run(...)`` and
+# ``urllib.request.urlopen(...)`` call site in ``scripts/**/*.py``
+# (excluding any path with a ``tests/`` segment) must have either a
+# ``timeout=`` keyword argument OR a ``**kwargs`` splat (treated as a
+# transparent pass-through that delegates timeout responsibility to the
+# caller).
 #
 # Why this check exists
 # ---------------------
-# An unbounded ``subprocess.run`` on the MainThread of a long-lived process
+# An unbounded network egress call on the MainThread of a long-lived process
 # can wedge the process silently forever — confirmed as the prime hypothesis
 # for the #3205 dispatcher silent-wedge class. Issue #3213 audited all
-# scripts/*.py call sites and fixed the 13 violations; this check prevents
-# the invariant from regressing.
+# scripts/*.py subprocess.run call sites and fixed the 13 violations; issue
+# #3309 extended the rule to urllib.request.urlopen calls. This check
+# prevents the invariant from regressing for both call shapes.
 #
 # Rule
 # ----
-# Every ``subprocess.run(...)`` call in ``scripts/**/*.py`` (excluding
-# ``scripts/**/tests/**``) must pass:
+# Every ``subprocess.run(...)`` or ``urllib.request.urlopen(...)`` call in
+# ``scripts/**/*.py`` (excluding ``scripts/**/tests/**``) must pass:
 #   (a) ``timeout=<value>`` as an explicit keyword argument, OR
 #   (b) ``**kwargs`` (``kw.arg is None``) as a keyword splat — the wrapper
 #       itself is expected to set the timeout and this tool cannot verify the
@@ -26,7 +28,7 @@
 # with a subsequent ``proc.wait(timeout=...)`` call. A follow-up issue will
 # extend this check to the Popen-pairing invariant.
 #
-# Tracking: issue #3213.
+# Tracking: issues #3213 (subprocess.run) and #3309 (urlopen).
 #
 # Usage
 # -----
@@ -35,7 +37,7 @@
 #
 # Exit codes
 # ----------
-#   0 — Every subprocess.run call site has a timeout= kwarg or **kwargs splat.
+#   0 — Every network egress call site has a timeout= kwarg or **kwargs splat.
 #   1 — At least one call site is missing a timeout constraint.
 
 # venv: none
@@ -69,16 +71,35 @@ except SyntaxError as exc:
     print(f"SYNTAX_ERROR:{exc}", file=sys.stderr)
     sys.exit(0)
 
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    func = node.func
-    if not (
+def is_subprocess_run(func):
+    return (
         isinstance(func, ast.Attribute)
         and func.attr == "run"
         and isinstance(func.value, ast.Name)
         and func.value.id == "subprocess"
+    )
+
+def is_urlopen(func):
+    # urllib.request.urlopen(...)
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "urlopen"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "request"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "urllib"
     ):
+        return True
+    # from urllib.request import urlopen; urlopen(...)
+    if isinstance(func, ast.Name) and func.id == "urlopen":
+        return True
+    return False
+
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call):
+        continue
+    func = node.func
+    if not (is_subprocess_run(func) or is_urlopen(func)):
         continue
     # Check for timeout= kwarg or **kwargs splat (kw.arg is None).
     has_timeout = any(
@@ -93,10 +114,10 @@ PYEOF
 )"
 
     if [[ -z "${python_output// /}" ]]; then
-        echo "check-subprocess-timeouts: $TARGET_FILE — OK (all subprocess.run calls have timeout= or **kwargs)"
+        echo "check-subprocess-timeouts: $TARGET_FILE — OK (all network egress calls have timeout= or **kwargs)"
         exit 0
     fi
-    echo "ERROR: subprocess.run call(s) missing timeout= kwarg or **kwargs splat."
+    echo "ERROR: network egress call(s) missing timeout= kwarg or **kwargs splat."
     echo ""
     echo "  Violations:"
     echo ""
@@ -109,7 +130,7 @@ PYEOF
     echo "  to the operation (e.g. timeout=30 for local git ops, timeout=120 for"
     echo "  network gh calls)."
     echo ""
-    echo "  See #3213 for the full audit and rationale."
+    echo "  See #3213 (subprocess.run) and #3309 (urlopen) for the full audit and rationale."
     exit 1
 fi
 
@@ -163,16 +184,35 @@ try:
 except SyntaxError:
     sys.exit(0)
 
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    func = node.func
-    if not (
+def is_subprocess_run(func):
+    return (
         isinstance(func, ast.Attribute)
         and func.attr == "run"
         and isinstance(func.value, ast.Name)
         and func.value.id == "subprocess"
+    )
+
+def is_urlopen(func):
+    # urllib.request.urlopen(...)
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "urlopen"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "request"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "urllib"
     ):
+        return True
+    # from urllib.request import urlopen; urlopen(...)
+    if isinstance(func, ast.Name) and func.id == "urlopen":
+        return True
+    return False
+
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call):
+        continue
+    func = node.func
+    if not (is_subprocess_run(func) or is_urlopen(func)):
         continue
     has_timeout = any(
         kw.arg == "timeout" or kw.arg is None
@@ -194,7 +234,7 @@ PYEOF
 done < <(find "$REPO_ROOT/scripts" -name "*.py" -print0 | sort -z)
 
 if (( violations_total > 0 )); then
-    echo "ERROR: subprocess.run call(s) missing timeout= kwarg or **kwargs splat."
+    echo "ERROR: network egress call(s) missing timeout= kwarg or **kwargs splat."
     echo ""
     echo "  Violations:"
     echo ""
@@ -206,9 +246,9 @@ if (( violations_total > 0 )); then
     echo "  to the operation (e.g. timeout=30 for local git ops, timeout=120 for"
     echo "  network gh calls)."
     echo ""
-    echo "  See #3213 for the full audit and rationale."
+    echo "  See #3213 (subprocess.run) and #3309 (urlopen) for the full audit and rationale."
     exit 1
 fi
 
-echo "check-subprocess-timeouts: ${files_scanned} file(s) scanned — all subprocess.run calls have timeout= or **kwargs."
+echo "check-subprocess-timeouts: ${files_scanned} file(s) scanned — all network egress calls have timeout= or **kwargs."
 exit 0

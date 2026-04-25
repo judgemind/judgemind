@@ -141,6 +141,54 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# ─── Test (g): urllib.request.urlopen with timeout= passes ───────────────────
+write_file "good_urlopen_timeout.py" <<'EOF'
+import urllib.request
+
+def fetch():
+    req = urllib.request.Request("https://api.example.com/data")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+EOF
+assert_passes "file with urllib.request.urlopen and explicit timeout= passes" \
+    "$TMPDIR_TEST/good_urlopen_timeout.py"
+
+# ─── Test (h): urllib.request.urlopen without timeout= fails ─────────────────
+write_file "bad_urlopen_no_timeout.py" <<'EOF'
+import urllib.request
+
+def fetch():
+    req = urllib.request.Request("https://api.example.com/data")
+    with urllib.request.urlopen(req) as resp:
+        return resp.read()
+EOF
+assert_fails "file with urllib.request.urlopen missing timeout= fails" \
+    "$TMPDIR_TEST/bad_urlopen_no_timeout.py"
+
+# ─── Test (i): from-import urlopen with timeout= passes ──────────────────────
+write_file "good_urlopen_from_import_timeout.py" <<'EOF'
+from urllib.request import urlopen, Request
+
+def fetch():
+    req = Request("https://api.example.com/data")
+    with urlopen(req, timeout=30) as resp:
+        return resp.read()
+EOF
+assert_passes "file with from-import urlopen and explicit timeout= passes" \
+    "$TMPDIR_TEST/good_urlopen_from_import_timeout.py"
+
+# ─── Test (j): from-import urlopen without timeout= fails ────────────────────
+write_file "bad_urlopen_from_import_no_timeout.py" <<'EOF'
+from urllib.request import urlopen, Request
+
+def fetch():
+    req = Request("https://api.example.com/data")
+    with urlopen(req) as resp:
+        return resp.read()
+EOF
+assert_fails "file with from-import urlopen missing timeout= fails" \
+    "$TMPDIR_TEST/bad_urlopen_from_import_no_timeout.py"
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "$TESTS tests run, $FAILURES failed"
