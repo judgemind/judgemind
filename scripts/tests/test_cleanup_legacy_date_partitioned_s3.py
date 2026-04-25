@@ -27,7 +27,7 @@ import pytest
 # which may not be installed in the CI scripts-tests environment.
 # ---------------------------------------------------------------------------
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "archive"))
 
 _mock_boto3 = MagicMock()
 _mock_psycopg = MagicMock()

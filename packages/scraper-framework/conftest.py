@@ -12,6 +12,7 @@ from __future__ import annotations
 # scraper-framework package.  These fail to import in CI's
 # scraper-framework-tests job but run in the scripts-tests job.
 collect_ignore_glob = [
+    "tests/test_audit*.py",
     "tests/test_backfill*.py",
     "tests/test_cleanup*.py",
     "tests/test_dedup*.py",
