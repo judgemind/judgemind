@@ -283,6 +283,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
                     --package "$pkg_key" \
                     --coverage-file "$cov_file" \
                     --baselines-file "$baselines_file" \
+                    --source-dir "$pkg_dir/src" \
+                    --source-dir "$pkg_dir/tests" \
                     --dry-run; then
                 echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
                 echo "  Add tests to restore coverage before pushing." >&2
@@ -375,6 +377,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
                     --package "packages/$pkg" \
                     --coverage-file "$cov_file" \
                     --baselines-file "$baselines_file" \
+                    --source-dir "$pkg_dir/src" \
+                    --source-dir "$pkg_dir/tests" \
                     --dry-run; then
                 echo "  Coverage has dropped below the baseline in coverage-baselines.json." >&2
                 echo "  Add tests to restore coverage before pushing." >&2

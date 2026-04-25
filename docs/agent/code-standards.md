@@ -136,6 +136,7 @@ Prefer narrowing the handler (`except FileNotFoundError:`) or logging the except
 
 - **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).
 - **Coverage floor ratchet:** overall package coverage must not decrease below the baseline in `coverage-baselines.json`. The floor only goes up — when coverage increases, update the baselines with `scripts/update-coverage-baselines.py`.
+- Pre-push only enforces the floor when `coverage/lcov.info` (or `coverage.xml`) is newer than every source file under `src/` and `tests/`. A scoped `npm test -- --coverage <files>` produces a stale-relative-to-source report; pre-push detects this and emits a warning instead of failing — re-run the full coverage command before pushing.
 
 ### TypeScript packages
 
