@@ -34,6 +34,46 @@ fi
 DST_DIR=$(dirname "$DST")
 mkdir -p "$DST_DIR"
 
+# Worktree scope guard: when called from inside a worktree, reject destinations
+# in the main-repo .claude/ that are outside the worktree.
+EFFECTIVE_CWD="${WRITE_CLAUDE_CWD:-$PWD}"
+case "$EFFECTIVE_CWD" in
+    */.claude/worktrees/*)
+        REPO_ROOT="${EFFECTIVE_CWD%%/.claude/worktrees/*}"
+        REST="${EFFECTIVE_CWD#"$REPO_ROOT"/.claude/worktrees/}"
+        WORKTREE_ID="${REST%%/*}"
+        WORKTREE_ROOT="$REPO_ROOT/.claude/worktrees/$WORKTREE_ID"
+        # Normalize DST to absolute
+        case "$DST" in
+            /*) DST_ABS="$DST" ;;
+            *)  DST_ABS="$EFFECTIVE_CWD/$DST" ;;
+        esac
+        DST_ABS=$(python3 -c "import os,sys; print(os.path.normpath(sys.argv[1]))" "$DST_ABS")
+        # Check: inside repo root but NOT inside worktree root
+        case "$DST_ABS" in
+            "$REPO_ROOT"/*|"$REPO_ROOT")
+                case "$DST_ABS" in
+                    "$WORKTREE_ROOT"/*|"$WORKTREE_ROOT")
+                        # Inside worktree — allow
+                        ;;
+                    *)
+                        REL="${DST_ABS#"$REPO_ROOT"/}"
+                        SUGGESTED="$WORKTREE_ROOT/$REL"
+                        echo "BLOCKED: $DST_ABS is inside the main repo checkout but outside your worktree ($WORKTREE_ROOT). Silent writes to the main repo bypass the PR workflow. Retry with the worktree-prefixed path: $SUGGESTED" >&2
+                        exit 1
+                        ;;
+                esac
+                ;;
+            *)
+                # Outside repo root entirely — allow
+                ;;
+        esac
+        ;;
+    *)
+        # Not inside a worktree — allow unconditionally
+        ;;
+esac
+
 # Check if destination file is already executable (before overwrite)
 DST_WAS_EXECUTABLE=false
 if [ -f "$DST" ] && [ -x "$DST" ]; then
