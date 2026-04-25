@@ -1240,6 +1240,36 @@ FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: retry — proper LLM-resolution path is the follow-up issue. Tier-3.
 FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH = "merge_conflict_at_push"
 
+#: #3366 — agent-runner-entrypoint terminal phase set when a Claude-driven
+#: phase's transition either resolves to ``route_to_diagnoser`` (with a
+#: hint other than ``conflict_unresolvable``, which has its own dedicated
+#: terminal) OR returns an unrecognized action. Examples include
+#: ``ralph_not_ship`` and any future phase-transition shape the entrypoint
+#: doesn't know how to handle. Routed through the empowered diagnoser
+#: (``/diagnose-failure``) so it can read the worktree state, ralph's
+#: commits, the latest reviewer feedback, and decide the next step.
+#: Pre-#3366, this terminal silently exited the ECS task with no
+#: ``dispatcher.failures`` row and no diagnoser invocation — see
+#: ``_reap_completed_agent_tasks`` for the routing site.
+FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
+
+#: #3366 — terminal-phase → failure-category map for the bypass-prone
+#: terminals the ECS entrypoint emits with ``status='failed'`` AND
+#: container exit 0. The reaper observes these in the
+#: ``task_success=true & status in TERMINAL_AGENT_STATUSES`` branch
+#: and pre-#3366 ran bookkeeping only — no ``dispatcher.failures``
+#: row, so the diagnoser sweep never picked them up. The reaper now
+#: looks each up here and routes through ``_handle_agent_failure``,
+#: which writes the failures row and lets ``_find_diagnoser_candidates``
+#: pick it up on the next supervisor tick.
+#:
+#: Both phases are already in :data:`TIER_3_CATEGORIES` so the
+#: candidate-finder treats them as first-occurrence diagnose-immediately.
+BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
+    "conflict_unresolvable": FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
+    "agent_runner_route_stub": FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
+}
+
 #: GitHub's rejection stderr fragment when branch protection's
 #: statusCheckRollup evaluator still sees a stale FAILURE check_run
 #: from an earlier CI attempt even though the *latest* ci-passed
@@ -1519,6 +1549,10 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         # path — the diagnoser picks block_and_comment or
         # file_prerequisite_task based on the conflict files.
         FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH,
+        # #3366: agent-runner entrypoint route_stub terminal. Routed
+        # here so the empowered diagnoser can apply broader judgment
+        # than the entrypoint's local routing table.
+        FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
     }
 )
 
@@ -1538,17 +1572,23 @@ TIER_2_RECURRENCE_WINDOW_SECONDS = 24 * 60 * 60
 STUCK_TIMEOUT_ALERT_WINDOW_SECONDS = 600
 
 #: Hard wall-clock timeout for the ``/diagnose-failure`` subprocess
-#: (``claude -p``). Matches spec §8 "5-min hard wall-clock timeout".
-#: Timeout, non-zero exit, or malformed recommendation JSON → fall
-#: back to fixed mechanical escalation policy (spec §8 "Budget &
-#: safety").
-DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS = 5 * 60
+#: (``claude -p``). Issue #3366 elevated the diagnoser to a peer-agent
+#: with full toolset (Bash/Edit/Write/Agent/MCP/git/gh/aws), which can
+#: take materially longer than the pre-#3366 read-only reasoning. The
+#: timeout is bumped to 90 minutes to accommodate sub-skill
+#: invocations (``/task-v2-fix-conflict``, ``/tdd``, ``/ralph``) and
+#: real diagnostic work (commit a fix, file a prerequisite). Daemon
+#: still surfaces long-running diagnoses via the structured-log stream
+#: for operator visibility but does not kill them within reason.
+DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS = 90 * 60
 
-#: ``--max-turns`` value for the diagnoser. 30 is generous for a
-#: read-only reasoning task — the skill reads a JSONB context, maybe
-#: fetches an issue/PR/CI log, and writes a recommendation. Matches
-#: the frontmatter in ``.claude/skills/diagnose-failure/SKILL.md``.
-DIAGNOSER_MAX_TURNS = 30
+#: ``--max-turns`` value for the diagnoser. Issue #3366 lifted the
+#: pre-existing 30-turn cap because the empowered diagnoser may need
+#: many more turns to read the worktree, run sub-skills, commit, push,
+#: and write the directive. 9999 is a sanity ceiling — far above any
+#: realistic diagnostic session — that prevents a runaway loop without
+#: artificially capping productive work.
+DIAGNOSER_MAX_TURNS = 9999
 
 #: Default model for the diagnoser. Matches
 #: ``dispatcher.config.model_by_phase.diagnose`` seed (``opus``) from
@@ -1590,6 +1630,43 @@ DIAGNOSER_ACTIONS: frozenset[str] = frozenset(
         "block_on_existing_task",
     }
 )
+
+#: Issue #3366 — phases the diagnoser may name in ``respawn_at=<phase>``
+#: and the agent-runner entrypoint accepts as ``START_PHASE``. The set
+#: is intentionally narrow: it covers the recovery-resume points the
+#: diagnoser can reasonably pick after committing a fix to the
+#: agent's branch. Excludes ``claiming`` (no need — that's the
+#: default) and ``retro`` (post-merge; not a recovery point).
+#:
+#: The entrypoint side mirrors this list in agent-runner-entrypoint.sh
+#: (``AGENT_RUNNER_VALID_START_PHASES``); a parity test asserts the
+#: two stay in sync. An unknown ``START_PHASE`` value rejects with
+#: ``exit 1`` on the entrypoint side so the bug is loud, not silent.
+AGENT_RUNNER_VALID_START_PHASES: frozenset[str] = frozenset(
+    {
+        "planning",
+        "setup",
+        "ralph",
+        "summary",
+        "push_and_pr",
+        "awaiting_ci",
+        "fix_ci",
+        "merge",
+        "awaiting_deploy",
+        "verify",
+    }
+)
+
+#: Issue #3366 — recognized ``next_directive`` shapes. ``terminal``
+#: means "diagnoser explicitly says no further action"; the
+#: ``respawn_at=<phase>`` shape is parsed for the named phase. Anything
+#: else (NULL, malformed, unknown literal) falls back to escalate AND
+#: emits ``daemon.diagnoser_did_not_complete`` so the operator sees the
+#: gap. Distinct from :data:`DIAGNOSER_ACTIONS` — the directive is the
+#: daemon-consumer input post-#3366, while ``recommendation.action``
+#: stays as supplementary audit context.
+DIRECTIVE_TERMINAL = "terminal"
+DIRECTIVE_RESPAWN_AT_PREFIX = "respawn_at="
 
 #: Circuit-breaker bounds (spec §8 "Budget & safety"). When the
 #: fallback rate (diagnoses with ``status='failed'``) over the last 24 h
@@ -11412,6 +11489,157 @@ class DispatcherDaemon:
             issue_number=issue_number,
         )
 
+    def _build_bypassed_terminal_details(
+        self,
+        *,
+        agent_id: str,
+        terminal_phase: str,
+        issue_number: int | None,
+    ) -> dict[str, Any]:
+        """Assemble per-terminal context for #3366 routed-to-diagnoser failures.
+
+        Reads the agent's most-recent ``dispatcher.phase_outputs`` row
+        for the terminal phase (the entrypoint's
+        ``agent_runner_reaped_failure`` writes ``{category, reason}``
+        there; for ``conflict_unresolvable`` the entrypoint also
+        persists the fix_conflict skill output earlier in the phase).
+        Best-effort — empty dict on any DB error.
+
+        For the diagnoser these details land in
+        ``dispatcher.diagnoses.context`` via ``_build_diagnoser_context``
+        which inlines the failure ``details`` JSONB into the bundle the
+        skill reads. Per-category fields:
+
+        * ``conflict_unresolvable`` — ``conflict_files``,
+          ``resolution_notes`` (read from the fix_conflict
+          phase_outputs row); ``budget_exhausted``.
+        * ``agent_runner_route_stub`` — ``route_hint`` (from the
+          stub phase_outputs row's ``reason`` field).
+
+        The returned dict is layered over the standard envelope
+        ``{phase, stderr_tail, exit_code}`` by ``_handle_agent_failure``
+        so the two are not mutually exclusive.
+        """
+        assert self._conn is not None, "connect() must run before details build"
+        details: dict[str, Any] = {
+            "issue_number": issue_number,
+            "terminal_phase": terminal_phase,
+        }
+        # Pull the most-recent phase_outputs row for the terminal
+        # phase. The entrypoint persists ``{category, reason}`` here
+        # via ``agent_runner_reaped_failure``.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT output_json FROM dispatcher.phase_outputs "
+                    "WHERE agent_id = %s AND phase = %s "
+                    "ORDER BY ts DESC LIMIT 1",
+                    (agent_id, terminal_phase),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+            if row is not None and row[0] is not None:
+                raw = row[0]
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except json.JSONDecodeError:
+                        raw = {}
+                if isinstance(raw, dict):
+                    # Carry the entrypoint-emitted reason as
+                    # stderr_tail so the diagnoser's §Step 1 verbatim-
+                    # quote rule still has a string to anchor on.
+                    reason = raw.get("reason")
+                    if isinstance(reason, str):
+                        details["stderr_tail"] = reason
+                    if terminal_phase == "agent_runner_route_stub":
+                        details["route_hint"] = reason or ""
+                    # The fix_conflict skill output (verdict, files,
+                    # resolution_notes) is persisted on the
+                    # fix_conflict phase, NOT the terminal phase —
+                    # pull that separately below.
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
+        if terminal_phase == "conflict_unresolvable":
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT output_json FROM dispatcher.phase_outputs "
+                        "WHERE agent_id = %s AND phase = 'fix_conflict' "
+                        "ORDER BY ts DESC LIMIT 1",
+                        (agent_id,),
+                    )
+                    row = cur.fetchone()
+                self._conn.commit()
+                if row is not None and row[0] is not None:
+                    raw = row[0]
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except json.JSONDecodeError:
+                            raw = {}
+                    if isinstance(raw, dict):
+                        for key in (
+                            "conflict_files",
+                            "resolution_notes",
+                            "budget_exhausted",
+                            "verdict",
+                        ):
+                            if key in raw:
+                                details[key] = raw[key]
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+
+        return details
+
+    def _clear_agent_task_arn(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        branch: str,
+    ) -> None:
+        """Clear ``dispatcher.agents.agent_task_arn`` (idempotent).
+
+        Used by #3366's bypass-terminal routing in
+        :meth:`_reap_completed_agent_tasks` so the next reap tick
+        excludes the row. Mirrors the success-path clear in
+        :meth:`_reap_finalize_ecs_success` and the failure-already-
+        terminal clear in the same method (#3329).
+        """
+        assert self._conn is not None, "connect() must run before arn clear"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET agent_task_arn = NULL "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.agent_runner_reaped_arn_clear_failed",
+                extra={
+                    "event": "agent_runner_reaped_arn_clear_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "branch": branch,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
+
     def _log_tail(self, worktree: Path, phase: str, max_chars: int = 500) -> str:
         """Return the last ``max_chars`` of the phase log, or an empty string."""
         log_path = worktree / "tmp" / f"claude-p-{phase}.log"
@@ -18189,6 +18417,16 @@ class DispatcherDaemon:
             def flush(self) -> None:
                 return None
 
+        # Issue #3366 — set the diagnoser sentinel env var so the
+        # PreToolUse hook (``.claude/hooks/preflight-bash.sh``) can
+        # enforce diagnoser-specific bright lines (no production
+        # deploy, no PAT rotation, no force-push to main, no
+        # recursive ``/diagnose-failure`` invocation). The env var
+        # is inert outside the diagnoser run — every other Bash
+        # invocation in the daemon / agent-runner / interactive
+        # operator session leaves it unset.
+        diagnoser_env = dict(os.environ)
+        diagnoser_env["JUDGEMIND_DIAGNOSER_RUN"] = "1"
         try:
             proc: subprocess.Popen[str] = subprocess.Popen(  # noqa: S603 — literal trusted cmd
                 cmd,
@@ -18197,6 +18435,7 @@ class DispatcherDaemon:
                 text=True,
                 bufsize=1,
                 cwd=str(repo_root),
+                env=diagnoser_env,
             )
         except FileNotFoundError:
             return None, "claude binary not found"
@@ -18314,6 +18553,281 @@ class DispatcherDaemon:
             ):
                 return None
         return action
+
+    # ──────────────────────────────────────────────────────────────────
+    # Issue #3366 — empowered diagnoser ``next_directive`` consumer.
+    # The 8-action recommendation contract stays for audit / operator
+    # review, but the daemon's deterministic resume decision now reads
+    # the explicit ``next_directive`` column. Three states matter:
+    #
+    #   * ``respawn_at=<phase>`` — diagnoser advanced the work; daemon
+    #     spawns a new agent-runner ECS task on the same agent_id with
+    #     ``START_PHASE=<phase>`` env so the agent picks up mid-pipeline.
+    #     Phase value is validated against
+    #     :data:`AGENT_RUNNER_VALID_START_PHASES` here AND on the
+    #     entrypoint side; an unknown phase falls back to escalate.
+    #   * ``terminal`` — diagnoser explicitly says no further action.
+    #     Whatever needed to be done — issue closed, blocker filed,
+    #     comment posted — was done directly via gh / git in the
+    #     diagnoser run. The daemon frees the slot and logs
+    #     ``diagnoser_completed_terminal``.
+    #   * NULL (the absence) — diagnoser didn't run, crashed, or didn't
+    #     finish writing the directive. Distinguishable from
+    #     ``terminal`` so the daemon emits
+    #     ``diagnoser_did_not_complete`` for operator visibility AND
+    #     falls back to the existing ``escalate`` path.
+    #
+    # The directive consumer runs AFTER ``_consume_diagnosis`` returns
+    # so the recommendation-driven path has already executed (label
+    # writes, retry markers, etc.). When the directive is
+    # ``respawn_at`` the consumer overrides the recommendation's
+    # terminal state by re-launching the agent runner.
+    # ──────────────────────────────────────────────────────────────────
+
+    def _read_next_directive(self, diagnosis_id: int) -> str | None:
+        """Read ``dispatcher.diagnoses.next_directive`` for the row.
+
+        Returns the raw string, or ``None`` when the column is NULL,
+        the row is missing, or the read fails. ``None`` is the
+        consumer's signal to fall back to escalate + log
+        ``diagnoser_did_not_complete``.
+        """
+        assert self._conn is not None, "connect() must run before directive read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT next_directive FROM dispatcher.diagnoses "
+                    "WHERE diagnosis_id = %s",
+                    (diagnosis_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None or row[0] is None:
+            return None
+        raw = row[0]
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        return text or None
+
+    def _parse_next_directive(
+        self, directive: str | None
+    ) -> tuple[str | None, str | None]:
+        """Return ``(kind, payload)`` for a directive string.
+
+        ``kind`` is one of:
+          * ``"terminal"`` — operator decision: free the slot.
+          * ``"respawn_at"`` — daemon spawns a new agent-runner.
+            ``payload`` is the validated phase name.
+          * ``None`` — directive absent / malformed / unknown.
+
+        Phase names are validated against
+        :data:`AGENT_RUNNER_VALID_START_PHASES`; an out-of-set phase
+        is treated as malformed (kind=None) so the consumer falls
+        back to escalate. The entrypoint also re-validates so a bug
+        on this side cannot produce silent skip-the-pipeline behavior.
+        """
+        if directive is None:
+            return None, None
+        text = directive.strip()
+        if text == DIRECTIVE_TERMINAL:
+            return "terminal", None
+        if text.startswith(DIRECTIVE_RESPAWN_AT_PREFIX):
+            phase = text[len(DIRECTIVE_RESPAWN_AT_PREFIX) :].strip()
+            if phase and phase in AGENT_RUNNER_VALID_START_PHASES:
+                return "respawn_at", phase
+            return None, None
+        return None, None
+
+    def _consume_next_directive(
+        self,
+        *,
+        diagnosis_id: int,
+        candidate: dict[str, Any],
+        consumed_action: str,
+    ) -> str:
+        """Act on ``dispatcher.diagnoses.next_directive`` (issue #3366).
+
+        Called from :meth:`_run_diagnoser_pass` after
+        :meth:`_consume_diagnosis` returns. Returns the directive
+        outcome as a short label for log / test correlation:
+
+          * ``"respawn_at_<phase>"`` — daemon launched a new
+            agent-runner ECS task at the named phase.
+          * ``"respawn_at_launch_failed"`` — phase was valid but
+            ``_launch_agent_ecs_task`` returned None (capacity
+            exhausted, IAM error). Falls through to escalate.
+          * ``"terminal"`` — diagnoser explicitly said done; slot
+            freed, ``daemon.diagnoser_completed_terminal`` logged.
+          * ``"absent"`` — directive was NULL / malformed / unknown
+            phase. Falls back to escalate AND logs
+            ``daemon.diagnoser_did_not_complete``.
+
+        ROUTING (#3366): the directive consumer is the FINAL step of
+        consuming a diagnoser pass — it fires after the
+        recommendation-driven action has run. On ``respawn_at`` it
+        intentionally re-launches a NEW ECS task on the same
+        ``agent_id`` AND clears the ``ended_at`` / status fields the
+        recommendation may have set, so the agent row reflects the
+        live respawn instead of the prior terminal.
+        """
+        directive = self._read_next_directive(diagnosis_id)
+        kind, payload = self._parse_next_directive(directive)
+        agent_id = candidate["agent_id"]
+        issue_number = candidate.get("issue_number")
+
+        if kind is None:
+            # Distinguishable from ``terminal``: diagnoser did NOT
+            # write a directive (or wrote a malformed one). Operator-
+            # visibility log event so the gap surfaces in CloudWatch.
+            self._log.warning(
+                "daemon.diagnoser_did_not_complete",
+                extra={
+                    "event": "diagnoser_did_not_complete",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "raw_directive": directive,
+                    "consumed_action": consumed_action,
+                },
+            )
+            # ``_consume_diagnosis`` already executed the
+            # recommendation-driven action (which may itself be
+            # ``escalate``). Belt-and-braces: if the consumed action
+            # was a *successful* terminal-non-escalate dispatch (e.g.
+            # ``retry`` / ``retry_with_hint`` / ``reissue``), the
+            # missing directive is informational — don't double-
+            # escalate. If the consumed action was an
+            # ``escalate_fallback`` (the recommendation also failed),
+            # the underlying mechanical escalation already ran. So
+            # the "absent" branch is a pure log signal here, not an
+            # additional side effect.
+            return "absent"
+
+        if kind == "terminal":
+            self._log.info(
+                "daemon.diagnoser_completed_terminal",
+                extra={
+                    "event": "diagnoser_completed_terminal",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "consumed_action": consumed_action,
+                },
+            )
+            # The diagnoser already did everything it needed (file an
+            # issue, post a comment, close, etc.). The agent row
+            # should already be terminal from ``_consume_diagnosis``;
+            # ensure the ``status/in-progress`` label is gone so the
+            # operator-cockpit reflects the freed slot.
+            if issue_number is not None:
+                try:
+                    self._gh_issue_remove_labels(
+                        issue_number, [STATUS_IN_PROGRESS_LABEL]
+                    )
+                except Exception:
+                    self._log.exception(
+                        "daemon.diagnoser_terminal_label_strip_failed",
+                        extra={
+                            "event": "diagnoser_terminal_label_strip_failed",
+                            "run_id": self._run_id,
+                            "diagnosis_id": diagnosis_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                        },
+                    )
+            return "terminal"
+
+        # kind == "respawn_at" — payload is the validated phase name.
+        assert payload is not None
+        self._log.info(
+            "daemon.diagnoser_respawn_at",
+            extra={
+                "event": "diagnoser_respawn_at",
+                "run_id": self._run_id,
+                "diagnosis_id": diagnosis_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "start_phase": payload,
+                "consumed_action": consumed_action,
+            },
+        )
+        # Reset the agent row before launching: clear ``ended_at`` /
+        # ``failure_summary`` and put the agent back into a runnable
+        # state so the supervisor's terminal-state filter doesn't
+        # exclude the respawned run. Phase is set to the resume phase
+        # so the entrypoint's ``read_current_phase`` matches the
+        # ``START_PHASE`` env.
+        try:
+            with self._conn.cursor() as cur:  # type: ignore[union-attr]
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'running', "
+                    "    phase = %s, "
+                    "    ended_at = NULL, "
+                    "    agent_task_arn = NULL "
+                    "WHERE agent_id = %s",
+                    (payload, agent_id),
+                )
+            self._conn.commit()  # type: ignore[union-attr]
+        except Exception:
+            self._log.exception(
+                "daemon.diagnoser_respawn_reset_failed",
+                extra={
+                    "event": "diagnoser_respawn_reset_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()  # type: ignore[union-attr]
+            except Exception:  # pragma: no cover
+                pass
+            return "respawn_at_launch_failed"
+
+        task_arn = self._launch_agent_ecs_task(
+            agent_id,
+            issue_number,
+            start_phase=payload,
+        )
+        if task_arn is None:
+            self._log.error(
+                "daemon.diagnoser_respawn_launch_failed",
+                extra={
+                    "event": "diagnoser_respawn_launch_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "start_phase": payload,
+                },
+            )
+            # Fall back to escalate so the agent doesn't stay in a
+            # zombie ``running`` state when the relaunch couldn't
+            # happen. Reuses the existing escalate path's labels +
+            # comment side effects.
+            self._consume_action_escalate(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                reasoning=(
+                    "Diagnoser proposed respawn_at="
+                    + payload
+                    + " but the daemon's ECS RunTask call failed "
+                    "(see daemon.diagnoser_respawn_launch_failed). "
+                    "Escalating so an operator can decide."
+                ),
+            )
+            return "respawn_at_launch_failed"
+        return f"respawn_at_{payload}"
 
     def _consume_diagnosis(self, diagnosis_id: int, candidate: dict[str, Any]) -> str:
         """Read the recommendation and execute the deterministic action.
@@ -19457,7 +19971,20 @@ class DispatcherDaemon:
                     continue
 
                 # Exit 0 — read the recommendation and consume it.
-                self._consume_diagnosis(diagnosis_id, candidate)
+                consumed_action = self._consume_diagnosis(diagnosis_id, candidate)
+                # Issue #3366 — read the explicit ``next_directive``
+                # column AFTER the recommendation has been consumed.
+                # On ``respawn_at`` the consumer relaunches the
+                # agent-runner ECS task with ``START_PHASE`` set; on
+                # ``terminal`` the slot is freed cleanly; on absence
+                # the consumer logs ``diagnoser_did_not_complete``
+                # for operator visibility (the recommendation-driven
+                # path has already run, so no double-escalate).
+                self._consume_next_directive(
+                    diagnosis_id=diagnosis_id,
+                    candidate=candidate,
+                    consumed_action=consumed_action,
+                )
             except Exception:
                 self._log.exception(
                     "daemon.diagnoser_pass_iteration_failed",
@@ -19927,7 +20454,11 @@ class DispatcherDaemon:
         )
 
     def _launch_agent_ecs_task(
-        self, agent_id: str, issue_number: int | None
+        self,
+        agent_id: str,
+        issue_number: int | None,
+        *,
+        start_phase: str | None = None,
     ) -> str | None:
         """``ecs:RunTask`` the agent-runner task def for one agent.
 
@@ -19947,6 +20478,16 @@ class DispatcherDaemon:
         Non-transient errors (AccessDenied, ValidationException) fail
         immediately — retrying those will never succeed and burns
         scheduler-tick time.
+
+        Issue #3366 — ``start_phase`` (optional) sets ``START_PHASE``
+        on the agent-runner container env so the entrypoint resumes
+        mid-pipeline at the named phase instead of always starting at
+        ``claiming``. Used by the diagnoser-directive consumer when
+        the diagnoser's ``next_directive`` is ``respawn_at=<phase>``.
+        Validated against :data:`AGENT_RUNNER_VALID_START_PHASES` by
+        :meth:`_consume_next_directive` before reaching here, but the
+        entrypoint also re-validates on its side so a bad value never
+        produces silent skip-the-pipeline behavior.
         """
         if not self._agent_runner_wiring_ready():
             self._log.error(
@@ -19966,19 +20507,21 @@ class DispatcherDaemon:
             )
             return None
 
+        env_pairs: list[dict[str, str]] = [
+            {"name": "AGENT_ID", "value": agent_id},
+            {
+                "name": "ISSUE_NUMBER",
+                "value": str(issue_number) if issue_number is not None else "",
+            },
+        ]
+        if start_phase:
+            # #3366 — directive-driven mid-pipeline resume.
+            env_pairs.append({"name": "START_PHASE", "value": start_phase})
         overrides = {
             "containerOverrides": [
                 {
                     "name": "agent-runner",
-                    "environment": [
-                        {"name": "AGENT_ID", "value": agent_id},
-                        {
-                            "name": "ISSUE_NUMBER",
-                            "value": str(issue_number)
-                            if issue_number is not None
-                            else "",
-                        },
-                    ],
+                    "environment": env_pairs,
                 }
             ],
         }
@@ -20507,6 +21050,61 @@ class DispatcherDaemon:
                 # advance the phase via the shared module's
                 # terminal-check.
                 if current_status in TERMINAL_AGENT_STATUSES:
+                    # Issue #3366 — route bypassed terminals through
+                    # the diagnoser. The ECS entrypoint emits
+                    # ``phase='agent_runner_route_stub'`` /
+                    # ``phase='conflict_unresolvable'`` with
+                    # ``status='failed'`` and exits 0, which lands
+                    # here (container_success=true,
+                    # current_status='failed' in terminal set). Pre-
+                    # #3366 the daemon ran ``_reap_finalize_ecs_success``
+                    # bookkeeping and called it done — no
+                    # ``dispatcher.failures`` row, so the diagnoser
+                    # sweep never picked the terminal up. We now
+                    # write a failures row + invoke the diagnoser
+                    # path so the empowered diagnoser can do the
+                    # right thing (resolve the conflict, file a
+                    # prerequisite, etc.).
+                    if (
+                        current_status == "failed"
+                        and current_phase in BYPASSED_TERMINAL_PHASES_TO_ROUTE
+                    ):
+                        self._log.info(
+                            "daemon.agent_runner_reaped_route_to_diagnoser",
+                            extra={
+                                "event": "agent_runner_reaped_route_to_diagnoser",
+                                "run_id": self._run_id,
+                                "agent_id": agent_id,
+                                "issue_number": issue_number,
+                                "task_arn": task_arn,
+                                "terminal_phase": current_phase,
+                            },
+                        )
+                        category = BYPASSED_TERMINAL_PHASES_TO_ROUTE[current_phase]
+                        details = self._build_bypassed_terminal_details(
+                            agent_id=agent_id,
+                            terminal_phase=current_phase,
+                            issue_number=issue_number,
+                        )
+                        self._handle_agent_failure(
+                            agent_id=agent_id,
+                            phase=current_phase,
+                            category=category,
+                            stderr_tail=details.get("stderr_tail", ""),
+                            exit_code=0,
+                            details=details,
+                            issue_number=issue_number,
+                        )
+                        # Clear agent_task_arn so the next reap tick
+                        # excludes this row (mirrors the
+                        # ``_reap_finalize_ecs_success`` ARN clear).
+                        self._clear_agent_task_arn(
+                            agent_id=agent_id,
+                            issue_number=issue_number,
+                            branch="route_to_diagnoser",
+                        )
+                        reaped_failure += 1
+                        continue
                     self._log.info(
                         "daemon.agent_runner_reaped_success",
                         extra={

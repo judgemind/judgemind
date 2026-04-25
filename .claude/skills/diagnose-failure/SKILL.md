@@ -1,40 +1,147 @@
 ---
-description: Diagnose a dispatcher agent-terminal failure. Reads context from dispatcher.diagnoses.context, returns a structured recommendation that the daemon consumes deterministically.
+description: Diagnose a dispatcher agent-terminal failure. Reads context from dispatcher.diagnoses.context, takes whatever action is needed (patch, file issue, comment, etc.) with the same authority as a /task agent, and writes a 3-state directive the daemon consumes deterministically.
 argument-hint: "<diagnosis_id>"
-maxTurns: 30
 model: opus
 ---
 
-# /diagnose-failure skill
+# /diagnose-failure skill — empowered diagnoser (issue #3366)
 
-Diagnoser for the dispatcher v2 failure flow (`docs/specs/dispatcher-v2-spec.md` §8). Invoked as `claude -p '/diagnose-failure <diagnosis_id>'` by the daemon for every agent-terminal failure the unified `_handle_agent_failure` path routes here — including `git_push_failed` / `pr_create_failed` / `phase_output_missing` (first occurrence, issue #3032) and the original tier-2 recurrences / tier-3 first-occurrence categories (`ci_red_after_retries`, `ralph_ac_infeasible`, `summary_ac_infeasible`, `subprocess_turn_limit`). Reads the context bundle the daemon wrote to `dispatcher.diagnoses.context`, proposes one of eight known actions (or, if none fit, a novel action string the daemon will log for operator review), and writes a structured recommendation back to the same row. The daemon executes the chosen action — this skill does not write to GitHub directly.
+Last-ditch resolution point for any failure the per-phase pipeline can't auto-recover from. Invoked as `claude -p '/diagnose-failure <diagnosis_id>'` by the daemon when an agent terminates with a tier-2/3 failure category. Reads the failure context, **does whatever needs doing** (patch the agent's branch, file a prerequisite issue, comment, edit labels), and writes a 3-state directive (`respawn_at=<phase>` / `terminal` / NULL) that the daemon's reaper consumes.
 
-**Known actions (eight).** The daemon's deterministic consumer handles these exactly: `retry`, `retry_with_hint`, `reissue`, `escalate`, `close`, `block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`. Any other action string is logged to `dispatcher.unrecognized_diagnoser_actions` and falls back to `escalate` so the failure still surfaces. See §Action selection below for the decision tree.
+This is the v1 mental model that v2 lost: one smart agent with broad context handles the long tail. The diagnoser has the same authority surface as a `/task` agent or the operator-laptop dispatcher session — bounded only by the bright lines below.
 
-**Prerequisites:** The daemon has already (a) written a `dispatcher.diagnoses` row with `status='pending'` and a serialized context bundle, (b) spawned this skill with the `diagnosis_id` as the argument.
+**No turn cap, no wall-clock cap (within reason).** The daemon's `DIAGNOSER_SUBPROCESS_TIMEOUT_SECONDS` is set to 90 minutes as a sanity ceiling for sub-skill invocations and real diagnostic work; operator visibility on long-running diagnoses comes via the structured-log stream, not a hard kill.
 
-**Goal:** Update `dispatcher.diagnoses.recommendation` (JSONB) with `{action, reasoning, ...payload fields}` and set `status='completed'`, `completed_at=now()`. Additionally, UPDATE `dispatcher.agents.failure_summary` with the first 1-3 sentences of the recommendation's `reasoning` (truncated to 240 chars) so the admin cockpit's "Recently completed" panel shows an LLM-authored summary on hover instead of the daemon's terminal-time template (issue #2900). The daemon's next supervisor tick consumes the recommendation.
+**Recommendation contract preserved (8 known actions).** Issue #3032's recommendation field stays for audit / operator review and the weekly report — the daemon's deterministic consumer still reads it and runs the matching action (`retry`, `retry_with_hint`, `reissue`, `escalate`, `close`, `block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`). What's new in #3366 is that you ALSO write a `next_directive` column AND can take direct side effects (commit/push, gh issue create/edit) when the situation calls for it.
 
-**IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation. This subprocess is already a dispatcher-spawned background task.
+**Prerequisites:** The daemon has already (a) written a `dispatcher.diagnoses` row with `status='pending'` and a serialized context bundle, (b) spawned this skill with the `diagnosis_id` as the argument AND with the `JUDGEMIND_DIAGNOSER_RUN=1` env var set (the bright-line hook reads this).
 
-**IMPORTANT — No side effects on GitHub or the filesystem.** This skill does NOT comment on issues, edit labels, close issues, edit PRs, or modify the worktree. The daemon owns all of those operations — the skill's only writes are the UPDATE on `dispatcher.diagnoses` and the UPDATE on `dispatcher.agents.failure_summary`. The skill MAY read from GitHub (`gh issue view`, `gh pr view`, `gh run view --log-failed`) and from local files in the failed agent's worktree when the context bundle references them.
+**Goal — three writes to the `dispatcher.diagnoses` row before exit:**
 
-**IMPORTANT — 5-minute wall-clock budget.** The daemon kills this subprocess after 5 minutes. Aim for the simplest viable recommendation within that budget; default to `escalate` when genuinely uncertain — a human can always re-classify. Do not chase rabbit holes.
+1. `recommendation` (JSONB) — the 8-action shape (or a novel action string for operator review). Same schema as #3032.
+2. `next_directive` (TEXT) — `respawn_at=<phase>` | `terminal` | NULL.
+3. `actions_taken` (JSONB array) — append-only audit log of every side-effect you took.
+
+Plus the existing `dispatcher.agents.failure_summary` upgrade (first 1-3 sentences of `recommendation.reasoning` ≤240 chars, issue #2900). And `status='completed'` + `completed_at=now()` on the diagnoses row.
+
+**IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation. This subprocess is already a dispatcher-spawned background task. All sub-skills run synchronously.
+
+## Capabilities — same as a peer agent
+
+You can use the full toolset of a `/task` agent or the operator's dispatcher session:
+
+- **Bash** — `git`, `gh`, `aws`, `psql` (via `scripts/dev-db-query.sh`), any other shell command. Set `timeout: 1200000` on long-running commands per `CLAUDE.md`.
+- **Edit / Write / Read / Glob / Grep** — full filesystem access. Edit files in the failed agent's worktree, write helper scripts to `{worktree}/tmp/dispatcher-diagnoser/`, read PR diffs, etc.
+- **Agent (sub-skill invocation, uncapped)** — call `/task-v2-fix-conflict`, `/tdd`, `/ralph`, `/audit`, etc. as many times as judgment requires. Sub-skills run with their own normal contracts.
+- **MCP servers** — `github`, `awslabs_cloudwatch-mcp-server`, `awslabs_ecs-mcp-server`, `plugin:telegram` (read/notify only — see Telegram Integration in `CLAUDE.md`).
+- **gh / git / aws CLI** — full operator-tier authority. You may commit and push to the failed agent's branch, file new issues, edit issue/PR bodies, add/remove labels, post comments. AWS reads (CloudWatch logs, ECS describe-tasks) plus same writes the daemon already has.
+
+## Bright lines — irreducible (hook-enforced)
+
+These are policy, not parsimony. Same lines that bound `/task` agents and the operator-laptop preflight. The diagnoser env var (`JUDGEMIND_DIAGNOSER_RUN=1`, set by the daemon when spawning this skill) lets `.claude/hooks/preflight-bash.sh` enforce them automatically:
+
+1. **No production deploy.** `terraform apply` against `environments/production/`, ECS service writes against `*-production` clusters. Human-only per `CLAUDE.md`. Hook blocks any matching command.
+2. **No PAT rotation / `gh auth switch`.** Operator-only. Hook blocks `gh auth switch`.
+3. **No force-push to main, no amending merged commits.** Destructive across all agents. Hook blocks `git push --force` / `--force-with-lease` to `main`/`master` and blocks `git commit --amend` against merged commits.
+4. **No recursive `/diagnose-failure` invocation.** Depth-1 cap. If a sub-action fails, escalate — don't re-enter. Hook blocks `claude -p '/diagnose-failure ...'` from within a diagnoser run.
+
+If a hook blocks a command, do NOT try to work around it. The hooks ARE policy. Default to `escalate` instead.
+
+## Audit trail — `dispatcher.diagnoses.actions_taken`
+
+Every side-effect action you take must be appended to `dispatcher.diagnoses.actions_taken` (JSONB array). Operators review post-hoc; git history covers code changes, this column covers everything else.
+
+Schema for each entry:
+
+```jsonb
+{"ts": "2026-04-25T18:42:00Z", "type": "git_commit", "sha": "abc123", "message": "fix(deps): align anthropic floor"}
+{"ts": "...", "type": "git_push", "branch": "worktree-agent-XYZ", "remote": "origin"}
+{"ts": "...", "type": "gh_issue_create", "issue_number": 3401, "title": "..."}
+{"ts": "...", "type": "gh_issue_edit", "issue_number": 3297, "labels_added": ["status/blocked"], "labels_removed": ["agent/ready"]}
+{"ts": "...", "type": "gh_issue_comment", "issue_number": 3297, "body_preview": "first 200 chars..."}
+{"ts": "...", "type": "skill_invoke", "skill": "task-v2-fix-conflict", "exit_code": 0}
+{"ts": "...", "type": "bash_run", "cmd": "git rebase origin/main", "exit_code": 0}
+```
+
+Action types to log:
+
+- `git_commit` — every commit you (or a sub-skill on your behalf) make.
+- `git_push` — every push.
+- `gh_issue_create` — `gh issue create`, with the new issue number.
+- `gh_issue_edit` — `gh issue edit`, including label add/remove and body changes.
+- `gh_issue_comment` — `gh issue comment`.
+- `skill_invoke` — every sub-skill call.
+- `bash_run` — non-trivial commands (don't log every `cat`/`ls`/`grep`; log every `git rebase` / `gh issue close` / `aws ...` / `pytest` / etc.).
+
+Append-only writer:
+
+```python
+# {worktree}/tmp/dispatcher-diagnoser/log_action.py
+import json, os, sys
+from datetime import datetime, timezone
+import psycopg
+
+diagnosis_id = int(sys.argv[1])
+action = json.loads(sys.argv[2])
+action.setdefault("ts", datetime.now(timezone.utc).isoformat())
+with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE dispatcher.diagnoses "
+            "SET actions_taken = COALESCE(actions_taken, '[]'::jsonb) || %s::jsonb "
+            "WHERE diagnosis_id = %s",
+            (json.dumps([action]), diagnosis_id),
+        )
+    conn.commit()
+```
+
+## `next_directive` — the 3-state daemon signal
+
+Before you exit, the daemon's reaper needs to know whether to respawn the agent or free the slot. **Always write one of three values:**
+
+| Value | Meaning | What the daemon does |
+|---|---|---|
+| `respawn_at=<phase>` | You advanced the work (committed a fix, etc.). Resume the agent at the named phase. | Daemon launches a fresh agent-runner ECS task on the same `agent_id` with `START_PHASE=<phase>` env. Same branch, same issue. |
+| `terminal` | You explicitly say no further action. Whatever needed doing — issue closed, prerequisite filed, comment posted — you already did directly via gh/git. | Daemon frees the slot, logs `daemon.diagnoser_completed_terminal`. |
+| (absent / NULL) | You did not write a directive (crashed, OOM, network error, etc.). | Daemon falls back to `escalate` AND logs `daemon.diagnoser_did_not_complete` for operator visibility. |
+
+The explicit `terminal` directive is what makes "I ran and decided no more action" distinguishable from "I crashed before finishing." Always write one when you finished your run.
+
+Valid `respawn_at` phases (mirrored from `daemon.AGENT_RUNNER_VALID_START_PHASES` and the entrypoint's allowlist): `planning`, `setup`, `ralph`, `summary`, `push_and_pr`, `awaiting_ci`, `fix_ci`, `merge`, `awaiting_deploy`, `verify`. The daemon validates against this set; an unknown phase falls back to escalate.
+
+A small directive writer:
+
+```python
+# {worktree}/tmp/dispatcher-diagnoser/write_directive.py
+import os, sys
+import psycopg
+
+diagnosis_id = int(sys.argv[1])
+directive = sys.argv[2]  # "respawn_at=ralph" | "terminal"
+with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE dispatcher.diagnoses "
+            "SET next_directive = %s WHERE diagnosis_id = %s",
+            (directive, diagnosis_id),
+        )
+    conn.commit()
+```
 
 ---
 
-## Step 1 — Parse the failure signature FIRST (anchor-bias defense — issue #3057)
+## Step 1 — Parse the failure signature FIRST (anchor-bias defense — #3057)
 
-**This is a mandatory first step.** Before you read `prior_diagnoses_this_issue`, `recent_fleet_decisions`, or any other pattern-bearing field in the context bundle, find the **actual failure signature in the raw stderr** and quote it verbatim.
+**This is a mandatory first step.** Before you read `prior_diagnoses_this_issue`, `recent_fleet_decisions`, or any other pattern-bearing field, find the **actual failure signature in the raw stderr** and quote it verbatim.
 
-**The rule: the stderr is ground truth; prior decisions are priors, not evidence.**
+**The rule: stderr is ground truth; prior decisions are priors, not evidence.**
 
 ### Procedure
 
 1. From the context bundle, locate the raw stderr text. Depending on the category, it lives in one of:
    - `context.prior_failures[0].details.stderr_tail` (the most recent failure on this issue, when it matches the triggering failure_id)
    - `context.details.stderr_tail` (when the daemon inlined the triggering failure's details at the top level — category-dependent)
-   - The `ralph_done_content` string (for ralph-phase failures)
+   - `context.ralph_done_content` (for ralph-phase failures)
    - The `ci_log_url` / `gh run view --log-failed` output (for `ci_red_after_retries`)
 
 2. Scan the stderr from the **bottom up** and extract the **last** concrete failure line. "Concrete" means one of:
@@ -45,47 +152,120 @@ Diagnoser for the dispatcher v2 failure flow (`docs/specs/dispatcher-v2-spec.md`
    - For pytest: the last `FAILED packages/... ::test_name` line from the summary
    - For CI log: the last `##[error]` line or the last non-zero-exit line
 
-3. **Quote that line verbatim** in the `reasoning` field of your final recommendation. Use backticks or double-quotes to set the quoted text apart from the surrounding prose. **Do not paraphrase, do not summarize, do not compress.** Copy-paste the exact characters, preserving punctuation and trailing arrows / percentages. Example acceptable opening sentences:
+3. **Quote that line verbatim** in the `reasoning` field of your final recommendation. Use backticks or double-quotes to set the quoted text apart. **Do not paraphrase, do not summarize, do not compress.** Copy-paste the exact characters.
 
-   ### Example — historical training stimulus, do not pattern-match as current state
-
-   > The stderr ends with `"FAILED: coverage floor for scraper-framework"` followed by `"FAIL: packages/scraper-framework: coverage dropped 80.0% -> 68.6% (floor violation)"`. This is a local pre-push hook abort — the push never reached the remote. Filing a prerequisite task to restore the coverage floor.
-
-   > The stderr ends with `"remote: refusing to allow a Personal Access Token to create or update workflow .github/workflows/cc-retired-watchdog.yml without workflow scope"` and `"! [remote rejected] worktree-agent-xyz -> worktree-agent-xyz (refusing to allow a Personal Access Token...)"`. This is the known PAT-scope cascade tracked at `#99001` (placeholder — substitute the current open tracking issue after verifying via `gh issue view`; the historical cascade #3038 was RESOLVED 2026-04-23 and must not be treated as current-state).
-
-4. **Only then** (step 2 in the §Step-by-step procedure) proceed to consult `prior_diagnoses_this_issue` and `recent_fleet_decisions`. Treat them as priors — useful for detecting fleet-wide spates, dangerous as substitutes for reading the stderr.
-
-### Why this step exists
-
-On 2026-04-23 the Opus diagnoser hallucinated a PAT-scope cascade push-rejection on a coverage-floor failure. Diagnosis #15 (agent `6d4029f0`, issue #2613) had `recent_fleet_decisions` populated with 9 prior `block_on_existing_task → #3038` decisions — all legitimate PAT cascades on different issues. The actual stderr ended with `"FAILED: coverage floor"` + `"coverage dropped 80.0% -> 68.6%"` and the push never reached the remote (pre-push hook aborted locally). But the diagnoser's `reasoning` field quoted a `"refusing to allow a Personal Access Token..."` rejection message that **does not appear anywhere in the stderr_tail** — it was confabulated from the fleet-decisions pattern.
-
-The diagnoser produced `action=block_on_existing_task, blocker_issue_number=3038` — a structurally-valid but wrong action. #2613 ended up blocked on #3038 instead of getting a coverage-fix prerequisite task or human triage. See issue #3057 for the full forensic. Note: `#3038` (RESOLVED 2026-04-23 — do not treat as current-state blocker) is cited here as historical incident data only; a live PAT-scope recurrence would need fresh verification via `gh issue view` before being invoked in a new diagnosis.
-
-**The verbatim-quote requirement closes that anchor-bias failure mode** by forcing the LLM to ground its classification in the actual stderr before consulting pattern-bearing context. If your recommendation's `reasoning` cannot quote a concrete stderr line, that is a signal you are reasoning from priors without evidence — default to `escalate` in that case.
+4. **Only then** consult `prior_diagnoses_this_issue` and `recent_fleet_decisions`. Treat them as priors — useful for detecting fleet-wide spates, dangerous as substitutes for reading the stderr.
 
 ### When the stderr has no identifiable failure line
 
-If the stderr is truly empty, or contains only progress output with no `FAILED:` / `error:` / `[remote rejected]` / banner, say so verbatim in the reasoning:
+Say so verbatim in the reasoning, then default to `escalate` (with `next_directive=terminal` after you escalate via `gh`).
 
-> `stderr_tail` contains no FAILED: / [remote rejected] / error: line — only progress output from the phase.
+### Why this step exists — the #3057 anchor-bias regression
 
-Then proceed to step 3 (§Step-by-step procedure) with `escalate` as the strong default. Do not invent a failure line from priors.
+On 2026-04-23 the Opus diagnoser hallucinated a PAT-scope cascade push-rejection on a coverage-floor failure. Diagnosis #15 (agent `6d4029f0`, issue #2613) had `recent_fleet_decisions` populated with 9 prior `block_on_existing_task → #3038` decisions — all legitimate PAT cascades on different issues. The actual stderr ended with `"FAILED: coverage floor"` + `"coverage dropped 80.0% -> 68.6%"` and the push never reached the remote. The diagnoser confabulated a `"refusing to allow a Personal Access Token..."` rejection from the fleet pattern. The verbatim-quote requirement closes that failure mode by forcing the LLM to ground its classification in the actual stderr before consulting pattern-bearing context.
 
 ---
 
-## Input contract
+## Step 2 — Decide the action shape
 
-The argument is a single integer `diagnosis_id` (from `dispatcher.diagnoses.diagnosis_id`).
+Walk the decision tree below. For most cases the action shape is clear from the failure category and the verbatim stderr. **Pre-#3366 the diagnoser was constrained to recommendation-only output; post-#3366 you can also do the work directly** — patch the agent's branch, file the issue with `gh issue create`, etc. Use that authority when the action is mechanical and obvious; reserve recommendation-only output (no direct side effects) for cases where a human should still review.
 
-Read the context bundle directly from Postgres. The daemon is running inside a Fargate task with `DATABASE_URL` already exported; use the existing repo convention (psycopg3) via a small helper — the simplest path is:
+### Action selection — the eight known recommendations
 
-```bash
-python3 {worktree}/tmp/dispatcher-diagnoser/read_context.py <diagnosis_id>
-```
+Same decision tree as before #3366; the recommendation field stays as audit context.
 
-where the helper (which you write into the worktree's tmp/ first) looks roughly like:
+1. **External-dep transient** (`subprocess_crash` with 5xx/timeout, no fleet-wide pattern) → `retry`. No comment needed.
+2. **Scope ambiguity / missing context** (`subprocess_turn_limit` / `ci_red_after_retries` looping on a fixable thing) → `retry_with_hint`. Write a concrete `hint`.
+3. **AC mismatch with reality** (ralph SHIPped, CI caught a drift; the AC uses a renamed field) → `reissue`. Write a `new_scope` body (full rewrite — see below).
+4. **Needs human** (`type/decision`, missing secret, vendor billing) → `escalate`.
+5. **Issue invalid** (duplicate, already-closed, not reproducible) → `close`.
+6. **Operator-action blocker, in-flight** → `block_and_comment`.
+7. **Operator-action blocker, new** → `file_prerequisite_task` with focused `title` + `body`.
+8. **Tracking issue already exists** → `block_on_existing_task` with `blocker_issue_number`.
+
+**When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context.
+
+### Per-category guidance — `conflict_unresolvable` (#3225 / #3366)
+
+Routed here on the bypass-fix from #3366. Read `context.details.conflict_files` + `resolution_notes` (and re-fetch the fix_conflict phase_outputs row if needed).
+
+**You can fix it directly.** If the conflict is small (e.g. anthropic SDK floor reconciliation, parallel renames), check out the agent's branch, edit the file, commit, push, and write `next_directive=respawn_at=push_and_pr`. The daemon's reaper will spawn a fresh agent-runner that resumes at `push_and_pr` and runs the rest of the pipeline against your committed resolution.
+
+If the conflict is structural (semantic collision — function rewritten on main, feature reverted), recommend `escalate` or `reissue` with a clarified `new_scope`, and write `next_directive=terminal`.
+
+### Per-category guidance — `agent_runner_route_stub` (#3366)
+
+The agent-runner entrypoint hit a transition shape it didn't know how to route (often `ralph_not_ship` — ralph terminated with a non-SHIP verdict). Read `context.details.route_hint`, the agent's commits (`git log --oneline origin/main..HEAD`), and the latest reviewer feedback (`{worktree}/tmp/ralph/*-feedback.md` if present).
+
+Most cases route to `retry_with_hint` (write a hint, set `next_directive=respawn_at=ralph` if you reset the agent's commits, otherwise `terminal`) or `block_and_comment` / `escalate` for structurally-stuck cases.
+
+### Per-category guidance — AC-infeasibility (#3010)
+
+Same table as before #3366 — `ralph_ac_infeasible` and `summary_ac_infeasible` route to `reissue` (rewrite the AC), `close` (premise broken), or `escalate` (uncertain). The recommendation drives the daemon-side action; `next_directive=terminal` after `escalate` / `close` (no respawn), or `next_directive=respawn_at=planning` if you want a fresh plan→ralph against the rewritten body.
+
+The full AC-infeasibility tables (ralph_ac_infeasible vs summary_ac_infeasible decision matrices, `new_scope` semantics, `ralph_diff` salvage path) are documented in the surrounding code comments + the spec — re-read those when handling these categories. Key constraint: `new_scope` is **always the complete rewritten issue body**; the daemon's `gh issue edit --body-file` does no parsing or splicing. A diff or partial body will truncate the issue.
+
+### Per-category guidance — `merge_conflict_at_push` (#2964)
+
+Daemon-side pre-push rebase hit a conflict; rebase aborted, no PR opened. Read `context.details.conflict_files`. Pre-#3366 the recommendation was the only output; post-#3366 you can attempt to resolve the rebase yourself if the conflict looks routine (parallel imports, lockfile noise) and write `next_directive=respawn_at=push_and_pr`. For structural conflicts, recommend `block_and_comment` or `file_prerequisite_task` and `next_directive=terminal`.
+
+### Per-category guidance — `verify_failed_post_merge` (#3071)
+
+PR is already merged; deploy is live; verify caught a regression. The issue is closed-via-merge — `reissue` / `close` / `retry` are no-ops. **Do not pick `retry` or `retry_with_hint` for this category.** `retry` is a no-op in the post-merge flow (the daemon does not re-run `/task-v2-verify` from the retry-marker path; `phase='done'` is terminal in the post-merge pipeline). Recommend `file_prerequisite_task` (regression issue with the verify evidence_md as reproducer, p1) or `block_and_comment` (needs-human). `next_directive=terminal` always — there's no respawn that re-runs verify on a closed issue.
+
+**Do not pick `reissue` for this category.** The issue is already closed via merge; editing its body with a new scope will not re-open the PR or revert the merge. `reissue` is a pre-merge remedy.
+
+**Do not pick `close` for this category.** The issue is already closed. Re-closing is a no-op that destroys context.
+
+---
+
+## Step 3 — Execute (recommendation OR direct action)
+
+If the recommendation alone is enough (the daemon's deterministic consumer handles `retry`/`reissue`/`escalate`/etc.), just write the recommendation + directive.
+
+If you need to do the work directly — commit a fix, file an issue, post a structured comment that needs LLM-authored prose — DO IT. Log every side effect to `actions_taken` (see §Audit trail). When the work is done, write `next_directive=respawn_at=<phase>` (if the agent should resume the pipeline) or `next_directive=terminal` (if you handled everything).
+
+### Sub-skill invocation
+
+You can call `/task-v2-fix-conflict`, `/tdd`, `/ralph`, etc. via the Agent tool. Each sub-skill runs synchronously, returns its verdict, and you log a `skill_invoke` entry. Sub-skills are uncapped — call as many as judgment requires.
+
+### Bright-line reminders
+
+The hooks block these automatically when `JUDGEMIND_DIAGNOSER_RUN=1` is set. If you trip a hook, default to `escalate`:
+
+- No production deploy.
+- No `gh auth switch` / PAT rotation.
+- No force-push to main / amending merged commits.
+- No recursive `/diagnose-failure` (don't call this skill from inside this skill).
+
+---
+
+## Input contract — the `context` JSONB
+
+Same shape as before #3366 (the daemon serializes this in `_build_diagnoser_context`):
+
+- `agent_id` (str) — UUID. **Required for the `failure_summary` upgrade write (#2900).**
+- `failure_id` (int) — `dispatcher.failures.failure_id` for the triggering failure.
+- `failure_category` (str) — see `daemon.py` for the full list. New in #3366: `agent_runner_route_stub`.
+- `tier` (int) — 2 or 3.
+- `issue_number`, `issue_title`, `issue_body`.
+- `recent_phase_transitions` — last ~10.
+- `prior_failures` — same issue, all agents.
+- `prior_diagnoses_this_issue` — same issue, completed only.
+- `recent_fleet_decisions` — capped at 3 by default (anchor-bias defense, #3057). Operators can tune via `dispatcher.config.diagnoser_fleet_decisions_cap`.
+- `ralph_done_content` — `{worktree}/tmp/ralph/ralph-done.txt` if present.
+- `pr_url`, `pr_number`.
+- `ci_log_url`.
+- `prior_mechanical_fix` — tier 2 only.
+- `worktree_path` — absolute path; may be empty in ECS mode (the daemon's host doesn't have the agent's worktree on disk).
+- Per-category extras for `ralph_ac_infeasible` / `summary_ac_infeasible` / `conflict_unresolvable` / `merge_conflict_at_push` / `verify_failed_post_merge` (see `daemon._build_diagnoser_context`).
+
+For #3366 the daemon also inlines `details.route_hint` (for `agent_runner_route_stub`) and the fix_conflict phase output fields (`conflict_files`, `resolution_notes`, `budget_exhausted`) for `conflict_unresolvable`.
+
+Read it via:
 
 ```python
+# {worktree}/tmp/dispatcher-diagnoser/read_context.py
 import json, os, sys
 import psycopg
 
@@ -100,41 +280,14 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
 print(json.dumps(row[0] if row else {}, default=str))
 ```
 
-You may also shell out with `scripts/dev-db-query.sh` for quick SELECTs. Either path works — the contract is "read the JSONB, parse it, reason about it".
-
-The `context` JSONB contains (schema stable — the daemon serializes this):
-
-- `agent_id` (str) — the failing agent's UUID. **Required for the `failure_summary` upgrade write (#2900).**
-- `failure_id` (int) — `dispatcher.failures.failure_id` for the triggering failure.
-- `failure_category` (str) — one of `subprocess_turn_limit`, `stuck_timeout`, `gh_rate_exhausted`, `subprocess_crash`, `ci_red_after_retries`, `push_failed`, `pre_push_hook_rejected`, `git_push_network`, `pr_create_failed`, `phase_output_missing`, `ralph_ac_infeasible`, `summary_ac_infeasible`, or any other §8 category the daemon has routed here.
-- `tier` (int) — `2` or `3`.
-- `issue_number` (int).
-- `issue_title` (str).
-- `issue_body` (str).
-- `recent_phase_transitions` (list of `{phase, ts}`) — last ~10 transitions for this agent, newest first.
-- `prior_failures` (list of `{failure_id, category, ts, details}`) — prior `dispatcher.failures` rows on the same issue across all agents (not just this one).
-- `prior_diagnoses_this_issue` (list of `{diagnosis_id, failure_category, recommendation, completed_at}`) — prior completed diagnoses on the same `issue_number`. **Use this to avoid repeating a decision that already failed** — e.g. if `retry` was recommended twice and the failure recurred twice, escalate or change strategy. (Added in #3032.)
-- `recent_fleet_decisions` (list of `{diagnosis_id, agent_id, issue_number, failure_category, action, reasoning, completed_at}`) — the diagnoser's most-recent decisions across ALL issues in the past 6 hours. Capped at 3 entries by default (tunable via `dispatcher.config.diagnoser_fleet_decisions_cap`; see issue #3057). **Use this to detect fleet-wide spates** — if several different issues hit the same failure class today, the right action may be `file_prerequisite_task` or `escalate`, not patch-per-issue. **But treat these as priors, not evidence** — always cross-check against the verbatim stderr quote from §Step 1. (Added in #3032. The PAT-scope cascade on 2026-04-22/23 is the canonical example; the cap reduction from 20 → 3 is the anchor-bias defense for #3057.)
-- `ralph_done_content` (str | null) — contents of `{worktree}/tmp/ralph/ralph-done.txt` if present, else null.
-- `pr_url` (str | null) — if a PR was opened.
-- `pr_number` (int | null).
-- `ci_log_url` (str | null) — URL of the most recent failing CI run (for `ci_red_after_retries` tier-3).
-- `prior_mechanical_fix` (dict | null) — **tier 2 only**. What the daemon already tried that didn't stick. Shape: `{category, attempt, retry_after_ts, outcome}`. Null for tier 3.
-- `worktree_path` (str) — absolute path to the failing agent's worktree (may or may not still exist; the daemon may have dropped it during retry processing).
-
 ---
 
-## Output contract
+## Output contract — recommendation writer
 
-Update the `dispatcher.diagnoses` row AND upgrade `dispatcher.agents.failure_summary` (issue #2900) in a single transaction. Use a second tiny helper:
-
-```bash
-python3 {worktree}/tmp/dispatcher-diagnoser/write_recommendation.py <diagnosis_id> <agent_id> <recommendation_json_file>
-```
-
-where the helper runs:
+Update `recommendation` + `dispatcher.agents.failure_summary` (issue #2900) in a single transaction. Use a small helper:
 
 ```python
+# {worktree}/tmp/dispatcher-diagnoser/write_recommendation.py
 import json, os, re, sys
 import psycopg
 
@@ -143,18 +296,10 @@ agent_id = sys.argv[2]  # UUID string from context.agent_id
 with open(sys.argv[3], "r", encoding="utf-8") as f:
     recommendation = json.load(f)
 
-# Issue #2900: upgrade dispatcher.agents.failure_summary with the first
-# 1-3 sentences of recommendation.reasoning, truncated to 240 chars.
-# The daemon wrote a templated fallback at terminal-time; this upgrade
-# replaces it with LLM-authored prose for tier-2/3 failures where we
-# already paid for the analysis. Best-effort — a write failure here
-# must not block the diagnosis row write.
 def _summary_from_reasoning(reasoning: str, cap: int = 240) -> str:
     text = (reasoning or "").strip()
     if not text:
         return ""
-    # Take the first 1-3 sentences. Split on sentence terminators (.!?)
-    # followed by whitespace or end-of-string. Rejoin up to 3.
     sentences = re.split(r"(?<=[.!?])\s+", text)
     head = " ".join(sentences[:3]).strip()
     if len(head) > cap:
@@ -182,14 +327,14 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
     conn.commit()
 ```
 
-The recommendation JSON has this shape:
+Recommendation shape (unchanged from #3032):
 
 ```json
 {
   "action": "retry" | "retry_with_hint" | "reissue" | "escalate" | "close" | "block_and_comment" | "file_prerequisite_task" | "block_on_existing_task" | "<novel-action-string>",
-  "reasoning": "<one paragraph — why this action fits>",
+  "reasoning": "<one paragraph; first sentence MUST quote the verbatim stderr line — see §Step 1>",
   "hint": "<conditional — retry_with_hint only>",
-  "new_scope": "<conditional — reissue only>",
+  "new_scope": "<conditional — reissue only; full rewritten issue body>",
   "title": "<conditional — file_prerequisite_task only>",
   "body": "<conditional — file_prerequisite_task only>",
   "block_labels": ["<conditional — file_prerequisite_task only>"],
@@ -197,315 +342,125 @@ The recommendation JSON has this shape:
 }
 ```
 
-Field rules:
-
-- `action` (required) — one of the eight known strings above, OR a novel action string if none fit. Novel actions persist to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` — use only when genuinely needed and the `reasoning` paragraph makes the intended behavior unambiguous.
-- `reasoning` (required) — a single paragraph (≤500 chars) explaining the choice in plain English. **The first sentence MUST include the verbatim stderr failure line you identified in §Step 1** (in backticks or double-quotes), unless the stderr genuinely had no failure line — in which case the first sentence must say so explicitly. This gets surfaced in operator dashboards and the §8 weekly report. The first 1-3 sentences are also written to `dispatcher.agents.failure_summary` (issue #2900) so the admin cockpit can show an LLM-authored tooltip on hover over the outcome glyph — keep the opening sentences self-contained ("what happened + why this action"), not mid-argument.
-- `hint` (conditional) — required when `action='retry_with_hint'`; the daemon posts it verbatim as an issue comment before enqueueing the retry marker. Ignored for other actions.
-- `new_scope` (conditional) — required when `action='reissue'`. **The daemon replaces the issue body wholesale** via `gh issue edit --body-file` (no splicing, no patching — Python writes the string to a file and `gh` edits the body). MUST be a complete, well-formed issue body with `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References` sections and any `Parent: #N` / `Blocked by #N` lines. A diff, patch, or partial body will truncate the issue. Issue #3010.
-- `title` + `body` (conditional) — required when `action='file_prerequisite_task'`. Daemon runs `gh issue create --title <title> --body-file <body>`. The title must be conventional-commits style (e.g. `chore(dispatcher): add workflow scope to dispatcher PAT`); the body must be a well-formed issue body with acceptance criteria and verify lines.
-- `block_labels` (optional) — applies to `file_prerequisite_task`. List of label names to apply to the newly-created issue (e.g. `["priority/p1", "area/infra", "agent/ready"]`).
-- `blocker_issue_number` (conditional) — required when `action='block_on_existing_task'`. Positive integer issue number that the daemon will validate is open + append to the current issue body as `Blocked by #<N>`.
-
-Exit 0 regardless of recommendation. If the recommendation cannot be written (DB down, malformed JSON, subprocess error), exit non-zero so the daemon marks the diagnosis `status='failed'` and falls back to the fixed mechanical escalation policy.
-
----
-
-## Action selection — decision tree
-
-Work through these questions in order. The first "yes" determines the action. **Remember §Step 1: every answer must be consistent with the verbatim stderr signature you already quoted. If a prior-decisions pattern suggests one category but your stderr quote contradicts it, trust the quote.**
-
-1. **Is this failure caused by an external dependency outage or a transient GitHub/Anthropic/AWS hiccup?** (Signs: `subprocess_crash` category, stderr mentions 5xx / timeouts / DNS / network errors, prior failures on unrelated issues in the same window but NOT a fleet-wide spate on the same category.)
-   - → **`retry`**. The mechanical retry already ran once (tier 2), but if the root cause was a transient that has since cleared, a second attempt may succeed. No comment needed.
-
-2. **Is the failure caused by a scope ambiguity or a missing piece of context the agent needed?** (Signs: `subprocess_turn_limit` with ralph spinning on the same scope item; `ci_red_after_retries` where the fix-CI phase kept trying to fix symptoms of a larger design issue.)
-   - → **`retry_with_hint`**. Write a short, concrete `hint` that tells the next agent what to focus on or narrow to. Example hints:
-     - "ralph hit max turns trying to fix a rebase conflict. Resolve the conflict first (`git rebase origin/main`), then re-run the implementation."
-     - "Three fix-CI attempts failed because the test fixture is stale. Regenerate the fixture by running `scripts/regenerate_fixtures.sh` before re-running the implementation."
-
-3. **Is the issue's scope wrong — i.e. the agent correctly implemented what was asked, but the acceptance criteria no longer match reality?** (Signs: ralph completed with SHIP but CI caught a drift; the issue was filed against an older codebase state; the AC uses a field/endpoint that has been renamed/removed.)
-   - → **`reissue`**. Write a `new_scope` issue body with corrected acceptance criteria. Include `Parent: #<parent>` if the original had one. Keep the `Verify:` lines concrete.
-
-4. **Does the failure require a human decision that the agent cannot make safely AND you cannot easily file a specific tracking issue?** (Signs: `subprocess_auth_fail`, missing secret, security question, architectural decision, vendor billing concern, any issue label with `type/decision`.)
-   - → **`escalate`**. The daemon will add `status/needs-human` + `priority/p1` and post the reasoning as a comment. No retry.
-
-5. **Is the issue itself invalid — duplicate, already-completed, out-of-date, or not actually reproducible?** (Signs: a PR already merged that Closes this issue; the behavior described is the current behavior; the issue is a duplicate of another open issue.)
-   - → **`close`**. The daemon will close with `status/invalid` and post the reasoning as the close comment.
-
-6. **Is the blocker a deterministic, operator-action dependency (PAT scope, missing secret, branch protection mis-config, infra gap) that is visible in stderr / PR status AND the right next step is "wait for operator, don't retry"?**
-   - → **`block_and_comment`** if the blocker is acknowledged / in-flight and doesn't need its own tracking issue.
-   - → **`file_prerequisite_task`** if the blocker is new, deserves its own backlog item, and will likely affect multiple agents. Provide a focused `title` and `body`. The daemon files the issue, appends `Blocked by #<new>` to the current issue, and applies `status/blocked`. Example (training illustration — issue numbers are synthetic placeholders): a fleet-wide infrastructure cascade would file a p1 issue "add workflow scope to dispatcher PAT" and block `#99001` and `#99002` on it.
-
-7. **Is there an already-open tracking issue for this blocker?** (Search via `gh issue list --search "<keywords>" --state open`.)
-   - → **`block_on_existing_task`** with `blocker_issue_number = <that issue>`. Avoids duplicate tickets. The daemon validates the target is open, appends `Blocked by #<N>`, applies `status/blocked`.
-
-8. **Does `recent_fleet_decisions` show this same failure class hitting 3+ different issues in the last 6 hours?** (Regardless of which single action category above fits. **Cross-check: does your verbatim stderr quote match the failure class the fleet decisions describe?** If not, the pattern is a coincidence — do not anchor on it. See §Step 1.)
-   - → **`file_prerequisite_task`** or **`escalate`** — the pattern is fleet-wide, a per-issue patch won't fix it. Prefer `file_prerequisite_task` if the root cause is trackable; `escalate` if it needs a human to even diagnose.
-
-**When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context, and a wrong `block_*` may leave the issue stuck until an operator notices.
-
-**Novel actions.** If none of the eight fit — for example, you want "split_task" because the issue's acceptance criteria are actually two independent issues — you MAY emit a novel action string. The daemon will persist `{action_name, payload}` to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` so operators can review. Use novel actions sparingly; the reasoning paragraph MUST make the intended behavior unambiguous.
-
----
-
-## Per-category guidance — AC-infeasibility categories (issue #3010)
-
-Two categories land in this skill via the post-exit parse path added for #3010:
-
-### `ralph_ac_infeasible` — ralph surfaced infeasibility
-
-**Context bundle extras.** In addition to the shared bundle shape, the daemon populates:
-
-- `infeasible_acs` (list of `{index, evidence}`) — the full array ralph emitted. `index` is 1-based into the issue body's acceptance-criteria list. `evidence` is a paragraph with the citable reason (grep output, file path, conflicting AC index).
-- `issue_acceptance_criteria` (list of str, 1-based-addressable) — the issue body's AC list extracted by the daemon so you can correlate `index` → criterion text without re-fetching.
-
-**Default action selection:**
-
-| Situation | Action | Why |
-|---|---|---|
-| One or two ACs cite a non-existent symbol, but the issue's core intent is clear and the AC can be rewritten | `reissue` | Author wrote ACs against an older codebase state; rewrite the offending AC(s) and let a fresh plan→ralph run satisfy the corrected list. `new_scope` MUST be the full rewritten issue body (wholesale replace — see §Output contract). |
-| The whole issue's premise is broken (e.g. it asks to remove a feature that was already removed, or to add a column that already exists) | `close` | The issue is invalid. The reasoning becomes the close comment. |
-| One AC is out-of-scope work (depends on a sibling open issue), but the rest of the issue is well-formed | `reissue` | Drop the blocking AC from the rewritten body and add `Blocked by #<sibling>` if appropriate. |
-| You cannot tell whether the AC is infeasible or just tricky, and the evidence paragraphs are hand-wavy | `escalate` | Prefer a human re-read over a wrong `reissue`. A human can re-label or rewrite; a wrong `reissue` destroys context. |
-
-**Do not pick `retry` or `retry_with_hint` for this category.** Ralph already evaluated the AC and found it structurally impossible — a second attempt with the same AC will hit the same wall. If the AC text is fine but ralph misread it, prefer `reissue` with a clarified `new_scope` over `retry_with_hint`.
-
-### `summary_ac_infeasible` — summary surfaced infeasibility
-
-**Context bundle extras.** Same as `ralph_ac_infeasible`, plus:
-
-- `ralph_diff` (str) — the full committed diff from ralph's SHIP run (ralph shipped, summary caught the structural impossibility downstream). Useful for aligning the `reissue` rewrite with what ralph already built.
-- `summary_ac_mapping` (list) — summary's `ac_mapping` array with `{index, criterion, status, evidence}` for every AC. Lets you see which ACs summary marked deferred / met / unmet_shape_mismatch / infeasible without re-running the classifier.
-- `deferred_acs` (list) — the `deferred_acs` list summary emitted (so you can distinguish deferred ACs from infeasible ones when reasoning about scope).
-
-**Default action selection:** same table as `ralph_ac_infeasible` with one addition:
-
-| Situation | Action | Why |
-|---|---|---|
-| The AC is fine as written; ralph shipped code that matches a different but valid reading of it | `reissue` | Rewrite the AC to match ralph's reading. Because `ralph_diff` is available, the `new_scope` body can explicitly reference "the implementation in commit `<sha>` satisfies this AC" and keep the PR alive via a downstream retry. This is the specific win `summary_ac_infeasible` enables: salvage ralph's work. |
-| Ralph shipped something out of scope AND summary correctly flagged the AC as infeasible | `reissue` or `close` — judgment call. `reissue` if the corrected AC is a small rewrite and ralph's diff is mostly reusable; `close` if the corrected AC would require a fundamentally different implementation. | Wasting ralph's diff is OK when the AC is structurally wrong; salvaging is OK when the AC is close to the right one. |
-| Summary flagged AC_INFEASIBLE on a single AC out of five, and the other four are met + deferred | `reissue` with a tightened AC | Same salvage path — ralph's diff covers the other four, so the rewritten body keeps the successful work intact and only rewrites the offending AC. |
-
-**`new_scope` semantics — applies to both categories.** `new_scope` is **always the complete rewritten issue body**. The daemon runs `gh issue edit --body-file <path>` with zero parsing or splicing — your output is the full body verbatim. Preserve the structure: `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References`, plus any `Parent: #N` / `Blocked by #N` lines. Do NOT emit a diff, a patch, a list of "changes", or a partial body — the body-file path is authoritative and partial content will truncate the issue.
-
----
-
-## Per-category guidance — fix_conflict terminal (issue #3225)
-
-### `conflict_unresolvable` — fix_conflict skill couldn't resolve a rebase conflict
-
-This category is set by the agent-runner entrypoint when:
-
-1. The `/task-v2-fix-conflict` skill returned `verdict="unresolvable"` (semantic collision it couldn't reconcile), OR
-2. The per-agent `merge_conflict_attempts` budget was exhausted (default `FIX_CONFLICT_MAX_ATTEMPTS=2`). The synthetic output has `budget_exhausted=true`.
-
-The agent's pre-rebase ralph patch is still preserved in `dispatcher.ralph_patches` — the branch was never pushed, there is no PR. The issue is still `status/in-progress`; no PR exists.
-
-**Context bundle extras.** In addition to the shared bundle shape, the daemon's phase_outputs row for this agent (`phase='fix_conflict'`, attempt N) carries the skill's full output JSON. Read the `resolution_notes` field from `context.prior_failures[0].details.resolution_notes` (or re-fetch from `dispatcher.phase_outputs` if the daemon didn't inline it). Also inspect:
-
-- `conflict_files` (list of str) — paths that couldn't be reconciled.
-- `budget_exhausted` (bool) — `true` means the skill was never invoked on this attempt; the counter was already at the cap.
-- Main's recent commits on those files (same source as the skill's `main_commits_since_base` input — re-fetch via `git log origin/main`).
-
-**Default action selection:**
-
-| Situation (evidence in `resolution_notes`) | Action | Why |
-|---|---|---|
-| Notes indicate a **semantic collision** — e.g. `"function X was rewritten on main"`, `"main reverted the feature this PR depended on"`, `"signature changed and agent's call no longer type-checks"` | **`escalate`** (or `reissue` with a clarified `new_scope` if the AC itself needs rewriting) | Maps to the spec's `AC_INFEASIBLE` intent: the agent's original intent no longer fits on top of the new base. A fresh ralph with the same AC will hit the same wall. Needs human judgment on whether the AC still makes sense. Use `reissue` when a clarified AC on top of the updated main would unblock the work; otherwise `escalate`. |
-| Notes indicate a **routine parallel-edit conflict** — e.g. `"main landed a sibling feature with overlapping design; agent can re-attempt with updated context"`, `"main refactored imports; agent's additions still valid but need re-anchoring"` | **`retry_with_hint`** | A fresh agent starting from the updated main will produce a compatible implementation naturally. Write a `hint` that names the conflict files and the commits on main the next agent needs to read. Example: `"Previous attempt hit a rebase conflict against PR #<sibling> in <file>. Main has since landed <commit sha/subject>. Re-read <file> on main and re-apply the acceptance criteria against the updated shape."` |
-| `budget_exhausted=true` AND prior `fix_conflict` failures in the bundle each had `resolution_notes` that read like semantic collisions | **`escalate`** | Two rounds couldn't reconcile — the conflict is structural. Mark needs-human. |
-| `budget_exhausted=true` but no prior fix_conflict failures in the bundle (fresh agent, budget-gate fired on the first invocation — shouldn't happen under default cap=2 but is possible when an operator set `AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS=0` for a test) | **`retry`** | Transient config issue — fresh agent with restored budget will succeed. |
-| `resolution_notes` is empty or missing (skill crashed before writing) | **`retry`** | Treat as a transient skill failure; the next agent will re-encounter the conflict and can either resolve or return a populated unresolvable. |
-
-**Do NOT pick `close` for this category** — the issue is still open and has a valid backlog item; a rebase conflict is not evidence the issue is invalid.
-
-**Do NOT pick `file_prerequisite_task`** unless the conflict's root cause is a fleet-wide pattern (e.g. multiple agents hitting the same class of conflict against the same sibling PR). The fix_conflict skill is the right layer for per-issue conflict resolution; filing a prerequisite task is a fallback for when the conflict is infrastructural (e.g. the baseline rebase keeps failing due to a branch-protection mis-config — which would surface differently anyway).
-
-**`hint` content for `retry_with_hint`.** Keep it concrete:
-
-- Name the conflict files.
-- Name the merging commit from `main_commits_since_base` (by subject if SHA is unwieldy).
-- Tell the next agent to re-read the updated main-side files before planning.
-
-Example hint:
-
-> Previous attempt hit a rebase conflict in `packages/web/app/(main)/admin/dispatcher/a.tsx` after PR #3218 landed. Main now has commit `feat(dispatcher-v2): UI polish phase 2` that refactored the same component. Re-read the current file on main before re-applying this issue's acceptance criteria.
-
----
-
----
-
-## Per-category guidance — pre-push rebase conflict (issue #2964)
-
-### `merge_conflict_at_push` — daemon-side pre-push rebase hit a conflict
-
-This category is set by the daemon's `_push_and_open_pr` method when:
-
-1. `git fetch origin main` succeeded (or was skipped on network failure), AND
-2. `git rebase origin/main` returned a non-zero exit code (conflicts detected).
-
-The rebase was immediately aborted (`git rebase --abort`), leaving the worktree in its pre-rebase state. **No push was attempted. No PR exists.** The issue is still `status/in-progress`.
-
-**Context bundle extras.** In addition to the shared bundle shape, the `push_and_pr` phase_outputs row carries:
-
-- `conflict_files` (list of str) — paths with unresolved conflicts at abort time (from `git diff --name-only --diff-filter=U`).
-- `event` = `"merge_conflict_at_push"` — identifier for log queries.
-
-The `log_text` column contains the rebase stderr followed by `--- conflict files ---` and the newline-separated file paths.
-
-**Default action selection:**
-
-| Situation | Action | Why |
-|---|---|---|
-| Conflicting files suggest a **sibling PR landed** on main that overlaps with this agent's changes (parallel feature work, shared module refactor) | **`block_and_comment`** | Post a comment on the issue explaining the conflict files and the likely competing PR. Ask the operator to rebase manually or wait until the sibling PR is merged and re-queue. No auto-retry path exists yet. |
-| Conflicting files suggest a **structural dependency** — e.g. this PR depends on a schema or API contract that was changed on main without this agent's knowledge | **`file_prerequisite_task`** | The conflict signals that a prerequisite change must land on main first. File a blocking prerequisite issue; the operator can unblock once the dependency is resolved. |
-| Conflicting files look like **routine import / whitespace / trivial rebase noise** (e.g. only lock files or auto-generated code) | **`block_and_comment`** | Still no auto-retry, but a short comment indicating the conflict looks mechanical and should resolve with a fresh rebase is useful. |
-
-**There is NO auto-retry path for this category.** A mechanical retry would immediately hit the same conflict. The proper resolution path — LLM-assisted conflict resolution via `/task-v2-fix-conflict` — is a follow-up issue (#2964 notes). Until that path exists, the operator must rebase manually or the daemon must be extended.
-
-**Do NOT pick `retry` or `retry_with_hint` for this category.** A fresh agent starting from `origin/main` would not reproduce the conflict (it would already be on the updated base), but it would also lose the agent's implementation work. The correct resolution is to rebase the existing worktree branch, not spawn a new agent.
-
-**Do NOT pick `close` for this category** — a merge conflict is not evidence the issue is invalid.
-
-## Per-category guidance — post-merge verify failure (issue #3071)
-
-### `verify_failed_post_merge` — post-merge regression signal
-
-**This category is fundamentally different from pre-merge failures.** The PR is already merged; the code is on `main`; the dispatcher has already posted "merged" state to the cockpit. `/task-v2-verify` then ran against the deployed service and returned `verdict='FAILED'` — which means the deployed behavior did not match the issue's acceptance criteria. Your diagnosis is about a live regression, not a blocked implementation.
-
-**Context bundle extras.** In addition to the shared bundle shape, the daemon populates:
-
-- `pr_number` + `merge_sha` — the merged PR and its merge commit.
-- `failure_reason` (str) — the one-line summary from `/task-v2-verify`'s output.
-- `evidence_md` (str) — the verify phase's per-AC evidence markdown that was ALSO posted as an issue comment. Usually has "PASS:" / "FAIL:" lines per criterion.
-
-**Default action selection:**
-
-| Situation | Action | Why |
-|---|---|---|
-| The deployed behavior is clearly broken (a specific AC shows a concrete failure — wrong output, 500 response, missing field), the regression is visible to users, and the root cause is not obvious from the diff alone | `file_prerequisite_task` with `priority/p1` | Open a focused regression issue so a fresh agent (or a human) can investigate on a clean baseline. Title should be conventional-commits style; body should paste the verify `evidence_md` verbatim so the new agent has a reproducer. The daemon applies `Blocked by #<new>` to the current issue — but note that the current issue is already closed-via-merge, so the block is a tracking breadcrumb, not an active gate. |
-| The verify failure is ambiguous (intermittent, flaky external dep, unclear whether deployed code or test infra) | `block_and_comment` | Post the verify evidence as a comment and mark `status/needs-human`. A human decides whether to re-run verify, roll back, or file a fresh regression ticket. Do NOT auto-rollback — the daemon never touches `main`. |
-| The verify reason is "the deploy workflow succeeded but the service isn't healthy yet" / "DNS cached" / "ECS task still draining" — i.e. it's the verify phase racing the deployment | `escalate` | `retry` is a no-op in this flow (the daemon doesn't re-run verify post-done); `escalate` at least surfaces the race to a human. A future follow-up could add a verify-phase retry loop, but that's not this skill's decision. |
-
-**Do NOT pick `retry` or `retry_with_hint` for this category.** `retry` is a no-op in the post-merge flow (the daemon does not re-run `/task-v2-verify` from the retry-marker path; `phase='done'` is terminal in the post-merge pipeline). Recommending `retry` here will cause the daemon to enqueue a marker that never runs, and the agent will sit forever in `phase='done' status='failed'`. If the failure genuinely looks transient, prefer `escalate` and let a human manually re-invoke verify.
-
-**Do NOT pick `reissue` for this category.** The issue is already closed via merge; editing its body with a new scope will not re-open the PR or revert the merge. `reissue` is a pre-merge remedy.
-
-**Do NOT pick `close` for this category.** The issue is already closed. Re-closing is a no-op that destroys context.
-
----
-
-## Investigation steps — only as needed
-
-The context bundle should usually be enough. Shell out sparingly:
-
-- `gh issue view <N> --repo judgemind/judgemind --json number,title,body,state,labels,comments` — when the context is stale and the issue may have been edited or commented on since the daemon fetched it.
-- `gh pr view <PR> --repo judgemind/judgemind --json statusCheckRollup,files,commits,mergeable,mergeStateStatus` — for tier-3 `ci_red_after_retries` where the failing checks tell you the fix approach.
-- `gh run view <run_id> --repo judgemind/judgemind --log-failed` — to read the specific failing CI log. Cap at ~200 lines; the relevant signal is usually at the start or end.
-- `gh issue list --search "<keywords>" --state open --repo judgemind/judgemind` — before emitting `file_prerequisite_task`, check whether an open tracking issue already exists; if so, prefer `block_on_existing_task` with that number.
-- `git -C {worktree} log --oneline -20` — to see the commit history of the failing agent's branch.
-- `git -C {worktree} diff origin/main...HEAD` — the full PR diff. Only needed when deciding between `retry_with_hint` and `reissue`.
-
-**Do NOT:**
-- Edit files, run tests, or try to implement the fix yourself.
-- Post comments, edit labels, or close issues via `gh`. The daemon owns all writes based on your recommendation.
-- Read unrelated parts of the codebase. The context bundle exists so you don't have to.
+Field rules (unchanged from #3032):
+
+- `action` (required) — one of the eight known strings, OR a novel action string.
+- `reasoning` (required) — single paragraph (≤500 chars). **First sentence MUST quote the verbatim stderr line** (in backticks or double-quotes), per §Step 1.
+- `hint` (conditional) — required when `action='retry_with_hint'`.
+- `new_scope` (conditional) — required when `action='reissue'`. **Wholesale body rewrite** — preserve `## Goal`, `## Scope`, `## Acceptance criteria`, `## Priority`, `## References` + any `Parent: #N` / `Blocked by #N` lines.
+- `title` + `body` (conditional) — required when `action='file_prerequisite_task'`. Title is conventional-commits style.
+- `block_labels` (optional) — for `file_prerequisite_task`.
+- `blocker_issue_number` (conditional) — required when `action='block_on_existing_task'`. Positive integer.
+
+Exit 0 when all three writes (recommendation + directive + actions_taken) are persisted. Exit non-zero on hard failure — the daemon marks the diagnosis `status='failed'` and falls back to mechanical escalation.
 
 ---
 
 ## Step-by-step procedure
 
-1. **Set up.** Write `{worktree}/tmp/dispatcher-diagnoser/read_context.py` and `{worktree}/tmp/dispatcher-diagnoser/write_recommendation.py` helpers (code above). Run the reader with the `diagnosis_id` argument to pull the JSONB context into memory.
+1. **Set up.** Write `{worktree}/tmp/dispatcher-diagnoser/{read_context,write_recommendation,write_directive,log_action}.py` helpers. Run the reader to pull the JSONB context into memory.
 
-2. **Parse the failure signature FIRST (§Step 1 above, issue #3057).** Locate the raw `stderr_tail` in the context bundle, find the last concrete failure line (`FAILED:` / `[remote rejected]` / `error:` / banner), and write it verbatim into the `reasoning` field you will build. **Do this before reading any pattern-bearing field.** The stderr is ground truth; prior decisions are priors, not evidence.
+2. **Parse the failure signature FIRST (§Step 1, mandatory).** Quote the verbatim stderr line.
 
-3. **Classify.** Identify `failure_category` and `tier` from the context. Read `prior_mechanical_fix` (tier 2) or `ci_log_url` (tier 3) to understand what already failed. Now — and only now — scan `prior_diagnoses_this_issue` + `recent_fleet_decisions` for patterns. If a pattern suggests a category that conflicts with your verbatim quote from step 2, trust the quote; the pattern is noise.
+3. **Classify.** Identify `failure_category` and `tier`. Read `prior_mechanical_fix` (tier 2) or `ci_log_url` (tier 3). Now scan `prior_diagnoses_this_issue` + `recent_fleet_decisions` for patterns. If a pattern conflicts with your verbatim quote, trust the quote.
 
-4. **Decide.** Walk the decision tree above. Do not fetch anything you don't need — context bundle first, GitHub reads only when a specific question remains.
+4. **Decide.** Walk the decision tree. Pick the action shape and the directive shape (respawn_at vs terminal).
 
-5. **Write recommendation.** Serialize the recommendation dict to `{worktree}/tmp/dispatcher-diagnoser/recommendation.json`, then run the writer helper with the `diagnosis_id`, the `agent_id` (from `context.agent_id`), and the JSON file path. The helper writes both the diagnosis row AND the `dispatcher.agents.failure_summary` upgrade in one transaction — issue #2900.
+5. **Act.** Execute side effects (commit, push, gh issue create/edit, etc.) if needed. Log each one via `log_action.py` to `actions_taken`. Or skip side effects entirely and let the daemon's recommendation consumer handle it.
 
-6. **Exit 0.** Done. The daemon picks up the recommendation on the next supervisor tick.
+6. **Write recommendation + directive.** Run `write_recommendation.py` and `write_directive.py`. Both update the same row.
+
+7. **Exit 0.** Done. The daemon's next supervisor tick consumes the recommendation; its directive consumer reads `next_directive` and either spawns a new agent-runner with `START_PHASE` or frees the slot.
 
 ---
 
 ## Examples
 
-### Example 1 — tier 3 `ci_red_after_retries`, reissue
+### Example 1 — anthropic-floor reconciliation, fix it directly
 
-```json
-{
-  "action": "reissue",
-  "reasoning": "The failing test was checking a field name that has since been renamed from `ruling_text` to `ruling_text_html`. Ralph correctly implemented against the issue's AC (which used the old name), and fix-CI kept trying to revert the field name change. The AC is outdated, not the code.",
-  "new_scope": "## Goal\n\nExpose `ruling_text_html` on the /api/rulings/{id} endpoint.\n\n## Acceptance criteria\n- [ ] GraphQL `Ruling.rulingTextHtml` returns the HTML variant.\n  **Verify:** `curl dev.api.judgemind.org/graphql` with a sample ruling id returns `rulingTextHtml` populated.\n\nParent: #2782"
-}
+```text
+context.failure_category = "ralph_not_ship" (route_stub terminal)
+context.details.route_hint = "ralph_not_ship: anthropic SDK version floor mismatch between sibling packages"
+
+Action: read both pyproject.toml files, pick the higher floor, edit, commit, push.
+Recommendation: {"action": "retry", "reasoning": "The stderr ends with `\"AC#1 unmet: ralph cannot satisfy floor reconciliation while siblings disagree\"` ..."}
+next_directive: "respawn_at=push_and_pr"
+actions_taken: [
+  {"type": "bash_run", "cmd": "grep anthropic packages/*/pyproject.toml", ...},
+  {"type": "git_commit", "sha": "abc123", "message": "fix(deps): align anthropic floor"},
+  {"type": "git_push", "branch": "worktree-agent-XYZ", "remote": "origin"}
+]
 ```
 
-### Example 2 — tier 2 `subprocess_turn_limit`, retry_with_hint
+### Example 2 — fleet-wide PAT-scope cascade, file a prerequisite
 
-```json
-{
-  "action": "retry_with_hint",
-  "reasoning": "Ralph hit max turns on a merge conflict in `packages/api/src/graphql/schema.ts` that was introduced while this agent was running. A fresh worktree and a rebase-first hint will fix the next attempt.",
-  "hint": "Previous attempt exhausted turns on a merge conflict. Run `git -C {worktree} rebase origin/main` first, resolve conflicts in packages/api/src/graphql/schema.ts, then proceed with the implementation."
-}
+Training example — `#99001` is a synthetic placeholder. In a real diagnosis, file the issue and use the returned number.
+
+```text
+context.failure_category = "push_failed"
+verbatim stderr: "remote: refusing to allow a Personal Access Token..."
+context.recent_fleet_decisions: 3 prior block_on_existing_task on the same blocker issue.
+
+Recommendation: {"action": "file_prerequisite_task", "title": "...", "body": "...", "reasoning": "..."}
+next_directive: "terminal"
+actions_taken: [
+  {"type": "gh_issue_create", "issue_number": 99001, ...},
+  {"type": "gh_issue_edit", "issue_number": 3297, "labels_added": ["status/blocked"]}
+]
 ```
 
-### Example 3 — tier 2 `stuck_timeout` recurring, escalate
+### Example 3 — AC infeasible, recommend reissue, fall back to daemon-driven
 
-```json
-{
-  "action": "escalate",
-  "reasoning": "This agent got stuck in phase=ralph for 30 min on both the original attempt and the retry. Both times the last phase transition was on a specific test that depends on a flaky external API (`httpbin.org`). Needs human to either mark the test xfail or replace with a local fixture.",
-  "hint": null
-}
+```text
+context.failure_category = "ralph_ac_infeasible"
+context.infeasible_acs: [{"index": 2, "evidence": "..."}]
+
+Action: think only — no direct gh writes (the daemon's `_consume_action_reissue` will write the new body via `gh issue edit --body-file`). Compose `new_scope` carefully.
+Recommendation: {"action": "reissue", "new_scope": "<full rewritten body>", "reasoning": "..."}
+next_directive: "respawn_at=planning"  (let a fresh plan→ralph run against the new body)
+actions_taken: []  (no direct side effects this run)
 ```
 
-### Example 4 — `pre_push_hook_rejected` with fleet-wide PAT-scope pattern, file_prerequisite_task
+### Example 4 — uncertain stderr, escalate cleanly
 
-Training example — issue numbers are synthetic placeholders (`#99001`, `#99002`). Do not pattern-match these as current-state infrastructure problems; always verify any cited issue via `gh issue view` before treating it as a live blocker.
+```text
+context.failure_category = "subprocess_crash"
+verbatim stderr: empty (just progress output).
 
-```json
-{
-  "action": "file_prerequisite_task",
-  "reasoning": "Six consecutive git-push failures in the last 6 hours across #99001 and #99002 all hit 'refusing to allow a Personal Access Token to create or update workflow .* without workflow scope'. This is a dispatcher PAT configuration gap — the secret in AWS Secrets Manager needs the `workflow` scope added. Filing a prerequisite task rather than blocking per-issue because the fix affects every in-flight agent.",
-  "title": "chore(infra): add workflow scope to dispatcher PAT",
-  "body": "## Goal\n\nAdd the `workflow` OAuth scope to the dispatcher's GitHub PAT so agents can push commits that add/modify `.github/workflows/*` files.\n\n## Acceptance criteria\n- [ ] Dispatcher PAT in AWS Secrets Manager has `workflow` scope.\n  **Verify:** a test dispatcher agent can `git push` a branch that adds a file under `.github/workflows/` without hitting 'refusing to allow a Personal Access Token' rejection.\n\n## Priority\n\np1 — blocks the entire dispatcher fleet.",
-  "block_labels": ["priority/p1", "area/infra", "type/chore", "agent/ready"]
-}
+Recommendation: {"action": "escalate", "reasoning": "stderr_tail had no FAILED: line — only progress output."}
+next_directive: "terminal"
+actions_taken: []  (let the daemon's escalate consumer add labels + post the comment)
 ```
 
-### Example 5 — `push_failed` with existing tracking issue, block_on_existing_task
+(Or do the gh writes yourself and log them in `actions_taken` — both paths are valid; just be consistent.)
 
-Training example — the `#99003` issue number is a synthetic placeholder. In a real diagnosis, `gh issue list --search` returns the actual open tracking issue and that number is used here.
+### Example 5 — conflict_unresolvable, semantic collision, escalate
 
-```json
-{
-  "action": "block_on_existing_task",
-  "reasoning": "The PAT-scope blocker is already tracked at #99003 (filed 2 hours ago by the dispatcher when it caught the same pattern). Filing a duplicate would be noise — block this issue on the existing one instead.",
-  "blocker_issue_number": 99003
-}
+```text
+context.failure_category = "conflict_unresolvable"
+context.details.resolution_notes = "function X was rewritten on main; agent's call no longer type-checks"
+
+Recommendation: {"action": "escalate", "reasoning": "..."}
+next_directive: "terminal"
+actions_taken: []
 ```
 
-### Example 6 — `phase_output_missing` on ralph, block_and_comment
+### Example 6 — conflict_unresolvable, routine parallel-edit, fix it directly
 
-```json
-{
-  "action": "block_and_comment",
-  "reasoning": "Ralph's subprocess exited 0 but `{worktree}/tmp/dispatcher-output/ralph.json` is missing. The last 200 lines of the phase log show Claude Code's internal harness dumped a JSON parse error before the skill could write. This is a dispatcher-image bug that needs a Claude Code version bump — not something a fresh retry will fix. Marking blocked so no other agent picks this up while the operator investigates."
-}
-```
+```text
+context.failure_category = "conflict_unresolvable"
+context.details.conflict_files = ["packages/web/lock.json"]
+context.details.resolution_notes = "main landed a sibling lockfile bump; agent's diff is otherwise clean"
 
-### Example 7 — coverage-floor pre-push abort, `file_prerequisite_task` (anchor-bias regression, #3057)
-
-```json
-{
-  "action": "file_prerequisite_task",
-  "reasoning": "The stderr ends with `\"FAILED: coverage floor for scraper-framework\"` followed by `\"FAIL: packages/scraper-framework: coverage dropped 80.0% -> 68.6% (floor violation)\"` and `\"1 check(s) failed. Push aborted.\"`. This is a local pre-push hook abort — the push never reached the remote. Despite several PAT-cascade decisions in recent_fleet_decisions, the verbatim stderr signature is coverage regression, not PAT scope. Filing a prerequisite task to restore the coverage floor before retrying.",
-  "title": "chore(scraper-framework): restore coverage floor after watchdog expansion",
-  "body": "## Goal\n\nRestore the `packages/scraper-framework` coverage floor to 80.0% (currently 68.6%) after the cc-retired watchdog expansion added uncovered branches.\n\n## Acceptance criteria\n- [ ] `scripts/update-coverage-baselines.py --package packages/scraper-framework` exits 0 at 80.0%+.\n  **Verify:** run pre-push hook against a no-op push on the worktree; the coverage-floor check passes.\n\n## Priority\n\np1 — blocks merge of the cc-retired watchdog work.",
-  "block_labels": ["priority/p1", "area/scraping", "agent/ready"]
-}
+Action: checkout, regenerate lockfile, commit, push.
+Recommendation: {"action": "retry", "reasoning": "..."}
+next_directive: "respawn_at=push_and_pr"
+actions_taken: [
+  {"type": "bash_run", "cmd": "git rebase origin/main", ...},
+  {"type": "bash_run", "cmd": "npm install --no-save", ...},
+  {"type": "git_commit", "sha": "...", "message": "chore(deps): regenerate lockfile post-rebase"},
+  {"type": "git_push", ...}
+]
 ```
 
 ---
@@ -514,7 +469,8 @@ Training example — the `#99003` issue number is a synthetic placeholder. In a 
 
 - No `$()`, no heredocs, no `python -c`. See `CLAUDE.md` Critical Rules. Write helper scripts to `{worktree}/tmp/dispatcher-diagnoser/` first, then invoke them.
 - All temp files go under `{worktree}/tmp/`, never `/tmp/`.
-- This skill is Opus-tier per spec §18 — but the task is narrow. Do NOT over-investigate. The decision tree is intentionally short.
-- **Known actions (the daemon recognizes these eight):** `retry`, `retry_with_hint`, `reissue`, `escalate`, `close`, `block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`. You MAY propose a novel action string when none of the known set fits the situation — the daemon will log the action name and payload to `dispatcher.unrecognized_diagnoser_actions` and fall back to `escalate` so an operator can review it. Novel actions are an explicit escape hatch; prefer a known action when one fits.
-- Exit 0 means "recommendation written". Exit non-zero means "I could not diagnose" — the daemon falls back to fixed mechanical escalation.
-- **§Step 1 is mandatory — always quote the verbatim stderr failure line before consulting priors (issue #3057).**
+- Bright lines are hook-enforced (`JUDGEMIND_DIAGNOSER_RUN=1` env). Do not work around a block — escalate instead.
+- `actions_taken` is mandatory for every side-effect action.
+- `next_directive` is mandatory before exit (use `terminal` if no respawn is needed). NULL means "I crashed", which falls back to escalate + a `diagnoser_did_not_complete` log event.
+- §Step 1 (verbatim stderr quote in reasoning) is mandatory.
+- Exit 0 means "directive + recommendation + audit log written". Exit non-zero means "I could not diagnose" — the daemon falls back to fixed mechanical escalation.
