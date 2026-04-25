@@ -319,6 +319,26 @@ if (queryError && !state) return <ErrorBanner error={queryError} />;
 
 **Enforcement:** an ESLint rule (`local/polled-query-error-guard`) flags any `useQuery` callsite with `pollInterval` where the destructured `error` binding is used in a bare `if (error)` that returns JSX. The rule emits an auto-fix rewriting the test to `error && !data`. See `packages/web/eslint-rules/polled-query-error-guard.js` and issue [#2850](https://github.com/judgemind/judgemind/issues/2850).
 
+### View Transitions + Modal Dialogs
+
+The browser composites `::view-transition-*` pseudo-elements above the entire regular z-index stack, so a Radix dialog (even with `z-[9999]`) cannot overlay an animating row while a view transition is in flight.
+
+**Rule:** thread a `dialogOpen` boolean prop down to any component that applies a CSS `view-transition-name` or calls `document.startViewTransition`. Gate both triggers off when `dialogOpen` is true:
+
+```tsx
+// Do not assign a view-transition-name while a modal is open
+const transitionName = dialogOpen ? undefined : "row-" + id;
+
+// Do not start a transition while a modal is open
+if (!dialogOpen) {
+  document.startViewTransition(() => mutate());
+} else {
+  mutate();
+}
+```
+
+**Reference implementation:** `packages/web/src/hooks/useViewTransition.ts` (`useViewTransitionUpdate`) already accepts a `disabled` flag for this purpose. See issue [#3206](https://github.com/judgemind/judgemind/issues/3206) and PR [#3209](https://github.com/judgemind/judgemind/pull/3209) for the incident and fix that motivated this pattern.
+
 ### Loading States
 
 - Skeleton loaders matching the shape of the content they replace
