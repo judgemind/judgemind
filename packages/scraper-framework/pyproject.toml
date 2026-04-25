@@ -30,6 +30,7 @@ dependencies = [
     "anthropic>=0.40",
     "google-genai>=1.0,<2.0",
     "rapidfuzz>=3.0",
+    "croniter>=2.0",
     "judgemind-config",
 ]
 

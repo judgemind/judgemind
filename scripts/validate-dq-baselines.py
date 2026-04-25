@@ -13,6 +13,7 @@ Validations:
   6. ``posting_days`` is present and contains valid day abbreviations.
   7. ``expected_null_rates`` counties exist in ``counties`` section.
   8. ``expected_null_rates`` field names and values are valid.
+  9. ``scraper_schedules`` keys are known scraper IDs and cron exprs are valid.
 
 Usage:
     scripts/validate-dq-baselines.py                      # default path
@@ -329,6 +330,95 @@ def validate_expected_null_rates(
     return errors
 
 
+def validate_scraper_schedules(
+    schedules_section: dict[str, Any],
+) -> list[str]:
+    """Validate the ``scraper_schedules`` section structure.
+
+    Checks:
+    - Every non-metadata key is a known scraper ID (cross-checked via
+      ``framework.runner.get_scraper_ids()``).
+    - Every entry with a ``cron`` key has a value that parses with croniter.
+
+    Falls back gracefully if ``framework.runner`` is unavailable (e.g. running
+    outside the scraper-framework venv) — only cron parse errors are reported.
+
+    Args:
+        schedules_section: The ``scraper_schedules`` section of baselines.
+
+    Returns:
+        List of error messages (empty if valid).
+    """
+    errors: list[str] = []
+
+    # Try to load known scraper IDs from the registry.
+    known_ids: set[str] | None = None
+    try:
+        import sys
+
+        _sf_src = _REPO_ROOT / "packages" / "scraper-framework" / "src"
+        if str(_sf_src) not in sys.path:
+            sys.path.insert(0, str(_sf_src))
+        from framework.runner import get_scraper_ids  # type: ignore[import-untyped]
+
+        known_ids = set(get_scraper_ids())
+    except Exception:
+        # Graceful fallback — scraper-framework not importable in this env.
+        known_ids = None
+
+    # Try to import croniter for cron expression validation.
+    _croniter_cls: type | None = None
+    try:
+        from croniter import croniter as _cron_import  # type: ignore[import-untyped]
+
+        _croniter_cls = _cron_import
+    except ImportError:
+        pass
+
+    for key, entry in schedules_section.items():
+        if key.startswith("_"):
+            continue  # Metadata key
+
+        if known_ids is not None and key not in known_ids:
+            errors.append(
+                f"scraper_schedules key '{key}' is not a known scraper ID "
+                f"(known: {', '.join(sorted(known_ids))})"
+            )
+
+        if not isinstance(entry, dict):
+            errors.append(
+                f"scraper_schedules entry '{key}' must be a dict, "
+                f"got {type(entry).__name__}"
+            )
+            continue
+
+        cron_expr = entry.get("cron")
+        if cron_expr is None:
+            continue  # No cron override — valid (fire always)
+
+        if not isinstance(cron_expr, str) or not cron_expr.strip():
+            errors.append(
+                f"scraper_schedules['{key}'].cron must be a non-empty string, "
+                f"got {type(cron_expr).__name__}: {cron_expr!r}"
+            )
+            continue
+
+        if _croniter_cls is not None:
+            try:
+                if not _croniter_cls.is_valid(cron_expr):
+                    errors.append(
+                        f"scraper_schedules['{key}'].cron '{cron_expr}' "
+                        f"is not a valid cron expression"
+                    )
+            except Exception as exc:
+                errors.append(
+                    f"scraper_schedules['{key}'].cron '{cron_expr}' "
+                    f"failed to parse: {exc}"
+                )
+
+    return errors
+
+
 def validate(baselines: dict[str, Any]) -> list[str]:
     """Run all validation checks on the baselines data.
 
@@ -343,12 +433,14 @@ def validate(baselines: dict[str, Any]) -> list[str]:
     counties = baselines.get("counties") or {}
     fc_section = baselines.get("field_completeness") or {}
     enr_section = baselines.get("expected_null_rates") or {}
+    schedules_section = baselines.get("scraper_schedules") or {}
 
     errors.extend(validate_county_consistency(counties, fc_section))
     errors.extend(validate_reasonable_expectations(counties, fc_section))
     errors.extend(validate_required_fc_fields(fc_section))
     errors.extend(validate_county_config(counties))
     errors.extend(validate_expected_null_rates(enr_section, counties))
+    errors.extend(validate_scraper_schedules(schedules_section))
 
     return errors
 

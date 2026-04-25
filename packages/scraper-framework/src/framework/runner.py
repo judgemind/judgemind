@@ -20,10 +20,13 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import psycopg
 import structlog
@@ -34,6 +37,114 @@ from .s3_cache import make_s3_client
 from .storage import S3Archiver
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Baselines path resolution (mirrors scripts/data-quality-check.py)
+# ---------------------------------------------------------------------------
+
+_RUNNER_DIR = Path(__file__).resolve().parent
+# runner.py lives at packages/scraper-framework/src/framework/runner.py
+# Repo root is four levels up.
+_REPO_ROOT = _RUNNER_DIR.parent.parent.parent.parent
+_DEFAULT_BASELINES_PATH = _REPO_ROOT / "data-quality-baselines.json"
+_DOCKER_BASELINES_PATH = Path("/app/data-quality-baselines.json")
+
+
+def _resolve_baselines_path() -> Path:
+    """Return the best available baselines file path (mirrors data-quality-check.py)."""
+    if _DEFAULT_BASELINES_PATH.exists():
+        return _DEFAULT_BASELINES_PATH
+    if _DOCKER_BASELINES_PATH.exists():
+        return _DOCKER_BASELINES_PATH
+    return _DEFAULT_BASELINES_PATH
+
+
+def _load_scraper_schedules() -> dict[str, Any] | None:
+    """Load the ``scraper_schedules`` block from data-quality-baselines.json.
+
+    Returns the dict (may be empty) or None if the file is missing or the
+    key is absent.  Never raises — missing baselines are treated as no
+    overrides (all scrapers fire).
+    """
+    path = _resolve_baselines_path()
+    try:
+        with open(path) as f:
+            data: dict[str, Any] = json.load(f)
+        return data.get("scraper_schedules")  # None if key absent
+    except Exception as exc:
+        logger.warning(
+            "scraper_schedules_load_error",
+            path=str(path),
+            error=str(exc),
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cadence gating — _should_fire
+# ---------------------------------------------------------------------------
+
+
+def _should_fire(
+    scraper_id: str,
+    schedules: dict[str, Any] | None,
+    now: datetime,
+    sweep_interval_hours: float = 12,
+) -> bool:
+    """Return True if this scraper should run at *now* given the schedules config.
+
+    Logic:
+    - If schedules is None/empty or scraper_id is not in schedules → always fire
+      (backwards-compatible default).
+    - If a ``cron`` key is present and valid: fire only when the cron has had at
+      least one scheduled instant in the half-open window (now - sweep_interval, now].
+      The window is exclusive on the left (last sweep boundary) and inclusive on
+      the right (now).
+    - Malformed / missing / empty cron → log a warning and treat as no override
+      (fire safely).
+
+    Args:
+        scraper_id: The scraper's registry ID.
+        schedules: The ``scraper_schedules`` dict from data-quality-baselines.json,
+            or None if the key is absent.
+        now: The current datetime (must be timezone-aware).
+        sweep_interval_hours: Width of the look-back window in hours (default 12,
+            matching the EventBridge twice-daily cadence).
+
+    Returns:
+        True if the scraper should run, False if it should be skipped.
+    """
+    if not schedules:
+        return True
+
+    entry = schedules.get(scraper_id)
+    if entry is None:
+        return True
+
+    cron_expr: str | None = entry.get("cron") if isinstance(entry, dict) else None
+    if not cron_expr:
+        return True
+
+    try:
+        from croniter import croniter  # type: ignore[import-untyped]
+
+        window_start = now - timedelta(hours=sweep_interval_hours)
+        # croniter.get_prev() returns the most recent fire time at or before ``now``.
+        # We need a fire instant strictly after window_start and at or before now.
+        itr = croniter(cron_expr, window_start)
+        next_fire: datetime = itr.get_next(datetime)
+        if next_fire <= now:
+            return True
+        return False
+    except Exception as exc:
+        logger.warning(
+            "scraper_cadence_cron_parse_error",
+            scraper_id=scraper_id,
+            cron=cron_expr,
+            error=str(exc),
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +459,26 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
             entries = [entry for entry in registry if entry[0] in scraper_ids]
         else:
             entries = list(registry)
+
+        # Apply cadence gating: skip scrapers whose cron override has not
+        # fired within the current sweep window.  Read schedules once from
+        # data-quality-baselines.json (same loader path as the alerter).
+        scraper_schedules = _load_scraper_schedules()
+        if scraper_schedules is not None:
+            now_utc = datetime.now(UTC)
+            gated_entries = []
+            for entry in entries:
+                sid = entry[0]
+                if _should_fire(sid, scraper_schedules, now_utc):
+                    gated_entries.append(entry)
+                else:
+                    logger.info(
+                        "scraper_skipped_by_cadence",
+                        scraper_id=sid,
+                        cron=scraper_schedules.get(sid, {}).get("cron"),
+                        now=now_utc.isoformat(),
+                    )
+            entries = gated_entries
 
         logger.info("Starting scraper run", scrapers=[e[0] for e in entries])
 

@@ -9,6 +9,8 @@
  */
 
 import type { Pool } from 'pg';
+import { readFileSync } from 'node:fs';
+import { resolve, join } from 'node:path';
 import { GraphQLError } from 'graphql';
 import type { AuthUser } from '../auth';
 
@@ -53,6 +55,233 @@ function pageSize(first: number | undefined | null): number {
 }
 
 // ---------------------------------------------------------------------------
+// Per-county threshold loader
+// ---------------------------------------------------------------------------
+
+interface CountyThresholds {
+  redHours: number;
+  yellowHours: number;
+}
+
+/**
+ * Raw county configuration as stored in data-quality-baselines.json.
+ * Used by getCountyThreshold() for posting-day-aware threshold computation.
+ */
+interface CountyConfig {
+  max_expected_gap_hours?: number;
+  posting_days?: string[];
+  schedule_type?: string;
+}
+
+/**
+ * Default fallback thresholds — calibrated against the twice-daily scraper
+ * schedule (6:15 AM and 6:15 PM PT) plus a 1-hour FlexibleTimeWindow slack.
+ * Aligned with alerter DAILY_SCRAPER_STALE_HOURS (scripts/data-quality-check.py).
+ *   yellow: ≥ 13h  (one missed cycle)
+ *   red:    > 25h  (two missed cycles)
+ */
+const DEFAULT_RED_HOURS = 25;
+const DEFAULT_YELLOW_HOURS = 13;
+
+/**
+ * Day-of-week abbreviations matching Python's _DAY_ABBREVS in data-quality-check.py.
+ * Index matches Python's weekday(): Mon=0 .. Sun=6.
+ */
+const DAY_ABBREVS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
+
+/**
+ * Read the baselines JSON file, trying the same candidate paths as loadCountyThresholds().
+ * Returns the parsed JSON, or null if no file found.
+ */
+function readBaselinesJson(): Record<string, unknown> | null {
+  const candidates = [
+    '/app/data-quality-baselines.json',
+    // __dirname is packages/api/dist/graphql at runtime; go up 4 to repo root
+    resolve(join(resolve(__dirname), '..', '..', '..', '..', 'data-quality-baselines.json')),
+    // fallback for test environments where __dirname may vary
+    resolve(join(process.cwd(), 'data-quality-baselines.json')),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const raw = readFileSync(candidate, 'utf8');
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
+/**
+ * Load per-county max_expected_gap_hours overrides from data-quality-baselines.json.
+ *
+ * This function is retained for backward compatibility and for tests that mock
+ * readFileSync to control the baselines content.
+ *
+ * Formula: redHours = max_expected_gap_hours ?? 25; yellowHours = redHours - 12
+ *
+ * Returns an empty Map on any error (no throw — missing baselines fall back to
+ * the hardcoded defaults in computeHealthStatus).
+ */
+export function loadCountyThresholds(): Map<string, CountyThresholds> {
+  const data = readBaselinesJson();
+  if (!data) return new Map();
+
+  try {
+    const counties = data['counties'] as Record<string, Record<string, unknown>> | undefined;
+    if (!counties || typeof counties !== 'object') {
+      return new Map();
+    }
+
+    const result = new Map<string, CountyThresholds>();
+    for (const [name, cfg] of Object.entries(counties)) {
+      if (!cfg || typeof cfg !== 'object') continue;
+      const gap = cfg['max_expected_gap_hours'];
+      if (gap !== undefined && typeof gap === 'number' && gap > 0) {
+        const redHours = gap;
+        const yellowHours = redHours - 12;
+        result.set(name, { redHours, yellowHours });
+      }
+    }
+    return result;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Load raw county configuration map from data-quality-baselines.json.
+ * Returns a Map<county, CountyConfig> with all fields needed for
+ * posting-day-aware threshold computation.
+ *
+ * Returns an empty Map on any error.
+ */
+export function loadCountyConfigs(): Map<string, CountyConfig> {
+  const data = readBaselinesJson();
+  if (!data) return new Map();
+
+  try {
+    const counties = data['counties'] as Record<string, Record<string, unknown>> | undefined;
+    if (!counties || typeof counties !== 'object') return new Map();
+
+    const result = new Map<string, CountyConfig>();
+    for (const [name, cfg] of Object.entries(counties)) {
+      if (!cfg || typeof cfg !== 'object') continue;
+      const config: CountyConfig = {};
+      const gap = cfg['max_expected_gap_hours'];
+      if (gap !== undefined && typeof gap === 'number' && gap > 0) {
+        config.max_expected_gap_hours = gap;
+      }
+      const postingDays = cfg['posting_days'];
+      if (Array.isArray(postingDays)) {
+        config.posting_days = postingDays.filter((d): d is string => typeof d === 'string');
+      }
+      const scheduleType = cfg['schedule_type'];
+      if (typeof scheduleType === 'string') {
+        config.schedule_type = scheduleType;
+      }
+      result.set(name, config);
+    }
+    return result;
+  } catch {
+    return new Map();
+  }
+}
+
+// Module-level singleton for raw county configs — loaded once per process.
+// Tests can call loadCountyConfigs() directly to bypass the singleton.
+let _countyConfigs: Map<string, CountyConfig> | null = null;
+
+function getCountyConfigs(): Map<string, CountyConfig> {
+  if (_countyConfigs === null) {
+    _countyConfigs = loadCountyConfigs();
+  }
+  return _countyConfigs;
+}
+
+/**
+ * Reset the county configs cache. Call from test beforeEach/afterEach
+ * after mocking readFileSync to ensure getCountyThreshold re-reads from the mock.
+ *
+ * This is intentionally exported for test use only — production code
+ * should never call this (the singleton is correct for long-lived processes).
+ */
+export function resetCountyConfigsCache(): void {
+  _countyConfigs = null;
+}
+
+/**
+ * Compute the posting-day-aware staleness threshold for a county, mirroring
+ * _calculate_stale_threshold() from scripts/data-quality-check.py.
+ *
+ * Algorithm (same as Python alerter):
+ *  1. If max_expected_gap_hours set → return it directly.
+ *  2. If no posting_days → return DEFAULT_RED_HOURS (25h).
+ *  3. Walk back from `now` up to 7 days to find the most recent posting day.
+ *     - If today is a posting day → return base (25h).
+ *     - Else → return days_back * 24 + base.
+ *
+ * Uses UTC to avoid local-timezone drift (matches Python alerter's UTC handling).
+ *
+ * @param county - County name as in data-quality-baselines.json.
+ * @param now    - Reference timestamp (use row.last_updated for determinism in tests).
+ * @returns      - { redHours, yellowHours } where yellowHours = redHours - 12.
+ */
+export function getCountyThreshold(county: string, now: Date): CountyThresholds {
+  const config = getCountyConfigs().get(county);
+  const redHours = computeRedHours(config, now);
+  return { redHours, yellowHours: redHours - 12 };
+}
+
+function computeRedHours(config: CountyConfig | undefined, now: Date): number {
+  if (!config) return DEFAULT_RED_HOURS;
+
+  // Explicit override takes priority.
+  if (config.max_expected_gap_hours !== undefined) {
+    return config.max_expected_gap_hours;
+  }
+
+  const postingDays = config.posting_days;
+  if (!postingDays || postingDays.length === 0) {
+    return DEFAULT_RED_HOURS;
+  }
+
+  // Convert posting day abbreviations to Python-compatible weekday integers (Mon=0..Sun=6).
+  const postingWeekdays = new Set<number>();
+  for (const day of postingDays) {
+    const idx = DAY_ABBREVS.indexOf(day as (typeof DAY_ABBREVS)[number]);
+    if (idx !== -1) {
+      postingWeekdays.add(idx);
+    }
+  }
+
+  if (postingWeekdays.size === 0) {
+    return DEFAULT_RED_HOURS;
+  }
+
+  // Use UTC day-of-week, converted to Python weekday convention (Mon=0..Sun=6).
+  // JS getUTCDay(): Sun=0..Sat=6 → Python weekday: (getUTCDay() + 6) % 7
+  const currentWeekday = (now.getUTCDay() + 6) % 7;
+
+  // Walk back up to 7 days (same range as Python: range(8)).
+  for (let daysBack = 0; daysBack <= 7; daysBack++) {
+    const checkDay = ((currentWeekday - daysBack) % 7 + 7) % 7;
+    if (postingWeekdays.has(checkDay)) {
+      if (daysBack === 0) {
+        // Today is a posting day — use normal base threshold.
+        return DEFAULT_RED_HOURS;
+      }
+      // Last posting day was daysBack ago.
+      return daysBack * 24 + DEFAULT_RED_HOURS;
+    }
+  }
+
+  // Should never reach here (we check 8 days covering a full week).
+  return 7 * 24 + DEFAULT_RED_HOURS;
+}
+
+// ---------------------------------------------------------------------------
 // Health status logic
 // ---------------------------------------------------------------------------
 
@@ -62,14 +291,19 @@ interface CountyMetrics {
   fieldCompletenessPct: number | null;
   scraperLastSuccessAgeHours: number | null;
   lastUpdated: string | null;
+  redThresholdHours?: number | null;
+  yellowThresholdHours?: number | null;
 }
 
 /**
  * Compute health status from the latest metrics for a county.
  *
  * Thresholds are calibrated against the twice-daily scraper schedule (6:15 AM
- * and 6:15 PM PT) plus a 1-hour slack for FlexibleTimeWindow and runtime:
+ * and 6:15 PM PT) plus a 1-hour slack for FlexibleTimeWindow and runtime.
+ * Per-county overrides can be provided via redThresholdHours / yellowThresholdHours
+ * (read from data-quality-baselines.json max_expected_gap_hours).
  *
+ * Defaults (no override):
  * - Green: ruling_count_24h > 0 AND field_completeness_pct >= 90
  *          AND scraper_last_success_age_hours < 13
  * - Yellow: any metric slightly degraded (completeness 70-90%, scraper age 13-25h)
@@ -78,25 +312,29 @@ interface CountyMetrics {
 export function computeHealthStatus(metrics: CountyMetrics): string {
   const { rulingCount24h, fieldCompletenessPct, scraperLastSuccessAgeHours } = metrics;
 
+  // Per-county threshold overrides — fall back to module defaults.
+  const redHours = metrics.redThresholdHours ?? DEFAULT_RED_HOURS;
+  const yellowHours = metrics.yellowThresholdHours ?? DEFAULT_YELLOW_HOURS;
+
   // If we have no data at all, report red
   if (rulingCount24h === null && fieldCompletenessPct === null && scraperLastSuccessAgeHours === null) {
     return 'red';
   }
 
   // Check for red conditions
-  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours > 25) return 'red';
+  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours > redHours) return 'red';
   if (fieldCompletenessPct !== null && fieldCompletenessPct < 70) return 'red';
   if (rulingCount24h !== null && rulingCount24h === 0) return 'red';
 
   // Check for yellow conditions
   if (fieldCompletenessPct !== null && fieldCompletenessPct < 90) return 'yellow';
-  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours >= 13) return 'yellow';
+  if (scraperLastSuccessAgeHours !== null && scraperLastSuccessAgeHours >= yellowHours) return 'yellow';
 
   // Check for green: all available metrics look good
   const isGreen =
     (rulingCount24h === null || rulingCount24h > 0) &&
     (fieldCompletenessPct === null || fieldCompletenessPct >= 90) &&
-    (scraperLastSuccessAgeHours === null || scraperLastSuccessAgeHours < 13);
+    (scraperLastSuccessAgeHours === null || scraperLastSuccessAgeHours < yellowHours);
 
   return isGreen ? 'green' : 'yellow';
 }
@@ -335,8 +573,15 @@ async function queryOverview(pool: Pool): Promise<Row[]> {
   `);
 
   return rows.map((row) => {
+    const countyName = row.county as string;
+    // Use last_updated as the reference time for posting-day-aware threshold computation.
+    // This is deterministic in tests (same input → same output) and mirrors the alerter
+    // which uses the current time when the alert check runs.
+    const lastUpdatedDate = row.last_updated ? new Date(String(row.last_updated)) : new Date();
+    const countyThresholds = getCountyThreshold(countyName, lastUpdatedDate);
+
     const metrics: CountyMetrics = {
-      county: row.county as string,
+      county: countyName,
       rulingCount24h: row.ruling_count_24h !== null ? Number(row.ruling_count_24h) : null,
       fieldCompletenessPct:
         row.field_completeness_pct !== null ? Number(row.field_completeness_pct) : null,
@@ -345,6 +590,8 @@ async function queryOverview(pool: Pool): Promise<Row[]> {
           ? Number(row.scraper_last_success_age_hours)
           : null,
       lastUpdated: row.last_updated ? String(row.last_updated) : null,
+      redThresholdHours: countyThresholds.redHours,
+      yellowThresholdHours: countyThresholds.yellowHours,
     };
 
     return {
@@ -354,6 +601,8 @@ async function queryOverview(pool: Pool): Promise<Row[]> {
       fieldCompletenessPct: metrics.fieldCompletenessPct,
       scraperLastSuccessAgeHours: metrics.scraperLastSuccessAgeHours,
       lastUpdated: metrics.lastUpdated,
+      redThresholdHours: metrics.redThresholdHours,
+      yellowThresholdHours: metrics.yellowThresholdHours,
     };
   });
 }
@@ -406,5 +655,5 @@ export const dataQualityResolvers = {
   },
 };
 
-// Export for testing
-export { requireAdmin, type CountyMetrics, type MetricResolution };
+// Export for testing (non-function types and requireAdmin which is not inline-exported)
+export { requireAdmin, type CountyMetrics, type CountyThresholds, type CountyConfig, type MetricResolution };

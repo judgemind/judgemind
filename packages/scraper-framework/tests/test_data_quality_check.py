@@ -2025,7 +2025,8 @@ class TestCalculateStaleThreshold:
     def test_daily_no_posting_days_returns_default(self) -> None:
         """Without posting_days, returns DAILY_SCRAPER_STALE_HOURS."""
         threshold = _calculate_stale_threshold(NOW, "daily", None, None)
-        assert threshold == 26  # DAILY_SCRAPER_STALE_HOURS
+        # DAILY_SCRAPER_STALE_HOURS (aligned with dashboard DEFAULT_RED_HOURS)
+        assert threshold == 25
 
     def test_frequent_no_posting_days_returns_default(self) -> None:
         """Without posting_days, frequent schedule returns 2h."""
@@ -2041,7 +2042,7 @@ class TestCalculateStaleThreshold:
         """When today is a posting day, returns the base threshold."""
         # NOW is Tuesday 2026-03-11 12:00 UTC
         threshold = _calculate_stale_threshold(NOW, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
-        assert threshold == 26  # Base threshold — today is a posting day
+        assert threshold == 25  # Base threshold — today is a posting day
 
     def test_saturday_with_weekday_posting(self) -> None:
         """Saturday check for Mon-Thu posting: last post was Thursday, 2 days ago."""
@@ -2049,29 +2050,29 @@ class TestCalculateStaleThreshold:
         threshold = _calculate_stale_threshold(
             saturday, "daily", ["Mon", "Tue", "Wed", "Thu"], None
         )
-        # Last posting day was Thursday (2 days ago) -> 48h + 26h buffer
-        assert threshold == 74.0
+        # Last posting day was Thursday (2 days ago) -> 48h + 25h buffer
+        assert threshold == 73.0
 
     def test_sunday_with_weekday_posting(self) -> None:
         """Sunday check for Mon-Thu posting: last post was Thursday, 3 days ago."""
         sunday = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)  # Sunday
         threshold = _calculate_stale_threshold(sunday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
-        # Last posting day was Thursday (3 days ago) -> 72h + 26h buffer
-        assert threshold == 98.0
+        # Last posting day was Thursday (3 days ago) -> 72h + 25h buffer
+        assert threshold == 97.0
 
     def test_monday_with_weekday_posting(self) -> None:
         """Monday check for Mon-Thu posting: today is a posting day."""
         monday = datetime(2026, 3, 16, 12, 0, 0, tzinfo=UTC)  # Monday
         threshold = _calculate_stale_threshold(monday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
         # Monday is a posting day -> base threshold
-        assert threshold == 26
+        assert threshold == 25
 
     def test_friday_with_mon_thu_posting(self) -> None:
         """Friday check for Mon-Thu posting: last post was Thursday, 1 day ago."""
         friday = datetime(2026, 3, 13, 12, 0, 0, tzinfo=UTC)  # Friday
         threshold = _calculate_stale_threshold(friday, "daily", ["Mon", "Tue", "Wed", "Thu"], None)
-        # Last posting day was Thursday (1 day ago) -> 24h + 26h buffer
-        assert threshold == 50.0
+        # Last posting day was Thursday (1 day ago) -> 24h + 25h buffer
+        assert threshold == 49.0
 
     def test_mon_to_fri_posting_on_saturday(self) -> None:
         """Saturday check for Mon-Fri posting: last post was Friday, 1 day ago."""
@@ -2079,18 +2080,18 @@ class TestCalculateStaleThreshold:
         threshold = _calculate_stale_threshold(
             saturday, "daily", ["Mon", "Tue", "Wed", "Thu", "Fri"], None
         )
-        # Last posting day was Friday (1 day ago) -> 24h + 26h buffer
-        assert threshold == 50.0
+        # Last posting day was Friday (1 day ago) -> 24h + 25h buffer
+        assert threshold == 49.0
 
     def test_empty_posting_days_returns_base(self) -> None:
         """Empty posting_days list falls back to base threshold."""
         threshold = _calculate_stale_threshold(NOW, "daily", [], None)
-        assert threshold == 26
+        assert threshold == 25
 
     def test_invalid_day_abbrevs_ignored(self) -> None:
         """Invalid day abbreviations are silently ignored."""
         threshold = _calculate_stale_threshold(NOW, "daily", ["Xyz", "Abc"], None)
-        assert threshold == 26  # Falls back to base — no valid days
+        assert threshold == 25  # Falls back to base — no valid days
 
 
 class TestScheduleAwareStaleness:
@@ -2122,7 +2123,7 @@ class TestScheduleAwareStaleness:
     def test_santa_clara_stale_on_posting_day(self) -> None:
         """Santa Clara should alert when stale on a posting day (Tuesday)."""
         tuesday = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
-        # Last run was 27h ago — exceeds the 26h base threshold
+        # Last run was 27h ago — exceeds the 25h base threshold
         last_run = tuesday - timedelta(hours=27)
         conn = FakeConnection(
             {
@@ -2159,7 +2160,7 @@ class TestScheduleAwareStaleness:
 
     def test_max_gap_override(self) -> None:
         """max_expected_gap_hours overrides all other logic."""
-        # 40h gap — would be stale with 26h default, but not with 48h override
+        # 40h gap — would be stale with 25h default, but not with 48h override
         last_run = NOW - timedelta(hours=40)
         conn = FakeConnection(
             {
