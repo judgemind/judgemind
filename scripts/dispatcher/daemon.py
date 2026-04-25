@@ -20113,6 +20113,18 @@ class DispatcherDaemon:
                             "final_phase": current_phase,
                         },
                     )
+                    # Issue #3324: mirror the bookkeeping side-effects
+                    # that ``_mark_agent_terminal`` (#2866) and
+                    # ``_write_merged_at`` (#2953) perform in
+                    # subprocess mode. The ECS agent-runner wrote its
+                    # own terminal row, but the daemon-side
+                    # ``status/in-progress`` label strip + ``merged_at``
+                    # stamp never fired in this branch — so closed
+                    # issues kept the label and ``fleet-status.sh``
+                    # showed 0 greens. Both ops are best-effort and
+                    # idempotent (re-reaps must not bump ``merged_at``
+                    # or repeat the label call cost).
+                    self._reap_finalize_ecs_success(agent_id, issue_number)
                     reaped_success += 1
                 else:
                     # Container exited 0 but agent row wasn't marked
@@ -20167,6 +20179,28 @@ class DispatcherDaemon:
                             "final_phase": current_phase,
                         },
                     )
+                    # Issue #3324: mirror the ``status/in-progress``
+                    # label strip that ``_mark_agent_terminal`` (#2866)
+                    # performs in the subprocess-mode failure path. No
+                    # ``merged_at`` stamp here — failures don't ship
+                    # PRs. Best-effort, GitHub flake cannot affect the
+                    # reap counter.
+                    if issue_number is not None:
+                        try:
+                            self._gh_issue_remove_labels(
+                                issue_number, [STATUS_IN_PROGRESS_LABEL]
+                            )
+                        except Exception:
+                            self._log.exception(
+                                "daemon.agent_runner_reaped_label_strip_failed",
+                                extra={
+                                    "event": "agent_runner_reaped_label_strip_failed",
+                                    "run_id": self._run_id,
+                                    "agent_id": agent_id,
+                                    "issue_number": issue_number,
+                                    "branch": "failure_already_terminal",
+                                },
+                            )
                     reaped_failure += 1
                     continue
                 # Real failure — agent-runner died before it could write
@@ -20212,6 +20246,85 @@ class DispatcherDaemon:
             "reaped_failure": reaped_failure,
             "still_running": still_running,
         }
+
+    def _reap_finalize_ecs_success(
+        self, agent_id: str, issue_number: int | None
+    ) -> None:
+        """Mirror subprocess-mode terminal bookkeeping for ECS reaps (#3324).
+
+        Called from :meth:`_reap_completed_agent_tasks` on the
+        success-already-terminal branch — the case where the
+        ECS agent-runner wrote its own ``status='succeeded'`` row
+        before exiting. Without this helper that branch only logs +
+        increments the counter, leaking two side-effects that
+        subprocess mode (#2866 + #2953) handles:
+
+        1. ``status/in-progress`` GitHub label strip — without this,
+           closed issues retain the label and the queue-scan filter
+           hides them from picker (#2927).
+        2. ``dispatcher.agents.merged_at`` stamp — read by
+           ``scripts/dispatcher/helpers/fleet-status.sh`` to count
+           "daemon-shipped greens"; without this the helper renders
+           ``0 of 0`` even when greens exist.
+
+        Both ops are best-effort: a GitHub flake or DB hiccup is
+        logged and swallowed so the reap counter stays accurate.
+
+        Idempotent on the DB side via ``WHERE merged_at IS NULL`` —
+        re-reaps don't bump the timestamp. ``pr_number IS NOT NULL``
+        guards the case where the agent failed without ever opening
+        a PR but somehow landed in the success branch (defensive).
+        Idempotent on the GitHub side because
+        :meth:`_gh_issue_remove_labels` is a no-op when the label is
+        already absent.
+        """
+        if issue_number is None:
+            return
+        # Best-effort label strip first — this is the operator-visible
+        # leak.
+        try:
+            self._gh_issue_remove_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
+        except Exception:
+            self._log.exception(
+                "daemon.agent_runner_reaped_label_strip_failed",
+                extra={
+                    "event": "agent_runner_reaped_label_strip_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "branch": "success_already_terminal",
+                },
+            )
+        # Best-effort merged_at stamp. Only stamp when the row already
+        # has a pr_number AND merged_at is currently NULL — both
+        # filters live in the WHERE clause so re-reaps and PR-less
+        # rows are no-ops.
+        assert self._conn is not None, "connect() must run before reap finalize"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET merged_at = now() "
+                    "WHERE agent_id = %s "
+                    "  AND merged_at IS NULL "
+                    "  AND pr_number IS NOT NULL",
+                    (agent_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.agent_runner_reaped_merged_at_stamp_failed",
+                extra={
+                    "event": "agent_runner_reaped_merged_at_stamp_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — defensive
+                pass
 
     def _read_agent_status_phase(self, agent_id: str) -> tuple[str | None, str | None]:
         """Fetch the current (status, phase) for an agent. Best-effort.
