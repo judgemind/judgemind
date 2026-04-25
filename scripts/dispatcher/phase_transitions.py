@@ -266,6 +266,15 @@ PHASE_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: advancing to the appropriate diagnoser-decided terminal phase.
 PHASE_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
 
+#: #3374 — synthetic scheduled-skill agents (kind='scheduled_skill').
+#: Set by the agent-runner entrypoint's ``handle_scheduled_skill`` when
+#: the dispatched skill exited non-zero or returned a non-success
+#: verdict. The supervisor picks these rows up via the same diagnoser
+#: candidates sweep as other failed terminals, but the diagnoser
+#: typically just records the failure since synthetic skills have no
+#: PR or worktree to retry against.
+PHASE_SCHEDULED_SKILL_FAILED = "scheduled_skill_failed"
+
 # ---------------------------------------------------------------------------
 # Verdict constants — the string values produced by the phase-output JSONs.
 # ---------------------------------------------------------------------------
@@ -367,6 +376,8 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_FIX_CI_FAILED,
         # #3137 — agent-runner route stub terminal (Stage 1b).
         PHASE_AGENT_RUNNER_ROUTE_STUB,
+        # #3374 — synthetic scheduled-skill failure terminal.
+        PHASE_SCHEDULED_SKILL_FAILED,
     }
 )
 
@@ -1194,6 +1205,7 @@ __all__ = [
     "PHASE_CONFLICT_UNRESOLVABLE",
     "PHASE_FIX_CI_FAILED",
     "PHASE_AGENT_RUNNER_ROUTE_STUB",
+    "PHASE_SCHEDULED_SKILL_FAILED",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",

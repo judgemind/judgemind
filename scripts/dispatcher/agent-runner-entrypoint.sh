@@ -299,6 +299,19 @@ read_current_phase() {
                    LIMIT 1;"
 }
 
+read_agent_kind() {
+    # Issue #3374. Read ``dispatcher.agents.kind`` so the phase-loop
+    # dispatch can branch on synthetic scheduled-skill agents
+    # (``kind='scheduled_skill'``) — those run ``claude -p /<phase>``
+    # directly instead of going through the plan→ralph→summary→PR
+    # pipeline. Returns the empty string when the row is missing
+    # (caller falls back to the standard phase router).
+    db_query_one "SELECT kind
+                    FROM dispatcher.agents
+                   WHERE agent_id = '$AGENT_ID'
+                   LIMIT 1;"
+}
+
 # ── Python helper: phase_transitions bridge --------------------------------
 #
 # The shell script can't import Python, so we expose the pure
@@ -1932,6 +1945,113 @@ run_claude_phase() {
         fi
 
         printf '{}'
+    fi
+}
+
+handle_scheduled_skill() {
+    # Issue #3374. Dispatch a synthetic scheduled-skill phase (audit,
+    # spotcheck, daily_report, etc.). The agent row's ``phase`` column
+    # is the skill name (no ``/`` prefix); we invoke
+    # ``claude -p /<phase> <agent_id>`` and parse the result.
+    #
+    # Synthetic skills:
+    #   * Are NOT part of the standard plan→ralph→summary→PR pipeline.
+    #   * Do NOT run push_and_pr — they file issues / open auto-PRs
+    #     internally as side-effects of the skill itself.
+    #   * Treat ``SHIPPED`` / ``PASSED`` / ``OK`` (and the absence of
+    #     a verdict in claude's output for skills that don't return one)
+    #     as success → ``status='succeeded'``, ``phase='done'``.
+    #   * Treat any other verdict / non-zero exit as failure →
+    #     ``status='failed'``, ``phase='scheduled_skill_failed'``.
+    #
+    # The handler updates the agent row directly and returns; the main
+    # phase loop sees the terminal phase on the next read and exits.
+    _skill_name="$1"
+    _out_file="$AGENT_WORKSPACE/claude-p-scheduled-$_skill_name.stdout.json"
+    _err_file="$AGENT_WORKSPACE/claude-p-scheduled-$_skill_name.stderr.log"
+
+    if [[ "$AGENT_RUNNER_DRY_RUN" == "1" ]]; then
+        log "scheduled_skill_dry_run" "skill=$_skill_name"
+        advance_phase "done" "succeeded"
+        return 0
+    fi
+
+    log "scheduled_skill_begin" "skill=$_skill_name" "agent_id=$AGENT_ID"
+    set +e
+    (
+        cd "$REPO_ROOT" || exit 127
+        claude -p "/$_skill_name $AGENT_ID" \
+            --output-format json \
+            --dangerously-skip-permissions \
+            > "$_out_file" \
+            2> "$_err_file"
+    )
+    _rc=$?
+    set -e
+    log "scheduled_skill_done" "skill=$_skill_name" "exit_code=$_rc"
+
+    # Persist the result envelope as a phase_output row for operator
+    # visibility — same way ``run_claude_phase``'s output gets
+    # persisted by its caller via ``persist_phase_output``. We pass
+    # the structured ``.result`` object when available, otherwise an
+    # empty dict (matches ``run_claude_phase``'s fallback).
+    _output="{}"
+    if [[ -s "$_out_file" ]]; then
+        if jq -e '.result | type == "object"' "$_out_file" >/dev/null 2>&1; then
+            _output=$(jq -c '.result' "$_out_file" 2>/dev/null || printf '{}')
+        else
+            # Wrap the string ``.result`` in a tiny envelope so operators
+            # can still see what claude returned without parsing the raw
+            # claude-p stdout. The verdict gate below uses _result_str
+            # directly.
+            _output=$(jq -c '{result_text: (.result // "" | tostring)}' \
+                "$_out_file" 2>/dev/null || printf '{}')
+        fi
+    fi
+    persist_phase_output "$_skill_name" "$_output"
+
+    # Verdict classification. We accept either the structured
+    # ``.verdict`` field (modern skills) OR a substring match on the
+    # ``.result`` string (legacy skills) — SHIPPED / PASSED / OK.
+    _verdict=""
+    if jq -e '.result | type == "object"' "$_out_file" >/dev/null 2>&1; then
+        _verdict=$(jq -r '.result.verdict // ""' "$_out_file" 2>/dev/null \
+            | tr '[:lower:]' '[:upper:]' || printf '')
+    fi
+    _result_str=""
+    if [[ -s "$_out_file" ]]; then
+        _result_str=$(jq -r '.result | tostring' "$_out_file" 2>/dev/null \
+            | tr '[:lower:]' '[:upper:]' || printf '')
+    fi
+
+    _success=0
+    if [[ "$_rc" -eq 0 ]]; then
+        case "$_verdict" in
+            SHIPPED|PASSED|OK|SUCCESS|DONE|"")
+                # Empty verdict + zero exit code = success (skills like
+                # /audit and /spotcheck don't return a structured verdict).
+                _success=1
+                ;;
+        esac
+        if [[ "$_success" -eq 0 ]]; then
+            # Substring tolerance for legacy skills.
+            case "$_result_str" in
+                *SHIPPED*|*PASSED*|*"FILED ISSUES"*|*"NO ACTIONABLE FINDINGS"*)
+                    _success=1
+                    ;;
+            esac
+        fi
+    fi
+
+    if [[ "$_success" -eq 1 ]]; then
+        log "scheduled_skill_succeeded" "skill=$_skill_name" "verdict=$_verdict"
+        advance_phase "done" "succeeded"
+    else
+        log "scheduled_skill_failed" \
+            "skill=$_skill_name" \
+            "exit_code=$_rc" \
+            "verdict=$_verdict"
+        advance_phase "scheduled_skill_failed" "failed"
     fi
 }
 
@@ -3905,6 +4025,22 @@ while true; do
         log "phase_terminal" "phase=$_current"
         mark_ended
         exit 0
+    fi
+
+    # Issue #3374: synthetic scheduled-skill agents (kind='scheduled_skill')
+    # don't go through the plan→ralph→summary→PR pipeline. The phase
+    # column on these agents is the skill name (e.g. 'audit', 'spotcheck')
+    # — dispatch directly to ``claude -p /<phase> <agent_id>`` via
+    # ``handle_scheduled_skill`` and let it advance the agent row
+    # to a terminal phase. The next loop iteration observes the new
+    # phase and exits cleanly.
+    _agent_kind=$(read_agent_kind)
+    if [[ "$_agent_kind" == "scheduled_skill" ]]; then
+        # Defensive: if the phase column already terminal-looking, the
+        # is_terminal check above already returned. Anything else here
+        # is a live skill name.
+        handle_scheduled_skill "$_current"
+        continue
     fi
 
     # Phases the Stage 1b entrypoint actually runs. Each case writes

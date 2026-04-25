@@ -117,6 +117,10 @@ from .phase_transitions import (  # noqa: E402
     transition_from_summary,
     transition_from_verify,
 )
+from .scheduled_skills import (  # noqa: E402  — issue #3374
+    CronParseError,
+    should_fire_cron,
+)
 
 
 # --------------------------------------------------------------------------
@@ -20603,6 +20607,500 @@ class DispatcherDaemon:
             )
         return reaped
 
+    # ── scheduled-skills tick (issue #3374) ─────────────────────────────
+
+    def _scheduled_skills_tick(self) -> dict[str, int]:
+        """Iterate ``dispatcher.scheduled_skills`` and fire due skills.
+
+        Issue #3374. Generalized cron-like scheduler for periodic skills
+        (``/audit``, ``/spotcheck``, future ``/dispatcher-daily-report``,
+        4h Telegram digest, etc.). Replaces the per-skill bespoke wiring
+        we'd otherwise build five+ times.
+
+        Per row in ``dispatcher.scheduled_skills WHERE enabled = true``:
+
+        1. ``trigger_kind = 'cron'``: use
+           :func:`scripts.dispatcher.scheduled_skills.should_fire_cron`
+           to walk the minute range from ``last_triggered_at`` to ``now``
+           and check whether any minute matches the cron expression.
+        2. ``trigger_kind = 'every_n_merges'``: count
+           ``dispatcher.agents`` rows whose ``merged_at`` falls in
+           (``last_triggered_at``, ``now``]; fire if count >= N.
+
+        On a positive fire signal:
+
+        * **Cap-aware:** skip if ``_active_agent_count() >= concurrency_cap``.
+          The next supervisor tick re-checks.
+        * **Collision-aware:** skip if a ``status='running'`` agent
+          already has ``phase=<name>``. Avoids double-firing.
+        * Spawn a synthetic agent via :meth:`_spawn_scheduled_skill_agent`
+          (writes ``dispatcher.agents`` then dispatches via
+          :meth:`_launch_agent_ecs_task`) and UPDATE the row's
+          ``last_triggered_at`` + ``last_triggered_agent_id``.
+
+        The pass is idempotent: if the table is missing (pre-#3374
+        environments) the SELECT raises and we log + skip the entire
+        pass without crashing the supervisor tick. Single-row failures
+        are caught and logged so one bad row doesn't block siblings.
+
+        Returns a summary dict for logs + tests with counters for fires
+        attempted, fires skipped (cap/collision), and rows scanned.
+        """
+        assert self._conn is not None, "connect() must run before ticks"
+
+        rows_scanned = 0
+        fires_succeeded = 0
+        fires_skipped_cap = 0
+        fires_skipped_collision = 0
+        fires_failed = 0
+
+        # Read enabled rows. SELECT in its own try/except so a missing
+        # table on a fresh-deploy DB skip can be distinguished from a
+        # broken row in the loop below.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, skill_invocation, trigger_kind, "
+                    "       trigger_value, last_triggered_at "
+                    "  FROM dispatcher.scheduled_skills "
+                    " WHERE enabled = true "
+                    " ORDER BY name"
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            self._log.info(
+                "daemon.scheduled_skills_select_failed",
+                extra={
+                    "event": "scheduled_skills_select_failed",
+                    "run_id": self._run_id,
+                    "detail": (
+                        "SELECT FROM dispatcher.scheduled_skills failed; "
+                        "the table may not exist (pre-migration-48 env). "
+                        "Skipping the scheduled-skills pass — supervisor "
+                        "tick continues."
+                    ),
+                },
+            )
+            return {
+                "rows_scanned": 0,
+                "fires_succeeded": 0,
+                "fires_skipped_cap": 0,
+                "fires_skipped_collision": 0,
+                "fires_failed": 0,
+            }
+
+        if not rows:
+            return {
+                "rows_scanned": 0,
+                "fires_succeeded": 0,
+                "fires_skipped_cap": 0,
+                "fires_skipped_collision": 0,
+                "fires_failed": 0,
+            }
+
+        now_dt = datetime.now(UTC)
+
+        for row in rows:
+            rows_scanned += 1
+            try:
+                (
+                    name,
+                    skill_invocation,
+                    trigger_kind,
+                    trigger_value,
+                    last_triggered_at,
+                ) = row
+            except (TypeError, ValueError):
+                self._log.warning(
+                    "daemon.scheduled_skills_row_malformed",
+                    extra={
+                        "event": "scheduled_skills_row_malformed",
+                        "run_id": self._run_id,
+                        "row": str(row),
+                    },
+                )
+                fires_failed += 1
+                continue
+
+            try:
+                should_fire = self._scheduled_skill_should_fire(
+                    name=name,
+                    trigger_kind=trigger_kind,
+                    trigger_value=trigger_value,
+                    last_triggered_at=last_triggered_at,
+                    now=now_dt,
+                )
+            except Exception:
+                self._log.exception(
+                    "daemon.scheduled_skills_should_fire_failed",
+                    extra={
+                        "event": "scheduled_skills_should_fire_failed",
+                        "run_id": self._run_id,
+                        "skill_name": name,
+                        "trigger_kind": trigger_kind,
+                        "trigger_value": trigger_value,
+                    },
+                )
+                fires_failed += 1
+                continue
+
+            if not should_fire:
+                continue
+
+            # Cap-aware: skip when the daemon is already at concurrency_cap.
+            cap = self._read_concurrency_cap_for_scheduler()
+            active = self._active_agent_count()
+            if cap is not None and active >= cap:
+                fires_skipped_cap += 1
+                self._log.info(
+                    "daemon.scheduled_skill_skipped_cap",
+                    extra={
+                        "event": "scheduled_skill_skipped_cap",
+                        "run_id": self._run_id,
+                        "skill_name": name,
+                        "active_agent_count": active,
+                        "concurrency_cap": cap,
+                    },
+                )
+                continue
+
+            # Collision-aware: skip when an agent with phase=<name> is
+            # already running. Avoids double-firing.
+            if self._scheduled_skill_running(name):
+                fires_skipped_collision += 1
+                self._log.info(
+                    "daemon.scheduled_skill_skipped_collision",
+                    extra={
+                        "event": "scheduled_skill_skipped_collision",
+                        "run_id": self._run_id,
+                        "skill_name": name,
+                    },
+                )
+                continue
+
+            # Spawn the synthetic agent + record on the scheduler row.
+            try:
+                agent_id = self._spawn_scheduled_skill_agent(
+                    name=name, skill_invocation=skill_invocation
+                )
+            except Exception:
+                self._log.exception(
+                    "daemon.scheduled_skill_spawn_failed",
+                    extra={
+                        "event": "scheduled_skill_spawn_failed",
+                        "run_id": self._run_id,
+                        "skill_name": name,
+                    },
+                )
+                fires_failed += 1
+                continue
+
+            if agent_id is None:
+                fires_failed += 1
+                continue
+
+            self._update_scheduled_skill_last_fire(name, agent_id, now_dt)
+            fires_succeeded += 1
+            self._log.info(
+                "daemon.scheduled_skill_fired",
+                extra={
+                    "event": "scheduled_skill_fired",
+                    "run_id": self._run_id,
+                    "skill_name": name,
+                    "skill_invocation": skill_invocation,
+                    "trigger_kind": trigger_kind,
+                    "agent_id": agent_id,
+                },
+            )
+
+        return {
+            "rows_scanned": rows_scanned,
+            "fires_succeeded": fires_succeeded,
+            "fires_skipped_cap": fires_skipped_cap,
+            "fires_skipped_collision": fires_skipped_collision,
+            "fires_failed": fires_failed,
+        }
+
+    def _scheduled_skill_should_fire(
+        self,
+        *,
+        name: str,
+        trigger_kind: str,
+        trigger_value: str,
+        last_triggered_at: datetime | None,
+        now: datetime,
+    ) -> bool:
+        """Decide whether a scheduled-skills row is due to fire.
+
+        Pure decision function (no side effects) so the cron + N-merges
+        logic is easy to unit-test without spawning agents.
+        """
+        if trigger_kind == "cron":
+            try:
+                return should_fire_cron(trigger_value, last_triggered_at, now)
+            except CronParseError as exc:
+                self._log.warning(
+                    "daemon.scheduled_skills_cron_parse_failed",
+                    extra={
+                        "event": "scheduled_skills_cron_parse_failed",
+                        "run_id": self._run_id,
+                        "skill_name": name,
+                        "trigger_value": trigger_value,
+                        "detail": str(exc),
+                    },
+                )
+                return False
+        if trigger_kind == "every_n_merges":
+            try:
+                n = int(trigger_value)
+            except (TypeError, ValueError):
+                self._log.warning(
+                    "daemon.scheduled_skills_n_parse_failed",
+                    extra={
+                        "event": "scheduled_skills_n_parse_failed",
+                        "run_id": self._run_id,
+                        "skill_name": name,
+                        "trigger_value": trigger_value,
+                    },
+                )
+                return False
+            if n <= 0:
+                return False
+            count = self._count_merges_since(last_triggered_at)
+            return count >= n
+        self._log.warning(
+            "daemon.scheduled_skills_unknown_trigger_kind",
+            extra={
+                "event": "scheduled_skills_unknown_trigger_kind",
+                "run_id": self._run_id,
+                "skill_name": name,
+                "trigger_kind": trigger_kind,
+            },
+        )
+        return False
+
+    def _read_concurrency_cap_for_scheduler(self) -> int | None:
+        """Read ``dispatcher.config.concurrency_cap``; return None on miss.
+
+        Mirrors the read in :meth:`scheduler_tick`. Kept as a tiny helper
+        rather than a shared accessor so the existing scheduler tick's
+        observability isn't affected.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("concurrency_cap",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None or row[0] is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _scheduled_skill_running(self, name: str) -> bool:
+        """Return True if a ``status='running'`` agent has phase = *name*.
+
+        Used by :meth:`_scheduled_skills_tick` for the collision guard.
+        Fail-closed: a DB error returns True so we skip the fire rather
+        than risk a double-spawn.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3374): collision predicate keyed
+                # on (status, phase). Both subprocess + ECS synthetic
+                # skill agents land status='running' phase=<name> the
+                # same way, so the predicate doesn't need to branch on
+                # execution_mode. Mirrors :meth:`_has_active_agent`'s
+                # exec-mode-agnostic SELECT pattern.
+                cur.execute(
+                    "SELECT 1 FROM dispatcher.agents "
+                    " WHERE status = 'running' AND phase = %s LIMIT 1",
+                    (name,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return True
+        return row is not None
+
+    def _count_merges_since(self, since: datetime | None) -> int:
+        """Count agents with merged_at > *since* (or all-time when None).
+
+        Used by the ``every_n_merges`` trigger kind. Fail-closed: a DB
+        error returns 0 so we skip the fire rather than over-count.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+        try:
+            with self._conn.cursor() as cur:
+                if since is None:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM dispatcher.agents "
+                        " WHERE merged_at IS NOT NULL"
+                    )
+                else:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM dispatcher.agents "
+                        " WHERE merged_at IS NOT NULL "
+                        "   AND merged_at > %s",
+                        (since,),
+                    )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _spawn_scheduled_skill_agent(
+        self, *, name: str, skill_invocation: str
+    ) -> str | None:
+        """INSERT a synthetic agent row + dispatch via the agent-runner.
+
+        Synthetic agents are scheduled-skill agents (audit, spotcheck,
+        etc.). They differ from normal agents in that:
+
+        * ``issue_number`` is NULL — the skill itself decides what to
+          act on (e.g. /audit reads recent merged PRs from GitHub).
+        * ``kind = 'scheduled_skill'`` — distinguishes them in the
+          admin cockpit and from rate-limit + queue-scan filters.
+        * ``phase = <name>`` from the start (no ``claiming``); the
+          agent-runner-entrypoint dispatches ``phase`` directly to
+          ``claude -p <skill_invocation>``.
+        * ``execution_mode = 'ecs'`` always — the agent-runner Fargate
+          path is the only one wired for synthetic skills (the legacy
+          subprocess path is being deprecated).
+
+        Returns the new agent_id on success or None on failure.
+        """
+        agent_id = str(uuid.uuid4())
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dispatcher.agents "
+                    "    (agent_id, parent_run_id, kind, issue_number, "
+                    "     issue_title, worktree_path, phase, status, "
+                    "     execution_mode) "
+                    "VALUES (%s, %s, 'scheduled_skill', NULL, %s, '', "
+                    "        %s, 'running', 'ecs')",
+                    (
+                        agent_id,
+                        self._run_id,
+                        f"scheduled_skill:{name}",
+                        name,
+                    ),
+                )
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            self._log.exception(
+                "daemon.scheduled_skill_insert_failed",
+                extra={
+                    "event": "scheduled_skill_insert_failed",
+                    "run_id": self._run_id,
+                    "skill_name": name,
+                    "agent_id": agent_id,
+                },
+            )
+            return None
+
+        # Dispatch via the existing agent-runner ECS launch path.
+        # ``issue_number=None`` is fine; the entrypoint reads phase
+        # from ``dispatcher.agents`` and never needs an issue context
+        # for synthetic skills.
+        task_arn = self._launch_agent_ecs_task(agent_id, None)
+        if task_arn is None:
+            # Launch failed — mark the agent terminal so it doesn't
+            # haunt the active count. We use the unified failure
+            # path so the diagnoser can pick it up if needed.
+            self._log.warning(
+                "daemon.scheduled_skill_launch_failed",
+                extra={
+                    "event": "scheduled_skill_launch_failed",
+                    "run_id": self._run_id,
+                    "skill_name": name,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE dispatcher.agents "
+                        "   SET status = 'failed', "
+                        "       phase = 'scheduled_skill_launch_failed' "
+                        " WHERE agent_id = %s",
+                        (agent_id,),
+                    )
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+            return None
+        return agent_id
+
+    def _update_scheduled_skill_last_fire(
+        self, name: str, agent_id: str, fired_at: datetime
+    ) -> None:
+        """UPDATE the scheduled_skills row's last_triggered_* columns."""
+        assert self._conn is not None, "connect() must run before writing"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.scheduled_skills "
+                    "   SET last_triggered_at = %s, "
+                    "       last_triggered_agent_id = %s "
+                    " WHERE name = %s",
+                    (fired_at, agent_id, name),
+                )
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            self._log.exception(
+                "daemon.scheduled_skill_update_failed",
+                extra={
+                    "event": "scheduled_skill_update_failed",
+                    "run_id": self._run_id,
+                    "skill_name": name,
+                    "agent_id": agent_id,
+                },
+            )
+
     # ── supervisor tick (every ``tick_supervisor_seconds``) ─────────────
 
     def supervisor_tick(self) -> dict[str, int]:
@@ -20788,6 +21286,30 @@ class DispatcherDaemon:
                 },
             )
 
+        # Issue #3374 — generalized scheduled-skills tick. Iterates
+        # ``dispatcher.scheduled_skills`` and fires due skills (audit,
+        # spotcheck, future periodic skills). The pass owns its own
+        # exception handling per row; this outer try/except is a
+        # belt-and-braces catch so a daemon-level bug never breaks the
+        # supervisor heartbeat below.
+        scheduled_skills_summary: dict[str, int] = {
+            "rows_scanned": 0,
+            "fires_succeeded": 0,
+            "fires_skipped_cap": 0,
+            "fires_skipped_collision": 0,
+            "fires_failed": 0,
+        }
+        try:
+            scheduled_skills_summary = self._scheduled_skills_tick()
+        except Exception:
+            self._log.exception(
+                "daemon.scheduled_skills_tick_failed",
+                extra={
+                    "event": "scheduled_skills_tick_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
         self._supervisor_ticks += 1
         self._last_heartbeat_at = datetime.now(UTC)
 
@@ -20812,6 +21334,22 @@ class DispatcherDaemon:
                 "rate_skip_active": rate_skip_active,
                 "diagnoses_ran": diagnoses_ran,
                 "diagnoses_reaped": diagnoses_reaped,
+                # #3374 — generalized scheduled-skills tick observability.
+                "scheduled_skills_rows_scanned": scheduled_skills_summary[
+                    "rows_scanned"
+                ],
+                "scheduled_skills_fires_succeeded": scheduled_skills_summary[
+                    "fires_succeeded"
+                ],
+                "scheduled_skills_fires_skipped_cap": scheduled_skills_summary[
+                    "fires_skipped_cap"
+                ],
+                "scheduled_skills_fires_skipped_collision": scheduled_skills_summary[
+                    "fires_skipped_collision"
+                ],
+                "scheduled_skills_fires_failed": scheduled_skills_summary[
+                    "fires_failed"
+                ],
             },
         )
         return {
@@ -20823,6 +21361,18 @@ class DispatcherDaemon:
             "rate_skip_active": 1 if rate_skip_active else 0,
             "diagnoses_ran": diagnoses_ran,
             "diagnoses_reaped": diagnoses_reaped,
+            # #3374 — generalized scheduled-skills tick observability.
+            "scheduled_skills_rows_scanned": scheduled_skills_summary["rows_scanned"],
+            "scheduled_skills_fires_succeeded": scheduled_skills_summary[
+                "fires_succeeded"
+            ],
+            "scheduled_skills_fires_skipped_cap": scheduled_skills_summary[
+                "fires_skipped_cap"
+            ],
+            "scheduled_skills_fires_skipped_collision": scheduled_skills_summary[
+                "fires_skipped_collision"
+            ],
+            "scheduled_skills_fires_failed": scheduled_skills_summary["fires_failed"],
         }
 
     # ── heartbeat metric emission (supervisor-tick step 3) ──────────────

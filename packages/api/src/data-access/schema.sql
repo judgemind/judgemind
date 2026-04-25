@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 47 migrations.
+-- Generated from 48 migrations.
 
 
 
@@ -723,6 +723,39 @@ COMMENT ON COLUMN dispatcher.runs.heartbeat_ts IS 'Daemon updates every tick. Cl
 COMMENT ON COLUMN dispatcher.runs.version_sha IS 'Git SHA of the daemon build; supports forensic questions after a crash.';
 
 
+CREATE TABLE dispatcher.scheduled_skills (
+    name text NOT NULL,
+    skill_invocation text NOT NULL,
+    trigger_kind text NOT NULL,
+    trigger_value text NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    last_triggered_at timestamp with time zone,
+    last_triggered_agent_id uuid,
+    notes text
+);
+
+
+COMMENT ON TABLE dispatcher.scheduled_skills IS 'Generalized cron-like scheduler rows (issue #3374). Daemon iterates enabled=true rows on every supervisor tick; per row computes whether now() >= next-fire-time (for cron) or merged-since-last-fire >= N (for every_n_merges) and spawns a synthetic dispatcher.agents row with phase=<name>. The agent-runner-entrypoint dispatches phase into claude -p <skill_invocation>.';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.name IS 'PRIMARY KEY. Also the value the daemon writes to dispatcher.agents.phase on the synthetic row, so the agent-runner entrypoint can route phase=<name> to claude -p <skill_invocation>.';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.skill_invocation IS 'Slash-command form of the skill (e.g. ''/audit'', ''/spotcheck''). The agent-runner entrypoint passes this verbatim to ``claude -p <skill_invocation> <agent_id>``.';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.trigger_kind IS 'One of ''cron'' (trigger_value is a 5-field cron expression) or ''every_n_merges'' (trigger_value is integer N as string — fire when N agents have merged since last_triggered_at).';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.trigger_value IS 'Per-trigger-kind value. For cron: 5-field expression. For every_n_merges: integer N as string. TEXT so future trigger kinds can encode whatever they need without a schema migration.';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.last_triggered_at IS 'Timestamp of the last fire. NULL means never fired (the daemon treats NULL-cron as "compute next fire from now()" and NULL-N as "count merges from row INSERT time").';
+
+
+COMMENT ON COLUMN dispatcher.scheduled_skills.last_triggered_agent_id IS 'agent_id of the dispatcher.agents row spawned by the last fire. FK ON DELETE SET NULL so a rare agents cleanup doesn''t cascade.';
+
+
 CREATE TABLE dispatcher.terminal_outcomes (
     outcome_id bigint NOT NULL,
     agent_id uuid,
@@ -1100,6 +1133,10 @@ ALTER TABLE ONLY dispatcher.retry_markers
 
 ALTER TABLE ONLY dispatcher.runs
     ADD CONSTRAINT runs_pkey PRIMARY KEY (run_id);
+
+
+ALTER TABLE ONLY dispatcher.scheduled_skills
+    ADD CONSTRAINT scheduled_skills_pkey PRIMARY KEY (name);
 
 
 ALTER TABLE ONLY dispatcher.terminal_outcomes
@@ -1511,6 +1548,10 @@ ALTER TABLE ONLY dispatcher.ralph_patches
 
 ALTER TABLE ONLY dispatcher.retry_markers
     ADD CONSTRAINT retry_markers_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES dispatcher.agents(agent_id);
+
+
+ALTER TABLE ONLY dispatcher.scheduled_skills
+    ADD CONSTRAINT scheduled_skills_last_triggered_agent_id_fkey FOREIGN KEY (last_triggered_agent_id) REFERENCES dispatcher.agents(agent_id) ON DELETE SET NULL;
 
 
 ALTER TABLE ONLY dispatcher.unrecognized_diagnoser_actions
