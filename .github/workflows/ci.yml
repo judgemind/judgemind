@@ -471,7 +471,7 @@ jobs:
       # subagent inside the dispatcher container) cannot accidentally migrate
       # the operational dev RDS database. See #3006.
       TEST_DATABASE_URL: postgresql://judgemind:localdev@localhost:5432/judgemind
-      OPENSEARCH_URL: http://localhost:9200
+      TEST_OPENSEARCH_URL: http://localhost:9200
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -1001,6 +1001,17 @@ jobs:
         run: scripts/check-no-test-database-url-fallback.sh
 
   # ---------------------------------------------------------------
+  # OpenSearch URL fallback guard: api tests must read
+  # TEST_OPENSEARCH_URL, not the operational OPENSEARCH_URL
+  # ---------------------------------------------------------------
+  opensearch-url-fallback-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check api tests consult TEST_OPENSEARCH_URL, not the operational env var
+        run: scripts/check-no-opensearch-url-fallback.sh
+
+  # ---------------------------------------------------------------
   # GitHub API call guard: api container src must not call GitHub (#2839)
   # ---------------------------------------------------------------
   no-api-github-fetch-check:
@@ -1417,7 +1428,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
