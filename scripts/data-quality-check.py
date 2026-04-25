@@ -92,7 +92,7 @@ def _resolve_baselines_path() -> Path:
 # Thresholds
 INGEST_DROP_THRESHOLD = 0.5  # Flag if below 50% of 7-day average
 DAILY_SCRAPER_STALE_HOURS = (
-    26  # Must exceed the 24h daily schedule interval (+ 2h buffer for runtime/skew)
+    25  # Aligned with dashboard DEFAULT_RED_HOURS (data-quality.ts).
 )
 FREQUENT_SCRAPER_STALE_HOURS = 2
 
