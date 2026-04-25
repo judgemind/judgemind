@@ -135,6 +135,9 @@ def _patch_ralph_helpers(
     d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._write_failure = MagicMock()  # type: ignore[method-assign]
+    # _run_ralph_phase now reads plan output from DB via _fetch_phase_output (#2975).
+    d._fetch_phase_output = MagicMock(return_value={})  # type: ignore[method-assign]
+    d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
 
 # --------------------------------------------------------------------------
@@ -254,9 +257,11 @@ class TestRunRalphPhaseAcInfeasible:
         # No failure row written, no terminal mark.
         d._write_failure.assert_not_called()  # type: ignore[union-attr]
         d._mark_agent_terminal.assert_not_called()  # type: ignore[union-attr]
-        # Ralph output stashed for summary phase.
-        assert d._agent_ralph_output is not None
-        assert d._agent_ralph_output.get("verdict") == "SHIP"
+        # Ralph output persisted to DB via _persist_phase_output (#2975).
+        d._persist_phase_output.assert_called_once()  # type: ignore[union-attr]
+        persisted_args = d._persist_phase_output.call_args.args  # type: ignore[union-attr]
+        assert persisted_args[1] == "ralph"
+        assert persisted_args[2].get("verdict") == "SHIP"
 
     def test_blocked_verdict_does_not_write_ac_infeasible_failure(
         self, tmp_path: Path

@@ -362,12 +362,15 @@ class TestSelfDeployDetectionPrePush:
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
 
-        d._agent_summary_output = {  # type: ignore[attr-defined]
-            "commit_message": "feat(dispatcher): split terminal success (#2953)",
-            "pr_title": "feat(dispatcher): split terminal success",
-            "pr_body_md": "body",
-        }
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(
+            return_value={  # type: ignore[method-assign]
+                "commit_message": "feat(dispatcher): split terminal success (#2953)",
+                "pr_title": "feat(dispatcher): split terminal success",
+                "pr_body_md": "body",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         worktree = tmp_path / "worktree"
         worktree.mkdir()
@@ -460,12 +463,15 @@ class TestSelfDeployDetectionPrePush:
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
 
-        d._agent_summary_output = {  # type: ignore[attr-defined]
-            "commit_message": "feat(web): new feature",
-            "pr_title": "feat(web): new feature",
-            "pr_body_md": "body",
-        }
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(
+            return_value={  # type: ignore[method-assign]
+                "commit_message": "feat(web): new feature",
+                "pr_title": "feat(web): new feature",
+                "pr_body_md": "body",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         worktree = tmp_path / "worktree"
         worktree.mkdir()
@@ -538,12 +544,15 @@ class TestSelfDeployDetectionPrePush:
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
 
-        d._agent_summary_output = {  # type: ignore[attr-defined]
-            "commit_message": "x",
-            "pr_title": "x",
-            "pr_body_md": "x",
-        }
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(
+            return_value={  # type: ignore[method-assign]
+                "commit_message": "x",
+                "pr_title": "x",
+                "pr_body_md": "x",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         worktree = tmp_path / "worktree"
         worktree.mkdir()

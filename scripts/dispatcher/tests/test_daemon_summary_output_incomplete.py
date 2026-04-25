@@ -139,10 +139,10 @@ def _patch_push_and_open_pr_helpers(
     d._is_noop_ship = MagicMock(return_value=is_noop)  # type: ignore[method-assign]
     d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
-    # Stash the summary output the caller wants ``_push_and_open_pr`` to
-    # see (normally written by ``_run_summary_phase``).
-    d._agent_summary_output = summary_output
-    d._agent_unmet_criteria = []
+    # Supply the summary output via _fetch_phase_output — _push_and_open_pr
+    # now reads from DB rather than an in-memory stash (#2975).
+    d._fetch_phase_output = MagicMock(return_value=summary_output)  # type: ignore[method-assign]
+    d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
 
 # --------------------------------------------------------------------------

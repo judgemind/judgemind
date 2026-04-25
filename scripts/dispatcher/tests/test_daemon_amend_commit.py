@@ -116,14 +116,19 @@ def _make_daemon(tmp_path: Path) -> tuple[daemon.DispatcherDaemon, _FakeConnecti
     return d, conn
 
 
+_SUMMARY_OUTPUT = {
+    "commit_message": "feat(dispatcher): ralph-commits-daemon-amends (#2971)",
+    "pr_title": "feat(dispatcher): ralph-commits-daemon-amends (#2971)",
+    "pr_body_md": "body",
+    "unmet_criteria": [],
+}
+
+
 def _prep_daemon_for_push(d: daemon.DispatcherDaemon) -> None:
     """Stub the DB methods ``_push_and_open_pr`` calls into no-ops."""
-    d._agent_summary_output = {  # type: ignore[attr-defined]
-        "commit_message": "feat(dispatcher): ralph-commits-daemon-amends (#2971)",
-        "pr_title": "feat(dispatcher): ralph-commits-daemon-amends (#2971)",
-        "pr_body_md": "body",
-    }
-    d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+    # _push_and_open_pr now reads summary output from DB via _fetch_phase_output (#2975).
+    d._fetch_phase_output = MagicMock(return_value=_SUMMARY_OUTPUT)  # type: ignore[method-assign]
+    d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
@@ -302,7 +307,7 @@ class TestPushAndOpenPrUsesAmend:
         write to the rewritten commit."""
         d, _conn = _make_daemon(tmp_path)
         _prep_daemon_for_push(d)
-        expected_msg = d._agent_summary_output["commit_message"]  # type: ignore[index]
+        expected_msg = _SUMMARY_OUTPUT["commit_message"]
 
         worktree = tmp_path / "worktree"
         worktree.mkdir()

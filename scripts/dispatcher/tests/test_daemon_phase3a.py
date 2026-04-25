@@ -1961,6 +1961,16 @@ class TestHappyPathOrchestration:
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
 
+        # _fetch_phase_output is now called at each spawn site to read prior
+        # phase outputs from DB (#2975). The fake DB cursor returns None for
+        # "FROM dispatcher.phase_outputs" so we monkeypatch the method to
+        # return the same fixtures the fake_spawn writes to disk.
+        monkeypatch.setattr(
+            d,
+            "_fetch_phase_output",
+            lambda _agent_id, phase: phase_outputs.get(phase),
+        )
+
         # Run orchestration.
         d._claim_and_orchestrate_one()
 
@@ -3447,6 +3457,13 @@ class TestNeedsReviewOrchestration:
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
 
+        # _fetch_phase_output is now called at each spawn site (#2975).
+        monkeypatch.setattr(
+            d,
+            "_fetch_phase_output",
+            lambda _agent_id, phase: phase_outputs.get(phase),
+        )
+
         d._claim_and_orchestrate_one()
 
         # --- AC1: draft flag present on gh pr create ---
@@ -3578,6 +3595,13 @@ class TestNeedsReviewOrchestration:
             return 0, 0.1
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+
+        # _fetch_phase_output is now called at each spawn site (#2975).
+        monkeypatch.setattr(
+            d,
+            "_fetch_phase_output",
+            lambda _agent_id, phase: phase_outputs.get(phase),
+        )
 
         d._claim_and_orchestrate_one()
 

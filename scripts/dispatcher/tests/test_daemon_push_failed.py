@@ -272,13 +272,16 @@ class TestGitPushFailedWritesFailureRow:
             stderr="pre-push: ruff check failed — 1 error",
         )
 
-        # _push_and_open_pr reads _agent_summary_output and _agent_unmet_criteria.
-        d._agent_summary_output = {  # type: ignore[attr-defined]
-            "commit_message": "feat: test commit",
-            "pr_title": "Test PR",
-            "pr_body_md": "body",
-        }
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        # _push_and_open_pr now reads summary output from DB via _fetch_phase_output (#2975).
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "commit_message": "feat: test commit",
+                "pr_title": "Test PR",
+                "pr_body_md": "body",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         # _update_agent_phase and _mark_agent_terminal do DB writes we don't
         # need to actually run in this test — stub them out.
@@ -377,12 +380,15 @@ class TestGitPushFailedWritesFailureRow:
             stderr="fatal: unable to access 'https://github.com/': Could not resolve host: github.com",
         )
 
-        d._agent_summary_output = {
-            "commit_message": "c",
-            "pr_title": "t",
-            "pr_body_md": "b",
-        }  # type: ignore[attr-defined]
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "commit_message": "c",
+                "pr_title": "t",
+                "pr_body_md": "b",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
@@ -463,12 +469,15 @@ class TestGitPushFailedWritesPhaseOutputRow:
         )
         push_fail = _make_push_result(returncode=1, stderr=long_stderr)
 
-        d._agent_summary_output = {
-            "commit_message": "c",
-            "pr_title": "t",
-            "pr_body_md": "b",
-        }  # type: ignore[attr-defined]
-        d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+        d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+            return_value={
+                "commit_message": "c",
+                "pr_title": "t",
+                "pr_body_md": "b",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]

@@ -207,8 +207,8 @@ class TestGitCommitFailedRouting:
         d._is_noop_ship = MagicMock(return_value=False)  # type: ignore[method-assign]
         d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
-        d._agent_summary_output = summary_output
-        d._agent_unmet_criteria = []
+        d._fetch_phase_output = MagicMock(return_value=summary_output)  # type: ignore[method-assign]
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         import subprocess  # noqa: PLC0415
 
@@ -247,12 +247,15 @@ class TestGitCommitFailedRouting:
         d._is_noop_ship = MagicMock(return_value=False)  # type: ignore[method-assign]
         d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
-        d._agent_summary_output = {
-            "commit_message": "feat(foo): bar (#3067)",
-            "pr_title": "feat(foo): bar (#3067)",
-            "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3067",
-        }
-        d._agent_unmet_criteria = []
+        d._fetch_phase_output = MagicMock(
+            return_value={  # type: ignore[method-assign]
+                "commit_message": "feat(foo): bar (#3067)",
+                "pr_title": "feat(foo): bar (#3067)",
+                "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3067",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         d._push_and_open_pr("agent-commit-exc", 3067, worktree)
 
@@ -290,12 +293,15 @@ class TestGitCommitFailedRouting:
         d._is_noop_ship = MagicMock(return_value=False)  # type: ignore[method-assign]
         d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
-        d._agent_summary_output = {
-            "commit_message": "feat(foo): bar (#3067)",
-            "pr_title": "feat(foo): bar (#3067)",
-            "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3067",
-        }
-        d._agent_unmet_criteria = []
+        d._fetch_phase_output = MagicMock(
+            return_value={  # type: ignore[method-assign]
+                "commit_message": "feat(foo): bar (#3067)",
+                "pr_title": "feat(foo): bar (#3067)",
+                "pr_body_md": "## Summary\n\nBaz.\n\nCloses #3067",
+                "unmet_criteria": [],
+            }
+        )
+        d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
 
         d._push_and_open_pr("agent-commit-nonzero", 3067, worktree)
 

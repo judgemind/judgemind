@@ -371,8 +371,9 @@ class TestPlanReuse:
         # _materialize_plan_output was called.
         d._materialize_plan_output.assert_called_once_with(worktree, _GOOD_PLAN_OUTPUT)
 
-        # _agent_plan_output is set from the reused plan.
-        assert d._agent_plan_output == _GOOD_PLAN_OUTPUT
+        # The in-memory stash was replaced by DB-read in #2975 — plan output
+        # is now persisted to dispatcher.phase_outputs and fetched via
+        # _fetch_phase_output at each spawn site.
 
         # Observability: daemon.plan_reused event logged (AC #4).
         reused_events = handler.events("plan_reused")

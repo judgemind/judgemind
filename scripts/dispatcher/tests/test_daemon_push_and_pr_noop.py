@@ -138,15 +138,18 @@ def _make_daemon(
     d._conn = conn  # type: ignore[assignment]
     d._run_id = "test-run-id"
 
-    # Supply the summary output so the non-no-op path has everything it
-    # needs to run (defensive — individual tests only exercise the no-op
-    # path where this data is never read).
-    d._agent_summary_output = {  # type: ignore[attr-defined]
-        "commit_message": "feat(dispatcher): test (#3039)",
-        "pr_title": "feat(dispatcher): test (#3039)",
-        "pr_body_md": "body",
-    }
-    d._agent_unmet_criteria = []  # type: ignore[attr-defined]
+    # Supply the summary output via _fetch_phase_output so the non-no-op
+    # path has everything it needs (defensive — individual tests only
+    # exercise the no-op path where this data is never read).
+    d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "commit_message": "feat(dispatcher): test (#3039)",
+            "pr_title": "feat(dispatcher): test (#3039)",
+            "pr_body_md": "body",
+            "unmet_criteria": [],
+        }
+    )
+    d._materialize_phase_output = MagicMock()  # type: ignore[method-assign]
     d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
     d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
     d._current_attempt_for = MagicMock(return_value=0)  # type: ignore[method-assign]
