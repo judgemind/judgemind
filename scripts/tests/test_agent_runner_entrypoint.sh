@@ -1869,6 +1869,10 @@ case "$query" in
             cat "$DB_SUMMARY_OUTPUT_FIXTURE"
         elif [[ "$query" == *"phase = 'verify'"* && -f "${DB_VERIFY_OUTPUT_FIXTURE:-}" ]]; then
             cat "$DB_VERIFY_OUTPUT_FIXTURE"
+        elif [[ "$query" == *"phase = 'plan'"* && -f "${DB_PLAN_OUTPUT_FIXTURE:-}" ]]; then
+            cat "$DB_PLAN_OUTPUT_FIXTURE"
+        elif [[ "$query" == *"phase = 'ralph'"* && -f "${DB_RALPH_OUTPUT_FIXTURE:-}" ]]; then
+            cat "$DB_RALPH_OUTPUT_FIXTURE"
         fi
         exit 0
         ;;
@@ -1985,6 +1989,8 @@ DATABASE_URL="postgres://test" \
     PATH="$STUB_BIN:$PATH" \
     INVOCATIONS_DIR="$INVOCATIONS_DIR" \
     GH_ISSUE_FIXTURE="$GH_ISSUE_FIXTURE" \
+    DB_RALPH_OUTPUT_FIXTURE="$t17_repo/tmp/dispatcher-output/ralph.json" \
+    DB_PLAN_OUTPUT_FIXTURE="$t17_repo/tmp/dispatcher-output/plan.json" \
     python3 "$SHIM_PY" summary "17171717-1717-1717-1717-171717171717" 3135 "$t17_repo" \
     >/dev/null 2>&1
 t17_rc=$?
@@ -2096,6 +2102,7 @@ DATABASE_URL="postgres://test" \
     GH_RUN_LOG_FIXTURE="$GH_RUN_LOG_FIXTURE" \
     DB_AGENT_PR_NUMBER="4242" \
     DB_AGENT_RETRIES_USED="2" \
+    DB_PLAN_OUTPUT_FIXTURE="$t18_repo/tmp/dispatcher-output/plan.json" \
     python3 "$SHIM_PY" fix-ci "18181818-1818-1818-1818-181818181818" 3135 "$t18_repo" \
     >/dev/null 2>&1
 t18_rc=$?
@@ -2230,6 +2237,7 @@ DATABASE_URL="postgres://test" \
     GH_RUN_LIST_FIXTURE="$GH_RUN_LIST_FIXTURE" \
     DB_AGENT_PR_NUMBER="5050" \
     DB_SUMMARY_OUTPUT_FIXTURE="$DB_SUMMARY_OUTPUT_FIXTURE" \
+    DB_PLAN_OUTPUT_FIXTURE="$t19_repo/tmp/dispatcher-output/plan.json" \
     python3 "$SHIM_PY" verify "19191919-1919-1919-1919-191919191919" 3135 "$t19_repo" \
     >/dev/null 2>&1
 t19_rc=$?
@@ -2333,6 +2341,7 @@ DATABASE_URL="postgres://test" \
     DB_PHASE_TRANSITIONS_FIXTURE="$DB_PHASE_TRANSITIONS_FIXTURE" \
     DB_FAILURES_FIXTURE="$DB_FAILURES_FIXTURE" \
     DB_VERIFY_OUTPUT_FIXTURE="$DB_VERIFY_OUTPUT_FIXTURE" \
+    DB_PLAN_OUTPUT_FIXTURE="$t20_repo/tmp/dispatcher-output/plan.json" \
     python3 "$SHIM_PY" retro "20202020-2020-2020-2020-202020202020" 3135 "$t20_repo" \
     >/dev/null 2>&1
 t20_rc=$?
