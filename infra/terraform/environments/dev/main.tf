@@ -304,6 +304,11 @@ module "dispatcher_daemon" {
   # region or account-id segment, so hard-coding is safe here.
   oneshot_script_bucket_arn          = "arn:aws:s3:::judgemind-assets-dev"
   oneshot_ecr_scraper_repository_arn = module.ecr.repository_arn
+  # #3050 — grant the daemon's task role `s3:ListBucket` on the document-
+  # archive bucket so data-task agents can run pre/post rebuild census
+  # queries from the daemon context. The `iam_scraper` role already has
+  # ListBucket for in-task use; this wiring is for the daemon container.
+  document_archive_bucket_arn = module.document_archive.bucket_arn
 
   # Heartbeat alarm wired to the shared SNS topic once the daemon starts
   # emitting HeartbeatAge (Phase 2). Kept enabled in Phase 1 so the alarm
