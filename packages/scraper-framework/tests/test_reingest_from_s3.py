@@ -2132,13 +2132,35 @@ class TestBuildFilters:
         assert params == []
 
     def test_department_in_adds_clause(self) -> None:
-        """Passing a non-empty department_in list emits the EXISTS subquery and
-        appends the list as the corresponding param."""
+        """Passing a non-empty department_in list emits the EXISTS subquery for
+        the any-ruling semantic and appends the list as the corresponding param."""
         depts = ["C32", "C11"]
         clauses, params = reingest._build_filters(None, None, None, department_in=depts)
         assert "AND EXISTS" in clauses
         assert "r.department = ANY(%s)" in clauses
         assert depts in params
+
+    def test_department_in_uses_any_ruling_semantic_not_latest(self) -> None:
+        """The --department-in filter uses an EXISTS subquery that matches a
+        document if *any* of its rulings has the given department — not just
+        the latest ruling.  The SQL must contain EXISTS and r.department =
+        ANY(%s), and must NOT use LATERAL or ORDER BY ruled_on DESC (which
+        would imply a latest-ruling join)."""
+        depts = ["C11"]
+        clauses, params = reingest._build_filters(None, None, None, department_in=depts)
+        # Confirm the any-ruling shape is present
+        assert "EXISTS" in clauses
+        assert "r.department = ANY(%s)" in clauses
+        # Confirm no latest-ruling join is used
+        assert "LATERAL" not in clauses
+        assert "ORDER BY ruled_on DESC" not in clauses
+        # A second selector value produces the same clause shape
+        depts2 = ["C99"]
+        clauses2, params2 = reingest._build_filters(None, None, None, department_in=depts2)
+        assert "EXISTS" in clauses2
+        assert "r.department = ANY(%s)" in clauses2
+        assert "LATERAL" not in clauses2
+        assert "ORDER BY ruled_on DESC" not in clauses2
 
     def test_department_in_none_no_clause(self) -> None:
         """Passing department_in=None emits no clause."""

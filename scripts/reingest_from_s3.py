@@ -3698,10 +3698,10 @@ def main() -> None:
         default=None,
         dest="department_in",
         help=(
-            "Only re-ingest documents whose latest ruling has a department "
-            "matching one of these values. Values must match rulings.department "
-            "exactly (case-sensitive). Useful for targeting specific courtrooms "
-            "without processing the entire county, e.g. "
+            "Only re-ingest documents that have at least one ruling whose "
+            "department matches one of these values. Values must match "
+            "rulings.department exactly (case-sensitive). Useful for targeting "
+            "specific courtrooms without processing the entire county, e.g. "
             "--department-in C11 C20 C32. Applies an EXISTS subquery against "
             "the rulings table."
         ),
