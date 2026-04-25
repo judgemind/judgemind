@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 44 migrations.
+-- Generated from 48 migrations.
 
 
 
@@ -479,7 +479,8 @@ CREATE TABLE dispatcher.diagnoses (
     started_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
     actions_taken jsonb,
-    next_directive text
+    next_directive text,
+    subprocess_pid integer
 );
 
 
@@ -487,6 +488,9 @@ COMMENT ON COLUMN dispatcher.diagnoses.actions_taken IS 'Structured action log w
 
 
 COMMENT ON COLUMN dispatcher.diagnoses.next_directive IS '3-state daemon-consumed directive (issue #3366). Values: "respawn_at=<phase>" — daemon spawns a new agent-runner with START_PHASE=<phase>; "terminal" — diagnoser explicitly done, free the slot; NULL — diagnoser did not complete, fall back to escalate AND emit diagnoser_did_not_complete. Distinguishable from terminal is the key invariant.';
+
+
+COMMENT ON COLUMN dispatcher.diagnoses.subprocess_pid IS 'OS PID of the diagnoser subprocess (issue #3376). Written by supervisor_tick when it fires the async spawn; read by the reap pass to check liveness via os.kill(pid, 0) and to enforce the 90-min wall-clock budget. NULL means the row has not been spawned yet (or has already been reaped to a terminal status).';
 
 
 CREATE SEQUENCE dispatcher.diagnoses_diagnosis_id_seq
@@ -1288,6 +1292,9 @@ CREATE INDEX idx_dispatcher_diagnoses_agent_id ON dispatcher.diagnoses USING btr
 
 
 CREATE INDEX idx_dispatcher_diagnoses_pending ON dispatcher.diagnoses USING btree (status) WHERE (status = 'pending'::text);
+
+
+CREATE INDEX idx_dispatcher_diagnoses_pending_pid ON dispatcher.diagnoses USING btree (subprocess_pid) WHERE ((status = 'pending'::text) AND (subprocess_pid IS NOT NULL));
 
 
 CREATE INDEX idx_dispatcher_failures_category_ts ON dispatcher.failures USING btree (category, ts DESC);
