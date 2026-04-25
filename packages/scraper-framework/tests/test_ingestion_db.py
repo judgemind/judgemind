@@ -2084,6 +2084,110 @@ class TestInsertRulingContentDedup:
         assert "SAVEPOINT ruling_insert" in sql_stmts
         assert "RELEASE SAVEPOINT ruling_insert" in sql_stmts
 
+    def test_supersede_context_select_failure_does_not_abort_supersede(self) -> None:
+        """A failing context SELECT must not abort the supersede — SAVEPOINT protects it.
+
+        When ``cur.execute`` raises on the context lookup, the primary supersede
+        (DELETE FROM rulings + UPDATE documents) must still run, and
+        ``ROLLBACK TO SAVEPOINT supersede_ctx`` must have been issued.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        unique_exc = psycopg.errors.UniqueViolation(
+            "duplicate key value violates unique constraint"
+        )
+        context_exc = psycopg.errors.QueryCanceled("query was canceled")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise unique_exc
+            if "SELECT c.county" in sql:
+                raise context_exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        # Winner lookup returns a row; context lookup raises (never reaches fetchone).
+        cur.fetchone = MagicMock(return_value=("winner-doc-id",))
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        sql_stmts = [call[0][0] for call in execute_calls]
+
+        # SAVEPOINT was issued before the context SELECT.
+        assert "SAVEPOINT supersede_ctx" in sql_stmts
+        # ROLLBACK was issued because the SELECT raised.
+        assert "ROLLBACK TO SAVEPOINT supersede_ctx" in sql_stmts
+        # Primary supersede still ran.
+        assert any("DELETE FROM rulings" in s for s in sql_stmts), (
+            "DELETE FROM rulings must run even when context SELECT raises."
+        )
+        assert any("UPDATE documents" in s and "superseded" in s for s in sql_stmts), (
+            "UPDATE documents … superseded must run even when context SELECT raises."
+        )
+
+    def test_supersede_metric_insert_failure_does_not_abort_supersede(self) -> None:
+        """A failing metric INSERT must not abort the supersede — SAVEPOINT protects it.
+
+        When ``cur.execute`` raises on the ``data_quality_metrics`` INSERT, the
+        outer UPDATE documents must already have run (it precedes the metric write),
+        and ``ROLLBACK TO SAVEPOINT supersede_metric`` must have been issued.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        unique_exc = psycopg.errors.UniqueViolation(
+            "duplicate key value violates unique constraint"
+        )
+        metric_exc = Exception("metric insert failure")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise unique_exc
+            if "INSERT INTO data_quality_metrics" in sql:
+                raise metric_exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        # Winner lookup returns a row; county lookup returns a county.
+        cur.fetchone = MagicMock(
+            side_effect=[
+                ("winner-doc-id",),
+                ("Contra Costa", "ca-contra_costa/some.pdf"),
+            ]
+        )
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        sql_stmts = [call[0][0] for call in execute_calls]
+
+        # SAVEPOINT was issued before the metric INSERT.
+        assert "SAVEPOINT supersede_metric" in sql_stmts
+        # ROLLBACK was issued because the INSERT raised.
+        assert "ROLLBACK TO SAVEPOINT supersede_metric" in sql_stmts
+        # Primary supersede UPDATE ran (precedes metric write).
+        assert any("UPDATE documents" in s and "superseded" in s for s in sql_stmts), (
+            "UPDATE documents … superseded must have run before metric INSERT attempted."
+        )
+
 
 # ---------------------------------------------------------------------------
 # _is_all_caps_title
