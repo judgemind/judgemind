@@ -1760,6 +1760,9 @@ def insert_ruling(
         # Fetch county and s3_key for the loser so we can emit a
         # per-county telemetry metric and a structured WARN log.  Best-
         # effort — failure to fetch doesn't prevent the supersede.
+        # Savepoint-protected so a transient error doesn't abort the outer
+        # transaction (mirrors the zero_ruling_metric pattern in worker.py).
+        cur.execute("SAVEPOINT supersede_ctx")
         try:
             cur.execute(
                 "SELECT c.county, d.s3_key FROM documents d "
@@ -1771,8 +1774,9 @@ def insert_ruling(
             if ctx_row is not None:
                 county_for_metric = ctx_row[0]
                 s3_key_for_log = ctx_row[1]
+            cur.execute("RELEASE SAVEPOINT supersede_ctx")
         except Exception:  # noqa: BLE001 — telemetry lookup is best-effort
-            pass
+            cur.execute("ROLLBACK TO SAVEPOINT supersede_ctx")
 
         cur.execute(
             "DELETE FROM rulings WHERE document_id = %s::uuid",
@@ -1806,7 +1810,10 @@ def insert_ruling(
         # (e.g. the document row doesn't exist yet in this transaction's
         # visible snapshot), skip — we don't want a telemetry write to
         # break the primary supersede path.
+        # Savepoint-protected so a transient error doesn't abort the outer
+        # transaction (mirrors the zero_ruling_metric pattern in worker.py).
         if county_for_metric is not None:
+            cur.execute("SAVEPOINT supersede_metric")
             try:
                 cur.execute(
                     """
@@ -1829,8 +1836,9 @@ def insert_ruling(
                         ),
                     ),
                 )
+                cur.execute("RELEASE SAVEPOINT supersede_metric")
             except Exception:  # noqa: BLE001 — telemetry is best-effort
-                pass
+                cur.execute("ROLLBACK TO SAVEPOINT supersede_metric")
 
     logger.warning(
         "insert_ruling: content-hash dedup — superseded losing document",
