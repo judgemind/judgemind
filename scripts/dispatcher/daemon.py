@@ -11812,6 +11812,9 @@ class DispatcherDaemon:
         # (best-effort, non-blocking).
         fetch_ok = False
         try:
+            # cold-path (#3089): best-effort pre-push fetch; on failure we fall
+            # through to push rather than retry — retrying a failing fetch here
+            # would add latency without changing the outcome.
             fetch_result = subprocess.run(
                 ["git", "-C", str(worktree), "fetch", "origin", "main"],
                 capture_output=True,
@@ -11845,6 +11848,8 @@ class DispatcherDaemon:
 
         if fetch_ok:
             try:
+                # cold-path (#3089): one-shot rebase; on conflict we abort and
+                # fail the push — retrying the rebase would not resolve conflicts.
                 rebase_result = subprocess.run(
                     ["git", "-C", str(worktree), "rebase", "origin/main"],
                     capture_output=True,
@@ -11864,6 +11869,7 @@ class DispatcherDaemon:
                 else:
                     # Capture conflicting files before aborting — markers
                     # are in the index during the conflicted rebase.
+                    # cold-path (#3089): local index read, no network — retry adds no value.
                     conflict_files_result = subprocess.run(
                         [
                             "git",
@@ -11882,6 +11888,7 @@ class DispatcherDaemon:
                         for f in conflict_files_result.stdout.strip().splitlines()
                         if f
                     ]
+                    # cold-path (#3089): cleanup abort, no network — retry adds no value.
                     subprocess.run(
                         ["git", "-C", str(worktree), "rebase", "--abort"],
                         capture_output=True,
