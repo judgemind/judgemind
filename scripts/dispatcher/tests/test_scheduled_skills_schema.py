@@ -18,7 +18,7 @@ MIGRATION_PATH = (
     / "packages"
     / "api"
     / "migrations"
-    / "47_dispatcher-scheduled-skills.sql"
+    / "48_dispatcher-scheduled-skills.sql"
 )
 
 
@@ -28,7 +28,7 @@ def _migration_text() -> str:
 
 def test_migration_file_exists() -> None:
     assert MIGRATION_PATH.is_file(), (
-        f"expected migration file at {MIGRATION_PATH}; issue #3374 ships migration 47"
+        f"expected migration file at {MIGRATION_PATH}; issue #3374 ships migration 48"
     )
 
 
