@@ -282,6 +282,12 @@ BLOCKED_SCAN_EVERY_N_TICKS = 4
 #: ``QUEUE_SCAN_PAGE_LIMIT`` so a single ``gh`` call always suffices.
 BLOCKED_SCAN_PAGE_LIMIT = 200
 
+#: Maximum number of unique blocker-issue numbers for which we fetch titles in a
+#: single scan tick. Numbers beyond this cap receive ``title=None`` silently.
+#: Guards against O(N × timeout) latency in ``_fetch_issue_titles_for_blockers``
+#: when GitHub is rate-limited and N is large (issue #2989).
+MAX_BLOCKER_TITLE_FETCH = 20
+
 #: Default CloudWatch metric namespace. Matches the terraform module's
 #: ``task_put_metric`` policy condition
 #: (``cloudwatch:namespace = Judgemind/Dispatcher``).
@@ -1870,6 +1876,7 @@ def _normalize_issue_enrichment(
     issue: dict[str, Any],
     *,
     include_body: bool = False,
+    blocker_title_lookup: dict[int, str | None] | None = None,
 ) -> dict[str, Any]:
     """Project a ``gh issue list``-shaped dict into the enrichment record.
 
@@ -1893,11 +1900,20 @@ def _normalize_issue_enrichment(
           "body":      <str | null>,    # so the API can parse
                                         # ``Blocked by #N`` without a
                                         # GitHub call
+          # when include_body=True AND blocker_title_lookup provided:
+          "blockedBy": [{"number": int, "title": str | null}, ...],
+                                        # enriched blocker refs (issue #2989)
         }
 
     ``gh`` sometimes omits keys on error responses; callers should
     already have filtered to dict-shaped entries before calling this.
+
+    ``blocker_title_lookup`` is injected by ``_scan_blocked_and_snapshot``
+    so this function stays pure — the lookup is built one level up and
+    shared across all issues in the tick (issue #2989).
     """
+    import re  # noqa: PLC0415 — lazy import
+
     number = issue.get("number")
     title = issue.get("title") if isinstance(issue.get("title"), str) else ""
     created_at = (
@@ -1922,6 +1938,17 @@ def _normalize_issue_enrichment(
     if include_body:
         body = issue.get("body")
         record["body"] = body if isinstance(body, str) else None
+        # Build blockedBy when a lookup is provided (issue #2989).
+        if blocker_title_lookup is not None:
+            body_str = body if isinstance(body, str) else ""
+            blocker_numbers = [
+                int(m)
+                for m in re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body_str)
+            ]
+            record["blockedBy"] = [
+                {"number": n, "title": blocker_title_lookup.get(n)}
+                for n in blocker_numbers
+            ]
     return record
 
 
@@ -3740,6 +3767,27 @@ class DispatcherDaemon:
             )
             return -1
 
+        # Collect all unique blocker numbers across the whole tick so we can
+        # fetch titles in one deduped pass (issue #2989).
+        all_blocker_numbers: set[int] = set()
+        for issue in issues:
+            body = issue.get("body") or ""
+            all_blocker_numbers.update(self._parse_blocked_by(body))
+
+        try:
+            blocker_title_lookup = self._fetch_issue_titles_for_blockers(
+                all_blocker_numbers
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.blocker_title_fetch_unexpected_error",
+                extra={
+                    "event": "blocker_title_fetch_unexpected_error",
+                    "run_id": self._run_id,
+                },
+            )
+            blocker_title_lookup = {}
+
         issue_numbers: list[int] = []
         issues_enriched: list[dict[str, Any]] = []
         for issue in issues:
@@ -3748,7 +3796,11 @@ class DispatcherDaemon:
                 continue
             issue_numbers.append(number)
             issues_enriched.append(
-                _normalize_issue_enrichment(issue, include_body=True)
+                _normalize_issue_enrichment(
+                    issue,
+                    include_body=True,
+                    blocker_title_lookup=blocker_title_lookup,
+                )
             )
         blocked_depth = len(issue_numbers)
 
@@ -5821,6 +5873,61 @@ class DispatcherDaemon:
 
         matches = re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body)
         return [int(m) for m in matches]
+
+    def _fetch_issue_titles_for_blockers(
+        self, numbers: set[int]
+    ) -> dict[int, str | None]:
+        """Fetch issue titles for a set of blocker issue numbers.
+
+        One ``gh issue view <N> --json number,title`` call per unique number,
+        routed through ``_subprocess_with_retry`` with
+        ``event_name='blocker_title_fetch'``. Returns ``{number: title}`` with
+        ``None`` on per-issue failure (404, closed, rate-limit).
+
+        Single-tick scope — no cross-tick caching. Issue #2989.
+
+        Caps the number of lookups at ``MAX_BLOCKER_TITLE_FETCH`` to bound
+        worst-case latency when GitHub is rate-limited (issue #2989).
+        """
+        result: dict[int, str | None] = {}
+        capped = set(list(numbers)[:MAX_BLOCKER_TITLE_FETCH])
+        for number in capped:
+            cmd = [
+                "gh",
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                self._cfg.github_repo,
+                "--json",
+                "number,title",
+            ]
+            outcome = self._subprocess_with_retry(
+                cmd,
+                event_name="blocker_title_fetch",
+                timeout=30,
+                extra_log_fields={"blocker_number": number},
+            )
+            if not outcome["ok"]:
+                self._log.warning(
+                    "daemon.blocker_title_fetch_exhausted for #%d",
+                    number,
+                    extra={
+                        "event": "blocker_title_fetch_exhausted",
+                        "run_id": self._run_id,
+                        "blocker_number": number,
+                        "reason": outcome.get("reason"),
+                    },
+                )
+                result[number] = None
+                continue
+            try:
+                payload = json.loads(outcome["result"].stdout or "{}")
+                title = payload.get("title")
+                result[number] = title if isinstance(title, str) else None
+            except (json.JSONDecodeError, AttributeError):
+                result[number] = None
+        return result
 
     @staticmethod
     def _parse_parent_issue(body: str) -> int | None:

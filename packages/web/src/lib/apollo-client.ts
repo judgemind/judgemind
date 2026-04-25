@@ -234,6 +234,12 @@ export function createApolloClient(): ApolloClient<unknown> {
         // here. Cache as literal array items; the query is not in the 2s
         // poll path so stale merging is not a concern.
         DiagnoserEffectivenessRow: { keyFields: false },
+        // BlockerRef: inline type inside QueueItem.blockedBy (issue #2989).
+        // Uses issue `number` as the identity key — blocker refs with the
+        // same number (same blocking issue) are the same object.
+        BlockerRef: {
+          keyFields: ['number'],
+        },
 
         // ---------------------------------------------------------------------
         // Types that intentionally do NOT need keyFields:

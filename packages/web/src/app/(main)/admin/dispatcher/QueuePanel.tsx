@@ -2,12 +2,7 @@
 
 import type { CSSProperties } from 'react';
 import { SECTION_HEADING } from '@/lib/typography';
-import type { QueueItem } from '@/lib/dispatcher-queries';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import type { BlockerRef, QueueItem } from '@/lib/dispatcher-queries';
 import { IssueLink, PriorityBadge } from './ui-primitives';
 
 interface QueuePanelProps {
@@ -269,6 +264,54 @@ export function formatCooldown(seconds: number): string {
 }
 
 /**
+ * Build the native `title` tooltip string for the `#NNNN` IssueLink on a
+ * blocked queue row. Issue #2989.
+ *
+ * Format:
+ * ```
+ * Blocked by:
+ *   #42 The blocker title
+ *   #100 Another blocker
+ *   (+M more)
+ * ```
+ *
+ * Rules:
+ * - Header line is always `Blocked by:`.
+ * - Each blocker gets its own line: `#N title` when title is known, or
+ *   `#N` alone when `title` is null.
+ * - Individual titles are capped at 80 characters with a `…` ellipsis.
+ * - At most 6 entries are shown; when truncated, a `(+M more)` line is
+ *   appended.
+ * - Entries are separated by `\n` — modern browsers render newlines in
+ *   native `title` attributes.
+ *
+ * Pure function — safe to call during render.
+ */
+export function formatBlockerTooltip(refs: BlockerRef[]): string {
+  const MAX_ENTRIES = 6;
+  const MAX_TITLE_CHARS = 80;
+
+  const lines: string[] = ['Blocked by:'];
+  const visible = refs.slice(0, MAX_ENTRIES);
+  for (const ref of visible) {
+    if (ref.title !== null && ref.title !== undefined) {
+      const truncated =
+        ref.title.length > MAX_TITLE_CHARS
+          ? `${ref.title.slice(0, MAX_TITLE_CHARS)}\u2026`
+          : ref.title;
+      lines.push(`  #${ref.number} ${truncated}`);
+    } else {
+      lines.push(`  #${ref.number}`);
+    }
+  }
+  const remaining = refs.length - MAX_ENTRIES;
+  if (remaining > 0) {
+    lines.push(`  (+${remaining} more)`);
+  }
+  return lines.join('\n');
+}
+
+/**
  * One row in the queue panel. Exported so the full-list dialog
  * (`QueueFullDialog`, issue #3159) can render the same row layout
  * without duplicating the markup.
@@ -308,7 +351,14 @@ export function QueueRow({
       data-testid={animated ? `queue-row-${item.issueNumber}` : undefined}
     >
       <div className="flex-shrink-0 pt-0.5">
-        <IssueLink number={item.issueNumber} />
+        <IssueLink
+          number={item.issueNumber}
+          title={
+            item.blockedBy.length > 0
+              ? formatBlockerTooltip(item.blockedBy)
+              : undefined
+          }
+        />
       </div>
       <div className="flex-shrink-0 pt-0.5">
         <PriorityBadge priority={item.priority} />
@@ -323,35 +373,13 @@ export function QueueRow({
         </span>
       )}
       <div className="min-w-0 flex-1">
-        {item.blockedBy.length > 0 ? (
-          <Tooltip delayDuration={0}>
-            <TooltipTrigger asChild>
-              <span
-                className="block break-words text-foreground"
-                data-testid={`blocker-tooltip-trigger-${item.issueNumber}`}
-                title={item.title}
-              >
-                {item.title}
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>
-              <span className="flex flex-wrap items-center gap-1 text-xs">
-                Blocked by{' '}
-                {item.blockedBy.map((blockerNumber) => (
-                  <IssueLink key={blockerNumber} number={blockerNumber} />
-                ))}
-              </span>
-            </TooltipContent>
-          </Tooltip>
-        ) : (
-          <span
-            className="block break-words text-foreground"
-            data-testid="queue-row-title"
-            title={item.title}
-          >
-            {item.title}
-          </span>
-        )}
+        <span
+          className="block break-words text-foreground"
+          data-testid="queue-row-title"
+          title={item.title}
+        >
+          {item.title}
+        </span>
       </div>
     </li>
   );

@@ -20,6 +20,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 import { describe, it, expect } from 'vitest';
+import { buildSchema } from 'graphql';
 import {
   CATEGORY_DISPLAY_NAMES,
   coerceNullableNumber,
@@ -36,6 +37,7 @@ import {
   type DiagnoserEffectivenessRow,
   type SnapshotIssueRecord,
 } from '../src/graphql/dispatcher/resolvers';
+import { dispatcherTypeDefs } from '../src/graphql/dispatcher/schema';
 import {
   extractPriority,
   parseBlockedBy,
@@ -174,13 +176,18 @@ describe('queueItemFromSnapshot', () => {
     });
   });
 
-  it('parses blockedBy from the body when requested', () => {
+  it('parses blockedBy from the body when requested (legacy body-only path wraps to BlockerRef[])', () => {
+    // Issue #2989: body-only legacy path (no blockedBy field in snapshot)
+    // wraps each parsed number as {number, title: null}.
     const withBody: SnapshotIssueRecord = {
       ...base,
       body: 'Some context.\n\nBlocked by #42\nBlocked by #100\n',
     };
     const result = queueItemFromSnapshot(withBody, true);
-    expect(result.blockedBy).toEqual([42, 100]);
+    expect(result.blockedBy).toEqual([
+      { number: 42, title: null },
+      { number: 100, title: null },
+    ]);
   });
 
   it('handles missing priority label', () => {
@@ -1500,5 +1507,180 @@ describe('diagnoserRowToGraphQL', () => {
     // The DateTime scalar serializes to a string; the raw value is passed
     // through so the DateTimeScalar.serialize function handles formatting.
     expect(out.day).toBe(isoDay);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #2989 — BlockerRef type in GraphQL schema + resolver back-compat
+// ---------------------------------------------------------------------------
+
+describe('GraphQL schema — BlockerRef type (issue #2989)', () => {
+  it('AC2: schema parses cleanly with BlockerRef type defined', () => {
+    // buildSchema will throw if the schema string has syntax errors or
+    // references an undefined type. This confirms BlockerRef is defined and
+    // QueueItem.blockedBy references it correctly.
+    //
+    // dispatcherTypeDefs uses `extend type Query/Mutation` — wrap in a
+    // base schema to satisfy buildSchema's requirement for root types.
+    const baseSchema = `
+      type Query { _noop: Boolean }
+      type Mutation { _noop: Boolean }
+    `;
+    expect(() => buildSchema(baseSchema + dispatcherTypeDefs)).not.toThrow();
+  });
+
+  it('AC2: QueueItem.blockedBy is typed [BlockerRef!]! in the schema', () => {
+    const baseSchema = `
+      type Query { _noop: Boolean }
+      type Mutation { _noop: Boolean }
+    `;
+    const schema = buildSchema(baseSchema + dispatcherTypeDefs);
+    const queueItemType = schema.getType('QueueItem') as import('graphql').GraphQLObjectType;
+    expect(queueItemType).toBeTruthy();
+    const blockedByField = queueItemType.getFields()['blockedBy'];
+    expect(blockedByField).toBeTruthy();
+    // Should be [BlockerRef!]! — inspect the type string
+    expect(blockedByField.type.toString()).toBe('[BlockerRef!]!');
+  });
+
+  it('AC2: BlockerRef type has number (Int!) and title (String) fields', () => {
+    const baseSchema = `
+      type Query { _noop: Boolean }
+      type Mutation { _noop: Boolean }
+    `;
+    const schema = buildSchema(baseSchema + dispatcherTypeDefs);
+    const blockerRefType = schema.getType('BlockerRef') as import('graphql').GraphQLObjectType;
+    expect(blockerRefType).toBeTruthy();
+    const fields = blockerRefType.getFields();
+    expect(fields['number'].type.toString()).toBe('Int!');
+    expect(fields['title'].type.toString()).toBe('String');
+  });
+});
+
+describe('queueItemFromSnapshot — BlockerRef shape (issue #2989)', () => {
+  it('AC3: legacy row with blockedBy=number[] wraps to [{number, title: null}]', () => {
+    // Pre-migration snapshot: daemon wrote blockedBy as number[] or body-only.
+    // The resolver back-compat shim must map this to BlockerRef[] without crash.
+    const legacyWithNumberArray: SnapshotIssueRecord & { blockedBy?: unknown } = {
+      number: 500,
+      title: 'Blocked issue',
+      labels: ['status/blocked'],
+      createdAt: '2026-04-18T12:00:00Z',
+      body: 'Blocked by #42\n',
+      blockedBy: [42, 100],  // legacy int[] shape
+    };
+    const result = queueItemFromSnapshot(legacyWithNumberArray as SnapshotIssueRecord, true);
+    // Back-compat: when blockedBy is number[], wrap each as {number, title: null}.
+    expect(result.blockedBy).toEqual([
+      { number: 42, title: null },
+      { number: 100, title: null },
+    ]);
+  });
+
+  it('uses new BlockerRef[] when present in snapshot', () => {
+    const newShape: SnapshotIssueRecord = {
+      number: 500,
+      title: 'Blocked issue',
+      labels: ['status/blocked'],
+      createdAt: '2026-04-18T12:00:00Z',
+      body: 'Blocked by #42\n',
+      blockedBy: [{ number: 42, title: 'The blocker title' }],
+    };
+    const result = queueItemFromSnapshot(newShape, true);
+    expect(result.blockedBy).toEqual([
+      { number: 42, title: 'The blocker title' },
+    ]);
+  });
+
+  it('falls back to body-parse when blockedBy is absent and includeBlockedBy=true', () => {
+    // Body-only legacy path (pre-#2989 daemon wrote body but no blockedBy field).
+    const bodyOnly: SnapshotIssueRecord = {
+      number: 501,
+      title: 'Body only',
+      labels: ['status/blocked'],
+      createdAt: '2026-04-18T12:00:00Z',
+      body: 'Blocked by #42\nBlocked by #100\n',
+    };
+    const result = queueItemFromSnapshot(bodyOnly, true);
+    expect(result.blockedBy).toEqual([
+      { number: 42, title: null },
+      { number: 100, title: null },
+    ]);
+  });
+
+  it('returns empty blockedBy when includeBlockedBy=false (ready panel)', () => {
+    // AC7: ready rows have no blockers — blockedBy should always be empty.
+    const readyIssue: SnapshotIssueRecord = {
+      number: 200,
+      title: 'Ready issue',
+      labels: ['agent/ready'],
+      createdAt: '2026-04-18T12:00:00Z',
+    };
+    const result = queueItemFromSnapshot(readyIssue, false);
+    expect(result.blockedBy).toEqual([]);
+  });
+
+  it('handles null title in BlockerRef gracefully', () => {
+    const withNullTitle: SnapshotIssueRecord = {
+      number: 502,
+      title: 'Blocked with null title',
+      labels: ['status/blocked'],
+      createdAt: '2026-04-18T12:00:00Z',
+      blockedBy: [{ number: 99, title: null }],
+    };
+    const result = queueItemFromSnapshot(withNullTitle, true);
+    expect(result.blockedBy).toEqual([{ number: 99, title: null }]);
+  });
+});
+
+describe('normalizeSnapshotJson — blockedBy field (issue #2989)', () => {
+  it('parses blockedBy: BlockerRef[] from the snapshot', () => {
+    const raw = [
+      {
+        number: 500,
+        title: 'Blocked',
+        labels: ['status/blocked'],
+        createdAt: '2026-04-18T12:00:00Z',
+        body: 'Blocked by #42\n',
+        blockedBy: [{ number: 42, title: 'Blocker title' }],
+      },
+    ];
+    const result = normalizeSnapshotJson(raw);
+    expect(result[0].blockedBy).toEqual([{ number: 42, title: 'Blocker title' }]);
+  });
+
+  it('drops malformed blockedBy entries (non-object or missing number)', () => {
+    const raw = [
+      {
+        number: 500,
+        title: 'Blocked',
+        labels: [],
+        createdAt: '',
+        blockedBy: [
+          { number: 42, title: 'Good' },
+          'bad_string',
+          { title: 'no-number' },
+          { number: 'not-int', title: 'bad-type' },
+          null,
+        ],
+      },
+    ];
+    const result = normalizeSnapshotJson(raw);
+    // Only the well-formed entry {number: 42, title: 'Good'} survives.
+    expect(result[0].blockedBy).toEqual([{ number: 42, title: 'Good' }]);
+  });
+
+  it('omits blockedBy field entirely when not present (queue snapshot shape)', () => {
+    // Ready-queue snapshots don't carry blockedBy.
+    const raw = [
+      {
+        number: 100,
+        title: 'Ready',
+        labels: ['agent/ready'],
+        createdAt: '2026-04-18T12:00:00Z',
+      },
+    ];
+    const result = normalizeSnapshotJson(raw);
+    expect('blockedBy' in result[0]).toBe(false);
   });
 });

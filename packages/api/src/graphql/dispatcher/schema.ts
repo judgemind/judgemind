@@ -212,13 +212,27 @@ export const dispatcherTypeDefs = `#graphql
     modelUsed: String
   }
 
+  """A blocker reference — the issue number and optional title of an issue
+  that is blocking a \`status/blocked\` queue item. Title is populated by the
+  daemon's \`_fetch_issue_titles_for_blockers\` helper (issue #2989) and may
+  be null when the title fetch failed (404, rate-limit, etc.).
+  """
+  type BlockerRef {
+    """Issue number of the blocking issue."""
+    number: Int!
+    """Title of the blocking issue at snapshot time. Null when the daemon
+    could not fetch the title (transient fetch failure, issue deleted, etc.).
+    Clients should render just \`#N\` when this is null."""
+    title: String
+  }
+
   """One row in the queue side-panels (#2805 §1.3). Capped at 10 server-side.
 
   - \`queueReady\` entries are open issues labelled \`agent/ready\` + not
     assigned + not blocked. Sorted by priority asc then created_at asc.
   - \`queueBlocked\` entries are open issues labelled \`status/blocked\`.
     Sorted by created_at desc. \`blockedBy\` is parsed from the issue body's
-    \`Blocked by #N\` lines.
+    \`Blocked by #N\` lines plus the daemon-fetched blocker titles (issue #2989).
   """
   type QueueItem {
     issueNumber: Int!
@@ -228,9 +242,10 @@ export const dispatcherTypeDefs = `#graphql
     labels: [String!]!
     """Null when the daemon snapshot's upstream GitHub lookup was missing or malformed."""
     createdAt: DateTime
-    """Issue numbers this issue is blocked by (from the 'Blocked by #N' lines
-    in the body). Empty for queueReady items."""
-    blockedBy: [Int!]!
+    """Blocker references for this issue (from the 'Blocked by #N' lines in the
+    body, enriched with titles fetched by the daemon at snapshot time — issue
+    #2989). Empty for queueReady items. Title may be null when the fetch failed."""
+    blockedBy: [BlockerRef!]!
     """Seconds left before this issue is eligible for the scheduler to pick up
     again after a recent failure. Null when no prior \`dispatcher.agents\` row
     exists or when cooldown has elapsed (0 = expired, positive = still cooling,
