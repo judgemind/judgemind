@@ -183,6 +183,25 @@ DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS = 120
 #: change, not a config flip.
 WATCHDOG_POLL_INTERVAL_SECONDS = 30
 
+#: boto3 ECS client socket timeouts (#3351). Applied to every
+#: :meth:`DispatcherDaemon._make_ecs_client` invocation via a
+#: :class:`botocore.config.Config`. Without these the AWS SDK defaults
+#: leave ``read_timeout`` effectively unbounded (urllib3's socket
+#: ``recv()`` can block forever if the AWS API never ACKs); a hung
+#: ``ecs:DescribeTasks`` in the reaper would then wedge the scheduler
+#: thread, the GIL, and (because faulthandler runs from a separate
+#: signal-driven thread that depends on the same kernel-level call) the
+#: entire process — exactly the failure mode observed in the 2026-04-25
+#: cascade (#3344 / #3351, "no faulthandler dumps for 30+ minutes while
+#: the ECS task remained RUNNING"). With explicit timeouts a hung call
+#: raises :class:`botocore.exceptions.ReadTimeoutError` after ~25s
+#: worst-case (one retry × 10s read + 5s connect), the scheduler-tick
+#: exception handler catches it, and the watchdog only has to fire as
+#: the second-line defence.
+ECS_CLIENT_CONNECT_TIMEOUT_SECONDS = 5
+ECS_CLIENT_READ_TIMEOUT_SECONDS = 10
+ECS_CLIENT_MAX_ATTEMPTS = 2
+
 #: Max stack frames per thread emitted in the stall thread dump. Each
 #: frame renders as ``file:line (function)`` — ~60-120 chars per frame.
 #: With ~10 threads (main + scheduler + ralph head-watcher + CloudWatch
@@ -19544,10 +19563,34 @@ class DispatcherDaemon:
         tests that don't exercise the ECS launcher path do not have to
         install boto3. Region comes from :attr:`DaemonConfig.aws_region`
         which is already wired from ``AWS_REGION`` / ``AWS_DEFAULT_REGION``.
+
+        #3351: applies an explicit
+        :class:`botocore.config.Config` so a hung ``ecs:DescribeTasks``
+        cannot block the reaper indefinitely. boto3's defaults leave
+        ``read_timeout`` effectively unbounded; the 2026-04-25 cascade
+        showed that a single hung DescribeTasks call wedged the entire
+        Python process (GIL held in urllib3's blocking ``recv()``,
+        faulthandler unable to fire). The constants
+        :data:`ECS_CLIENT_CONNECT_TIMEOUT_SECONDS`,
+        :data:`ECS_CLIENT_READ_TIMEOUT_SECONDS`, and
+        :data:`ECS_CLIENT_MAX_ATTEMPTS` document the chosen budget.
         """
         import boto3  # noqa: PLC0415 — lazy import
+        import botocore.config  # noqa: PLC0415 — lazy import, mirrors boto3
 
-        return boto3.client("ecs", region_name=self._cfg.aws_region)
+        ecs_cfg = botocore.config.Config(
+            connect_timeout=ECS_CLIENT_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=ECS_CLIENT_READ_TIMEOUT_SECONDS,
+            retries={
+                "max_attempts": ECS_CLIENT_MAX_ATTEMPTS,
+                "mode": "standard",
+            },
+        )
+        return boto3.client(
+            "ecs",
+            region_name=self._cfg.aws_region,
+            config=ecs_cfg,
+        )
 
     def _cb_config_str(self, key: str, default: str) -> str:
         """Read a string key from ``dispatcher.config`` with a fallback.
@@ -20998,11 +21041,14 @@ class DispatcherDaemon:
                     pass
 
     def _start_watchdog(self) -> None:
-        """Spawn the supervisor watchdog thread (#3097).
+        """Spawn the supervisor watchdog thread (#3097, #3351).
 
         Idempotent — a second call while the thread is alive is a no-op.
-        Called from :meth:`run_forever` after the initial tick so the
-        watchdog starts only when the daemon is fully up.
+        Called from :meth:`run_forever` BEFORE the initial scheduler
+        tick (#3351) so an initial-tick wedge is still observable by
+        the watchdog. The baseline timestamp is seeded at boot in
+        :meth:`__init__` so the first observation has a valid reference
+        even before the first tick fires.
         """
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             return
@@ -21038,6 +21084,21 @@ class DispatcherDaemon:
         last_scheduler = 0.0
         last_supervisor = 0.0
         last_housekeeping = 0.0
+
+        # #3351: spawn the stall-watchdog BEFORE the first scheduler /
+        # supervisor tick so an initial-tick wedge (e.g. a hung
+        # ``ecs:DescribeTasks`` in the reaper) is still observed by the
+        # watchdog and force-exits the process at the EXIT threshold.
+        # Pre-#3351 the watchdog started AFTER the initial tick, so a
+        # boto3 client created during that first reap could block the
+        # daemon forever with no recourse — exactly the failure mode
+        # observed in the 2026-04-25 cascade. The watchdog's baseline
+        # is ``_last_scheduler_tick_at``, seeded at boot in
+        # :meth:`__init__`, so observation has a valid reference even
+        # before the first tick fires. See :meth:`_watchdog_loop` for
+        # the WARN/EXIT tier semantics.
+        self._start_watchdog()
+
         # Tick once on boot so the first scheduler/supervisor cycle is
         # observable immediately in logs + DB, rather than after the
         # first full cadence elapses. Housekeeping is NOT fired on boot
@@ -21054,11 +21115,6 @@ class DispatcherDaemon:
         except Exception:
             self._log.exception("daemon.initial_tick_failed")
             return 1
-
-        # #3097: spawn the stall-watchdog thread after the initial tick
-        # so it begins observing from a known-fresh baseline. See
-        # :meth:`_watchdog_loop` for the WARN/EXIT tier semantics.
-        self._start_watchdog()
 
         # Poll the stop flag in 1-second slices so SIGTERM lands promptly.
         while not self._stop.is_set():

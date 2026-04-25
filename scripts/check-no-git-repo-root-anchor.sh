@@ -76,8 +76,11 @@ try:
     source = path.read_text()
     tree = ast.parse(source)
 except SyntaxError as exc:
-    # Not valid Python — skip silently (the file may be a fixture
-    # or a stub the check doesn't need to flag).
+    # Not valid Python — skip silently. The file may be a fixture or
+    # a stub the check is not meant to flag. (Avoid apostrophes here:
+    # bash 3.2 mis-parses single quotes inside a $()-wrapped heredoc
+    # even when the heredoc terminator is itself single-quoted, which
+    # makes the wrapper script unrunnable on macOS. See #3351.)
     sys.exit(0)
 
 lines = source.splitlines()

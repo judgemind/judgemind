@@ -752,6 +752,17 @@ resource "aws_ecs_task_definition" "dispatcher" {
           "awslogs-group"         = aws_cloudwatch_log_group.dispatcher.name
           "awslogs-region"        = data.aws_region.current.id
           "awslogs-stream-prefix" = "dispatcher"
+          # #3351: switch the awslogs driver to non-blocking delivery
+          # so a CloudWatch slowdown cannot block the daemon's stdout
+          # (which would itself wedge the Python process — the same
+          # GIL-held / silent-for-30+-min failure mode observed in
+          # the 2026-04-25 cascade). With ``mode = non-blocking`` the
+          # driver buffers up to ``max-buffer-size`` and drops oldest
+          # events on overflow rather than back-pressuring the
+          # container. 4MB is the AWS-recommended floor — smaller
+          # values throttle awslogs internally.
+          "mode"            = "non-blocking"
+          "max-buffer-size" = "4m"
         }
       }
     }
