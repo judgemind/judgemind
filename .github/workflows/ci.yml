@@ -35,6 +35,7 @@ jobs:
       githooks: ${{ steps.changes.outputs.githooks }}
       dispatcher-terminals: ${{ steps.changes.outputs.dispatcher-terminals }}
       dispatcher-image: ${{ steps.changes.outputs.dispatcher-image }}
+      deploy-workflows: ${{ steps.changes.outputs.deploy-workflows }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
       - uses: actions/checkout@v6
@@ -149,6 +150,14 @@ jobs:
             dispatcher-image:
               - 'Dockerfile.dispatcher'
               # Include ci.yml so that edits to the dispatcher-image-version-check
+              # job are exercised on the PR that introduces them. Without this, the
+              # paths filter makes the job SKIP on its own PR — the #2410/#2505
+              # footgun. See scripts/check-ci-job-skipped.py.
+              - '.github/workflows/ci.yml'
+            deploy-workflows:
+              - '.github/workflows/deploy-*.yml'
+              - 'scripts/check-deploy-workflow-rollout.sh'
+              # Include ci.yml so that edits to the deploy-workflow-rollout-check
               # job are exercised on the PR that introduces them. Without this, the
               # paths filter makes the job SKIP on its own PR — the #2410/#2505
               # footgun. See scripts/check-ci-job-skipped.py.
@@ -1453,10 +1462,25 @@ jobs:
       - name: Verify dispatcher image meets minimum runtime version requirements
         run: scripts/check-dispatcher-image-versions.sh --build Dockerfile.dispatcher
 
+  # ---------------------------------------------------------------
+  # Deploy-workflow rollout guard (#2777)
+  # Asserts that every deploy-*.yml that pushes to ECR also rolls
+  # a service (or carries an explicit opt-out marker).
+  # ---------------------------------------------------------------
+  deploy-workflow-rollout-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.deploy-workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check every deploy workflow that pushes to ECR also rolls a service
+        run: scripts/check-deploy-workflow-rollout.sh
+
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check, deploy-workflow-rollout-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

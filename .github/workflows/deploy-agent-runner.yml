@@ -1,5 +1,7 @@
 name: Deploy Agent Runner
 
+# rollout-not-required: task-definition family — ecs:RunTask callers pull :latest. See #2777.
+
 # Builds and pushes the dispatcher agent-runner image
 # (`judgemind/dispatcher-agent-runner`) to ECR on merge to main. Mirrors
 # the build-and-push half of `deploy-dispatcher.yml`, without the

@@ -485,6 +485,27 @@ if [ -n "$changed_ci_yml" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Deploy-workflow rollout check — run whenever a deploy-*.yml changes
+# or the check script itself changes (#2777)
+# -------------------------------------------------------------------
+# Mirrors the CI `deploy-workflow-rollout-check` job so the guard fires
+# locally before the push reaches CI.  Catches deploy workflows that
+# push to ECR but forget to roll the service.
+changed_deploy_wf=$(echo "$changed_files" | grep -E '^\.github/workflows/deploy-.*\.yml$|^scripts/check-deploy-workflow-rollout\.sh$' || true)
+if [ -n "$changed_deploy_wf" ]; then
+    echo "pre-push: checking deploy workflows for missing service rollout..." >&2
+    if [ -x scripts/check-deploy-workflow-rollout.sh ]; then
+        if ! run_check "_" "scripts/check-deploy-workflow-rollout.sh" scripts/check-deploy-workflow-rollout.sh; then
+            echo "  A deploy workflow pushes to ECR but has no service rollout step." >&2
+            echo "  Add a rollout step or an opt-out marker. See #2777." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-deploy-workflow-rollout.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # Markdown link check — run whenever any .md file is in the push
 # -------------------------------------------------------------------
 # Mirrors the CI `markdown-links-check` job so broken internal pointers
