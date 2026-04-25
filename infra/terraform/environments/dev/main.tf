@@ -323,9 +323,9 @@ module "dispatcher_daemon" {
   # agent-runner module's task-def family + security group + role ARNs
   # through to the daemon's task role (for ecs:RunTask / DescribeTasks
   # / StopTask / iam:PassRole) and to the daemon's container env vars
-  # (so _launch_agent_ecs_task knows what to run and where). Default
-  # ``dispatcher.config.agent_execution_mode`` stays at ``'subprocess'``
-  # — this wiring is inert until Stage 4 (#3093) flips the default.
+  # (so _launch_agent_ecs_task knows what to run and where).
+  # Stage 4 (#3093) flipped ``dispatcher.config.agent_execution_mode`` to
+  # ``'ecs'`` — this wiring is now active on every agent claim.
   agent_runner_task_definition_family = module.dispatcher_agent_runner.task_definition_family
   agent_runner_execution_role_arn     = module.dispatcher_agent_runner.execution_role_arn
   agent_runner_task_role_arn          = module.dispatcher_agent_runner.task_role_arn

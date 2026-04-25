@@ -282,7 +282,7 @@ Skills read from the input file and write to the output file; neither should dep
 
 #### Sizing
 
-Agent-runner sizing matches the subprocess-daemon envelope (4 vCPU / 16 GiB) while subprocess mode remains the default. Can shrink once subprocess is retired and the dispatcher daemon scales down correspondingly. The initial Stage 1b baseline (512 CPU / 1024 MB) pegged memory at 1022/1024 MB for hours and saturated CPU at 509/512 in bursts under real ralph workload (#3153).
+Agent-runner sizing matches the subprocess-daemon envelope (4 vCPU / 16 GiB) under the per-agent ECS default (since #3093). Can shrink once subprocess is retired and the dispatcher daemon scales down correspondingly. The initial Stage 1b baseline (512 CPU / 1024 MB) pegged memory at 1022/1024 MB for hours and saturated CPU at 509/512 in bursts under real ralph workload (#3153).
 
 #### Debugging a live ECS agent
 

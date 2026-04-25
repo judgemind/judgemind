@@ -211,7 +211,7 @@ variable "oneshot_ecr_scraper_repository_arn" {
 # Leave empty to skip the policy entirely — the daemon's self-
 # invocation policy (`task_run_task_self`) and oneshot policy
 # (`task_run_oneshot`) are untouched. Useful while Stage 2 is still
-# inert behind the `agent_execution_mode='subprocess'` default.
+# active as of Stage 4 (#3093) — agent_execution_mode now defaults to 'ecs'.
 
 variable "agent_runner_task_definition_family" {
   description = "Family name of the dispatcher-agent-runner task definition (e.g. `judgemind-dispatcher-agent-runner-<env>`). Wired from the dispatcher-agent-runner module's `task_definition_family` output. When set alongside the two role ARNs below, the daemon's task role gains ecs:RunTask / ecs:DescribeTasks / ecs:StopTask scoped to this family. Empty disables -- Stage 2 launcher falls back to the subprocess path."
