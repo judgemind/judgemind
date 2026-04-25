@@ -524,6 +524,15 @@ class SDCalendarScraper(BaseScraper):
                     html = response.text
 
                     hearings = parse_calendar_page(html)
+
+                    if len(hearings) == 0:
+                        self._log.warning(
+                            "Skipping empty calendar page",
+                            division=division_name,
+                            url=url,
+                        )
+                        continue
+
                     motion_hearings = [h for h in hearings if _is_motion_event(h.event_type)]
 
                     self._log.info(
