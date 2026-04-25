@@ -9,7 +9,7 @@ running on AWS ECS Fargate.
 | ------------------ | --------------------------------------------------------- |
 | ECS Cluster        | `judgemind-{env}`                                         |
 | Task Definition    | `judgemind-scraper-{env}`                                 |
-| EventBridge Sched. | `judgemind-scraper-{env}` (daily at 6 AM PT)              |
+| EventBridge Sched. | `judgemind-scraper-{env}` (twice daily at 6:15 AM/PM PT)  |
 | CloudWatch Logs    | `/ecs/judgemind-scraper-{env}`                            |
 | S3 Archive         | `judgemind-document-archive-{env}`                        |
 | SNS Alerts         | `judgemind-scraper-alerts-{env}`                          |
@@ -205,7 +205,7 @@ Disable the schedule immediately:
 aws scheduler update-schedule \
   --name judgemind-scraper-dev \
   --state DISABLED \
-  --schedule-expression "cron(0 6 * * ? *)" \
+  --schedule-expression "cron(15 6,18 * * ? *)" \
   --schedule-expression-timezone "America/Los_Angeles" \
   --flexible-time-window '{"Mode":"FLEXIBLE","MaximumWindowInMinutes":30}' \
   --target '{}' \
@@ -218,7 +218,7 @@ Re-enable:
 aws scheduler update-schedule \
   --name judgemind-scraper-dev \
   --state ENABLED \
-  --schedule-expression "cron(0 6 * * ? *)" \
+  --schedule-expression "cron(15 6,18 * * ? *)" \
   --schedule-expression-timezone "America/Los_Angeles" \
   --flexible-time-window '{"Mode":"FLEXIBLE","MaximumWindowInMinutes":30}' \
   --target '{}' \

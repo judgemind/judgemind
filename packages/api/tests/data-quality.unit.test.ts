@@ -72,12 +72,34 @@ describe('computeHealthStatus', () => {
     expect(computeHealthStatus(metrics)).toBe('yellow');
   });
 
-  it('returns yellow when scraper age is 6-24h', () => {
+  it('returns green when scraper age is 12h (below 13h yellow threshold)', () => {
     const metrics: CountyMetrics = {
       county: 'Los Angeles',
       rulingCount24h: 10,
       fieldCompletenessPct: 95,
       scraperLastSuccessAgeHours: 12,
+      lastUpdated: '2026-03-01T00:00:00Z',
+    };
+    expect(computeHealthStatus(metrics)).toBe('green');
+  });
+
+  it('returns yellow when scraper age is 13h (at yellow threshold)', () => {
+    const metrics: CountyMetrics = {
+      county: 'Los Angeles',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 13,
+      lastUpdated: '2026-03-01T00:00:00Z',
+    };
+    expect(computeHealthStatus(metrics)).toBe('yellow');
+  });
+
+  it('returns yellow when scraper age is 13-25h', () => {
+    const metrics: CountyMetrics = {
+      county: 'Los Angeles',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 20,
       lastUpdated: '2026-03-01T00:00:00Z',
     };
     expect(computeHealthStatus(metrics)).toBe('yellow');
@@ -116,26 +138,37 @@ describe('computeHealthStatus', () => {
     expect(computeHealthStatus(metrics)).toBe('green');
   });
 
-  it('returns yellow at boundary: scraper age exactly 6h', () => {
+  it('returns yellow at boundary: scraper age exactly 13h', () => {
     const metrics: CountyMetrics = {
       county: 'Los Angeles',
       rulingCount24h: 10,
       fieldCompletenessPct: 95,
-      scraperLastSuccessAgeHours: 6,
+      scraperLastSuccessAgeHours: 13,
       lastUpdated: '2026-03-01T00:00:00Z',
     };
     expect(computeHealthStatus(metrics)).toBe('yellow');
   });
 
-  it('returns red at boundary: scraper age exactly 24h (> 24 check)', () => {
+  it('returns red at boundary: scraper age exactly 26h (> 25 check)', () => {
     const metrics: CountyMetrics = {
       county: 'Los Angeles',
       rulingCount24h: 10,
       fieldCompletenessPct: 95,
-      scraperLastSuccessAgeHours: 24,
+      scraperLastSuccessAgeHours: 26,
       lastUpdated: '2026-03-01T00:00:00Z',
     };
-    // 24 is not > 24 so it's yellow, not red
+    expect(computeHealthStatus(metrics)).toBe('red');
+  });
+
+  it('returns red at boundary: scraper age exactly 25h (> 25 check — 25 is not > 25 so yellow)', () => {
+    const metrics: CountyMetrics = {
+      county: 'Los Angeles',
+      rulingCount24h: 10,
+      fieldCompletenessPct: 95,
+      scraperLastSuccessAgeHours: 25,
+      lastUpdated: '2026-03-01T00:00:00Z',
+    };
+    // 25 is not > 25 so it's yellow, not red
     expect(computeHealthStatus(metrics)).toBe('yellow');
   });
 });

@@ -118,13 +118,13 @@ module "compute" {
   courtlistener_api_token_secret_arn = data.aws_secretsmanager_secret.courtlistener_api_token.arn
   capsolver_api_key_secret_arn       = data.aws_secretsmanager_secret.capsolver_api_key.arn
 
-  # Dev: 1 vCPU, 2 GB RAM, daily schedule at 6 AM PT
+  # Dev: 1 vCPU, 2 GB RAM, twice-daily schedule at 6:15 AM and 6:15 PM PT
   # Matches production to prevent OOM kills during the full 17-scraper run.
   # See #2349 — 0.5 vCPU / 1 GB was insufficient and caused the task to be
   # killed before completing all scrapers.
   task_cpu            = 1024
   task_memory         = 2048
-  schedule_expression = "cron(0 6 * * ? *)"
+  schedule_expression = "cron(15 6,18 * * ? *)"
   schedule_timezone   = "America/Los_Angeles"
   schedule_enabled    = true
   log_retention_days  = 14

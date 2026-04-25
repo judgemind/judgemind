@@ -131,6 +131,8 @@ These mechanisms catch scraper *failures* well (crashes, staleness, missing fiel
 
 **Scraper health model.** Operational status is tracked via `scraper_runs` records (success/failure, response time, records captured). Output quality is tracked via hourly data quality checks. CloudWatch alarms fire if no successful scraper run occurs within 24 hours. The admin data quality dashboard shows per-county health tiles (green/yellow/red) based on ruling count, field completeness, and scraper freshness.
 
+**Scraper cadence.** The EventBridge Scheduler fires twice daily at 6:15 AM and 6:15 PM PT (`cron(15 6,18 * * ? *)`). Fire times are deliberately outside typical business hours so admin and clerk staff are off-clock when any transient scraper errors surface. The 12-hour cadence doubles capture opportunities versus the previous once-daily schedule, reducing the maximum window during which a newly posted tentative ruling could go uncaptured. Dashboard and alerter thresholds are aligned to this cadence: the scraper freshness field turns yellow at 13 hours (12h cadence + 1h slack for `FlexibleTimeWindow` and runtime) and red at 25 hours (two missed cycles + 1h slack). Per-scraper cadence overrides and threshold tuning are tracked at #2981.
+
 ## 3.2 Data Store
 
 Judgemind uses three complementary storage systems, each optimized for a specific access pattern.
