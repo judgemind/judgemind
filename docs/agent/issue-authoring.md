@@ -31,6 +31,47 @@ Acceptance criteria must be concrete and machine-checkable wherever possible. Va
 
 Each criterion should have at least one `Verify:` line that an agent can execute to confirm the criterion is met. This applies to issues filed by both humans and agents. If a verification command is not possible (e.g., requires subjective judgment), note that explicitly so reviewers know it requires manual verification.
 
+## Verify the gap exists before filing
+
+Before filing a "does X" / "enable X" / "add X" issue, run a single command that verifies X is not already the case. This rule exists because an agent-runner cycle spent re-creating state that already exists is pure waste — the canonical example is #3146, where an issue was filed to "enable Container Insights on the ECS cluster" after the Terraform attribute `enable_container_insights = true` had already shipped in a prior PR. The agent spent a full cycle discovering, through probing, that there was nothing to do. A thirty-second check before filing would have surfaced that immediately. This is a sibling of the external-integration feasibility note in §Writing Acceptance Criteria (line 15): both rules say "verify the precondition before you ask an agent to build on top of it."
+
+**Probe patterns by verb:**
+
+- **"Enable AWS setting Y"** → check the live state and the Terraform source before filing.
+  ```
+  # Live state (example: ECS Container Insights)
+  aws ecs describe-clusters --clusters <cluster-name> --include SETTINGS \
+    --query 'clusters[0].settings'
+  # Terraform source
+  grep -r "enable_container_insights\|container_insights" infra/terraform/
+  ```
+  Already present if: live state shows `"value": "enabled"` OR Terraform already sets the attribute to `true`.
+
+- **"Add metric / alarm for X"** → check whether the metric namespace is already populated and the alarm already exists.
+  ```
+  aws cloudwatch list-metrics --namespace <namespace> --metric-name <MetricName>
+  aws cloudwatch describe-alarms --alarm-name-prefix <prefix>
+  ```
+  Already present if: `list-metrics` returns a non-empty `Metrics` array, or `describe-alarms` returns an existing alarm with the expected name prefix.
+
+- **"Add documentation for X"** → grep the docs tree before filing.
+  ```
+  grep -r "X" docs/
+  # or for agent-skill docs:
+  grep -r "X" .claude/skills/ CLAUDE.md
+  ```
+  Already present if: the concept is already explained at the relevant level of detail in an existing doc.
+
+- **"Fix code bug X" / "X throws an error"** → grep for the function name or error-message string; the bug may already be fixed in a prior PR the filer didn't see.
+  ```
+  grep -r "error_message_or_function_name" packages/
+  # Also check recent git log for the relevant area:
+  git log --oneline --all -- packages/<area>/
+  ```
+  Already fixed if: the offending code path no longer exists, or a recent commit message references the fix.
+
+**Decision after probing:** If the gap is genuinely absent (the feature/setting/doc does not yet exist), file the issue normally. If the gap is already satisfied, either close the draft or pivot scope to a doc-only update that confirms the current state (e.g., "document that Container Insights is enabled and cite the Terraform attribute"). If the probe is ambiguous, treat as real and file normally — agents can do their own probe at pickup time per Step 4b in `.claude/skills/task/SKILL.md`.
+
 ## Priority Framework
 
 Assign priority by urgency and workflow impact, not by user-visibility.
