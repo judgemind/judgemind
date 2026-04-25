@@ -28,7 +28,7 @@
 
 1. **Postgres is the state of record.** Not files, not S3, not agent-status markers on disk. Everything the daemon does is reflected in `dispatcher.*` tables within the next tick.
 2. **Every tick is idempotent.** A crash-and-restart mid-tick produces the same eventual state as a clean run.
-3. **Runtime signals over post-hoc classification.** Failures are labeled by cheap deterministic signals (hooks, exit codes, timeouts). Weekly summaries are SQL aggregations, not LLM transcript reviews.
+3. **Runtime signals over post-hoc classification.** Failures are labeled by cheap deterministic signals (hooks, exit codes, timeouts). Daily summaries are SQL aggregations, not LLM transcript reviews.
 4. **Retry markers, not retry RPCs.** Hooks and sub-subprocesses signal the daemon by writing rows (`dispatcher.failures`, `dispatcher.retry_markers`), never by calling back. Survives any crash.
 5. **Fail to escalate, not to silent drop.** After the retry budget is exhausted, the task gets `status/needs-human` and a Telegram message with the issue URL. Nothing quietly vanishes.
 6. **No LLM subprocess spans more than one workflow phase.** Each `claude -p` invocation runs one tightly-scoped phase (plan, implement, summarize, verify, etc.) with fresh context. Inter-phase handoff is strictly via `dispatcher.*` + small file artifacts the next phase reads. This is what lets us live without auto-compact in print mode (see §18 Risk 4b) and keeps every leaf LLM call small, reproducible, and replayable.
@@ -325,7 +325,7 @@ Note: `enableExecuteCommand` only takes effect on freshly-launched tasks. Tasks 
 1. **Stuck detection.** Agents with `status='running'` and no `dispatcher.phase_transitions` update in >30min are flagged. Writes `dispatcher.failures(category='stuck_timeout')`. `stuck_timeout` is mechanical (§8), so this creates a `dispatcher.retry_markers` row directly with exponential backoff (60s → 300s → 900s; give up after attempt 3). Judgment-required failures route through a diagnoser subprocess first (§8 Diagnosis step) — no retry marker is created until the diagnoser returns.
 2. **529 backoff.** Count failures with `category='rate_limit_529'` in the last 10 min. ≥3 → set `dispatcher.config.spawn_frozen_until = now + 10min`. Scheduler respects this.
 3. **Heartbeat.** UPDATE `dispatcher.runs.heartbeat_ts = now`. External check (CloudWatch alarm) pages if stale > 5min.
-4. **Weekly summary.** Sundays at 06:00 UTC, run a SQL aggregation over the last week of `dispatcher.failures` (GROUP BY category, count, most-recent example) and commit the report to docs/dispatcher-weekly/YYYY-WW.md via an auto-PR. Pure SQL + markdown template — no LLM.
+4. **Daily summary.** 12:00 UTC, run a SQL aggregation over the last 24h of `dispatcher.failures` (GROUP BY category, count, most-recent example) and commit the report to docs/dispatcher-daily/YYYY-MM-DD.md via an auto-PR. Pure SQL + markdown template — no LLM.
 
 ## 8. Failure Taxonomy
 
@@ -401,7 +401,7 @@ Rationale: the operator is not continuously available. Escalating straight to hu
 - Circuit breaker: if >30% of diagnoses in the last 24h fall back (timeout, malformed JSON, subprocess crash), flip `dispatcher.config.diagnoser_enabled = false`. Operator re-enables manually.
 - The diagnoser is another leaf LLM feeding a deterministic switch — no unbounded agent loops, no agent judging another agent's judgment.
 
-**Effectiveness tracking:** once a retry resolves (success, escalation, or close), its outcome is written back to `dispatcher.diagnoses.outcome`. The weekly report aggregates "diagnoser recommended X → outcome Y" so we can measure net benefit. If after a month the diagnoser is net-neutral or net-harmful vs fixed policy, cut it.
+**Effectiveness tracking:** once a retry resolves (success, escalation, or close), its outcome is written back to `dispatcher.diagnoses.outcome`. The daily report aggregates "diagnoser recommended X → outcome Y" so we can measure net benefit. If after a month the diagnoser is net-neutral or net-harmful vs fixed policy, cut it.
 
 ## 9. Hooks
 
@@ -625,7 +625,7 @@ Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/di
 - Retries resolve ≥80% of transient failures (stuck, 529, cwd drift) without human touch.
 - Median dispatcher-to-merge time matches or beats laptop dispatcher. (Current: need to measure — this needs a baseline from `task-timings.jsonl` before cutover.)
 - Admin page answers "what is the dispatcher doing right now" in under 2s.
-- Weekly SQL-based summary produced reliably for ≥4 consecutive weeks; the operator can spot the top 3 failure categories at a glance.
+- Daily SQL-based summary produced reliably for ≥7 consecutive days; the operator can spot the top 3 failure categories at a glance.
 
 ## 18. Risks & Open Questions (adversarial-review bait)
 
@@ -657,7 +657,7 @@ Rollback plan: any phase can revert by scaling ECS to 0 and invoking laptop `/di
 
 4. **Cost comparison** — laptop dispatcher costs Anthropic tokens + user's time. Daemon costs tokens + ECS (~$30/mo task + CW logs) + dev DB load. Is the delta justified by self-healing? **Action:** project a month's run before building.
 
-5. **Diagnoser net benefit — tiered version.** The tiered diagnoser (§8: mechanical first, diagnose only on recurrence or Tier 3) should see far fewer invocations than the always-diagnose original. Projected: ~2-3 invocations/week. At that volume, the effectiveness bar is low — we mainly need to verify the diagnoser doesn't make things worse than immediate human escalation. **Action:** first month of operation, dump every `dispatcher.diagnoses.recommendation` + its `outcome` weekly. If the diagnoser's recommendation was "retry" and the retry succeeded, that's net-positive latency savings; if it escalated, the human got a pre-analyzed failure; if it was wrong, measure the added-damage rate.
+5. **Diagnoser net benefit — tiered version.** The tiered diagnoser (§8: mechanical first, diagnose only on recurrence or Tier 3) should see far fewer invocations than the always-diagnose original. Projected: ~2-3 invocations/week. At that volume, the effectiveness bar is low — we mainly need to verify the diagnoser doesn't make things worse than immediate human escalation. **Action:** first month of operation, dump every `dispatcher.diagnoses.recommendation` + its `outcome` daily. If the diagnoser's recommendation was "retry" and the retry succeeded, that's net-positive latency savings; if it escalated, the human got a pre-analyzed failure; if it was wrong, measure the added-damage rate.
 
 ## 19. Appendix — Schema DDL sketch
 
