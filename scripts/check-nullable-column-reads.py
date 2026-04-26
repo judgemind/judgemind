@@ -54,24 +54,22 @@ _AUDIT_DIRS = [
     "packages/web",
 ]
 
-# Regex: match ALTER TABLE ... ALTER COLUMN <col> DROP NOT NULL
-# Handles optional schema prefix, multi-word table names, surrounding
-# whitespace, and case insensitivity. Captures (table, column).
+# Two-pass parser regexes for ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL.
 #
-# Pattern:
-#   ALTER TABLE [schema.]table ... ALTER COLUMN col DROP NOT NULL
-#   (the "..." between ALTER TABLE and ALTER COLUMN can span lines, but we
-#   match single-line or allow one optional intermediate clause like TYPE)
-_DROP_NOT_NULL_RE = re.compile(
-    r"""
-    ALTER \s+ TABLE \s+
-    (?:[\w]+\.)? ([\w]+)   # optional schema prefix, then table name
-    \s+ ALTER \s+ COLUMN \s+
-    ([\w]+)                # column name
-    (?:\s+\w+)*?           # optional TYPE clause words
-    \s+ DROP \s+ NOT \s+ NULL
-    """,
-    re.VERBOSE | re.IGNORECASE,
+# Pass 1: Capture the table name from an ALTER TABLE statement header.
+#   Handles optional schema prefix; captures bare table name.
+_ALTER_TABLE_HEAD_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(?:[\w]+\.)?([\w]+)\b",
+    re.IGNORECASE,
+)
+
+# Pass 2: Find every ALTER COLUMN ... DROP NOT NULL action within a statement.
+#   Handles comma-separated action lists such as:
+#     ALTER COLUMN a TYPE TEXT, ALTER COLUMN b DROP NOT NULL
+#   Captures the column name for each DROP NOT NULL action.
+_DROP_NOT_NULL_ACTION_RE = re.compile(
+    r"ALTER\s+COLUMN\s+([\w]+)(?:\s+\w+)*?\s+DROP\s+NOT\s+NULL",
+    re.IGNORECASE,
 )
 
 # SELECT-shaped patterns: a string that looks like it reads a column.
@@ -125,15 +123,25 @@ class Violation:
 
 def parse_dropped_not_null(sql_text: str) -> list[tuple[str, str]]:
     """Return a list of (table, column) pairs for every ``ALTER COLUMN col
-    DROP NOT NULL`` statement in *sql_text*.
+    DROP NOT NULL`` action in *sql_text*.
 
     Case-insensitive. Handles optional ``schema.`` prefix on the table name
     (the schema prefix is stripped — callers match on bare table name only,
     since columns are the key discriminator).
 
+    Uses a two-pass parser so that comma-separated action lists are handled
+    correctly:
+      - Pass 1: split into ``;``-terminated statements (after stripping
+        ``--`` line comments) and identify each ``ALTER TABLE`` statement's
+        table name via ``_ALTER_TABLE_HEAD_RE``.
+      - Pass 2: run ``_DROP_NOT_NULL_ACTION_RE.finditer`` within each
+        statement body to collect every ``ALTER COLUMN … DROP NOT NULL``
+        action, yielding one (table, column) pair per match.
+
     Examples that match:
         ALTER TABLE derived.rulings ALTER COLUMN hearing_date DROP NOT NULL;
         ALTER TABLE dispatcher.agents ALTER COLUMN issue_number DROP NOT NULL;
+        ALTER TABLE foo ALTER COLUMN a TYPE TEXT, ALTER COLUMN b DROP NOT NULL;
 
     Examples that do NOT match:
         ALTER TABLE foo ADD COLUMN bar TEXT;
@@ -141,10 +149,20 @@ def parse_dropped_not_null(sql_text: str) -> list[tuple[str, str]]:
         ALTER TABLE foo ALTER COLUMN bar SET NOT NULL;
     """
     results: list[tuple[str, str]] = []
-    for m in _DROP_NOT_NULL_RE.finditer(sql_text):
-        table = m.group(1).lower()
-        column = m.group(2).lower()
-        results.append((table, column))
+
+    # Strip single-line -- comments so they don't confuse the parser.
+    stripped = re.sub(r"--[^\n]*", "", sql_text)
+
+    # Split on semicolons into individual statements.
+    for statement in stripped.split(";"):
+        head_match = _ALTER_TABLE_HEAD_RE.search(statement)
+        if head_match is None:
+            continue
+        table = head_match.group(1).lower()
+        for action_match in _DROP_NOT_NULL_ACTION_RE.finditer(statement):
+            column = action_match.group(1).lower()
+            results.append((table, column))
+
     return results
 
 
@@ -186,9 +204,16 @@ def find_changed_migrations(base_ref: str, repo_root: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _file_has_nullable_ok(text: str) -> bool:
-    """Return True if the file carries a ``# nullable-ok: <reason>`` line."""
-    return bool(re.search(r"#\s*nullable-ok\s*:", text, re.IGNORECASE))
+def _column_has_nullable_ok(text: str, column: str) -> bool:
+    """Return True if the file carries a ``# nullable-ok: <column>: <reason>``
+    annotation for *column*.
+
+    The annotation format is ``# nullable-ok: <column>: <reason>``.  The
+    column name must match exactly (case-insensitive).  A generic annotation
+    without a column name does NOT suppress violations.
+    """
+    pattern = r"#\s*nullable-ok\s*:\s*" + re.escape(column) + r"\s*:"
+    return bool(re.search(pattern, text, re.IGNORECASE))
 
 
 def _text_has_null_guard(text: str, column: str) -> bool:
@@ -253,7 +278,7 @@ def audit_column_reads(
     1. It references the column name (fast pre-filter).
     2. It has a SELECT-shaped reference to the column.
     3. It does NOT have ``<column> IS NOT NULL`` anywhere in the file.
-    4. It does NOT carry a ``# nullable-ok: <reason>`` file-level ack.
+    4. It does NOT carry a ``# nullable-ok: <column>: <reason>`` per-column ack.
 
     Only `.py` files are scanned (SQL templates and TypeScript resolvers are
     out of scope for v1).
@@ -282,8 +307,8 @@ def audit_column_reads(
                 if not _file_has_select_shaped_reference(text, column):
                     continue
 
-                # File-level ack — skip if present.
-                if _file_has_nullable_ok(text):
+                # Per-column ack — skip if this column is acknowledged.
+                if _column_has_nullable_ok(text, column):
                     continue
 
                 # NULL guard check — skip if present.
@@ -298,7 +323,7 @@ def audit_column_reads(
                         reason=(
                             f"File references '{column}' in a SELECT context "
                             f"but has no IS NOT NULL guard and no "
-                            f"# nullable-ok: annotation."
+                            f"# nullable-ok: {column}: annotation."
                         ),
                     )
                 )
@@ -428,8 +453,8 @@ def main() -> int:
         file=sys.stderr,
     )
     print(
-        "  2. Add a file-level acknowledgment if NULL is handled elsewhere:\n"
-        "       # nullable-ok: <reason explaining how NULL is handled>",
+        "  2. Add a per-column acknowledgment if NULL is handled elsewhere:\n"
+        "       # nullable-ok: <column>: <reason explaining how NULL is handled>",
         file=sys.stderr,
     )
     print("", file=sys.stderr)

@@ -22,6 +22,7 @@ _spec.loader.exec_module(mod)
 
 parse_dropped_not_null = mod.parse_dropped_not_null
 audit_column_reads = mod.audit_column_reads
+_column_has_nullable_ok = mod._column_has_nullable_ok
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +118,9 @@ class TestAuditColumnReads:
         assert violations == []
 
     def test_passes_with_nullable_ok_annotation(self, tmp_path: Path) -> None:
-        """A file carrying # nullable-ok: <reason> is explicitly ack'd — no violation."""
+        """A file carrying # nullable-ok: <column>: <reason> is explicitly ack'd — no violation."""
         code = (
-            "# nullable-ok: issue_number is None for scheduled-skill agents\n"
+            "# nullable-ok: issue_number: is None for scheduled-skill agents\n"
             'query = "SELECT issue_number FROM dispatcher.agents"\n'
             'issue_num = row["issue_number"]\n'
         )
@@ -153,3 +154,62 @@ class TestAuditColumnReads:
         self._make_scripts_file(tmp_path, "constants.py", code)
         violations = audit_column_reads(tmp_path, [("agents", "issue_number")])
         assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# parse_dropped_not_null — multi-action ALTER TABLE (AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDroppedNotNullMultiAction:
+    def test_extracts_from_multi_action_alter(self) -> None:
+        """Comma-separated actions: TYPE change + DROP NOT NULL yields one pair."""
+        sql = (
+            "ALTER TABLE foo ALTER COLUMN a TYPE TEXT, ALTER COLUMN b DROP NOT NULL;\n"
+        )
+        result = parse_dropped_not_null(sql)
+        assert result == [("foo", "b")]
+
+    def test_extracts_from_multi_action_two_drops(self) -> None:
+        """Two DROP NOT NULL actions in one statement both yield pairs."""
+        sql = (
+            "ALTER TABLE foo "
+            "ALTER COLUMN a DROP NOT NULL, "
+            "ALTER COLUMN b DROP NOT NULL;\n"
+        )
+        result = parse_dropped_not_null(sql)
+        assert result == [("foo", "a"), ("foo", "b")]
+
+
+# ---------------------------------------------------------------------------
+# _column_has_nullable_ok — per-column annotation (AC3)
+# ---------------------------------------------------------------------------
+
+
+class TestColumnHasNullableOk:
+    def test_nullable_ok_requires_column_name_match(self, tmp_path: Path) -> None:
+        """Annotation for column 'foo' does NOT suppress a violation on 'bar';
+        the same annotation DOES suppress a violation on 'foo'."""
+        # Write a file that reads both 'foo' and 'bar' in a SELECT context,
+        # annotated only for 'foo'.
+        code = (
+            "# nullable-ok: foo: handled upstream\n"
+            'query_foo = "SELECT foo FROM t"\n'
+            'query_bar = "SELECT bar FROM t"\n'
+            'v_foo = row["foo"]\n'
+            'v_bar = row["bar"]\n'
+        )
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir(exist_ok=True)
+        (scripts_dir / "mixed.py").write_text(code, encoding="utf-8")
+
+        violations_foo = audit_column_reads(tmp_path, [("t", "foo")])
+        violations_bar = audit_column_reads(tmp_path, [("t", "bar")])
+
+        # 'foo' is annotated — no violation.
+        assert violations_foo == [], (
+            f"Expected no violation for 'foo', got {violations_foo}"
+        )
+        # 'bar' is NOT annotated — must be flagged.
+        assert len(violations_bar) == 1
+        assert violations_bar[0].column == "bar"

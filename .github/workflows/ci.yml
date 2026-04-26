@@ -1150,8 +1150,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Fetch origin/main for diff base
-        run: git fetch origin main --depth=50
       - name: Check for unguarded reads of columns with dropped NOT NULL constraint
         run: scripts/check-nullable-column-reads.sh --base origin/main
 
