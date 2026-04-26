@@ -75,19 +75,17 @@ KNOWN_MAPPINGS: dict[tuple[str, str], list[tuple[str, str]]] = {
     ],
 }
 
-# Regex: match ALTER TABLE ... ALTER COLUMN <col> DROP NOT NULL
-# Handles optional schema prefix, multi-word table names, surrounding
-# whitespace, and case insensitivity. Captures (table, column).
-_DROP_NOT_NULL_RE = re.compile(
-    r"""
-    ALTER \s+ TABLE \s+
-    (?:[\w]+\.)? ([\w]+)   # optional schema prefix, then table name
-    \s+ ALTER \s+ COLUMN \s+
-    ([\w]+)                # column name
-    (?:\s+\w+)*?           # optional TYPE clause words
-    \s+ DROP \s+ NOT \s+ NULL
-    """,
-    re.VERBOSE | re.IGNORECASE,
+# Two-pass parser constants for ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL.
+# Pass 1: identify the table name from the ALTER TABLE head.
+_ALTER_TABLE_HEAD_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(?:[\w]+\.)?([\w]+)\b",
+    re.IGNORECASE,
+)
+
+# Pass 2: find each ALTER COLUMN <col> DROP NOT NULL action within a statement.
+_DROP_NOT_NULL_ACTION_RE = re.compile(
+    r"ALTER\s+COLUMN\s+([\w]+)(?:\s+\w+)*?\s+DROP\s+NOT\s+NULL",
+    re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
@@ -117,14 +115,25 @@ class GraphQLDriftViolation:
 
 def parse_dropped_not_null(sql_text: str) -> list[tuple[str, str]]:
     """Return a list of (table, column) pairs for every ``ALTER COLUMN col
-    DROP NOT NULL`` statement in *sql_text*.
+    DROP NOT NULL`` action in *sql_text*.
 
     Case-insensitive. Handles optional ``schema.`` prefix on the table name
-    (the schema prefix is stripped — callers match on bare table name only).
+    (the schema prefix is stripped — callers match on bare table name only,
+    since columns are the key discriminator).
+
+    Uses a two-pass parser so that comma-separated action lists are handled
+    correctly:
+      - Pass 1: split into ``;``-terminated statements (after stripping
+        ``--`` line comments) and identify each ``ALTER TABLE`` statement's
+        table name via ``_ALTER_TABLE_HEAD_RE``.
+      - Pass 2: run ``_DROP_NOT_NULL_ACTION_RE.finditer`` within each
+        statement body to collect every ``ALTER COLUMN … DROP NOT NULL``
+        action, yielding one (table, column) pair per match.
 
     Examples that match:
         ALTER TABLE derived.rulings ALTER COLUMN hearing_date DROP NOT NULL;
         ALTER TABLE dispatcher.agents ALTER COLUMN issue_number DROP NOT NULL;
+        ALTER TABLE foo ALTER COLUMN a TYPE TEXT, ALTER COLUMN b DROP NOT NULL;
 
     Examples that do NOT match:
         ALTER TABLE foo ADD COLUMN bar TEXT;
@@ -132,10 +141,20 @@ def parse_dropped_not_null(sql_text: str) -> list[tuple[str, str]]:
         ALTER TABLE foo ALTER COLUMN bar SET NOT NULL;
     """
     results: list[tuple[str, str]] = []
-    for m in _DROP_NOT_NULL_RE.finditer(sql_text):
-        table = m.group(1).lower()
-        column = m.group(2).lower()
-        results.append((table, column))
+
+    # Strip single-line -- comments so they don't confuse the parser.
+    stripped = re.sub(r"--[^\n]*", "", sql_text)
+
+    # Split on semicolons into individual statements.
+    for statement in stripped.split(";"):
+        head_match = _ALTER_TABLE_HEAD_RE.search(statement)
+        if head_match is None:
+            continue
+        table = head_match.group(1).lower()
+        for action_match in _DROP_NOT_NULL_ACTION_RE.finditer(statement):
+            column = action_match.group(1).lower()
+            results.append((table, column))
+
     return results
 
 
@@ -186,48 +205,60 @@ def check_field_nonnull(
       - line_number: 1-based line number of the field declaration (0 if not found).
       - line_text: the raw text of the matching line (empty if not found).
 
-    Strategy: scan within the type block for *graphql_type*, then look for
-    a field declaration line matching *field_name*.  We use a simple
-    line-by-line scan rather than a full GraphQL parser — the schema files
-    are well-structured and this is more robust to whitespace variation.
+    Strategy: locate the opening ``{`` of the type block for *graphql_type*
+    using a regex that accepts optional ``@directive`` decorators and inline
+    single-line bodies.  Then walk characters to find the matching closing
+    ``}`` (brace-depth counter).  Finally, search the extracted body for the
+    field declaration using *field_re*.
+
+    Accepts three type-block forms:
+      1. Multi-line:   ``type Foo {\\n  field: T!\\n}``
+      2. Single-line:  ``type Foo { id: ID! }``
+      3. Decorated:    ``type Foo @directive { ... }``
+                       ``type Foo @directive(arg: "x") { ... }``
     """
-    lines = schema_text.splitlines()
-
-    # Find the type block for graphql_type.  We look for a line that opens
-    # the type block: ``type TypeName {`` or ``type TypeName\n{``.
-    type_start = -1
-    type_block_re = re.compile(r"^\s*type\s+" + re.escape(graphql_type) + r"\s*\{?\s*$")
-    for i, line in enumerate(lines):
-        if type_block_re.match(line):
-            type_start = i
-            break
-
-    if type_start == -1:
-        # Type not found in this schema file — not a violation here.
+    # Match the type opener — allows zero-or-more @directive(...) decorators
+    # between the type name and the opening brace.
+    type_opener_re = re.compile(
+        r"^\s*type\s+" + re.escape(graphql_type) + r"\b(?:\s+@\w+(?:\([^)]*\))?)*\s*\{",
+        re.MULTILINE,
+    )
+    opener_match = type_opener_re.search(schema_text)
+    if opener_match is None:
         return False, 0, ""
 
-    # Scan lines after the type block opening until the closing ``}``.
-    depth = 0
-    in_block = False
+    # Walk from the character after the opening '{' to find the matching '}'.
+    body_start = opener_match.end()
+    depth = 1
+    pos = body_start
+    while pos < len(schema_text) and depth > 0:
+        ch = schema_text[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        pos += 1
+    body_end = pos - 1  # points at the closing '}'
+
+    body = schema_text[body_start:body_end]
+
+    # Search for the field declaration within the body.
     field_re = re.compile(
-        r"^\s*" + re.escape(field_name) + r"\s*(?:\([^)]*\))?\s*:\s*([\w\[\]!]+)"
+        r"^\s*" + re.escape(field_name) + r"\s*(?:\([^)]*\))?\s*:\s*([\w\[\]!]+)",
+        re.MULTILINE,
     )
-    for i in range(type_start, len(lines)):
-        line = lines[i]
-        # Track brace depth.
-        depth += line.count("{") - line.count("}")
-        if not in_block and "{" in line:
-            in_block = True
-        if in_block and depth <= 0:
-            break  # exited the type block
+    field_match = field_re.search(body)
+    if field_match is None:
+        return False, 0, ""
 
-        m = field_re.match(line)
-        if m:
-            type_expr = m.group(1).strip()
-            is_nonnull = type_expr.endswith("!")
-            return is_nonnull, i + 1, line.rstrip()
+    # Compute the 1-based line number in the original schema_text.
+    abs_pos = body_start + field_match.start()
+    line_no = schema_text.count("\n", 0, abs_pos) + 1
+    line_text = schema_text.splitlines()[line_no - 1]
 
-    return False, 0, ""
+    type_expr = field_match.group(1).strip()
+    is_nonnull = type_expr.endswith("!")
+    return is_nonnull, line_no, line_text.rstrip()
 
 
 def find_graphql_drift(

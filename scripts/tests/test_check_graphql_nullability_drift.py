@@ -65,6 +65,12 @@ class TestParseDroppedNotNull:
         result = parse_dropped_not_null(sql)
         assert result == [("agents", "issue_number"), ("failures", "issue_number")]
 
+    def test_multi_action_alter(self) -> None:
+        sql = "ALTER TABLE foo ALTER COLUMN a TYPE TEXT, ALTER COLUMN b DROP NOT NULL;"
+        result = parse_dropped_not_null(sql)
+        assert ("foo", "b") in result
+        assert ("foo", "a") not in result
+
 
 # ---------------------------------------------------------------------------
 # check_field_nonnull — unit tests for the GraphQL schema scanner
@@ -131,6 +137,29 @@ export const typeDefs = `#graphql
         )
         assert is_nonnull is False
         assert line_no == 0
+
+    def test_single_line_type_block(self, tmp_path: Path) -> None:
+        schema = "type DispatcherAgent { issueNumber: Int! }"
+        sf = tmp_path / "schema.ts"
+        sf.write_text(schema)
+        is_nonnull, line_no, line_text = check_field_nonnull(
+            schema, sf, "DispatcherAgent", "issueNumber"
+        )
+        assert is_nonnull is True
+        assert line_no > 0
+        assert "Int!" in line_text
+
+    def test_decorated_type_block(self, tmp_path: Path) -> None:
+        schema = (
+            "type DispatcherAgent @cacheControl(maxAge: 60) {\n    issueNumber: Int!\n}"
+        )
+        sf = tmp_path / "schema.ts"
+        sf.write_text(schema)
+        is_nonnull, line_no, line_text = check_field_nonnull(
+            schema, sf, "DispatcherAgent", "issueNumber"
+        )
+        assert is_nonnull is True
+        assert line_no > 0
 
 
 # ---------------------------------------------------------------------------
