@@ -103,7 +103,7 @@ MIGRATION_50_PATH = (
     / "packages"
     / "api"
     / "migrations"
-    / "50_dispatcher-daily-report-skill.sql"
+    / "51_dispatcher-daily-report-skill.sql"
 )
 
 
@@ -113,7 +113,7 @@ def _migration_50_text() -> str:
 
 def test_daily_report_migration_file_exists() -> None:
     assert MIGRATION_50_PATH.is_file(), (
-        f"expected migration file at {MIGRATION_50_PATH}; issue #3375 ships migration 50"
+        f"expected migration file at {MIGRATION_50_PATH}; issue #3375 ships migration 51"
     )
 
 
