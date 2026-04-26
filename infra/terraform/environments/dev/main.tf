@@ -383,6 +383,7 @@ module "dispatcher_agent_runner" {
   spotcheck_oneshot_source_execution_role_arn = module.compute.task_execution_role_arn
   spotcheck_ecs_cluster_arn                   = module.compute.cluster_arn
   spotcheck_document_archive_bucket_arn       = module.document_archive.bucket_arn
+  spotcheck_oneshot_script_bucket_arn         = "arn:aws:s3:::judgemind-assets-dev"
 }
 
 output "ecr_repository_url" {

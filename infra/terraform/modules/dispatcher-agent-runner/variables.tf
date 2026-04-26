@@ -120,8 +120,15 @@ variable "repo_url" {
 #     + PDF artifacts back after the oneshot writes them.
 #
 # Deliberately NOT granted:
-#   - s3:PutObject / DeleteObject anywhere — /spotcheck is read-only on
-#     S3 (the oneshot itself uses the iam_scraper role for writes).
+#   - s3:PutObject / DeleteObject on the document-archive bucket —
+#     /spotcheck is read-only on the archive (the oneshot itself uses the
+#     iam_scraper role for writes). PutObject + DeleteObject ARE granted
+#     on the `oneshot-scripts/*` prefix of the assets bucket
+#     (spotcheck_oneshot_script_bucket_arn) — that is the launcher's
+#     script-staging path (scripts/ecs-run-task.sh:547-577) and is
+#     distinct from the archive read-only contract.
+#   - ecs:ListTasks IS granted, scoped to the dev cluster, to allow
+#     dev-db-query.sh:143 to list running tasks.
 #   - ECR DescribeImages — only used by the daemon's stale-image path.
 #   - Bucket-level grants beyond ListBucket + GetBucketLocation (no
 #     PutBucketPolicy / GetBucketAcl etc.).
@@ -146,6 +153,12 @@ variable "spotcheck_ecs_cluster_arn" {
 
 variable "spotcheck_document_archive_bucket_arn" {
   description = "ARN of the document-archive bucket (`judgemind-document-archive-<env>`). Spotcheck's bidirectional sampling reads ruling JSON + PDF artifacts from this bucket via `aws s3 cp`."
+  type        = string
+  default     = ""
+}
+
+variable "spotcheck_oneshot_script_bucket_arn" {
+  description = "ARN of the assets bucket (`judgemind-assets-<env>`) used for staging oneshot scripts >8 KB via pre-signed URL. When non-empty, grants s3:PutObject + s3:DeleteObject on the `oneshot-scripts/*` prefix (scripts/ecs-run-task.sh:547-577). Leave empty to skip the grant."
   type        = string
   default     = ""
 }
