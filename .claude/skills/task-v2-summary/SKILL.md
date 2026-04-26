@@ -59,7 +59,7 @@ Read `{worktree}/tmp/dispatcher-input/summary.json`. Required fields:
 - `issue_number` (int).
 - `issue_title` (str).
 - `issue_body` (str).
-- `issue_comments` (list of `{author, date, body}` — non-bots only).
+- `collapsed_comments` (list of `{author, date, body}` — non-bots only; sourced from `plan.json.collapsed_comments` which may be a structural collapse of the original thread when total tokens exceeded 2000).
 - `ralph_summary` (str) — the 1-3 sentence summary from ralph output.
 - `changed_files` (list of path).
 - `git_diff` (str) — full unified diff from `git diff origin/main...HEAD`. Post-#2971, ralph's Step 2.5 always commits its work before returning, so the range resolves against a committed HEAD and the diff is non-empty for every non-no-op SHIP. No working-tree-vs-committed-state branching is required on the summary side.
@@ -120,7 +120,7 @@ Exit 0 regardless. Empty `unmet_criteria` + empty `infeasible_acs` + `verdict="O
 
 ## Step 1 — Extract acceptance criteria
 
-Read the issue body and `issue_comments`. Identify all `- [ ]` checkboxes under an "Acceptance criteria" heading (or similar). Also capture any criterion mentioned in a non-bot comment that supersedes the original body (re-scoping, adding criteria).
+Read the issue body and `collapsed_comments`. Identify all `- [ ]` checkboxes under an "Acceptance criteria" heading (or similar). Also capture any criterion mentioned in a non-bot comment that supersedes the original body (re-scoping, adding criteria).
 
 If `plan_acceptance_criteria` is populated, cross-check against your extracted list. If they diverge, prefer the issue body + comments (the source of truth). Note the divergence in `pre_pr_check_notes` so the retro phase can file a follow-up.
 

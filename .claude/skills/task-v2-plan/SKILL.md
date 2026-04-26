@@ -67,7 +67,8 @@ Write `{worktree}/tmp/dispatcher-output/plan.json` with these fields, then exit 
   "relevant_files": ["<path>", ...],
   "relevant_docs": ["docs/specs/<name>.md", ...],
   "change_type": "api" | "scraper" | "ingestion" | "web" | "db_migration" | "dx_tooling" | "backfill_script" | "docs" | "agent_skill" | "no_deployed_component",
-  "dependencies_to_install": ["<package-relative-path>", ...]
+  "dependencies_to_install": ["<package-relative-path>", ...],
+  "collapsed_comments": [<comment dicts — see Step 5.5>]
 }
 ```
 
@@ -148,6 +149,22 @@ For `go=true`, write `plan_text` as ≤500 words of markdown covering:
 
 Populate `relevant_files` with every path ralph should Read during implementation. Populate `relevant_docs` with any docs/specs or docs/agent files ralph must honor.
 
+## Step 5.5 — Collapse long comment threads
+
+After writing `plan_text`, collapse the raw `issue_comments` for downstream phases:
+
+```python
+from scripts.dispatcher.collapse_comments import collapse_comments
+collapsed = collapse_comments(issue_comments)
+```
+
+Where `issue_comments` is the list read from `plan.json` input. Set `collapsed_comments` in the output JSON to the result:
+
+- When total token estimate is **under 2000**, `collapsed_comments` is identical to `issue_comments` (same objects).
+- When total token estimate is **2000 or above**, `collapsed_comments` contains the first comment verbatim, collapsed middle entries (body truncated to 120 chars, `_collapsed: true`), and the last two verbatim.
+
+If any `_collapsed=true` entry's body is still unclear in context, you MAY inline a one-line LLM summary into its `body` field in place of the raw truncation — but this is optional enrichment. The deterministic structural collapse (what `collapse_comments` does) is the minimum requirement.
+
 ## Step 6 — Write the output JSON
 
 Use the Write tool to produce `{worktree}/tmp/dispatcher-output/plan.json` containing all fields above. Exit 0.
@@ -172,6 +189,7 @@ For an issue "fix(scraping): Orange County department parsing drops leading zero
 - `change_type`: `scraper`.
 - `dependencies_to_install`: `["scraper-framework"]`.
 - `plan_text`: covers the one-line regex fix, the new regression test against a fixture, the out-of-scope note for Riverside, and the AC verification map.
+- `collapsed_comments`: result of `collapse_comments(issue_comments)` — empty list when no issue comments, or the collapsed/verbatim list otherwise.
 - `go`: true.
 
 For an issue "docs(agent): add retro phase to task skill" where the task skill doesn't exist anymore:

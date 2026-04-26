@@ -48,6 +48,7 @@ Optional:
 - `plan_text` (str) — from plan output; can clarify ambiguous criteria.
 - `scope_check` (list) — for context on what's intentionally out of scope.
 - `deferred_acs` (list) — carried forward from summary's output (`dispatcher.phase_outputs`). Shape: `[{"index": <int>, "reason": "marker" | "heuristic", "verify_instruction": "<Verify: line text>"}]`. When present, this skill runs the deferred ACs FIRST and labels each result as "deferred (marker|heuristic) → pass|fail"; the remaining ACs are labeled as "pre-merge validated, re-confirmed post-deploy". See [spec §6a `^summary-deferred-acs`](../../../docs/specs/dispatcher-v2-spec.md) and issue #3010. Absent or empty on pre-#3010 agents and on no-deploy/docs change types — the skill treats the verification universe as "every AC, no labeling" in that case.
+- `collapsed_comments` (list) — carried from plan output via the daemon (see issue #2716). Reserved for future use: verify does not currently consume comments directly. Absent on pre-#2716 agents.
 
 If the file is missing or malformed, exit 0 with verdict=`FAILED, failure_reason="input JSON missing or malformed"`.
 

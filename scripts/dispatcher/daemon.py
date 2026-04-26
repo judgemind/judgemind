@@ -11263,7 +11263,7 @@ class DispatcherDaemon:
             "issue_number": issue_number,
             "issue_title": bundle.get("issue_title", ""),
             "issue_body": bundle.get("issue_body", ""),
-            "issue_comments": bundle.get("issue_comments", []),
+            "collapsed_comments": plan_output.get("collapsed_comments") or bundle.get("issue_comments", []),
             "ralph_summary": ralph_output.get("summary", ""),
             "changed_files": changed_files,
             "git_diff": git_diff,
