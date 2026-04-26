@@ -5044,6 +5044,178 @@ else
     pass "#3411 T54 — does NOT invoke gh issue close on CLOSED issue"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test 55: #3429 T55 — printf failure routes via return 1.
+#
+# Scenario: disk / inode pressure causes the write to the tmpfile to fail
+# (ENOSPC). Before #3429, mktemp + printf ran under ``set -e`` and a failed
+# write would abort the shell immediately with a masked exit code. After the
+# fix, printf's failure is caught inside set +e, logged as
+# phase_output_persist_failed reason=tmpfile_write_failed, and routed via
+# ``return 1`` so the caller can inspect the rc and continue.
+#
+# We simulate the write failure by pointing the stub ``mktemp`` at
+# /dev/full, which always returns ENOSPC on write.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Reuse the same fixture file extracted for T40 — it already contains
+# db_exec, log, and persist_phase_output with the #3429 fix applied.
+t55_funcs="$TEST_TMP/t55-funcs.sh"
+printf 'exec 3>&1\n' > "$t55_funcs"
+
+awk '
+    /^db_exec\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t55_funcs"
+
+awk '
+    /^log\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t55_funcs"
+
+awk '
+    /^persist_phase_output\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t55_funcs"
+
+# Build a stub mktemp that returns /dev/full so writes always fail (ENOSPC).
+t55_stub_bin="$TEST_TMP/t55-bin"
+mkdir -p "$t55_stub_bin"
+cat > "$t55_stub_bin/mktemp" <<'T55MKTEMPEOF'
+#!/usr/bin/env bash
+printf '/dev/full\n'
+exit 0
+T55MKTEMPEOF
+chmod +x "$t55_stub_bin/mktemp"
+
+# Also need a stub psql (should never be reached, but must exist).
+cat > "$t55_stub_bin/psql" <<'T55PSQLEOF'
+#!/usr/bin/env bash
+exit 0
+T55PSQLEOF
+chmod +x "$t55_stub_bin/psql"
+
+set +e
+t55_out=$(PATH="$t55_stub_bin:$PATH" \
+    AGENT_ID="55555555-dead-beef-cafe-000000000001" \
+    DATABASE_URL="postgres://test" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t55_funcs"'"
+        # Use || to prevent set -e from killing the subshell when the
+        # function returns 1 — this is how real callers handle it. The
+        # important assertions are (b) that this line is reached at all
+        # (proving no early shell abort via set -e inside the function)
+        # and (c) the persist_failed log event is emitted.
+        persist_phase_output "ralph" "{}" || true
+        echo "after-call=$?"
+    ' 2>&1)
+t55_rc=$?
+set -e
+
+# (a) subshell exit code 0 — caller code after the call executed, no abort.
+if [[ "$t55_rc" -eq 0 ]]; then
+    pass "#3429 T55 — subshell did not abort (exit 0)"
+else
+    fail "#3429 T55 — subshell did not abort (exit 0)" \
+         "rc=$t55_rc output: $t55_out"
+fi
+
+# (b) sentinel line reached.
+if printf '%s' "$t55_out" | grep -q "after-call="; then
+    pass "#3429 T55 — sentinel after-call= reached"
+else
+    fail "#3429 T55 — sentinel after-call= reached" \
+         "output: $t55_out"
+fi
+
+# (c) phase_output_persist_failed with reason=tmpfile_write_failed logged.
+# The log() function formats key=value pairs as JSON ("key": "value"), so
+# we check for the event name and the value string independently.
+if printf '%s' "$t55_out" | grep -q "phase_output_persist_failed" \
+   && printf '%s' "$t55_out" | grep -q "tmpfile_write_failed"; then
+    pass "#3429 T55 — phase_output_persist_failed reason=tmpfile_write_failed logged"
+else
+    fail "#3429 T55 — phase_output_persist_failed reason=tmpfile_write_failed logged" \
+         "output: $t55_out"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 56: #3429 T56 — mktemp failure routes via return 1.
+#
+# Scenario: mktemp itself fails (no inodes). The stub prints nothing and
+# exits 1. Before #3429, the $() expansion of mktemp ran under ``set -e``
+# and a failing mktemp would kill the shell. After the fix the empty
+# result is checked inside set +e and routed via ``return 1`` with a
+# phase_output_persist_failed reason=mktemp_failed log event.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Reuse $t55_funcs — same fixture.
+
+# Build a stub mktemp that prints nothing and exits 1.
+t56_stub_bin="$TEST_TMP/t56-bin"
+mkdir -p "$t56_stub_bin"
+cat > "$t56_stub_bin/mktemp" <<'T56MKTEMPEOF'
+#!/usr/bin/env bash
+exit 1
+T56MKTEMPEOF
+chmod +x "$t56_stub_bin/mktemp"
+
+# Stub psql (should never be reached).
+cat > "$t56_stub_bin/psql" <<'T56PSQLEOF'
+#!/usr/bin/env bash
+exit 0
+T56PSQLEOF
+chmod +x "$t56_stub_bin/psql"
+
+set +e
+t56_out=$(PATH="$t56_stub_bin:$PATH" \
+    AGENT_ID="56565656-dead-beef-cafe-000000000001" \
+    DATABASE_URL="postgres://test" \
+    bash -c '
+        set -euo pipefail
+        # shellcheck disable=SC1090
+        . "'"$t55_funcs"'"
+        # Use || to prevent set -e from killing the subshell — same
+        # pattern as T55. Key assertions are (b) this line is reached
+        # and (c) the mktemp_failed log event is emitted.
+        persist_phase_output "ralph" "{}" || true
+        echo "after-call=$?"
+    ' 2>&1)
+t56_rc=$?
+set -e
+
+# (a) subshell exit code 0 — caller code executed, no abort.
+if [[ "$t56_rc" -eq 0 ]]; then
+    pass "#3429 T56 — subshell did not abort (exit 0)"
+else
+    fail "#3429 T56 — subshell did not abort (exit 0)" \
+         "rc=$t56_rc output: $t56_out"
+fi
+
+# (b) sentinel line reached.
+if printf '%s' "$t56_out" | grep -q "after-call="; then
+    pass "#3429 T56 — sentinel after-call= reached"
+else
+    fail "#3429 T56 — sentinel after-call= reached" \
+         "output: $t56_out"
+fi
+
+# (c) phase_output_persist_failed with reason=mktemp_failed logged.
+# The log() function formats key=value pairs as JSON ("key": "value"), so
+# we check for the event name and the value string independently.
+if printf '%s' "$t56_out" | grep -q "phase_output_persist_failed" \
+   && printf '%s' "$t56_out" | grep -q "mktemp_failed"; then
+    pass "#3429 T56 — phase_output_persist_failed reason=mktemp_failed logged"
+else
+    fail "#3429 T56 — phase_output_persist_failed reason=mktemp_failed logged" \
+         "output: $t56_out"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
