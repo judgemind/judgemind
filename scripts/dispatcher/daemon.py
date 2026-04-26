@@ -12728,17 +12728,30 @@ class DispatcherDaemon:
                 # and blocked cap>1 Phase 4 entry. The ``execution_mode``
                 # column surfaces in the SELECT so the dispatch can
                 # filter on it without a second round-trip.
+                # Issue #3394: ``issue_number`` was made nullable by
+                # PR #3381 so scheduled-skill agents (/audit, /spotcheck
+                # spawned via #3379) can run without an issue. Those
+                # agents are owned end-to-end by
+                # ``agent-runner-entrypoint.sh`` — the daemon's
+                # supervisor MUST NOT advance them. Filtering NULL out
+                # of the SELECT avoids ``int(None)`` blowing the whole
+                # tick (the bare-except below would catch it but return
+                # ``[]``, which silently halts ALL advance-loop work
+                # while a NULL-issue row sits in any
+                # ``status='succeeded' phase IN ('done',
+                # 'retro_done', 'retro_failed')`` state).
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status, "
                     "       merge_unstick_attempts, "
                     "       COALESCE(execution_mode, 'subprocess') "
                     "FROM dispatcher.agents "
-                    "WHERE (status = 'running' "
-                    "       AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
-                    "   OR (status = 'succeeded' "
-                    "       AND phase IN ('awaiting_deploy', 'done', "
-                    "                     'retro_done', 'retro_failed')) "
+                    "WHERE ((status = 'running' "
+                    "        AND phase IN ('awaiting_ci', 'awaiting_deploy')) "
+                    "    OR (status = 'succeeded' "
+                    "        AND phase IN ('awaiting_deploy', 'done', "
+                    "                      'retro_done', 'retro_failed'))) "
+                    "  AND issue_number IS NOT NULL "
                     "ORDER BY started_at ASC",
                 )
                 for row in cur.fetchall():
