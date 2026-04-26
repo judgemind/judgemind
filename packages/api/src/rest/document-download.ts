@@ -89,7 +89,7 @@ export function registerDocumentDownload(
           expiresIn: PRESIGNED_URL_TTL,
         });
 
-        return reply.redirect(302, presignedUrl);
+        return reply.redirect(presignedUrl, 302);
       } catch (err) {
         if (err instanceof NoSuchKey
           || (err instanceof Error && (err.name === 'NoSuchKey' || err.name === 'NotFound'))) {
