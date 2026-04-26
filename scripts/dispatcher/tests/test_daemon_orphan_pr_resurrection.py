@@ -425,6 +425,50 @@ class TestResurrectionNegativePaths:
         assert skipped[0].past_attempts == daemon.ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS
         assert skipped[0].max_attempts == daemon.ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS
 
+    def test_count_failed_skips_candidate_no_resurrection(self, tmp_path: Path) -> None:
+        """When _count_orphan_pr_resurrections returns None (DB error),
+        the candidate must be skipped without calling _fetch_pr_status
+        (no wasted gh API call) and without any resurrection DB write.
+        A distinct orphan_pr_resurrection_skipped event with
+        reason='count_failed' must be logged (#3427).
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        # One candidate row in the list.
+        conn.cursor_instance.fetchall_queue.append([("agent-count-fail", 444, 600)])
+
+        # Force _count_orphan_pr_resurrections to return None.
+        d._count_orphan_pr_resurrections = lambda agent_id: None  # type: ignore[method-assign]
+
+        # Sentinel: _fetch_pr_status must NOT be called.
+        pr_status_calls: list[int] = []
+
+        def fetch_pr_sentinel(pr: int) -> dict[str, Any]:
+            pr_status_calls.append(pr)
+            return _pr_status_green()
+
+        d._fetch_pr_status = fetch_pr_sentinel  # type: ignore[method-assign]
+
+        n = d._resurrect_orphan_pr_agents()
+
+        assert n == 0, "no resurrection expected"
+        assert pr_status_calls == [], (
+            "_fetch_pr_status must NOT be called on count_failed"
+        )
+        # No resurrection event.
+        assert handler.events("agent_resurrected_for_orphan_pr") == []
+        # Distinct skip event with count_failed reason.
+        skipped = handler.events("orphan_pr_resurrection_skipped")
+        assert skipped, "expected orphan_pr_resurrection_skipped event"
+        assert skipped[0].reason == "count_failed"
+        # No UPDATE issued.
+        update_calls = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+        ]
+        assert update_calls == []
+
     def test_no_candidates_returns_zero_no_log(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
         # SELECT returns no rows.
@@ -684,7 +728,7 @@ class TestAwaitingCiRedWorktreeMissingGuard:
 
 
 class TestDbErrorPaths:
-    def test_count_returns_zero_on_db_error(self, tmp_path: Path) -> None:
+    def test_count_returns_none_on_db_error(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
 
         def boom(*_a: Any, **_k: Any) -> None:
@@ -694,7 +738,7 @@ class TestDbErrorPaths:
 
         n = d._count_orphan_pr_resurrections("agent-x")
 
-        assert n == 0
+        assert n is None
         # Failure event logged so CloudWatch captures the issue.
         assert handler.events("orphan_pr_count_failed")
 
