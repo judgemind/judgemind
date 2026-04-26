@@ -249,6 +249,207 @@ resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
   })
 }
 
+# ─── IAM: Spotcheck oneshot launcher (#3459) ───────────────────────────────
+#
+# Re-enables the /spotcheck scheduled skill (re-enabled hourly by
+# migration 52) by widening this task role to launch its sampling
+# oneshot via `scripts/ecs-run-task.sh` and read the resulting
+# JSON + PDF artifacts from the document-archive bucket.
+#
+# The previous leaf-only task role intentionally lacked ecs:RunTask
+# (header comment above), which is correct for the *general* leaf
+# threat model — but spotcheck is a special case: a scheduled skill
+# whose entire job is to run an audit oneshot and grade the output.
+# Issue #3459 / PR #3457 traced the failure to this gap and chose
+# Option A (widen the role with a tightly-scoped subset of the
+# daemon's `task_run_oneshot` policy) over Option B (refactor the
+# daemon to pre-launch the oneshot).
+#
+# Scope invariants (audit via `aws iam get-role-policy`):
+#
+#   - RunTask / StopTask restricted to the `judgemind-oneshot-${env}`
+#     family on the dev cluster — no other family, no other cluster.
+#   - DescribeTasks / DescribeServices use `Resource = "*"` (AWS API
+#     does not accept ARN scoping on those actions); the cluster-ARN
+#     condition is the defence-in-depth control. Same pattern as the
+#     daemon's `task_run_oneshot`.
+#   - PassRole pinned to the caller-supplied source task + execution
+#     role ARNs — no daemon role, no other oneshot role.
+#   - GetRole pinned to `judgemind-*-${env}` (the launcher resolves a
+#     `--role <name>` override to an ARN at run-time).
+#   - logs:GetLogEvents / FilterLogEvents pinned to
+#     `/ecs/judgemind-*-${env}` so the agent-runner can stream the
+#     oneshot's logs (where /spotcheck reads `s3://...` paths) but
+#     cannot read unrelated log groups.
+#   - S3 grants limited to ListBucket / GetBucketLocation / GetObject
+#     on the document-archive bucket only — read-only, no writes.
+#     /spotcheck never writes to S3; the oneshot itself uses the
+#     iam_scraper role for any writes.
+#
+# Disabled (count = 0) when any of the four required inputs is empty.
+# Same rationale as the daemon module — staging / throwaway test stacks
+# that do not provision the oneshot family stay at the prior leaf-only
+# scope without further config gymnastics.
+
+locals {
+  spotcheck_oneshot_enabled = (
+    var.spotcheck_oneshot_source_task_role_arn != "" &&
+    var.spotcheck_oneshot_source_execution_role_arn != "" &&
+    var.spotcheck_ecs_cluster_arn != "" &&
+    var.spotcheck_document_archive_bucket_arn != ""
+  )
+  spotcheck_oneshot_family_arn_pattern = (
+    local.spotcheck_oneshot_enabled
+    ? "arn:aws:ecs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:task-definition/judgemind-oneshot-${var.environment}:*"
+    : ""
+  )
+  spotcheck_oneshot_pass_role_arns = compact([
+    var.spotcheck_oneshot_source_task_role_arn,
+    var.spotcheck_oneshot_source_execution_role_arn,
+  ])
+}
+
+resource "aws_iam_role_policy" "task_spotcheck_oneshot" {
+  count = local.spotcheck_oneshot_enabled ? 1 : 0
+
+  name = "${local.task_family}-task-spotcheck-oneshot"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Register a fresh oneshot task definition for each /spotcheck
+        # invocation. AWS does not accept ARN scoping on this action.
+        Sid      = "AllowRegisterOneshotTaskDefinition"
+        Effect   = "Allow"
+        Action   = "ecs:RegisterTaskDefinition"
+        Resource = "*"
+      },
+      {
+        Sid      = "AllowDeregisterOneshotTaskDefinition"
+        Effect   = "Allow"
+        Action   = "ecs:DeregisterTaskDefinition"
+        Resource = local.spotcheck_oneshot_family_arn_pattern
+      },
+      {
+        # Source-task-def read (template) + freshly registered oneshot
+        # task-def read. AWS requires `*` on this action.
+        Sid      = "AllowDescribeOneshotTaskDefinitions"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeTaskDefinition"
+        Resource = "*"
+      },
+      {
+        # Launch the oneshot, scoped to the dev oneshot family on this
+        # cluster only.
+        Sid      = "AllowRunOneshotTask"
+        Effect   = "Allow"
+        Action   = "ecs:RunTask"
+        Resource = local.spotcheck_oneshot_family_arn_pattern
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+          }
+        }
+      },
+      {
+        # Stop a hung oneshot if /spotcheck times out (the launcher's
+        # cleanup path uses StopTask before exiting).
+        Sid      = "AllowStopOneshotTask"
+        Effect   = "Allow"
+        Action   = "ecs:StopTask"
+        Resource = local.spotcheck_oneshot_family_arn_pattern
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+          }
+        }
+      },
+      {
+        # Poll DescribeTasks until the oneshot finishes; DescribeServices
+        # resolves the cluster's networking config for RunTask. Both
+        # actions require `*` at the API level — the cluster-ARN
+        # condition is the defence-in-depth control.
+        Sid    = "AllowDescribeOneshotRunningTasks"
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeTasks",
+          "ecs:DescribeServices",
+        ]
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+          }
+        }
+      },
+      {
+        # PassRole the oneshot's source task + execution roles.
+        # Without this, RunTask fails with `AccessDeniedException:
+        # User ... is not authorized to pass role ... because no
+        # identity-based policy allows the iam:PassRole action`.
+        Sid      = "AllowPassOneshotRoles"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = local.spotcheck_oneshot_pass_role_arns
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+          }
+        }
+      },
+      {
+        # Resolve a `--role <name>` override (ecs-run-task.sh calls
+        # `aws iam get-role --role-name <name>` to map a role name to
+        # an ARN before RunTask). Scoped to this account's
+        # `judgemind-*-${env}` roles only.
+        Sid      = "AllowResolveOneshotRoleName"
+        Effect   = "Allow"
+        Action   = "iam:GetRole"
+        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/judgemind-*-${var.environment}"
+      },
+      {
+        # Stream the oneshot's CloudWatch logs back into the agent-
+        # runner's stdout (the launcher tails the ingestion-worker
+        # log group, where oneshot tasks inherit their log config).
+        # Scoped to judgemind-* log groups in this account/region.
+        Sid    = "AllowReadOneshotLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:DescribeLogStreams",
+          "logs:GetLogEvents",
+          "logs:FilterLogEvents",
+        ]
+        Resource = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/judgemind-*:*"
+      },
+      {
+        # /spotcheck reads its sampling JSON output back from
+        # s3://judgemind-document-archive-${env}/spotcheck/... and
+        # downloads paired PDFs from s3://.../ca/<county>/raw/...
+        # GetBucketLocation is a precondition for `aws s3 cp` against
+        # a regional bucket from a multi-region SDK call path.
+        Sid    = "AllowSpotcheckBucketReads"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+        ]
+        Resource = var.spotcheck_document_archive_bucket_arn
+      },
+      {
+        # Object-level read on the same bucket. /spotcheck never
+        # writes — no PutObject / DeleteObject is granted. The oneshot
+        # itself uses the iam_scraper role for writes.
+        Sid      = "AllowSpotcheckObjectReads"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${var.spotcheck_document_archive_bucket_arn}/*"
+      },
+    ]
+  })
+}
+
 # ─── ECS Task Definition ───────────────────────────────────────────────────
 #
 # CPU / memory: 4096 / 16384 to match the subprocess-daemon envelope —
