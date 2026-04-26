@@ -459,6 +459,84 @@ class TestListAdvanceableAgents:
             "post-#2927 — every row is daemon-owned. Actual SQL: " + sql
         )
 
+    def test_select_excludes_null_issue_number(self, tmp_path: Path) -> None:
+        """Issue #3394 regression: SELECT filters out ``issue_number IS NULL`` rows.
+
+        PR #3381 made ``dispatcher.agents.issue_number`` nullable so
+        scheduled-skill agents (/audit, /spotcheck spawned via #3379)
+        can run without a closing issue. Those agents are owned end-to-
+        end by ``agent-runner-entrypoint.sh`` — the daemon's
+        supervisor advance loop must NOT pick them up.
+
+        Pre-fix, the dict-construction at the top of
+        ``_list_advanceable_agents`` called ``int(row[1])``
+        unconditionally. When a scheduled-skill row reached
+        ``status='succeeded' phase='done'`` (which matches the SELECT),
+        ``int(None)`` raised ``TypeError`` every supervisor tick. The
+        outer ``except`` swallowed it and returned ``[]``, silently
+        halting ALL advance-loop work while the offending row sat in
+        the table. This is a daemon-shipped-greens throughput killer.
+
+        The fix filters NULL out at the SQL layer so no downstream
+        code has to None-check. This test guards the WHERE clause.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [[]]
+        d._list_advanceable_agents()
+
+        selects = [
+            sql
+            for sql, _params in conn.cursor_instance.executed
+            if "SELECT agent_id" in sql and "FROM dispatcher.agents" in sql
+        ]
+        assert selects, "expected _list_advanceable_agents to issue the SELECT"
+        sql = selects[-1]
+        assert "issue_number IS NOT NULL" in sql, (
+            "_list_advanceable_agents must filter NULL issue_number rows "
+            "(scheduled-skill agents from #3379) at the SQL layer to avoid "
+            "int(None) crashing the supervisor tick (#3394). Actual SQL: " + sql
+        )
+
+    def test_null_issue_number_row_does_not_crash_dict_construction(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #3394 belt-and-suspenders: even if a NULL row reaches the
+        dict-construction loop (e.g. via a test fake bypassing the SQL filter
+        or a race where DB filtering is lost), the production code path must
+        not raise an unhandled ``TypeError`` that escapes
+        ``_list_advanceable_agents``.
+
+        With option-1 (filter at SQL) chosen as the fix, this test
+        documents the *contract*: a NULL ``issue_number`` row reaching
+        the loop is a bug upstream, but the immediate symptom (returning
+        ``[]`` and halting the advance loop) must be visible — not
+        silently swallowed mid-iteration corrupting later rows.
+
+        Today the bare-except wrapping the loop catches it and returns
+        ``[]``; this test pins that behavior so any future refactor that
+        moves the loop outside the ``try`` will have to make a deliberate
+        choice about handling the NULL.
+        """
+        d, conn, _handler = _make_daemon(tmp_path)
+        # Bypass the SQL filter at the fake-cursor layer to simulate a row
+        # that would have crashed the pre-fix code path.
+        null_issue_row = (
+            "agent-null-issue",
+            None,  # issue_number
+            "done",
+            None,  # pr_number
+            "/tmp/wt",
+            0,
+            "succeeded",
+            0,
+            "ecs",
+        )
+        conn.cursor_instance.fetchall_queue = [[null_issue_row]]
+        # Must not raise — outer except returns [] on TypeError.
+        rows = d._list_advanceable_agents()
+        assert rows == []
+        assert conn.rollbacks >= 1
+
 
 # --------------------------------------------------------------------------
 # _advance_running_agents — dispatch + crash isolation
