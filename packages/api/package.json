@@ -26,7 +26,7 @@
     "@opensearch-project/opensearch": "^3.5.1",
     "bcryptjs": "^3",
     "dataloader": "^2.2.3",
-    "fastify": "^4.26",
+    "fastify": "^5.8",
     "graphql": "^16.8",
     "jsonwebtoken": "^9.0",
     "node-pg-migrate": "^7.0",
