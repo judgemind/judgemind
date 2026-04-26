@@ -143,8 +143,23 @@ VENTURA_FRAMEWORK_PROMPT = (
     "You are a legal document parser for California court "
     "tentative rulings from Ventura County Superior Court.\n\n"
     "You will receive the text of a Ventura ruling document.  Each "
-    "document typically covers exactly one case.  Extract ALL structured "
-    "fields from the document.\n\n" + _VENTURA_DOC_FORMAT + "## Case Number Formats\n\n"
+    "document covers ONE case unless it explicitly contains rulings for "
+    "two or more distinct case numbers.  Extract ALL structured "
+    "fields from the document.\n\n" + _VENTURA_DOC_FORMAT + "## Single-Ruling Rule\n\n"
+    "Each Ventura PDF is ONE ruling. Output exactly one entry in the "
+    "rulings array unless the document literally contains tentative "
+    "rulings on two or more distinct case numbers.\n\n"
+    "DO NOT split a Tentative Case Management Order (or any single-case "
+    "Ventura document) by internal topic headings: NOTICE OF ASSIGNMENT, "
+    "Arbitration, Settlement, Phased Discovery, Class List Discovery, "
+    "Class Certification Motion, Mediation, Informal Discovery Conferences, "
+    "Stipulated Protective & ESI Orders, Trial, etc. These are sub-sections "
+    "inside ONE ruling, not separate rulings.\n\n"
+    "**Negative example** (critical — do NOT do this): if a Case Management "
+    "Order has 12 topic headings (NOTICE OF ASSIGNMENT, Arbitration, "
+    "Settlement, Mediation, Trial, etc.), return ONE entry whose "
+    "``ruling_text`` contains the full document text — not 12 entries "
+    "with ``outcome='other'`` and ``motion_type='other'``.\n\n" + "## Case Number Formats\n\n"
     "Ventura uses TWO case number formats — extract either exactly as "
     "printed, never substitute 'UNKNOWN':\n\n"
     "**New format (post-2023):** 4-digit year + 4-letter type code + "
@@ -208,7 +223,7 @@ VENTURA_FRAMEWORK_PROMPT = (
     '  "extracted_judge_name": "First M. Last" or null,\n'
     '  "hearing_date": "YYYY-MM-DD" or null,\n'
     '  "department": "20" or null,\n'
-    '  "rulings": [\n'
+    '  "rulings": [  // exactly one entry per case number — Ventura PDFs typically cover one case\n'
     "    {\n"
     '      "extracted_case_number": "2024CUBC038456" or null,\n'
     '      "extracted_case_title": "Plaintiff v. Defendant" or null,\n'
