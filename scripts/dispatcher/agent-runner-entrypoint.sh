@@ -2172,10 +2172,36 @@ persist_phase_output() {
     # ``handle_scheduled_skill`` flow uses ``_rc`` to capture claude's
     # exit code immediately before calling ``persist_phase_output``, and
     # then routes on it later).
-    _persist_tmpfile=$(mktemp)
-    printf '%s' "$_output_json" > "$_persist_tmpfile"
-    log "db_exec_begin" "fn=persist_phase_output phase=$_phase"
+    #
+    # #3429 — move mktemp + printf INSIDE the set +e envelope so that disk /
+    # inode pressure cannot kill the entrypoint with a masked exit code.
+    # Previously both calls ran under ``set -e`` (the set +e below came
+    # AFTER them), so a failed mktemp or a failed write to the tmpfile
+    # would abort the shell immediately without returning a diagnosable
+    # error to the caller.  The pattern mirrors the documented dollar-paren
+    # / set-e masking antipattern catalogued in #3416 / #3417: every
+    # operation that can fail now runs inside the set +e window, its return
+    # code is captured explicitly, and failures are routed via ``return 1``
+    # so the caller sees a clean non-zero rc rather than a hard entrypoint
+    # exit. Each early-return path cleans up ``_persist_tmpfile`` explicitly
+    # (no ``trap RETURN`` — bash RETURN traps are global and would fire on
+    # all subsequent function returns in the same shell, breaking callers).
     set +e
+    _persist_tmpfile=$(mktemp)
+    if [[ -z "$_persist_tmpfile" ]]; then
+        log "phase_output_persist_failed" "reason=mktemp_failed phase=$_phase"
+        set -e
+        return 1
+    fi
+    printf '%s' "$_output_json" > "$_persist_tmpfile"
+    _persist_rc=$?
+    if [[ $_persist_rc -ne 0 ]]; then
+        rm -f "$_persist_tmpfile" 2>/dev/null || true
+        log "phase_output_persist_failed" "reason=tmpfile_write_failed phase=$_phase"
+        set -e
+        return 1
+    fi
+    log "db_exec_begin" "fn=persist_phase_output phase=$_phase"
     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
         -v agent_id="$AGENT_ID" \
         -v phase="$_phase" \
