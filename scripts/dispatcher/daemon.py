@@ -6278,35 +6278,98 @@ class DispatcherDaemon:
         match = re.search(r"(?im)^\s*parent\s*:\s*#(\d+)\s*$", body)
         return int(match.group(1)) if match else None
 
+    def _phase_io_root(self, worktree: Path, phase: str) -> Path:
+        """Return the filesystem root that the phase subprocess will treat as cwd.
+
+        Mirrors the cwd-selection logic in :meth:`_spawn_phase_subprocess` so
+        that input/output JSON paths are always aligned with the subprocess's
+        working directory.  Post-merge phases (``verify``, ``retro``) run with
+        ``cwd=baseline_repo_root`` in Fargate mode; all other phases run with
+        ``cwd=worktree``.  Using this helper instead of a bare ``worktree``
+        reference in :meth:`_write_phase_input` and :meth:`_read_phase_output`
+        keeps the two policies in sync and prevents the path-misalignment that
+        caused ``verify_infra_failure_post_merge`` + ``phase_output_missing``
+        (#3468).
+        """
+        if (
+            phase in POST_MERGE_PHASES_USING_BASELINE_CWD
+            and self._cfg.baseline_repo_root is not None
+        ):
+            return self._cfg.baseline_repo_root
+        return worktree
+
     def _write_phase_input(
         self,
         worktree: Path,
         phase: str,
         payload: dict[str, Any],
     ) -> Path:
-        """Write ``{worktree}/tmp/dispatcher-input/<phase>.json``.
+        """Write the phase input JSON under the IO root for this phase.
 
-        Creates parent dirs. Returns the absolute path for logging.
+        For post-merge phases (``verify``, ``retro``) in Fargate mode the
+        primary write target is ``{baseline_repo_root}/tmp/dispatcher-input/
+        <phase>.json`` — that is the path the subprocess's cwd will resolve
+        to when it reads ``tmp/dispatcher-input/<phase>.json``.  The file is
+        also written to ``{worktree}/tmp/dispatcher-input/<phase>.json`` so
+        that acceptance criteria that check the worktree path continue to pass
+        and so that local-dev fixtures (where both roots are the same) keep
+        working unchanged.
+
+        For pre-merge phases the two writes land on the same path (IO root ==
+        worktree), so the dual-write is harmless.
+
+        Creates parent dirs. Returns the primary (IO-root-relative) path for
+        logging.
         """
-        input_dir = worktree / "tmp" / "dispatcher-input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        input_path = input_dir / f"{phase}.json"
-        input_path.write_text(json.dumps(payload, indent=2, default=str))
-        return input_path
+        payload_text = json.dumps(payload, indent=2, default=str)
+
+        # Primary write — under the IO root the subprocess will use.
+        io_root = self._phase_io_root(worktree, phase)
+        primary_dir = io_root / "tmp" / "dispatcher-input"
+        primary_dir.mkdir(parents=True, exist_ok=True)
+        primary_path = primary_dir / f"{phase}.json"
+        primary_path.write_text(payload_text)
+
+        # Belt-and-suspenders write — always keep a copy under the worktree so
+        # callers that reference the worktree path directly (e.g. acceptance
+        # tests, ECS entrypoint) continue to find the file.
+        if io_root != worktree:
+            worktree_dir = worktree / "tmp" / "dispatcher-input"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / f"{phase}.json").write_text(payload_text)
+
+        return primary_path
 
     def _read_phase_output(self, worktree: Path, phase: str) -> dict[str, Any] | None:
-        """Read ``{worktree}/tmp/dispatcher-output/<phase>.json``.
+        """Read the phase output JSON, preferring the IO root over the worktree.
+
+        For post-merge phases (``verify``, ``retro``) in Fargate mode the
+        subprocess writes output relative to ``baseline_repo_root`` (its cwd).
+        Prefer that path; fall back to the worktree-relative path so ECS-mode
+        agents (where both paths coincide) and pre-merge phases continue to
+        work unchanged.
 
         Returns the parsed JSON, or ``None`` if the file is missing /
         malformed (the caller treats that as a phase failure).
         """
-        output_path = worktree / "tmp" / "dispatcher-output" / f"{phase}.json"
-        if not output_path.exists():
-            return None
-        try:
-            return json.loads(output_path.read_text())
-        except json.JSONDecodeError:
-            return None
+        io_root = self._phase_io_root(worktree, phase)
+        primary_path = io_root / "tmp" / "dispatcher-output" / f"{phase}.json"
+        if primary_path.exists():
+            try:
+                return json.loads(primary_path.read_text())
+            except json.JSONDecodeError:
+                return None
+
+        # Fall back to worktree path (covers ECS mode and local dev where the
+        # io_root IS the worktree, and therefore primary_path == fallback_path).
+        fallback_path = worktree / "tmp" / "dispatcher-output" / f"{phase}.json"
+        if fallback_path.exists() and fallback_path != primary_path:
+            try:
+                return json.loads(fallback_path.read_text())
+            except json.JSONDecodeError:
+                return None
+
+        return None
 
     def _persist_phase_output(
         self,
@@ -11263,7 +11326,8 @@ class DispatcherDaemon:
             "issue_number": issue_number,
             "issue_title": bundle.get("issue_title", ""),
             "issue_body": bundle.get("issue_body", ""),
-            "collapsed_comments": plan_output.get("collapsed_comments") or bundle.get("issue_comments", []),
+            "collapsed_comments": plan_output.get("collapsed_comments")
+            or bundle.get("issue_comments", []),
             "ralph_summary": ralph_output.get("summary", ""),
             "changed_files": changed_files,
             "git_diff": git_diff,

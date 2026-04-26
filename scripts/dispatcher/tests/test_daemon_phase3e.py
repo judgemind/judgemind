@@ -1259,3 +1259,106 @@ class TestDiagnosisOutcomeWriteback:
         d._mark_agent_terminal("agent-1", status="succeeded", phase="done", exit_code=0)
         # Failure event logged.
         assert handler.events("diagnosis_outcome_update_failed")
+
+
+# --------------------------------------------------------------------------
+# #3468 — _phase_io_root / _write_phase_input / _read_phase_output alignment
+#          (retro phase mirror of test_daemon_phase3b.TestVerifyPhaseIoRoot)
+# --------------------------------------------------------------------------
+
+
+class TestRetroPhaseIoRoot:
+    """Issue #3468 — retro is a post-merge phase and shares the same
+    IO-root misalignment bug as verify.  These tests mirror
+    ``test_daemon_phase3b.TestVerifyPhaseIoRoot`` for the ``retro`` phase."""
+
+    def test_retro_input_written_to_baseline_repo_root_for_post_merge_subprocess(
+        self, tmp_path: Path
+    ) -> None:
+        """In Fargate mode (``baseline_repo_root`` set) the input JSON for
+        ``retro`` must be written under ``{baseline_repo_root}/tmp/
+        dispatcher-input/retro.json`` — the path the subprocess resolves
+        from its cwd."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        payload = {"agent_id": "retro-test", "issue_number": 777}
+        d._write_phase_input(worktree, "retro", payload)
+
+        expected = baseline / "tmp" / "dispatcher-input" / "retro.json"
+        assert expected.exists(), (
+            f"Retro input JSON must be written to baseline_repo_root: {expected}"
+        )
+        assert json.loads(expected.read_text()) == payload
+
+    def test_retro_input_also_present_in_worktree_for_post_merge(
+        self, tmp_path: Path
+    ) -> None:
+        """Belt-and-suspenders: the worktree copy must also be written so
+        acceptance-criteria checks referencing the worktree path pass (AC #4)."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        payload = {"agent_id": "retro-test", "issue_number": 777}
+        d._write_phase_input(worktree, "retro", payload)
+
+        wt_path = worktree / "tmp" / "dispatcher-input" / "retro.json"
+        assert wt_path.exists(), (
+            f"Retro input JSON must also be written to worktree: {wt_path}"
+        )
+        assert json.loads(wt_path.read_text()) == payload
+
+    def test_retro_read_phase_output_prefers_baseline_root(
+        self, tmp_path: Path
+    ) -> None:
+        """When the retro subprocess writes output to
+        ``{baseline_repo_root}/tmp/dispatcher-output/retro.json`` (cwd=baseline),
+        ``_read_phase_output`` must return that content."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        out_dir = baseline / "tmp" / "dispatcher-output"
+        out_dir.mkdir(parents=True)
+        expected_output = {"issues_to_file": [{"title": "Follow-up A"}]}
+        (out_dir / "retro.json").write_text(json.dumps(expected_output))
+
+        result = d._read_phase_output(worktree, "retro")
+        assert result == expected_output, (
+            f"_read_phase_output must prefer baseline-root for retro; got {result!r}"
+        )
+
+    def test_retro_read_phase_output_falls_back_to_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        """Fallback: when baseline-root file is absent (local-dev / ECS),
+        ``_read_phase_output`` must return the worktree-relative content."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        assert d._cfg.baseline_repo_root is None
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        out_dir = worktree / "tmp" / "dispatcher-output"
+        out_dir.mkdir(parents=True)
+        expected_output = {"issues_to_file": []}
+        (out_dir / "retro.json").write_text(json.dumps(expected_output))
+
+        result = d._read_phase_output(worktree, "retro")
+        assert result == expected_output, (
+            f"_read_phase_output must fall back to worktree for retro; got {result!r}"
+        )
