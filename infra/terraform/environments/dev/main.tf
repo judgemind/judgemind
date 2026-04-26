@@ -371,6 +371,18 @@ module "dispatcher_agent_runner" {
   # observes the STOPPED state.
   enable_alerts       = true
   alert_sns_topic_arn = module.compute.alerts_topic_arn
+
+  # #3459 — widen the agent-runner task role with the SUBSET of the
+  # daemon's `task_run_oneshot` policy that /spotcheck actually
+  # exercises (ecs:RunTask + iam:PassRole on the oneshot family,
+  # s3:ListBucket + s3:GetObject on the document-archive bucket). This
+  # re-enables the /spotcheck scheduled skill, which migration 52 flips
+  # back on at hourly cadence. Wired in dev only — production /spotcheck
+  # remains gated until operator explicitly opts in.
+  spotcheck_oneshot_source_task_role_arn      = module.iam_scraper.role_arn
+  spotcheck_oneshot_source_execution_role_arn = module.compute.task_execution_role_arn
+  spotcheck_ecs_cluster_arn                   = module.compute.cluster_arn
+  spotcheck_document_archive_bucket_arn       = module.document_archive.bucket_arn
 }
 
 output "ecr_repository_url" {

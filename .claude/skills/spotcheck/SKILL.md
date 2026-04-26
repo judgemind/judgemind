@@ -1,5 +1,5 @@
 ---
-description: Periodic data quality spot-check — runs a one-shot bidirectional sample across all counties, downloads originals, compares against DB records, and files issues for findings.
+description: Periodic data quality spot-check — a senior engineer doing a high-level review for problems a human reviewer would notice. Discovers, root-causes, and (when scoped) fixes inline.
 argument-hint: ""
 maxTurns: 200
 ---
@@ -8,291 +8,319 @@ maxTurns: 200
 
 ## Purpose
 
-The original court documents are authoritative. They are the source of truth — published by the court, ephemeral, and irreplaceable once they expire. Our entire value depends on accurately representing these documents in our database so that rulings can be found, searched, and associated with the correct cases, judges, motion types, and outcomes.
+You are a senior engineer running a one-hour spot-check of Judgemind. Your job is to find the kinds of problems a thoughtful human reviewer would notice if they sat down with the data, the dashboards, the dispatcher, and the codebase for an hour. Then root-cause and (when the fix is scoped) ship the fix.
 
-**The spotcheck's job is to verify that we are doing this correctly.** It draws a random sample of rulings and original documents across all active counties and verifies — as rigorously as possible — that the parsed data in our database is an accurate representation of what the court actually published.
+There is no fixed checklist. Production rarely fails in the way the last checklist anticipated; the value of this skill is the discovery aspect — *looking* for problems. Use the toolset below, follow your nose, and when something looks wrong trace it to a code or config root cause before deciding what to do with it.
 
-**Correctness over completeness.** The primary question is: "Is each extracted field accurate compared to the source document?" A null field is acceptable — a wrong field is a bug. When you find a populated field, verify it matches the original. When you find a null field, check whether the information was present in the source — if it was, that's a completeness gap worth filing, but it's less urgent than a field that's present but wrong.
+The original court documents are authoritative. They are the source of truth — published by the court, ephemeral, and irreplaceable once they expire. Our entire value depends on accurately representing these documents in our database so rulings can be found, searched, and associated with the correct cases, judges, motion types, and outcomes. Most spotchecks should still verify some sample of that pipeline against original PDFs — but you are not limited to that.
 
-Completeness metrics (% of fields populated) are useful as a *signal* toward correctness problems — a sudden drop suggests a bug — but don't mistake high completeness for high quality. Every field matters: a ruling attributed to the wrong case, a motion type that doesn't match the document, a case title that's garbled — these are the critical failures that make the data unreliable for the lawyers and researchers who depend on it.
+**Correctness over completeness.** A null field is acceptable; a wrong field is a bug. A populated field that misattributes a ruling, garbles a case title, or invents a judge name is the failure mode that destroys our value.
 
-The original documents may contain typos, ambiguities, or unusual formatting. That's fine — they're court documents. But our extraction must faithfully represent what's there, not silently drop, mangle, or misattribute it.
+## Operating principles
 
-## Process
+1. **State-awareness before action.** Before filing or fixing anything, check whether the problem is already known or already in flight. The cheapest way to spam GitHub is to file a duplicate every hour.
+2. **Senior-engineer judgment over rote checks.** If your sample looks clean, look elsewhere — dispatcher behavior, scraper drift, dashboard anomalies, dead columns, unscheduled cron skips, abandoned migrations, stale skill docs that contradict the code. The discovery aspect is the point.
+3. **Root cause, not symptoms.** When you find a problem, trace it to a file:line or config:key before filing or fixing. "Outcome is wrong on this ruling" is a symptom; the bug is at `<file>:<line>` in the extraction logic and presents the same way for every ruling matching pattern X. File the second framing, not the first.
+4. **Fix small things inline.** When a finding is small + scoped (one stale docstring, one wrong column comment, one bad boolean default in a config row), open a PR yourself. You have Edit, gh, and the full pre-PR check toolchain. Don't file a follow-up issue for something you can fix in 5 minutes.
+5. **File issues for structural findings.** When the fix shape is non-trivial or requires a maintainer decision, file an `agent/ready` issue with root-cause-first analysis (file:line evidence, the structural fix shape, why a surface patch wouldn't work) so the dispatcher can pick it up.
+6. **No `priority/p0`.** Reserved for humans.
 
-Bidirectional spot-check across all active counties:
-- **Rulings → Originals:** Sample 10 random rulings from the DB, download source PDFs, verify every field against the original.
-- **Originals → Rulings:** Sample 10 random original documents, query derived rulings, verify all cases in the source are represented and correctly attributed.
+> **MCP vs `gh`:** `mcp__github__list_issues` and `mcp__github__search_issues` for reads (full typed objects, no `--json` enumeration). `gh issue create --body-file` and `gh issue comment --body-file` for writes — the MCP write path is currently auth-blocked. See `docs/agent/github-api-access.md`.
 
-**Do not ask for confirmation. Work autonomously through every step.**
-
-> **MCP vs `gh`:** use `mcp__github__list_issues` for the open-issues lookup in Step 4.1 (no `--json` enumeration, no `-q` jq — returns full typed objects). Keep `gh issue create --body-file` for new-issue writes — the MCP write path (`mcp__github__create_issue`) exists but is currently auth-blocked on this machine. See `docs/agent/github-api-access.md` for the decision rule.
-
-
-> **MCP vs `aws` CLI:** the spotcheck stays on `scripts/ecs-run-task.sh` for the oneshot Fargate launch (handles network config, log streaming, exit-code propagation — not MCP-replaceable) and on `aws s3 cp` for downloading the spotcheck JSON and PDF artifacts (no MCP S3 coverage in Phase A). For ad-hoc post-run health checks against the dev cluster (`DescribeServices` on the ingestion worker, Logs Insights queries against `/ecs/judgemind-ingestion-worker-dev`), prefer the `mcp__awslabs_ecs-mcp-server__*` and `mcp__awslabs_cloudwatch-mcp-server__*` tools — see `docs/agent/aws-api-access.md`.
+> **MCP vs `aws` CLI:** `scripts/ecs-run-task.sh` for the oneshot Fargate launch (handles network config, log streaming, exit-code propagation — not MCP-replaceable). `aws s3 cp` for downloading the spotcheck JSON and PDF artifacts. `mcp__awslabs_ecs-mcp-server__*` and `mcp__awslabs_cloudwatch-mcp-server__*` for ad-hoc cluster + logs reads. See `docs/agent/aws-api-access.md`.
 
 ---
 
 ## Step 0a — Post-compaction recovery (READ FIRST after any context reset)
 
-**When this applies:** Your context just went through autocompaction (the conversation summary references "previous conversation"), or you are otherwise starting a turn without a clear memory of which step you are in. Autocompaction preserves what was done but elides procedural imperatives, so the summary alone cannot tell you whether the spotcheck is complete — the **status file** is authoritative (see #2545).
+If your context was just autocompacted (the summary references "previous conversation"), run the recovery check before anything else:
 
-**What to do — mechanical procedure:**
+```
+{worktree}/scripts/check-task-recovery.sh {worktree}
+```
 
-1. **Run the recovery check:**
-   ```
-   {worktree}/scripts/check-task-recovery.sh {worktree}
-   ```
-   - **Exit 0 (`DONE`):** the status file shows `phase: done`. The spotcheck is actually complete. You may emit your final report and end the turn.
-   - **Exit 1 (`RESUME`):** work remains. The script prints the next required step (e.g. `continue with §2.5 (S3 orphan check) then §3 (screenshots) and §4 (cross-reference)`). Resume from that step — do NOT emit `end_turn`, do NOT produce a final report.
-   - **Exit 2 (`UNKNOWN`):** the status file is missing or malformed. Assume work remains. Re-read this SKILL.md from the top and reconstruct phase from the state of `{worktree}/tmp/spotcheck/` before proceeding.
+- **Exit 0 (`DONE`):** the status file shows `phase: done`. End the turn.
+- **Exit 1 (`RESUME`):** continue from the step the script names — do NOT emit `end_turn`.
+- **Exit 2 (`UNKNOWN`):** re-read this SKILL.md and reconstruct phase from `{worktree}/tmp/spotcheck/` state.
 
-2. **Increment `autocompact_count`** in the status file. If the file has no such field, add one initialized to `1`.
-
-3. **Re-read this SKILL.md** from the step named in the `RESUME` output before taking any further action.
-
-4. **Do NOT emit `end_turn`** until `check-task-recovery.sh` returns exit 0 (`DONE`).
+Increment `autocompact_count` in the status file (initialize to `1` if absent).
 
 ---
 
-## Step 0 — Run the one-shot spotcheck script
+## Step 0 — Set up
 
-**Write status: `phase: spotcheck-step-0`, `summary: Running ECS spotcheck script`** at the start of this step. The status file lives at `{repo_root}/tmp/agent-status/{agent-id}.txt`; create the directory if needed (`mkdir -p {repo_root}/tmp/agent-status`).
+Create `{worktree}/tmp/spotcheck/` and the agent status file (`{repo_root}/tmp/agent-status/{agent-id}.txt`):
 
-The spotcheck script (`scripts/spotcheck/run_spotcheck.py`) runs on ECS and does all DB work in one shot: samples rulings and originals per county, fetches all paired data, detects the all-same-case bug, and writes the full result JSON to S3.
+```
+issue: spotcheck-<timestamp>
+phase: spotcheck-running
+updated: <ISO-8601>
+summary: Running spot-check
+```
+
+Run the one-shot sampling script. This launches an ECS oneshot that samples rulings + originals across all counties and writes the result JSON to S3. Use `timeout: 1200000`.
 
 ```
 scripts/ecs-run-task.sh scripts/spotcheck/run_spotcheck.py -- --n 10
 ```
 
-<!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
-
-Use `timeout: 1200000` — this queries every county.
-
-The script prints a compact summary to stdout (visible in the task logs) and writes the full result to S3. The last line of stderr contains the S3 path.
-
-### Download the result
-
-After the ECS task completes, download the full JSON from S3:
+The last line of stderr contains the S3 path. Download:
 
 ```
 aws s3 cp s3://judgemind-document-archive-dev/spotcheck/<timestamp>.json {worktree}/tmp/spotcheck/data.json
 ```
 
-The S3 path is printed in the ECS task output. Parse it from the logs.
-
-### Download PDFs for review
-
-Collect all unique `s3_key` values from the result JSON (from both `rulings_by_county` and `originals_by_county`). Write a shell script to `{worktree}/tmp/spotcheck/download_pdfs.sh` that downloads each one:
-
-```
-aws s3 cp s3://judgemind-document-archive-dev/<s3_key> {worktree}/tmp/spotcheck/pdfs/<basename>
-```
-
-Run the download script. Skip keys that are null.
+Sampling is the *anchor* of the spotcheck — it ensures you actually look at originals — but it is not the only thing you should do this hour. After the sample lands, you have plenty of budget to investigate other surfaces (Step 3).
 
 ---
 
-## Step 1 — Review rulings direction (DB → Originals)
+## Step 1 — State-awareness before any action (MANDATORY)
 
-**Write status: `phase: spotcheck-step-1`, `summary: Reviewing rulings direction (DB → Originals)`** before starting this step.
+Before you file anything, fix anything, or even decide what's worth investigating further, learn what's already in flight. This step protects against the most common spotcheck regression: hourly duplicate-issue filing.
 
-**Review EVERY sampled ruling, not just flagged ones.** The summary stats (null judges, UNKNOWN case numbers, etc.) are triage hints for where to look harder, but you must check every ruling against its original PDF. Do not skip items because a field looks normal in the JSON — the whole point is to verify the JSON against the source.
-
-For each county in `rulings_by_county`, review all sampled rulings.
-
-For each ruling:
-
-1. **Read the original PDF** — use `pages: "1-20"` (the Read tool's max per request). For PDFs over 20 pages, make a second read with `pages: "21-40"`. Read the entire document to catch cases on later pages.
-2. **Compare against the DB record** from the JSON data
-
-Check for:
-
-| Check | What to look for |
-|---|---|
-| **Case attribution** | Does the ruling text preview match the case_title? Is this actually about a different case from the same multi-case PDF? |
-| **Outcome accuracy** | Does DB outcome match the PDF? Watch for: OVERRULED→"denied" (correct for demurrers), MOOT→"granted" (wrong), SUSTAINED→"granted" (correct for demurrers) |
-| **Motion type** | Does DB motion_type match the PDF? |
-| **Case title** | Any contamination — case numbers, department names, boilerplate in the title? |
-| **Judge name** | Does DB judge match the PDF header? Null when PDF clearly shows the judge? |
-| **Department** | Does DB department match? Watch for years or fragments misextracted (e.g., "(1982)") |
-| **UNKNOWN case numbers** | case_number starts with "UNKNOWN-" but PDF shows the real number? |
-| **Truncation** | Compare `ruling_text_length` against the apparent length in the PDF. A multi-page ruling analysis reduced to a few hundred chars is a truncation bug. |
-
-Record findings in `{worktree}/tmp/spotcheck/rulings_findings.md`.
-
-**Systemic patterns:** If you see the same bug repeated across many rulings in one county (e.g., every ruling has wrong case attribution), note the pattern with 2-3 examples and the total count, then move on. But you still must open each PDF and verify — do not assume a ruling is clean based on the JSON alone.
-
----
-
-## Step 2 — Review originals direction (S3 → DB)
-
-**Write status: `phase: spotcheck-step-2`, `summary: Reviewing originals direction (S3 → DB)`** before starting this step.
-
-**Review EVERY sampled original, not just flagged ones.** The `all_same_case` and `zero_derived` flags are triage hints, but you must open each PDF and verify all derived rulings against the source. A document with `all_same_case: false` and 7 distinct titles can still have wrong outcomes, wrong motion types, or truncated text.
-
-For each county in `originals_by_county`, review all sampled originals.
-
-For each selected original:
-
-1. **Read the original PDF** — use `pages: "1-20"`. For PDFs over 20 pages, make a second read. Read the full document to count all cases.
-2. **Compare against derived rulings** from the JSON data
-
-Check for:
-
-| Check | What to look for |
-|---|---|
-| **All-same-case bug** | `all_same_case: true` — all derived rulings have the same case_title despite the PDF having multiple distinct cases (#2195) |
-| **Missing rulings** | PDF has N cases but `derived_count` is lower — cases dropped during splitting |
-| **Zero derived** | Document exists in DB but produced no rulings at all |
-| **Content fidelity** | Do ruling_text_previews match the actual PDF content? |
-| **Ruling count** | For multi-case PDFs, does derived_count match the case count in the PDF? |
-| **Truncation** | Compare `ruling_text_length` per ruling against the apparent length in the PDF. Multi-page analyses reduced to a few hundred chars is a truncation bug. |
-
-Record findings in `{worktree}/tmp/spotcheck/originals_findings.md`.
-
-### 2.5 — S3 orphan check (supplementary)
-
-**Write status: `phase: spotcheck-step-2.5`, `summary: Running S3 orphan check`** before starting this sub-step.
-
-The originals sampled in Step 2 come from the documents table, so they always have DB rows. To also catch **orphaned S3 objects** (archived but never ingested), run the S3-based sampler for 2-3 counties:
-
-> **Two-shape S3 key gotcha (see #2583):** S3 contains two key shapes — legacy date-partitioned keys (`raw/YYYY/MM/DD/<uuid>.ext`) and flat-hash keys (`raw/<sha256-hex>.<ext>`). The sampler pulls from all S3 objects under `ca/<county>/`, so date-partitioned keys (which the DB never references by that path) inflate the orphan rate to 60–90% regardless of actual bugs. Until #2629 lands a proper regression guard (`scripts/spotcheck/check_s3_orphan_rate.py`), apply the post-filter below to get a meaningful orphan count.
-
-```
-scripts/run-py.sh scripts/spotcheck/sample.py --from originals --county "<County>" --n 10 --output {worktree}/tmp/spotcheck/s3_sample_<county>.json
-```
-
-After sampling, filter to flat-hash keys only before computing the orphan rate (regex matches `scripts/archive/migrate_s3_keys.py`'s `NEW_KEY_PATTERN`):
-
-```python
-import json, re
-flat = re.compile(r".*/raw/[0-9a-f]{64}\.[a-z]+$")
-data = json.load(open("{worktree}/tmp/spotcheck/s3_sample_<county>.json"))
-flat_keys = [k for k in data["s3_keys"] if flat.match(k)]
-print(f"{len(flat_keys)} flat-hash keys out of {len(data['s3_keys'])} sampled")
-```
-
-Compare `flat_keys` against the `originals_by_county` data. Any flat-hash key not in the documents table is an orphan — note the count per county. Tracking the flat-hash orphan rate over time helps measure progress (see #2583).
-
----
-
-## Step 3 — Screenshots (optional, 3-5 per county)
-
-If time permits, take screenshots of a few ruling detail pages:
-
-```
-scripts/run-py.sh scripts/screenshot.py /rulings/<ruling_id> \
-    --output {worktree}/tmp/spotcheck/screenshots/<ruling_id>.png --full-page
-```
-
-Check for garbled titles, missing fields, layout issues. Record in `{worktree}/tmp/spotcheck/visual_findings.md`.
-
----
-
-## Step 4 — Cross-reference and file issues
-
-**Write status: `phase: spotcheck-step-4`, `summary: Cross-referencing findings and filing issues`** before starting this step.
-
-### 4.1 — Fetch open issues
-
-Use MCP — returns full typed objects (number, title, body, labels, assignees) in one call:
+### 1.1 — Pull the open-issue index
 
 ```
 mcp__github__list_issues
   owner: "judgemind"
   repo: "judgemind"
   state: "open"
-  labels: ["type/bug"]
   per_page: 200
 ```
 
-### 4.2 — Classify findings
-
-For each finding, classify as:
-- **New** — no existing open issue covers this pattern
-- **Known (extends)** — existing issue covers the pattern, new examples found
-- **Known (duplicate)** — already fully covered
-
-**File per-pattern, not per-case.** If 5 rulings across 3 counties show the same bug, that's one issue.
-
-### 4.3 — File new issues
-
-Write each issue body to `{worktree}/tmp/spotcheck/issue_N.txt`. Include:
-- **Found by:** `/spotcheck` skill
-- **Affected counties** with example ruling IDs
-- **Acceptance criteria** with `Verify:` lines
-
-**File spotcheck issues with `agent/ready` by default.** The dispatcher should be able to pick them up immediately — spotcheck findings are concrete, evidence-backed, and per-pattern, so they meet the bar. Only omit `agent/ready` when there's a specific reason:
-- **Blocked by an open dependency** — use `scripts/block-issue.sh <new-issue> <blocker>` instead. This adds `status/blocked` and a `Blocked by #N` line that auto-unblocks when the blocker closes.
-- **Acceptance criteria not yet concrete** — e.g. "investigate X" with no clear success condition. Tighten the AC before filing, or file with `status/triage` for human review.
-- **Needs a maintainer decision** — scope/priority ambiguity that an agent can't resolve.
+Skim the titles for what's already tracked. For deeper matching on a specific symptom, search:
 
 ```
-gh issue create --repo judgemind/judgemind \
-    --title "fix(scraping): <description>" \
-    --label "type/bug,priority/<p1|p2>,area/scraping,agent/ready" \
-    --body-file {worktree}/tmp/spotcheck/issue_N.txt
+mcp__github__search_issues
+  q: "repo:judgemind/judgemind state:open <keywords>"
 ```
+
+Or `gh issue list --search "<keywords>" --state open --repo judgemind/judgemind --limit 50` if you need a label filter the MCP search doesn't expose.
+
+### 1.2 — Match findings to existing issues
+
+For each candidate finding, decide:
+
+- **Already tracked, current evidence in-issue:** add a brief comment with the new example (ruling ID, county, date) and move on. Do not file a duplicate.
+- **Already tracked, evidence stale:** comment with the latest sample date showing the bug still reproduces. The dispatcher uses recent activity as a freshness signal.
+- **Tracked by a closed issue that you can prove regressed:** reopen via `gh issue reopen <N>` and comment with the reproducing evidence. Reopens require evidence — if the closed issue's fix shipped and you can't show a regression, file a new issue instead.
+- **Genuinely new finding:** continue to investigation (Step 2).
+
+### 1.3 — Avoid the rolling-issue trap
+
+If you find yourself wanting to file an issue per ruling for the same root cause, you've gone wrong. One root-cause issue per pattern, with concrete examples in the body. Five rulings showing the same outcome-extraction bug is one issue, not five.
 
 ---
 
-## Step 5 — Summary report
+## Step 2 — Investigate before filing or fixing
 
-**Write status: `phase: spotcheck-step-5`, `summary: Writing spotcheck summary report`** before starting this step.
+The `data.json` from Step 0 has summary stats (null judges, UNKNOWN case numbers, all-same-case flag, zero derived) — those are *triage hints* for where to look harder. Open PDFs, compare against derived rulings, and check the categories below. Don't restrict yourself to flagged rows: a ruling without a triage flag can still have a wrong outcome, garbled title, or truncated text.
 
-Write to `{worktree}/tmp/spotcheck/report.md` and print to stdout:
+For the bidirectional sample (rulings → originals, originals → rulings) the table below is a starting list of patterns. It is not exhaustive — add your own as you see drift.
 
-```markdown
-# Spotcheck Report — YYYY-MM-DD
+| Check | What to look for |
+|---|---|
+| **Case attribution** | Does the ruling text match the case_title? Multi-case PDFs sometimes attribute every derived ruling to the same case. |
+| **Outcome accuracy** | Demurrer: SUSTAINED→granted, OVERRULED→denied. Motion: GRANTED/DENIED literal. MOOT≠granted. |
+| **Motion type** | Does DB motion_type match the PDF? |
+| **Case title** | Contamination — case numbers, department names, boilerplate inside the title? |
+| **Judge name** | Null when the PDF clearly shows a judge? Wrong attribution? |
+| **Department** | Wrong format, year fragments, "(1982)" misextracted? |
+| **UNKNOWN case numbers** | `UNKNOWN-...` placeholder despite a real number in the PDF? |
+| **Truncation** | `ruling_text_length` looks too short for the page count? Multi-page analyses reduced to a few hundred chars is a truncation bug. |
 
-## Coverage
-- Counties checked: N / N active
-- Rulings sampled (DB → Originals): N per county
-- Originals sampled (DB docs → Derived): N per county
+For multi-page PDFs use `pages: "1-20"`, then `"21-40"` — the Read tool maxes at 20 pages per call.
 
-## Quick Stats (from spotcheck script)
-| County | Rulings | Originals | Null Judges | UNKNOWN Cases | Same-Case Bug | Zero Derived |
-|--------|---------|-----------|-------------|---------------|---------------|--------------|
-| ...    | ...     | ...       | ...         | ...           | ...           | ...          |
+Record what you find as you go (`{worktree}/tmp/spotcheck/findings.md` is fine; the structure is up to you).
 
-## Findings by Direction
+### Root-cause discipline
 
-### Rulings → Originals
-[Per-county findings summary with examples]
+When something looks wrong, trace it before filing. Examples of what "trace it" means:
 
-### Originals → Rulings
-[Per-county findings summary with examples]
+- *DB outcome doesn't match PDF:* `grep -rn "OUTCOME_GRANTED\|OUTCOME_DENIED" packages/scraper-framework/src` and read the extraction path. Cite `<file>:<line>` for the offending branch.
+- *Case title contamination:* find the title-extraction regex, check what it greedily matches, propose the correction or the bounded regex.
+- *Truncation bug:* find the LLM call's `max_tokens`, the post-processor that slices, or the document chunker. Cite the cap value and which span got cut.
+- *Wrong judge attribution:* find the judge-name regex, check whether the PDF's actual format matches the regex's assumption, propose the fix.
 
-## Issues Filed / Extended
-- #N — title (severity)
+A finding without a traced root cause is half-done — you'll either file a vague issue someone else has to re-investigate, or fix the symptom without preventing the regression.
 
-## Overall Assessment
-[Good / Needs attention / Critical]
+---
+
+## Step 3 — Look beyond the bidirectional sample
+
+Once you've worked through the sample, you usually still have time. Use it. The spotcheck's value is finding things a human reviewer would notice; that includes things outside the rulings/originals pipeline.
+
+Possible directions (pick what feels productive — don't try to do them all):
+
+- **Scraper drift.** Check `telemetry.scraper_runs` for counties with declining capture rates or unusual error patterns. `scripts/dev-db-query.sh` for the SELECT.
+- **Dispatcher behavior.** Skim the last 24h of `dispatcher.agents` rows — failure-class concentration, repeated stuck_timeouts on the same issue, `final_phase` distribution. Anything anomalous?
+- **Dead or abandoned columns.** Check whether columns marked deprecated in migrations are still being written or read by application code. A column with stale data is worse than a missing one.
+- **Stale documentation.** Source-file docstrings or `README.md` files in `packages/` that contradict the current code (a frequent spotcheck finding — investigations land but the docstrings stay stale; see #2434 and B.1.5 in `.claude/skills/task/SKILL.md`).
+- **Field completeness regressions.** `derived.rulings` null-rate per field over recent days — sudden cliff = regression. Compare against the field-completeness loop notes (`MEMORY.md` → `field-completeness-loop.md`) if you have access.
+- **Dashboard / UI sanity.** Pull a ruling detail page on dev (`scripts/run-py.sh scripts/screenshot.py /rulings/<id>`) and look at it. Garbled title, missing field, broken layout, slow render — all worth filing.
+- **Archive-vs-DB drift.** Are there S3 objects under `ca/<county>/raw/<sha256>.<ext>` that have no row in `derived.documents`? Mind the two-shape S3 key gotcha (#2583): legacy date-partitioned keys exist alongside flat-hash keys; only flat-hash keys are tracked in the DB, so filter to those before computing an orphan rate.
+- **Scheduled-skill cron health.** `dispatcher.scheduled_skills` rows — any with `enabled=true` but `last_triggered_at` stale (suggests cron walk skipped them)?
+
+This list is illustrative, not prescriptive. If your nose tells you to look at something else, look there.
+
+### Tooling reference
+
+- `scripts/dev-db-query.sh "<SQL>"` — quick read against dev Postgres (no scripts; SELECT/EXPLAIN only).
+- `scripts/ecs-run-task.sh scripts/<file>.py -- <args>` — anything heavier (data scripts, backfills, multi-statement reads).
+- `scripts/run-py.sh scripts/screenshot.py <path>` — UI spot-check on `dev.judgemind.org`.
+- `mcp__awslabs_cloudwatch-mcp-server__execute_log_insights_query` — dispatcher logs, scraper logs, ingestion-worker logs.
+- `mcp__awslabs_ecs-mcp-server__ecs_resource_management` — service / task / cluster reads.
+- `mcp__github__search_code` — find code patterns across the repo.
+
+Use them as needed. Don't ask permission to investigate something — that's the job.
+
+---
+
+## Step 4 — Disposition: fix inline or file an issue
+
+For each finding, decide between two paths.
+
+### 4a — Fix inline (preferred for small + scoped findings)
+
+If the fix is contained (one file, one config row, one docstring) and you can write tests for it, just do it. You have full agent capability — Edit, gh, the pre-PR check toolchain.
+
+Process:
+
+1. Make the change on the worktree branch (you're already in a worktree at `{worktree}`). Add tests if the change is in code.
+2. Run the relevant pre-PR checks for the touched package — see `docs/agent/code-standards.md` §Pre-PR Checks. Most spotcheck-fix PRs touch one or two files; the tight-loop is usually `ruff check packages/<pkg>/`, `pytest packages/<pkg>/tests/<test>.py`, and the diff-coverage gate.
+3. Commit with a conventional message (`fix(area): description`) and push.
+4. Open a PR with `gh pr create --base main --body-file <file>`. PR body must describe the root cause (not just the symptom), the fix shape, and how it prevents the class of regression. Include `Found by: /spotcheck` in the body so the merge log shows provenance.
+5. Watch CI to green via `gh run watch <id> --interval 60 --exit-status --compact`.
+6. Merge once CI passes: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
+
+Examples of "fix inline" scope:
+
+- A docstring that contradicts the current code (concrete file:line, replacement text known).
+- A migration `notes` column that's wrong/stale.
+- A column comment that documents the wrong semantics.
+- A test fixture that asserts a value that's now incorrect.
+- A config row in `dispatcher.config` that has a defensible single correct value (e.g. a typo in a string).
+
+Examples of "do NOT fix inline":
+
+- Anything touching extraction logic (LLM prompts, regex, schema). File an issue — extraction changes need batched re-evaluation.
+- Anything that requires a migration touching `derived.*` rows beyond a small surgical patch. Use `rebuild_db.py --county <name>` instead, and that goes via an issue.
+- Anything that requires a maintainer scope/priority decision.
+
+### 4b — File an `agent/ready` issue (for structural findings)
+
+When the fix is non-trivial, requires multi-file changes, or needs a maintainer decision, file an issue so the dispatcher's queue can pick it up.
+
+Write the body to `{worktree}/tmp/spotcheck/issue_N.txt`. Required structure:
+
+```
+## Root cause
+
+<File:line evidence. The actual broken code/config, not just "outputs are wrong">
+
+<Why the symptom presents this way. Trace the code path from the broken site to
+the observable bug. Cite git history if the regression has an obvious commit.>
+
+## Symptoms
+
+- <County, ruling_id, what looks wrong>
+- <County, ruling_id, what looks wrong>
+- (per-pattern, not per-row — if 12 rulings show the same root cause, list 3
+  representative examples and state the total count)
+
+## Proposed fix shape
+
+<The structural change. NOT a one-line patch — what subsystem changes, what
+tests need to land, what re-ingest/rebuild is implied. If you're unsure of the
+exact code change, describe what the agent who picks this up should investigate
+first.>
+
+## Acceptance criteria
+
+- [ ] <concrete, verifiable>
+  Verify: <SQL query or curl or test invocation>
+- [ ] <concrete, verifiable>
+  Verify: <SQL query or curl or test invocation>
+
+Found by: /spotcheck (<ISO-date>)
 ```
 
-After writing the report, **write status: `phase: done`, `summary: Spotcheck complete — N issues filed`**.
+File with:
+
+```
+gh issue create --repo judgemind/judgemind \
+    --title "<conventional-commits title — fix(area): X is broken because Y>" \
+    --label "type/bug,priority/<p1|p2|p3>,area/<x>,agent/ready" \
+    --body-file {worktree}/tmp/spotcheck/issue_N.txt
+```
+
+Title rule: never `"X is broken"`. Always frame as `"X is broken because Y"` or `"<symptom> due to <root cause>"`. The title should let a maintainer decide priority without opening the issue.
+
+Priority rule: `p1` for things actively producing wrong data or blocking workflow; `p2` for most user-visible quality bugs; `p3` for hygiene / docstring / dx. No `p0`.
+
+If the new issue is blocked by another open issue, run `scripts/block-issue.sh <new-issue> <blocker>` after filing — adds `status/blocked` and the `Blocked by #N` mechanic that auto-unblocks on merge.
+
+### 4c — Comment on existing issue (for new evidence)
+
+When state-awareness in Step 1 matched the finding to an existing open issue, post a comment with the new sample:
+
+```
+gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/spotcheck/comment_N.txt
+```
+
+Comment body should add value — a fresh date, a county not previously seen, a counter-example that disambiguates, a hypothesis the issue body didn't consider. "+1, still broken" is not a comment worth posting.
+
+---
+
+## Step 5 — Summary report (only if you found things worth reporting)
+
+If the spotcheck was clean — sample looks correct, no anomalies in the surfaces you investigated — write a one-paragraph summary to `{worktree}/tmp/spotcheck/report.md` and stop. The dispatcher's daily report aggregates spotcheck activity; you don't need to file an issue saying "all clean."
+
+If you filed issues, opened PRs, or extended existing issues, write a short report listing what you did:
+
+```markdown
+# Spotcheck — <ISO-date>
+
+## Sample
+- N rulings, M originals across <K> counties.
+
+## Issues filed
+- #N — <title> (priority/<x>)
+- #N — <title> (priority/<x>)
+
+## PRs opened
+- #N — <title>
+
+## Existing issues extended
+- #N (commented with new evidence)
+
+## Notes
+<Anything that didn't fit the structured outputs above — investigation paths
+that didn't pan out, hypotheses worth checking next time, surfaces you couldn't
+investigate this run.>
+```
+
+Then write status: `phase: done`, `summary: Spotcheck complete — N issues, M PRs, K extended`. Add `final_phase: done` so the dispatcher's post-mortem can distinguish a clean exit.
 
 ---
 
 ## What NOT to do
 
-- **Do not fix issues directly.** Spotcheck is diagnostic only.
-- **Do not re-file existing issues.** Cross-reference first.
-- **Do not set `priority/p0`.** Human-only.
-- **Do not modify source files.** Read and report only.
-- **Do not screenshot production.** Only `dev.judgemind.org`.
-- **Do not use `dev-db-query.sh` in scripts.** Use `ecs-run-task.sh` for all DB queries. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
-- **Large PDFs:** Read tool max is 20 pages per request. For PDFs over 20 pages, make multiple reads (`pages: "1-20"`, then `pages: "21-40"`).
+- Do not re-file an existing open issue. Always run Step 1 first.
+- Do not file `priority/p0`. Reserved for humans.
+- Do not file a surface-symptom issue without root-cause analysis. The fix-shape proposal is the value of a spotcheck issue.
+- Do not screenshot or query production. Dev only.
+- Do not push directly to `main`. PRs always.
+- Do not skip pre-PR checks before opening a PR — `.githooks/pre-push` will reject the push and you'll waste a CI run.
+- Do not run the bidirectional sample as a checklist and stop. The discovery aspect (Step 3) is where most senior-engineer-noticeable problems live.
 
 ---
 
 ## Reminders
 
-- **No `$()` in Bash.** Separate tool calls for dynamic values.
-- **No heredocs or `python -c`.** Write scripts to files first.
-- **All temp files in `{worktree}/tmp/`**, not `/tmp/`.
-- **`timeout: 1200000`** on `ecs-run-task.sh` commands. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
-- **Judge name: `judges.canonical_name`**, not `name`.
-- **S3 bucket: `judgemind-document-archive-dev`**.
-- **S3 prefix: lowercase with underscores** (`ca/orange/`, not `CA/Orange/`).
+- No `$()` or heredocs in Bash; separate tool calls for dynamic values.
+- Temp files in `{worktree}/tmp/`, not `/tmp/`.
+- `timeout: 1200000` on `scripts/ecs-run-task.sh` and any data script.
+- Judge name column is `judges.canonical_name`, not `name`.
+- S3 bucket is `judgemind-document-archive-dev`. Prefix is lowercase with underscores (`ca/orange/`, not `CA/Orange/`).
+- `.claude/` writes go through `scripts/write-claude-file.sh` — the platform blocks Edit/Write inside `.claude/`.
