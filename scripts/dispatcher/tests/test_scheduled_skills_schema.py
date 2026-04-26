@@ -92,3 +92,50 @@ def test_does_not_drop_legacy_config_keys() -> None:
     # cleanup belongs in a follow-up after one verified deploy cycle.
     assert "DELETE FROM dispatcher.config" not in text
     assert "delete from dispatcher.config" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Migration 51 — dispatcher-daily-report skill row (issue #3375)
+# ---------------------------------------------------------------------------
+
+MIGRATION_50_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "packages"
+    / "api"
+    / "migrations"
+    / "50_dispatcher-daily-report-skill.sql"
+)
+
+
+def _migration_50_text() -> str:
+    return MIGRATION_50_PATH.read_text(encoding="utf-8")
+
+
+def test_daily_report_migration_file_exists() -> None:
+    assert MIGRATION_50_PATH.is_file(), (
+        f"expected migration file at {MIGRATION_50_PATH}; issue #3375 ships migration 50"
+    )
+
+
+def test_daily_report_row_seeded() -> None:
+    """Migration 50 must INSERT the dispatcher-daily-report row."""
+    text = _migration_50_text()
+    assert "INSERT INTO dispatcher.scheduled_skills" in text
+    assert "'dispatcher-daily-report'" in text
+    assert "'/dispatcher-daily-report'" in text
+    assert "'cron'" in text
+    assert "'0 12 * * *'" in text
+
+
+def test_daily_report_row_idempotent() -> None:
+    """Migration 50 INSERT must use ON CONFLICT (name) DO NOTHING."""
+    text = _migration_50_text()
+    assert "ON CONFLICT (name) DO NOTHING" in text
+
+
+def test_daily_report_down_migration() -> None:
+    """Migration 50 must have a Down Migration block that deletes the row."""
+    text = _migration_50_text()
+    assert "-- Down Migration" in text
+    assert "DELETE FROM dispatcher.scheduled_skills" in text
+    assert "'dispatcher-daily-report'" in text
