@@ -252,7 +252,7 @@ variable "document_archive_bucket_arn" {
 }
 
 variable "supervisor_tick_failure_window_seconds" {
-  description = "CloudWatch alarm period (seconds) for supervisor-tick failure alarms. With the default 120s tick, a 300s window holds 2-3 ticks — threshold=2 cleanly separates a transient from a wedge."
+  description = "CloudWatch alarm period (seconds) for supervisor-tick failure alarms. With the default 120s tick, a 300s window holds 2-3 ticks -- threshold=2 cleanly separates a transient from a wedge."
   type        = number
   default     = 300
 }
