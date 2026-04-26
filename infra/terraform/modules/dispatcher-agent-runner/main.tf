@@ -465,12 +465,17 @@ resource "aws_iam_role_policy" "task_spotcheck_oneshot" {
       ],
       var.spotcheck_oneshot_script_bucket_arn != "" ? [
         {
-          # Upload scripts >8KB via pre-signed URL. Scoped to the
-          # oneshot-scripts/ prefix inside the caller-supplied assets bucket.
+          # Upload + download scripts >8KB via pre-signed URL. Scoped to
+          # the oneshot-scripts/ prefix inside the caller-supplied assets
+          # bucket. GetObject is required because the URL is signed by
+          # this principal — S3 evaluates the signing principal's IAM
+          # policy at request time, so the oneshot container's anonymous
+          # urllib download fails with 403 unless GetObject is granted.
           Sid    = "AllowUploadSpotcheckOneshotScripts"
           Effect = "Allow"
           Action = [
             "s3:PutObject",
+            "s3:GetObject",
             "s3:DeleteObject",
           ]
           Resource = "${var.spotcheck_oneshot_script_bucket_arn}/oneshot-scripts/*"
