@@ -35,6 +35,8 @@
 #   scripts/run-scraper.sh --detach federal-courtlistener-opinions
 #
 set -euo pipefail
+# AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
+export AWS_PAGER=""
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
@@ -110,8 +112,7 @@ echo "Reading latest task definition for ${TASK_FAMILY}..." >&2
 TASK_DEF_JSON=$(aws ecs describe-task-definition \
     --task-definition "$TASK_FAMILY" \
     --region "$REGION" \
-    --output json \
-    --no-cli-pager 2>/dev/null) || {
+    --output json 2>/dev/null) || {
     echo "Error: could not read task definition '${TASK_FAMILY}'." >&2
     echo "Ensure the scraper is deployed in the '${ENVIRONMENT}' environment." >&2
     exit 1
@@ -128,8 +129,7 @@ echo "Reading network config from scheduler '${SCHEDULER_NAME}'..." >&2
 SCHEDULER_JSON=$(aws scheduler get-schedule \
     --name "$SCHEDULER_NAME" \
     --region "$REGION" \
-    --output json \
-    --no-cli-pager 2>/dev/null) || {
+    --output json 2>/dev/null) || {
     echo "Error: could not read EventBridge Scheduler '${SCHEDULER_NAME}'." >&2
     echo "Ensure the scheduler exists in the '${ENVIRONMENT}' environment." >&2
     exit 1
@@ -199,7 +199,6 @@ RUN_OUTPUT=$(aws ecs run-task \
     --launch-type FARGATE \
     --region "$REGION" \
     --output json \
-    --no-cli-pager \
     --overrides "$OVERRIDE_JSON" \
     --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}")
 
@@ -256,8 +255,7 @@ find_log_stream() {
         --max-items 50 \
         --region "$REGION" \
         --output text \
-        --query "logStreams[*].logStreamName" \
-        --no-cli-pager | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
+        --query "logStreams[*].logStreamName" | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
 }
 
 stream_new_logs() {
@@ -271,7 +269,6 @@ stream_new_logs() {
         --log-stream-name "$LOG_STREAM_NAME"
         --region "$REGION"
         --output json
-        --no-cli-pager
     )
 
     if [[ -n "$LOG_NEXT_TOKEN" ]]; then
@@ -320,8 +317,7 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json \
-        --no-cli-pager)
+        --output json)
 
     CURRENT_STATUS=$(echo "$DESCRIBE_OUTPUT" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])")
 

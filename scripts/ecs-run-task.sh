@@ -71,6 +71,8 @@
 #   scripts/ecs-run-task.sh --logs arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abc123
 
 set -euo pipefail
+# AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
+export AWS_PAGER=""
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
@@ -189,8 +191,7 @@ if [[ -n "$LOGS_TASK_ARN" ]]; then
         --cluster "$CLUSTER_FROM_ARN" \
         --tasks "$LOGS_TASK_ARN" \
         --region "$REGION" \
-        --output json \
-        --no-cli-pager 2>/dev/null) || {
+        --output json 2>/dev/null) || {
         echo "Error: could not describe task. Check the ARN and your AWS credentials." >&2
         exit 1
     }
@@ -341,7 +342,6 @@ cleanup() {
         aws ecs deregister-task-definition \
             --task-definition "$ONESHOT_TASK_DEF_ARN" \
             --region "$REGION" \
-            --no-cli-pager \
             --output text > /dev/null 2>&1 || true
     fi
 
@@ -381,8 +381,7 @@ echo "Reading latest task definition for ${SOURCE_FAMILY}..." >&2
 SOURCE_TASK_DEF=$(aws ecs describe-task-definition \
     --task-definition "$SOURCE_FAMILY" \
     --region "$REGION" \
-    --output json \
-    --no-cli-pager 2>/dev/null) || {
+    --output json 2>/dev/null) || {
     echo "Error: could not read task definition '${SOURCE_FAMILY}'." >&2
     echo "Ensure the ingestion worker is deployed in the '${ENVIRONMENT}' environment." >&2
     exit 1
@@ -421,8 +420,7 @@ SERVICE_DIGEST=$(aws ecr describe-images \
     --image-ids "imageTag=${SERVICE_IMAGE_TAG}" \
     --region "$REGION" \
     --query 'imageDetails[0].imageDigest' \
-    --output text \
-    --no-cli-pager 2>/dev/null) || SERVICE_DIGEST=""
+    --output text 2>/dev/null) || SERVICE_DIGEST=""
 
 # Get the latest image from ECR (most recently pushed)
 LATEST_ECR_INFO=$(aws ecr describe-images \
@@ -430,8 +428,7 @@ LATEST_ECR_INFO=$(aws ecr describe-images \
     --image-ids imageTag=latest \
     --region "$REGION" \
     --query 'imageDetails[0].{digest:imageDigest,pushed:imagePushedAt}' \
-    --output json \
-    --no-cli-pager 2>/dev/null) || LATEST_ECR_INFO=""
+    --output json 2>/dev/null) || LATEST_ECR_INFO=""
 
 # Decide which image to use. The default is now to prefer the latest ECR
 # image when it differs from the service image, avoiding stale-code runs.
@@ -487,8 +484,7 @@ if [[ -n "$ROLE_OVERRIDE" ]]; then
         --role-name "$ROLE_OVERRIDE" \
         --region "$REGION" \
         --query 'Role.Arn' \
-        --output text \
-        --no-cli-pager 2>/dev/null) || {
+        --output text 2>/dev/null) || {
         echo "Error: could not resolve IAM role '${ROLE_OVERRIDE}'." >&2
         echo "Check the role name and your AWS credentials." >&2
         exit 1
@@ -556,8 +552,7 @@ if [[ "$ENCODED_SIZE" -gt 6000 ]]; then
 
     if [[ "$DRY_RUN" == "false" ]]; then
         aws s3 cp "$SCRIPT_PATH" "s3://${S3_BUCKET}/${S3_SCRIPT_KEY}" \
-            --region "$REGION" \
-            --no-cli-pager > /dev/null
+            --region "$REGION" > /dev/null
 
         # Generate a pre-signed URL (15 min TTL) so the container can download
         # the script without needing the AWS CLI installed. 15 minutes allows
@@ -692,8 +687,7 @@ echo "$TASK_DEF_JSON" > "${TMP_DIR}/_oneshot_task_def.json"
 REGISTER_OUTPUT=$(aws ecs register-task-definition \
     --cli-input-json "file://${TMP_DIR}/_oneshot_task_def.json" \
     --region "$REGION" \
-    --output json \
-    --no-cli-pager)
+    --output json)
 
 ONESHOT_TASK_DEF_ARN=$(echo "$REGISTER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['taskDefinition']['taskDefinitionArn'])")
 
@@ -710,7 +704,6 @@ NETWORK_CONFIG=$(aws ecs describe-services \
     --services "$SERVICE_NAME" \
     --region "$REGION" \
     --output json \
-    --no-cli-pager \
     --query 'services[0].networkConfiguration.awsvpcConfiguration')
 
 if [[ -z "$NETWORK_CONFIG" || "$NETWORK_CONFIG" == "null" ]]; then
@@ -736,7 +729,6 @@ RUN_OUTPUT=$(aws ecs run-task \
     --launch-type FARGATE \
     --region "$REGION" \
     --output json \
-    --no-cli-pager \
     --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUPS}],assignPublicIp=DISABLED}")
 
 TASK_ARN=$(echo "$RUN_OUTPUT" | python3 -c "import sys,json; tasks=json.load(sys.stdin)['tasks']; print(tasks[0]['taskArn'] if tasks else '')")
@@ -805,8 +797,7 @@ find_log_stream() {
         --max-items 50 \
         --region "$REGION" \
         --output text \
-        --query "logStreams[*].logStreamName" \
-        --no-cli-pager | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
+        --query "logStreams[*].logStreamName" | tr '\t' '\n' | grep -F "$TASK_ID" | head -n 1 || true
 }
 
 # stream_new_logs — Fetch and print any new log events since the last check.
@@ -830,7 +821,6 @@ stream_new_logs() {
         --log-stream-name "$LOG_STREAM_NAME"
         --region "$REGION"
         --output json
-        --no-cli-pager
     )
 
     if [[ -n "$LOG_NEXT_TOKEN" ]]; then
@@ -883,8 +873,7 @@ while [[ $ELAPSED -lt $TIMEOUT ]]; do
         --cluster "$CLUSTER" \
         --tasks "$TASK_ARN" \
         --region "$REGION" \
-        --output json \
-        --no-cli-pager)
+        --output json)
 
     CURRENT_STATUS=$(echo "$DESCRIBE_OUTPUT" | python3 -c "import sys,json; t=json.load(sys.stdin)['tasks'][0]; print(t['lastStatus'])")
 
