@@ -139,3 +139,41 @@ def test_daily_report_down_migration() -> None:
     assert "-- Down Migration" in text
     assert "DELETE FROM dispatcher.scheduled_skills" in text
     assert "'dispatcher-daily-report'" in text
+
+
+# ---------------------------------------------------------------------------
+# Migration 51 — disable spotcheck scheduled skill (issue #3450)
+# ---------------------------------------------------------------------------
+
+MIGRATION_51_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "packages"
+    / "api"
+    / "migrations"
+    / "51_dispatcher-disable-spotcheck-cron.sql"
+)
+
+
+def _migration_51_text() -> str:
+    return MIGRATION_51_PATH.read_text(encoding="utf-8")
+
+
+def test_disable_spotcheck_migration_file_exists() -> None:
+    assert MIGRATION_51_PATH.is_file(), (
+        f"expected migration file at {MIGRATION_51_PATH}; issue #3450 ships migration 51"
+    )
+
+
+def test_disable_spotcheck_migration_targets_spotcheck_row() -> None:
+    """Migration 51 must UPDATE the spotcheck row to enabled = false."""
+    text = _migration_51_text()
+    assert "WHERE name = 'spotcheck'" in text
+    assert "enabled = false" in text
+
+
+def test_disable_spotcheck_down_migration() -> None:
+    """Migration 51 Down section must restore enabled = true for spotcheck."""
+    text = _migration_51_text()
+    assert "-- Down Migration" in text
+    assert "enabled = true" in text
+    assert "'spotcheck'" in text
