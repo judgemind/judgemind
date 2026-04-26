@@ -86,7 +86,7 @@ New schema `dispatcher.*` in the existing dev RDS. Authoritative. Every field th
 | `dispatcher.retry_markers` | Pending retries waiting for a scheduler tick. | `marker_id`, `agent_id`, `reason`, `attempt` (1..3), `retry_after_ts`, `resolved_at` |
 | `dispatcher.commands` | Admin/CLI control channel. Poll-consumed by scheduler. | `command_id`, `command` (`start` / `stop` / `drain` / `pause` / `retry` / `force_kill`), `issued_by`, `issued_at`, `consumed_at`, `payload` (jsonb) |
 | `dispatcher.config` | Live-editable settings (concurrency cap, idle mode on/off, backoff schedule). | `key`, `value`, `updated_at`, `updated_by` |
-| `dispatcher.diagnoses` | One row per judgment-required failure routed to a diagnosis subprocess (see §8). Retains recommendation + post-retry outcome for effectiveness tracking. | `diagnosis_id`, `failure_id`, `agent_id`, `status` (pending / completed / failed), `recommendation` (jsonb), `outcome` (jsonb), `started_at`, `completed_at` |
+| `dispatcher.diagnoses` | One row per judgment-required failure routed to a diagnosis subprocess (see §8). Retains recommendation + post-retry outcome for effectiveness tracking. | `diagnosis_id`, `failure_id`, `agent_id`, `status` (pending / completed / failed), `recommendation` (jsonb), `outcome` (jsonb), `started_at`, `completed_at`, `actions_taken` (jsonb — empowered-diagnoser side-effect audit trail, migration 46), `next_directive` (text — `respawn_at=<phase>` \| `terminal` \| NULL, migration 46) |
 
 Rationale for Postgres over files/S3:
 - The dev DB already exists and has backups.
@@ -382,7 +382,7 @@ Rationale: the operator is not continuously available. Escalating straight to hu
 3. Skill reads the context, investigates as needed (the transcript, issue thread, CI logs), writes a structured JSON to `dispatcher.diagnoses.recommendation`:
    ```json
    {
-     "action": "retry" | "retry_with_hint" | "reissue" | "escalate" | "close",
+     "action": "retry" | "retry_with_hint" | "reissue" | "escalate" | "close" | "block_and_comment" | "file_prerequisite_task" | "block_on_existing_task" | "terminal",
      "reasoning": "<one paragraph>",
      "hint": "<optional: comment text to post on the issue before retry>",
      "new_scope": "<optional: rewritten issue body if action='reissue'>"
@@ -394,6 +394,12 @@ Rationale: the operator is not continuously available. Escalating straight to hu
    - **reissue** → post diagnosis summary as comment, replace issue body with `new_scope`, keep `agent/ready`, create retry marker.
    - **escalate** → `status/needs-human` + `priority/p1`, post diagnosis as comment, no retry.
    - **close** → add `status/invalid`, close issue with diagnosis as the close comment, no retry.
+   - **block_and_comment** → post diagnosis as comment, add `status/blocked`, remove `agent/ready`, no retry.
+   - **file_prerequisite_task** → file a new prerequisite issue, append `Blocked by #<new>` to the current issue body, add `status/blocked`, post comment, no retry.
+   - **block_on_existing_task** → append `Blocked by #<blocker>` to the current issue body, add `status/blocked`, remove `agent/ready`, post comment, no retry.
+   - **`terminal`** → SKILL has already performed the gh side-effects directly (close, comment, label, file). Daemon's `_consume_action_terminal` records the recommendation and marks the agent terminal at phase `diagnoser_terminal`. No additional gh writes from the daemon.
+
+**Inline-action pattern (#3458):** the empowered SKILL has peer-tier `gh` authority and performs gh writes itself, logging each side-effect to `dispatcher.diagnoses.actions_taken` (JSONB array — one entry per `git_commit`, `gh_issue_create`, `gh_issue_close`, etc.) and writing `dispatcher.diagnoses.next_directive` (`respawn_at=<phase>` to resume the pipeline, or `terminal` to free the slot). The preferred shape for any action involving gh side-effects is `action="terminal"` with descriptive `action_taken` + `summary` fields so the daemon's consumer path collapses to a single `diagnoser_terminal` phase. The legacy five actions (`retry`, `retry_with_hint`, `reissue`, `escalate`, `close`) plus the three newer ones (`block_and_comment`, `file_prerequisite_task`, `block_on_existing_task`) remain fully supported for backward compat; older skills that emit these keep working unchanged.
 
 **Budget & safety:**
 - One diagnosis per failure. Never diagnose a diagnosis.
@@ -750,7 +756,9 @@ CREATE TABLE dispatcher.diagnoses (
   recommendation  jsonb,                            -- {action, reasoning, hint?, new_scope?}
   outcome         jsonb,                            -- filled in after the retry resolves
   started_at      timestamptz NOT NULL DEFAULT now(),
-  completed_at    timestamptz
+  completed_at    timestamptz,
+  actions_taken   jsonb,                            -- empowered-diagnoser side-effect audit log (#3458 / migration 46)
+  next_directive  text                              -- 3-state daemon directive: respawn_at=<phase> | terminal | NULL (#3458 / migration 46)
 );
 CREATE INDEX ON dispatcher.diagnoses (status) WHERE status = 'pending';
 CREATE INDEX ON dispatcher.diagnoses (agent_id);
