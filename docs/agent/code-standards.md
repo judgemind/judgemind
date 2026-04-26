@@ -224,6 +224,37 @@ Then commit the updated `schema.sql` alongside the migration. `schema.sql` is au
 
 The same check runs in CI as the `schema-drift-check` job. The pre-push hook runs it whenever a `packages/api/migrations/*.sql` file is in the push (requires Docker + a running daemon; emits a WARNING and skips if Docker is unavailable), so migration-vs-schema drift is caught locally before the ~10 minute CI round trip. See #2702.
 
+### Nullable schema migrations
+
+When a migration drops `NOT NULL` on a column, every Python call site that reads that column without an `IS NOT NULL` guard becomes a latent `NoneType` bug — the column silently returns `None` in rows that were written after the migration, crashing code that assumed a non-null value.
+
+**Audit requirement:** any migration that contains `ALTER COLUMN <col> DROP NOT NULL` must have all affected read sites either guarded or explicitly acknowledged before merging. The `nullable-column-reads-check` CI job enforces this automatically on the migrations shard (see #3394, #3396).
+
+To run the check locally:
+
+```
+scripts/check-nullable-column-reads.sh --base origin/main
+# or, against a specific migration file:
+scripts/check-nullable-column-reads.sh --migration packages/api/migrations/49_foo.sql
+```
+
+**Two escape hatches** are accepted:
+
+1. **SQL-level `IS NOT NULL` filter** — add a `WHERE <col> IS NOT NULL` clause to every SELECT that reads the column, or guard the Python read site with an explicit null check:
+
+   ```python
+   if row["hearing_date"] is not None:
+       ...
+   ```
+
+2. **File-level acknowledgment** — if null values are handled via logic the linter cannot trace (e.g. a downstream consumer filters them), add a comment at the top of the file:
+
+   ```python
+   # nullable-ok: hearing_date is filtered upstream by the ingest pipeline
+   ```
+
+   The comment suppresses the violation for that entire file. Use sparingly — prefer explicit guards at the read site.
+
 ### macOS bash 3.2 compatibility
 
 Operator laptops run macOS, which ships with bash 3.2.57 (Apple has frozen the OS bash at 3.2 since 2007 for GPLv3 licensing reasons). Shell scripts in this repo — especially `scripts/check-*.sh` hygiene guards and `scripts/tests/*.sh` unit tests — are run both from CI (ubuntu-latest, bash 5+) and from operator shells. A script that uses a bash 4+ feature passes CI but fails locally with a cryptic message such as `mapfile: command not found` (exit 127) or `bad substitution`.
