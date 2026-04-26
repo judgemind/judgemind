@@ -37,8 +37,6 @@ if [[ ! -t 0 ]]; then
     stdin_content=$(cat)
     if [[ -n "$stdin_content" ]]; then
         printf 'STDIN:%s\n' "$stdin_content" >> "$INVOCATIONS_LOG"
-        # Re-emit stdin to stdout so piped callers still see it.
-        printf '%s\n' "$stdin_content"
     fi
 fi
 
