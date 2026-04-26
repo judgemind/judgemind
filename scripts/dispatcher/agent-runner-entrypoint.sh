@@ -396,6 +396,47 @@ sys.stdout.write("\t".join(fields))
 PYEOF
 fi
 
+# ── Startup validation: TRANSITION_SHIM (#3410) ────────────────────────────
+#
+# Fast-fail before the first claude invocation. Catches: missing file,
+# +x lost, wrong interpreter, sys.path misconfigured. The smoke payload
+# uses phase=plan so the shim exercises the real import path.
+#
+# The check runs unconditionally (whether we stamped the shim above or
+# accepted a pre-set AGENT_RUNNER_TRANSITION_SHIM from the caller) so
+# a test harness that injects a bad path also fails early.
+if [[ ! -s "$TRANSITION_SHIM" ]]; then
+    log "transition_shim_invalid" \
+        "path=$TRANSITION_SHIM" \
+        "reason=missing_or_empty"
+    die "transition_shim_invalid"
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    log "transition_shim_invalid" \
+        "path=$TRANSITION_SHIM" \
+        "reason=python3_not_on_path"
+    die "transition_shim_invalid"
+fi
+
+_shim_smoke_err_path="$AGENT_WORKSPACE/shim-smoke.err"
+_shim_smoke_in_path="$AGENT_WORKSPACE/shim-smoke.in"
+printf '{"current_phase":"plan","output":{}}' > "$_shim_smoke_in_path"
+set +e
+_shim_smoke_out=$(python3 "$TRANSITION_SHIM" < "$_shim_smoke_in_path" 2>"$_shim_smoke_err_path")
+_shim_smoke_rc=$?
+set -e
+if [[ "$_shim_smoke_rc" -ne 0 ]] || ! printf '%s' "$_shim_smoke_out" | grep -q $'\t'; then
+    _shim_smoke_err=$(head -5 "$_shim_smoke_err_path" 2>/dev/null | tr '\n' ' ')
+    log "transition_shim_invalid" \
+        "path=$TRANSITION_SHIM" \
+        "reason=smoke_failed" \
+        "exit_code=$_shim_smoke_rc" \
+        "stderr_tail=$_shim_smoke_err"
+    die "transition_shim_invalid"
+fi
+log "transition_shim_ok" "path=$TRANSITION_SHIM"
+
 transition_for() {
     # $1 = current phase, $2 = output JSON string (defaults to "{}").
     # See persist_phase_output for why we avoid ``${2:-{}}`` — bash's
@@ -4250,17 +4291,27 @@ while true; do
             # verdict=resolved, and emits the output envelope the
             # transition shim uses to advance.
             _output=$(handle_fix_conflict)
+            _fc_verdict=$(printf '%s' "$_output" | jq -r '.verdict // ""' 2>/dev/null || printf '')
+            log "fix_conflict_handler_done" "verdict=$_fc_verdict"
             persist_phase_output "fix_conflict" "$_output"
+            log "fix_conflict_persist_done"
             _transition=$(transition_for "fix_conflict" "$_output")
             _action=$(printf '%s' "$_transition" | cut -f1)
             _next=$(printf '%s' "$_transition" | cut -f2)
             _status=$(printf '%s' "$_transition" | cut -f3)
             _hint=$(printf '%s' "$_transition" | cut -f4)
+            log "fix_conflict_transition_shim_done" \
+                "action=$_action" \
+                "next=$_next" \
+                "status=$_status" \
+                "hint=$_hint"
             case "$_action" in
                 advance)
+                    log "fix_conflict_dispatched_action" "action=$_action"
                     advance_phase "$_next"
                     ;;
                 advance_with_status)
+                    log "fix_conflict_dispatched_action" "action=$_action"
                     advance_phase "$_next" "$_status"
                     ;;
                 route_to_diagnoser)
@@ -4269,6 +4320,7 @@ while true; do
                     # agent_runner_reaped_failure so the row carries
                     # ``category=conflict_unresolvable`` for the
                     # diagnoser sweep.
+                    log "fix_conflict_dispatched_action" "action=$_action"
                     log "fix_conflict_route_to_diagnoser" "hint=$_hint"
                     agent_runner_reaped_failure \
                         "conflict_unresolvable" \
@@ -4276,6 +4328,7 @@ while true; do
                         "fix_conflict skill returned unresolvable or budget exhausted"
                     ;;
                 *)
+                    log "fix_conflict_dispatched_action" "action=$_action"
                     log "fix_conflict_transition_unrecognized" "action=$_action"
                     agent_runner_reaped_failure \
                         "conflict_unresolvable" \
