@@ -52,3 +52,28 @@ output "diagnoser_fallback_spike_alarm_arn" {
   description = "ARN of the diagnoser_fallback_spike CloudWatch alarm (empty when enable_alerts is false)"
   value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.diagnoser_fallback_spike[0].arn : ""
 }
+
+output "list_advanceable_failed_alarm_arn" {
+  description = "ARN of the list_advanceable_failed CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.list_advanceable_failed[0].arn : ""
+}
+
+output "recover_scan_failed_alarm_arn" {
+  description = "ARN of the recover_scan_failed CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.recover_scan_failed[0].arn : ""
+}
+
+output "resume_scan_failed_alarm_arn" {
+  description = "ARN of the resume_scan_failed CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.resume_scan_failed[0].arn : ""
+}
+
+output "observe_external_terminal_failed_alarm_arn" {
+  description = "ARN of the observe_external_terminal_failed CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.observe_external_terminal_failed[0].arn : ""
+}
+
+output "reap_agent_tasks_select_failed_alarm_arn" {
+  description = "ARN of the reap_agent_tasks_select_failed CloudWatch alarm (empty when enable_alerts is false)"
+  value       = var.enable_alerts ? aws_cloudwatch_metric_alarm.reap_agent_tasks_select_failed[0].arn : ""
+}
