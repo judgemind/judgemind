@@ -6153,55 +6153,74 @@ class DispatcherDaemon:
     ) -> dict[int, str | None]:
         """Fetch issue titles for a set of blocker issue numbers.
 
-        One ``gh issue view <N> --json number,title`` call per unique number,
-        routed through ``_subprocess_with_retry`` with
-        ``event_name='blocker_title_fetch'``. Returns ``{number: title}`` with
-        ``None`` on per-issue failure (404, closed, rate-limit).
+        Issues a single batched GitHub GraphQL query with one aliased
+        ``issue(number: N)`` field per capped blocker number, routed
+        through ``_subprocess_with_retry`` with
+        ``event_name='blocker_title_fetch'``. Returns ``{number: title}``
+        with ``None`` on failure (404, rate-limit, network error).
 
         Single-tick scope — no cross-tick caching. Issue #2989.
+        Issue #3435: batched GraphQL replaces the per-issue loop.
 
         Caps the number of lookups at ``MAX_BLOCKER_TITLE_FETCH`` to bound
-        worst-case latency when GitHub is rate-limited (issue #2989).
+        worst-case query size when GitHub is rate-limited (issue #2989).
         """
-        result: dict[int, str | None] = {}
-        capped = set(list(numbers)[:MAX_BLOCKER_TITLE_FETCH])
-        for number in capped:
-            cmd = [
-                "gh",
-                "issue",
-                "view",
-                str(number),
-                "--repo",
-                self._cfg.github_repo,
-                "--json",
-                "number,title",
-            ]
-            outcome = self._subprocess_with_retry(
-                cmd,
-                event_name="blocker_title_fetch",
-                timeout=30,
-                extra_log_fields={"blocker_number": number},
+        if not numbers:
+            return {}
+
+        # Sort for deterministic ordering so tests are predictable.
+        capped = sorted(numbers)[:MAX_BLOCKER_TITLE_FETCH]
+
+        # Parse owner/name from "owner/repo" config value.
+        repo_parts = self._cfg.github_repo.split("/", 1)
+        owner = repo_parts[0]
+        name = repo_parts[1] if len(repo_parts) > 1 else ""
+
+        # Build a single GraphQL query with one aliased field per number.
+        alias_fields = " ".join(
+            f"i{n}: issue(number: {n}) {{ number title }}" for n in capped
+        )
+        query = (
+            f'query {{ repository(owner:"{owner}", name:"{name}") '
+            f"{{ {alias_fields} }} }}"
+        )
+
+        cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+        outcome = self._subprocess_with_retry(
+            cmd,
+            event_name="blocker_title_fetch",
+            timeout=30,
+            extra_log_fields={"blocker_count": len(capped)},
+        )
+
+        if not outcome["ok"]:
+            self._log.warning(
+                "daemon.blocker_title_fetch_exhausted",
+                extra={
+                    "event": "blocker_title_fetch_exhausted",
+                    "run_id": self._run_id,
+                    "blocker_count": len(capped),
+                    "reason": outcome.get("reason"),
+                },
             )
-            if not outcome["ok"]:
-                self._log.warning(
-                    "daemon.blocker_title_fetch_exhausted for #%d",
-                    number,
-                    extra={
-                        "event": "blocker_title_fetch_exhausted",
-                        "run_id": self._run_id,
-                        "blocker_number": number,
-                        "reason": outcome.get("reason"),
-                    },
+            return {n: None for n in capped}
+
+        try:
+            payload = json.loads(outcome["result"].stdout or "{}")
+            repo_data = payload["data"]["repository"]
+            return {
+                n: (
+                    repo_data[f"i{n}"]["title"]
+                    if (
+                        isinstance(repo_data.get(f"i{n}"), dict)
+                        and isinstance(repo_data[f"i{n}"].get("title"), str)
+                    )
+                    else None
                 )
-                result[number] = None
-                continue
-            try:
-                payload = json.loads(outcome["result"].stdout or "{}")
-                title = payload.get("title")
-                result[number] = title if isinstance(title, str) else None
-            except (json.JSONDecodeError, AttributeError):
-                result[number] = None
-        return result
+                for n in capped
+            }
+        except (json.JSONDecodeError, AttributeError, KeyError, TypeError):
+            return {n: None for n in capped}
 
     @staticmethod
     def _parse_parent_issue(body: str) -> int | None:

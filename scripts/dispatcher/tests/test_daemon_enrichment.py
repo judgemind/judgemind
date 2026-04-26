@@ -632,11 +632,17 @@ class TestFetchIssueTitlesForBlockers:
             extra_log_fields: dict | None = None,
         ) -> dict:
             call_log.append(cmd)
-            number_str = cmd[cmd.index("view") + 1]
             result = MagicMock()
             result.returncode = 0
             result.stdout = json.dumps(
-                {"number": int(number_str), "title": f"Title for #{number_str}"}
+                {
+                    "data": {
+                        "repository": {
+                            "i42": {"number": 42, "title": "Title for #42"},
+                            "i100": {"number": 100, "title": "Title for #100"},
+                        }
+                    }
+                }
             )
             return {"ok": True, "result": result, "attempts": 1}
 
@@ -646,13 +652,18 @@ class TestFetchIssueTitlesForBlockers:
 
         assert titles[42] == "Title for #42"
         assert titles[100] == "Title for #100"
-        # One gh call per unique number.
-        assert len(call_log) == 2
+        # Single batched GraphQL call for all numbers.
+        assert len(call_log) == 1
+        # Command is ["gh", "api", "graphql", "-f", "query=..."].
+        assert call_log[0][:4] == ["gh", "api", "graphql", "-f"]
+        assert call_log[0][4].startswith("query=")
 
     def test_returns_none_on_subprocess_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         d, _conn, handler = _make_daemon_with_capture()
+
+        call_count = 0
 
         def fake_retry(
             cmd: list[str],
@@ -661,6 +672,8 @@ class TestFetchIssueTitlesForBlockers:
             timeout: float,
             extra_log_fields: dict | None = None,
         ) -> dict:
+            nonlocal call_count
+            call_count += 1
             return {
                 "ok": False,
                 "reason": "nonzero_exit",
@@ -673,6 +686,8 @@ class TestFetchIssueTitlesForBlockers:
 
         titles = d._fetch_issue_titles_for_blockers({99})
         assert titles[99] is None
+        # Single batched call, not one per number.
+        assert call_count == 1
         # Warning logged at WARNING level.
         warn_events = [
             r
@@ -701,10 +716,10 @@ class TestFetchIssueTitlesForBlockers:
     def test_deduplicates_blocker_numbers_within_tick(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """One gh issue view per distinct blocker number across the whole tick."""
+        """Single batched GraphQL call regardless of how many distinct numbers."""
         d, _conn, _handler = _make_daemon_with_capture()
 
-        call_log: list[str] = []
+        call_log: list[list[str]] = []
 
         def fake_retry(
             cmd: list[str],
@@ -713,25 +728,74 @@ class TestFetchIssueTitlesForBlockers:
             timeout: float,
             extra_log_fields: dict | None = None,
         ) -> dict:
-            number_str = cmd[cmd.index("view") + 1]
-            call_log.append(number_str)
+            call_log.append(cmd)
             result = MagicMock()
             result.returncode = 0
             result.stdout = json.dumps(
-                {"number": int(number_str), "title": f"T#{number_str}"}
+                {
+                    "data": {
+                        "repository": {
+                            "i42": {"number": 42, "title": "T#42"},
+                            "i100": {"number": 100, "title": "T#100"},
+                        }
+                    }
+                }
             )
             return {"ok": True, "result": result, "attempts": 1}
 
         monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
 
         # Pass a set — duplicates are already deduplicated by set semantics.
-        # This verifies we only make one call even when the same number
+        # This verifies we only make ONE call even when the same number
         # appears in multiple blocked issues' bodies.
         titles = d._fetch_issue_titles_for_blockers({42, 42, 100})
-        # Set deduplicated to {42, 100} — only 2 calls.
-        assert len(call_log) == 2
-        assert sorted(call_log) == ["100", "42"]
+        # Exactly one batched GraphQL call for both numbers.
+        assert len(call_log) == 1
+        query_arg = call_log[0][4]
+        assert "i42:" in query_arg
+        assert "i100:" in query_arg
         assert titles[42] == "T#42"
+
+    def test_called_once_with_list_arg_for_multiple_blockers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC #1: single subprocess call with a list-shaped cmd for multiple numbers."""
+        d, _conn, _handler = _make_daemon_with_capture()
+
+        call_log: list[list[str]] = []
+
+        def fake_retry(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict | None = None,
+        ) -> dict:
+            call_log.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            # Build response for all five numbers.
+            repo_data = {
+                f"i{n}": {"number": n, "title": f"T#{n}"} for n in [1, 2, 3, 4, 5]
+            }
+            result.stdout = json.dumps({"data": {"repository": repo_data}})
+            return {"ok": True, "result": result, "attempts": 1}
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+
+        titles = d._fetch_issue_titles_for_blockers({1, 2, 3, 4, 5})
+
+        # AC #1: exactly one call.
+        assert len(call_log) == 1
+        # cmd is a list (not a string).
+        assert isinstance(call_log[0], list)
+        # The single query string contains all five issue aliases.
+        query_arg = call_log[0][4]
+        for n in [1, 2, 3, 4, 5]:
+            assert f"i{n}:" in query_arg
+        # All five numbers have titles.
+        assert len(titles) == 5
+        assert all(titles[n] == f"T#{n}" for n in [1, 2, 3, 4, 5])
 
 
 # --------------------------------------------------------------------------
@@ -931,33 +995,38 @@ class TestScanBlockedAndSnapshotWithTitles:
 
 
 class TestFetchIssuesTitleCap:
-    """MAX_BLOCKER_TITLE_FETCH cap bounds the number of gh calls."""
+    """MAX_BLOCKER_TITLE_FETCH cap bounds the GraphQL query size."""
 
     def test_cap_limits_gh_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When >MAX_BLOCKER_TITLE_FETCH unique blockers are passed, only the
-        first MAX_BLOCKER_TITLE_FETCH are fetched; the rest are absent."""
+        first MAX_BLOCKER_TITLE_FETCH are fetched via a single GraphQL call."""
+        import re
+
         from dispatcher.daemon import MAX_BLOCKER_TITLE_FETCH
 
         d, _conn, _handler = _make_daemon_with_capture()
 
-        call_count = 0
+        call_log: list[list[str]] = []
 
         def fake_subprocess_with_retry(
             cmd: list[str],
+            *,
             event_name: str,
             timeout: int = 30,
             extra_log_fields: dict | None = None,
         ) -> dict:
-            nonlocal call_count
-            call_count += 1
-            # cmd = ["gh", "issue", "view", "<N>", "--repo", ...]
-            number = int(cmd[3])
+            call_log.append(cmd)
+            # Build a GraphQL response for the capped numbers only.
+            # Parse alias names from the query to know which numbers to return.
+            query_arg = cmd[4]  # "query=..."
+            aliases = re.findall(r"i(\d+):", query_arg)
+            repo_data = {f"i{n}": {"number": int(n), "title": f"T{n}"} for n in aliases}
             return {
                 "ok": True,
                 "result": type(
                     "CP",
                     (),
-                    {"stdout": f'{{"number": {number}, "title": "T{number}"}}'},
+                    {"stdout": json.dumps({"data": {"repository": repo_data}})},
                 )(),
             }
 
@@ -967,8 +1036,12 @@ class TestFetchIssuesTitleCap:
         monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess_with_retry)
         result = d._fetch_issue_titles_for_blockers(big_set)
 
-        # Only MAX_BLOCKER_TITLE_FETCH calls should have been made.
-        assert call_count == MAX_BLOCKER_TITLE_FETCH
+        # Exactly ONE batched GraphQL call regardless of how many numbers.
+        assert len(call_log) == 1
+        # The query references exactly MAX_BLOCKER_TITLE_FETCH aliases.
+        query_arg = call_log[0][4]
+        alias_count = len(re.findall(r"i\d+:", query_arg))
+        assert alias_count == MAX_BLOCKER_TITLE_FETCH
         # All fetched numbers have a title.
         assert len(result) == MAX_BLOCKER_TITLE_FETCH
         assert all(v is not None for v in result.values())
