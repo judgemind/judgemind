@@ -64,6 +64,7 @@ known-first-party = ["framework", "courts", "templates", "validation", "ingestio
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 addopts = "--cov=framework --cov=courts --cov=templates --cov=validation --cov=ingestion --cov-report=term --cov-report=html:htmlcov --cov-report=xml:coverage.xml"
 markers = [
     "regression: scraper regression tests against archived fixtures",

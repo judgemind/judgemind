@@ -242,8 +242,10 @@ def test_enrichment_alias_match_updates_judge_name(
     with caplog.at_level(logging.INFO):
         worker.process_event(event)
 
-    # Verify resolve_judge was called with canonical name
-    mock_resolve_judge.assert_called_once_with(mock_conn, "Smith, Jonathan A.", "court-uuid-1")
+    # Verify resolve_judge was called with canonical name and source label
+    mock_resolve_judge.assert_called_once_with(
+        mock_conn, "Smith, Jonathan A.", "court-uuid-1", source="ca-la-tentatives-civil"
+    )
 
     # Verify OpenSearch got the canonical judge name
     os_mock.index.assert_called_once()
@@ -302,7 +304,9 @@ def test_enrichment_directory_mismatch_logs_warning_no_override(
         worker.process_event(event)
 
     # Judge name should NOT be changed to directory judge
-    mock_resolve_judge.assert_called_once_with(mock_conn, "Smith, John A.", "court-uuid-1")
+    mock_resolve_judge.assert_called_once_with(
+        mock_conn, "Smith, John A.", "court-uuid-1", source="ca-la-tentatives-civil"
+    )
 
     # Verify directory mismatch warning was logged
     assert any(
@@ -555,8 +559,10 @@ def test_enrichment_no_db_api_changes(
     event = _make_event()
     worker.process_event(event)
 
-    # Verify resolve_judge is still called the same way
-    mock_resolve_judge.assert_called_once_with(mock_conn, "Smith, John A.", "court-uuid-1")
+    # Verify resolve_judge is called with the source label from scraper_id
+    mock_resolve_judge.assert_called_once_with(
+        mock_conn, "Smith, John A.", "court-uuid-1", source="ca-la-tentatives-civil"
+    )
 
     # Verify commit was called (transaction completed)
     mock_conn.commit.assert_called_once()
@@ -655,7 +661,9 @@ def test_enrichment_invalid_judge_name_handled_gracefully(
     worker.process_event(event)
 
     # Judge name should remain unchanged — enrichment did not resolve it
-    mock_resolve_judge.assert_called_once_with(mock_conn, "XYZ Invalid", "court-uuid-1")
+    mock_resolve_judge.assert_called_once_with(
+        mock_conn, "XYZ Invalid", "court-uuid-1", source="ca-la-tentatives-civil"
+    )
     mock_conn.commit.assert_called_once()
 
 
