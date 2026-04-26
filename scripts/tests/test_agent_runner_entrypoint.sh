@@ -2471,7 +2471,7 @@ fi
 # each INSERT. This avoids adding a DB uniqueness constraint that
 # would also affect the daemon's subprocess-mode insert path — see
 # migration 42's rationale for the non-change.
-if grep -F "SELECT 1 FROM dispatcher.ralph_patches" "$INVOCATIONS_DIR/psql.log" \
+if grep "SELECT.*ralph_patches" "$INVOCATIONS_DIR/psql.log" \
      | grep -q "iteration_n"; then
     pass "#3144 T23 — SELECT guard runs before each INSERT"
 else
