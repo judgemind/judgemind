@@ -255,6 +255,18 @@ scripts/check-nullable-column-reads.sh --migration packages/api/migrations/49_fo
 
    The comment suppresses the violation for that entire file. Use sparingly — prefer explicit guards at the read site.
 
+**GraphQL nullability drift:** when the nullable column also backs a GraphQL field, the field declaration must be flipped from `Type!` to `Type` in the **same PR** as the migration. Leaving the field non-null causes the GraphQL serializer to throw at runtime the first time the column returns NULL, crashing the entire query. The `graphql-nullability-drift-check` CI job enforces this automatically for the columns listed in `KNOWN_MAPPINGS` inside `scripts/check-graphql-nullability-drift.py` (see #3441).
+
+To run the check locally:
+
+```
+scripts/check-graphql-nullability-drift.sh --base origin/main
+# or, against a specific migration file:
+scripts/check-graphql-nullability-drift.sh --migration packages/api/migrations/49_foo.sql
+```
+
+If you add a new column→GraphQL-field mapping not yet covered, extend `KNOWN_MAPPINGS` in `scripts/check-graphql-nullability-drift.py` in the same PR.
+
 ### Bash patterns
 
 #### Exit-code masking via `|| printf`
