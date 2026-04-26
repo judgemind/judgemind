@@ -328,6 +328,134 @@ class TestLogSummary:
         record = json.loads(log_path.read_text(encoding="utf-8").strip())
         assert record["final_verdict"] == "MAX_ITERATIONS"
 
+    def test_uploads_to_s3_when_agent_id_and_issue_provided(
+        self, state_dir: Path
+    ) -> None:
+        """S3 upload is attempted when both agent_id and issue_number are provided."""
+        import sys
+        from unittest.mock import MagicMock
+
+        # Set up a mock telemetry_upload module that we can inspect
+        mock_mirror = MagicMock(return_value=True)
+        mock_telemetry = MagicMock()
+        mock_telemetry.mirror_to_s3 = mock_mirror
+
+        sys.modules["telemetry_upload"] = mock_telemetry
+        try:
+            log_summary(
+                state_dir,
+                total_iterations=1,
+                final_verdict="SHIP",
+                reviews=[],
+                agent_id="agent-ab4722a2",
+                issue_number=2647,
+            )
+        finally:
+            sys.modules.pop("telemetry_upload", None)
+
+        assert mock_mirror.called
+        call_args = mock_mirror.call_args
+        # First positional arg is the log file path
+        log_path_arg = call_args[0][0]
+        assert str(log_path_arg).endswith("review-log.jsonl")
+        # Second positional arg is the S3 key
+        s3_key_arg = call_args[0][1]
+        assert s3_key_arg.startswith("ralph-reviews/")
+        assert "agent-ab4722a2-2647.jsonl" in s3_key_arg
+
+    def test_skips_upload_when_agent_id_missing(self, state_dir: Path) -> None:
+        """S3 upload is skipped when agent_id is None."""
+        import sys
+        from unittest.mock import MagicMock
+
+        mock_mirror = MagicMock(return_value=True)
+        mock_telemetry = MagicMock()
+        mock_telemetry.mirror_to_s3 = mock_mirror
+
+        sys.modules["telemetry_upload"] = mock_telemetry
+        try:
+            log_summary(
+                state_dir,
+                total_iterations=1,
+                final_verdict="SHIP",
+                reviews=[],
+                agent_id=None,
+                issue_number=2647,
+            )
+        finally:
+            sys.modules.pop("telemetry_upload", None)
+
+        mock_mirror.assert_not_called()
+
+    def test_skips_upload_when_issue_number_missing(self, state_dir: Path) -> None:
+        """S3 upload is skipped when issue_number is None."""
+        import sys
+        from unittest.mock import MagicMock
+
+        mock_mirror = MagicMock(return_value=True)
+        mock_telemetry = MagicMock()
+        mock_telemetry.mirror_to_s3 = mock_mirror
+
+        sys.modules["telemetry_upload"] = mock_telemetry
+        try:
+            log_summary(
+                state_dir,
+                total_iterations=1,
+                final_verdict="SHIP",
+                reviews=[],
+                agent_id="agent-ab4722a2",
+                issue_number=None,
+            )
+        finally:
+            sys.modules.pop("telemetry_upload", None)
+
+        mock_mirror.assert_not_called()
+
+    def test_s3_failure_is_non_fatal(self, state_dir: Path) -> None:
+        """S3 upload failure does not raise and local log write still succeeds."""
+        import sys
+        from unittest.mock import MagicMock
+
+        mock_mirror = MagicMock(side_effect=RuntimeError("S3 exploded"))
+        mock_telemetry = MagicMock()
+        mock_telemetry.mirror_to_s3 = mock_mirror
+
+        sys.modules["telemetry_upload"] = mock_telemetry
+        try:
+            # Must not raise
+            log_summary(
+                state_dir,
+                total_iterations=1,
+                final_verdict="SHIP",
+                reviews=[],
+                agent_id="agent-ab4722a2",
+                issue_number=2647,
+            )
+        finally:
+            sys.modules.pop("telemetry_upload", None)
+
+        # Local write still happened
+        log_path = state_dir / "review-log.jsonl"
+        assert log_path.exists()
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert record["type"] == "summary"
+
+    def test_local_write_unchanged_when_upload_skipped(self, state_dir: Path) -> None:
+        """Local review-log.jsonl is written exactly as before regardless of upload."""
+        log_summary(
+            state_dir,
+            total_iterations=3,
+            final_verdict="SHIP",
+            reviews=[],
+            agent_id=None,
+            issue_number=None,
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert record["type"] == "summary"
+        assert record["total_iterations"] == 3
+        assert record["final_verdict"] == "SHIP"
+
 
 class TestReviewTimer:
     """Tests for ReviewTimer context manager."""
