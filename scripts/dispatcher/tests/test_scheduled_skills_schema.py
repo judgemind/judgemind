@@ -95,31 +95,31 @@ def test_does_not_drop_legacy_config_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Migration 49 — dispatcher-daily-report skill row (issue #3375)
+# Migration 50 — dispatcher-daily-report skill row (issue #3375)
 # ---------------------------------------------------------------------------
 
-MIGRATION_49_PATH = (
+MIGRATION_50_PATH = (
     Path(__file__).resolve().parents[3]
     / "packages"
     / "api"
     / "migrations"
-    / "49_dispatcher-daily-report-skill.sql"
+    / "50_dispatcher-daily-report-skill.sql"
 )
 
 
-def _migration_49_text() -> str:
-    return MIGRATION_49_PATH.read_text(encoding="utf-8")
+def _migration_50_text() -> str:
+    return MIGRATION_50_PATH.read_text(encoding="utf-8")
 
 
 def test_daily_report_migration_file_exists() -> None:
-    assert MIGRATION_49_PATH.is_file(), (
-        f"expected migration file at {MIGRATION_49_PATH}; issue #3375 ships migration 49"
+    assert MIGRATION_50_PATH.is_file(), (
+        f"expected migration file at {MIGRATION_50_PATH}; issue #3375 ships migration 50"
     )
 
 
 def test_daily_report_row_seeded() -> None:
-    """Migration 49 must INSERT the dispatcher-daily-report row."""
-    text = _migration_49_text()
+    """Migration 50 must INSERT the dispatcher-daily-report row."""
+    text = _migration_50_text()
     assert "INSERT INTO dispatcher.scheduled_skills" in text
     assert "'dispatcher-daily-report'" in text
     assert "'/dispatcher-daily-report'" in text
@@ -128,14 +128,14 @@ def test_daily_report_row_seeded() -> None:
 
 
 def test_daily_report_row_idempotent() -> None:
-    """Migration 49 INSERT must use ON CONFLICT (name) DO NOTHING."""
-    text = _migration_49_text()
+    """Migration 50 INSERT must use ON CONFLICT (name) DO NOTHING."""
+    text = _migration_50_text()
     assert "ON CONFLICT (name) DO NOTHING" in text
 
 
 def test_daily_report_down_migration() -> None:
-    """Migration 49 must have a Down Migration block that deletes the row."""
-    text = _migration_49_text()
+    """Migration 50 must have a Down Migration block that deletes the row."""
+    text = _migration_50_text()
     assert "-- Down Migration" in text
     assert "DELETE FROM dispatcher.scheduled_skills" in text
     assert "'dispatcher-daily-report'" in text
