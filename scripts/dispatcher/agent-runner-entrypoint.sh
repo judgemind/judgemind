@@ -3783,7 +3783,6 @@ agent_runner_reaped_failure() {
         "terminal_phase=$_term_phase" \
         "category=$_category" \
         "reason=$_reason"
-    _escaped_reason=$(printf '%s' "$_reason" | sed "s/'/''/g")
     # #3219 — ON CONFLICT overwrite. See persist_phase_output for the
     # full rationale; the short version is that the unique index
     # ``idx_dispatcher_phase_outputs_agent_phase_attempt`` rejects a
@@ -3794,16 +3793,34 @@ agent_runner_reaped_failure() {
     # masked the crash already, but without ON CONFLICT the failure
     # payload simply wasn't persisted — operators lost the reaper's
     # category + reason context on re-entry.
-    # Schema parity enforced by scripts/tests/test_phase_outputs_insert_shape.py
-    db_exec "INSERT INTO dispatcher.phase_outputs
-               (agent_id, phase, output_json)
-             VALUES
-               ('$AGENT_ID', '$_term_phase',
-                '{\"category\": \"$_category\", \"reason\": \"$_escaped_reason\"}'::jsonb)
-             ON CONFLICT (agent_id, phase, attempt) DO UPDATE
-               SET output_json = EXCLUDED.output_json,
-                   ts = now();" \
-        >/dev/null 2>&1 || true
+    #
+    # #3488 — use psql -v variable substitution rather than bash
+    # interpolation so that $_reason (the head -c 200 of a stderr tail)
+    # never lands in a bash command line. The previous implementation
+    # built JSON via string interpolation after a sed single-quote
+    # escape, which still allowed $() / backticks / $VAR in $_reason to
+    # be expanded by bash before psql saw the SQL.
+    # Fix: lift $_category and $_reason into psql -v vars; build the
+    # JSON via jsonb_build_object(:'category'::text, :'reason'::text)
+    # so the values reach Postgres as typed parameters with no further
+    # bash quoting. Schema parity enforced by
+    # scripts/tests/test_phase_outputs_insert_shape.py
+    set +e
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+        -v agent_id="$AGENT_ID" \
+        -v term_phase="$_term_phase" \
+        -v category="$_category" \
+        -v reason="$_reason" <<'EOF' >/dev/null 2>&1
+INSERT INTO dispatcher.phase_outputs
+    (agent_id, phase, output_json)
+VALUES
+    (:'agent_id', :'term_phase',
+     jsonb_build_object('category', :'category'::text, 'reason', :'reason'::text))
+ON CONFLICT (agent_id, phase, attempt) DO UPDATE
+  SET output_json = EXCLUDED.output_json,
+      ts = now();
+EOF
+    set -e
     db_exec "UPDATE dispatcher.agents
                 SET phase = '$_term_phase', status = 'failed'
               WHERE agent_id = '$AGENT_ID';"

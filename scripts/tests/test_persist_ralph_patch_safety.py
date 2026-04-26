@@ -344,11 +344,11 @@ def test_persist_round_trips_dollar_paren_patch(tmp_path: Path) -> None:
     test_dsn = _get_test_dsn()
     assert test_dsn is not None
 
-    patch_content = "From deadbeef Mon Sep 17 00:00:00 2001\n+x = $(this should not execute)\n"
-    rc, persisted, stderr = _roundtrip_patch(test_dsn, patch_content, tmp_path)
-    assert rc == 0, (
-        f"persist_ralph_patch failed with rc={rc}. stderr:\n{stderr}"
+    patch_content = (
+        "From deadbeef Mon Sep 17 00:00:00 2001\n+x = $(this should not execute)\n"
     )
+    rc, persisted, stderr = _roundtrip_patch(test_dsn, patch_content, tmp_path)
+    assert rc == 0, f"persist_ralph_patch failed with rc={rc}. stderr:\n{stderr}"
     assert persisted is not None
     assert persisted == patch_content.rstrip("\n")
 
@@ -378,7 +378,9 @@ def test_persist_round_trips_var_expansion_patch(tmp_path: Path) -> None:
     test_dsn = _get_test_dsn()
     assert test_dsn is not None
 
-    patch_content = "From deadbeef Mon Sep 17 00:00:00 2001\n+path = $HOME/bin:$PATH\n+arg = $1\n"
+    patch_content = (
+        "From deadbeef Mon Sep 17 00:00:00 2001\n+path = $HOME/bin:$PATH\n+arg = $1\n"
+    )
     rc, persisted, stderr = _roundtrip_patch(test_dsn, patch_content, tmp_path)
     assert rc == 0, f"persist failed rc={rc}\n{stderr}"
     assert persisted is not None
