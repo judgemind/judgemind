@@ -12964,6 +12964,22 @@ class DispatcherDaemon:
             # via the phase_transitions audit log. This avoids needing
             # a new schema column for the counter (#3399 is pure code).
             past_attempts = self._count_orphan_pr_resurrections(agent_id)
+            if past_attempts is None:
+                # DB read failed — skip rather than grant a free pass.
+                # Checked BEFORE _fetch_pr_status to avoid a wasted gh
+                # API call when we already know we can't proceed safely.
+                self._log.info(
+                    "daemon.orphan_pr_resurrection_skipped",
+                    extra={
+                        "event": "orphan_pr_resurrection_skipped",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "count_failed",
+                    },
+                )
+                continue
             if past_attempts >= ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS:
                 self._log.info(
                     "daemon.orphan_pr_resurrection_skipped",
@@ -13119,16 +13135,16 @@ class DispatcherDaemon:
             return []
         return rows
 
-    def _count_orphan_pr_resurrections(self, agent_id: str) -> int:
+    def _count_orphan_pr_resurrections(self, agent_id: str) -> int | None:
         """Return how many times this agent has been resurrected by
         the orphan-PR sweep (#3399).
 
         Counted by reading append-only
         ``dispatcher.phase_transitions`` rows whose phase is
-        :data:`PHASE_RESURRECTED_FOR_ORPHAN_PR`. Returns 0 on DB error
-        so a transient hiccup cannot block resurrection (the worst case
-        on read failure is one extra resurrection that still respects
-        every other gate — the next tick re-evaluates).
+        :data:`PHASE_RESURRECTED_FOR_ORPHAN_PR`. Returns ``None`` on DB
+        error so the caller can distinguish "zero resurrections" from
+        "count failed" — a ``None`` result causes the candidate to be
+        skipped rather than granted a free pass.
         """
         assert self._conn is not None, "connect() must run before counting"
 
@@ -13154,7 +13170,7 @@ class DispatcherDaemon:
                 self._conn.rollback()
             except Exception:  # pragma: no cover — best-effort
                 pass
-            return 0
+            return None
         if row is None:
             return 0
         return int(row[0] or 0)
