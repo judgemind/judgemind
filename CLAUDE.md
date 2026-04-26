@@ -14,7 +14,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Never run bare `git stash pop` or `git stash apply` (#2749). Pop by explicit ref after `git stash list`, or use a throwaway commit instead.
 
 ### NEVER — Workflow
-- Never use `run_in_background` in any subagent (`/task`, `/ralph`, `/tdd`, or Agent-spawned workers). All commands inside subagents run synchronously.
+- Never use `run_in_background` in any subagent (`/task`, `/ralph`, or Agent-spawned workers). All commands inside subagents run synchronously.
 - Never commit directly to `main` during autonomous task work.
 - **You MAY merge your own PRs** after `/ralph` and CI are green: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 - Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
@@ -108,10 +108,24 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 
 - **`/task`** — Full autonomous pipeline: worktree, issue claim, implementation, PR, review. Accepts `#N`, natural language, or no argument (picks highest priority).
 - **`/ralph`** — Iterative work-review loop. Spawns worker (TDD) and reviewer subagents. Called by `/task` automatically for testable code tasks.
-- **`/tdd`** — Test-driven implementation for code tasks (Python, TypeScript). Called by `/ralph` internally. **Not for** Terraform, DB migrations, CI/CD, docs, or investigation tasks.
 - **`/dispatcher`** — Opt-in autonomous work queue manager. See `.claude/skills/dispatcher/SKILL.md`.
 - **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
 - **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings.
+
+### Dispatcher-internal phase skills
+
+The dispatcher v2 pipeline decomposes each task into per-phase subagents. Operators still invoke `/task` for one-shot work; the daemon invokes these phases directly. Full spec: `docs/specs/dispatcher-v2-spec.md`. Entry-point spec: `.claude/skills/task-v2-plan/SKILL.md`.
+
+- **`/task-v2-plan`** — Reads issue + comments, produces a plan document and go/no-go signal.
+- **`/task-v2-ralph`** — Iterative worker + reviewer loop; returns SHIP verdict plus committed diff.
+- **`/task-v2-summary`** — Produces process-summary comment, commit message, PR title, and PR body.
+- **`/task-v2-verify`** — Reads merged PR + deploy status + acceptance criteria; posts verification-evidence comment.
+- **`/task-v2-fix-ci`** — Reads CI failure logs and PR diff; produces a patch commit or blocker signal.
+- **`/task-v2-fix-conflict`** — Resolves rebase conflicts semantically against updated `origin/main`.
+- **`/task-v2-retro`** — Retrospective phase; files follow-up issues from the full agent history.
+- **`/dispatcher-startup`** — One-shot startup sweep (stale worktrees, stale assignments, queue scan).
+- **`/dispatcher-daily-report`** — Daily failure-summary report; auto-PRs to `docs/dispatcher-daily/`.
+- **`/diagnose-failure`** — Diagnoses agent-terminal failures and produces a daemon-consumable directive.
 
 ### Worktree setup
 
@@ -278,6 +292,7 @@ When you encounter a prompt for a safe command, work around it immediately using
 
 - Prefer updating `CLAUDE.md` in the repo root over writing to `~/.claude` project memory.
 - Only use local `~/.claude` memory for things that cannot go in the repo.
+- For `.claude/` writes (skill SKILL.md files, hook configs, etc.) where the platform blocks the Write/Edit tools, use `scripts/write-claude-file.sh`. From inside a worktree the script also enforces worktree scope to prevent cross-worktree writes (#3345).
 
 ## Additional Prohibitions
 
