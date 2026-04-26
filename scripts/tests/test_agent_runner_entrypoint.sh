@@ -114,6 +114,7 @@ INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 
 # Parse args for -c <query>.
 query=""
+saved_args=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c)
@@ -123,6 +124,50 @@ while [[ $# -gt 0 ]]; do
     esac
     shift || true
 done
+
+# #3413 — persist_phase_output now feeds the INSERT through a quoted
+# heredoc on stdin instead of the historical ``-c "$1"`` argv slot, so
+# the SQL no longer appears in argv. The existing assertions
+# (``grep "INSERT INTO dispatcher.phase_outputs" psql.log``) and the
+# substring router below both depend on seeing the SQL — so when stdin
+# carries a query, route by it AND emit a synthetic ``STDIN`` log line
+# so the assertions match. We also resolve any ``-v output_path=PATH``
+# argument and inline the file content into the log so assertions that
+# greppe the JSON payload (e.g. ``already_merged``) keep working — in
+# the new wire format the JSON arrives as the contents of the file
+# pointed to by ``-v output_path=``.
+if [[ -z "$query" && ! -t 0 ]]; then
+    stdin_content=$(cat)
+    if [[ -n "$stdin_content" ]]; then
+        query="$stdin_content"
+        output_path_value=""
+        for arg in "${saved_args[@]}"; do
+            case "$arg" in
+                output_path=*)
+                    output_path_value="${arg#output_path=}"
+                    ;;
+            esac
+        done
+        output_path_content=""
+        if [[ -n "$output_path_value" && -f "$output_path_value" ]]; then
+            output_path_content=$(cat "$output_path_value" 2>/dev/null || true)
+        fi
+        # Mirror to the invocation log so existing greps still find the
+        # SQL. ``printf '%q'`` matches the recorder's quoting style so
+        # tests that grep for ``\'planning\'`` keep matching.
+        {
+            printf 'CALL '
+            for arg in "${saved_args[@]}"; do
+                printf '%q ' "$arg"
+            done
+            printf '%q ' "STDIN:$stdin_content"
+            if [[ -n "$output_path_content" ]]; then
+                printf '%q' "OUTPUT_PATH_CONTENT:$output_path_content"
+            fi
+            printf '\n'
+        } >> "${INVOCATIONS_DIR:-/tmp}/psql.log"
+    fi
+fi
 
 # Routing — purely by substring match on the SQL.
 case "$query" in
@@ -696,24 +741,28 @@ else
     fail "happy-path pipeline exits cleanly" "rc=$rc, final phase: $(cat "$PHASE_FIXTURE_FILE" 2>/dev/null), output: $(printf '%s\n' "$out" | tail -40)"
 fi
 
-# Verify each expected phase had an INSERT into phase_outputs. Each
-# INSERT invocation is a single `CALL ...` record in the psql log;
-# the quoted SQL argument is printed via `printf '%q '`, which for
-# multi-line SQL (our queries are triple-quoted in the script)
-# produces a `$'...'` dollar-quoted shell token containing literal
-# `\n` escape sequences — so the whole stanza ends up on one physical
-# line. We grep the file for a line containing BOTH the INSERT token
-# AND the phase name quoted.
+# Verify each expected phase had an INSERT into phase_outputs. The
+# entrypoint records each INSERT as a single ``CALL ...`` line in the
+# psql log. Two distinct wire formats are valid here:
+#   * Pre-#3413: ``psql -c <SQL>`` — the SQL is in argv. Phase appears
+#     as the SQL literal ``'planning'`` (recorded as ``\'planning\'``
+#     after ``printf '%q'`` escaping).
+#   * #3413+:    ``psql -v phase=planning ... <<EOF ... :'phase' ...``
+#     — phase is passed via psql's ``-v`` variable substitution, the
+#     SQL is on stdin, and the stub mirrors stdin into the log with a
+#     ``STDIN:`` prefix. Phase shows up in the ``-v phase=planning``
+#     argv slot AND the SQL on stdin contains the ``INSERT INTO
+#     dispatcher.phase_outputs`` token.
+# The assertion accepts either: a CALL line containing both the INSERT
+# token AND the phase name in any of these positions.
 for expected in planning ralph summary push_and_pr verify; do
-    # `printf '%q '` output wraps single-quoted SQL fragments in a
-    # `$'...'` token and escapes nested single-quotes as `\'`. So the
-    # phase literal `'planning'` shows up in the log as `\'planning\'`.
-    if grep -F "\\'${expected}\\'" "$INVOCATIONS_DIR/psql.log" \
-         | grep -F "INSERT INTO dispatcher.phase_outputs" > /dev/null 2>&1; then
+    if grep "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
+         | grep -E "(\\\\'${expected}\\\\'|-v phase=${expected})" \
+         > /dev/null 2>&1; then
         pass "persists phase_outputs row for $expected"
     else
         fail "persists phase_outputs row for $expected" \
-             "psql log sample: $(grep -m1 "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" | head -c 200)"
+             "psql log sample: $(grep -m1 "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" | head -c 300)"
     fi
 done
 
@@ -3385,14 +3434,34 @@ mkdir -p "$t40_stub_bin"
 cat > "$t40_stub_bin/psql" <<'T40PSQLEOF'
 #!/usr/bin/env bash
 set -u
-# Parse -c <query>.
+# Parse -c <query> AND ``-v name=value`` (#3413 — persist_phase_output
+# now passes agent_id/phase/output_path via psql -v variables and the
+# SQL via stdin heredoc). We accept both the legacy ``-c <SQL>`` shape
+# (still used by db_exec for non-persist queries) and the new
+# heredoc + -v shape so the test stays meaningful across the bug fix.
 query=""
+v_agent_id=""
+v_phase=""
+v_output_path=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c) shift; query="$1" ;;
+        -v)
+            shift
+            case "$1" in
+                agent_id=*)    v_agent_id="${1#agent_id=}" ;;
+                phase=*)       v_phase="${1#phase=}" ;;
+                output_path=*) v_output_path="${1#output_path=}" ;;
+            esac
+            ;;
     esac
     shift || true
 done
+
+# Pull the SQL from stdin if no -c was supplied (heredoc shape).
+if [[ -z "$query" && ! -t 0 ]]; then
+    query=$(cat)
+fi
 
 # Only phase_outputs INSERTs matter to this test — everything else is
 # a silent success.
@@ -3400,17 +3469,25 @@ if [[ "$query" != *"INSERT INTO dispatcher.phase_outputs"* ]]; then
     exit 0
 fi
 
-# Extract agent_id and phase from the query. The entrypoint formats
-# VALUES as ('<agent_id>', '<phase>', '<output>'::jsonb) — we grep the
-# first two single-quoted tokens after VALUES.
-agent_id=$(printf '%s' "$query" | sed -n "s/.*VALUES[[:space:]]*([[:space:]]*'\\([^']*\\)'.*/\\1/p")
-phase=$(printf '%s' "$query" | sed -n "s/.*VALUES[[:space:]]*('[^']*'[[:space:]]*,[[:space:]]*'\\([^']*\\)'.*/\\1/p")
+# Extract agent_id, phase, output_json from one of two wire formats:
+#   1. Legacy -c "INSERT ... VALUES ('<agent_id>', '<phase>',
+#      '<output>'::jsonb)" — grep the VALUES tuple.
+#   2. New heredoc + -v: agent_id and phase came from -v args; the JSON
+#      payload is the contents of the file at $v_output_path.
+if [[ -n "$v_agent_id" && -n "$v_phase" && -n "$v_output_path" ]]; then
+    agent_id="$v_agent_id"
+    phase="$v_phase"
+    output_json=$(cat "$v_output_path" 2>/dev/null || true)
+else
+    agent_id=$(printf '%s' "$query" | sed -n "s/.*VALUES[[:space:]]*([[:space:]]*'\\([^']*\\)'.*/\\1/p")
+    phase=$(printf '%s' "$query" | sed -n "s/.*VALUES[[:space:]]*('[^']*'[[:space:]]*,[[:space:]]*'\\([^']*\\)'.*/\\1/p")
+    output_json=$(printf '%s' "$query" \
+        | sed -n "s/.*VALUES[[:space:]]*('[^']*'[[:space:]]*,[[:space:]]*'[^']*'[[:space:]]*,[[:space:]]*'\\(.*\\)'::jsonb.*/\\1/p")
+fi
 # Entrypoint always lets attempt default to 0.
 attempt=0
 key="${agent_id}__${phase}__${attempt}"
 state_file="${T40_STATE_DIR}/${key}.json"
-output_json=$(printf '%s' "$query" \
-    | sed -n "s/.*VALUES[[:space:]]*('[^']*'[[:space:]]*,[[:space:]]*'[^']*'[[:space:]]*,[[:space:]]*'\\(.*\\)'::jsonb.*/\\1/p")
 
 if [[ -f "$state_file" ]]; then
     # Second INSERT on same (agent_id, phase, attempt). ON CONFLICT

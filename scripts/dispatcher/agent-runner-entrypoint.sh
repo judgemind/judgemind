@@ -2144,13 +2144,57 @@ persist_phase_output() {
     if [[ -z "$_output_json" ]]; then
         _output_json="{}"
     fi
+    # #3413 — pass JSON via tmpfile + psql variable substitution rather than
+    # bash interpolation. The previous implementation built the SQL with
+    # ``"... '$_escaped'::jsonb ..."`` and a ``sed "s/'/''/g"`` escape, and
+    # was passed to ``db_exec`` which feeds ``psql -c "$1"``. Bash interpolated
+    # ``$_escaped`` into the SQL string BEFORE psql ever saw it, so any of
+    # ``$()`` / backticks / unescaped ``$VAR`` in the JSON were expanded by
+    # bash and corrupted the final SQL — producing exit_code=126 silently
+    # somewhere inside psql/its child shells (#3413, third occurrence:
+    # 2026-04-26 agent dbaff683 on issue #3407, fix_conflict phase, between
+    # ``fix_conflict_handler_done`` and the never-fired
+    # ``fix_conflict_persist_done``).
+    #
+    # The fix is two layers:
+    #   1. Write the JSON to a tmpfile so the JSON content NEVER lands in a
+    #      bash command line.
+    #   2. Use a quoted heredoc (``<<'EOF'``) so bash performs zero expansion
+    #      on the SQL body. The required values reach psql through psql's
+    #      own ``-v name=value`` variable substitution + ``\set output_json
+    #      `cat :'output_path'``` (psql's backtick reads the file at psql
+    #      time, into a psql variable), then ``:'output_json'`` quotes the
+    #      content as a SQL literal that the ``::jsonb`` cast parses.
     # Schema parity enforced by scripts/tests/test_phase_outputs_insert_shape.py
-    _escaped=$(printf '%s' "$_output_json" | sed "s/'/''/g")
-    db_exec "INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
-             VALUES ('$AGENT_ID', '$_phase', '$_escaped'::jsonb)
-             ON CONFLICT (agent_id, phase, attempt) DO UPDATE
-               SET output_json = EXCLUDED.output_json,
-                   ts = now();"
+    # Use a function-local variable name (``_persist_rc``) rather than the
+    # natural ``_rc``. Bash variables are dynamically scoped — naming the
+    # local ``_rc`` would clobber the caller's ``_rc`` (e.g. the
+    # ``handle_scheduled_skill`` flow uses ``_rc`` to capture claude's
+    # exit code immediately before calling ``persist_phase_output``, and
+    # then routes on it later).
+    _persist_tmpfile=$(mktemp)
+    printf '%s' "$_output_json" > "$_persist_tmpfile"
+    log "db_exec_begin" "fn=persist_phase_output phase=$_phase"
+    set +e
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+        -v agent_id="$AGENT_ID" \
+        -v phase="$_phase" \
+        -v output_path="$_persist_tmpfile" <<'EOF' >/dev/null
+\set output_json `cat :'output_path'`
+INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
+VALUES (:'agent_id', :'phase', :'output_json'::jsonb)
+ON CONFLICT (agent_id, phase, attempt) DO UPDATE
+  SET output_json = EXCLUDED.output_json,
+      ts = now();
+EOF
+    _persist_rc=$?
+    set -e
+    rm -f "$_persist_tmpfile"
+    log "db_exec_done" "fn=persist_phase_output phase=$_phase rc=$_persist_rc"
+    if [[ $_persist_rc -ne 0 ]]; then
+        log "phase_output_persist_failed" "phase=$_phase rc=$_persist_rc"
+        return $_persist_rc
+    fi
     log "phase_output_persisted" "phase=$_phase"
 }
 

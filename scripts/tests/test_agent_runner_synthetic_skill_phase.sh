@@ -86,6 +86,7 @@ INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 . "$(dirname "$0")/_record_invocation.sh" psql "$@"
 
 query=""
+saved_args=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c)
@@ -95,6 +96,38 @@ while [[ $# -gt 0 ]]; do
     esac
     shift || true
 done
+
+# #3413 — see test_agent_runner_entrypoint.sh stub for context.
+# persist_phase_output now feeds SQL via stdin heredoc instead of -c.
+if [[ -z "$query" && ! -t 0 ]]; then
+    stdin_content=$(cat)
+    if [[ -n "$stdin_content" ]]; then
+        query="$stdin_content"
+        output_path_value=""
+        for arg in "${saved_args[@]}"; do
+            case "$arg" in
+                output_path=*)
+                    output_path_value="${arg#output_path=}"
+                    ;;
+            esac
+        done
+        output_path_content=""
+        if [[ -n "$output_path_value" && -f "$output_path_value" ]]; then
+            output_path_content=$(cat "$output_path_value" 2>/dev/null || true)
+        fi
+        {
+            printf 'CALL '
+            for arg in "${saved_args[@]}"; do
+                printf '%q ' "$arg"
+            done
+            printf '%q ' "STDIN:$stdin_content"
+            if [[ -n "$output_path_content" ]]; then
+                printf '%q' "OUTPUT_PATH_CONTENT:$output_path_content"
+            fi
+            printf '\n'
+        } >> "${INVOCATIONS_DIR:-/tmp}/psql.log"
+    fi
+fi
 
 case "$query" in
     *"SELECT phase"*"FROM dispatcher.agents"*)
