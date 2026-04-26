@@ -709,8 +709,11 @@ def transition_from_awaiting_ci(
       place).
     * **Green** (all SUCCESS/SKIPPED + ``mergeable=MERGEABLE`` +
       ``mergeStateStatus=CLEAN``) — advance to ``merge``.
-    * **Red** (any FAILURE/CANCELLED/TIMED_OUT/ACTION_REQUIRED) —
-      advance to ``fix_ci``.
+    * **Red / conflict** (``mergeStateStatus=DIRTY`` or
+      ``mergeable=CONFLICTING``) — advance to ``fix_conflict``
+      (#3431; code-side rebase required).
+    * **Red / CI failure** (any FAILURE/CANCELLED/TIMED_OUT/
+      ACTION_REQUIRED) — advance to ``fix_ci``.
     """
     state = _ci_rollup_state(pr_status)
     if state == "green":
@@ -720,6 +723,20 @@ def transition_from_awaiting_ci(
             reason="CI green",
         )
     if state == "red":
+        # Distinguish a true merge conflict (DIRTY/CONFLICTING) from a
+        # CI check failure so callers can route to the right fix phase.
+        merge_state = str((pr_status or {}).get("mergeStateStatus") or "").upper()
+        mergeable = str((pr_status or {}).get("mergeable") or "").upper()
+        if merge_state == "DIRTY" or mergeable == "CONFLICTING":
+            return PhaseTransition(
+                action=TransitionAction.ADVANCE,
+                next_phase=PHASE_FIX_CONFLICT,
+                reason="CI conflict — routing to fix_conflict (#3431)",
+                context={
+                    "conflict_files": [],
+                    "source_phase": "awaiting_ci",
+                },
+            )
         return PhaseTransition(
             action=TransitionAction.ADVANCE,
             next_phase=PHASE_FIX_CI,
@@ -1009,10 +1026,14 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     2. If any check is not yet complete (CheckRun status
        in_progress / queued / pending, or StatusContext state
        EXPECTED / PENDING) → pending.
-    3. If mergeable is not ``MERGEABLE`` or mergeStateStatus is not
-       ``CLEAN`` → pending (the merge-conflict polling path; we
-       treat it as "not ready yet" rather than red).
-    4. Otherwise → green.
+    3. If ``mergeStateStatus == 'DIRTY'`` or ``mergeable ==
+       'CONFLICTING'`` → red (true merge conflict requiring
+       code-side rebase; routed to fix_conflict by callers, #3431).
+    4. If mergeable is not ``MERGEABLE`` or mergeStateStatus is not
+       ``CLEAN`` for any other reason (e.g. ``UNKNOWN`` /
+       ``UNSTABLE``) → pending (transient recompute; re-poll next
+       tick).
+    5. Otherwise → green.
     """
     if not pr_status:
         return "pending"
@@ -1055,6 +1076,10 @@ def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
 
     mergeable = str(pr_status.get("mergeable") or "").upper()
     merge_state = str(pr_status.get("mergeStateStatus") or "").upper()
+    # Rule 3: true merge conflict — code-side rebase required (#3431).
+    if merge_state == "DIRTY" or mergeable == "CONFLICTING":
+        return "red"
+    # Rule 4: transient recompute states (UNKNOWN, UNSTABLE, etc.) — re-poll.
     if mergeable != "MERGEABLE" or merge_state != "CLEAN":
         return "pending"
     return "green"

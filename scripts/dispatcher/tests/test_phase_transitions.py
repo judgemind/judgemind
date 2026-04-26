@@ -300,7 +300,9 @@ class TestTransitionFromAwaitingCi:
         result = pt.transition_from_awaiting_ci(status)
         assert result.next_phase == pt.PHASE_AWAITING_CI
 
-    def test_mergeable_not_mergeable_stays_pending(self) -> None:
+    def test_mergeable_conflicting_routes_to_fix_conflict(self) -> None:
+        # mergeable=CONFLICTING is a true merge conflict (#3431) — must
+        # route to fix_conflict, not stay pending.
         status = self._make_status(
             [
                 {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
@@ -308,14 +310,30 @@ class TestTransitionFromAwaitingCi:
             mergeable="CONFLICTING",
         )
         result = pt.transition_from_awaiting_ci(status)
-        assert result.next_phase == pt.PHASE_AWAITING_CI
+        assert result.next_phase == pt.PHASE_FIX_CONFLICT
 
-    def test_merge_state_not_clean_stays_pending(self) -> None:
+    def test_merge_state_dirty_routes_to_fix_conflict(self) -> None:
+        # mergeStateStatus=DIRTY is a true merge conflict (#3431) — must
+        # route to fix_conflict, not stay pending.
         status = self._make_status(
             [
                 {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
             ],
             merge_state="DIRTY",
+        )
+        result = pt.transition_from_awaiting_ci(status)
+        assert result.next_phase == pt.PHASE_FIX_CONFLICT
+
+    def test_unknown_stays_pending(self) -> None:
+        # Regression guard for AC #3 (#3431): UNKNOWN is a transient GitHub
+        # recompute state, NOT a merge conflict. Must stay in awaiting_ci
+        # (pending) so the daemon re-polls rather than routing to fix_conflict.
+        status = self._make_status(
+            [
+                {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
+            ],
+            mergeable="UNKNOWN",
+            merge_state="UNKNOWN",
         )
         result = pt.transition_from_awaiting_ci(status)
         assert result.next_phase == pt.PHASE_AWAITING_CI
