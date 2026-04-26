@@ -31,7 +31,7 @@
     "jsonwebtoken": "^9.0",
     "node-pg-migrate": "^7.0",
     "pg": "^8.11",
-    "pino": "^8.19",
+    "pino": "^9",
     "redis": "^4.6",
     "zod": "^3.22"
   },
