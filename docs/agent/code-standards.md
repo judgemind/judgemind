@@ -255,6 +255,40 @@ scripts/check-nullable-column-reads.sh --migration packages/api/migrations/49_fo
 
    The comment suppresses the violation for that entire file. Use sparingly — prefer explicit guards at the read site.
 
+### Bash patterns
+
+#### Exit-code masking via `|| printf`
+
+**Antipattern — do not use when the exit code matters:**
+
+```
+_var=$(cmd || printf '')
+_rc=$?
+```
+
+`$?` always reflects the last command in the substitution, which is `printf` (exit 0), not `cmd`. The caller cannot distinguish "cmd succeeded with empty output" from "cmd failed and we fell back to empty". This pattern silently swallows failures.
+
+Concrete incident: the initial `close_issue_post_merge` implementation in `scripts/dispatcher/agent-runner-entrypoint.sh` (#3411 review) used this shape to probe a GitHub issue's state. When the `gh` stub was misconfigured the probe returned `exit_code=0` with an empty string, so the caller treated the failure as a successful empty-state result rather than a probe error.
+
+**Recommended fix — redirect stdout to a file, capture `_rc=$?` directly:**
+
+```
+set +e
+cmd --flag arg \
+    > "$WORKSPACE/cmd.stdout.log" \
+    2> "$WORKSPACE/cmd.stderr.log"
+_rc=$?
+set -e
+_var=""
+if [[ -s "$WORKSPACE/cmd.stdout.log" ]]; then
+    _var=$(tr -d '\n\r' < "$WORKSPACE/cmd.stdout.log")
+fi
+```
+
+`_rc` now reflects `cmd`'s own exit code. See `close_issue_post_merge` (lines 3795–3807) for the precedent shape.
+
+**When `|| printf` is fine:** use it only when the caller needs a default value and does NOT make any exit-code-bearing decision afterwards — e.g. `_label=$(git tag --points-at HEAD || printf 'none')` where the caller unconditionally uses `_label` as a display string. If the branch on `_rc` or a `[[ -z "$_var" ]]` guard is anywhere in the same function, prefer the file-redirect shape instead.
+
 ### macOS bash 3.2 compatibility
 
 Operator laptops run macOS, which ships with bash 3.2.57 (Apple has frozen the OS bash at 3.2 since 2007 for GPLv3 licensing reasons). Shell scripts in this repo — especially `scripts/check-*.sh` hygiene guards and `scripts/tests/*.sh` unit tests — are run both from CI (ubuntu-latest, bash 5+) and from operator shells. A script that uses a bash 4+ feature passes CI but fails locally with a cryptic message such as `mapfile: command not found` (exit 127) or `bad substitution`.
