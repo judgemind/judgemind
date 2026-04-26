@@ -5043,6 +5043,11 @@ class DispatcherDaemon:
                 "B60205",
                 "Diagnoser flagged — needs operator review",
             ),
+            (
+                "source/dispatcher-audit",
+                "FBCA04",
+                "Filed by /dispatcher-audit periodic operational-health check",
+            ),
         ]
         attempted = 0
         for name, colour, description in required:
