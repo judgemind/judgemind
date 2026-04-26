@@ -143,6 +143,39 @@ case "$query" in
         printf '%s\n' "${MERGE_UNSTICK_ATTEMPTS_FIXTURE:-0}"
         exit 0
         ;;
+    *"SELECT COALESCE(pr_number"*"FROM dispatcher.agents"*)
+        printf '%s' "${DB_AGENT_PR_NUMBER:-0}"
+        exit 0
+        ;;
+    *"SELECT COALESCE(retries_used"*"FROM dispatcher.agents"*)
+        printf '%s' "${DB_AGENT_RETRIES_USED:-0}"
+        exit 0
+        ;;
+    *"EXTRACT(EPOCH FROM (now() - started_at))"*"FROM dispatcher.agents"*)
+        printf '%s' "${DB_AGENT_TOTAL_DURATION_S:-0}"
+        exit 0
+        ;;
+    *"SELECT output_json"*"FROM dispatcher.phase_outputs"*)
+        # Route by phase name substring.
+        if [[ "$query" == *"phase = 'summary'"* && -f "${DB_SUMMARY_OUTPUT_FIXTURE:-}" ]]; then
+            cat "$DB_SUMMARY_OUTPUT_FIXTURE"
+        elif [[ "$query" == *"phase = 'verify'"* && -f "${DB_VERIFY_OUTPUT_FIXTURE:-}" ]]; then
+            cat "$DB_VERIFY_OUTPUT_FIXTURE"
+        fi
+        exit 0
+        ;;
+    *"FROM dispatcher.phase_transitions"*)
+        if [[ -f "${DB_PHASE_TRANSITIONS_FIXTURE:-}" ]]; then
+            cat "$DB_PHASE_TRANSITIONS_FIXTURE"
+        fi
+        exit 0
+        ;;
+    *"FROM dispatcher.failures"*)
+        if [[ -f "${DB_FAILURES_FIXTURE:-}" ]]; then
+            cat "$DB_FAILURES_FIXTURE"
+        fi
+        exit 0
+        ;;
     *"SELECT patch_content"*)
         if [[ -f "${PRIOR_PATCH_FIXTURE:-}" ]]; then
             cat "$PRIOR_PATCH_FIXTURE"
@@ -432,13 +465,22 @@ case "$sub $verb" in
         exit "${GH_PR_CREATE_EXIT:-0}"
         ;;
     "pr view")
+        # Shim-test fixture (Stage 2) first, then post-PR fixture,
+        # then a canonical green-rollup fallback so happy-path tests can
+        # traverse awaiting_ci → merge → awaiting_deploy without setting
+        # any fixture at all.
+        if [[ -n "${GH_PR_FIXTURE:-}" && -f "$GH_PR_FIXTURE" ]]; then
+            cat "$GH_PR_FIXTURE"
+            exit 0
+        fi
         if [[ -n "${GH_PR_VIEW_JSON_FIXTURE:-}" && -f "${GH_PR_VIEW_JSON_FIXTURE:-}" ]]; then
             cat "$GH_PR_VIEW_JSON_FIXTURE"
-        else
-            # Default: green rollup, mergeable, with a merge SHA so
-            # happy-path tests can traverse awaiting_ci → merge →
-            # awaiting_deploy without fixture overrides.
-            cat <<'JSONEOF'
+            exit 0
+        fi
+        # Default: green rollup, mergeable, with a merge SHA so
+        # happy-path tests can traverse awaiting_ci → merge →
+        # awaiting_deploy without fixture overrides.
+        cat <<'JSONEOF'
 {
   "statusCheckRollup": [
     {"name": "ci-passed", "status": "COMPLETED", "conclusion": "SUCCESS"}
@@ -449,8 +491,14 @@ case "$sub $verb" in
   "mergeCommit": {"oid": "deadbeefcafe"}
 }
 JSONEOF
-        fi
         exit 0
+        ;;
+    "pr diff")
+        if [[ -n "${GH_PR_DIFF_FIXTURE:-}" && -f "$GH_PR_DIFF_FIXTURE" ]]; then
+            cat "$GH_PR_DIFF_FIXTURE"
+            exit 0
+        fi
+        exit 1
         ;;
     "pr merge")
         if [[ -n "${GH_PR_MERGE_STDERR:-}" ]]; then
@@ -458,18 +506,37 @@ JSONEOF
         fi
         exit "${GH_PR_MERGE_EXIT:-0}"
         ;;
+    "run view")
+        if [[ -n "${GH_RUN_LOG_FIXTURE:-}" && -f "$GH_RUN_LOG_FIXTURE" ]]; then
+            cat "$GH_RUN_LOG_FIXTURE"
+            exit 0
+        fi
+        exit 1
+        ;;
     "run list")
+        # Shim-test fixture (Stage 2) first, then post-PR fixture,
+        # then empty array fallback so awaiting_deploy's "no runs → verify"
+        # branch lights up without fixture setup.
+        if [[ -n "${GH_RUN_LIST_FIXTURE:-}" && -f "$GH_RUN_LIST_FIXTURE" ]]; then
+            cat "$GH_RUN_LIST_FIXTURE"
+            exit 0
+        fi
         if [[ -n "${GH_RUN_LIST_JSON_FIXTURE:-}" && -f "${GH_RUN_LIST_JSON_FIXTURE:-}" ]]; then
             cat "$GH_RUN_LIST_JSON_FIXTURE"
-        else
-            printf '[]\n'
+            exit 0
         fi
+        printf '[]\n'
         exit "${GH_RUN_LIST_EXIT:-0}"
         ;;
     "auth login"|"auth setup-git")
         exit 0
         ;;
     "issue view")
+        # GH_ISSUE_FIXTURE: full JSON fixture file (Stage 2 shim tests).
+        if [[ -n "${GH_ISSUE_FIXTURE:-}" && -f "$GH_ISSUE_FIXTURE" ]]; then
+            cat "$GH_ISSUE_FIXTURE"
+            exit 0
+        fi
         # #3411: post-merge cleanup probe. Test fixture
         # GH_ISSUE_STATE_FIXTURE controls the returned state
         # ("OPEN" | "CLOSED"). Defaults to CLOSED so existing tests
@@ -1705,260 +1772,6 @@ else
     fail "#3135 — entrypoint stamps phase_input_shim.py file on disk" \
          "expected file not found: $SHIM_PY"
 fi
-
-# Extend the gh stub with richer routes for the Stage 2 fetches and the
-# #3176 post-PR mechanical phases:
-#   * ``gh issue view <N> --json ...``    → read $GH_ISSUE_FIXTURE
-#   * ``gh pr view <N> --json ...``       → read $GH_PR_FIXTURE (shim
-#                                           tests) OR #3176
-#                                           $GH_PR_VIEW_JSON_FIXTURE
-#                                           (post-PR tests) — falls
-#                                           back to a canonical green
-#                                           rollup when neither is set.
-#   * ``gh pr diff <N>``                  → read $GH_PR_DIFF_FIXTURE
-#   * ``gh pr create``                    → honour GH_PR_CREATE_EXIT
-#                                           (defaults to 0, printing a
-#                                           canonical PR URL).
-#   * ``gh pr merge``                     → honour GH_PR_MERGE_EXIT +
-#                                           GH_PR_MERGE_STDERR (#3176).
-#   * ``gh run view --log-failed --job``  → read $GH_RUN_LOG_FIXTURE
-#   * ``gh run list --commit <sha>``      → read $GH_RUN_LIST_FIXTURE
-#                                           (shim tests) OR #3176
-#                                           $GH_RUN_LIST_JSON_FIXTURE
-#                                           (post-PR tests) — falls
-#                                           back to ``[]``.
-cat > "$STUB_BIN/gh" <<'GHEOF'
-#!/usr/bin/env bash
-set -u
-INVOCATIONS_DIR="${INVOCATIONS_DIR}"
-. "$(dirname "$0")/_record_invocation.sh" gh "$@"
-
-# Parse subcommand chain.
-if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
-    if [[ -n "${GH_ISSUE_FIXTURE:-}" && -f "$GH_ISSUE_FIXTURE" ]]; then
-        cat "$GH_ISSUE_FIXTURE"
-        exit 0
-    fi
-    # #3411: post-merge cleanup probe uses ``gh issue view <N>
-    # --json state --jq .state``. Honor GH_ISSUE_STATE_FIXTURE
-    # ("OPEN" | "CLOSED") so close_issue_post_merge tests can drive
-    # both branches. Defaults to CLOSED so existing tests that
-    # traverse merge → awaiting_deploy don't accidentally exercise
-    # the close path.
-    if printf '%s' "$*" | grep -q -- "--json state"; then
-        printf '%s\n' "${GH_ISSUE_STATE_FIXTURE:-CLOSED}"
-        exit "${GH_ISSUE_VIEW_EXIT:-0}"
-    fi
-    exit 1
-fi
-
-# #3411: gh issue close + gh issue edit (post-merge cleanup actions).
-if [[ "${1:-}" == "issue" && "${2:-}" == "close" ]]; then
-    exit "${GH_ISSUE_CLOSE_EXIT:-0}"
-fi
-if [[ "${1:-}" == "issue" && "${2:-}" == "edit" ]]; then
-    exit "${GH_ISSUE_EDIT_EXIT:-0}"
-fi
-
-if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
-    # Shim-test fixture (Stage 2) first, then #3176 post-PR fixture,
-    # then a canonical green-rollup fallback so happy-path tests can
-    # traverse awaiting_ci → merge → awaiting_deploy without setting
-    # any fixture at all.
-    if [[ -n "${GH_PR_FIXTURE:-}" && -f "$GH_PR_FIXTURE" ]]; then
-        cat "$GH_PR_FIXTURE"
-        exit 0
-    fi
-    if [[ -n "${GH_PR_VIEW_JSON_FIXTURE:-}" && -f "$GH_PR_VIEW_JSON_FIXTURE" ]]; then
-        cat "$GH_PR_VIEW_JSON_FIXTURE"
-        exit 0
-    fi
-    cat <<'JSONEOF'
-{
-  "statusCheckRollup": [
-    {"name": "ci-passed", "status": "COMPLETED", "conclusion": "SUCCESS"}
-  ],
-  "mergeable": "MERGEABLE",
-  "mergeStateStatus": "CLEAN",
-  "headRefOid": "deadbeefcafe",
-  "mergeCommit": {"oid": "deadbeefcafe"}
-}
-JSONEOF
-    exit 0
-fi
-
-if [[ "${1:-}" == "pr" && "${2:-}" == "diff" ]]; then
-    if [[ -n "${GH_PR_DIFF_FIXTURE:-}" && -f "$GH_PR_DIFF_FIXTURE" ]]; then
-        cat "$GH_PR_DIFF_FIXTURE"
-        exit 0
-    fi
-    exit 1
-fi
-
-if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
-    # #3176: handle_merge calls ``gh pr merge <N> --squash --delete-branch``.
-    if [[ -n "${GH_PR_MERGE_STDERR:-}" ]]; then
-        printf '%s\n' "$GH_PR_MERGE_STDERR" >&2
-    fi
-    exit "${GH_PR_MERGE_EXIT:-0}"
-fi
-
-if [[ "${1:-}" == "run" && "${2:-}" == "view" ]]; then
-    if [[ -n "${GH_RUN_LOG_FIXTURE:-}" && -f "$GH_RUN_LOG_FIXTURE" ]]; then
-        cat "$GH_RUN_LOG_FIXTURE"
-        exit 0
-    fi
-    exit 1
-fi
-
-if [[ "${1:-}" == "run" && "${2:-}" == "list" ]]; then
-    # Shim-test fixture (Stage 2) first, then #3176 post-PR fixture,
-    # then empty array fallback so awaiting_deploy's "no runs → verify"
-    # branch lights up without fixture setup.
-    if [[ -n "${GH_RUN_LIST_FIXTURE:-}" && -f "$GH_RUN_LIST_FIXTURE" ]]; then
-        cat "$GH_RUN_LIST_FIXTURE"
-        exit 0
-    fi
-    if [[ -n "${GH_RUN_LIST_JSON_FIXTURE:-}" && -f "$GH_RUN_LIST_JSON_FIXTURE" ]]; then
-        cat "$GH_RUN_LIST_JSON_FIXTURE"
-        exit 0
-    fi
-    printf '[]\n'
-    exit "${GH_RUN_LIST_EXIT:-0}"
-fi
-
-# Legacy route kept for push_and_pr tests.
-sub=""
-for arg in "$@"; do
-    if [[ "$sub" == "" && "$arg" != --* && "$arg" != -* ]]; then
-        sub="$arg"
-        continue
-    fi
-    if [[ -n "$sub" && "$sub" == "pr" && "$arg" != --* && "$arg" != -* ]]; then
-        if [[ "$arg" == "create" ]]; then
-            printf 'https://github.com/judgemind/judgemind/pull/9999\n'
-            exit "${GH_PR_CREATE_EXIT:-0}"
-        fi
-    fi
-done
-
-exit 0
-GHEOF
-chmod +x "$STUB_BIN/gh"
-
-# Extend the psql stub with Stage 2 SELECTs on dispatcher.agents,
-# dispatcher.phase_outputs, dispatcher.phase_transitions, and
-# dispatcher.failures. Each new fixture env var is read on-demand so
-# individual tests configure only what they need.
-cat > "$STUB_BIN/psql" <<'PSQLEOF'
-#!/usr/bin/env bash
-set -u
-INVOCATIONS_DIR="${INVOCATIONS_DIR}"
-. "$(dirname "$0")/_record_invocation.sh" psql "$@"
-
-query=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -c)
-            shift
-            query="$1"
-            ;;
-    esac
-    shift || true
-done
-
-case "$query" in
-    *"SELECT phase"*"FROM dispatcher.agents"*)
-        if [[ -f "${PHASE_FIXTURE_FILE:-}" ]]; then
-            head -n 1 "$PHASE_FIXTURE_FILE"
-        fi
-        exit 0
-        ;;
-    *"SELECT pr_number"*"FROM dispatcher.agents"*)
-        # #3176 — post-PR handlers read pr_number from the agent row.
-        printf '%s\n' "${PR_NUMBER_FIXTURE:-9999}"
-        exit 0
-        ;;
-    *"SELECT COALESCE(merge_unstick_attempts"*|*"SELECT merge_unstick_attempts"*)
-        # #3176 — handle_merge's auto-unstick budget check.
-        printf '%s\n' "${MERGE_UNSTICK_ATTEMPTS_FIXTURE:-0}"
-        exit 0
-        ;;
-    *"SELECT COALESCE(pr_number"*"FROM dispatcher.agents"*)
-        printf '%s' "${DB_AGENT_PR_NUMBER:-0}"
-        exit 0
-        ;;
-    *"SELECT COALESCE(retries_used"*"FROM dispatcher.agents"*)
-        printf '%s' "${DB_AGENT_RETRIES_USED:-0}"
-        exit 0
-        ;;
-    *"EXTRACT(EPOCH FROM (now() - started_at))"*"FROM dispatcher.agents"*)
-        printf '%s' "${DB_AGENT_TOTAL_DURATION_S:-0}"
-        exit 0
-        ;;
-    *"SELECT output_json"*"FROM dispatcher.phase_outputs"*)
-        # Route by phase name substring.
-        if [[ "$query" == *"phase = 'summary'"* && -f "${DB_SUMMARY_OUTPUT_FIXTURE:-}" ]]; then
-            cat "$DB_SUMMARY_OUTPUT_FIXTURE"
-        elif [[ "$query" == *"phase = 'verify'"* && -f "${DB_VERIFY_OUTPUT_FIXTURE:-}" ]]; then
-            cat "$DB_VERIFY_OUTPUT_FIXTURE"
-        fi
-        exit 0
-        ;;
-    *"FROM dispatcher.phase_transitions"*)
-        if [[ -f "${DB_PHASE_TRANSITIONS_FIXTURE:-}" ]]; then
-            cat "$DB_PHASE_TRANSITIONS_FIXTURE"
-        fi
-        exit 0
-        ;;
-    *"FROM dispatcher.failures"*)
-        if [[ -f "${DB_FAILURES_FIXTURE:-}" ]]; then
-            cat "$DB_FAILURES_FIXTURE"
-        fi
-        exit 0
-        ;;
-    *"SELECT patch_content"*)
-        if [[ -f "${PRIOR_PATCH_FIXTURE:-}" ]]; then
-            cat "$PRIOR_PATCH_FIXTURE"
-        fi
-        exit 0
-        ;;
-    *"UPDATE dispatcher.agents"*"SET phase ="*)
-        new_phase=$(printf '%s' "$query" | sed -n "s/.*SET phase = '\\([^']*\\)'.*/\\1/p")
-        if [[ -n "$new_phase" && -f "${PHASE_FIXTURE_FILE:-}" ]]; then
-            printf '%s\n' "$new_phase" > "$PHASE_FIXTURE_FILE"
-        fi
-        exit 0
-        ;;
-    *"UPDATE dispatcher.agents"*"SET ended_at"*)
-        exit 0
-        ;;
-    *"INSERT INTO dispatcher.phase_outputs"*)
-        exit 0
-        ;;
-    *"INSERT INTO dispatcher.ralph_patches"*)
-        # #3144 T26 knob — see equivalent in the earlier stub (L151).
-        if [[ "${PSQL_FAIL_ON_INSERT:-0}" == "1" ]]; then
-            exit 1
-        fi
-        exit 0
-        ;;
-    *"SELECT 1 FROM dispatcher.ralph_patches"*)
-        if [[ "${RALPH_PATCH_EXISTS:-0}" == "1" ]]; then
-            printf '1\n'
-        fi
-        exit 0
-        ;;
-    *"UPDATE dispatcher.agents"*"SET ralph_iterations_observed"*)
-        # #3144 HEAD-watcher counter bump.
-        exit 0
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-PSQLEOF
-chmod +x "$STUB_BIN/psql"
 
 # Helper: invoke the shim directly and print the JSON payload path.
 run_shim() {
