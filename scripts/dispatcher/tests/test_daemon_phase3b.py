@@ -36,6 +36,7 @@ if str(_SCRIPTS) not in sys.path:
 
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher import phase_transitions  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -148,11 +149,11 @@ def _agent_row(
 
 
 # --------------------------------------------------------------------------
-# _classify_check_rollup — pure function
+# _ci_rollup_state — pure function (canonical classifier, phase_transitions)
 # --------------------------------------------------------------------------
 
 
-class TestClassifyCheckRollup:
+class TestCiRollupState:
     def test_all_green_with_mergeable_clean_returns_green(self) -> None:
         status = {
             "statusCheckRollup": [
@@ -162,7 +163,7 @@ class TestClassifyCheckRollup:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "green"
+        assert phase_transitions._ci_rollup_state(status) == "green"
 
     def test_any_in_progress_returns_pending(self) -> None:
         status = {
@@ -173,7 +174,7 @@ class TestClassifyCheckRollup:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "pending"
+        assert phase_transitions._ci_rollup_state(status) == "pending"
 
     def test_queued_returns_pending(self) -> None:
         status = {
@@ -183,7 +184,7 @@ class TestClassifyCheckRollup:
             "mergeable": "UNKNOWN",
             "mergeStateStatus": "UNKNOWN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "pending"
+        assert phase_transitions._ci_rollup_state(status) == "pending"
 
     def test_any_failure_returns_red(self) -> None:
         status = {
@@ -194,11 +195,12 @@ class TestClassifyCheckRollup:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "red"
+        assert phase_transitions._ci_rollup_state(status) == "red"
 
-    def test_all_green_but_not_mergeable_returns_red(self) -> None:
-        # Branch protection rules not met, or still waiting on a required
-        # review that CI alone cannot satisfy.
+    def test_all_green_but_conflicting_returns_pending(self) -> None:
+        # CONFLICTING / DIRTY are transient GitHub recompute states — the
+        # canonical classifier returns 'pending' (not 'red') so the daemon
+        # keeps polling rather than routing to fix-ci unnecessarily.
         status = {
             "statusCheckRollup": [
                 {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
@@ -206,23 +208,23 @@ class TestClassifyCheckRollup:
             "mergeable": "CONFLICTING",
             "mergeStateStatus": "DIRTY",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "red"
+        assert phase_transitions._ci_rollup_state(status) == "pending"
 
     def test_legacy_commit_status_pending(self) -> None:
         status = {
-            "statusCheckRollup": [{"state": "PENDING"}],
+            "statusCheckRollup": [{"__typename": "STATUSCONTEXT", "state": "PENDING"}],
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "pending"
+        assert phase_transitions._ci_rollup_state(status) == "pending"
 
     def test_legacy_commit_status_failure(self) -> None:
         status = {
-            "statusCheckRollup": [{"state": "FAILURE"}],
+            "statusCheckRollup": [{"__typename": "STATUSCONTEXT", "state": "FAILURE"}],
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "red"
+        assert phase_transitions._ci_rollup_state(status) == "red"
 
     def test_empty_rollup_with_mergeable_returns_green(self) -> None:
         # If there are literally no checks and the branch is mergeable,
@@ -233,7 +235,7 @@ class TestClassifyCheckRollup:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         }
-        assert daemon.DispatcherDaemon._classify_check_rollup(status) == "green"
+        assert phase_transitions._ci_rollup_state(status) == "green"
 
 
 # --------------------------------------------------------------------------
