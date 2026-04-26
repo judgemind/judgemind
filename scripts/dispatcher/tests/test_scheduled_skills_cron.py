@@ -112,10 +112,11 @@ class TestShouldFireCron:
         now = datetime(2026, 4, 25, 14, 0, tzinfo=UTC)
         assert should_fire_cron("0 14 * * *", None, now) is True
 
-    def test_first_fire_no_match_yet(self) -> None:
+    def test_first_fire_no_match_in_24h(self) -> None:
+        # An expression that can never match (Feb 30 does not exist) yields
+        # False regardless of the NULL-anchor 24h lookback.
         now = datetime(2026, 4, 25, 13, 0, tzinfo=UTC)
-        # First fire, but the schedule is 14:00 and now is 13:00.
-        assert should_fire_cron("0 14 * * *", None, now) is False
+        assert should_fire_cron("0 0 30 2 *", None, now) is False
 
     def test_no_fire_before_next_match(self) -> None:
         # Last fired at 14:00; "now" is 14:01 — same matching minute
@@ -162,3 +163,33 @@ class TestShouldFireCron:
         now = datetime(2026, 4, 25, 14, 1, tzinfo=UTC)
         with pytest.raises(CronParseError):
             should_fire_cron("not a cron", last, now)
+
+    # ------------------------------------------------------------------
+    # NULL-anchor 24h lookback (issue #3424)
+    # ------------------------------------------------------------------
+
+    def test_first_fire_finds_match_within_24h(self) -> None:
+        """AC #1 + AC #4: last=None, now=13:00Z, expr 0 12 * * * → True.
+
+        The cron's 12:00 slot already passed today (1 hour ago), but the
+        24h lookback window reaches back to yesterday's 12:00, so the walk
+        finds today's 12:00 and returns True.
+        """
+        now = datetime(2026, 4, 25, 13, 0, tzinfo=UTC)
+        assert should_fire_cron("0 12 * * *", None, now) is True
+
+    def test_consecutive_ticks_fire_once(self) -> None:
+        """AC #5: two consecutive ticks; second must NOT re-fire.
+
+        First tick: last=None, now=12:00:30Z → True (12:00 found in window).
+        Second tick: last=12:00:30Z (set by caller after first fire),
+        now=12:01:30Z → False (next 12:00 is tomorrow).
+        """
+        now_first = datetime(2026, 4, 25, 12, 0, 30, tzinfo=UTC)
+        assert should_fire_cron("0 12 * * *", None, now_first) is True
+
+        last_after_first_fire = datetime(2026, 4, 25, 12, 0, 30, tzinfo=UTC)
+        now_second = datetime(2026, 4, 25, 12, 1, 30, tzinfo=UTC)
+        assert (
+            should_fire_cron("0 12 * * *", last_after_first_fire, now_second) is False
+        )

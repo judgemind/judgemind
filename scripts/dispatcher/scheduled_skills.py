@@ -27,6 +27,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+#: Lookback window used when ``last_triggered_at`` is NULL (first-ever fire or
+#: manually reset).  Walking 24 hours ensures that a cron whose exact minute
+#: already passed today is still found and fired once on the next daemon tick,
+#: matching standard cron "fire exactly once if missed" semantics.  24 hours
+#: also matches the existing 24h iteration-cap safety guard so the two
+#: constants stay in sync without an extra config knob.
+_NULL_ANCHOR_LOOKBACK = timedelta(hours=24)
+
 
 # Field bounds, matching the standard 5-field cron layout:
 #   minute hour day_of_month month day_of_week
@@ -149,10 +157,14 @@ def should_fire_cron(
     inclusive) and return True if any minute in that range matches the
     cron schedule.
 
-    On first-ever fire (``last_triggered_at is None``) the anchor is
-    set to ``now - 1 minute`` so that a cron expression matching the
-    *current* minute fires on this tick rather than waiting until the
-    next match.
+    On first-ever fire (``last_triggered_at is None``) — including
+    rows that were manually reset to NULL — the anchor walks back a
+    full :data:`_NULL_ANCHOR_LOOKBACK` (24 hours) from ``now``.  This
+    ensures the most-recent past match within the last day is found
+    and fired exactly once on this tick, even if the cron's target
+    minute already passed today.  The existing 24h iteration cap (see
+    below) bounds the walk identically, so no extra config knob is
+    needed.
 
     Bounds:
       - The walk is capped at 24 hours so a daemon that was offline
@@ -162,8 +174,9 @@ def should_fire_cron(
     """
     schedule = parse_cron(expression)
     if last_triggered_at is None:
-        # First fire — let "now matches" trigger immediately.
-        anchor = now - timedelta(minutes=1)
+        # Never fired (or manually reset) — walk back 24h so the
+        # most-recent past match is found and fired on this tick.
+        anchor = now - _NULL_ANCHOR_LOOKBACK
     else:
         anchor = last_triggered_at
     # Defensive: if last_triggered is in the future (clock skew or
