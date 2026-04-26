@@ -1302,6 +1302,15 @@ FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED = "merge_unstick_exhausted"
 #: rebase today — but when it is added it must route here.
 FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 
+#: #3465 — push_and_pr or start-of-ralph baseline rebase exited non-zero
+#: but ``git diff --name-only --diff-filter=U`` returned no files. Routing
+#: to fix_conflict with an empty bundle causes an immediate ``unresolvable``
+#: verdict. The agent-runner entrypoint emits a distinct
+#: ``no_unmerged_files=True`` envelope and the transition shim routes here
+#: instead. The diagnoser decides next steps (evaluate ``--empty=drop``,
+#: reissue, etc.).
+FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
+
 #: daemon-side ``_push_and_open_pr`` pre-push rebase against ``origin/main``
 #: hit a conflict; rebase was aborted and worktree restored. No mechanical
 #: retry — proper LLM-resolution path is the follow-up issue. Tier-3.
@@ -1361,6 +1370,8 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "summary_ac_infeasible": FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
     "fix_ci_blocked": FAILURE_CATEGORY_FIX_CI_BLOCKED,
     "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
+    # #3465 — rebase exited non-zero with no unmerged files.
+    "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's

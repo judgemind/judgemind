@@ -704,6 +704,110 @@ class TestTransitionFromRalphBaselineRebaseConflict:
 
 
 # --------------------------------------------------------------------------
+# transition_from_push_and_pr — no_unmerged_files branch (#3465)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromPushAndPrNoUnmergedFiles:
+    """#3465: push_and_pr rebase exits non-zero with no unmerged files →
+    route to diagnoser, NOT fix_conflict."""
+
+    def test_no_unmerged_files_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_push_and_pr(
+            {
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+                "rebase_stderr_tail": "error: could not apply abc1234",
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES
+        assert result.context["rebase_stderr_tail"] == "error: could not apply abc1234"
+        assert result.context["source_phase"] == "push_and_pr"
+
+    def test_no_unmerged_files_without_stderr_tail_still_routes(self) -> None:
+        # Defensive: if the entrypoint couldn't capture the stderr tail,
+        # the transition must still route to diagnoser (no crash).
+        result = pt.transition_from_push_and_pr(
+            {
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES
+        assert result.context.get("rebase_stderr_tail") is None
+        assert result.context["source_phase"] == "push_and_pr"
+
+    def test_no_unmerged_files_takes_precedence_over_conflict_files(self) -> None:
+        # If both no_unmerged_files and conflict_files are present (shouldn't
+        # happen, but defensive), no_unmerged_files must win — never route
+        # to fix_conflict.
+        result = pt.transition_from_push_and_pr(
+            {
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+                "conflict_files": ["packages/web/app/foo.tsx"],
+                "rebase_stderr_tail": "some tail",
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.next_phase != pt.PHASE_FIX_CONFLICT
+
+
+# --------------------------------------------------------------------------
+# transition_from_ralph — no_unmerged_files branch (#3465)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromRalphNoUnmergedFiles:
+    """#3465: start-of-ralph baseline rebase exits non-zero with no unmerged
+    files → route to diagnoser, NOT fix_conflict."""
+
+    def test_no_unmerged_files_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_ralph(
+            {
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+                "rebase_stderr_tail": "error: could not apply def5678",
+                "source_phase": "ralph",
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES
+        assert result.context["rebase_stderr_tail"] == "error: could not apply def5678"
+        assert result.context["source_phase"] == "ralph"
+
+    def test_no_unmerged_files_without_stderr_tail_still_routes(self) -> None:
+        # Defensive: if the entrypoint couldn't capture the stderr tail,
+        # the transition must still route to diagnoser (no crash).
+        result = pt.transition_from_ralph(
+            {
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES
+        assert result.context.get("rebase_stderr_tail") is None
+        assert result.context["source_phase"] == "ralph"
+
+    def test_no_unmerged_files_takes_precedence_over_conflict_files(self) -> None:
+        # If both no_unmerged_files and conflict_files are present, the
+        # no_unmerged_files branch must win — never route to fix_conflict.
+        result = pt.transition_from_ralph(
+            {
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+                "conflict_files": ["x.py", "y.py"],
+                "rebase_stderr_tail": "some tail",
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.next_phase != pt.PHASE_FIX_CONFLICT
+
+
+# --------------------------------------------------------------------------
 # transition_from_merge
 # --------------------------------------------------------------------------
 
