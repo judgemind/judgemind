@@ -1732,6 +1732,11 @@ DIRECTIVE_RESPAWN_AT_PREFIX = "respawn_at="
 #: have run, the daemon flips ``dispatcher.config.diagnoser_enabled``
 #: to ``false``. Matches the spec's "≥5 diagnoses" floor so a single
 #: early failure cannot trip the breaker.
+#:
+#: Issue #3383: ``status='orphaned'`` rows (boot-reap of a previous
+#: daemon's pending diagnoses) are excluded from both numerator and
+#: denominator — they were never executed by the diagnoser, so they
+#: don't measure diagnoser-decision quality.
 CIRCUIT_BREAKER_MIN_DIAGNOSES = 5
 CIRCUIT_BREAKER_WINDOW_SECONDS = 24 * 60 * 60
 
@@ -17078,6 +17083,16 @@ class DispatcherDaemon:
         ``daemon.diagnoser_circuit_breaker_tripped`` event. Operator
         manually re-enables.
 
+        Issue #3383: rows with ``status='orphaned'`` are excluded
+        from BOTH the failed-count numerator AND the total-count
+        denominator. Orphans are pending rows abandoned by a
+        crashed/restarted parent daemon and reaped on boot — they
+        were never executed by the diagnoser, so they say nothing
+        about diagnoser-decision quality. Pre-fix, the boot reaper
+        wrote them as ``'failed'`` and a single daemon-restart
+        cascade (7 orphans on 2026-04-25) inflated the breaker to
+        100% fallback rate, structurally disabling the diagnoser.
+
         Returns True if the breaker was tripped this call, False
         otherwise. Called once per supervisor tick (cheap — one COUNT
         aggregation over a narrow time range).
@@ -17092,7 +17107,8 @@ class DispatcherDaemon:
                     "    COUNT(*) FILTER (WHERE status = 'failed'), "
                     "    COUNT(*) "
                     "FROM dispatcher.diagnoses "
-                    "WHERE started_at > now() - make_interval(secs => %s)",
+                    "WHERE started_at > now() - make_interval(secs => %s) "
+                    "  AND status <> 'orphaned'",
                     (CIRCUIT_BREAKER_WINDOW_SECONDS,),
                 )
                 row = cur.fetchone()
@@ -18417,6 +18433,67 @@ class DispatcherDaemon:
             "daemon.diagnoser_fallback",
             extra={
                 "event": "diagnoser_fallback",
+                "run_id": self._run_id,
+                "diagnosis_id": diagnosis_id,
+                "reason": reason,
+            },
+        )
+
+    def _mark_diagnosis_orphaned(self, diagnosis_id: int, reason: str) -> None:
+        """UPDATE diagnosis row to ``status='orphaned'`` (issue #3383).
+
+        Distinct from :meth:`_mark_diagnosis_failed` because the row
+        was never executed by the diagnoser — it was abandoned by a
+        previous daemon (watchdog kill, panic, etc.) before any LLM
+        run completed. The circuit breaker counts ``'failed'`` rows
+        against the 24h fallback threshold (a measurement of "is the
+        diagnoser making bad decisions?"); orphans are infrastructure
+        artifacts that say nothing about diagnoser quality, so they
+        live under a distinct status that the breaker excludes.
+
+        Background: PR #3378 introduced
+        :meth:`_reap_orphaned_diagnoses_on_boot`, which used
+        ``_mark_diagnosis_failed``. On 2026-04-25 a daemon-restart
+        cascade orphaned 7 pending rows; the boot reaper transitioned
+        them to ``'failed'`` and the breaker tripped at 7/7=100%
+        fallback rate, structurally disabling the diagnoser even
+        though no real diagnoser run had failed.
+
+        ``dispatcher.diagnoses.status`` is a free-text TEXT column
+        (no CHECK / enum constraint, see migration 21), so adding
+        ``'orphaned'`` requires no schema migration. Existing rows
+        manually re-statused to ``'orphaned'`` at 23:25Z on
+        2026-04-25 remain valid post-deploy.
+        """
+        assert self._conn is not None, "connect() must run before diagnosis update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.diagnoses "
+                    "SET status = 'orphaned', "
+                    "    completed_at = now() "
+                    "WHERE diagnosis_id = %s",
+                    (diagnosis_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnosis_mark_orphaned_failed",
+                extra={
+                    "event": "diagnosis_mark_orphaned_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "reason": reason,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+        self._log.warning(
+            "daemon.diagnosis_marked_orphaned",
+            extra={
+                "event": "diagnosis_marked_orphaned",
                 "run_id": self._run_id,
                 "diagnosis_id": diagnosis_id,
                 "reason": reason,
@@ -20619,7 +20696,7 @@ class DispatcherDaemon:
         return max(0.0, (now - started_at).total_seconds())
 
     def _reap_orphaned_diagnoses_on_boot(self) -> int:
-        """Reap diagnoses orphaned by a daemon restart (#3376, #3384).
+        """Reap diagnoses orphaned by a daemon restart (#3376, #3383, #3384).
 
         Called once at daemon startup, after :meth:`recover_abandoned_agents`.
         Iterates ``dispatcher.diagnoses`` rows with ``status='pending'``
@@ -20632,10 +20709,10 @@ class DispatcherDaemon:
 
           * **No PID** (``subprocess_pid IS NULL``) — the previous daemon
             crashed before the PID UPDATE landed.  Log
-            ``diagnoser_orphan_pid_dead`` (no kill possible), mark failed.
+            ``diagnoser_orphan_pid_dead`` (no kill possible), mark orphaned.
           * **PID dead** (``_process_alive`` returns ``False``) — the
             diagnoser process has already exited.  Log
-            ``diagnoser_orphan_pid_dead``, mark failed.
+            ``diagnoser_orphan_pid_dead``, mark orphaned.
           * **PID alive, cmdline matches** (``_diagnoser_cmdline_matches``
             returns ``True``) — the previous daemon's diagnoser subprocess
             is still running and IS confirmed to be a ``claude -p
@@ -20643,12 +20720,12 @@ class DispatcherDaemon:
             DB row and GitHub credentials so it IS responsible for this
             process.  Log ``diagnoser_orphan_killed``, call
             :meth:`_kill_diagnoser_process` (SIGTERM → grace →
-            SIGKILL), then mark failed.
+            SIGKILL), then mark orphaned.
           * **PID alive, cmdline mismatched / unreadable** (``False`` or
             ``None``) — the OS has recycled the old PID and the slot now
             belongs to an unrelated process.  Log
             ``diagnoser_orphan_pid_recycled``, do NOT signal the unrelated
-            process, mark failed.
+            process, mark orphaned.
 
         **Rationale for killing (#3384).** The prior design said "do NOT
         kill — the new daemon doesn't own it."  That was correct for the
@@ -20657,10 +20734,20 @@ class DispatcherDaemon:
         hold the ``diagnosis_id`` DB row in ``status='pending'`` and may
         still be writing to GitHub/disk using shared credentials.  Killing
         it (with cmdline verification) is the safe path — the row will be
-        marked failed and the task's failure will be re-evaluated on the
+        marked orphaned and the task's failure will be re-evaluated on the
         next supervisor tick.  The ``DIAGNOSER_REAP_GRACE_SECONDS`` constant
         governs the SIGTERM grace window (same as the supervisor-tick reaper,
         PR #3378 lineage).
+
+        **Status note (#3383).** Orphans are written as
+        ``status='orphaned'``, NOT ``'failed'``. The diagnoser circuit
+        breaker (:meth:`_check_diagnoser_circuit_breaker`) excludes orphans
+        from its 24h fallback-rate calculation because they are
+        infrastructure artifacts — rows that were never executed by the
+        diagnoser. Counting them as diagnoser failures structurally
+        disabled the diagnoser on 2026-04-25 (7 orphans → 100% fallback
+        rate → breaker tripped → real failure #3380's diagnoser spawn was
+        gated).
 
         Returns the number of orphans reaped.  Always non-fatal — DB errors
         are logged and the daemon continues.  The supervisor tick's reaper is
@@ -20787,7 +20874,12 @@ class DispatcherDaemon:
                 )
 
             try:
-                self._mark_diagnosis_failed(
+                # Issue #3383: write ``status='orphaned'``, not
+                # ``'failed'``. The breaker excludes orphans from its
+                # 24h fallback-rate calculation (orphans are
+                # infrastructure artifacts, not diagnoser-decision
+                # failures).
+                self._mark_diagnosis_orphaned(
                     diagnosis_id,
                     reason="diagnoser_orphaned_by_daemon_restart",
                 )
