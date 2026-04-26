@@ -4633,6 +4633,249 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
+# Test T50: #3410 — startup transition_shim validation rejects missing shim.
+#
+# Scenario: AGENT_RUNNER_TRANSITION_SHIM points at a nonexistent path.
+# The entrypoint's shim-validation block (added in #3410) must:
+#   1. Detect the missing file before the python3 smoke invocation.
+#   2. Emit transition_shim_invalid to the log stream.
+#   3. Exit non-zero (die exits 2).
+#
+# Approach: extract the shim-validation block from the entrypoint using
+# awk (same pattern as T40/T41), inject stub log/die/AGENT_WORKSPACE
+# definitions so the test doesn't need the full entrypoint stack, and
+# source in a subshell.
+# ══════════════════════════════════════════════════════════════════════════
+
+t50_workspace="$TEST_TMP/t50-workspace"
+mkdir -p "$t50_workspace"
+
+# Extract the shim-validation block. The block starts at the comment
+# "# ── Startup validation: TRANSITION_SHIM (#3410)" and ends just
+# before "transition_for()". We capture everything between those markers.
+t50_block="$TEST_TMP/t50-shim-validation.sh"
+awk '
+    /^# ── Startup validation: TRANSITION_SHIM/ { in_block=1 }
+    in_block && /^transition_for\(\)/ { exit }
+    in_block { print }
+' "$ENTRYPOINT" > "$t50_block"
+
+# Sanity: the block was extracted.
+if grep -q "transition_shim_invalid" "$t50_block"; then
+    pass "#3410 T50 setup — extracted shim validation block from entrypoint"
+else
+    fail "#3410 T50 setup — extracted shim validation block from entrypoint" \
+         "block head: $(head -c 400 "$t50_block")"
+fi
+
+# Drive the validation block with a nonexistent shim path. Stub log to
+# capture events to a file; stub die to exit 2 (matching die() contract).
+set +e
+t50_out=$(bash -c '
+    set -uo pipefail
+    AGENT_ID="50505050-dead-beef-cafe-000000000050"
+    AGENT_WORKSPACE="'"$t50_workspace"'"
+    TRANSITION_SHIM="/nonexistent/path/shim.py"
+    exec 3>&1
+    log() {
+        _ev="$1"; shift
+        printf "LOG %s" "$_ev"
+        for kv in "$@"; do printf " %s" "$kv"; done
+        printf "\n"
+    }
+    die() {
+        printf "DIE %s\n" "$1"
+        exit 2
+    }
+    # shellcheck disable=SC1090
+    . "'"$t50_block"'"
+' 2>&1)
+t50_rc=$?
+set -e
+
+# 1. Must exit non-zero.
+if [[ "$t50_rc" -ne 0 ]]; then
+    pass "#3410 T50 — shim validation exits non-zero for missing shim"
+else
+    fail "#3410 T50 — shim validation exits non-zero for missing shim" \
+         "rc=$t50_rc, output: $t50_out"
+fi
+
+# 2. Log must contain transition_shim_invalid.
+if printf '%s' "$t50_out" | grep -q "transition_shim_invalid"; then
+    pass "#3410 T50 — log contains transition_shim_invalid for missing shim"
+else
+    fail "#3410 T50 — log contains transition_shim_invalid for missing shim" \
+         "output: $t50_out"
+fi
+
+# 3. Log contains the offending path.
+if printf '%s' "$t50_out" | grep -q "nonexistent"; then
+    pass "#3410 T50 — log contains offending path"
+else
+    fail "#3410 T50 — log contains offending path" \
+         "output: $t50_out"
+fi
+
+# ── Sub-assertion: non-readable file also fails ────────────────────────
+# Create an empty file (non-empty check will fire because it is empty).
+t50_empty_shim="$t50_workspace/empty-shim.py"
+printf '' > "$t50_empty_shim"
+
+set +e
+t50b_out=$(bash -c '
+    set -uo pipefail
+    AGENT_ID="50505050-dead-beef-cafe-000000000050"
+    AGENT_WORKSPACE="'"$t50_workspace"'"
+    TRANSITION_SHIM="'"$t50_empty_shim"'"
+    exec 3>&1
+    log() {
+        _ev="$1"; shift
+        printf "LOG %s" "$_ev"
+        for kv in "$@"; do printf " %s" "$kv"; done
+        printf "\n"
+    }
+    die() {
+        printf "DIE %s\n" "$1"
+        exit 2
+    }
+    # shellcheck disable=SC1090
+    . "'"$t50_block"'"
+' 2>&1)
+t50b_rc=$?
+set -e
+
+if [[ "$t50b_rc" -ne 0 ]] && printf '%s' "$t50b_out" | grep -q "transition_shim_invalid"; then
+    pass "#3410 T50 — shim validation rejects empty (non-readable) shim file"
+else
+    fail "#3410 T50 — shim validation rejects empty (non-readable) shim file" \
+         "rc=$t50b_rc, output: $t50b_out"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T51: #3410 — per-step logs emitted on fix_conflict happy path.
+#
+# Scenario: the fix_conflict dispatch arm runs with a resolved verdict.
+# The four new log events added in #3410 must appear in the captured
+# output:
+#   fix_conflict_handler_done
+#   fix_conflict_persist_done
+#   fix_conflict_transition_shim_done
+#   fix_conflict_dispatched_action
+#
+# Approach: extract the log() function from the entrypoint, then define
+# stubs for handle_fix_conflict / persist_phase_output / transition_for /
+# advance_phase / jq so the dispatch block can run without the full
+# entrypoint stack. Extract the fix_conflict) arm using awk (strip the
+# outer case/esac so the block is runnable standalone).
+# ══════════════════════════════════════════════════════════════════════════
+
+t51_workspace="$TEST_TMP/t51-workspace"
+mkdir -p "$t51_workspace"
+
+# Extract the log() function.
+t51_funcs="$TEST_TMP/t51-funcs.sh"
+printf 'exec 3>&1\n' > "$t51_funcs"
+awk -v FN="^log\\(\\)" '
+    $0 ~ FN { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+' "$ENTRYPOINT" >> "$t51_funcs"
+
+# Sanity check.
+if grep -q "^log()" "$t51_funcs"; then
+    pass "#3410 T51 setup — extracted log() from entrypoint"
+else
+    fail "#3410 T51 setup — extracted log() from entrypoint" \
+         "funcs head: $(head -c 200 "$t51_funcs")"
+fi
+
+# Extract the fix_conflict) dispatch arm. Match only the standalone arm
+# (not the compact one-liner in phase_to_skill) using the end-of-line
+# anchor. Strip the trailing outer ";;" arm terminator so the body can be
+# sourced inside a case statement wrapper below.
+t51_dispatch_body="$TEST_TMP/t51-dispatch-body.sh"
+awk '
+    /^        fix_conflict\)$/ { in_arm=1; next }
+    in_arm && /^        fix_ci\)/ { exit }
+    in_arm { print }
+' "$ENTRYPOINT" | head -n -1 > "$t51_dispatch_body"
+
+# Sanity: dispatch block was extracted.
+if grep -q "fix_conflict_handler_done" "$t51_dispatch_body"; then
+    pass "#3410 T51 setup — extracted fix_conflict dispatch arm with new log events"
+else
+    fail "#3410 T51 setup — extracted fix_conflict dispatch arm with new log events" \
+         "dispatch head: $(head -c 400 "$t51_dispatch_body")"
+fi
+
+# Drive the dispatch block by sourcing it inside a case statement wrapper
+# so the inner case "$_action" in ... esac is well-formed shell syntax.
+set +e
+t51_out=$(bash -c '
+    set -euo pipefail
+    AGENT_ID="51515151-dead-beef-cafe-000000000051"
+    AGENT_WORKSPACE="'"$t51_workspace"'"
+    # shellcheck disable=SC1090
+    . "'"$t51_funcs"'"
+
+    # Stub: handle_fix_conflict returns a resolved envelope.
+    handle_fix_conflict() {
+        printf '"'"'{"verdict":"resolved","resolution_notes":"ok","resolved_files":[]}'"'"'
+    }
+
+    # Stub: persist_phase_output — no-op.
+    persist_phase_output() { return 0; }
+
+    # Stub: transition_for returns tab-separated advance\tpush_and_pr\t\t
+    transition_for() {
+        printf "advance\tpush_and_pr\t\t"
+    }
+
+    # Stub: advance_phase — no-op.
+    advance_phase() { return 0; }
+
+    # Stub: jq — minimal verdict extractor.
+    jq() {
+        if printf "%s" "$*" | grep -q "verdict"; then
+            printf "resolved"
+        else
+            printf ""
+        fi
+    }
+
+    # Wrap the extracted body in a case to satisfy the inner case syntax.
+    _phase="fix_conflict"
+    case "$_phase" in
+        fix_conflict)
+            # shellcheck disable=SC1090
+            . "'"$t51_dispatch_body"'"
+            ;;
+    esac
+' 2>&1)
+t51_rc=$?
+set -e
+
+# Must exit 0 (advance path, no failure).
+if [[ "$t51_rc" -eq 0 ]]; then
+    pass "#3410 T51 — fix_conflict dispatch exits 0 on advance"
+else
+    fail "#3410 T51 — fix_conflict dispatch exits 0 on advance" \
+         "rc=$t51_rc, output: $t51_out"
+fi
+
+# All four new log events must appear.
+for _ev in fix_conflict_handler_done fix_conflict_persist_done \
+           fix_conflict_transition_shim_done fix_conflict_dispatched_action; do
+    if printf '%s' "$t51_out" | grep -q "$_ev"; then
+        pass "#3410 T51 — log event emitted: $_ev"
+    else
+        fail "#3410 T51 — log event emitted: $_ev" \
+             "output: $t51_out"
+    fi
+done
+
+# ══════════════════════════════════════════════════════════════════════════
 # DEPLOY_WORKFLOWS default — static regression guard (#3185)
 # ══════════════════════════════════════════════════════════════════════════
 
