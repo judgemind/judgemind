@@ -6346,33 +6346,50 @@ class DispatcherDaemon:
         return primary_path
 
     def _read_phase_output(self, worktree: Path, phase: str) -> dict[str, Any] | None:
-        """Read the phase output JSON, preferring the IO root over the worktree.
+        """Read the phase output JSON, preferring the most recently written file.
 
         For post-merge phases (``verify``, ``retro``) in Fargate mode the
         subprocess writes output relative to ``baseline_repo_root`` (its cwd).
-        Prefer that path; fall back to the worktree-relative path so ECS-mode
-        agents (where both paths coincide) and pre-merge phases continue to
-        work unchanged.
+        Both paths are considered; the newer file (by mtime) is tried first so
+        a freshly-written worktree output wins over a stale baseline-root file
+        from a previous run of the same agent slot (#3480 AC #1).
 
-        Returns the parsed JSON, or ``None`` if the file is missing /
+        If the newer file contains corrupt JSON it falls through to the older
+        candidate rather than returning ``None`` immediately, recovering from
+        partial writes (#3480 AC #2).
+
+        Returns the parsed JSON, or ``None`` if all candidates are missing or
         malformed (the caller treats that as a phase failure).
         """
         io_root = self._phase_io_root(worktree, phase)
         primary_path = io_root / "tmp" / "dispatcher-output" / f"{phase}.json"
-        if primary_path.exists():
-            try:
-                return json.loads(primary_path.read_text())
-            except json.JSONDecodeError:
-                return None
-
-        # Fall back to worktree path (covers ECS mode and local dev where the
-        # io_root IS the worktree, and therefore primary_path == fallback_path).
         fallback_path = worktree / "tmp" / "dispatcher-output" / f"{phase}.json"
-        if fallback_path.exists() and fallback_path != primary_path:
+
+        # Build a deduplicated candidate list (when io_root == worktree the two
+        # paths are identical; include only one copy so we don't double-log).
+        seen: set[Path] = set()
+        candidates: list[Path] = []
+        for p in (primary_path, fallback_path):
+            if p.exists() and p not in seen:
+                seen.add(p)
+                candidates.append(p)
+
+        # Sort newest-first so a freshly-written worktree output wins over a
+        # stale baseline-root file left over from a previous agent run.
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        for candidate in candidates:
             try:
-                return json.loads(fallback_path.read_text())
+                return json.loads(candidate.read_text())
             except json.JSONDecodeError:
-                return None
+                raw = candidate.read_bytes()
+                extra: dict[str, Any] = {
+                    "event": "phase_output_corrupt",
+                    "path": str(candidate),
+                    "phase": phase,
+                    "head_bytes": raw[:256].decode("utf-8", errors="replace"),
+                }
+                self._log.warning("daemon.phase_output_corrupt", extra=extra)
 
         return None
 
