@@ -126,6 +126,60 @@ agent_is_finished() {
     fi
 }
 
+# --- Mirror review-log.jsonl to S3 before teardown (best-effort) ---
+# Derives agent_id from the worktree basename and issue_number from the
+# first line of {worktree}/tmp/ralph/task.md, then calls telemetry_upload.py.
+# Non-zero exit from the upload is silently ignored — telemetry must never
+# abort a cleanup.
+_mirror_review_log_best_effort() {
+    local worktree_path="$1"
+    local repo_root="$2"
+
+    local review_log="$worktree_path/tmp/ralph/review-log.jsonl"
+
+    # Skip if log does not exist or is empty
+    if [[ ! -s "$review_log" ]]; then
+        return 0
+    fi
+
+    # Derive agent_id from worktree basename (expected: agent-<hex>)
+    local dir_base agent_id
+    dir_base="$(basename "$worktree_path")"
+    agent_id="$dir_base"
+
+    # Derive issue_number from first line of task.md (format: "# Issue #<N> — ...")
+    local task_md="$worktree_path/tmp/ralph/task.md"
+    local issue_number=""
+    if [[ -f "$task_md" ]]; then
+        local first_line
+        first_line="$(head -n 1 "$task_md" 2>/dev/null)"
+        # Extract the number after "# Issue #"
+        if [[ "$first_line" =~ ^#[[:space:]]+Issue[[:space:]]+#([0-9]+) ]]; then
+            issue_number="${BASH_REMATCH[1]}"
+        fi
+    fi
+
+    # Build S3 key: ralph-reviews/<YYYY-MM-DD>/<agent_id>-<issue>.jsonl
+    local today s3_key
+    today="$(date -u +%Y-%m-%d 2>/dev/null)"
+    if [[ -z "$issue_number" ]]; then
+        s3_key="ralph-reviews/${today}/${agent_id}.jsonl"
+    else
+        s3_key="ralph-reviews/${today}/${agent_id}-${issue_number}.jsonl"
+    fi
+
+    local upload_script="$repo_root/scripts/telemetry_upload.py"
+    if [[ ! -f "$upload_script" ]]; then
+        echo "telemetry_upload.py not found — skipping review-log S3 mirror" >&2
+        return 0
+    fi
+
+    echo "Mirroring review log to s3://.../${s3_key}" >&2
+    # 10-second timeout; ignore non-zero exit — telemetry must never abort cleanup
+    timeout 10 python3 "$upload_script" "$review_log" "$s3_key" 2>&1 | sed 's/^/[telemetry] /' >&2 || true
+    return 0
+}
+
 # --- Remove the worktree ---
 remove_worktree() {
     local repo_root="$1"
@@ -230,6 +284,10 @@ main() {
         echo "ERROR: agent appears to still be running: $reason" >&2
         return 1
     fi
+
+    # Best-effort: mirror review-log.jsonl to S3 before tearing down the worktree.
+    # The upload runs with a 10s timeout and never aborts cleanup on failure.
+    _mirror_review_log_best_effort "$worktree_path" "$repo_root"
 
     # Remove the worktree (this also cd's to repo root)
     if remove_worktree "$repo_root" "$worktree_path"; then

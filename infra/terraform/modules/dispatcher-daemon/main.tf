@@ -469,6 +469,34 @@ resource "aws_iam_role_policy" "task_s3_archive_list" {
   })
 }
 
+# Grants `s3:PutObject` on the ralph-reviews/ prefix so the daemon can
+# mirror review-log.jsonl telemetry after each ralph SHIP (via log_summary's
+# S3 upload path) and before each worktree teardown (via cleanup_worktree.sh's
+# best-effort fallback).
+#
+# Scoped to `<bucket>/ralph-reviews/*` — no broader write access is granted.
+# Disabled (count=0) when `document_archive_bucket_arn` is empty — safe for
+# staging / throwaway stacks that don't provision the archive bucket.
+
+resource "aws_iam_role_policy" "task_ralph_review_telemetry" {
+  count = var.document_archive_bucket_arn != "" ? 1 : 0
+
+  name = "${local.service_name}-task-ralph-review-telemetry"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowPutRalphReviewTelemetry"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${var.document_archive_bucket_arn}/ralph-reviews/*"
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "task_ecs_exec_ssm" {
   name = "${local.service_name}-task-ecs-exec-ssm"
   role = aws_iam_role.task.id

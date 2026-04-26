@@ -450,6 +450,39 @@ resource "aws_iam_role_policy" "task_spotcheck_oneshot" {
   })
 }
 
+# Grants `s3:PutObject` on the ralph-reviews/ prefix so the agent-runner
+# container can mirror review-log.jsonl telemetry after each ralph SHIP (via
+# log_summary's S3 upload path) and before each worktree teardown (via the
+# cleanup_worktree.sh best-effort fallback).
+#
+# Reuses `spotcheck_document_archive_bucket_arn` — the same
+# `judgemind-document-archive-<env>` bucket that already holds spotcheck and
+# data-quality artifacts.  Forward-compatible with Stage 2 per-agent ECS
+# migration (#3086/#3091) where `log_summary` runs inside the agent-runner
+# container.
+#
+# Disabled (count=0) when `spotcheck_document_archive_bucket_arn` is empty —
+# safe for stacks that do not provision the document-archive bucket.
+
+resource "aws_iam_role_policy" "task_ralph_review_telemetry" {
+  count = var.spotcheck_document_archive_bucket_arn != "" ? 1 : 0
+
+  name = "${local.task_family}-task-ralph-review-telemetry"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowPutRalphReviewTelemetry"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${var.spotcheck_document_archive_bucket_arn}/ralph-reviews/*"
+      },
+    ]
+  })
+}
+
 # ─── ECS Task Definition ───────────────────────────────────────────────────
 #
 # CPU / memory: 4096 / 16384 to match the subprocess-daemon envelope —

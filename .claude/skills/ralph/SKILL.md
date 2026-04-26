@@ -495,21 +495,42 @@ The reviewers have approved the implementation. Before returning, log a summary 
 
 ### 3a — Log review summary
 
-Write the following to `{worktree}/tmp/ralph/log_summary.py` (substituting actual paths):
+Write the following to `{worktree}/tmp/ralph/log_summary.py` (substituting actual paths for `{worktree}` and `{repo_root}`):
 
 ```python
 import sys
-sys.path.insert(0, "<repo_root>/scripts")
-from ralph_review_log import log_summary
+import re
 from pathlib import Path
 
+sys.path.insert(0, "<repo_root>/scripts")
+from ralph_review_log import log_summary
+
 state_dir = Path("<worktree>/tmp/ralph")
+worktree = Path("<worktree>")
 iteration = int(state_dir.joinpath("iteration.txt").read_text(encoding="utf-8").strip())
+
+# Derive agent_id from the worktree basename (e.g. "agent-ab4722a2").
+_wt_name = worktree.name
+agent_id = _wt_name if re.match(r"^agent-[0-9a-f]+$", _wt_name) else None
+
+# Derive issue_number from the first line of task.md (format: "# Issue #<N> — <title>").
+issue_number = None
+_task_md = state_dir / "task.md"
+if _task_md.exists():
+    try:
+        _first = _task_md.read_text(encoding="utf-8").splitlines()[0]
+        _m = re.match(r"^#\s+Issue\s+#(\d+)", _first)
+        if _m:
+            issue_number = int(_m.group(1))
+    except (OSError, IndexError, ValueError):
+        pass
 
 log_summary(
     state_dir,
     total_iterations=iteration,
     final_verdict="SHIP",
+    agent_id=agent_id,
+    issue_number=issue_number,
 )
 ```
 

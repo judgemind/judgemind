@@ -85,6 +85,16 @@ Rules that apply to every script or service that writes or copies objects under 
 
 Helpers are in `packages/scraper-framework/src/framework/s3_integrity.py` — use `verify_key_matches_bytes` for a boolean check and `assert_key_matches_bytes` for a hard assertion (raises `S3MislabelError` on any mismatch or missing object).
 
+## Telemetry artifacts
+
+S3 paths for agent observability data, all under `s3://judgemind-document-archive-dev/`:
+
+- **`ralph-reviews/<YYYY-MM-DD>/<agent-id>-<issue>.jsonl`** — complete `review-log.jsonl` for one ralph run. One object per agent run. Written by `scripts/ralph_review_log.py::log_summary` (on SHIP) and `scripts/cleanup_worktree.sh` (best-effort fallback on teardown). Schema: JSONL with `type` field — `"review"` (one per iteration per reviewer), `"summary"` (one at loop end), `"dissent_override"` (optional).
+
+Upload helper: `scripts/telemetry_upload.py` — lazy-imports boto3, swallows all errors (network, credentials, missing boto3), returns `True`/`False`. Never raises. Import as a library (`from telemetry_upload import mirror_to_s3`) or invoke directly (`python3 scripts/telemetry_upload.py <local-path> <s3-key>`).
+
+IAM grant: `s3:PutObject` on `<document_archive_bucket>/ralph-reviews/*`, wired into both the `dispatcher-daemon` and `dispatcher-agent-runner` modules via `task_ralph_review_telemetry` policies.
+
 ## Performance awareness
 
 Every diff review must check for these common bottlenecks:

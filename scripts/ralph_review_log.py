@@ -81,11 +81,20 @@ def log_summary(
     total_iterations: int,
     final_verdict: str,
     reviews: list[dict[str, Any]] | None = None,
+    agent_id: str | None = None,
+    issue_number: int | None = None,
 ) -> None:
     """Log a summary record at the end of the ralph loop.
 
     Computes agreement rate and catch patterns from the review log
     if individual reviews are provided.
+
+    After writing the summary record, if both ``agent_id`` and
+    ``issue_number`` are provided, mirrors the complete review-log.jsonl
+    to S3 under ``ralph-reviews/<YYYY-MM-DD>/<agent_id>-<issue_number>.jsonl``.
+    The upload is best-effort: S3 failures are logged as warnings and never
+    abort the function.  ``telemetry_upload`` is lazy-imported so this module
+    remains stdlib-only when the upload path is not exercised.
 
     Args:
         state_dir: Path to {worktree}/tmp/ralph/.
@@ -93,6 +102,10 @@ def log_summary(
         final_verdict: Final loop outcome — "SHIP" or "MAX_ITERATIONS".
         reviews: Optional list of review records to compute agreement stats.
             If not provided, reads them from the log file.
+        agent_id: Agent identifier (e.g. ``agent-ab4722a2``).  When provided
+            together with ``issue_number``, triggers the S3 upload.
+        issue_number: GitHub issue number the ralph run addressed.  When
+            provided together with ``agent_id``, triggers the S3 upload.
     """
     if reviews is None:
         reviews = read_reviews(state_dir)
@@ -151,6 +164,22 @@ def log_summary(
         record["adversarial_only_catches"] = adversarial_only_catches
 
     _append_record(state_dir, record)
+
+    # Mirror the complete review-log.jsonl to S3 as a telemetry artifact.
+    # Best-effort: S3 failure never aborts the function.
+    # Lazy-import telemetry_upload so this module stays stdlib-only when
+    # the upload path is not exercised (e.g. detect_persistent_dissent reads).
+    if agent_id is not None and issue_number is not None:
+        try:
+            import telemetry_upload as _tu  # noqa: PLC0415
+
+            log_file = _log_path(state_dir)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            s3_key = f"ralph-reviews/{today}/{agent_id}-{issue_number}.jsonl"
+            _tu.mirror_to_s3(Path(log_file), s3_key)
+        except Exception:  # noqa: BLE001
+            # Swallow any unexpected error so telemetry never blocks the loop.
+            pass
 
 
 def read_reviews(state_dir: str | Path) -> list[dict[str, Any]]:
