@@ -247,13 +247,13 @@ scripts/check-nullable-column-reads.sh --migration packages/api/migrations/49_fo
        ...
    ```
 
-2. **File-level acknowledgment** — if null values are handled via logic the linter cannot trace (e.g. a downstream consumer filters them), add a comment at the top of the file:
+2. **Per-column acknowledgment** — if null values are handled via logic the linter cannot trace (e.g. a downstream consumer filters them), add a comment at the top of the file with the column name:
 
    ```python
-   # nullable-ok: hearing_date is filtered upstream by the ingest pipeline
+   # nullable-ok: hearing_date: filtered upstream by the ingest pipeline
    ```
 
-   The comment suppresses the violation for that entire file. Use sparingly — prefer explicit guards at the read site.
+   The column name is required; the annotation suppresses violations only for that column in the file. Use sparingly — prefer explicit guards at the read site.
 
 ### Bash patterns
 
