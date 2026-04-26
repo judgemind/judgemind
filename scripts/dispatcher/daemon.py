@@ -20289,6 +20289,13 @@ class DispatcherDaemon:
         )
         self._gh_issue_add_labels(issue_number, ["status/blocked"])
         self._gh_issue_remove_labels(issue_number, ["agent/ready"])
+        # ROUTING (#3062): close-out of the diagnoser pass — the upstream
+        # failure row that triggered this pass already exists. Intentionally
+        # NOT routed through ``_handle_agent_failure`` (would cause an
+        # infinite diagnoser loop on re-pick). See the umbrella ROUTING
+        # comment on ``_consume_action_escalate`` (#3062) — this is the 5th
+        # diagnoser-consumer action method, just outside the 250-line check
+        # window from that umbrella.
         self._mark_agent_terminal(
             agent_id,
             status="failed",
