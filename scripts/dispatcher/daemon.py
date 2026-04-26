@@ -1332,9 +1332,35 @@ FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
 #:
 #: Both phases are already in :data:`TIER_3_CATEGORIES` so the
 #: candidate-finder treats them as first-occurrence diagnose-immediately.
+#:
+#: Issue #3455 — the entrypoint's ``route_to_diagnoser`` arm now emits
+#: descriptive terminal phases (``ralph_ac_infeasible``,
+#: ``summary_ac_infeasible``, ``fix_ci_blocked``,
+#: ``verify_failed_post_merge``) instead of bouncing through
+#: ``agent_runner_route_stub``. Mapping each phase to its
+#: ``FAILURE_CATEGORY_*`` constant lets the reaper still spawn the
+#: diagnoser via the same bypassed-terminal sweep. ``plan_blocked``
+#: is intentionally NOT here — that hint comes through
+#: ``advance_with_status`` (terminal status), not ``route_to_diagnoser``,
+#: so the daemon has its own explicit handling for it.
+#:
+#: ``ralph_not_ship`` is intentionally NOT in this map. Issue #3455
+#: handles that hint locally in the agent-runner entrypoint
+#: (``handle_ralph_not_ship_local``) — ralph already wrote a structured
+#: ``block_reason`` and the diagnoser doesn't add value there. The
+#: terminal phase still reads ``ralph_not_ship`` for operator visibility,
+#: but no diagnoser is invoked. Same shape as ``conflict_unresolvable``
+#: legacy treatment minus the routing.
 BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "conflict_unresolvable": FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
     "agent_runner_route_stub": FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
+    # #3455 — descriptive terminals from agent-runner-entrypoint.sh's
+    # ``route_to_diagnoser`` arm. Each maps to the corresponding
+    # FAILURE_CATEGORY so the diagnoser sweep picks them up.
+    "ralph_ac_infeasible": FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+    "summary_ac_infeasible": FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
+    "fix_ci_blocked": FAILURE_CATEGORY_FIX_CI_BLOCKED,
+    "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's
@@ -1724,7 +1750,7 @@ DIAGNOSER_MODEL = "opus"
 #: these fit, and the unrecognized-actions table is the review path.
 #:
 #: The first five (``retry`` through ``close``) are the original set
-#: from issue #2795. The last three are added in #3032:
+#: from issue #2795. The next three are added in #3032:
 #:   - ``block_and_comment`` — apply ``status/blocked`` + remove
 #:     ``agent/ready`` + post comment. For operator-action blockers
 #:     (PAT scope, missing secret, infra gap) that do not warrant a
@@ -1735,6 +1761,16 @@ DIAGNOSER_MODEL = "opus"
 #:   - ``block_on_existing_task`` — append ``Blocked by #<N>`` to the
 #:     current issue body when the diagnoser identifies an already-open
 #:     tracking issue for the root cause. Avoids duplicate tickets.
+#:
+#: The final ``terminal`` action (issue #3455) is the post-#3366 shape:
+#: the SKILL itself performs whatever gh side-effects are needed (close,
+#: comment, label, file prerequisite) and emits ``action="terminal"``
+#: with descriptive ``action_taken`` / ``summary`` / ``evidence`` fields.
+#: The daemon's consumer just records the diagnosis and marks the agent
+#: terminal — no per-action gh writes from Python, no per-action phase
+#: name. Collapses the diagnoser-action executor layer (#3455 Path A);
+#: the legacy actions stay for backward compat but ``terminal`` is the
+#: preferred shape going forward.
 DIAGNOSER_ACTIONS: frozenset[str] = frozenset(
     {
         "retry",
@@ -1745,6 +1781,7 @@ DIAGNOSER_ACTIONS: frozenset[str] = frozenset(
         "block_and_comment",
         "file_prerequisite_task",
         "block_on_existing_task",
+        "terminal",
     }
 )
 
@@ -19339,6 +19376,9 @@ class DispatcherDaemon:
             ``body``.
           - ``block_on_existing_task`` — positive integer
             ``blocker_issue_number``.
+          - ``terminal`` (#3455) — non-empty strings ``action_taken``
+            and ``summary``. The SKILL has already performed any gh
+            side-effects; these fields are descriptive only.
         All other fields are advisory.
 
         Returns None when the action is missing, not in the known set,
@@ -19372,6 +19412,13 @@ class DispatcherDaemon:
                 or isinstance(blocker, bool)
                 or blocker <= 0
             ):
+                return None
+        if action == "terminal":
+            action_taken = recommendation.get("action_taken")
+            summary = recommendation.get("summary")
+            if not isinstance(action_taken, str) or not action_taken.strip():
+                return None
+            if not isinstance(summary, str) or not summary.strip():
                 return None
         return action
 
@@ -19826,6 +19873,16 @@ class DispatcherDaemon:
                 else 0,
                 reasoning=reasoning,
             )
+        elif action == "terminal":
+            # Issue #3455 Path A — the SKILL handled the gh actions
+            # itself. Daemon just records the diagnosis and marks the
+            # agent terminal with a single phase name.
+            self._consume_action_terminal(
+                agent_id=agent_id,
+                issue_number=issue_number,
+                action_taken=str(recommendation.get("action_taken") or ""),
+                summary=str(recommendation.get("summary") or ""),
+            )
 
         # Emit instrumentation and mark the diagnosis completed AFTER the
         # action handler runs (issue #3422 — the SKILL must NOT set
@@ -19997,6 +20054,52 @@ class DispatcherDaemon:
             )
         self._mark_agent_terminal(
             agent_id, status="failed", phase="diagnoser_escalate", exit_code=None
+        )
+
+    def _consume_action_terminal(
+        self,
+        *,
+        agent_id: str,
+        issue_number: int | None,
+        action_taken: str,
+        summary: str,
+    ) -> None:
+        """Record a SKILL-executed diagnosis as a clean terminal.
+
+        Issue #3455 Path A: the empowered diagnoser SKILL has the same
+        peer-tier authority as a /task agent (Bash, gh CLI, Edit, Write,
+        Agent). When the SKILL handles the gh actions itself — closing
+        the issue, adding labels, posting the comment, filing the
+        prerequisite task — it emits ``action="terminal"`` so the daemon
+        does NO additional gh writes here. We just mark the agent
+        terminal with a single phase name (``diagnoser_terminal``) and
+        let the directive consumer free the slot.
+
+        This collapses the previous executor layer (one ``_consume_action_*``
+        per action × one ``diagnoser_<action>`` phase name) into a single
+        consumer + phase pair. The per-action variants
+        (``_consume_action_close`` etc.) remain for backward compat —
+        older skills that emit ``action="close"`` keep working — but new
+        skills are expected to emit ``action="terminal"`` and do their
+        own gh writes inline.
+
+        ``action_taken`` is descriptive only (e.g. ``"close"``,
+        ``"escalate"``, ``"file_prerequisite_task"``). The daemon does
+        not dispatch on it; it logs it for operator visibility / audit.
+        """
+        self._log.info(
+            "daemon.diagnoser_terminal_recorded",
+            extra={
+                "event": "diagnoser_terminal_recorded",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "action_taken": action_taken,
+                "summary": summary[:240] if isinstance(summary, str) else "",
+            },
+        )
+        self._mark_agent_terminal(
+            agent_id, status="failed", phase="diagnoser_terminal", exit_code=None
         )
 
     def _consume_action_close(

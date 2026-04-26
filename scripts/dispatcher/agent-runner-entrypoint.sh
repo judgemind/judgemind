@@ -3637,6 +3637,109 @@ agent_runner_reaped_failure() {
     log "phase_advanced" "next_phase=$_term_phase" "status=failed"
 }
 
+handle_ralph_not_ship_local() {
+    # Issue #3455 Path B — handle ``ralph_not_ship`` locally instead of
+    # routing to the diagnoser. Pre-#3455 this hint hit the
+    # ``advance_phase agent_runner_route_stub`` fall-through (line ~4433)
+    # because the daemon-side ralph_not_ship handler was never wired —
+    # 14 agents died at ``diagnoser_route_stub`` for absent-handler
+    # reasons. The empowered diagnoser doesn't add value here: ralph
+    # already wrote a ``block_reason`` explaining why it couldn't ship.
+    # We just relay that reason to the issue as a comment, add
+    # ``status/blocked``, and emit a clean terminal.
+    #
+    # $1 = the ralph phase output JSON (so we can extract block_reason).
+    _ralph_output="${1:-}"
+    _block_reason=$(printf '%s' "$_ralph_output" | jq -r '.block_reason // ""' 2>/dev/null)
+    _verdict=$(printf '%s' "$_ralph_output" | jq -r '.verdict // ""' 2>/dev/null)
+    _iterations_used=$(printf '%s' "$_ralph_output" | jq -r '.iterations_used // ""' 2>/dev/null)
+    log "ralph_not_ship_local_handler" \
+        "issue_number=$ISSUE_NUMBER" \
+        "verdict=$_verdict" \
+        "iterations_used=$_iterations_used" \
+        "block_reason_preview=$(printf '%s' "$_block_reason" | head -c 120)"
+
+    if [[ -n "$ISSUE_NUMBER" ]]; then
+        # Compose the comment body in a temp file to avoid heredoc /
+        # quoted-string preflight issues. ``$AGENT_WORKSPACE`` is the
+        # entrypoint's writable scratch dir.
+        _comment_file="$AGENT_WORKSPACE/ralph-not-ship-comment.md"
+        {
+            printf '## Ralph determined it cannot ship\n\n'
+            if [[ -n "$_verdict" && "$_verdict" != "null" ]]; then
+                printf 'Verdict: `%s`\n\n' "$_verdict"
+            fi
+            if [[ -n "$_iterations_used" && "$_iterations_used" != "null" && "$_iterations_used" != "" ]]; then
+                printf 'Iterations used: %s\n\n' "$_iterations_used"
+            fi
+            if [[ -n "$_block_reason" && "$_block_reason" != "null" ]]; then
+                printf '**Block reason from ralph:**\n\n'
+                printf '> %s\n\n' "$_block_reason"
+            else
+                printf 'Ralph did not provide a structured block_reason.\n\n'
+            fi
+            printf 'Adding `status/blocked` so the issue stays off the queue '
+            printf 'until a human reviews the block reason and decides whether '
+            printf 'to clarify the AC, file a prerequisite, or close as NOOP.\n'
+            printf '\n'
+            printf '_Posted by the agent-runner ralph_not_ship local handler '
+            printf '(#3455). The diagnoser was not invoked — ralph already '
+            printf 'identified the block; relaying its reasoning verbatim is '
+            printf 'cheaper and more honest than another LLM pass over the '
+            printf 'same evidence._\n'
+        } > "$_comment_file" 2> "$AGENT_WORKSPACE/ralph-not-ship-comment.stderr.log"
+
+        set +e
+        gh issue comment "$ISSUE_NUMBER" \
+            --repo judgemind/judgemind \
+            --body-file "$_comment_file" \
+            > "$AGENT_WORKSPACE/ralph-not-ship-comment.stdout.log" \
+            2>> "$AGENT_WORKSPACE/ralph-not-ship-comment.stderr.log"
+        _comment_rc=$?
+        set -e
+        if [[ "$_comment_rc" -ne 0 ]]; then
+            log "ralph_not_ship_local_comment_failed" \
+                "issue_number=$ISSUE_NUMBER" "exit_code=$_comment_rc"
+        else
+            log "ralph_not_ship_local_comment_posted" \
+                "issue_number=$ISSUE_NUMBER"
+        fi
+
+        # Add status/blocked + remove agent/ready so the issue is fully
+        # off the queue until human review. Both ops are idempotent.
+        set +e
+        gh issue edit "$ISSUE_NUMBER" \
+            --repo judgemind/judgemind \
+            --add-label status/blocked \
+            --remove-label agent/ready \
+            > "$AGENT_WORKSPACE/ralph-not-ship-label.stdout.log" \
+            2> "$AGENT_WORKSPACE/ralph-not-ship-label.stderr.log"
+        _label_rc=$?
+        set -e
+        if [[ "$_label_rc" -ne 0 ]]; then
+            log "ralph_not_ship_local_label_failed" \
+                "issue_number=$ISSUE_NUMBER" "exit_code=$_label_rc"
+        else
+            log "ralph_not_ship_local_label_applied" \
+                "issue_number=$ISSUE_NUMBER"
+        fi
+    else
+        log "ralph_not_ship_local_no_issue_number" \
+            "skipping comment + label edits — no ISSUE_NUMBER set"
+    fi
+
+    # Always emit the descriptive terminal. The reason carries the
+    # block_reason so operators / failure dashboards see the cause.
+    _reason_for_terminal="$_block_reason"
+    if [[ -z "$_reason_for_terminal" ]]; then
+        _reason_for_terminal="ralph emitted non-SHIP verdict ${_verdict:-(missing)} without block_reason"
+    fi
+    agent_runner_reaped_failure \
+        "ralph_not_ship" \
+        "ralph_not_ship" \
+        "$_reason_for_terminal"
+}
+
 fetch_pr_status() {
     # $1 = pr_number. Writes the JSON response from
     # ``gh pr view <N> --json statusCheckRollup,mergeable,
@@ -4371,8 +4474,20 @@ while true; do
                         if [[ "$_ba" == "advance" ]]; then
                             advance_phase "$_bn"
                         else
+                            # Issue #3455 — replace the route_stub
+                            # fall-through with a descriptive terminal
+                            # so the daemon row reads
+                            # ``ralph_baseline_transition_unrecognized``
+                            # instead of ``agent_runner_route_stub``.
+                            # No diagnoser routing — this is a code
+                            # bug surface (transition_for returned a
+                            # shape we don't handle), not a semantic
+                            # failure the diagnoser can fix.
                             log "ralph_baseline_transition_unrecognized" "action=$_ba"
-                            advance_phase "agent_runner_route_stub" "crashed"
+                            agent_runner_reaped_failure \
+                                "ralph_baseline_transition_unrecognized" \
+                                "ralph_baseline_transition_unrecognized" \
+                                "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
                         fi
                         continue
                     fi
@@ -4416,26 +4531,79 @@ while true; do
                     advance_phase "$_next" "$_status"
                     ;;
                 route_to_diagnoser)
-                    # #3225: for the conflict_unresolvable hint, route
-                    # to the dedicated terminal so the diagnoser
-                    # supervisor sweep picks it up with the right
-                    # category. Other hints keep the Stage-1b stub
-                    # terminal (the daemon-side failure router owns
-                    # the real category mapping for those).
-                    if [[ "$_hint" == "conflict_unresolvable" ]]; then
-                        log "diagnoser_route_conflict_unresolvable" "hint=$_hint"
-                        agent_runner_reaped_failure \
-                            "conflict_unresolvable" \
-                            "conflict_unresolvable" \
-                            "fix_conflict skill returned unresolvable or budget exhausted"
-                    else
-                        log "diagnoser_route_stub" "hint=$_hint"
-                        advance_phase "agent_runner_route_stub" "failed"
-                    fi
+                    # Issue #3455 Path B — replace the
+                    # ``advance_phase agent_runner_route_stub`` fall-
+                    # through with descriptive terminals. Three cases:
+                    #
+                    #   1. ``conflict_unresolvable`` (#3225) — keep
+                    #      the dedicated terminal so the diagnoser
+                    #      supervisor sweep picks it up with the
+                    #      right category. Routed via
+                    #      ``BYPASSED_TERMINAL_PHASES_TO_ROUTE``.
+                    #   2. ``ralph_not_ship`` — handle locally.
+                    #      Ralph already wrote a structured
+                    #      ``block_reason``; we relay it as an issue
+                    #      comment + add ``status/blocked``, then
+                    #      emit the ``ralph_not_ship`` terminal
+                    #      (NOT routed to the diagnoser). 14 agents
+                    #      pre-#3455 died here at ``route_stub``.
+                    #   3. Other hints (e.g. ``ralph_ac_infeasible``,
+                    #      ``summary_ac_infeasible``,
+                    #      ``fix_ci_blocked``,
+                    #      ``verify_failed_post_merge``) — emit a
+                    #      descriptive terminal whose phase name
+                    #      matches the hint. The daemon's
+                    #      ``BYPASSED_TERMINAL_PHASES_TO_ROUTE``
+                    #      maps these to the corresponding
+                    #      ``FAILURE_CATEGORY_*`` so the diagnoser
+                    #      sweep picks them up.
+                    case "$_hint" in
+                        conflict_unresolvable)
+                            log "diagnoser_route_conflict_unresolvable" "hint=$_hint"
+                            agent_runner_reaped_failure \
+                                "conflict_unresolvable" \
+                                "conflict_unresolvable" \
+                                "fix_conflict skill returned unresolvable or budget exhausted"
+                            ;;
+                        ralph_not_ship)
+                            log "ralph_not_ship_local" "hint=$_hint"
+                            handle_ralph_not_ship_local "$_output"
+                            ;;
+                        ralph_ac_infeasible|summary_ac_infeasible|fix_ci_blocked|verify_failed_post_merge)
+                            # Descriptive terminal — the daemon's
+                            # BYPASSED_TERMINAL_PHASES_TO_ROUTE maps
+                            # these phase names to failure categories
+                            # so the diagnoser sweep picks them up.
+                            log "diagnoser_route_descriptive" "hint=$_hint" "phase=$_current"
+                            agent_runner_reaped_failure \
+                                "$_hint" \
+                                "$_hint" \
+                                "post-claude phase=$_current emitted route_to_diagnoser hint=$_hint"
+                            ;;
+                        *)
+                            # Truly novel hint we don't recognize.
+                            # Emit a descriptive terminal so the
+                            # operator sees what shape leaked through
+                            # without tripping the route_stub bug.
+                            log "diagnoser_route_unrecognized_hint" "hint=$_hint" "phase=$_current"
+                            agent_runner_reaped_failure \
+                                "diagnoser_route_unrecognized_hint" \
+                                "diagnoser_route_unrecognized_hint" \
+                                "post-claude phase=$_current emitted route_to_diagnoser hint=${_hint:-(empty)}"
+                            ;;
+                    esac
                     ;;
                 unrecognized|*)
-                    log "transition_unrecognized" "phase=$_current" "action=$_action"
-                    advance_phase "agent_runner_route_stub" "crashed"
+                    # Issue #3455 — descriptive terminal instead of
+                    # ``agent_runner_route_stub``. transition_for
+                    # returned a shape this dispatch arm doesn't
+                    # handle — that's a code-drift bug, not a semantic
+                    # failure, so no diagnoser routing.
+                    log "post_claude_transition_unrecognized" "phase=$_current" "action=$_action"
+                    agent_runner_reaped_failure \
+                        "post_claude_transition_unrecognized" \
+                        "post_claude_transition_unrecognized" \
+                        "phase=$_current returned action=$_action (not advance / advance_with_status / route_to_diagnoser)"
                     ;;
             esac
             ;;
@@ -4472,8 +4640,13 @@ while true; do
                     advance_phase "$_next" "$_status"
                     ;;
                 *)
+                    # Issue #3455 — descriptive terminal instead of
+                    # ``agent_runner_route_stub``.
                     log "push_and_pr_transition_unrecognized" "action=$_action"
-                    advance_phase "agent_runner_route_stub" "crashed"
+                    agent_runner_reaped_failure \
+                        "push_and_pr_transition_unrecognized" \
+                        "push_and_pr_transition_unrecognized" \
+                        "push_and_pr returned action=$_action (not advance / advance_with_status)"
                     ;;
             esac
             ;;
@@ -4645,8 +4818,18 @@ while true; do
             advance_phase "$_next"
             ;;
         *)
+            # Issue #3455 — descriptive terminal instead of
+            # ``agent_runner_route_stub``. The catch-all fires when
+            # the phase column reads a value the dispatch loop
+            # doesn't recognize — that's a code-drift bug (a new
+            # phase landed in dispatcher.agents without being
+            # wired here), not a semantic failure, so no diagnoser
+            # routing.
             log "phase_unknown" "phase=$_current"
-            advance_phase "agent_runner_route_stub" "crashed"
+            agent_runner_reaped_failure \
+                "phase_unknown" \
+                "phase_unknown" \
+                "dispatch loop saw unknown phase=$_current (not wired in agent-runner-entrypoint.sh)"
             ;;
     esac
 done

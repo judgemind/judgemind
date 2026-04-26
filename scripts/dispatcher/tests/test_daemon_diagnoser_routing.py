@@ -131,12 +131,15 @@ def _make_daemon(cursor: _FakeCursor | None = None) -> daemon.DispatcherDaemon:
 
 
 # --------------------------------------------------------------------------
-# AC#4 — DIAGNOSER_ACTIONS is now 8 (open menu, issue #3032)
+# AC#4 — DIAGNOSER_ACTIONS is now 9 (open menu, issue #3032 + #3455)
 # --------------------------------------------------------------------------
 
 
 class TestDiagnoserActionsExpanded:
-    def test_eight_known_actions(self) -> None:
+    def test_nine_known_actions(self) -> None:
+        # Issue #3455 added the ``terminal`` action (collapse the
+        # daemon-side executor layer; the SKILL performs gh side
+        # effects itself).
         assert DIAGNOSER_ACTIONS == frozenset(
             {
                 "retry",
@@ -147,6 +150,7 @@ class TestDiagnoserActionsExpanded:
                 "block_and_comment",
                 "file_prerequisite_task",
                 "block_on_existing_task",
+                "terminal",
             }
         )
 
@@ -154,10 +158,16 @@ class TestDiagnoserActionsExpanded:
         for action in ("retry", "retry_with_hint", "reissue", "escalate", "close"):
             assert action in DIAGNOSER_ACTIONS
 
-    def test_three_new_actions(self) -> None:
+    def test_three_3032_actions(self) -> None:
         assert "block_and_comment" in DIAGNOSER_ACTIONS
         assert "file_prerequisite_task" in DIAGNOSER_ACTIONS
         assert "block_on_existing_task" in DIAGNOSER_ACTIONS
+
+    def test_3455_terminal_action(self) -> None:
+        # Issue #3455 — collapsed executor layer. The SKILL performs
+        # gh side-effects itself; the daemon just records the diagnosis
+        # and marks the agent terminal.
+        assert "terminal" in DIAGNOSER_ACTIONS
 
 
 # --------------------------------------------------------------------------
@@ -1422,3 +1432,250 @@ class TestConsumeDiagnosisLifecycle:
         event_rec = apply_failed_events[0]
         assert getattr(event_rec, "diagnosis_id", None) == 56
         assert getattr(event_rec, "action", "sentinel") is None
+
+
+# --------------------------------------------------------------------------
+# Issue #3455 — `terminal` action: collapse the executor layer.
+# The SKILL performs gh side-effects itself; daemon just records the
+# diagnosis and marks the agent terminal with a single phase name.
+# --------------------------------------------------------------------------
+
+
+class TestTerminalActionValidation:
+    """Validation rules for the new ``action="terminal"`` shape (#3455)."""
+
+    def test_action_terminal_in_known_set(self) -> None:
+        assert "terminal" in DIAGNOSER_ACTIONS
+
+    def test_validate_accepts_terminal_with_required_fields(self) -> None:
+        d = _make_daemon()
+        rec = {
+            "action": "terminal",
+            "action_taken": "close",
+            "summary": "Closed as duplicate of #3000.",
+            "reasoning": "Stderr ends with 'duplicate'.",
+        }
+        assert d._validate_recommendation(rec) == "terminal"
+
+    def test_validate_rejects_terminal_missing_action_taken(self) -> None:
+        d = _make_daemon()
+        rec = {
+            "action": "terminal",
+            "summary": "Closed.",
+        }
+        assert d._validate_recommendation(rec) is None
+
+    def test_validate_rejects_terminal_missing_summary(self) -> None:
+        d = _make_daemon()
+        rec = {
+            "action": "terminal",
+            "action_taken": "close",
+        }
+        assert d._validate_recommendation(rec) is None
+
+    def test_validate_rejects_terminal_with_empty_action_taken(self) -> None:
+        d = _make_daemon()
+        rec = {
+            "action": "terminal",
+            "action_taken": "   ",
+            "summary": "Closed.",
+        }
+        assert d._validate_recommendation(rec) is None
+
+    def test_validate_rejects_terminal_with_empty_summary(self) -> None:
+        d = _make_daemon()
+        rec = {
+            "action": "terminal",
+            "action_taken": "close",
+            "summary": "",
+        }
+        assert d._validate_recommendation(rec) is None
+
+    def test_validate_rejects_terminal_with_non_string_action_taken(self) -> None:
+        d = _make_daemon()
+        rec = {
+            "action": "terminal",
+            "action_taken": 42,  # int, not str
+            "summary": "Closed.",
+        }
+        assert d._validate_recommendation(rec) is None
+
+
+class TestConsumeActionTerminal:
+    """Direct-handler tests for ``_consume_action_terminal`` (#3455).
+
+    The handler is intentionally minimal: no gh writes (the SKILL did
+    them inline), just mark the agent terminal at the single phase
+    ``diagnoser_terminal``.
+    """
+
+    def test_marks_agent_terminal_with_single_phase_name(self) -> None:
+        d = _make_daemon()
+        with patch.object(d, "_mark_agent_terminal") as mock_mark:
+            d._consume_action_terminal(
+                agent_id="agent-3455-1",
+                issue_number=99001,
+                action_taken="close",
+                summary="Closed as duplicate of #3000.",
+            )
+        mock_mark.assert_called_once()
+        kwargs = mock_mark.call_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["phase"] == "diagnoser_terminal"
+        assert kwargs["exit_code"] is None
+
+    def test_does_not_call_gh_helpers(self) -> None:
+        """The SKILL already did the gh writes; daemon must NOT duplicate them."""
+        d = _make_daemon()
+        with (
+            patch.object(d, "_gh_issue_comment") as mock_comment,
+            patch.object(d, "_gh_issue_close") as mock_close,
+            patch.object(d, "_gh_issue_add_labels") as mock_add,
+            patch.object(d, "_gh_issue_remove_labels") as mock_remove,
+            patch.object(d, "_gh_issue_create") as mock_create,
+            patch.object(d, "_mark_agent_terminal"),
+        ):
+            d._consume_action_terminal(
+                agent_id="agent-3455-1",
+                issue_number=99001,
+                action_taken="block_and_comment",
+                summary="Posted block reasoning + status/blocked.",
+            )
+        mock_comment.assert_not_called()
+        mock_close.assert_not_called()
+        mock_add.assert_not_called()
+        mock_remove.assert_not_called()
+        mock_create.assert_not_called()
+
+    def test_terminal_phase_is_same_for_all_action_taken_values(self) -> None:
+        """``diagnoser_terminal`` is the single phase name — no per-action
+        variants. This is the #3455 collapse invariant.
+        """
+        d = _make_daemon()
+        observed_phases: list[str] = []
+        for action_taken in (
+            "close",
+            "escalate",
+            "block_and_comment",
+            "file_prerequisite_task",
+            "block_on_existing_task",
+        ):
+            with patch.object(d, "_mark_agent_terminal") as mock_mark:
+                d._consume_action_terminal(
+                    agent_id=f"agent-{action_taken}",
+                    issue_number=99001,
+                    action_taken=action_taken,
+                    summary=f"Did {action_taken}.",
+                )
+            observed_phases.append(mock_mark.call_args.kwargs["phase"])
+
+        assert observed_phases == ["diagnoser_terminal"] * 5
+
+    def test_no_issue_number_still_marks_terminal(self) -> None:
+        d = _make_daemon()
+        with patch.object(d, "_mark_agent_terminal") as mock_mark:
+            d._consume_action_terminal(
+                agent_id="agent-3455-1",
+                issue_number=None,
+                action_taken="escalate",
+                summary="No issue number.",
+            )
+        mock_mark.assert_called_once()
+        assert mock_mark.call_args.kwargs["phase"] == "diagnoser_terminal"
+
+    def test_emits_diagnoser_terminal_recorded_log_event(self, caplog: Any) -> None:
+        import logging as _logging
+
+        d = _make_daemon()
+        caplog.set_level(_logging.INFO, logger="test.daemon")
+        with patch.object(d, "_mark_agent_terminal"):
+            d._consume_action_terminal(
+                agent_id="agent-3455-2",
+                issue_number=99002,
+                action_taken="file_prerequisite_task",
+                summary="Filed #99003 as prerequisite.",
+            )
+        events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "diagnoser_terminal_recorded"
+        ]
+        assert events, "daemon.diagnoser_terminal_recorded event not emitted"
+        evt = events[0]
+        assert getattr(evt, "agent_id", None) == "agent-3455-2"
+        assert getattr(evt, "issue_number", None) == 99002
+        assert getattr(evt, "action_taken", None) == "file_prerequisite_task"
+
+
+class TestConsumeDiagnosisDispatchesTerminal:
+    """Integration: ``_consume_diagnosis`` routes ``action="terminal"``
+    to ``_consume_action_terminal`` and marks the diagnosis completed.
+    """
+
+    def test_terminal_action_marks_completed_and_emits_event(self, caplog: Any) -> None:
+        import logging as _logging
+
+        d = _make_daemon()
+        caplog.set_level(_logging.INFO, logger="test.daemon")
+        candidate = {
+            "agent_id": "agent-3455-disp",
+            "issue_number": 99001,
+            "category": FAILURE_CATEGORY_PUSH_FAILED,
+        }
+        rec = {
+            "action": "terminal",
+            "action_taken": "close",
+            "summary": "Closed as duplicate.",
+            "reasoning": "Stderr ends with 'duplicate of #3000'.",
+        }
+        mark_called: list[int] = []
+
+        with (
+            patch.object(d, "_read_recommendation", return_value=rec),
+            patch.object(d, "_consume_action_terminal") as mock_handler,
+            patch.object(
+                d,
+                "_mark_diagnosis_completed",
+                side_effect=lambda did: mark_called.append(did),
+            ),
+        ):
+            result = d._consume_diagnosis(diagnosis_id=88, candidate=candidate)
+
+        assert result == "terminal"
+        mock_handler.assert_called_once()
+        kwargs = mock_handler.call_args.kwargs
+        assert kwargs["agent_id"] == "agent-3455-disp"
+        assert kwargs["issue_number"] == 99001
+        assert kwargs["action_taken"] == "close"
+        assert kwargs["summary"] == "Closed as duplicate."
+        assert mark_called == [88]
+
+        events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "directive_applied"
+        ]
+        assert events
+        assert getattr(events[0], "action", None) == "terminal"
+
+    def test_terminal_with_missing_required_field_falls_back_to_escalate(self) -> None:
+        d = _make_daemon()
+        candidate = {
+            "agent_id": "agent-3455-bad",
+            "issue_number": 99001,
+            "category": FAILURE_CATEGORY_PUSH_FAILED,
+        }
+        # Missing ``summary`` — validation fails, falls back to escalate.
+        rec = {"action": "terminal", "action_taken": "close"}
+
+        with (
+            patch.object(d, "_read_recommendation", return_value=rec),
+            patch.object(d, "_apply_mechanical_escalation") as mock_esc,
+            patch.object(d, "_mark_diagnosis_failed"),
+            patch.object(d, "_consume_action_terminal") as mock_term,
+        ):
+            result = d._consume_diagnosis(diagnosis_id=89, candidate=candidate)
+
+        assert result == "escalate_fallback"
+        mock_esc.assert_called_once()
+        mock_term.assert_not_called()
