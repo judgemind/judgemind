@@ -2258,7 +2258,12 @@ class IngestionWorker:
             # 3. Resolve judge name to canonical judge record
             judge_id: str | None = None
             if judge_name:
-                judge_id = resolve_judge(conn, judge_name, court_id)
+                judge_id = resolve_judge(
+                    conn,
+                    judge_name,
+                    court_id,
+                    source=scraper_id or "scraper",
+                )
 
             # 4. Insert document + ruling via shared helper (#1790).
             # The helper guarantees the same document_id is passed to both
