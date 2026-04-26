@@ -3270,7 +3270,6 @@ ralph_head_watcher_persist() {
         return 0
     fi
 
-    _escaped_patch=$(sed "s/'/''/g" "$_patch_file")
     _issue_clause="${ISSUE_NUMBER:-0}"
 
     # SELECT-then-INSERT guard against double-emit races. The race we
@@ -3282,11 +3281,22 @@ ralph_head_watcher_persist() {
     # handling, so retroactively adding uniqueness would break the
     # daemon path. The cost of SELECT-then-INSERT is a second round-
     # trip per iteration — negligible at our write rate.
-    _check_sql="SELECT 1 FROM dispatcher.ralph_patches
-                 WHERE agent_id = '$AGENT_ID'
-                   AND iteration_n = $_iter
-                 LIMIT 1;"
-    if ! _already=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -At -c "$_check_sql" 2>/dev/null); then
+    #
+    # #3488 — use psql -v variables for all three SQL statements so
+    # that $AGENT_ID, $_iter, and $_sha reach psql via its own variable
+    # substitution rather than bash string interpolation. The INSERT also
+    # uses the \set patch_content `cat :'patch_path'` idiom (same as
+    # persist_ralph_patch / persist_phase_output) so patch content never
+    # lands in a bash command line.
+    set +e
+    _already=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -At \
+        -v agent_id="$AGENT_ID" \
+        -v iter="$_iter" \
+        -c "SELECT 1 FROM dispatcher.ralph_patches WHERE agent_id = :'agent_id' AND iteration_n = :'iter'::int LIMIT 1;" \
+        2>/dev/null)
+    _check_rc=$?
+    set -e
+    if [[ $_check_rc -ne 0 ]]; then
         log "ralph_head_watcher_db_failure" \
             "iteration_n=$_iter" \
             "commit_sha=$_sha" \
@@ -3300,14 +3310,24 @@ ralph_head_watcher_persist() {
         return 0
     fi
 
-    _sql="INSERT INTO dispatcher.ralph_patches
-            (agent_id, issue_number, patch_content, commit_sha,
-             iteration_n, verdict)
-          VALUES
-            ('$AGENT_ID', $_issue_clause, '$_escaped_patch',
-             '$_sha', $_iter, 'LOOP');"
-
-    if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "$_sql" >/dev/null 2>&1; then
+    set +e
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+        -v agent_id="$AGENT_ID" \
+        -v issue_number="$_issue_clause" \
+        -v commit_sha="$_sha" \
+        -v iter="$_iter" \
+        -v patch_path="$_patch_file" <<'EOF' >/dev/null 2>&1
+\set patch_content `cat :'patch_path'`
+INSERT INTO dispatcher.ralph_patches
+    (agent_id, issue_number, patch_content, commit_sha,
+     iteration_n, verdict)
+VALUES
+    (:'agent_id', :'issue_number'::int, :'patch_content',
+     :'commit_sha', :'iter'::int, 'LOOP');
+EOF
+    _insert_rc=$?
+    set -e
+    if [[ $_insert_rc -ne 0 ]]; then
         log "ralph_head_watcher_db_failure" \
             "iteration_n=$_iter" \
             "commit_sha=$_sha" \
@@ -3319,11 +3339,15 @@ ralph_head_watcher_persist() {
     # handles out-of-order arrival though the tick is strictly
     # monotone today). Separate statement so an INSERT conflict still
     # keeps the counter in sync on the next tick.
-    _update_sql="UPDATE dispatcher.agents
-                    SET ralph_iterations_observed =
-                        GREATEST(ralph_iterations_observed, $_iter)
-                  WHERE agent_id = '$AGENT_ID';"
-    if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "$_update_sql" >/dev/null 2>&1; then
+    set +e
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+        -v agent_id="$AGENT_ID" \
+        -v iter="$_iter" \
+        -c "UPDATE dispatcher.agents SET ralph_iterations_observed = GREATEST(ralph_iterations_observed, :'iter'::int) WHERE agent_id = :'agent_id';" \
+        >/dev/null 2>&1
+    _update_rc=$?
+    set -e
+    if [[ $_update_rc -ne 0 ]]; then
         log "ralph_head_watcher_db_failure" \
             "iteration_n=$_iter" \
             "commit_sha=$_sha" \
@@ -3480,8 +3504,24 @@ stop_skill_phase_watcher() {
 persist_ralph_patch() {
     # Called on ralph SHIP when the worktree has a staged/committed
     # diff. Reads `git format-patch -1 HEAD --stdout` and INSERTs the
-    # content + HEAD sha into dispatcher.ralph_patches. Returns the
-    # new patch_id on stdout (for reference linkage in phase_outputs).
+    # content + HEAD sha into dispatcher.ralph_patches.
+    #
+    # #3488 — pass patch content via tmpfile + psql variable substitution
+    # rather than bash interpolation. The prior implementation escaped
+    # single quotes with sed and interpolated $_escaped_patch into the SQL
+    # string via db_exec. Bash expanded $() / backticks / $VAR inside the
+    # patch content BEFORE psql ever saw it, corrupting the SQL and
+    # producing exit_code=126 silently (#3488, same class as #3413 for
+    # persist_phase_output). The fix mirrors persist_phase_output (PR #3419):
+    #   1. The patch file already exists ($AGENT_WORKSPACE/ralph-ship.patch).
+    #      No extra mktemp needed.
+    #   2. Use a quoted heredoc (<<'EOF') so bash performs zero expansion on
+    #      the SQL body. The patch path reaches psql via -v patch_path, and
+    #      psql's \set reads the file at psql time via `cat :'patch_path'`
+    #      into a psql variable. :'patch_content' then quotes it as a SQL
+    #      literal that postgres stores verbatim in TEXT.
+    #   3. Wrap in set +e / set -e to capture failure without killing the
+    #      entrypoint (matches persist_phase_output's envelope).
     _commit_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf '')
     if [[ -z "$_commit_sha" ]]; then
         log "ralph_patch_skip_no_head"
@@ -3495,13 +3535,27 @@ persist_ralph_patch() {
         return 0
     fi
 
-    # Escape single quotes for SQL literal.
-    _escaped_patch=$(sed "s/'/''/g" "$_patch_file")
     _issue_clause="${ISSUE_NUMBER:-0}"
-    db_exec "INSERT INTO dispatcher.ralph_patches
-               (agent_id, issue_number, patch_content, commit_sha)
-             VALUES
-               ('$AGENT_ID', $_issue_clause, '$_escaped_patch', '$_commit_sha');"
+    set +e
+    log "db_exec_begin" "fn=persist_ralph_patch commit_sha=$_commit_sha"
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+        -v agent_id="$AGENT_ID" \
+        -v issue_number="$_issue_clause" \
+        -v commit_sha="$_commit_sha" \
+        -v patch_path="$_patch_file" <<'EOF' >/dev/null
+\set patch_content `cat :'patch_path'`
+INSERT INTO dispatcher.ralph_patches
+    (agent_id, issue_number, patch_content, commit_sha)
+VALUES
+    (:'agent_id', :'issue_number'::int, :'patch_content', :'commit_sha');
+EOF
+    _rc=$?
+    set -e
+    log "db_exec_done" "fn=persist_ralph_patch commit_sha=$_commit_sha rc=$_rc"
+    if [[ $_rc -ne 0 ]]; then
+        log "ralph_patch_persist_failed" "commit_sha=$_commit_sha rc=$_rc"
+        return $_rc
+    fi
     log "ralph_patch_persisted" "commit_sha=$_commit_sha"
 }
 
