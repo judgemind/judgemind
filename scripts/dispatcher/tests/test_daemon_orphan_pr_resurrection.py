@@ -310,6 +310,12 @@ class TestResurrectionNegativePaths:
         assert update_calls == []
 
     def test_dirty_pr_is_skipped(self, tmp_path: Path) -> None:
+        # #3431: mergeStateStatus=DIRTY is a true merge conflict, not a
+        # transient recompute. The classifier now returns 'red' (routed to
+        # fix_conflict), and the orphan sweep maps that to 'conflict' via
+        # _reason_to_state, producing reason='rollup_state_conflict'.
+        # The orphan is still skipped (operator-owned escalation path), but
+        # with a distinct reason that surfaces in CloudWatch vs. pending.
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue.append([("agent-dirty", 888, 200)])
         conn.cursor_instance.fetch_queue.append((0,))
@@ -321,11 +327,7 @@ class TestResurrectionNegativePaths:
         assert handler.events("agent_resurrected_for_orphan_pr") == []
         skipped = handler.events("orphan_pr_resurrection_skipped")
         assert skipped, "expected orphan_pr_resurrection_skipped"
-        # mergeStateStatus=DIRTY drops the classifier into the
-        # 'pending' fallback (the canonical _ci_rollup_state treats
-        # "checks pass but merge state isn't yet CLEAN" as pending,
-        # not red — same behavior the awaiting_ci handler uses).
-        assert skipped[0].reason == "rollup_state_pending"
+        assert skipped[0].reason == "rollup_state_conflict"
 
     def test_mergeable_unknown_classifies_as_pending_not_red(
         self, tmp_path: Path

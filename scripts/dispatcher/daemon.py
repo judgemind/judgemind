@@ -106,6 +106,7 @@ if TYPE_CHECKING:  # pragma: no cover — types only
 from .stream_forwarder import stream_subprocess_output_async  # noqa: E402
 from .phase_transitions import (  # noqa: E402
     FAILURE_HINT_RALPH_AC_INFEASIBLE,
+    PHASE_FIX_CONFLICT,
     TransitionAction,
     transition_from_awaiting_ci,
     transition_from_awaiting_deploy,
@@ -13013,6 +13014,7 @@ class DispatcherDaemon:
                 "CI green": "green",
                 "CI red": "red",
                 "CI pending": "pending",
+                "CI conflict — routing to fix_conflict (#3431)": "conflict",
             }
             rollup_state = _reason_to_state.get(ci_transition.reason, "pending")
             if rollup_state != "green":
@@ -13600,11 +13602,13 @@ class DispatcherDaemon:
         # StatusContext (__typename=STATUSCONTEXT) entries correctly (#3200).
         awaiting_ci_transition = transition_from_awaiting_ci(pr_status)
         # Derive rollup_state from the transition reason for the ci_poll
-        # log event. Reason strings are "CI green" / "CI red" / "CI pending".
+        # log event. Reason strings are "CI green" / "CI red" / "CI pending"
+        # / "CI conflict — routing to fix_conflict (#3431)".
         _reason_to_state = {
             "CI green": "green",
             "CI red": "red",
             "CI pending": "pending",
+            "CI conflict — routing to fix_conflict (#3431)": "conflict",
         }
         rollup_state = _reason_to_state.get(awaiting_ci_transition.reason, "pending")
         self._log.info(
@@ -13626,6 +13630,29 @@ class DispatcherDaemon:
 
         if awaiting_ci_transition.next_phase == "merge":
             self._merge_pr_and_advance(agent, pr_status)
+            return
+
+        if awaiting_ci_transition.next_phase == PHASE_FIX_CONFLICT:
+            # Merge conflict (mergeStateStatus=DIRTY or mergeable=CONFLICTING)
+            # detected during CI polling (#3431). The subprocess path does not
+            # yet spawn a fix_conflict skill (see FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE
+            # comment at line ~1300 anticipating this). Route to terminal +
+            # diagnoser so the empowered diagnoser can decide next step.
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
+                stderr_tail="",
+                exit_code=None,
+                details={
+                    "mergeable": pr_status.get("mergeable"),
+                    "merge_state_status": pr_status.get("mergeStateStatus"),
+                    "detail": (
+                        "PR has a merge conflict (DIRTY/CONFLICTING) after CI — "
+                        "routing to terminal+diagnoser via conflict_unresolvable (#3431)"
+                    ),
+                },
+            )
             return
 
         # awaiting_ci_transition.next_phase == "fix_ci" (CI red)

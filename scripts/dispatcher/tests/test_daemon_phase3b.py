@@ -197,16 +197,29 @@ class TestCiRollupState:
         }
         assert phase_transitions._ci_rollup_state(status) == "red"
 
-    def test_all_green_but_conflicting_returns_pending(self) -> None:
-        # CONFLICTING / DIRTY are transient GitHub recompute states — the
-        # canonical classifier returns 'pending' (not 'red') so the daemon
-        # keeps polling rather than routing to fix-ci unnecessarily.
+    def test_all_green_but_dirty_returns_red(self) -> None:
+        # CONFLICTING / DIRTY is a true merge conflict requiring a code-side
+        # rebase (#3431). The canonical classifier returns 'red' so callers
+        # route to fix_conflict rather than treating it as a transient poll.
         status = {
             "statusCheckRollup": [
                 {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
             ],
             "mergeable": "CONFLICTING",
             "mergeStateStatus": "DIRTY",
+        }
+        assert phase_transitions._ci_rollup_state(status) == "red"
+
+    def test_unknown_returns_pending(self) -> None:
+        # Regression guard for AC #3 (#3431): UNKNOWN is a transient GitHub
+        # recompute state, NOT a merge conflict. Must stay 'pending' so the
+        # supervisor re-polls rather than routing to fix_conflict.
+        status = {
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "lint"},
+            ],
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "UNKNOWN",
         }
         assert phase_transitions._ci_rollup_state(status) == "pending"
 
@@ -1094,6 +1107,78 @@ class TestAwaitingCiMaxRetries:
             and "failed" in e[1]
         ]
         assert failed_updates
+
+
+# --------------------------------------------------------------------------
+# _advance_awaiting_ci — DIRTY/CONFLICTING → terminal+diagnoser (#3431)
+# --------------------------------------------------------------------------
+
+
+class TestAwaitingCiConflict:
+    def test_dirty_pr_routes_to_conflict_unresolvable(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """#3431: mergeStateStatus=DIRTY is a true merge conflict.
+
+        _advance_awaiting_ci must route it to terminal+diagnoser via
+        FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE, not stay pending or
+        spawn fix-ci.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = json.dumps(
+                {
+                    "statusCheckRollup": [
+                        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                    "mergeable": "CONFLICTING",
+                    "mergeStateStatus": "DIRTY",
+                    "headRefOid": "head-sha",
+                    "mergeCommit": None,
+                }
+            )
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        # Fail the test if fix-ci subprocess spawns (it should not).
+        def fake_spawn(*_a: Any, **_k: Any) -> tuple[int, float]:
+            raise AssertionError("fix-ci must not spawn for a DIRTY conflict")
+
+        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+
+        agent = {
+            "agent_id": "conflict-agent-id",
+            "issue_number": 42,
+            "phase": "awaiting_ci",
+            "pr_number": 101,
+            "worktree_path": str(tmp_path),
+            "retries_used": 0,
+        }
+        d._advance_awaiting_ci(agent)
+
+        # Agent marked failed (terminal + diagnoser path via _handle_agent_failure).
+        failed_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "failed" in e[1]
+        ]
+        assert failed_updates, "DIRTY PR must mark agent terminal with status=failed"
+        # failures row written with conflict_unresolvable category.
+        failures_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT" in e[0] and "dispatcher.failures" in e[0]
+        ]
+        assert failures_inserts, (
+            "DIRTY PR must write a dispatcher.failures row with conflict_unresolvable"
+        )
 
 
 # --------------------------------------------------------------------------
