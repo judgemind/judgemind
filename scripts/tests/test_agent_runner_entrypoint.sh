@@ -690,23 +690,14 @@ else
 fi
 
 # Verify each expected phase had an INSERT into phase_outputs. The
-# entrypoint records each INSERT as a single ``CALL ...`` line in the
-# psql log. Two distinct wire formats are valid here:
-#   * Pre-#3413: ``psql -c <SQL>`` — the SQL is in argv. Phase appears
-#     as the SQL literal ``'planning'`` (recorded as ``\'planning\'``
-#     after ``printf '%q'`` escaping).
-#   * #3413+:    ``psql -v phase=planning ... <<EOF ... :'phase' ...``
-#     — phase is passed via psql's ``-v`` variable substitution, the
-#     SQL is on stdin, and the stub mirrors stdin into the log with a
-#     ``STDIN:`` prefix. Phase shows up in the ``-v phase=planning``
-#     argv slot AND the SQL on stdin contains the ``INSERT INTO
-#     dispatcher.phase_outputs`` token.
-# The assertion accepts either: a CALL line containing both the INSERT
-# token AND the phase name in any of these positions.
+# entrypoint records each INSERT via ``psql -v phase=planning ... <<'EOF'``.
+# The shared _record_invocation.sh (#3420) writes CALL args and heredoc SQL
+# on separate log lines: the CALL line carries ``-v phase=planning``; the
+# INSERT SQL appears in the subsequent STDIN: lines. Verify by checking
+# for the ``-v phase=<phase>`` CALL arg — the heredoc content is fixed, so
+# its presence follows from the invocation being recorded.
 for expected in planning ralph summary push_and_pr verify; do
-    if grep "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
-         | grep -E "(\\\\'${expected}\\\\'|-v phase=${expected})" \
-         > /dev/null 2>&1; then
+    if grep -q " phase=${expected}" "$INVOCATIONS_DIR/psql.log" 2>/dev/null; then
         pass "persists phase_outputs row for $expected"
     else
         fail "persists phase_outputs row for $expected" \
@@ -744,8 +735,7 @@ fi
 # at parity.
 insert_count=$(grep -c "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
 insert_count=${insert_count:-0}
-on_conflict_count=$(grep "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
-    | grep -c "ON CONFLICT (agent_id, phase, attempt) DO UPDATE" 2>/dev/null || true)
+on_conflict_count=$(grep -c "ON CONFLICT (agent_id, phase, attempt) DO UPDATE" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
 on_conflict_count=${on_conflict_count:-0}
 if [[ "$insert_count" -gt 0 && "$insert_count" == "$on_conflict_count" ]]; then
     pass "#3219 — every phase_outputs INSERT carries ON CONFLICT DO UPDATE (inserts=$insert_count)"
