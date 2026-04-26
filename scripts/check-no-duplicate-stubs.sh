@@ -50,54 +50,45 @@ while IFS= read -r -d '' test_file; do
         continue
     fi
 
-    # Collect all binary names and their line numbers in this file.
-    # Format: "<lineno> <binary>"
-    declare -A binary_first_line=()
-    declare -A binary_count=()
-
+    # Collect all (lineno binary) pairs from this file, skipping comment lines.
+    pairs=""
     while IFS= read -r match_line; do
-        # match_line format from grep -n: "<lineno>:<content>"
         lineno="${match_line%%:*}"
         content="${match_line#*:}"
-
-        # Skip comment lines (first non-whitespace char is #).
         if [[ "$content" =~ ^[[:space:]]*# ]]; then
             continue
         fi
-
-        # Extract the binary name via shell pattern match.
-        # Pattern: cat > "$STUB_BIN/<binary>" <<
         if [[ "$content" =~ cat[[:space:]]+\>[[:space:]]+\"\$STUB_BIN/([^\"]*)\"[[:space:]]+\<\< ]]; then
             binary="${BASH_REMATCH[1]}"
-
-            if [[ -z "${binary_first_line[$binary]:-}" ]]; then
-                binary_first_line[$binary]="$lineno"
-                binary_count[$binary]=1
-            else
-                binary_count[$binary]=$(( binary_count[$binary] + 1 ))
-                if [[ ${binary_count[$binary]} -eq 2 ]]; then
-                    # First time we detect a duplicate — emit the error.
-                    if [[ $violations -eq 0 ]]; then
-                        echo "ERROR: Test file(s) redefine the same stub binary more than once."
-                        echo ""
-                        echo "  The second cat > \"\$STUB_BIN/<binary>\" << block overwrites the"
-                        echo "  first, silently discarding any routes merged into the initial"
-                        echo "  definition.  Consolidate both definitions into the first block."
-                        echo ""
-                    fi
-                    echo "    File:   $test_file"
-                    echo "    Binary: $binary"
-                    echo "    Line 1: ${binary_first_line[$binary]}"
-                    echo "    Line 2: $lineno"
-                    echo ""
-                    violations=$(( violations + 1 ))
-                fi
-            fi
+            pairs="${pairs}${lineno} ${binary}"$'\n'
         fi
     done < <(grep -n 'cat > "\$STUB_BIN/' "$test_file" 2>/dev/null || true)
 
-    unset binary_first_line
-    unset binary_count
+    # Use awk (POSIX, bash-3.2-safe) to find binaries defined more than once.
+    # For each duplicate binary, awk prints "<binary> <line1> <line2>".
+    while IFS=' ' read -r binary line1 line2; do
+        if [[ $violations -eq 0 ]]; then
+            echo "ERROR: Test file(s) redefine the same stub binary more than once."
+            echo ""
+            echo "  The second cat > \"\$STUB_BIN/<binary>\" << block overwrites the"
+            echo "  first, silently discarding any routes merged into the initial"
+            echo "  definition.  Consolidate both definitions into the first block."
+            echo ""
+        fi
+        echo "    File:   $test_file"
+        echo "    Binary: $binary"
+        echo "    Line 1: $line1"
+        echo "    Line 2: $line2"
+        echo ""
+        violations=$(( violations + 1 ))
+    done < <(printf '%s' "$pairs" | awk '
+        NF == 2 {
+            lineno = $1; binary = $2
+            cnt[binary]++
+            if (cnt[binary] == 1) { first[binary] = lineno }
+            else if (cnt[binary] == 2) { print binary, first[binary], lineno }
+        }
+    ')
 done < <(find "$SCAN_DIR" -maxdepth 1 -name 'test_*.sh' -print0 2>/dev/null)
 
 if [[ $violations -gt 0 ]]; then
