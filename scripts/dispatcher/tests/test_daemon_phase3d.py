@@ -1420,7 +1420,9 @@ class TestConstants:
         assert daemon.FAILURE_CATEGORY_CI_RED_AFTER_RETRIES == "ci_red_after_retries"
 
     def test_diagnoser_actions_exhaustive(self) -> None:
-        # Issue #3032 expanded the known action set from 5 to 8. The
+        # Issue #3032 expanded the known action set from 5 to 8. Issue
+        # #3455 added ``terminal`` (collapse the daemon-side executor
+        # layer; the SKILL performs gh side-effects itself). The
         # daemon's consumer still has an explicit switch so any
         # addition here must also land in ``_consume_diagnosis``. The
         # closed-enum guardrail in the diagnoser skill itself is
@@ -1437,6 +1439,7 @@ class TestConstants:
                 "block_and_comment",
                 "file_prerequisite_task",
                 "block_on_existing_task",
+                "terminal",
             }
         )
 

@@ -120,9 +120,26 @@ class TestBypassedTerminalConstants:
         assert FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE in TIER_3_CATEGORIES
 
     def test_bypassed_terminal_map_shape(self) -> None:
+        # Issue #3455 added descriptive terminal phases for the
+        # post-claude ``route_to_diagnoser`` arm in
+        # agent-runner-entrypoint.sh. Each phase maps to its
+        # FAILURE_CATEGORY so the diagnoser sweep picks them up.
+        # ``ralph_not_ship`` is intentionally NOT here — it's handled
+        # locally by the entrypoint.
+        from dispatcher.daemon import (
+            FAILURE_CATEGORY_FIX_CI_BLOCKED,
+            FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+            FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
+            FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
+        )
+
         assert BYPASSED_TERMINAL_PHASES_TO_ROUTE == {
             "conflict_unresolvable": FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
             "agent_runner_route_stub": FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
+            "ralph_ac_infeasible": FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+            "summary_ac_infeasible": FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
+            "fix_ci_blocked": FAILURE_CATEGORY_FIX_CI_BLOCKED,
+            "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
         }
 
 
