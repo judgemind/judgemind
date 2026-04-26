@@ -4,8 +4,12 @@ detection against synthetic Python fixtures."""
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 # Import the module despite its dash-containing filename.
 # Register it in sys.modules BEFORE exec_module so `@dataclass` can find
@@ -23,6 +27,8 @@ _spec.loader.exec_module(mod)
 parse_dropped_not_null = mod.parse_dropped_not_null
 audit_column_reads = mod.audit_column_reads
 _column_has_nullable_ok = mod._column_has_nullable_ok
+find_changed_migrations = mod.find_changed_migrations
+main = mod.main
 
 
 # ---------------------------------------------------------------------------
@@ -213,3 +219,197 @@ class TestColumnHasNullableOk:
         # 'bar' is NOT annotated — must be flagged.
         assert len(violations_bar) == 1
         assert violations_bar[0].column == "bar"
+
+
+# ---------------------------------------------------------------------------
+# main() — CLI entry point (AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    """Tests for the main() CLI entry point.
+
+    All tests use --repo-root pointing to tmp_path so the audit walk stays
+    confined to a controlled fixture directory.
+    """
+
+    def _write_sql(self, tmp_path: Path, name: str, content: str) -> Path:
+        p = tmp_path / name
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def _write_scripts_file(self, tmp_path: Path, name: str, content: str) -> Path:
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir(exist_ok=True)
+        p = scripts_dir / name
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_main_no_drop_not_null_returns_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Migration with only ADD COLUMN — no DROP NOT NULL — exits 0."""
+        sql_file = self._write_sql(
+            tmp_path, "add_only.sql", "ALTER TABLE foo ADD COLUMN bar TEXT;\n"
+        )
+        with patch(
+            "sys.argv",
+            [
+                "check-nullable-column-reads",
+                "--repo-root",
+                str(tmp_path),
+                "--migration",
+                str(sql_file),
+            ],
+        ):
+            result = main()
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "no DROP NOT NULL statements" in out
+
+    def test_main_no_violations_returns_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Migration with DROP NOT NULL but all reads are guarded — exits 0."""
+        sql_file = self._write_sql(
+            tmp_path,
+            "drop_nn.sql",
+            "ALTER TABLE t ALTER COLUMN foo DROP NOT NULL;\n",
+        )
+        self._write_scripts_file(
+            tmp_path,
+            "clean.py",
+            'query = "SELECT foo FROM t WHERE foo IS NOT NULL"\nv = row["foo"]\n',
+        )
+        with patch(
+            "sys.argv",
+            [
+                "check-nullable-column-reads",
+                "--repo-root",
+                str(tmp_path),
+                "--migration",
+                str(sql_file),
+            ],
+        ):
+            result = main()
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "no unguarded read sites" in out
+
+    def test_main_violations_return_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Migration with DROP NOT NULL and unguarded read — exits 1."""
+        sql_file = self._write_sql(
+            tmp_path,
+            "drop_nn.sql",
+            "ALTER TABLE t ALTER COLUMN foo DROP NOT NULL;\n",
+        )
+        self._write_scripts_file(
+            tmp_path,
+            "dirty.py",
+            'query = "SELECT foo FROM t"\nv = row["foo"]\n',
+        )
+        with patch(
+            "sys.argv",
+            [
+                "check-nullable-column-reads",
+                "--repo-root",
+                str(tmp_path),
+                "--migration",
+                str(sql_file),
+            ],
+        ):
+            result = main()
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "FAIL" in err
+        assert "unguarded reads" in err
+
+    def test_main_no_migrations_changed_returns_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No migration files found via git-diff path — exits 0 immediately."""
+        with patch(
+            "sys.argv", ["check-nullable-column-reads", "--repo-root", str(tmp_path)]
+        ):
+            with patch(
+                "check_nullable_column_reads.find_changed_migrations", return_value=[]
+            ):
+                result = main()
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "no migration files touched" in out
+
+
+# ---------------------------------------------------------------------------
+# find_changed_migrations() — git subprocess wrapper (AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestFindChangedMigrations:
+    """Tests for find_changed_migrations using real git repos where possible."""
+
+    def _git(self, *args: str, cwd: Path) -> None:
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    def test_real_git_diff_returns_modified_migration(self, tmp_path: Path) -> None:
+        """Real git init: a committed SQL migration shows up in the diff."""
+        self._git("init", cwd=tmp_path)
+        self._git("config", "user.email", "test@example.com", cwd=tmp_path)
+        self._git("config", "user.name", "Test User", cwd=tmp_path)
+        self._git("checkout", "-b", "main", cwd=tmp_path)
+
+        migrations_dir = tmp_path / "packages" / "api" / "migrations"
+        migrations_dir.mkdir(parents=True)
+        sql_file = migrations_dir / "49_x.sql"
+        sql_file.write_text("-- initial\n", encoding="utf-8")
+
+        self._git("add", ".", cwd=tmp_path)
+        self._git("commit", "-m", "initial", cwd=tmp_path)
+
+        self._git("checkout", "-b", "feature", cwd=tmp_path)
+        sql_file.write_text("-- modified\n", encoding="utf-8")
+        self._git("add", ".", cwd=tmp_path)
+        self._git("commit", "-m", "modify migration", cwd=tmp_path)
+
+        result = find_changed_migrations("main", tmp_path)
+        assert len(result) == 1
+        assert result[0] == sql_file
+
+    def test_subprocess_failure_raises_runtime_error(self, tmp_path: Path) -> None:
+        """Non-zero git exit raises RuntimeError with 'git diff failed'."""
+        fake_result = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="fatal: bad revision"
+        )
+        with patch("subprocess.run", return_value=fake_result):
+            with pytest.raises(RuntimeError, match="git diff failed"):
+                find_changed_migrations("main", tmp_path)
+
+    def test_filters_to_sql_files_only(self, tmp_path: Path) -> None:
+        """Non-.sql files in the diff are excluded from the result."""
+        self._git("init", cwd=tmp_path)
+        self._git("config", "user.email", "test@example.com", cwd=tmp_path)
+        self._git("config", "user.name", "Test User", cwd=tmp_path)
+        self._git("checkout", "-b", "main", cwd=tmp_path)
+
+        migrations_dir = tmp_path / "packages" / "api" / "migrations"
+        migrations_dir.mkdir(parents=True)
+        sql_file = migrations_dir / "50_y.sql"
+        sql_file.write_text("-- initial\n", encoding="utf-8")
+        readme = migrations_dir / "README.md"
+        readme.write_text("# migrations\n", encoding="utf-8")
+
+        self._git("add", ".", cwd=tmp_path)
+        self._git("commit", "-m", "initial", cwd=tmp_path)
+
+        self._git("checkout", "-b", "feature", cwd=tmp_path)
+        sql_file.write_text("-- modified\n", encoding="utf-8")
+        readme.write_text("# migrations updated\n", encoding="utf-8")
+        self._git("add", ".", cwd=tmp_path)
+        self._git("commit", "-m", "modify both", cwd=tmp_path)
+
+        result = find_changed_migrations("main", tmp_path)
+        assert all(p.suffix == ".sql" for p in result)
+        assert sql_file in result
+        assert readme not in result
