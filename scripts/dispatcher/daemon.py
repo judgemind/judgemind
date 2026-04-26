@@ -12791,11 +12791,22 @@ class DispatcherDaemon:
                 )
                 continue
 
-            # The classifier returns 'green' only when all checks are
-            # SUCCESS/SKIPPED AND mergeable=MERGEABLE AND
-            # mergeStateStatus=CLEAN. Closed/merged PRs come back with
-            # mergeable in a different state, so this catches them too.
-            rollup_state = self._classify_check_rollup(pr_status)
+            # Use the same canonical classifier (_ci_rollup_state via
+            # transition_from_awaiting_ci) the awaiting_ci handler
+            # uses, so the green gate is consistent across both call
+            # sites. Critically, this classifier returns 'pending'
+            # (not 'red') when ``mergeable=UNKNOWN`` — GitHub flips
+            # state to UNKNOWN intermittently while it recomputes, and
+            # the legacy ``_classify_check_rollup`` would mis-skip
+            # the row in that window. Reasons surface as 'CI green' /
+            # 'CI red' / 'CI pending' from the transition.reason field.
+            ci_transition = transition_from_awaiting_ci(pr_status)
+            _reason_to_state = {
+                "CI green": "green",
+                "CI red": "red",
+                "CI pending": "pending",
+            }
+            rollup_state = _reason_to_state.get(ci_transition.reason, "pending")
             if rollup_state != "green":
                 self._log.info(
                     "daemon.orphan_pr_resurrection_skipped",

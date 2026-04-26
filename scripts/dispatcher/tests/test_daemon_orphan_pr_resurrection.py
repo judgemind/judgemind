@@ -294,9 +294,10 @@ class TestResurrectionNegativePaths:
         assert n == 0
         # NO resurrection success event.
         assert handler.events("agent_resurrected_for_orphan_pr") == []
-        # Skip event fired with rollup_state reason (red, because the
-        # classifier returns 'red' when checks pass but mergeable is
-        # CONFLICTING — see _classify_check_rollup's final fallback).
+        # Skip event fired with rollup_state reason. The canonical
+        # _ci_rollup_state treats mergeable=CONFLICTING as 'pending'
+        # (transient — GitHub may recompute), so the skip reason is
+        # rollup_state_pending. The important thing is we skip.
         skipped = handler.events("orphan_pr_resurrection_skipped")
         assert skipped, "expected orphan_pr_resurrection_skipped"
         assert skipped[0].reason.startswith("rollup_state_")
@@ -320,9 +321,45 @@ class TestResurrectionNegativePaths:
         assert handler.events("agent_resurrected_for_orphan_pr") == []
         skipped = handler.events("orphan_pr_resurrection_skipped")
         assert skipped, "expected orphan_pr_resurrection_skipped"
-        # mergeStateStatus=DIRTY drops the classifier into the 'red'
-        # fallback (mergeable=MERGEABLE but merge_state != CLEAN).
-        assert skipped[0].reason == "rollup_state_red"
+        # mergeStateStatus=DIRTY drops the classifier into the
+        # 'pending' fallback (the canonical _ci_rollup_state treats
+        # "checks pass but merge state isn't yet CLEAN" as pending,
+        # not red — same behavior the awaiting_ci handler uses).
+        assert skipped[0].reason == "rollup_state_pending"
+
+    def test_mergeable_unknown_classifies_as_pending_not_red(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression guard for the issue caught during PR #3399 verify
+        on PR #3391. GitHub flips mergeable + mergeStateStatus to
+        UNKNOWN intermittently while it recomputes (classic refresh
+        window). The canonical _ci_rollup_state classifier handles
+        this as 'pending' (so the next supervisor tick re-checks),
+        not as 'red' (which the legacy classifier did, causing the
+        sweep to mis-skip a row that was actually mergeable). The
+        switch to transition_from_awaiting_ci closes that gap."""
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue.append([("agent-unknown", 666, 600)])
+        conn.cursor_instance.fetch_queue.append((0,))
+        unknown_payload = {
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS", "name": "ci-passed"},
+            ],
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "UNKNOWN",
+            "headRefOid": "head-sha",
+            "mergeCommit": None,
+        }
+        d._fetch_pr_status = lambda pr: unknown_payload  # type: ignore[method-assign]
+
+        n = d._resurrect_orphan_pr_agents()
+
+        assert n == 0, "UNKNOWN must NOT count as green"
+        # NOT 'red' — that was the legacy bug. Pending means we'll
+        # re-check next tick.
+        skipped = handler.events("orphan_pr_resurrection_skipped")
+        assert skipped, "expected orphan_pr_resurrection_skipped"
+        assert skipped[0].reason == "rollup_state_pending"
 
     def test_pending_ci_is_skipped(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
