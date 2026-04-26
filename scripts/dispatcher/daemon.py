@@ -78,7 +78,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -1319,6 +1319,32 @@ STALE_ROLLUP_STDERR_MARKER = "base branch policy prohibits the merge"
 #: under :data:`FAILURE_CATEGORY_MERGE_UNSTICK_EXHAUSTED`. 1 matches
 #: the spec: "at most one auto-unstick attempt per agent lifetime".
 MERGE_UNSTICK_MAX_ATTEMPTS = 1
+
+#: How far back the orphan-PR resurrection sweep looks for failed
+#: agents whose PR may have become mergeable since the agent died
+#: (#3399). Agents whose ``ended_at`` is older than this window are
+#: skipped — operator-attention territory; a 2-day-old failed agent
+#: with a still-open PR is unlikely to be a transient flake. 24h
+#: matches the spec; tune via the constant rather than per-call.
+ORPHAN_PR_RESURRECTION_LOOKBACK = timedelta(hours=24)
+
+#: How many times the orphan-PR sweep will resurrect the same
+#: ``agent_id`` (#3399). Bound prevents an infinite loop where a
+#: resurrected agent keeps going green-then-red-then-green and we
+#: keep flipping it back to ``running`` forever. Counted by reading
+#: ``dispatcher.phase_transitions`` rows whose phase is
+#: :data:`PHASE_RESURRECTED_FOR_ORPHAN_PR`. 3 matches the issue's
+#: "don't resurrect more than 2-3 times per agent_id" guidance.
+ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS = 3
+
+#: Phase-transition marker the resurrection sweep writes when it
+#: flips a ``status='failed'`` agent back to ``status='running' AND
+#: phase='awaiting_ci'`` (#3399). Stored as a free-form
+#: ``dispatcher.phase_transitions`` row keyed by ``agent_id`` so the
+#: sweep can count past resurrections without a schema migration.
+#: NOT in the canonical phase progression — exists purely as an
+#: append-only audit + bookkeeping marker.
+PHASE_RESURRECTED_FOR_ORPHAN_PR = "resurrected_for_orphan_pr"
 
 #: Which failure categories auto-create a retry marker (tier 1 per
 #: spec §8 table). ``subprocess_turn_limit`` (tier 2) and
@@ -12652,6 +12678,325 @@ class DispatcherDaemon:
     # unhandled exceptions flip the agent to ``status='crashed'`` and
     # the supervisor tick continues with the next agent.
 
+    def _resurrect_orphan_pr_agents(self) -> int:
+        """Resurrect ``status='failed'`` agents whose PR is now mergeable.
+
+        Issue #3399. When a daemon-spawned agent dies after creating a
+        PR — e.g. ``status='failed' phase='fix_ci_failed'`` from a
+        transient CI flake or a since-resolved migration collision —
+        the PR remains open. CI may go green later (the flake clears,
+        sibling PRs land, the operator re-runs the failed jobs), making
+        the PR mergeable. But ``_list_advanceable_agents`` only picks
+        up ``status='running'`` (or ``'succeeded'`` for retro paths)
+        rows — failed agents are excluded, so the PR sits stuck.
+        Re-adding ``agent/ready`` to the issue spawns a NEW agent that
+        runs ralph from scratch on a fresh branch and doesn't reuse the
+        existing PR (and often dies on the same root cause).
+
+        This sweep, run once per supervisor tick BEFORE
+        :meth:`_advance_running_agents`, looks for ``status='failed'
+        AND pr_number IS NOT NULL AND ended_at >
+        now() - ORPHAN_PR_RESURRECTION_LOOKBACK`` rows. For each, it
+        fetches the PR's combined check rollup + merge state via
+        :meth:`_fetch_pr_status` and runs the same classifier
+        (:meth:`_classify_check_rollup`) the awaiting_ci handler uses.
+        Only when the classifier says ``'green'`` (open + mergeable +
+        all checks SUCCESS/SKIPPED + ``mergeStateStatus=CLEAN``) does
+        the sweep flip the row back to ``status='running' AND
+        phase='awaiting_ci'`` so the next tick's
+        :meth:`_advance_awaiting_ci` handler can drive the
+        ``gh pr merge`` path.
+
+        Bounds:
+
+        * **Recency:** :data:`ORPHAN_PR_RESURRECTION_LOOKBACK` (24h
+          default). Older failures are operator territory — not the
+          autonomous sweep's job.
+        * **Resurrection budget per agent_id:**
+          :data:`ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS` (3 default),
+          counted by reading
+          ``dispatcher.phase_transitions`` rows whose phase is
+          :data:`PHASE_RESURRECTED_FOR_ORPHAN_PR`. After the budget is
+          exhausted the row stays ``status='failed'`` and the
+          ``orphan_pr_resurrection_skipped`` event records the skip
+          reason.
+        * **PR-state guard:** the classifier's ``'green'`` predicate
+          rejects closed/merged PRs (``mergeable != 'MERGEABLE'``),
+          dirty PRs (``mergeStateStatus != 'CLEAN'``), and
+          still-pending CI. Skips emit ``orphan_pr_resurrection_skipped``
+          with a ``reason`` tag for CloudWatch grep.
+
+        On resurrection the row is also forced to
+        ``execution_mode='subprocess'``. The sweep is a daemon-owned
+        recovery path — the worktree is gone (cleaned up at terminal
+        time), the original agent's ECS Fargate task is gone, and the
+        ``_advance_awaiting_ci`` handler only needs the PR number to
+        merge. Forcing subprocess mode prevents
+        :meth:`_advance_running_agents`'s ECS short-circuit from
+        skipping the resurrected row.
+
+        Returns the number of agents this tick resurrected (for the
+        supervisor-tick log summary). Per-row failures (PR fetch
+        timeout, DB write error) are logged and swallowed so one bad
+        row cannot stall the sweep or the tick.
+        """
+        assert self._conn is not None, "connect() must run before resurrection sweep"
+
+        candidates = self._list_orphan_pr_failed_agents()
+        if not candidates:
+            return 0
+
+        resurrected = 0
+        for row in candidates:
+            agent_id = row["agent_id"]
+            pr_number = row["pr_number"]
+            issue_number = row["issue_number"]
+
+            # Budget check — count past resurrections for this agent_id
+            # via the phase_transitions audit log. This avoids needing
+            # a new schema column for the counter (#3399 is pure code).
+            past_attempts = self._count_orphan_pr_resurrections(agent_id)
+            if past_attempts >= ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS:
+                self._log.info(
+                    "daemon.orphan_pr_resurrection_skipped",
+                    extra={
+                        "event": "orphan_pr_resurrection_skipped",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "budget_exhausted",
+                        "past_attempts": past_attempts,
+                        "max_attempts": ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS,
+                    },
+                )
+                continue
+
+            # PR-state guard. Re-uses the same classifier as the
+            # awaiting_ci handler so the gate is consistent — if the
+            # PR isn't currently green-and-mergeable, don't resurrect.
+            pr_status = self._fetch_pr_status(pr_number)
+            if pr_status is None:
+                # Transient gh failure — log and skip; next tick re-tries.
+                self._log.info(
+                    "daemon.orphan_pr_resurrection_skipped",
+                    extra={
+                        "event": "orphan_pr_resurrection_skipped",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": "pr_view_failed",
+                    },
+                )
+                continue
+
+            # The classifier returns 'green' only when all checks are
+            # SUCCESS/SKIPPED AND mergeable=MERGEABLE AND
+            # mergeStateStatus=CLEAN. Closed/merged PRs come back with
+            # mergeable in a different state, so this catches them too.
+            rollup_state = self._classify_check_rollup(pr_status)
+            if rollup_state != "green":
+                self._log.info(
+                    "daemon.orphan_pr_resurrection_skipped",
+                    extra={
+                        "event": "orphan_pr_resurrection_skipped",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "reason": f"rollup_state_{rollup_state}",
+                        "mergeable": pr_status.get("mergeable"),
+                        "merge_state_status": pr_status.get("mergeStateStatus"),
+                    },
+                )
+                continue
+
+            # Flip status='running' phase='awaiting_ci' and force
+            # execution_mode='subprocess'. The append to
+            # phase_transitions is part of the same transaction so the
+            # next sweep's budget count is accurate even if the daemon
+            # crashes between writes.
+            if not self._mark_agent_resurrected_for_orphan_pr(agent_id):
+                # Already logged inside the helper; advance to next row.
+                continue
+
+            self._log.info(
+                "daemon.agent_resurrected_for_orphan_pr",
+                extra={
+                    "event": "agent_resurrected_for_orphan_pr",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "past_attempts": past_attempts,
+                    "new_attempts": past_attempts + 1,
+                    "mergeable": pr_status.get("mergeable"),
+                    "merge_state_status": pr_status.get("mergeStateStatus"),
+                },
+            )
+            resurrected += 1
+
+        return resurrected
+
+    def _list_orphan_pr_failed_agents(self) -> list[dict[str, Any]]:
+        """SELECT failed agents with an open PR_number for the
+        resurrection sweep (#3399).
+
+        Returns rows where ``status='failed' AND pr_number IS NOT NULL
+        AND ended_at > now() - ORPHAN_PR_RESURRECTION_LOOKBACK``.
+        Issue-number-NULL rows (scheduled-skill agents from #3379) are
+        excluded — they don't carry a real issue and shouldn't trigger
+        resurrection bookkeeping. Returns ``[]`` on DB error so the
+        supervisor tick can continue without this work.
+
+        Result rows are dicts with ``agent_id``, ``pr_number``,
+        ``issue_number``. Worktree path is intentionally NOT selected:
+        the worktree was cleaned up at terminal time, and the
+        resurrection path drives ``gh pr merge`` directly without
+        touching the local filesystem.
+        """
+        assert self._conn is not None, "connect() must run before reading"
+
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._conn.cursor() as cur:
+                # Inline the lookback as a parameter rather than baking
+                # a hard-coded ``interval '24 hours'`` into the SQL —
+                # makes the constant the single source of truth and
+                # keeps the query tunable from one place.
+                cur.execute(
+                    "SELECT agent_id, pr_number, issue_number "
+                    "FROM dispatcher.agents "
+                    "WHERE status = 'failed' "
+                    "  AND pr_number IS NOT NULL "
+                    "  AND issue_number IS NOT NULL "
+                    "  AND ended_at IS NOT NULL "
+                    "  AND ended_at > now() - %s "
+                    "ORDER BY ended_at DESC",
+                    (ORPHAN_PR_RESURRECTION_LOOKBACK,),
+                )
+                for raw in cur.fetchall():
+                    rows.append(
+                        {
+                            "agent_id": str(raw[0]),
+                            "pr_number": int(raw[1]),
+                            "issue_number": int(raw[2]),
+                        }
+                    )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.orphan_pr_list_failed",
+                extra={
+                    "event": "orphan_pr_list_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return []
+        return rows
+
+    def _count_orphan_pr_resurrections(self, agent_id: str) -> int:
+        """Return how many times this agent has been resurrected by
+        the orphan-PR sweep (#3399).
+
+        Counted by reading append-only
+        ``dispatcher.phase_transitions`` rows whose phase is
+        :data:`PHASE_RESURRECTED_FOR_ORPHAN_PR`. Returns 0 on DB error
+        so a transient hiccup cannot block resurrection (the worst case
+        on read failure is one extra resurrection that still respects
+        every other gate — the next tick re-evaluates).
+        """
+        assert self._conn is not None, "connect() must run before counting"
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM dispatcher.phase_transitions "
+                    "WHERE agent_id = %s AND phase = %s",
+                    (agent_id, PHASE_RESURRECTED_FOR_ORPHAN_PR),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.orphan_pr_count_failed",
+                extra={
+                    "event": "orphan_pr_count_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return 0
+        if row is None:
+            return 0
+        return int(row[0] or 0)
+
+    def _mark_agent_resurrected_for_orphan_pr(self, agent_id: str) -> bool:
+        """Flip a failed-but-mergeable agent back to ``status='running'
+        AND phase='awaiting_ci'`` and write the audit transition (#3399).
+
+        Both UPDATE and INSERT happen in the same transaction so the
+        next supervisor tick's budget count and the next advance loop
+        see a consistent state — either both writes land or neither.
+        Returns True on success; False on DB error (logged + rolled
+        back).
+
+        Forces ``execution_mode='subprocess'`` so
+        :meth:`_advance_running_agents`'s ECS short-circuit doesn't
+        skip the resurrected row — the original ECS task-runner is
+        gone and the daemon owns the merge path here.
+
+        Clears ``ended_at``, ``exit_code``, and ``failure_summary`` on
+        the row so the admin page renders the resurrected agent as a
+        live row again rather than a confusing terminal+running mix.
+        """
+        assert self._conn is not None, "connect() must run before resurrection"
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'running', "
+                    "    phase = 'awaiting_ci', "
+                    "    execution_mode = 'subprocess', "
+                    "    ended_at = NULL, "
+                    "    exit_code = NULL, "
+                    "    failure_summary = NULL "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                cur.execute(
+                    "INSERT INTO dispatcher.phase_transitions "
+                    "    (agent_id, phase) "
+                    "VALUES (%s, %s)",
+                    (agent_id, PHASE_RESURRECTED_FOR_ORPHAN_PR),
+                )
+            self._conn.commit()
+            return True
+        except Exception:
+            self._log.exception(
+                "daemon.orphan_pr_resurrect_failed",
+                extra={
+                    "event": "orphan_pr_resurrect_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return False
+
     def _list_advanceable_agents(self) -> list[dict[str, Any]]:
         """Return agents waiting for the next state-machine step.
 
@@ -13067,6 +13412,43 @@ class DispatcherDaemon:
             return
 
         # awaiting_ci_transition.next_phase == "fix_ci" (CI red)
+        #
+        # Issue #3399 defensive guard: if the agent's worktree was
+        # cleaned up (e.g. this row was resurrected by the orphan-PR
+        # sweep — the original worktree was removed at terminal time),
+        # the fix-ci spawn would fail trying to read the missing
+        # working directory. Fail cleanly here instead of letting
+        # _run_fix_ci crash on a missing path. The PR was green when
+        # the sweep resurrected it; the red flip between sweep tick
+        # and this tick means the operator owns the next move (often a
+        # transient that re-greens, in which case a future tick will
+        # resurrect again under the same budget).
+        worktree_path = agent.get("worktree_path") or ""
+        worktree_exists = bool(worktree_path) and Path(worktree_path).exists()
+        if not worktree_exists:
+            self._log.warning(
+                "daemon.awaiting_ci_red_worktree_missing",
+                extra={
+                    "event": "awaiting_ci_red_worktree_missing",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "worktree_path": worktree_path,
+                    "detail": (
+                        "CI flipped red after orphan-PR resurrection — "
+                        "worktree gone, cannot run fix-ci. Marking failed."
+                    ),
+                },
+            )
+            # Re-flip to status='failed'. The row was previously failed
+            # before the sweep; falling back to that state keeps the
+            # admin page coherent. Next sweep tick re-evaluates if CI
+            # re-greens (subject to the resurrection budget).
+            self._mark_agent_terminal(
+                agent_id, status="failed", phase="awaiting_ci", exit_code=None
+            )
+            return
+
         self._run_fix_ci(agent, pr_status)
 
     def _fetch_pr_status(self, pr_number: int) -> dict[str, Any] | None:
@@ -21431,7 +21813,16 @@ class DispatcherDaemon:
                rows + enqueues retry markers; the GitHub rate-limit
                guard sets ``self._gh_rate_skip_until`` when the budget
                is low.
-            4. **Phase 3B (#2787):** call ``_advance_running_agents``.
+            4. **Issue #3399:** call ``_resurrect_orphan_pr_agents``
+               BEFORE the advance pass. Scans for failed agents whose
+               PR has gone mergeable since the agent died (transient
+               flake cleared, sibling PRs landed, operator re-ran a
+               check) and flips them back to ``status='running' AND
+               phase='awaiting_ci'`` so the same tick's advance pass
+               picks them up and merges. Skipped when the rate-limit
+               flag is set (the sweep calls ``gh pr view`` per
+               candidate).
+            5. **Phase 3B (#2787):** call ``_advance_running_agents``.
                Iterates agents in ``awaiting_ci``/``awaiting_deploy``
                and drives each one forward by one state-machine step.
                Errors are caught per-agent so one bad row cannot stall
@@ -21500,6 +21891,29 @@ class DispatcherDaemon:
             )
 
         rate_skip_active = self._gh_rate_skip_active()
+
+        # Issue #3399: orphan-PR resurrection sweep. Runs BEFORE the
+        # advance pass so any agent flipped from status='failed' back
+        # to status='running' AND phase='awaiting_ci' is picked up by
+        # _list_advanceable_agents in the very same tick — the
+        # supervisor merges the orphaned PR within one tick of it
+        # becoming mergeable rather than waiting an extra tick.
+        # Skipped when the rate-limit flag is set; the sweep calls
+        # ``gh pr view`` per candidate, which would burn the remaining
+        # budget and delay the reset for the same reason as the 3B
+        # advance pass.
+        orphan_pr_resurrected = 0
+        if not rate_skip_active:
+            try:
+                orphan_pr_resurrected = self._resurrect_orphan_pr_agents()
+            except Exception:
+                self._log.exception(
+                    "daemon.orphan_pr_sweep_failed",
+                    extra={
+                        "event": "orphan_pr_sweep_failed",
+                        "run_id": self._run_id,
+                    },
+                )
 
         # Phase 3B (#2787): advance agents that are past push_and_pr.
         # Wrapped in try/except — the heartbeat + metric emission below
@@ -21641,6 +22055,7 @@ class DispatcherDaemon:
                 "failures_last_hour": failures_last_hour,
                 "heartbeat_metric_emitted": metric_emitted,
                 "agents_advanced": agents_advanced,
+                "orphan_pr_resurrected": orphan_pr_resurrected,
                 "stuck_flagged": stuck_flagged,
                 "retry_markers_processed": retry_processed,
                 "rate_skip_active": rate_skip_active,
@@ -21668,6 +22083,7 @@ class DispatcherDaemon:
             "failures_last_hour": failures_last_hour,
             "heartbeat_metric_emitted": 1 if metric_emitted else 0,
             "agents_advanced": agents_advanced,
+            "orphan_pr_resurrected": orphan_pr_resurrected,
             "stuck_flagged": stuck_flagged,
             "retry_markers_processed": retry_processed,
             "rate_skip_active": 1 if rate_skip_active else 0,
