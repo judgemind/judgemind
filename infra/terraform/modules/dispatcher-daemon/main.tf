@@ -945,3 +945,188 @@ resource "aws_cloudwatch_metric_alarm" "diagnoser_fallback_spike" {
   alarm_actions = [var.alert_sns_topic_arn]
   ok_actions    = [var.alert_sns_topic_arn]
 }
+
+# ─── Supervisor-tick swallow-and-return failure alarms ───────────────────────
+# Each of the five handlers below catches exceptions internally and returns
+# rather than propagating. A single event may be transient; two within the
+# window (default 300 s / ~2-3 ticks) signals a wedge.
+
+resource "aws_cloudwatch_log_metric_filter" "list_advanceable_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-list-advanceable-failed"
+  pattern        = "{ $.event = \"list_advanceable_failed\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "ListAdvanceableFailedCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "list_advanceable_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-list-advanceable-failed"
+  alarm_description = "_list_advanceable_agents raised an unhandled exception during the supervisor tick (${var.environment}). Check ${aws_cloudwatch_log_group.dispatcher.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "ListAdvanceableFailedCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.supervisor_tick_failure_threshold
+  period              = var.supervisor_tick_failure_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_log_metric_filter" "recover_scan_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-recover-scan-failed"
+  pattern        = "{ $.event = \"recover_scan_failed\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "RecoverScanFailedCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "recover_scan_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-recover-scan-failed"
+  alarm_description = "_recover_scan raised an unhandled exception during the supervisor tick (${var.environment}). Check ${aws_cloudwatch_log_group.dispatcher.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "RecoverScanFailedCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.supervisor_tick_failure_threshold
+  period              = var.supervisor_tick_failure_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_log_metric_filter" "resume_scan_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-resume-scan-failed"
+  pattern        = "{ $.event = \"resume_scan_failed\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "ResumeScanFailedCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "resume_scan_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-resume-scan-failed"
+  alarm_description = "_resume_scan raised an unhandled exception during the supervisor tick (${var.environment}). Check ${aws_cloudwatch_log_group.dispatcher.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "ResumeScanFailedCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.supervisor_tick_failure_threshold
+  period              = var.supervisor_tick_failure_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_log_metric_filter" "observe_external_terminal_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-observe-external-terminal-failed"
+  pattern        = "{ $.event = \"observe_external_terminal_failed\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "ObserveExternalTerminalFailedCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "observe_external_terminal_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-observe-external-terminal-failed"
+  alarm_description = "_observe_external_terminal raised an unhandled exception during the supervisor tick (${var.environment}). Check ${aws_cloudwatch_log_group.dispatcher.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "ObserveExternalTerminalFailedCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.supervisor_tick_failure_threshold
+  period              = var.supervisor_tick_failure_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
+
+resource "aws_cloudwatch_log_metric_filter" "reap_agent_tasks_select_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  name           = "${local.service_name}-reap-agent-tasks-select-failed"
+  pattern        = "{ $.event = \"reap_agent_tasks_select_failed\" }"
+  log_group_name = aws_cloudwatch_log_group.dispatcher.name
+
+  metric_transformation {
+    name          = "ReapAgentTasksSelectFailedCount"
+    namespace     = "Judgemind/Dispatcher"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "reap_agent_tasks_select_failed" {
+  count = var.enable_alerts ? 1 : 0
+
+  alarm_name        = "${local.service_name}-reap-agent-tasks-select-failed"
+  alarm_description = "_reap_agent_tasks raised an unhandled exception during the supervisor tick (${var.environment}). Check ${aws_cloudwatch_log_group.dispatcher.name}."
+
+  namespace   = "Judgemind/Dispatcher"
+  metric_name = "ReapAgentTasksSelectFailedCount"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = var.supervisor_tick_failure_threshold
+  period              = var.supervisor_tick_failure_window_seconds
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+}
