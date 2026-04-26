@@ -182,6 +182,16 @@ class TestTierSetsIncludeNewCategories:
             FAILURE_CATEGORY_PHASE_OUTPUT_MISSING in TIER_2_FIRST_OCCURRENCE_CATEGORIES
         )
 
+    def test_phase_output_fetch_failed_in_tier2_first_occurrence(self) -> None:
+        """#3385 — DB-layer fetch errors route through the diagnoser on first
+        occurrence so the diagnoser can pick retry vs escalate based on
+        whether the failure is transient or persistent.
+        """
+        assert (
+            daemon.FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED
+            in TIER_2_FIRST_OCCURRENCE_CATEGORIES
+        )
+
     def test_regression_ac_infeasible_categories_still_tier3(self) -> None:
         assert FAILURE_CATEGORY_RALPH_AC_INFEASIBLE in TIER_3_CATEGORIES
         assert FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE in TIER_3_CATEGORIES

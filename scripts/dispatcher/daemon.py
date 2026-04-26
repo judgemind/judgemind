@@ -1046,6 +1046,22 @@ VERIFY_SKIP_REASON_SELF_DEPLOY = "self_deploy"
 #: issue lands.
 _SELF_DEPLOY_PATH_PREFIXES: tuple[str, ...] = ("scripts/dispatcher/",)
 
+
+class PhaseOutputFetchError(RuntimeError):
+    """Raised by :meth:`DispatcherDaemon._fetch_phase_output` when a psycopg
+    (or other DB-layer) exception prevents reading the
+    ``dispatcher.phase_outputs`` row.
+
+    The underlying exception is available as ``__cause__`` so callers can
+    include it in the ``stderr_tail`` passed to
+    :meth:`DispatcherDaemon._handle_agent_failure`.
+
+    Distinct from the "row not found" case (which still returns ``None``) —
+    this exception signals a transient infrastructure failure, not a missing
+    row. Issue #3385.
+    """
+
+
 #: Failure category written when the daemon restart-recovery sweep
 #: reclaims a ``status='running'`` agent left behind by the previous
 #: daemon run. Tier-1 mechanical retry category — the agent gets a
@@ -1158,6 +1174,20 @@ FAILURE_CATEGORY_GIT_PUSH_NETWORK = "git_push_network"
 #: or skill bug); hardcoded retry does not help.
 FAILURE_CATEGORY_PR_CREATE_FAILED = "pr_create_failed"
 FAILURE_CATEGORY_PHASE_OUTPUT_MISSING = "phase_output_missing"
+
+#: Tier-2 first-occurrence category from issue #3385 — a psycopg (or
+#: other DB-layer) exception prevented reading the
+#: ``dispatcher.phase_outputs`` row inside
+#: :meth:`DispatcherDaemon._fetch_phase_output`. The three hot-path call
+#: sites in ``_run_ralph_phase``, ``_run_summary_phase``, and
+#: ``_push_and_open_pr`` all raise :class:`PhaseOutputFetchError` on
+#: exception (pre-#3385 they silently returned ``None`` which let the
+#: ``or {}`` patterns propagate empty ``commit_message`` / ``pr_title``
+#: / ``unmet_criteria`` fields). The diagnoser picks ``retry`` /
+#: ``retry_with_hint`` / ``escalate`` based on the transient vs
+#: persistent nature of the failure. Mirrors the ``phase_output_missing``
+#: shape — same tier, same ``details`` schema, same routing.
+FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED = "phase_output_fetch_failed"
 
 #: Tier-2 first-occurrence category from issue #3067 — the daemon-side
 #: ``git commit --amend`` invoked by ``_push_and_open_pr`` after ralph
@@ -1515,6 +1545,7 @@ TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
         FAILURE_CATEGORY_GIT_COMMIT_FAILED,  # #3067
         FAILURE_CATEGORY_FIX_CI_APPLY_FAILED,  # #3069
         FAILURE_CATEGORY_DEPLOY_FAILED,  # #3070
+        FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED,  # #3385
     }
 )
 
@@ -10675,7 +10706,23 @@ class DispatcherDaemon:
         )
         # ── end prior-attempt context ──────────────────────────────────────
 
-        plan_output = self._fetch_phase_output(agent_id, "plan") or {}
+        # Issue #3385: catch PhaseOutputFetchError so a transient DB
+        # hiccup does not silently propagate an empty plan dict into
+        # the ralph input bundle. The diagnoser picks retry vs escalate.
+        try:
+            plan_output = self._fetch_phase_output(agent_id, "plan") or {}
+        except PhaseOutputFetchError as _fetch_exc:
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="ralph",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED,
+                stderr_tail=str(_fetch_exc.__cause__)[:512],
+                exit_code=None,
+                details={"fetch_phase": "plan", "issue_number": issue_number},
+                issue_number=issue_number,
+            )
+            return False
+
         ralph_input = {
             "agent_id": agent_id,
             "issue_number": issue_number,
@@ -10897,7 +10944,24 @@ class DispatcherDaemon:
         except Exception:  # pragma: no cover — defensive; not asserted in unit tests
             git_diff = ""
 
-        ralph_output = self._fetch_phase_output(agent_id, "ralph") or {}
+        # Issue #3385: catch PhaseOutputFetchError so a transient DB error
+        # in either the ralph or plan fetch does not silently produce an
+        # empty summary input bundle. Both fetches share one handler since
+        # they feed the same input file and have the same failure action.
+        try:
+            ralph_output = self._fetch_phase_output(agent_id, "ralph") or {}
+        except PhaseOutputFetchError as _fetch_exc:
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="summary",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED,
+                stderr_tail=str(_fetch_exc.__cause__)[:512],
+                exit_code=None,
+                details={"fetch_phase": "ralph", "issue_number": issue_number},
+                issue_number=issue_number,
+            )
+            return False
+
         changed_files = ralph_output.get("changed_files", []) or []
         # Fall back to a git-state read if ralph didn't populate
         # changed_files (non-testable short-circuit path).
@@ -10943,7 +11007,22 @@ class DispatcherDaemon:
                 "parent_issue": None,
             }
 
-        plan_output = self._fetch_phase_output(agent_id, "plan") or {}
+        # Issue #3385: plan fetch shares the same failure action — route
+        # through _handle_agent_failure if the DB is unavailable.
+        try:
+            plan_output = self._fetch_phase_output(agent_id, "plan") or {}
+        except PhaseOutputFetchError as _fetch_exc:
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="summary",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED,
+                stderr_tail=str(_fetch_exc.__cause__)[:512],
+                exit_code=None,
+                details={"fetch_phase": "plan", "issue_number": issue_number},
+                issue_number=issue_number,
+            )
+            return False
+
         # Branch name matches ``_create_worktree``'s naming convention.
         short_id = agent_id.replace("-", "")[:AGENT_SHORT_ID_HEX_CHARS]
         branch = f"agent/{short_id}"
@@ -11812,7 +11891,25 @@ class DispatcherDaemon:
             )
             return
 
-        summary_output = self._fetch_phase_output(agent_id, "summary") or {}
+        # Issue #3385: catch PhaseOutputFetchError so a transient DB error
+        # does not silently produce an empty commit_message / pr_title /
+        # unmet_criteria — which would either open a garbage PR or silently
+        # fall through to the summary_output_incomplete branch with no
+        # failure row. The diagnoser picks retry vs escalate.
+        try:
+            summary_output = self._fetch_phase_output(agent_id, "summary") or {}
+        except PhaseOutputFetchError as _fetch_exc:
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="push_and_pr",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED,
+                stderr_tail=str(_fetch_exc.__cause__)[:512],
+                exit_code=None,
+                details={"fetch_phase": "summary", "issue_number": issue_number},
+                issue_number=issue_number,
+            )
+            return
+
         unmet_criteria = [str(u) for u in (summary_output.get("unmet_criteria") or [])]
         is_needs_review = bool(unmet_criteria)
         commit_message = summary_output.get("commit_message") or ""
@@ -15321,7 +15418,14 @@ class DispatcherDaemon:
         return int(row[0])
 
     def _fetch_phase_output(self, agent_id: str, phase: str) -> dict[str, Any] | None:
-        """SELECT a single ``dispatcher.phase_outputs`` row JSON, or None."""
+        """SELECT a single ``dispatcher.phase_outputs`` row JSON, or None.
+
+        Returns ``None`` when the row does not exist yet (normal "not ready"
+        case). Raises :class:`PhaseOutputFetchError` on any DB-layer
+        exception so callers can route the failure through
+        :meth:`_handle_agent_failure` instead of silently propagating an
+        empty ``{}`` payload. Issue #3385.
+        """
         assert self._conn is not None, "connect() must run before reading"
         try:
             with self._conn.cursor() as cur:
@@ -15332,7 +15436,7 @@ class DispatcherDaemon:
                 )
                 row = cur.fetchone()
             self._conn.commit()
-        except Exception:
+        except Exception as exc:
             self._log.exception(
                 "daemon.fetch_phase_output_failed",
                 extra={
@@ -15346,7 +15450,9 @@ class DispatcherDaemon:
                 self._conn.rollback()
             except Exception:  # pragma: no cover
                 pass
-            return None
+            raise PhaseOutputFetchError(
+                f"DB error fetching phase_outputs for agent={agent_id} phase={phase}"
+            ) from exc
         if row is None:
             return None
         raw = row[0]
