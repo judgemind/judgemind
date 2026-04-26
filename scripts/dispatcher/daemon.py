@@ -252,6 +252,38 @@ WATCHDOG_THREAD_DUMP_MAX_FRAMES_PER_THREAD = 20
 #: to a config key if we end up needing per-environment overrides.
 SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS = 5.0
 
+#: Per-step slow-warning threshold for :meth:`supervisor_tick` (#3403).
+#: Mirror of :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS` for the
+#: supervisor sub-steps (heartbeat update, failures count, stuck-agent
+#: scan, gh-rate guard, orphan-PR resurrection, advance pass, retry
+#: marker drain, diagnoser circuit-breaker / reap / spawn, scheduled
+#: skills, heartbeat metric emit). Supervisor steps are inherently
+#: slower than scheduler steps — the advance pass calls ``gh pr view``
+#: per agent, the diagnoser pass spawns subprocesses — so the threshold
+#: is set higher (10s vs 5s) to avoid spurious WARNs on a normal busy
+#: tick while still firing well before the watchdog WARN at 60s. Not
+#: operator-tunable today; flip to a config key if per-environment
+#: overrides are needed.
+SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS = 10.0
+
+#: Watchdog heartbeat log cadence (#3403). The :meth:`_watchdog_loop`
+#: thread emits a ``daemon.watchdog_heartbeat`` INFO line every Nth
+#: poll cycle (poll interval is :data:`WATCHDOG_POLL_INTERVAL_SECONDS`,
+#: so 10 polls × 30s = one heartbeat every 5 minutes). The heartbeat is
+#: unconditional — it fires regardless of whether the scheduler or
+#: supervisor ticks are emitting, giving an "even-if-everything-else-stops
+#: the watchdog itself is alive" liveness signal in CloudWatch. The
+#: heartbeat carries the elapsed gap to the last scheduler tick + the
+#: WARN/EXIT thresholds so the operator can interpret a single line
+#: without cross-referencing scheduler_tick events.
+#:
+#: 5min cadence chosen as a compromise: short enough that an operator
+#: glancing at recent logs sees daemon-is-alive evidence within one
+#: scroll, long enough that we don't drown out the actual tick events.
+#: The watchdog already emits WARN/EXIT events on stall — the heartbeat
+#: only exists to confirm the watchdog itself is running.
+WATCHDOG_HEARTBEAT_LOG_EVERY_N_POLLS = 10
+
 #: Periodic faulthandler stderr-dump cadence (#3205). At daemon startup
 #: we arm :func:`faulthandler.dump_traceback_later(FAULTHANDLER_DUMP_INTERVAL_SECONDS,
 #: repeat=True)` so every live Python thread's stack prints to stderr
@@ -21800,6 +21832,14 @@ class DispatcherDaemon:
     def supervisor_tick(self) -> dict[str, int]:
         """Run one supervisor tick. Writes heartbeat; advances running agents.
 
+        **#3403 instrumentation.** Each major sub-step is bracketed by
+        a :meth:`_record_supervisor_step` call that (a) refreshes
+        ``_last_scheduler_tick_at`` so the watchdog observes forward
+        progress mid-supervisor-tick, and (b) emits a
+        ``daemon.supervisor_tick_slow_<step>`` WARNING if the sub-step
+        exceeds :data:`SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS`. Mirrors
+        the #3205 pattern in :meth:`scheduler_tick`.
+
         Steps (in order):
             1. UPDATE ``dispatcher.runs.heartbeat_ts`` — keeps the lease
                alive and signals to the ``HeartbeatAge`` CloudWatch
@@ -21838,6 +21878,18 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before ticks"
         assert self._run_id is not None, "register the run before ticking"
 
+        # #3403 — per-step instrumentation chain. Mirrors the #3205
+        # ``t_step`` chain in :meth:`scheduler_tick` so the watchdog
+        # observes forward progress mid-supervisor-tick AND a wedged
+        # sub-step is named in a ``daemon.supervisor_tick_slow_<step>``
+        # WARNING before the watchdog has to dump the whole thread set.
+        # Each ``self._record_supervisor_step(...)`` call also refreshes
+        # ``_last_scheduler_tick_at``, so a long supervisor tick is
+        # treated as "alive" by the watchdog as long as the steps are
+        # individually progressing.
+        t_step = time.monotonic()
+        self._last_scheduler_tick_at = t_step
+
         failures_last_hour = 0
 
         with self._conn.cursor() as cur:
@@ -21857,6 +21909,7 @@ class DispatcherDaemon:
             if row is not None:
                 failures_last_hour = int(row[0] or 0)
         self._conn.commit()
+        t_step = self._record_supervisor_step("heartbeat_and_failures", t_step)
 
         # Phase 3C (#2791): stuck-timeout scan. Runs first so any newly
         # crashed agents land retry markers early in the tick, giving
@@ -21875,6 +21928,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("stuck_check", t_step)
 
         # Phase 3C (#2791): rate-limit guard. Write the failure row +
         # set the skip flag before the 3B advance pass so this tick
@@ -21889,6 +21943,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("gh_rate_check", t_step)
 
         rate_skip_active = self._gh_rate_skip_active()
 
@@ -21914,6 +21969,7 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
+        t_step = self._record_supervisor_step("orphan_pr_resurrect", t_step)
 
         # Phase 3B (#2787): advance agents that are past push_and_pr.
         # Wrapped in try/except — the heartbeat + metric emission below
@@ -21944,6 +22000,7 @@ class DispatcherDaemon:
                         "run_id": self._run_id,
                     },
                 )
+        t_step = self._record_supervisor_step("advance_running_agents", t_step)
 
         # Phase 3C (#2791): drain due retry markers. Runs AFTER the
         # advance pass so a marker created earlier in this tick (via
@@ -21961,6 +22018,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("retry_markers", t_step)
 
         # Phase 3D (#2795): circuit breaker + diagnoser pass. The
         # breaker check runs FIRST so a bad 24h window disables the
@@ -21983,6 +22041,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("diagnoser_circuit_breaker", t_step)
         # Issue #3376: reap completed/timed-out async diagnosers
         # FIRST so the slot count is current before the spawn pass
         # checks the cap. The reaper is the consumer side of the
@@ -22000,6 +22059,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("diagnoser_reap", t_step)
         diagnoses_ran = 0
         try:
             diagnoses_ran = self._run_diagnoser_pass()
@@ -22011,6 +22071,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("diagnoser_run", t_step)
 
         # Issue #3374 — generalized scheduled-skills tick. Iterates
         # ``dispatcher.scheduled_skills`` and fires due skills (audit,
@@ -22035,6 +22096,7 @@ class DispatcherDaemon:
                     "run_id": self._run_id,
                 },
             )
+        t_step = self._record_supervisor_step("scheduled_skills", t_step)
 
         self._supervisor_ticks += 1
         self._last_heartbeat_at = datetime.now(UTC)
@@ -22045,6 +22107,7 @@ class DispatcherDaemon:
         # indicator for the alarm in
         # ``infra/terraform/modules/dispatcher-daemon/main.tf``.
         metric_emitted = self._emit_heartbeat_metric()
+        t_step = self._record_supervisor_step("heartbeat_metric_emit", t_step)
 
         self._log.info(
             "daemon.supervisor_tick",
@@ -23580,6 +23643,50 @@ class DispatcherDaemon:
             )
         return now
 
+    def _record_supervisor_step(self, step: str, t_before: float) -> float:
+        """Refresh the watchdog heartbeat + warn on slow supervisor steps (#3403).
+
+        Mirror of :meth:`_record_scheduler_step` for :meth:`supervisor_tick`.
+        Called between each major sub-step so:
+
+        * The :meth:`_watchdog_loop` thread observes forward progress
+          mid-supervisor-tick — pre-#3403 a long supervisor step (e.g. a
+          slow ``_advance_running_agents`` pass, an unresponsive
+          ``cloudwatch:PutMetricData``, a wedged ``gh pr view``) only
+          refreshed ``_last_scheduler_tick_at`` at the end of the
+          supervisor tick, so a wedge mid-supervisor would still trip
+          the watchdog after 60s but the log would name the whole tick
+          rather than the offending sub-step.
+        * A ``daemon.supervisor_tick_slow_<step>`` WARNING fires the moment
+          a sub-step exceeds :data:`SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS`,
+          producing a self-diagnosing log line BEFORE the watchdog has to
+          dump the whole thread set.
+
+        Returns ``time.monotonic()`` so callers can chain
+        ``t_step = _record_supervisor_step("foo", t_step)`` between
+        sub-steps without re-reading the clock.
+
+        The single-writer (supervisor thread, which on the daemon is the
+        same as the main run-forever thread) / single-reader (watchdog
+        thread) atomic-float-assignment semantics are identical to
+        :meth:`_record_scheduler_step` — see that method's docstring.
+        """
+        now = time.monotonic()
+        elapsed = now - t_before
+        self._last_scheduler_tick_at = now
+        if elapsed >= SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS:
+            self._log.warning(
+                f"daemon.supervisor_tick_slow_{step}",
+                extra={
+                    "event": f"supervisor_tick_slow_{step}",
+                    "run_id": self._run_id,
+                    "step": step,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "threshold_seconds": SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS,
+                },
+            )
+        return now
+
     def _emit_scheduler_stall_warning(self, elapsed_seconds: float) -> None:
         """Log a WARNING ``scheduler_tick_stalled`` with a thread dump.
 
@@ -23665,7 +23772,7 @@ class DispatcherDaemon:
         )
 
     def _watchdog_loop(self) -> None:
-        """Run the supervisor watchdog thread (#3097).
+        """Run the supervisor watchdog thread (#3097, #3403 heartbeat).
 
         Wakes every :data:`WATCHDOG_POLL_INTERVAL_SECONDS`. If the gap
         between ``time.monotonic()`` and
@@ -23673,6 +23780,17 @@ class DispatcherDaemon:
         emit a one-shot WARNING with a bounded thread dump. If the gap
         exceeds the EXIT threshold, emit an ERROR with a final thread
         dump and call ``os._exit(137)``.
+
+        #3403 — every :data:`WATCHDOG_HEARTBEAT_LOG_EVERY_N_POLLS` polls
+        (default 10 × 30s = 5min cadence) the loop emits a
+        ``daemon.watchdog_heartbeat`` INFO event carrying the current
+        elapsed-since-tick gap and the WARN/EXIT thresholds. The
+        heartbeat is unconditional — even if the scheduler and
+        supervisor stop emitting, an operator scanning CloudWatch can
+        confirm from this thread alone that the daemon process is alive
+        and the watchdog is monitoring it. The heartbeat does NOT
+        replace the WARN/EXIT events; it is a liveness signal in
+        addition to them.
 
         Opens its own psycopg connection so the thresholds can be read
         via ``_cb_config_int`` without contending with the main
@@ -23721,6 +23839,13 @@ class DispatcherDaemon:
             },
         )
 
+        # #3403 — Track poll iterations so we can emit an unconditional
+        # ``daemon.watchdog_heartbeat`` every N polls (default 10 × 30s
+        # = 5 minutes). Even if the scheduler / supervisor go fully
+        # silent the heartbeat continues to fire from this thread — it
+        # is the bottom-most observability signal that "the daemon
+        # process is alive and the watchdog is monitoring it."
+        watchdog_poll_n = 0
         try:
             while not self._watchdog_stop.is_set():
                 try:
@@ -23751,6 +23876,28 @@ class DispatcherDaemon:
                                 },
                             )
                         self._watchdog_warn_emitted_for_gap = False
+
+                    # #3403 — unconditional liveness heartbeat. Fires
+                    # every Nth poll regardless of scheduler/supervisor
+                    # state, so an operator scanning CloudWatch can
+                    # confirm "the watchdog itself is running" even
+                    # during a sustained log-quiet stretch.
+                    watchdog_poll_n += 1
+                    if watchdog_poll_n % WATCHDOG_HEARTBEAT_LOG_EVERY_N_POLLS == 0:
+                        self._log.info(
+                            "daemon.watchdog_heartbeat",
+                            extra={
+                                "event": "watchdog_heartbeat",
+                                "run_id": self._run_id,
+                                "poll_n": watchdog_poll_n,
+                                "elapsed_since_tick_s": round(elapsed, 1),
+                                "warn_threshold_seconds": warn_threshold,
+                                "exit_threshold_seconds": exit_threshold,
+                                "warn_emitted_for_current_gap": (
+                                    self._watchdog_warn_emitted_for_gap
+                                ),
+                            },
+                        )
                 except Exception:  # pragma: no cover — defensive
                     # Any watchdog exception is logged and the loop
                     # continues — a bug in the watchdog must not disable
