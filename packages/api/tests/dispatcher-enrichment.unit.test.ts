@@ -1557,6 +1557,69 @@ describe('GraphQL schema — BlockerRef type (issue #2989)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Issue #3425 — issueNumber is nullable on DispatcherAgent + RecentCompletion
+//
+// Scheduled-skill agents (`/audit`, `/spotcheck`, `/dispatcher-daily-report`)
+// have `dispatcher.agents.issue_number = NULL` by design — they're not
+// addressing a GitHub issue (migration 49 / issue #3381). Pre-#3425 the
+// schema declared these GraphQL fields as `Int!` (non-null), which caused
+// the entire `dispatcherState` query to 500 the moment a scheduled-skill
+// agent landed in `activeAgents` or `recentCompletions`: the GraphQL
+// serializer threw on NULL → Int! and every panel went dark for the
+// operator. Pinning the nullability here so a future cleanup doesn't
+// silently re-introduce the regression.
+//
+// `QueueItem.issueNumber` stays `Int!` — queue items are GitHub issues
+// by definition, never scheduled-skill agent rows.
+// ---------------------------------------------------------------------------
+describe('GraphQL schema — issueNumber nullability (issue #3425)', () => {
+  const baseSchema = `
+    type Query { _noop: Boolean }
+    type Mutation { _noop: Boolean }
+  `;
+
+  it('DispatcherAgent.issueNumber is nullable (Int, not Int!)', () => {
+    const schema = buildSchema(baseSchema + dispatcherTypeDefs);
+    const agentType = schema.getType('DispatcherAgent') as import('graphql').GraphQLObjectType;
+    expect(agentType).toBeTruthy();
+    const issueNumberField = agentType.getFields()['issueNumber'];
+    expect(issueNumberField).toBeTruthy();
+    expect(issueNumberField.type.toString()).toBe('Int');
+  });
+
+  it('RecentCompletion.issueNumber is nullable (Int, not Int!)', () => {
+    const schema = buildSchema(baseSchema + dispatcherTypeDefs);
+    const completionType = schema.getType('RecentCompletion') as import('graphql').GraphQLObjectType;
+    expect(completionType).toBeTruthy();
+    const issueNumberField = completionType.getFields()['issueNumber'];
+    expect(issueNumberField).toBeTruthy();
+    expect(issueNumberField.type.toString()).toBe('Int');
+  });
+
+  it('DispatcherFailure.issueNumber is nullable (regression guard)', () => {
+    // Already nullable pre-#3425 because failures can predate their agent
+    // (joins via `agents.issue_number`). Pin it so the bulk-edit doesn't
+    // accidentally flip it.
+    const schema = buildSchema(baseSchema + dispatcherTypeDefs);
+    const failureType = schema.getType('DispatcherFailure') as import('graphql').GraphQLObjectType;
+    expect(failureType).toBeTruthy();
+    const issueNumberField = failureType.getFields()['issueNumber'];
+    expect(issueNumberField.type.toString()).toBe('Int');
+  });
+
+  it('QueueItem.issueNumber stays Int! (queue items are always GitHub issues)', () => {
+    // Sanity guard: the bulk-flip-to-nullable in #3425 must not touch
+    // QueueItem. Queue items come from agent/ready scans of GitHub
+    // issues, never from `dispatcher.agents.issue_number`.
+    const schema = buildSchema(baseSchema + dispatcherTypeDefs);
+    const queueItemType = schema.getType('QueueItem') as import('graphql').GraphQLObjectType;
+    expect(queueItemType).toBeTruthy();
+    const issueNumberField = queueItemType.getFields()['issueNumber'];
+    expect(issueNumberField.type.toString()).toBe('Int!');
+  });
+});
+
 describe('queueItemFromSnapshot — BlockerRef shape (issue #2989)', () => {
   it('AC3: legacy row with blockedBy=number[] wraps to [{number, title: null}]', () => {
     // Pre-migration snapshot: daemon wrote blockedBy as number[] or body-only.

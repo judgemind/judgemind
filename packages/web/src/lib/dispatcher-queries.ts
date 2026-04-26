@@ -194,7 +194,12 @@ export interface DispatcherRun {
 
 export interface DispatcherAgent {
   id: string;
-  issueNumber: number;
+  /** Issue number the agent is working on. Nullable for
+   * scheduled-skill agents (`/audit`, `/spotcheck`,
+   * `/dispatcher-daily-report`) which have no closing GitHub issue —
+   * see migration 49 (issue #3381) and bug #3425. The cockpit renders
+   * the null case via `IssueLink`'s null branch (em-dash placeholder). */
+  issueNumber: number | null;
   /** Issue title captured at claim time from the queue-snapshot
    * enrichment (#2820). Null for pre-migration-28 rows or when the
    * issue was not in the snapshot at claim time — the UI renders
@@ -275,7 +280,11 @@ export interface QueueItem {
 
 export interface RecentCompletion {
   agentId: string;
-  issueNumber: number;
+  /** Issue the agent was working on. Nullable for scheduled-skill
+   * agents (`/audit`, `/spotcheck`, `/dispatcher-daily-report`) which
+   * have no closing GitHub issue — see migration 49 (issue #3381) and
+   * bug #3425. */
+  issueNumber: number | null;
   issueTitle: string | null;
   /** Priority label captured at claim time — `p0` | `p1` | `p2` | `p3`
    * | null. Same semantics as `DispatcherAgent.priority`; pre-migration-33

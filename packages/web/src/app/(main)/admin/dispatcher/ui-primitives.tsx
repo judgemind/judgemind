@@ -54,8 +54,39 @@ const BRAND_LINK_CLASSES =
  * attribute for a browser tooltip — used by `QueueRow` to surface
  * blocker details on the `#NNNN` link in the Queue: Blocked panel
  * (issue #2989). Pass `undefined` (or omit) for no tooltip.
+ *
+ * `number={null}` renders an em-dash placeholder span instead of an
+ * anchor — used by panels that surface scheduled-skill agents (audit,
+ * spotcheck, daily-report) whose `dispatcher.agents.issue_number` is
+ * NULL by design (migration 49 / issue #3381). Bug #3425: the prior
+ * non-nullable signature crashed the entire dispatcher cockpit
+ * (server-side `Int!` serializer threw on NULL → all panels dark)
+ * once a scheduled-skill agent landed in the active or recently-
+ * completed lists. Centralizing the null branch on `IssueLink` means
+ * every call site (ActiveAgentsTable, RecentCompletionsPanel,
+ * RecentFailuresPanel, QueueFullDialog via RecentCompletionRow) gets
+ * the placeholder for free without per-site guards.
  */
-export function IssueLink({ number, className, title }: { number: number; className?: string; title?: string }) {
+export function IssueLink({
+  number,
+  className,
+  title,
+}: {
+  number: number | null;
+  className?: string;
+  title?: string;
+}) {
+  if (number === null) {
+    return (
+      <span
+        className="font-mono text-muted-foreground"
+        data-testid="issue-link-null"
+        title={title}
+      >
+        &mdash;
+      </span>
+    );
+  }
   const href = `https://github.com/${REPO}/issues/${number}`;
   return (
     <a

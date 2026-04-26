@@ -120,7 +120,16 @@ export const dispatcherTypeDefs = `#graphql
   """
   type DispatcherAgent {
     id: ID!
-    issueNumber: Int!
+    """Issue number the agent is working on. Nullable for
+    scheduled-skill agents (\`/audit\`, \`/spotcheck\`,
+    \`/dispatcher-daily-report\`) which have no closing GitHub
+    issue — see migration 49 (issue #3381) and bug #3425. Pre-#3425
+    this was \`Int!\`, which crashed the entire \`dispatcherState\`
+    GraphQL query when a scheduled-skill agent was running because
+    the serializer threw on NULL → Int!. The cockpit renders the
+    null case as an em-dash placeholder via \`IssueLink\`'s null
+    branch (see \`packages/web/src/app/(main)/admin/dispatcher/ui-primitives.tsx\`)."""
+    issueNumber: Int
     """Issue title captured at claim time by the daemon's
     \`_atomic_claim\` from the queue-snapshot enrichment, issue #2820.
     Null when the issue is not in the snapshot or the row predates
@@ -260,8 +269,14 @@ export const dispatcherTypeDefs = `#graphql
   type RecentCompletion {
     """Agent id (UUID)."""
     agentId: ID!
-    """Issue the agent was working on."""
-    issueNumber: Int!
+    """Issue the agent was working on. Nullable for scheduled-skill
+    agents (\`/audit\`, \`/spotcheck\`, \`/dispatcher-daily-report\`)
+    which have no closing GitHub issue — see migration 49 (issue
+    #3381) and bug #3425. Same nullability change applied to
+    \`DispatcherAgent.issueNumber\` and to the GraphQL \`DispatcherFailure.issueNumber\`
+    field; clients render the null case as an em-dash via the
+    \`IssueLink\` null branch."""
+    issueNumber: Int
     """Priority label captured at claim time — one of p0 | p1 | p2 | p3 | null.
     Same semantics as \`DispatcherAgent.priority\`: reflects "priority
     when spawned". Pre-migration-33 rows return null (em-dash in the
