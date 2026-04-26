@@ -18971,6 +18971,40 @@ class DispatcherDaemon:
             },
         )
 
+    def _mark_diagnosis_completed(self, diagnosis_id: int) -> None:
+        """UPDATE diagnosis row to ``status='completed'`` after action applied.
+
+        Called by :meth:`_consume_diagnosis` at the END of the success
+        branch, after the directive action has been applied. The SKILL
+        must NOT set ``status='completed'`` — the reaper filters
+        ``WHERE status='pending'``, so premature completion silently
+        drops the directive (issue #3422).
+        """
+        assert self._conn is not None, "connect() must run before diagnosis update"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.diagnoses "
+                    "SET status = 'completed', "
+                    "    completed_at = now() "
+                    "WHERE diagnosis_id = %s",
+                    (diagnosis_id,),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.diagnosis_mark_completed_failed",
+                extra={
+                    "event": "diagnosis_mark_completed_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+
     def _mark_diagnosis_orphaned(self, diagnosis_id: int, reason: str) -> None:
         """UPDATE diagnosis row to ``status='orphaned'`` (issue #3383).
 
@@ -19608,6 +19642,16 @@ class DispatcherDaemon:
                 diagnosis_id, reason="recommendation_missing_or_malformed_json"
             )
             self._apply_mechanical_escalation(candidate)
+            self._log.warning(
+                "daemon.directive_apply_failed",
+                extra={
+                    "event": "directive_apply_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "action": None,
+                    "reason": "recommendation_missing_or_malformed_json",
+                },
+            )
             return "escalate_fallback"
 
         action = self._validate_recommendation(recommendation)
@@ -19656,6 +19700,16 @@ class DispatcherDaemon:
             )
             self._mark_diagnosis_failed(diagnosis_id, reason=reason)
             self._apply_mechanical_escalation(candidate)
+            self._log.warning(
+                "daemon.directive_apply_failed",
+                extra={
+                    "event": "directive_apply_failed",
+                    "run_id": self._run_id,
+                    "diagnosis_id": diagnosis_id,
+                    "action": raw_action if isinstance(raw_action, str) else None,
+                    "reason": reason,
+                },
+            )
             return "escalate_fallback"
 
         # Valid action — dispatch.
@@ -19729,6 +19783,22 @@ class DispatcherDaemon:
                 else 0,
                 reasoning=reasoning,
             )
+
+        # Emit instrumentation and mark the diagnosis completed AFTER the
+        # action handler runs (issue #3422 — the SKILL must NOT set
+        # status='completed'; the daemon owns that transition).
+        self._log.info(
+            "daemon.directive_applied",
+            extra={
+                "event": "directive_applied",
+                "run_id": self._run_id,
+                "diagnosis_id": diagnosis_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "action": action,
+            },
+        )
+        self._mark_diagnosis_completed(diagnosis_id)
 
         return action
 

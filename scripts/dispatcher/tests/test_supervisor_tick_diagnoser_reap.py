@@ -174,6 +174,94 @@ class TestReaperConsumesCompletedDiagnosis:
         assert len(directive_calls) == 1
         assert directive_calls[0]["consumed_action"] == "retry"
 
+    def test_reaper_calls_mark_completed_after_consume_diagnosis(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issue #3422 — the daemon (not the SKILL) writes status='completed'.
+
+        After _consume_diagnosis runs successfully, the reaper must
+        result in _mark_diagnosis_completed being called with the
+        diagnosis_id.  We verify by checking that the fake cursor's
+        ``executed`` queue contains an UPDATE with status='completed'.
+        """
+        from unittest.mock import patch
+
+        d = _make_daemon(tmp_path)
+
+        pending_row = {
+            "diagnosis_id": 51,
+            "subprocess_pid": 22223,
+            "started_at": daemon.datetime.now(daemon.UTC),
+            "failure_id": 101,
+            "agent_id": "agent-test-2",
+            "category": "subprocess_crash",
+            "details": {"issue_number": 5001},
+            "issue_number": 5001,
+        }
+        monkeypatch.setattr(
+            d, "_list_pending_diagnoses_for_reap", lambda: [pending_row]
+        )
+        monkeypatch.setattr(
+            daemon.DispatcherDaemon, "_process_alive", staticmethod(lambda _pid: False)
+        )
+        monkeypatch.setattr(
+            d, "_persist_diagnoser_phase_output", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(d, "_parse_diagnoser_usage", lambda _id: None)
+        monkeypatch.setattr(d, "_read_diagnoser_stderr_tail", lambda _id: None)
+        monkeypatch.setattr(d, "_consume_next_directive", lambda **_kw: "terminal")
+
+        mark_completed_calls: list[int] = []
+
+        with patch.object(
+            d,
+            "_mark_diagnosis_completed",
+            wraps=lambda did: mark_completed_calls.append(did),
+        ):
+            # _consume_diagnosis is real but stubs its inner read to return a valid action.
+            with patch.object(
+                d,
+                "_read_recommendation",
+                return_value={"action": "retry", "reasoning": "t"},
+            ):
+                with patch.object(d, "_consume_action_retry"):
+                    d._reap_diagnoser_subprocesses()
+
+        # The reaper must have triggered _mark_diagnosis_completed(51).
+        assert 51 in mark_completed_calls, (
+            "_mark_diagnosis_completed was not called with diagnosis_id=51 after _consume_diagnosis"
+        )
+
+
+class TestMarkDiagnosisCompleted:
+    """Direct unit tests for _mark_diagnosis_completed (issue #3422)."""
+
+    def test_issues_correct_update_sql(self, tmp_path: Path) -> None:
+        """_mark_diagnosis_completed must UPDATE status='completed' + completed_at."""
+        d = _make_daemon(tmp_path)
+        conn = d._conn  # type: ignore[assignment]
+        d._mark_diagnosis_completed(diagnosis_id=42)
+
+        assert conn.commits == 1
+        assert len(conn.cursor_instance.executed) == 1
+        sql, params = conn.cursor_instance.executed[0]
+        assert "SET status = 'completed'" in sql
+        assert "completed_at = now()" in sql
+        assert "dispatcher.diagnoses" in sql
+        assert params == (42,)
+
+    def test_db_error_does_not_propagate(self, tmp_path: Path) -> None:
+        """A DB error in _mark_diagnosis_completed must not crash the caller."""
+        d = _make_daemon(tmp_path)
+        conn = d._conn  # type: ignore[assignment]
+
+        def _boom(_sql: str, _params: Any = None) -> None:
+            raise RuntimeError("db down")
+
+        conn.cursor_instance.execute = _boom  # type: ignore[assignment]
+        # Must not raise.
+        d._mark_diagnosis_completed(diagnosis_id=99)
+
 
 class TestReaperLeavesAliveAndWithinBudget:
     """Diagnoser still running, within 90-min budget — leave alone."""

@@ -1249,7 +1249,176 @@ class TestRegressionExistingActions:
         with (
             patch.object(d, "_read_recommendation", return_value=rec),
             patch.object(d, "_consume_action_escalate") as mock_handler,
+            patch.object(d, "_mark_diagnosis_completed"),
         ):
             action = d._consume_diagnosis(diagnosis_id=32, candidate=candidate)
         assert action == "escalate"
         mock_handler.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# Issue #3422 — lifecycle: _mark_diagnosis_completed + directive_applied
+# --------------------------------------------------------------------------
+
+
+class TestConsumeDiagnosisLifecycle:
+    """After _consume_diagnosis succeeds, the daemon must:
+    (a) call _mark_diagnosis_completed with the diagnosis_id,
+    (b) emit a daemon.directive_applied log event with the action field.
+
+    For each of the four primary action shapes (close, escalate,
+    block_and_comment, file_prerequisite_task) plus one negative path.
+    """
+
+    _CANDIDATE: dict[str, Any] = {
+        "agent_id": "agent-lc-1",
+        "issue_number": 99002,
+        "category": FAILURE_CATEGORY_PUSH_FAILED,
+    }
+
+    def _run_with_action(
+        self,
+        action: str,
+        rec: dict[str, Any],
+        caplog: Any,
+    ) -> tuple[str, list[int]]:
+        """Helper: run _consume_diagnosis with stubbed handler and capture calls."""
+        import logging
+
+        d = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon")
+        mark_called: list[int] = []
+
+        handler_map = {
+            "close": "_consume_action_close",
+            "escalate": "_consume_action_escalate",
+            "block_and_comment": "_consume_action_block_and_comment",
+            "file_prerequisite_task": "_consume_action_file_prerequisite_task",
+            "retry": "_consume_action_retry",
+        }
+        handler_attr = handler_map.get(action, f"_consume_action_{action}")
+
+        with (
+            patch.object(d, "_read_recommendation", return_value=rec),
+            patch.object(d, handler_attr),
+            patch.object(
+                d,
+                "_mark_diagnosis_completed",
+                side_effect=lambda did: mark_called.append(did),
+            ),
+        ):
+            result = d._consume_diagnosis(diagnosis_id=55, candidate=self._CANDIDATE)
+
+        return result, mark_called
+
+    def test_close_marks_completed_and_emits_event(self, caplog: Any) -> None:
+        rec = {"action": "close", "reasoning": "issue is invalid"}
+        result, mark_called = self._run_with_action("close", rec, caplog)
+        assert result == "close"
+        assert mark_called == [55], (
+            "_mark_diagnosis_completed not called with diagnosis_id=55"
+        )
+        events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "directive_applied"
+        ]
+        assert events, "daemon.directive_applied event not emitted"
+        assert getattr(events[0], "action", None) == "close"
+
+    def test_escalate_marks_completed_and_emits_event(self, caplog: Any) -> None:
+        rec = {"action": "escalate", "reasoning": "needs human"}
+        result, mark_called = self._run_with_action("escalate", rec, caplog)
+        assert result == "escalate"
+        assert mark_called == [55]
+        events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "directive_applied"
+        ]
+        assert events
+        assert getattr(events[0], "action", None) == "escalate"
+
+    def test_block_and_comment_marks_completed_and_emits_event(
+        self, caplog: Any
+    ) -> None:
+        rec = {"action": "block_and_comment", "reasoning": "operator must act"}
+        result, mark_called = self._run_with_action("block_and_comment", rec, caplog)
+        assert result == "block_and_comment"
+        assert mark_called == [55]
+        events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "directive_applied"
+        ]
+        assert events
+        assert getattr(events[0], "action", None) == "block_and_comment"
+
+    def test_file_prerequisite_task_marks_completed_and_emits_event(
+        self, caplog: Any
+    ) -> None:
+        rec = {
+            "action": "file_prerequisite_task",
+            "title": "chore: x",
+            "body": "## Goal\nx",
+            "reasoning": "root cause",
+        }
+        result, mark_called = self._run_with_action(
+            "file_prerequisite_task", rec, caplog
+        )
+        assert result == "file_prerequisite_task"
+        assert mark_called == [55]
+        events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "directive_applied"
+        ]
+        assert events
+        assert getattr(events[0], "action", None) == "file_prerequisite_task"
+
+    def test_malformed_recommendation_fires_failed_events(self, caplog: Any) -> None:
+        """Negative path: malformed recommendation → _mark_diagnosis_failed +
+        daemon.directive_apply_failed fire; _mark_diagnosis_completed does NOT."""
+        import logging
+
+        d = _make_daemon()
+        caplog.set_level(logging.WARNING, logger="test.daemon")
+        candidate = {
+            "agent_id": "agent-lc-1",
+            "issue_number": 99002,
+            "category": FAILURE_CATEGORY_PUSH_FAILED,
+        }
+        mark_failed_calls: list[Any] = []
+        mark_completed_calls: list[Any] = []
+
+        with (
+            patch.object(d, "_read_recommendation", return_value=None),
+            patch.object(d, "_apply_mechanical_escalation"),
+            patch.object(
+                d,
+                "_mark_diagnosis_failed",
+                side_effect=lambda did, **kw: mark_failed_calls.append(did),
+            ),
+            patch.object(
+                d,
+                "_mark_diagnosis_completed",
+                side_effect=lambda did: mark_completed_calls.append(did),
+            ),
+        ):
+            result = d._consume_diagnosis(diagnosis_id=56, candidate=candidate)
+
+        assert result == "escalate_fallback"
+        assert mark_failed_calls == [56], "_mark_diagnosis_failed must fire on fallback"
+        assert mark_completed_calls == [], (
+            "_mark_diagnosis_completed must NOT fire on fallback"
+        )
+
+        apply_failed_events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "directive_apply_failed"
+        ]
+        assert apply_failed_events, "daemon.directive_apply_failed event not emitted"
+        event_rec = apply_failed_events[0]
+        assert getattr(event_rec, "diagnosis_id", None) == 56
+        assert getattr(event_rec, "action", "sentinel") is None
