@@ -2078,3 +2078,146 @@ class TestVerifyRecoveryShortCircuit:
         assert handle_failure_calls[0]["category"] == (
             daemon.FAILURE_CATEGORY_PHASE_OUTPUT_MISSING
         )
+
+
+# --------------------------------------------------------------------------
+# #3468 — _phase_io_root / _write_phase_input / _read_phase_output alignment
+# --------------------------------------------------------------------------
+
+
+class TestVerifyPhaseIoRoot:
+    """Issue #3468 — post-merge phases (verify, retro) run with
+    ``cwd=baseline_repo_root`` in Fargate mode, but the pre-#3468 IO
+    helpers always wrote/read relative to the worktree.  The helpers now
+    use :meth:`~daemon.DispatcherDaemon._phase_io_root` to select the
+    correct root so paths stay aligned with the subprocess cwd.
+
+    Tests in this class cover the verify phase; the retro-phase mirror
+    lives in ``test_daemon_phase3e.TestRetroPhaseIoRoot``."""
+
+    def test_verify_input_written_to_baseline_repo_root_for_post_merge_subprocess(
+        self, tmp_path: Path
+    ) -> None:
+        """In Fargate mode (``baseline_repo_root`` set) the input JSON for
+        ``verify`` must be written under ``{baseline_repo_root}/tmp/
+        dispatcher-input/verify.json`` — that is the path the subprocess
+        resolves when it reads ``tmp/dispatcher-input/verify.json`` from its
+        cwd."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        payload = {"pr_number": 42, "agent_id": "test-agent"}
+        d._write_phase_input(worktree, "verify", payload)
+
+        expected = baseline / "tmp" / "dispatcher-input" / "verify.json"
+        assert expected.exists(), (
+            f"Input JSON must be written to baseline_repo_root: {expected}"
+        )
+        assert json.loads(expected.read_text()) == payload
+
+    def test_verify_input_also_present_in_worktree_for_post_merge(
+        self, tmp_path: Path
+    ) -> None:
+        """Belt-and-suspenders: ``_write_phase_input`` for a post-merge
+        phase must ALSO write to ``{worktree}/tmp/dispatcher-input/
+        verify.json`` so that acceptance-criteria checks that look at the
+        worktree path continue to pass (AC #1)."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        payload = {"pr_number": 42, "agent_id": "test-agent"}
+        d._write_phase_input(worktree, "verify", payload)
+
+        wt_path = worktree / "tmp" / "dispatcher-input" / "verify.json"
+        assert wt_path.exists(), (
+            f"Input JSON must also be written to worktree for AC #1: {wt_path}"
+        )
+        assert json.loads(wt_path.read_text()) == payload
+
+    def test_verify_read_phase_output_prefers_baseline_root(
+        self, tmp_path: Path
+    ) -> None:
+        """When the verify subprocess writes its output to
+        ``{baseline_repo_root}/tmp/dispatcher-output/verify.json``
+        (because cwd=baseline_repo_root), ``_read_phase_output`` must
+        return that content rather than returning ``None`` because the
+        worktree-relative path is empty."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        # Write output only at the baseline path — worktree path is absent.
+        out_dir = baseline / "tmp" / "dispatcher-output"
+        out_dir.mkdir(parents=True)
+        expected_output = {"verdict": "VERIFIED", "evidence": "curl 200"}
+        (out_dir / "verify.json").write_text(json.dumps(expected_output))
+
+        result = d._read_phase_output(worktree, "verify")
+        assert result == expected_output, (
+            f"_read_phase_output must prefer the baseline-root path; got {result!r}"
+        )
+
+    def test_verify_read_phase_output_falls_back_to_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        """Fallback: when the baseline-root output file is absent (e.g. ECS
+        mode where subprocess writes relative to worktree), ``_read_phase_output``
+        must return the worktree-relative file's contents."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        # No baseline_repo_root → local-dev / ECS mode.
+        assert d._cfg.baseline_repo_root is None
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        out_dir = worktree / "tmp" / "dispatcher-output"
+        out_dir.mkdir(parents=True)
+        expected_output = {"verdict": "VERIFIED", "evidence": "log line"}
+        (out_dir / "verify.json").write_text(json.dumps(expected_output))
+
+        result = d._read_phase_output(worktree, "verify")
+        assert result == expected_output, (
+            f"_read_phase_output must fall back to worktree path; got {result!r}"
+        )
+
+    def test_plan_input_only_written_to_worktree_not_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression guard: non-post-merge phases (``plan``) must NOT
+        dual-write to ``baseline_repo_root``.  Only the worktree path is
+        written, so the IO-root selection has no side-effect on pre-merge
+        phases even when ``baseline_repo_root`` is configured."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        d._cfg.baseline_repo_root = baseline
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        payload = {"issue_number": 99}
+        d._write_phase_input(worktree, "plan", payload)
+
+        # Worktree path written.
+        wt_path = worktree / "tmp" / "dispatcher-input" / "plan.json"
+        assert wt_path.exists(), f"Plan input must be written to worktree: {wt_path}"
+
+        # Baseline path must NOT be written for a pre-merge phase.
+        baseline_path = baseline / "tmp" / "dispatcher-input" / "plan.json"
+        assert not baseline_path.exists(), (
+            f"Plan input must NOT be written to baseline_repo_root: {baseline_path}"
+        )
