@@ -126,6 +126,8 @@ chmod +x "$STUB_BIN/psql"
 # ── claude stub ────────────────────────────────────────────────────────────
 # Records the slash-command invoked and emits a canned envelope. Honors
 # CLAUDE_VERDICT_OVERRIDE for synthetic-skill verdict assertions.
+# When CLAUDE_SKILL_PHASE_STATUS_FILE is set, simulates phase transitions
+# by writing to the status file (used by Test 4 / skill_phase_watcher).
 cat > "$STUB_BIN/claude" <<'CLAUDEEOF'
 #!/usr/bin/env bash
 set -u
@@ -142,6 +144,16 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Simulate skill phase transitions when the watcher test sets this file.
+if [[ -n "${CLAUDE_SKILL_PHASE_STATUS_FILE:-}" ]]; then
+    printf 'phase: spotcheck-step-2\nsummary: running checks\n' \
+        > "$CLAUDE_SKILL_PHASE_STATUS_FILE"
+    sleep 2
+    printf 'phase: done\nsummary: complete\n' \
+        > "$CLAUDE_SKILL_PHASE_STATUS_FILE"
+    sleep 1
+fi
 
 # Emit the requested envelope. Default = SHIPPED-style success result.
 if [[ -n "${CLAUDE_RESULT_OVERRIDE:-}" ]]; then
@@ -402,38 +414,6 @@ mkdir -p "$watcher_status_dir"
 printf 'phase: spotcheck-step-1\nsummary: starting\n' \
     > "$watcher_status_dir/$WATCHER_AGENT_ID.txt"
 
-# Write a specialised claude stub that advances phase then exits success.
-# Sleep 2s between writes so the 1s poll catches each transition.
-cat > "$STUB_BIN/claude" <<'CLAUDEPHASEEOF'
-#!/usr/bin/env bash
-set -u
-INVOCATIONS_DIR="${INVOCATIONS_DIR}"
-. "$(dirname "$0")/_record_invocation.sh" claude "$@"
-
-for arg in "$@"; do
-    case "$arg" in
-        /*)
-            cmd=$(printf '%s' "$arg" | awk '{print $1}')
-            printf '%s\n' "$cmd" >> "$INVOCATIONS_DIR/claude-slash-cmd.log"
-            break
-            ;;
-    esac
-done
-
-if [[ -n "${CLAUDE_SKILL_PHASE_STATUS_FILE:-}" ]]; then
-    printf 'phase: spotcheck-step-2\nsummary: running checks\n' \
-        > "$CLAUDE_SKILL_PHASE_STATUS_FILE"
-    sleep 2
-    printf 'phase: done\nsummary: complete\n' \
-        > "$CLAUDE_SKILL_PHASE_STATUS_FILE"
-    sleep 1
-fi
-
-printf '{"result": "SHIPPED — filed 2 issues"}\n'
-exit 0
-CLAUDEPHASEEOF
-chmod +x "$STUB_BIN/claude"
-
 set +e
 out=$(AGENT_ID="$WATCHER_AGENT_ID" \
       ISSUE_NUMBER="" \
@@ -494,32 +474,6 @@ if command -v jq >/dev/null 2>&1; then
 else
     pass "skill_phase_change event field check (skipped — jq unavailable)"
 fi
-
-# Restore the generic claude stub for any tests added after this.
-cat > "$STUB_BIN/claude" <<'CLAUDEEOF'
-#!/usr/bin/env bash
-set -u
-INVOCATIONS_DIR="${INVOCATIONS_DIR}"
-. "$(dirname "$0")/_record_invocation.sh" claude "$@"
-
-for arg in "$@"; do
-    case "$arg" in
-        /*)
-            cmd=$(printf '%s' "$arg" | awk '{print $1}')
-            printf '%s\n' "$cmd" >> "$INVOCATIONS_DIR/claude-slash-cmd.log"
-            break
-            ;;
-    esac
-done
-
-if [[ -n "${CLAUDE_RESULT_OVERRIDE:-}" ]]; then
-    printf '%s\n' "$CLAUDE_RESULT_OVERRIDE"
-else
-    printf '{"result": "SHIPPED — filed 3 issues"}\n'
-fi
-exit "${CLAUDE_EXIT_OVERRIDE:-0}"
-CLAUDEEOF
-chmod +x "$STUB_BIN/claude"
 
 # ══════════════════════════════════════════════════════════════════════════
 # Summary
