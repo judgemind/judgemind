@@ -24,6 +24,8 @@
 #   1  — one or more checks failed (AccessDenied or unexpected error)
 
 set -euo pipefail
+# AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
+export AWS_PAGER=""
 
 REGION="us-west-2"
 CLUSTER="judgemind-dev"
@@ -53,7 +55,6 @@ CREDS=$(aws sts assume-role \
     --role-arn "${AGENT_ROLE_ARN}" \
     --role-session-name "iam-phase-b-smoke-${RUN_ID}" \
     --region "${REGION}" \
-    --no-cli-pager \
     --output json \
     --query 'Credentials.{AKI:AccessKeyId,SAK:SecretAccessKey,ST:SessionToken}')
 
@@ -98,7 +99,6 @@ TD_ARN=$(aws ecs register-task-definition \
     --memory 512 \
     --container-definitions '[{"name":"smoke","image":"busybox","essential":true,"command":["sleep","1"]}]' \
     --region "${REGION}" \
-    --no-cli-pager \
     --output text \
     --query 'taskDefinition.taskDefinitionArn' 2>&1) && {
     echo "PASS: RegisterTaskDefinition -> ${TD_ARN}" >&2
@@ -121,7 +121,6 @@ if [[ -n "${TD_ARN:-}" ]]; then
         --launch-type FARGATE \
         --network-configuration "awsvpcConfiguration={subnets=[],securityGroups=[],assignPublicIp=DISABLED}" \
         --region "${REGION}" \
-        --no-cli-pager \
         --output json 2>&1) && {
         FAILURES=$(echo "${RUN_OUT}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('failures',[])))" 2>/dev/null || echo "0")
         if [[ "${FAILURES}" == "0" ]]; then
@@ -161,7 +160,6 @@ UPDATE_OUT=$(aws ecs update-service \
     --service "${SERVICE}" \
     --force-new-deployment \
     --region "${REGION}" \
-    --no-cli-pager \
     --output text \
     --query 'service.serviceName' 2>&1) && {
     echo "PASS: UpdateService -> ${UPDATE_OUT}" >&2
@@ -182,8 +180,7 @@ UPDATE_OUT=$(aws ecs update-service \
 echo "" >&2
 echo "--- Step 4: s3 ls nested prefix staging/orange/ ---" >&2
 S3_OUT=$(aws s3 ls "s3://${ARCHIVE_BUCKET}/staging/orange/" \
-    --region "${REGION}" \
-    --no-cli-pager 2>&1) && {
+    --region "${REGION}" 2>&1) && {
     echo "PASS: s3 ls staging/orange/ (ListBucket nested prefix allowed)" >&2
     PASS=$((PASS + 1))
 } || {

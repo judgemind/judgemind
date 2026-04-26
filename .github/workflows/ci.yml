@@ -630,6 +630,9 @@ jobs:
       - name: Check AWS CLI boolean flag usage
         if: matrix.shard == 'python'
         run: scripts/check-aws-bool-flags.sh
+      - name: Check AWS CLI flag portability
+        if: matrix.shard == 'python'
+        run: scripts/check-aws-flag-portability.sh
       - name: Check for forbidden ECS services-stable waiter usage
         if: matrix.shard == 'python'
         run: scripts/check-no-ecs-wait-services-stable.sh

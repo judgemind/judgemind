@@ -19,6 +19,8 @@
 #   /ecs/judgemind-api-dev
 
 set -euo pipefail
+# AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
+export AWS_PAGER=""
 
 # ─── Defaults ──────────────────────────────────────────────────────────────
 
@@ -118,8 +120,7 @@ validate_stream() {
         --region "$REGION" \
         --limit 1 \
         --no-start-from-head \
-        --output json \
-        --no-cli-pager > /dev/null 2>&1
+        --output json > /dev/null 2>&1
 }
 
 # ─── Find the most recent log stream ──────────────────────────────────────
@@ -147,8 +148,7 @@ find_stream() {
                 --max-items 100 \
                 --region "$REGION" \
                 --output text \
-                --query "logStreams[*].logStreamName" \
-                --no-cli-pager 2>/dev/null) || continue
+                --query "logStreams[*].logStreamName" 2>/dev/null) || continue
 
             match=$(echo "$prefix_streams" | tr '\t' '\n' | grep -F "$TASK_FILTER" | head -n 1) || true
             if [[ -n "$match" ]]; then
@@ -166,8 +166,7 @@ find_stream() {
                 --region "$REGION" \
                 --max-items 50 \
                 --output text \
-                --query "logStreams[*].logStreamName" \
-                --no-cli-pager 2>/dev/null) || {
+                --query "logStreams[*].logStreamName" 2>/dev/null) || {
                 echo "Error: failed to list log streams for '$LOG_GROUP'" >&2
                 echo "Check that the log group exists and you have AWS credentials configured." >&2
                 exit 1
@@ -196,8 +195,7 @@ find_stream() {
             --max-items 5 \
             --region "$REGION" \
             --output text \
-            --query "logStreams[*].logStreamName" \
-            --no-cli-pager 2>/dev/null) || {
+            --query "logStreams[*].logStreamName" 2>/dev/null) || {
             echo "Error: failed to list log streams for '$LOG_GROUP'" >&2
             echo "Check that the log group exists and you have AWS credentials configured." >&2
             exit 1
@@ -246,7 +244,6 @@ fetch_events() {
         --region "$REGION"
         --output json
         --no-start-from-head
-        --no-cli-pager
     )
 
     if [[ -n "$NEXT_TOKEN" ]]; then

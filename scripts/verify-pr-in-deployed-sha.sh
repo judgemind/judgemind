@@ -54,6 +54,8 @@
 #   AWS_REGION           — AWS region (default: us-west-2).
 
 set -uo pipefail
+# AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
+export AWS_PAGER=""
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
@@ -153,7 +155,6 @@ FILTER_JSON=$("$AWS_CLI" logs filter-log-events \
     --start-time "$START_MS" \
     --filter-pattern '"event" "startup"' \
     --region "$AWS_REGION" \
-    --no-cli-pager \
     --output json 2>/dev/null) || {
     echo "error: aws logs filter-log-events failed for $DISPATCHER_LOG_GROUP" >&2
     exit 2

@@ -22,6 +22,8 @@
 #   4. Exits non-zero on failure (crash-loop, rollout FAILED, timeout).
 
 set -euo pipefail
+# AWS CLI v1/v2 portability: suppress pager without --no-cli-pager (v2-only flag). See #3461.
+export AWS_PAGER=""
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGION="us-west-2"
@@ -49,7 +51,6 @@ NEW_DEPLOYMENT_ID=$(aws ecs update-service \
     --service "$SERVICE" \
     --force-new-deployment \
     --region "$REGION" \
-    --no-cli-pager \
     --output text \
     --query 'service.deployments[0].id')
 
@@ -102,7 +103,6 @@ aws ecs describe-tasks \
     --tasks $TASK_ARNS \
     --region "$REGION" \
     --output table \
-    --no-cli-pager \
     --query 'tasks[*].{TaskId: taskArn, Status: lastStatus, Image: containers[0].image, ImageDigest: containers[0].imageDigest}'
 
 echo "Deployment complete." >&2
