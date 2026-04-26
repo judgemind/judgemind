@@ -109,6 +109,13 @@ When filing or implementing an issue that includes a backfill migration (any PR 
   ```
 - **For large tables, include a before/after row-count breakdown by status.** Confirm the counts add up correctly — total updated should equal the sum of per-class counts.
 
+## Migrations
+
+When filing or implementing an issue whose migration drops `NOT NULL` on a column that backs a GraphQL field:
+
+- **Flip the GraphQL field to nullable in the same PR.** Change `FieldName: Type!` to `FieldName: Type` in the schema file. Leaving it non-null causes the GraphQL serializer to throw at runtime when NULL rows appear post-migration, crashing the entire query.
+- **The `graphql-nullability-drift-check` CI job enforces this** for columns listed in `KNOWN_MAPPINGS` inside `scripts/check-graphql-nullability-drift.py`. If your column is not yet covered, extend `KNOWN_MAPPINGS` in the same PR (see `docs/agent/code-standards.md` §Nullable schema migrations and #3441).
+
 ## Investigation Tasks
 
 Investigation tasks produce documentation, not code:
