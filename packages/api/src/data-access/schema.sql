@@ -487,9 +487,6 @@ CREATE TABLE dispatcher.diagnoses (
 );
 
 
-COMMENT ON COLUMN dispatcher.diagnoses.status IS 'Diagnosis lifecycle: pending | completed | failed | orphaned. pending = subprocess in-flight. completed = recommendation consumed. failed = real diagnoser-run failure (timeout, malformed JSON, subprocess crash, unknown action) — counts against the circuit breaker. orphaned (#3383) = pending row reaped on daemon boot because the previous daemon crashed/restarted before the run completed; never executed by the diagnoser, so excluded from breaker fallback-rate.';
-
-
 COMMENT ON COLUMN dispatcher.diagnoses.actions_taken IS 'Structured action log written by the empowered diagnoser (issue #3366). One entry per side-effect: git_commit, git_push, gh_issue_create, gh_issue_edit, gh_issue_comment, skill_invoke, bash_run (non-trivial). Operator audit trail; daemon never reads.';
 
 
