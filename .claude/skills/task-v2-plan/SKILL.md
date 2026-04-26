@@ -154,7 +154,10 @@ Populate `relevant_files` with every path ralph should Read during implementatio
 After writing `plan_text`, collapse the raw `issue_comments` for downstream phases:
 
 ```python
-from scripts.dispatcher.collapse_comments import collapse_comments
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path("scripts").resolve()))
+from dispatcher.collapse_comments import collapse_comments
 collapsed = collapse_comments(issue_comments)
 ```
 
