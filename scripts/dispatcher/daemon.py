@@ -7698,6 +7698,106 @@ class DispatcherDaemon:
             # succeeded the moment the PR shipped. Best-effort; matches
             # the ``_mark_agent_terminal`` teardown path (#2866).
             self._gh_issue_remove_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
+            # Issue #3411: post-merge issue cleanup. Defense in depth
+            # against PRs whose body doesn't contain ``Closes #N`` —
+            # GitHub won't auto-close the issue, so the daemon has to
+            # do it explicitly. The PR-body validation in
+            # :meth:`_ensure_closes_keyword` makes this branch a
+            # belt-and-suspenders safety net for legacy PRs and edge
+            # cases where the keyword somehow gets stripped during
+            # rebase / amend.
+            try:
+                self._close_issue_post_merge(int(issue_number), pr_number)
+            except Exception:
+                self._log.exception(
+                    "daemon.close_issue_post_merge_failed",
+                    extra={
+                        "event": "close_issue_post_merge_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                    },
+                )
+
+    def _close_issue_post_merge(self, issue_number: int, pr_number: int | None) -> None:
+        """Close the originating issue + strip ``agent/ready`` after PR merge.
+
+        Issue #3411. Belt-and-suspenders for the (now-rare) case where
+        the PR body lacks a ``Closes #N`` keyword and GitHub doesn't
+        auto-close the issue. Mirrors the manual ``gh issue close +
+        gh issue edit --remove-label agent/ready`` flow operators have
+        been running by hand on stale ready-queue entries.
+
+        Behavior:
+
+        - If the issue is already CLOSED, no-op (logs ``post_merge_
+          cleanup_skipped`` with reason ``already_closed``).
+        - If the issue is OPEN, post a close comment naming the merged
+          PR and the autonomous-cleanup origin (cites #3411 so future
+          operators reading the comment can find this code path), then
+          strip ``agent/ready`` so the issue is fully off the queue.
+
+        Best-effort: any failure (gh probe flake, close timeout,
+        label-strip non-zero) is logged but does not raise. The
+        primary correctness invariant — ``status='succeeded'`` and
+        ``merged_at`` are stamped — was already committed by
+        :meth:`_write_merged_at` before reaching this method.
+        """
+        if not self._gh_issue_is_open(issue_number):
+            self._log.info(
+                "daemon.post_merge_cleanup_skipped",
+                extra={
+                    "event": "post_merge_cleanup_skipped",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "already_closed",
+                },
+            )
+            return
+        # Compose the close comment. Naming the PR + the cleanup
+        # origin (#3411) makes the comment self-explanatory in the
+        # issue thread; operators reading it later can grep for #3411
+        # to find this code path.
+        if pr_number is not None:
+            comment = (
+                f"Closed by PR #{pr_number} (autonomous post-merge cleanup, "
+                f"see #3411 — PR body did not contain ``Closes #{issue_number}`` "
+                f"keyword so GitHub didn't auto-close)."
+            )
+        else:
+            # pr_number is unexpectedly missing — close without naming
+            # the PR rather than skipping the cleanup entirely.
+            comment = (
+                f"Closed by merged PR (autonomous post-merge cleanup, "
+                f"see #3411 — PR body did not contain ``Closes #{issue_number}`` "
+                f"keyword so GitHub didn't auto-close)."
+            )
+        self._log.info(
+            "daemon.post_merge_cleanup_begin",
+            extra={
+                "event": "post_merge_cleanup_begin",
+                "run_id": self._run_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+            },
+        )
+        self._gh_issue_close(issue_number, comment=comment, reason="completed")
+        # Strip ``agent/ready`` so the issue doesn't reappear in the
+        # daemon's queue scan on the next supervisor tick. The label
+        # remove is independently retried by ``_gh_issue_remove_labels``;
+        # idempotent if the label is already absent.
+        self._gh_issue_remove_labels(issue_number, ["agent/ready"])
+        self._log.info(
+            "daemon.post_merge_cleanup_done",
+            extra={
+                "event": "post_merge_cleanup_done",
+                "run_id": self._run_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+            },
+        )
 
     def _write_verified_at(self, agent_id: str) -> None:
         """Stamp ``verified_at = now()`` when the verify phase succeeds.
@@ -12043,6 +12143,24 @@ class DispatcherDaemon:
             )
             return
 
+        # Issue #3411: ensure ``Closes #<issue_number>`` is present in
+        # the PR body so GitHub auto-closes the issue on merge.
+        # /task-v2-summary doesn't always emit the keyword (observed on
+        # PRs #3393, #3391, #3390 and others). Without this guarantee
+        # the issue stays OPEN with ``agent/ready`` and the daemon
+        # re-evaluates it every supervisor tick under the
+        # ``already_attempted`` cooldown — wasting candidate-eval cost
+        # and masking the true ready-queue size. The helper is
+        # idempotent when the keyword is already present.
+        #
+        # Runs AFTER the empty-body validation above so the validation
+        # branch still trips on ``pr_body_md=""`` from summary —
+        # otherwise this helper would synthesize a non-empty body
+        # ("Closes #N") and mask a malformed summary output as
+        # shippable. Order matters: validate → inject.
+        if issue_number is not None:
+            pr_body_md = self._ensure_closes_keyword(pr_body_md, int(issue_number))
+
         # git commit --amend -F <file>. Issue #2971: Ralph's Step 2.5
         # commits its work directly (placeholder message "WIP: ralph
         # output") and leaves the commit in place. We amend that commit
@@ -12680,6 +12798,62 @@ class DispatcherDaemon:
             if match:
                 return int(match.group(1))
         return None
+
+    @staticmethod
+    def _ensure_closes_keyword(body: str, issue_number: int) -> str:
+        """Ensure the PR body contains a ``Closes #<issue_number>`` keyword.
+
+        Issue #3411 — daemon-spawned PRs have been merging without a
+        ``Closes #N`` / ``Fixes #N`` GitHub keyword in the body, leaving
+        the originating issue OPEN with ``agent/ready`` and stuck in
+        the daemon's ``already_attempted`` cooldown. This helper is the
+        last-line guarantee that EVERY PR body shipped by the daemon
+        carries the closing keyword for its issue, regardless of what
+        ``/task-v2-summary`` produced.
+
+        Behavior:
+
+        - If the body already contains a closing keyword pointing at
+          ``issue_number`` (any of ``Closes #N`` / ``Fixes #N`` /
+          ``Resolves #N``, case-insensitive), return ``body`` unchanged.
+        - Otherwise (no closing keyword, or a closing keyword for some
+          OTHER issue number), append ``\\n\\nCloses #<issue_number>\\n``
+          to ``body``.
+
+        The "wrong issue number" case is intentionally additive — we
+        don't strip the existing wrong-issue keyword (which would
+        mutate operator-visible content) but we DO append our own so
+        the issue we actually care about gets closed. The result is
+        a PR that closes both the wrong-and-our-issue (rare but
+        observed in copy-paste regressions); operators can correct
+        the surplus close manually if needed.
+
+        Pure function — no I/O, no side effects.
+        """
+        import re  # noqa: PLC0415
+
+        # GitHub recognizes: close, closes, closed, fix, fixes, fixed,
+        # resolve, resolves, resolved (case-insensitive). Match the
+        # full set so we don't add a duplicate ``Closes #N`` when the
+        # summary skill emitted ``Resolves #N``.
+        # See https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword
+        pattern = re.compile(
+            r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#"
+            + str(issue_number)
+            + r"\b",
+            re.IGNORECASE,
+        )
+        if pattern.search(body or ""):
+            return body
+        # Append. Use \n\n separator so the keyword is its own
+        # paragraph and doesn't accidentally land on the same line as
+        # a trailing summary paragraph.
+        suffix = f"\n\nCloses #{issue_number}\n"
+        # Strip trailing whitespace/newlines first so we don't end up
+        # with ``...\n\n\n\nCloses #N\n``. Idempotent under repeated
+        # invocation when the keyword IS present (covered by the
+        # unchanged-return branch above).
+        return (body or "").rstrip() + suffix
 
     # ── Phase 3B post-PR orchestration (supervisor-tick step 3) ─────────
     #

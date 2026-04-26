@@ -469,6 +469,21 @@ JSONEOF
     "auth login"|"auth setup-git")
         exit 0
         ;;
+    "issue view")
+        # #3411: post-merge cleanup probe. Test fixture
+        # GH_ISSUE_STATE_FIXTURE controls the returned state
+        # ("OPEN" | "CLOSED"). Defaults to CLOSED so existing tests
+        # that traverse merge → awaiting_deploy don't accidentally
+        # exercise the close path.
+        printf '%s\n' "${GH_ISSUE_STATE_FIXTURE:-CLOSED}"
+        exit "${GH_ISSUE_VIEW_EXIT:-0}"
+        ;;
+    "issue close")
+        exit "${GH_ISSUE_CLOSE_EXIT:-0}"
+        ;;
+    "issue edit")
+        exit "${GH_ISSUE_EDIT_EXIT:-0}"
+        ;;
 esac
 
 exit 0
@@ -1724,7 +1739,25 @@ if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
         cat "$GH_ISSUE_FIXTURE"
         exit 0
     fi
+    # #3411: post-merge cleanup probe uses ``gh issue view <N>
+    # --json state --jq .state``. Honor GH_ISSUE_STATE_FIXTURE
+    # ("OPEN" | "CLOSED") so close_issue_post_merge tests can drive
+    # both branches. Defaults to CLOSED so existing tests that
+    # traverse merge → awaiting_deploy don't accidentally exercise
+    # the close path.
+    if printf '%s' "$*" | grep -q -- "--json state"; then
+        printf '%s\n' "${GH_ISSUE_STATE_FIXTURE:-CLOSED}"
+        exit "${GH_ISSUE_VIEW_EXIT:-0}"
+    fi
     exit 1
+fi
+
+# #3411: gh issue close + gh issue edit (post-merge cleanup actions).
+if [[ "${1:-}" == "issue" && "${2:-}" == "close" ]]; then
+    exit "${GH_ISSUE_CLOSE_EXIT:-0}"
+fi
+if [[ "${1:-}" == "issue" && "${2:-}" == "edit" ]]; then
+    exit "${GH_ISSUE_EDIT_EXIT:-0}"
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
@@ -4641,6 +4674,303 @@ if grep -qE '^DEPLOY_WORKFLOWS=.*deploy-agent-runner\.yml' "$ENTRYPOINT"; then
 else
     fail "#3185 — DEPLOY_WORKFLOWS default includes deploy-agent-runner.yml" \
          "deploy-agent-runner.yml not found in DEPLOY_WORKFLOWS default in $ENTRYPOINT"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 50: #3411 — handle_push_and_pr appends `Closes #N` to PR body when
+# /task-v2-summary's pr_body_md doesn't include it. Asserts that the
+# pr_body.md file written before `gh pr create` contains the keyword.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t50.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t50_workspace="$TEST_TMP/t50-workspace"
+mkdir -p "$t50_workspace/repo/.git" "$t50_workspace/repo/tmp/dispatcher-output"
+
+# Pre-stage a summary.json with a PR body that LACKS Closes #N. The
+# entrypoint reads from $REPO_ROOT/tmp/dispatcher-output/summary.json
+# (REPO_ROOT="$AGENT_WORKSPACE/repo").
+cat > "$t50_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(test): demonstrate Closes injection (#3411)",
+  "pr_title": "feat(test): demonstrate Closes injection (#3411)",
+  "pr_body_md": "## Summary\n\nDemonstrates the keyword injection.\n\n(no Closes line in this body — the entrypoint must add one)\n",
+  "unmet_criteria": []
+}
+EOF
+
+set +e
+out=$(AGENT_ID="50000000-1111-2222-3333-444444444444" \
+      ISSUE_NUMBER="3411" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t50_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# The entrypoint logs `push_and_pr_closes_keyword_appended` when the
+# keyword was missing and got injected.
+if printf '%s' "$out" | grep -q "push_and_pr_closes_keyword_appended"; then
+    pass "#3411 T50 — entrypoint logs closes_keyword_appended when missing"
+else
+    fail "#3411 T50 — entrypoint logs closes_keyword_appended when missing" \
+         "out tail: $(printf '%s' "$out" | tail -c 800)"
+fi
+
+# The pr_body.md the entrypoint wrote before `gh pr create` should
+# contain `Closes #3411`.
+if [[ -f "$t50_workspace/pr_body.md" ]] && grep -qF "Closes #3411" "$t50_workspace/pr_body.md"; then
+    pass "#3411 T50 — pr_body.md contains Closes #3411 after injection"
+else
+    fail "#3411 T50 — pr_body.md contains Closes #3411 after injection" \
+         "pr_body.md content: $(cat "$t50_workspace/pr_body.md" 2>/dev/null || echo '<missing>')"
+fi
+
+# Original body content must be preserved verbatim — we only append.
+if [[ -f "$t50_workspace/pr_body.md" ]] && grep -qF "Demonstrates the keyword injection" "$t50_workspace/pr_body.md"; then
+    pass "#3411 T50 — original pr_body content preserved"
+else
+    fail "#3411 T50 — original pr_body content preserved" \
+         "pr_body.md content: $(cat "$t50_workspace/pr_body.md" 2>/dev/null || echo '<missing>')"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 51: #3411 — handle_push_and_pr is a no-op (idempotent) when the
+# PR body already contains Closes #N for the agent's issue.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t51.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t51_workspace="$TEST_TMP/t51-workspace"
+mkdir -p "$t51_workspace/repo/.git" "$t51_workspace/repo/tmp/dispatcher-output"
+
+cat > "$t51_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "fix(thing): existing closes (#3411)",
+  "pr_title": "fix(thing): existing closes (#3411)",
+  "pr_body_md": "## Summary\n\nA fix.\n\nCloses #3411\n",
+  "unmet_criteria": []
+}
+EOF
+
+set +e
+out=$(AGENT_ID="51000000-1111-2222-3333-444444444444" \
+      ISSUE_NUMBER="3411" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t51_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# When the keyword is already present, log `closes_keyword_present`
+# (not `_appended`).
+if printf '%s' "$out" | grep -q "push_and_pr_closes_keyword_present"; then
+    pass "#3411 T51 — entrypoint logs closes_keyword_present when already there"
+else
+    fail "#3411 T51 — entrypoint logs closes_keyword_present when already there" \
+         "out tail: $(printf '%s' "$out" | tail -c 800)"
+fi
+
+if printf '%s' "$out" | grep -q "push_and_pr_closes_keyword_appended"; then
+    fail "#3411 T51 — does NOT append when keyword already present" \
+         "out tail: $(printf '%s' "$out" | tail -c 800)"
+else
+    pass "#3411 T51 — does NOT append when keyword already present"
+fi
+
+# pr_body.md should contain exactly one Closes #3411.
+if [[ -f "$t51_workspace/pr_body.md" ]]; then
+    _count=$(grep -cF "Closes #3411" "$t51_workspace/pr_body.md")
+    if [[ "$_count" == "1" ]]; then
+        pass "#3411 T51 — pr_body.md has exactly one Closes #3411 (idempotent)"
+    else
+        fail "#3411 T51 — pr_body.md has exactly one Closes #3411 (idempotent)" \
+             "count=$_count, content: $(cat "$t51_workspace/pr_body.md")"
+    fi
+else
+    fail "#3411 T51 — pr_body.md exists" "missing pr_body.md"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 52: #3411 — handle_push_and_pr appends our Closes when the
+# existing keyword targets a DIFFERENT issue number.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t52.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t52_workspace="$TEST_TMP/t52-workspace"
+mkdir -p "$t52_workspace/repo/.git" "$t52_workspace/repo/tmp/dispatcher-output"
+
+cat > "$t52_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "fix(thing): wrong-issue closes (#3411)",
+  "pr_title": "fix(thing): wrong-issue closes (#3411)",
+  "pr_body_md": "## Summary\n\nA fix.\n\nCloses #999\n",
+  "unmet_criteria": []
+}
+EOF
+
+set +e
+out=$(AGENT_ID="52000000-1111-2222-3333-444444444444" \
+      ISSUE_NUMBER="3411" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t52_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=15 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+# Both keywords should be present in the final body.
+if [[ -f "$t52_workspace/pr_body.md" ]] && grep -qF "Closes #999" "$t52_workspace/pr_body.md"; then
+    pass "#3411 T52 — preserves wrong-issue Closes #999"
+else
+    fail "#3411 T52 — preserves wrong-issue Closes #999" \
+         "pr_body.md: $(cat "$t52_workspace/pr_body.md" 2>/dev/null)"
+fi
+
+if [[ -f "$t52_workspace/pr_body.md" ]] && grep -qF "Closes #3411" "$t52_workspace/pr_body.md"; then
+    pass "#3411 T52 — appends our Closes #3411 alongside wrong-issue keyword"
+else
+    fail "#3411 T52 — appends our Closes #3411 alongside wrong-issue keyword" \
+         "pr_body.md: $(cat "$t52_workspace/pr_body.md" 2>/dev/null)"
+fi
+
+if printf '%s' "$out" | grep -q "push_and_pr_closes_keyword_appended"; then
+    pass "#3411 T52 — logs appended event for wrong-issue case"
+else
+    fail "#3411 T52 — logs appended event for wrong-issue case" \
+         "out tail: $(printf '%s' "$out" | tail -c 800)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 53: #3411 — close_issue_post_merge invokes gh issue close + edit
+# when the issue is OPEN after a successful merge.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t53.txt"
+printf 'merge\n' > "$PHASE_FIXTURE_FILE"
+
+t53_workspace="$TEST_TMP/t53-workspace"
+set +e
+t53_out=$(run_post_pr_phase "merge" "$t53_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_ISSUE_STATE_FIXTURE=OPEN")
+set -e
+
+# Cleanup begin event fired (issue was OPEN, so we entered the cleanup
+# path).
+if printf '%s' "$t53_out" | grep -q "post_merge_cleanup_begin"; then
+    pass "#3411 T53 — post_merge_cleanup_begin logged on OPEN issue"
+else
+    fail "#3411 T53 — post_merge_cleanup_begin logged on OPEN issue" \
+         "out tail: $(printf '%s' "$t53_out" | tail -c 1000)"
+fi
+
+# gh issue close was invoked.
+if grep -F "issue" "$INVOCATIONS_DIR/gh.log" | grep -F "close" >/dev/null 2>&1; then
+    pass "#3411 T53 — gh issue close invoked"
+else
+    fail "#3411 T53 — gh issue close invoked" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+fi
+
+# gh issue edit --remove-label agent/ready was invoked.
+if grep -F "issue" "$INVOCATIONS_DIR/gh.log" | grep -F "remove-label" | grep -F "agent/ready" >/dev/null 2>&1; then
+    pass "#3411 T53 — gh issue edit --remove-label agent/ready invoked"
+else
+    fail "#3411 T53 — gh issue edit --remove-label agent/ready invoked" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+fi
+
+# Cleanup done event fired.
+if printf '%s' "$t53_out" | grep -q "post_merge_cleanup_done"; then
+    pass "#3411 T53 — post_merge_cleanup_done logged after close + label-strip"
+else
+    fail "#3411 T53 — post_merge_cleanup_done logged after close + label-strip" \
+         "out tail: $(printf '%s' "$t53_out" | tail -c 1000)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 54: #3411 — close_issue_post_merge skips when the issue is
+# already CLOSED. No gh issue close / edit invocations.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t54.txt"
+printf 'merge\n' > "$PHASE_FIXTURE_FILE"
+
+t54_workspace="$TEST_TMP/t54-workspace"
+set +e
+t54_out=$(run_post_pr_phase "merge" "$t54_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_ISSUE_STATE_FIXTURE=CLOSED")
+set -e
+
+# Skipped event fired with reason=already_closed.
+if printf '%s' "$t54_out" | grep -q "post_merge_cleanup_skipped"; then
+    pass "#3411 T54 — post_merge_cleanup_skipped logged on CLOSED issue"
+else
+    fail "#3411 T54 — post_merge_cleanup_skipped logged on CLOSED issue" \
+         "out tail: $(printf '%s' "$t54_out" | tail -c 1000)"
+fi
+
+if printf '%s' "$t54_out" | grep -q '"reason": "already_closed"'; then
+    pass "#3411 T54 — skip reason is already_closed"
+else
+    fail "#3411 T54 — skip reason is already_closed" \
+         "out tail: $(printf '%s' "$t54_out" | tail -c 1000)"
+fi
+
+# Critically: NO gh issue close invocation when issue is already CLOSED.
+if grep -F "issue" "$INVOCATIONS_DIR/gh.log" | grep -F "close" >/dev/null 2>&1; then
+    fail "#3411 T54 — does NOT invoke gh issue close on CLOSED issue" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+else
+    pass "#3411 T54 — does NOT invoke gh issue close on CLOSED issue"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

@@ -2338,6 +2338,37 @@ handle_push_and_pr() {
         return 0
     fi
 
+    # ── #3411: ensure ``Closes #<ISSUE_NUMBER>`` (or equivalent) is
+    # present in the PR body. /task-v2-summary doesn't always emit
+    # the keyword, and without it GitHub won't auto-close the issue
+    # on merge — leaving the daemon's ready queue stuck with done-
+    # but-unclaimable issues. This is the entrypoint-side mirror of
+    # daemon.py's ``_ensure_closes_keyword``. Idempotent: if the
+    # keyword for $ISSUE_NUMBER is already present, the body is left
+    # unchanged. Defense in depth across both subprocess + ECS modes.
+    if [[ -n "$_pr_body_md" && -n "$ISSUE_NUMBER" ]]; then
+        # Case-insensitive grep for any of: close|closes|closed,
+        # fix|fixes|fixed, resolve|resolves|resolved followed by
+        # whitespace then ``#<ISSUE_NUMBER>`` with a word boundary so
+        # ``#3411`` doesn't match a request body containing ``#34110``.
+        # Use ``-E`` for extended regex (portable across grep
+        # implementations on Linux + macOS bash 3.2). Escape the
+        # ``#`` even though it's not regex-special — defensive.
+        _close_pattern="(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#${ISSUE_NUMBER}([^0-9]|$)"
+        if ! printf '%s' "$_pr_body_md" | grep -qiE "$_close_pattern"; then
+            log "push_and_pr_closes_keyword_appended" "issue_number=$ISSUE_NUMBER"
+            # Strip trailing whitespace/newlines so we don't end up
+            # with an oversized blank-line tail, then append the
+            # keyword as its own paragraph.
+            _pr_body_md="$(printf '%s' "$_pr_body_md" | sed -e 's/[[:space:]]*$//')
+
+Closes #${ISSUE_NUMBER}
+"
+        else
+            log "push_and_pr_closes_keyword_present" "issue_number=$ISSUE_NUMBER"
+        fi
+    fi
+
     # ── #3176: open the PR with summary's pr_title + pr_body_md when
     # available. Fall back to ``--fill`` so a missing summary still
     # produces a PR (degraded but not abandoned).
@@ -3698,6 +3729,89 @@ try_auto_unstick_merge() {
     return 0
 }
 
+close_issue_post_merge() {
+    # Issue #3411 — belt-and-suspenders post-merge issue cleanup.
+    # Mirrors daemon.py's ``_close_issue_post_merge``. If the PR body
+    # lacked a ``Closes #N`` keyword (or GitHub failed to auto-close
+    # for any other reason), close the originating issue + strip
+    # ``agent/ready`` so it doesn't reappear in the daemon's queue
+    # scan. The PR-body validation in handle_push_and_pr makes this
+    # branch rare, but the keep-the-queue-clean invariant matters
+    # more than the cost of an extra ``gh issue view`` per merge.
+    #
+    # Args: $1 = issue_number, $2 = pr_number.
+    # Best-effort — every failure is logged but does not propagate.
+    _issue_num="$1"
+    _pr_num="$2"
+    if [[ -z "$_issue_num" ]]; then
+        log "post_merge_cleanup_skipped" "reason=no_issue_number"
+        return 0
+    fi
+    # Probe issue state. Write stdout to a file so we can capture the
+    # exit code distinctly from the substitution's exit code (a
+    # ``$( ... || printf '' )`` pattern always exits 0 regardless of
+    # whether gh succeeded — losing the probe failure signal).
+    set +e
+    gh issue view "$_issue_num" \
+        --repo judgemind/judgemind \
+        --json state \
+        --jq '.state' \
+        > "$AGENT_WORKSPACE/gh-issue-state.stdout.log" \
+        2> "$AGENT_WORKSPACE/gh-issue-state.stderr.log"
+    _probe_rc=$?
+    set -e
+    _state=""
+    if [[ -s "$AGENT_WORKSPACE/gh-issue-state.stdout.log" ]]; then
+        _state=$(tr -d '\n\r' < "$AGENT_WORKSPACE/gh-issue-state.stdout.log")
+    fi
+    if [[ "$_probe_rc" -ne 0 || -z "$_state" ]]; then
+        log "post_merge_cleanup_probe_failed" \
+            "issue_number=$_issue_num" "exit_code=$_probe_rc"
+        return 0
+    fi
+    # ``gh issue view --json state`` returns ``OPEN`` or ``CLOSED``.
+    # Compare case-insensitively for safety.
+    _state_upper=$(printf '%s' "$_state" | tr '[:lower:]' '[:upper:]')
+    if [[ "$_state_upper" != "OPEN" ]]; then
+        log "post_merge_cleanup_skipped" \
+            "issue_number=$_issue_num" "reason=already_closed" "state=$_state"
+        return 0
+    fi
+    log "post_merge_cleanup_begin" "issue_number=$_issue_num" "pr_number=$_pr_num"
+    # Close the issue with a comment naming the PR + cleanup origin.
+    _close_comment="Closed by PR #${_pr_num} (autonomous post-merge cleanup, see #3411 — PR body did not contain \`Closes #${_issue_num}\` keyword so GitHub didn't auto-close)."
+    set +e
+    gh issue close "$_issue_num" \
+        --repo judgemind/judgemind \
+        --reason completed \
+        --comment "$_close_comment" \
+        > "$AGENT_WORKSPACE/gh-issue-close.stdout.log" \
+        2> "$AGENT_WORKSPACE/gh-issue-close.stderr.log"
+    _close_rc=$?
+    set -e
+    if [[ "$_close_rc" -ne 0 ]]; then
+        log "post_merge_cleanup_close_failed" \
+            "issue_number=$_issue_num" "exit_code=$_close_rc"
+        # Continue to label-strip even if close failed — the label is
+        # the queue-visible signal; close is for the operator UI.
+    fi
+    # Strip agent/ready so the issue is fully off the queue.
+    set +e
+    gh issue edit "$_issue_num" \
+        --repo judgemind/judgemind \
+        --remove-label agent/ready \
+        > "$AGENT_WORKSPACE/gh-issue-remove-label.stdout.log" \
+        2> "$AGENT_WORKSPACE/gh-issue-remove-label.stderr.log"
+    _label_rc=$?
+    set -e
+    if [[ "$_label_rc" -ne 0 ]]; then
+        log "post_merge_cleanup_label_strip_failed" \
+            "issue_number=$_issue_num" "exit_code=$_label_rc"
+    fi
+    log "post_merge_cleanup_done" "issue_number=$_issue_num" "pr_number=$_pr_num"
+    return 0
+}
+
 handle_merge() {
     # Squash-merge the PR with branch-delete. On stale-rollup stderr,
     # attempt one auto-unstick (push empty commit, go back to
@@ -3732,6 +3846,16 @@ handle_merge() {
             _merge_sha=""
         fi
         log "merge_succeeded" "pr_number=$_pr_number" "merge_sha=$_merge_sha"
+        # ── #3411: post-merge issue cleanup (belt & suspenders) ───────
+        # Mirror daemon.py's ``_close_issue_post_merge``. If the PR
+        # body lacked a ``Closes #N`` keyword (or GitHub failed to
+        # auto-close for any other reason), close the issue + strip
+        # ``agent/ready`` so it doesn't reappear in the daemon's
+        # ready-queue scan. The PR-body validation in handle_push_and_pr
+        # makes this a rare branch, but the keep-the-queue-clean
+        # invariant is more important than minimizing redundant gh
+        # calls.
+        close_issue_post_merge "$ISSUE_NUMBER" "$_pr_number"
         printf '{"merged": true, "pr_number": %s, "merge_sha": "%s"}' \
             "$_pr_number" "$_merge_sha"
         return 0
