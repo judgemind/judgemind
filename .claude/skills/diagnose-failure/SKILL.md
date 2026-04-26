@@ -22,7 +22,9 @@ This is the v1 mental model that v2 lost: one smart agent with broad context han
 2. `next_directive` (TEXT) — `respawn_at=<phase>` | `terminal` | NULL.
 3. `actions_taken` (JSONB array) — append-only audit log of every side-effect you took.
 
-Plus the existing `dispatcher.agents.failure_summary` upgrade (first 1-3 sentences of `recommendation.reasoning` ≤240 chars, issue #2900). And `status='completed'` + `completed_at=now()` on the diagnoses row.
+Plus the existing `dispatcher.agents.failure_summary` upgrade (first 1-3 sentences of `recommendation.reasoning` ≤240 chars, issue #2900).
+
+**Important — `status` ownership:** Do NOT set `status='completed'` in `write_recommendation.py`. Leave the row at `status='pending'` on SKILL exit. The daemon's reaper queries `WHERE status='pending'` and calls `_consume_diagnosis`; the daemon then writes `status='completed'` after the directive action runs. If the SKILL sets `status='completed'` before exiting, the reaper skips the row and the directive is silently dropped (issue #3422).
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation. This subprocess is already a dispatcher-spawned background task. All sub-skills run synchronously.
 
@@ -284,7 +286,7 @@ print(json.dumps(row[0] if row else {}, default=str))
 
 ## Output contract — recommendation writer
 
-Update `recommendation` + `dispatcher.agents.failure_summary` (issue #2900) in a single transaction. Use a small helper:
+Update `recommendation` + `dispatcher.agents.failure_summary` (issue #2900) in a single transaction. The SKILL writes `recommendation` only — `status` stays `'pending'` so the daemon's reaper picks it up. Use a small helper:
 
 ```python
 # {worktree}/tmp/dispatcher-diagnoser/write_recommendation.py
@@ -312,9 +314,7 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE dispatcher.diagnoses "
-            "SET recommendation = %s, "
-            "    status = 'completed', "
-            "    completed_at = now() "
+            "SET recommendation = %s "
             "WHERE diagnosis_id = %s",
             (json.dumps(recommendation), diagnosis_id),
         )
@@ -326,6 +326,8 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
             )
     conn.commit()
 ```
+
+**Do not add `status = 'completed'` or `completed_at = now()` to this UPDATE.** The daemon's `_consume_diagnosis` / `_mark_diagnosis_completed` owns the `status` transition. Premature `'completed'` causes the reaper (`WHERE status='pending'`) to skip the row and silently drop the directive (issue #3422).
 
 Recommendation shape (unchanged from #3032):
 
@@ -352,7 +354,7 @@ Field rules (unchanged from #3032):
 - `block_labels` (optional) — for `file_prerequisite_task`.
 - `blocker_issue_number` (conditional) — required when `action='block_on_existing_task'`. Positive integer.
 
-Exit 0 when all three writes (recommendation + directive + actions_taken) are persisted. Exit non-zero on hard failure — the daemon marks the diagnosis `status='failed'` and falls back to mechanical escalation.
+Exit 0 when all three writes (recommendation + directive + actions_taken) are persisted. The daemon writes `status='completed'` after consuming the directive — the SKILL does not. Exit non-zero on hard failure — the daemon marks the diagnosis `status='failed'` and falls back to mechanical escalation.
 
 ---
 
@@ -368,7 +370,7 @@ Exit 0 when all three writes (recommendation + directive + actions_taken) are pe
 
 5. **Act.** Execute side effects (commit, push, gh issue create/edit, etc.) if needed. Log each one via `log_action.py` to `actions_taken`. Or skip side effects entirely and let the daemon's recommendation consumer handle it.
 
-6. **Write recommendation + directive.** Run `write_recommendation.py` and `write_directive.py`. Both update the same row.
+6. **Write recommendation + directive.** Run `write_recommendation.py` and `write_directive.py`. Both update the same row. `status` stays `'pending'` — the daemon's reaper picks it up on the next tick and writes `'completed'` after applying the directive.
 
 7. **Exit 0.** Done. The daemon's next supervisor tick consumes the recommendation; its directive consumer reads `next_directive` and either spawns a new agent-runner with `START_PHASE` or frees the slot.
 
@@ -474,3 +476,4 @@ actions_taken: [
 - `next_directive` is mandatory before exit (use `terminal` if no respawn is needed). NULL means "I crashed", which falls back to escalate + a `diagnoser_did_not_complete` log event.
 - §Step 1 (verbatim stderr quote in reasoning) is mandatory.
 - Exit 0 means "directive + recommendation + audit log written". Exit non-zero means "I could not diagnose" — the daemon falls back to fixed mechanical escalation.
+- **Do not set `status='completed'`** in `write_recommendation.py`. That column is owned by the daemon's `_mark_diagnosis_completed` method (issue #3422).
