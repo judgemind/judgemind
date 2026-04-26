@@ -80,21 +80,7 @@ INVOCATIONS_DIR="$TEST_TMP/invocations"
 mkdir -p "$STUB_BIN" "$INVOCATIONS_DIR"
 
 # Shared stub utility — each stub sources this to record its invocation.
-cat > "$STUB_BIN/_record_invocation.sh" <<'RECORDEOF'
-# Source this to record argv into $INVOCATIONS_DIR/<tool>.log, one
-# invocation per line starting with a count marker. Pass the tool name
-# as $1, remaining args as $2+.
-TOOL_NAME="$1"
-shift
-INVOCATIONS_LOG="${INVOCATIONS_DIR:-/tmp}/${TOOL_NAME}.log"
-{
-    printf 'CALL '
-    for arg in "$@"; do
-        printf '%q ' "$arg"
-    done
-    printf '\n'
-} >> "$INVOCATIONS_LOG"
-RECORDEOF
+cp "$REPO_ROOT/scripts/tests/_record_invocation.sh" "$STUB_BIN/_record_invocation.sh"
 
 # ── psql stub ──────────────────────────────────────────────────────────────
 # Responds based on the query substring:
@@ -114,7 +100,6 @@ INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 
 # Parse args for -c <query>.
 query=""
-saved_args=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c)
@@ -125,48 +110,11 @@ while [[ $# -gt 0 ]]; do
     shift || true
 done
 
-# #3413 — persist_phase_output now feeds the INSERT through a quoted
-# heredoc on stdin instead of the historical ``-c "$1"`` argv slot, so
-# the SQL no longer appears in argv. The existing assertions
-# (``grep "INSERT INTO dispatcher.phase_outputs" psql.log``) and the
-# substring router below both depend on seeing the SQL — so when stdin
-# carries a query, route by it AND emit a synthetic ``STDIN`` log line
-# so the assertions match. We also resolve any ``-v output_path=PATH``
-# argument and inline the file content into the log so assertions that
-# greppe the JSON payload (e.g. ``already_merged``) keep working — in
-# the new wire format the JSON arrives as the contents of the file
-# pointed to by ``-v output_path=``.
-if [[ -z "$query" && ! -t 0 ]]; then
-    stdin_content=$(cat)
-    if [[ -n "$stdin_content" ]]; then
-        query="$stdin_content"
-        output_path_value=""
-        for arg in "${saved_args[@]}"; do
-            case "$arg" in
-                output_path=*)
-                    output_path_value="${arg#output_path=}"
-                    ;;
-            esac
-        done
-        output_path_content=""
-        if [[ -n "$output_path_value" && -f "$output_path_value" ]]; then
-            output_path_content=$(cat "$output_path_value" 2>/dev/null || true)
-        fi
-        # Mirror to the invocation log so existing greps still find the
-        # SQL. ``printf '%q'`` matches the recorder's quoting style so
-        # tests that grep for ``\'planning\'`` keep matching.
-        {
-            printf 'CALL '
-            for arg in "${saved_args[@]}"; do
-                printf '%q ' "$arg"
-            done
-            printf '%q ' "STDIN:$stdin_content"
-            if [[ -n "$output_path_content" ]]; then
-                printf '%q' "OUTPUT_PATH_CONTENT:$output_path_content"
-            fi
-            printf '\n'
-        } >> "${INVOCATIONS_DIR:-/tmp}/psql.log"
-    fi
+# When -c was absent, fall back to stdin captured by the shared recorder.
+# The recorder sets $stdin_content and writes STDIN: + FILE: tokens to the
+# log, so existing assertions (grep for INSERT/already_merged) still match.
+if [[ -z "$query" ]]; then
+    query="${stdin_content:-}"
 fi
 
 # Routing — purely by substring match on the SQL.

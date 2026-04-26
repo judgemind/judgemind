@@ -71,20 +71,7 @@ INVOCATIONS_DIR="$TEST_TMP/invocations"
 mkdir -p "$STUB_BIN" "$INVOCATIONS_DIR"
 
 # Shared stub utility — each stub sources this to record its invocation.
-cat > "$STUB_BIN/_record_invocation.sh" << 'RECORDEOF'
-# Source this to record argv into $INVOCATIONS_DIR/<tool>.log, one
-# invocation per line starting with a count marker.
-TOOL_NAME="$1"
-shift
-INVOCATIONS_LOG="${INVOCATIONS_DIR:-/tmp}/${TOOL_NAME}.log"
-{
-    printf 'CALL '
-    for arg in "$@"; do
-        printf '%q ' "$arg"
-    done
-    printf '\n'
-} >> "$INVOCATIONS_LOG"
-RECORDEOF
+cp "$REPO_ROOT/scripts/tests/_record_invocation.sh" "$STUB_BIN/_record_invocation.sh"
 
 # ── aws stub ─────────────────────────────────────────────────────────────────
 # Routes on subcommand:
