@@ -456,6 +456,14 @@ FAILURE_HINT_PLAN_BLOCKED = "plan_blocked"
 #: ``FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE`` in daemon.py. See #3225.
 FAILURE_HINT_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 
+#: #3465 — push_and_pr or start-of-ralph baseline rebase exited non-zero
+#: but ``git diff --name-only --diff-filter=U`` returned no files. Routing
+#: to fix_conflict with an empty conflict bundle would cause the skill to
+#: return ``unresolvable`` immediately (nothing to resolve). Instead we
+#: emit a distinct envelope and route to the diagnoser. Maps to
+#: ``FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES`` in daemon.py.
+FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
+
 
 # ---------------------------------------------------------------------------
 # Transition dataclass.
@@ -577,6 +585,22 @@ def transition_from_ralph(output: Mapping[str, Any] | None) -> PhaseTransition:
     path takes precedence over verdict parsing because no claude
     skill has run yet.
     """
+    # #3465: start-of-ralph baseline rebase exited non-zero but produced
+    # no unmerged files. MUST come before the generic rebase_failed branch
+    # so the empty bundle never reaches fix_conflict.
+    if output and output.get("rebase_failed") and output.get("no_unmerged_files"):
+        return PhaseTransition(
+            action=TransitionAction.ROUTE_TO_DIAGNOSER,
+            failure_hint=FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES,
+            reason=(
+                "ralph baseline rebase failed with no unmerged files — "
+                "routing to diagnoser (#3465)"
+            ),
+            context={
+                "rebase_stderr_tail": output.get("rebase_stderr_tail"),
+                "source_phase": "ralph",
+            },
+        )
     # #3225: start-of-ralph baseline rebase conflict. Short-circuits
     # the verdict check because the claude skill never ran.
     if output and output.get("rebase_failed"):
@@ -658,6 +682,14 @@ def transition_from_push_and_pr(
     * ``no_op=True`` — ralph's #3039 no-op-SHIP guardrail fired; the
       working tree was clean on SHIP. Terminal success with phase
       ``no_op``, status ``succeeded``. No PR, no CI, no merge.
+    * ``rebase_failed=True, no_unmerged_files=True`` (#3465) — the
+      pre-push ``git rebase origin/main`` exited non-zero but
+      ``git diff --name-only --diff-filter=U`` returned no files.
+      Routing to fix_conflict with an empty bundle would cause the
+      skill to return ``unresolvable`` immediately. Route to diagnoser
+      instead with hint ``push_and_pr_no_unmerged_files`` so the
+      diagnoser can decide next steps (evaluate ``--empty=drop``,
+      reissue, etc.).
     * ``rebase_failed=True`` (#3225) — the pre-push
       ``git rebase origin/main`` hit a conflict. Advance to the
       ``fix_conflict`` phase, where a claude skill semantically
@@ -671,6 +703,22 @@ def transition_from_push_and_pr(
             next_phase=PHASE_NO_OP,
             terminal_status=AgentStatus.SUCCEEDED.value,
             reason="push_and_pr no-op SHIP (#3039)",
+        )
+    # #3465: rebase exited non-zero but produced no unmerged files.
+    # MUST come before the generic rebase_failed branch so the empty
+    # bundle never reaches fix_conflict.
+    if output and output.get("rebase_failed") and output.get("no_unmerged_files"):
+        return PhaseTransition(
+            action=TransitionAction.ROUTE_TO_DIAGNOSER,
+            failure_hint=FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES,
+            reason=(
+                "push_and_pr rebase failed with no unmerged files — "
+                "routing to diagnoser (#3465)"
+            ),
+            context={
+                "rebase_stderr_tail": output.get("rebase_stderr_tail"),
+                "source_phase": "push_and_pr",
+            },
         )
     # #3225: pre-push rebase conflict. The entrypoint emits
     # ``{"rebase_failed": true, "conflict_files": [...]}`` when
@@ -1257,6 +1305,7 @@ __all__ = [
     "FAILURE_HINT_VERIFY_FAILED_POST_MERGE",
     "FAILURE_HINT_PLAN_BLOCKED",
     "FAILURE_HINT_CONFLICT_UNRESOLVABLE",
+    "FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES",
     # Transition dataclass + enum
     "PhaseTransition",
     "TransitionAction",

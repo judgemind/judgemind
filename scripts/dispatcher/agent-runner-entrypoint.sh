@@ -2410,6 +2410,14 @@ handle_push_and_pr() {
                     "$_fix_conflict_stage/conflict-files.txt" 2>/dev/null \
                     || printf '[]')
             fi
+            # #3465: capture the last ~50 lines of git-rebase.stderr.log
+            # (size-capped at ~5 KB) so the diagnoser can inspect the
+            # rebase failure reason when no unmerged files are present.
+            _rebase_stderr_tail=$(tail -n 50 \
+                "$AGENT_WORKSPACE/git-rebase.stderr.log" 2>/dev/null \
+                | head -c 5120 \
+                | jq -Rs '.' 2>/dev/null \
+                || printf '""')
             # Now abort the in-progress rebase so the worktree returns
             # to its pre-rebase state, log the failure, and emit the
             # structured envelope.
@@ -2420,10 +2428,20 @@ handle_push_and_pr() {
             set -e
             log "push_and_pr_rebase_conflict" "exit_code=$_rebase_rc" \
                 "conflict_files_json=$_conflict_files_json"
-            # #3225: emit conflict_files so transition_from_push_and_pr
-            # routes to fix_conflict with the file list in context.
-            printf '{"no_op": false, "rebase_failed": true, "conflict_files": %s}' \
-                "$_conflict_files_json"
+            # #3465: if the conflict-files list is empty the entrypoint
+            # emits a distinct no_unmerged_files envelope so the
+            # transition shim routes to the diagnoser instead of
+            # fix_conflict (which would immediately return unresolvable
+            # on an empty bundle).
+            if [[ "$_conflict_files_json" == "[]" ]]; then
+                printf '{"no_op": false, "rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": %s}' \
+                    "$_rebase_stderr_tail"
+            else
+                # #3225: emit conflict_files so transition_from_push_and_pr
+                # routes to fix_conflict with the file list in context.
+                printf '{"no_op": false, "rebase_failed": true, "conflict_files": %s, "rebase_stderr_tail": %s}' \
+                    "$_conflict_files_json" "$_rebase_stderr_tail"
+            fi
             return 0
         fi
     else
@@ -4559,15 +4577,33 @@ while true; do
                                 "$_fix_conflict_stage/conflict-files.txt" 2>/dev/null \
                                 || printf '[]')
                         fi
+                        # #3465: capture the last ~50 lines of
+                        # ralph-baseline-rebase.stderr.log (size-capped at
+                        # ~5 KB) so the diagnoser can inspect the rebase
+                        # failure reason when no unmerged files are present.
+                        _baseline_rebase_stderr_tail=$(tail -n 50 \
+                            "$AGENT_WORKSPACE/ralph-baseline-rebase.stderr.log" \
+                            2>/dev/null \
+                            | head -c 5120 \
+                            | jq -Rs '.' 2>/dev/null \
+                            || printf '""')
                         log "ralph_baseline_rebase_conflict" \
                             "exit_code=$_baseline_rebase_rc" \
                             "conflict_files_json=$_baseline_conflict_files_json"
-                        # Build a synthetic ralph-phase output with the
-                        # rebase_failed envelope. Persist + transition
-                        # via the normal shim path so the conflict
-                        # routes to fix_conflict.
-                        _ralph_baseline_output=$(printf '{"rebase_failed": true, "conflict_files": %s, "source_phase": "ralph"}' \
-                            "$_baseline_conflict_files_json")
+                        # #3465: build the synthetic ralph-phase output with
+                        # the rebase_failed envelope. If the conflict-files
+                        # list is empty, emit the no_unmerged_files variant
+                        # so the transition shim routes to the diagnoser
+                        # instead of fix_conflict. Otherwise emit the
+                        # conflict_files shape so fix_conflict can consume
+                        # the bundle.
+                        if [[ "$_baseline_conflict_files_json" == "[]" ]]; then
+                            _ralph_baseline_output=$(printf '{"rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
+                                "$_baseline_rebase_stderr_tail")
+                        else
+                            _ralph_baseline_output=$(printf '{"rebase_failed": true, "conflict_files": %s, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
+                                "$_baseline_conflict_files_json" "$_baseline_rebase_stderr_tail")
+                        fi
                         persist_phase_output "ralph" "$_ralph_baseline_output"
                         _bt=$(transition_for "ralph" "$_ralph_baseline_output")
                         _ba=$(printf '%s' "$_bt" | cut -f1)
@@ -4670,7 +4706,7 @@ while true; do
                             log "ralph_not_ship_local" "hint=$_hint"
                             handle_ralph_not_ship_local "$_output"
                             ;;
-                        ralph_ac_infeasible|summary_ac_infeasible|fix_ci_blocked|verify_failed_post_merge)
+                        ralph_ac_infeasible|summary_ac_infeasible|fix_ci_blocked|verify_failed_post_merge|push_and_pr_no_unmerged_files)
                             # Descriptive terminal — the daemon's
                             # BYPASSED_TERMINAL_PHASES_TO_ROUTE maps
                             # these phase names to failure categories
