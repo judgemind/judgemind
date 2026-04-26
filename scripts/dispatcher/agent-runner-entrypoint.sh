@@ -2018,6 +2018,7 @@ handle_scheduled_skill() {
     fi
 
     log "scheduled_skill_begin" "skill=$_skill_name" "agent_id=$AGENT_ID"
+    start_skill_phase_watcher "$_skill_name"
     set +e
     (
         cd "$REPO_ROOT" || exit 127
@@ -2029,6 +2030,7 @@ handle_scheduled_skill() {
     )
     _rc=$?
     set -e
+    stop_skill_phase_watcher
     log "scheduled_skill_done" "skill=$_skill_name" "exit_code=$_rc"
 
     # Persist the result envelope as a phase_output row for operator
@@ -3356,6 +3358,105 @@ stop_ralph_head_watcher() {
         "pid=$_ralph_watcher_pid" \
         "wait_rc=$_wait_rc"
     _ralph_watcher_pid=""
+}
+
+# ── Skill phase watcher (#3462) ───────────────────────────────────────────
+#
+# Tails ``$REPO_ROOT/tmp/agent-status/$AGENT_ID.txt`` while a scheduled
+# skill (audit, spotcheck, etc.) is running and fans each ``phase:``
+# change out as a structured ``agent_runner.skill_phase_change`` event
+# on stdout (fd 3 via ``log``).
+#
+# This fills the observability gap between ``scheduled_skill_begin`` and
+# ``scheduled_skill_done`` — cron skills can run for 10–90 min and the
+# entrypoint emits nothing during that window. The SKILL itself already
+# writes ``phase: <value>`` / ``summary: <value>`` to the status file;
+# this watcher just surfaces those updates in real time.
+#
+# Modeled directly on the ``ralph_head_watcher_*`` pattern above —
+# same trap idiom, same backgrounded-sleep SIGTERM handshake, same
+# sentinel file.
+
+AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL="${AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL:-5}"
+
+skill_phase_watcher_loop() {
+    # Body of the backgrounded subshell. Runs until killed by
+    # stop_skill_phase_watcher. Never exits on its own.
+    #
+    # Parses ``phase:`` and ``summary:`` lines from the status file on
+    # each tick. When the ``phase`` value changes, emits
+    # ``log "skill_phase_change" ...``. Bash 3.2 compatible — plain
+    # awk, no associative arrays.
+    _skill_name_w="$1"
+
+    _watcher_sleep_pid=""
+    trap '[[ -n "$_watcher_sleep_pid" ]] && kill "$_watcher_sleep_pid" 2>/dev/null; exit 0' TERM INT
+
+    _status_file="$REPO_ROOT/tmp/agent-status/$AGENT_ID.txt"
+    _last_phase=""
+
+    log "skill_phase_watcher_started" \
+        "skill=$_skill_name_w" \
+        "poll_interval=$AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL" \
+        "status_file=$_status_file"
+
+    # Sentinel so the test harness can confirm the watcher started.
+    printf 'started\n' > "$AGENT_WORKSPACE/skill-phase-watcher.started"
+
+    while true; do
+        if [[ -f "$_status_file" ]]; then
+            _cur_phase=$(awk '/^phase: /{print substr($0, 8)}' "$_status_file" 2>/dev/null | head -n 1 || true)
+            _cur_summary=$(awk '/^summary: /{print substr($0, 10)}' "$_status_file" 2>/dev/null | head -n 1 || true)
+            if [[ -n "$_cur_phase" && "$_cur_phase" != "$_last_phase" ]]; then
+                log "skill_phase_change" \
+                    "skill=$_skill_name_w" \
+                    "phase=$_cur_phase" \
+                    "summary=${_cur_summary:-}"
+                _last_phase="$_cur_phase"
+            fi
+        fi
+        sleep "$AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL" &
+        _watcher_sleep_pid=$!
+        wait "$_watcher_sleep_pid" 2>/dev/null || true
+        _watcher_sleep_pid=""
+    done
+}
+
+start_skill_phase_watcher() {
+    # Fork the watcher subshell. Sets ``$_skill_phase_watcher_pid`` in
+    # the caller's scope (global var — bash 3.2 compat, no ``local -n``).
+    # When AGENT_RUNNER_DISABLE_SKILL_PHASE_WATCHER=1 (tests, emergency
+    # kill-switch), skip entirely.
+    _skill_phase_watcher_pid=""
+    if [[ "${AGENT_RUNNER_DISABLE_SKILL_PHASE_WATCHER:-0}" == "1" ]]; then
+        log "skill_phase_watcher_disabled"
+        return 0
+    fi
+
+    # Run the loop in a subshell. fd 3 is inherited so log() still
+    # writes to the top-level stdout the CloudWatch agent reads.
+    skill_phase_watcher_loop "$1" &
+    _skill_phase_watcher_pid=$!
+    log "skill_phase_watcher_forked" "pid=$_skill_phase_watcher_pid" "skill=$1"
+}
+
+stop_skill_phase_watcher() {
+    # Kill the watcher subshell + reap it. Idempotent — safe to call
+    # on disable path where _skill_phase_watcher_pid is empty.
+    if [[ -z "${_skill_phase_watcher_pid:-}" ]]; then
+        return 0
+    fi
+    if kill "$_skill_phase_watcher_pid" 2>/dev/null; then
+        log "skill_phase_watcher_kill_sent" "pid=$_skill_phase_watcher_pid"
+    fi
+    set +e
+    wait "$_skill_phase_watcher_pid" 2>/dev/null
+    _wait_rc=$?
+    set -e
+    log "skill_phase_watcher_stopped" \
+        "pid=$_skill_phase_watcher_pid" \
+        "wait_rc=$_wait_rc"
+    _skill_phase_watcher_pid=""
 }
 
 persist_ralph_patch() {

@@ -126,6 +126,8 @@ chmod +x "$STUB_BIN/psql"
 # ── claude stub ────────────────────────────────────────────────────────────
 # Records the slash-command invoked and emits a canned envelope. Honors
 # CLAUDE_VERDICT_OVERRIDE for synthetic-skill verdict assertions.
+# When CLAUDE_SKILL_PHASE_STATUS_FILE is set, simulates phase transitions
+# by writing to the status file (used by Test 4 / skill_phase_watcher).
 cat > "$STUB_BIN/claude" <<'CLAUDEEOF'
 #!/usr/bin/env bash
 set -u
@@ -142,6 +144,16 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Simulate skill phase transitions when the watcher test sets this file.
+if [[ -n "${CLAUDE_SKILL_PHASE_STATUS_FILE:-}" ]]; then
+    printf 'phase: spotcheck-step-2\nsummary: running checks\n' \
+        > "$CLAUDE_SKILL_PHASE_STATUS_FILE"
+    sleep 2
+    printf 'phase: done\nsummary: complete\n' \
+        > "$CLAUDE_SKILL_PHASE_STATUS_FILE"
+    sleep 1
+fi
 
 # Emit the requested envelope. Default = SHIPPED-style success result.
 if [[ -n "${CLAUDE_RESULT_OVERRIDE:-}" ]]; then
@@ -371,6 +383,96 @@ if printf '%s' "$out" | grep -q "scheduled_skill_failed"; then
     pass "logs scheduled_skill_failed event on non-zero exit"
 else
     fail "logs scheduled_skill_failed event on non-zero exit" "out tail: $(printf '%s\n' "$out" | tail -20)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 4: skill_phase_watcher emits skill_phase_change events (#3462)
+#
+# A claude stub writes phase changes to the per-agent status file while
+# the entrypoint's handle_scheduled_skill blocks. The skill phase watcher
+# polls every 1s (AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL=1) and must emit
+# at least 2 distinct skill_phase_change events before the skill exits.
+#
+# Asserts:
+#   * ≥2 distinct agent_runner.skill_phase_change events in stdout
+#   * Each event contains agent_id, phase, summary, ts (log() shape)
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-skill-phase.txt"
+printf 'spotcheck\n' > "$PHASE_FIXTURE_FILE"
+KIND_FIXTURE="scheduled_skill"
+watcher_workspace="$TEST_TMP/skill-phase-watcher-workspace"
+mkdir -p "$watcher_workspace"
+
+# The status file lives at REPO_ROOT/tmp/agent-status/AGENT_ID.txt.
+# REPO_ROOT = AGENT_WORKSPACE/repo (set in the entrypoint).
+# Create the directory and pre-seed with step-1.
+WATCHER_AGENT_ID="dddd1111-2222-3333-4444-555555555555"
+watcher_status_dir="$watcher_workspace/repo/tmp/agent-status"
+mkdir -p "$watcher_status_dir"
+printf 'phase: spotcheck-step-1\nsummary: starting\n' \
+    > "$watcher_status_dir/$WATCHER_AGENT_ID.txt"
+
+set +e
+out=$(AGENT_ID="$WATCHER_AGENT_ID" \
+      ISSUE_NUMBER="" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$watcher_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      KIND_FIXTURE="$KIND_FIXTURE" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL=1 \
+      CLAUDE_SKILL_PHASE_STATUS_FILE="$watcher_status_dir/$WATCHER_AGENT_ID.txt" \
+      bash "$ENTRYPOINT" 2>&1)
+rc=$?
+set -e
+
+if [[ $rc -eq 0 ]]; then
+    pass "skill_phase_watcher test: entrypoint exits cleanly (rc=0)"
+else
+    fail "skill_phase_watcher test: entrypoint exits cleanly" \
+         "rc=$rc, out tail: $(printf '%s\n' "$out" | tail -20)"
+fi
+
+# Count distinct skill_phase_change events.
+phase_change_count=$(printf '%s\n' "$out" \
+    | grep -c '"event": "agent_runner.skill_phase_change"' || true)
+if [[ "$phase_change_count" -ge 2 ]]; then
+    pass "skill_phase_watcher emits >=2 skill_phase_change events (got $phase_change_count)"
+else
+    fail "skill_phase_watcher emits >=2 skill_phase_change events" \
+         "got $phase_change_count — out tail: $(printf '%s\n' "$out" | tail -30)"
+fi
+
+# Assert each event contains required fields (agent_id, phase, summary, ts).
+# Extract one matching line and verify all four fields are present via jq.
+if command -v jq >/dev/null 2>&1; then
+    _sample_event=$(printf '%s\n' "$out" \
+        | grep '"event": "agent_runner.skill_phase_change"' | head -n 1 || true)
+    if [[ -n "$_sample_event" ]]; then
+        _has_agent_id=$(printf '%s' "$_sample_event" | jq -r '.agent_id // ""' 2>/dev/null || true)
+        _has_phase=$(printf '%s' "$_sample_event" | jq -r '.phase // ""' 2>/dev/null || true)
+        _has_summary=$(printf '%s' "$_sample_event" | jq -r 'has("summary") | tostring' 2>/dev/null || true)
+        _has_ts=$(printf '%s' "$_sample_event" | jq -r '.ts // ""' 2>/dev/null || true)
+        if [[ -n "$_has_agent_id" && -n "$_has_phase" && "$_has_summary" == "true" && -n "$_has_ts" ]]; then
+            pass "skill_phase_change event contains agent_id, phase, summary, ts"
+        else
+            fail "skill_phase_change event contains agent_id, phase, summary, ts" \
+                 "agent_id='$_has_agent_id' phase='$_has_phase' summary_key=$_has_summary ts='$_has_ts'"
+        fi
+    else
+        fail "skill_phase_change event contains agent_id, phase, summary, ts" \
+             "no matching event line found in output"
+    fi
+else
+    pass "skill_phase_change event field check (skipped — jq unavailable)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
