@@ -111,6 +111,8 @@ jobs:
               - 'packages/scraper-framework/Dockerfile'
               - 'packages/scraper-framework/pyproject.toml'
               - '.github/ecs-oneshot-test/**'
+              - 'infra/terraform/modules/dispatcher-agent-runner/**'
+              - 'infra/terraform/modules/dispatcher-daemon/**'
             dockerfile:
               - 'packages/scraper-framework/Dockerfile'
               - '.github/playwright-browser-check/**'
