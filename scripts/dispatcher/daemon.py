@@ -2390,11 +2390,11 @@ class DispatcherDaemon:
         # is the shared atomic (single-writer from the scheduler thread at
         # the top of every :meth:`scheduler_tick`, single-reader from the
         # watchdog loop) that records the most recent tick's monotonic
-        # timestamp. Initialized to boot-time so the watchdog's first
-        # observation has a valid reference — run_forever fires the first
-        # tick within milliseconds of boot, so the initial value is only
-        # in play during the brief startup window before the first tick
-        # overwrites it.
+        # timestamp. Initialized here as a defensive default; the
+        # load-bearing seed happens in :meth:`_start_watchdog` as its
+        # first action (#3386) so the watchdog's reference is always the
+        # moment the loop starts — not ``__init__`` finish, which may be
+        # 30-60s earlier on a cold ECS boot.
         #
         # ``_watchdog_thread`` is the supervisor thread that polls the
         # gap every :data:`WATCHDOG_POLL_INTERVAL_SECONDS` and fires
@@ -23366,17 +23366,25 @@ class DispatcherDaemon:
                     pass
 
     def _start_watchdog(self) -> None:
-        """Spawn the supervisor watchdog thread (#3097, #3351).
+        """Spawn the supervisor watchdog thread (#3097, #3351, #3386).
 
         Idempotent — a second call while the thread is alive is a no-op.
         Called from :meth:`run_forever` BEFORE the initial scheduler
         tick (#3351) so an initial-tick wedge is still observable by
-        the watchdog. The baseline timestamp is seeded at boot in
-        :meth:`__init__` so the first observation has a valid reference
-        even before the first tick fires.
+        the watchdog.
+
+        Contract (#3386): the first substantive action (after the
+        idempotency early-return) is to re-seed
+        ``_last_scheduler_tick_at`` to ``time.monotonic()`` so the
+        watchdog's reference is the moment the loop starts, not
+        ``__init__`` finish.  Cold ECS boots can take 30-60s between
+        construction and :meth:`run_forever`; without this re-seed the
+        watchdog would observe a stale baseline and fire a spurious WARN
+        before the first tick has had a chance to run.
         """
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             return
+        self._last_scheduler_tick_at = time.monotonic()
         self._watchdog_stop.clear()
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
@@ -23418,10 +23426,10 @@ class DispatcherDaemon:
         # boto3 client created during that first reap could block the
         # daemon forever with no recourse — exactly the failure mode
         # observed in the 2026-04-25 cascade. The watchdog's baseline
-        # is ``_last_scheduler_tick_at``, seeded at boot in
-        # :meth:`__init__`, so observation has a valid reference even
-        # before the first tick fires. See :meth:`_watchdog_loop` for
-        # the WARN/EXIT tier semantics.
+        # is ``_last_scheduler_tick_at``, seeded by :meth:`_start_watchdog`
+        # as its first action (#3386) so the reference is always the
+        # moment the loop starts, not ``__init__`` finish. See
+        # :meth:`_watchdog_loop` for the WARN/EXIT tier semantics.
         self._start_watchdog()
 
         # Tick once on boot so the first scheduler/supervisor cycle is
