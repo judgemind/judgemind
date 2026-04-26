@@ -762,6 +762,18 @@ class TestVenturaFrameworkPrompt:
         assert "granted_in_part" in VENTURA_FRAMEWORK_PROMPT
         assert "granted_in_part" in VENTURA_SYSTEM_PROMPT
 
+    def test_forbids_topic_heading_splits(self) -> None:
+        """Prompt explicitly forbids splitting a single-case document on topic headings (#3493)."""
+        assert "Each Ventura PDF is ONE ruling" in VENTURA_FRAMEWORK_PROMPT
+        assert "Case Management Order" in VENTURA_FRAMEWORK_PROMPT
+        assert "Arbitration" in VENTURA_FRAMEWORK_PROMPT
+        assert "Settlement" in VENTURA_FRAMEWORK_PROMPT
+        assert "Mediation" in VENTURA_FRAMEWORK_PROMPT
+
+    def test_negative_example_present(self) -> None:
+        """Prompt includes a negative example referencing 12 topic headings (#3493)."""
+        assert "12" in VENTURA_FRAMEWORK_PROMPT
+
 
 class TestVenturaConfigUsesFrameworkPrompt:
     """Verify the Ventura extraction config uses the framework prompt (#2271)."""
