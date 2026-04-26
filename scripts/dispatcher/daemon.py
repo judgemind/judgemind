@@ -12731,7 +12731,9 @@ class DispatcherDaemon:
         now() - ORPHAN_PR_RESURRECTION_LOOKBACK`` rows. For each, it
         fetches the PR's combined check rollup + merge state via
         :meth:`_fetch_pr_status` and runs the same classifier
-        (:meth:`_classify_check_rollup`) the awaiting_ci handler uses.
+        (:func:`phase_transitions._ci_rollup_state` via
+        :func:`phase_transitions.transition_from_awaiting_ci`) the
+        awaiting_ci handler uses.
         Only when the classifier says ``'green'`` (open + mergeable +
         all checks SUCCESS/SKIPPED + ``mergeStateStatus=CLEAN``) does
         the sweep flip the row back to ``status='running' AND
@@ -12829,8 +12831,8 @@ class DispatcherDaemon:
             # sites. Critically, this classifier returns 'pending'
             # (not 'red') when ``mergeable=UNKNOWN`` — GitHub flips
             # state to UNKNOWN intermittently while it recomputes, and
-            # the legacy ``_classify_check_rollup`` would mis-skip
-            # the row in that window. Reasons surface as 'CI green' /
+            # the legacy classifier would mis-skip the row in that
+            # window. Reasons surface as 'CI green' /
             # 'CI red' / 'CI pending' from the transition.reason field.
             ci_transition = transition_from_awaiting_ci(pr_status)
             _reason_to_state = {
@@ -13418,12 +13420,10 @@ class DispatcherDaemon:
 
         # Dispatch through the pure phase-transition catalog (#2976).
         # transition_from_awaiting_ci encapsulates the rollup-state
-        # classification (via _ci_rollup_state from phase_transitions.py)
-        # and returns the canonical next-phase decision. This replaces
-        # the inline _classify_check_rollup call — the two classifiers
-        # are functionally equivalent; the pure-module version also
-        # handles StatusContext (__typename=STATUSCONTEXT) entries
-        # that the legacy path overlooked (#3200).
+        # classification (via _ci_rollup_state from phase_transitions.py,
+        # the single source of truth for gh pr view rollup classification)
+        # and returns the canonical next-phase decision. Also handles
+        # StatusContext (__typename=STATUSCONTEXT) entries correctly (#3200).
         awaiting_ci_transition = transition_from_awaiting_ci(pr_status)
         # Derive rollup_state from the transition reason for the ci_poll
         # log event. Reason strings are "CI green" / "CI red" / "CI pending".
@@ -13567,86 +13567,6 @@ class DispatcherDaemon:
             )
             return None
 
-    @staticmethod
-    def _classify_check_rollup(pr_status: dict[str, Any]) -> str:
-        """Return ``'green'``, ``'red'``, or ``'pending'`` for a PR status.
-
-        Logic:
-
-        * Any check in ``IN_PROGRESS`` / ``QUEUED`` / ``PENDING`` /
-          ``WAITING`` → ``'pending'`` (even if others failed — we must
-          wait for the full signal before deciding).
-        * If no pending and any check in ``FAILURE`` / ``CANCELLED`` /
-          ``TIMED_OUT`` / ``ACTION_REQUIRED`` → ``'red'``.
-        * All ``SUCCESS`` / ``SKIPPED`` / ``NEUTRAL`` / ``STALE`` AND
-          ``mergeable='MERGEABLE'`` AND ``mergeStateStatus='CLEAN'`` →
-          ``'green'``.
-        * Otherwise (mergeable=false, conflicting, etc.) → ``'red'``
-          so the fix-ci path runs.
-
-        Accepts both Actions-style (``status``/``conclusion``) and
-        legacy-commit-status-style (``state``) rollup entries so it
-        works with whatever mix ``gh pr view --json statusCheckRollup``
-        returns.
-        """
-        rollup = pr_status.get("statusCheckRollup") or []
-
-        pending_statuses = {"IN_PROGRESS", "QUEUED", "PENDING", "WAITING"}
-        # Values GitHub uses for a failed Actions check.
-        failure_conclusions = {
-            "FAILURE",
-            "CANCELLED",
-            "TIMED_OUT",
-            "ACTION_REQUIRED",
-            "STARTUP_FAILURE",
-        }
-        # Legacy commit-status states.
-        legacy_pending = {"PENDING", "EXPECTED"}
-        legacy_failure = {"FAILURE", "ERROR"}
-
-        has_pending = False
-        has_failure = False
-
-        for check in rollup:
-            if not isinstance(check, dict):
-                continue
-            # Actions-style.
-            raw_status = check.get("status")
-            raw_conclusion = check.get("conclusion")
-            if raw_status is not None:
-                status_up = str(raw_status).upper()
-                conclusion_up = (
-                    str(raw_conclusion).upper() if raw_conclusion is not None else ""
-                )
-                if status_up == "COMPLETED":
-                    if conclusion_up in failure_conclusions:
-                        has_failure = True
-                elif status_up in pending_statuses:
-                    has_pending = True
-                continue
-            # Legacy commit-status-style.
-            raw_state = check.get("state")
-            if raw_state is not None:
-                state_up = str(raw_state).upper()
-                if state_up in legacy_pending:
-                    has_pending = True
-                elif state_up in legacy_failure:
-                    has_failure = True
-
-        if has_pending:
-            return "pending"
-        if has_failure:
-            return "red"
-
-        mergeable = str(pr_status.get("mergeable") or "").upper()
-        merge_state = str(pr_status.get("mergeStateStatus") or "").upper()
-        if mergeable == "MERGEABLE" and merge_state == "CLEAN":
-            return "green"
-
-        # Checks all green but PR not mergeable (conflicts, branch
-        # protection unmet, etc.) — treat as red so fix-ci can try.
-        return "red"
-
     def _merge_pr_and_advance(
         self, agent: dict[str, Any], pr_status: dict[str, Any]
     ) -> None:
@@ -13656,7 +13576,7 @@ class DispatcherDaemon:
         stale-rollup marker (``base branch policy prohibits the merge``)
         AND the daemon already observed ci-passed green for this PR —
         the precondition for having reached this method via the
-        ``_classify_check_rollup → 'green'`` branch — the failure is
+        ``_ci_rollup_state → 'green'`` branch — the failure is
         NOT a real CI regression. It's GitHub's branch-protection
         evaluator still scoring an old FAILURE check_run from a rerun
         on the same SHA. Bounded at 1 auto-unstick per agent lifetime
@@ -13794,7 +13714,7 @@ class DispatcherDaemon:
         with ``base branch policy prohibits the merge`` after we
         already observed ``ci-passed=SUCCESS`` for the current HEAD
         (that's the precondition for reaching the merge call site via
-        the ``_classify_check_rollup → 'green'`` branch — the rollup
+        the ``_ci_rollup_state → 'green'`` branch — the rollup
         classifier requires ``mergeable='MERGEABLE'`` AND no FAILURE
         conclusions, which implies latest ci-passed is SUCCESS).
 

@@ -983,10 +983,12 @@ _CI_STATUSCONTEXT_SUCCESS_STATES: frozenset[str] = frozenset({"SUCCESS", "NEUTRA
 def _ci_rollup_state(pr_status: Mapping[str, Any] | None) -> str:
     """Classify a ``gh pr view --json`` rollup as green / red / pending.
 
-    Mirrors the rollup parsing logic embedded in
-    ``_advance_awaiting_ci`` (daemon.py lines 10774+). Extracted so
-    the agent-runner can use it identically without duplicating the
-    check-run conclusion constants.
+    This is the **single source of truth** for ``gh pr view`` rollup
+    classification across the daemon and the agent-runner.  All callers
+    (``transition_from_awaiting_ci``, ``_resurrect_orphan_pr_failed_agents``,
+    and the agent-runner entrypoint) delegate to this function so that
+    the classification rules are defined and maintained in exactly one
+    place.
 
     statusCheckRollup is a heterogeneous list:
 
