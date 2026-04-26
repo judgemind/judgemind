@@ -317,136 +317,166 @@ resource "aws_iam_role_policy" "task_spotcheck_oneshot" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        # Register a fresh oneshot task definition for each /spotcheck
-        # invocation. AWS does not accept ARN scoping on this action.
-        Sid      = "AllowRegisterOneshotTaskDefinition"
-        Effect   = "Allow"
-        Action   = "ecs:RegisterTaskDefinition"
-        Resource = "*"
-      },
-      {
-        Sid      = "AllowDeregisterOneshotTaskDefinition"
-        Effect   = "Allow"
-        Action   = "ecs:DeregisterTaskDefinition"
-        Resource = local.spotcheck_oneshot_family_arn_pattern
-      },
-      {
-        # Source-task-def read (template) + freshly registered oneshot
-        # task-def read. AWS requires `*` on this action.
-        Sid      = "AllowDescribeOneshotTaskDefinitions"
-        Effect   = "Allow"
-        Action   = "ecs:DescribeTaskDefinition"
-        Resource = "*"
-      },
-      {
-        # Launch the oneshot, scoped to the dev oneshot family on this
-        # cluster only.
-        Sid      = "AllowRunOneshotTask"
-        Effect   = "Allow"
-        Action   = "ecs:RunTask"
-        Resource = local.spotcheck_oneshot_family_arn_pattern
-        Condition = {
-          ArnEquals = {
-            "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+    Statement = concat(
+      [
+        {
+          # Register a fresh oneshot task definition for each /spotcheck
+          # invocation. AWS does not accept ARN scoping on this action.
+          Sid      = "AllowRegisterOneshotTaskDefinition"
+          Effect   = "Allow"
+          Action   = "ecs:RegisterTaskDefinition"
+          Resource = "*"
+        },
+        {
+          Sid      = "AllowDeregisterOneshotTaskDefinition"
+          Effect   = "Allow"
+          Action   = "ecs:DeregisterTaskDefinition"
+          Resource = local.spotcheck_oneshot_family_arn_pattern
+        },
+        {
+          # Source-task-def read (template) + freshly registered oneshot
+          # task-def read. AWS requires `*` on this action.
+          Sid      = "AllowDescribeOneshotTaskDefinitions"
+          Effect   = "Allow"
+          Action   = "ecs:DescribeTaskDefinition"
+          Resource = "*"
+        },
+        {
+          # Launch the oneshot, scoped to the dev oneshot family on this
+          # cluster only.
+          Sid      = "AllowRunOneshotTask"
+          Effect   = "Allow"
+          Action   = "ecs:RunTask"
+          Resource = local.spotcheck_oneshot_family_arn_pattern
+          Condition = {
+            ArnEquals = {
+              "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+            }
           }
-        }
-      },
-      {
-        # Stop a hung oneshot if /spotcheck times out (the launcher's
-        # cleanup path uses StopTask before exiting).
-        Sid      = "AllowStopOneshotTask"
-        Effect   = "Allow"
-        Action   = "ecs:StopTask"
-        Resource = local.spotcheck_oneshot_family_arn_pattern
-        Condition = {
-          ArnEquals = {
-            "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+        },
+        {
+          # Stop a hung oneshot if /spotcheck times out (the launcher's
+          # cleanup path uses StopTask before exiting).
+          Sid      = "AllowStopOneshotTask"
+          Effect   = "Allow"
+          Action   = "ecs:StopTask"
+          Resource = local.spotcheck_oneshot_family_arn_pattern
+          Condition = {
+            ArnEquals = {
+              "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+            }
           }
-        }
-      },
-      {
-        # Poll DescribeTasks until the oneshot finishes; DescribeServices
-        # resolves the cluster's networking config for RunTask. Both
-        # actions require `*` at the API level — the cluster-ARN
-        # condition is the defence-in-depth control.
-        Sid    = "AllowDescribeOneshotRunningTasks"
-        Effect = "Allow"
-        Action = [
-          "ecs:DescribeTasks",
-          "ecs:DescribeServices",
-        ]
-        Resource = "*"
-        Condition = {
-          ArnEquals = {
-            "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+        },
+        {
+          # Poll DescribeTasks until the oneshot finishes; DescribeServices
+          # resolves the cluster's networking config for RunTask. Both
+          # actions require `*` at the API level — the cluster-ARN
+          # condition is the defence-in-depth control.
+          Sid    = "AllowDescribeOneshotRunningTasks"
+          Effect = "Allow"
+          Action = [
+            "ecs:DescribeTasks",
+            "ecs:DescribeServices",
+          ]
+          Resource = "*"
+          Condition = {
+            ArnEquals = {
+              "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+            }
           }
-        }
-      },
-      {
-        # PassRole the oneshot's source task + execution roles.
-        # Without this, RunTask fails with `AccessDeniedException:
-        # User ... is not authorized to pass role ... because no
-        # identity-based policy allows the iam:PassRole action`.
-        Sid      = "AllowPassOneshotRoles"
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
-        Resource = local.spotcheck_oneshot_pass_role_arns
-        Condition = {
-          StringEquals = {
-            "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+        },
+        {
+          # PassRole the oneshot's source task + execution roles.
+          # Without this, RunTask fails with `AccessDeniedException:
+          # User ... is not authorized to pass role ... because no
+          # identity-based policy allows the iam:PassRole action`.
+          Sid      = "AllowPassOneshotRoles"
+          Effect   = "Allow"
+          Action   = "iam:PassRole"
+          Resource = local.spotcheck_oneshot_pass_role_arns
+          Condition = {
+            StringEquals = {
+              "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+            }
           }
-        }
-      },
-      {
-        # Resolve a `--role <name>` override (ecs-run-task.sh calls
-        # `aws iam get-role --role-name <name>` to map a role name to
-        # an ARN before RunTask). Scoped to this account's
-        # `judgemind-*-${env}` roles only.
-        Sid      = "AllowResolveOneshotRoleName"
-        Effect   = "Allow"
-        Action   = "iam:GetRole"
-        Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/judgemind-*-${var.environment}"
-      },
-      {
-        # Stream the oneshot's CloudWatch logs back into the agent-
-        # runner's stdout (the launcher tails the ingestion-worker
-        # log group, where oneshot tasks inherit their log config).
-        # Scoped to judgemind-* log groups in this account/region.
-        Sid    = "AllowReadOneshotLogs"
-        Effect = "Allow"
-        Action = [
-          "logs:DescribeLogStreams",
-          "logs:GetLogEvents",
-          "logs:FilterLogEvents",
-        ]
-        Resource = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/judgemind-*:*"
-      },
-      {
-        # /spotcheck reads its sampling JSON output back from
-        # s3://judgemind-document-archive-${env}/spotcheck/... and
-        # downloads paired PDFs from s3://.../ca/<county>/raw/...
-        # GetBucketLocation is a precondition for `aws s3 cp` against
-        # a regional bucket from a multi-region SDK call path.
-        Sid    = "AllowSpotcheckBucketReads"
-        Effect = "Allow"
-        Action = [
-          "s3:ListBucket",
-          "s3:GetBucketLocation",
-        ]
-        Resource = var.spotcheck_document_archive_bucket_arn
-      },
-      {
-        # Object-level read on the same bucket. /spotcheck never
-        # writes — no PutObject / DeleteObject is granted. The oneshot
-        # itself uses the iam_scraper role for writes.
-        Sid      = "AllowSpotcheckObjectReads"
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
-        Resource = "${var.spotcheck_document_archive_bucket_arn}/*"
-      },
-    ]
+        },
+        {
+          # Resolve a `--role <name>` override (ecs-run-task.sh calls
+          # `aws iam get-role --role-name <name>` to map a role name to
+          # an ARN before RunTask). Scoped to this account's
+          # `judgemind-*-${env}` roles only.
+          Sid      = "AllowResolveOneshotRoleName"
+          Effect   = "Allow"
+          Action   = "iam:GetRole"
+          Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/judgemind-*-${var.environment}"
+        },
+        {
+          # Stream the oneshot's CloudWatch logs back into the agent-
+          # runner's stdout (the launcher tails the ingestion-worker
+          # log group, where oneshot tasks inherit their log config).
+          # Scoped to judgemind-* log groups in this account/region.
+          Sid    = "AllowReadOneshotLogs"
+          Effect = "Allow"
+          Action = [
+            "logs:DescribeLogStreams",
+            "logs:GetLogEvents",
+            "logs:FilterLogEvents",
+          ]
+          Resource = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/judgemind-*:*"
+        },
+        {
+          # /spotcheck reads its sampling JSON output back from
+          # s3://judgemind-document-archive-${env}/spotcheck/... and
+          # downloads paired PDFs from s3://.../ca/<county>/raw/...
+          # GetBucketLocation is a precondition for `aws s3 cp` against
+          # a regional bucket from a multi-region SDK call path.
+          Sid    = "AllowSpotcheckBucketReads"
+          Effect = "Allow"
+          Action = [
+            "s3:ListBucket",
+            "s3:GetBucketLocation",
+          ]
+          Resource = var.spotcheck_document_archive_bucket_arn
+        },
+        {
+          # Object-level read on the same bucket. /spotcheck never
+          # writes — no PutObject / DeleteObject is granted. The oneshot
+          # itself uses the iam_scraper role for writes.
+          Sid      = "AllowSpotcheckObjectReads"
+          Effect   = "Allow"
+          Action   = "s3:GetObject"
+          Resource = "${var.spotcheck_document_archive_bucket_arn}/*"
+        },
+        {
+          # List running tasks on the dev cluster so dev-db-query.sh and
+          # ecs-run.sh can resolve the running task ARN. AWS requires
+          # Resource = "*" on ListTasks; the cluster-ARN condition is the
+          # defence-in-depth control.
+          Sid      = "AllowSpotcheckListTasks"
+          Effect   = "Allow"
+          Action   = "ecs:ListTasks"
+          Resource = "*"
+          Condition = {
+            ArnEquals = {
+              "ecs:cluster" = var.spotcheck_ecs_cluster_arn
+            }
+          }
+        },
+      ],
+      var.spotcheck_oneshot_script_bucket_arn != "" ? [
+        {
+          # Upload scripts >8KB via pre-signed URL. Scoped to the
+          # oneshot-scripts/ prefix inside the caller-supplied assets bucket.
+          Sid    = "AllowUploadSpotcheckOneshotScripts"
+          Effect = "Allow"
+          Action = [
+            "s3:PutObject",
+            "s3:DeleteObject",
+          ]
+          Resource = "${var.spotcheck_oneshot_script_bucket_arn}/oneshot-scripts/*"
+        },
+      ] : [],
+    )
   })
 }
 
