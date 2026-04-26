@@ -80,21 +80,7 @@ INVOCATIONS_DIR="$TEST_TMP/invocations"
 mkdir -p "$STUB_BIN" "$INVOCATIONS_DIR"
 
 # Shared stub utility — each stub sources this to record its invocation.
-cat > "$STUB_BIN/_record_invocation.sh" <<'RECORDEOF'
-# Source this to record argv into $INVOCATIONS_DIR/<tool>.log, one
-# invocation per line starting with a count marker. Pass the tool name
-# as $1, remaining args as $2+.
-TOOL_NAME="$1"
-shift
-INVOCATIONS_LOG="${INVOCATIONS_DIR:-/tmp}/${TOOL_NAME}.log"
-{
-    printf 'CALL '
-    for arg in "$@"; do
-        printf '%q ' "$arg"
-    done
-    printf '\n'
-} >> "$INVOCATIONS_LOG"
-RECORDEOF
+cp "$REPO_ROOT/scripts/tests/_record_invocation.sh" "$STUB_BIN/_record_invocation.sh"
 
 # ── psql stub ──────────────────────────────────────────────────────────────
 # Responds based on the query substring:
@@ -114,7 +100,6 @@ INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 
 # Parse args for -c <query>.
 query=""
-saved_args=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c)
@@ -125,48 +110,11 @@ while [[ $# -gt 0 ]]; do
     shift || true
 done
 
-# #3413 — persist_phase_output now feeds the INSERT through a quoted
-# heredoc on stdin instead of the historical ``-c "$1"`` argv slot, so
-# the SQL no longer appears in argv. The existing assertions
-# (``grep "INSERT INTO dispatcher.phase_outputs" psql.log``) and the
-# substring router below both depend on seeing the SQL — so when stdin
-# carries a query, route by it AND emit a synthetic ``STDIN`` log line
-# so the assertions match. We also resolve any ``-v output_path=PATH``
-# argument and inline the file content into the log so assertions that
-# greppe the JSON payload (e.g. ``already_merged``) keep working — in
-# the new wire format the JSON arrives as the contents of the file
-# pointed to by ``-v output_path=``.
-if [[ -z "$query" && ! -t 0 ]]; then
-    stdin_content=$(cat)
-    if [[ -n "$stdin_content" ]]; then
-        query="$stdin_content"
-        output_path_value=""
-        for arg in "${saved_args[@]}"; do
-            case "$arg" in
-                output_path=*)
-                    output_path_value="${arg#output_path=}"
-                    ;;
-            esac
-        done
-        output_path_content=""
-        if [[ -n "$output_path_value" && -f "$output_path_value" ]]; then
-            output_path_content=$(cat "$output_path_value" 2>/dev/null || true)
-        fi
-        # Mirror to the invocation log so existing greps still find the
-        # SQL. ``printf '%q'`` matches the recorder's quoting style so
-        # tests that grep for ``\'planning\'`` keep matching.
-        {
-            printf 'CALL '
-            for arg in "${saved_args[@]}"; do
-                printf '%q ' "$arg"
-            done
-            printf '%q ' "STDIN:$stdin_content"
-            if [[ -n "$output_path_content" ]]; then
-                printf '%q' "OUTPUT_PATH_CONTENT:$output_path_content"
-            fi
-            printf '\n'
-        } >> "${INVOCATIONS_DIR:-/tmp}/psql.log"
-    fi
+# When -c was absent, fall back to stdin captured by the shared recorder.
+# The recorder sets $stdin_content and writes STDIN: + FILE: tokens to the
+# log, so existing assertions (grep for INSERT/already_merged) still match.
+if [[ -z "$query" ]]; then
+    query="${stdin_content:-}"
 fi
 
 # Routing — purely by substring match on the SQL.
@@ -742,23 +690,14 @@ else
 fi
 
 # Verify each expected phase had an INSERT into phase_outputs. The
-# entrypoint records each INSERT as a single ``CALL ...`` line in the
-# psql log. Two distinct wire formats are valid here:
-#   * Pre-#3413: ``psql -c <SQL>`` — the SQL is in argv. Phase appears
-#     as the SQL literal ``'planning'`` (recorded as ``\'planning\'``
-#     after ``printf '%q'`` escaping).
-#   * #3413+:    ``psql -v phase=planning ... <<EOF ... :'phase' ...``
-#     — phase is passed via psql's ``-v`` variable substitution, the
-#     SQL is on stdin, and the stub mirrors stdin into the log with a
-#     ``STDIN:`` prefix. Phase shows up in the ``-v phase=planning``
-#     argv slot AND the SQL on stdin contains the ``INSERT INTO
-#     dispatcher.phase_outputs`` token.
-# The assertion accepts either: a CALL line containing both the INSERT
-# token AND the phase name in any of these positions.
+# entrypoint records each INSERT via ``psql -v phase=planning ... <<'EOF'``.
+# The shared _record_invocation.sh (#3420) writes CALL args and heredoc SQL
+# on separate log lines: the CALL line carries ``-v phase=planning``; the
+# INSERT SQL appears in the subsequent STDIN: lines. Verify by checking
+# for the ``-v phase=<phase>`` CALL arg — the heredoc content is fixed, so
+# its presence follows from the invocation being recorded.
 for expected in planning ralph summary push_and_pr verify; do
-    if grep "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
-         | grep -E "(\\\\'${expected}\\\\'|-v phase=${expected})" \
-         > /dev/null 2>&1; then
+    if grep -q " phase=${expected}" "$INVOCATIONS_DIR/psql.log" 2>/dev/null; then
         pass "persists phase_outputs row for $expected"
     else
         fail "persists phase_outputs row for $expected" \
@@ -796,8 +735,7 @@ fi
 # at parity.
 insert_count=$(grep -c "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
 insert_count=${insert_count:-0}
-on_conflict_count=$(grep "INSERT INTO dispatcher.phase_outputs" "$INVOCATIONS_DIR/psql.log" \
-    | grep -c "ON CONFLICT (agent_id, phase, attempt) DO UPDATE" 2>/dev/null || true)
+on_conflict_count=$(grep -c "ON CONFLICT (agent_id, phase, attempt) DO UPDATE" "$INVOCATIONS_DIR/psql.log" 2>/dev/null || true)
 on_conflict_count=${on_conflict_count:-0}
 if [[ "$insert_count" -gt 0 && "$insert_count" == "$on_conflict_count" ]]; then
     pass "#3219 — every phase_outputs INSERT carries ON CONFLICT DO UPDATE (inserts=$insert_count)"
