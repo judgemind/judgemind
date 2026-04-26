@@ -34,6 +34,58 @@ describe('IssueLink', () => {
     // readability regression where links render as low-contrast gray.
     expect(link.className).not.toMatch(/(^|\s)text-accent(\s|$)/);
   });
+
+  // Regression guard for #3425. Scheduled-skill agents (`/audit`,
+  // `/spotcheck`, `/dispatcher-daily-report`) have
+  // `dispatcher.agents.issue_number = NULL` by design (migration 49 /
+  // issue #3381). Pre-#3425 `IssueLink` declared `number: number`
+  // (non-null) and the cockpit blew up the moment one of those agents
+  // landed in the active or recently-completed lists. Centralizing the
+  // null branch on `IssueLink` means every call site
+  // (ActiveAgentsTable, RecentCompletionsPanel, QueueFullDialog via
+  // RecentCompletionRow) gets the placeholder for free.
+  describe('null issueNumber (#3425)', () => {
+    it('renders an em-dash placeholder span when number is null', () => {
+      render(<IssueLink number={null} />);
+      const placeholder = screen.getByTestId('issue-link-null');
+      // `&mdash;` is U+2014 EM DASH — the same glyph PriorityBadge uses
+      // for its null branch and RecentFailuresPanel uses for its inline
+      // null guard. Keep the codepoint pinned so tooling that
+      // greps for em-dashes (BRAND.md compliance, snapshot review) finds
+      // a consistent one.
+      expect(placeholder.textContent).toBe('—');
+      // Must not be an anchor — there is no GitHub issue to link to.
+      expect(placeholder.tagName.toLowerCase()).toBe('span');
+      expect(placeholder.getAttribute('href')).toBeNull();
+    });
+
+    it('placeholder uses muted-foreground (no brand-accent link styling)', () => {
+      render(<IssueLink number={null} />);
+      const placeholder = screen.getByTestId('issue-link-null');
+      expect(placeholder.className).toContain('text-muted-foreground');
+      // Belt-and-suspenders: the placeholder must NOT carry the
+      // brand-accent link colour — otherwise an operator scanning the
+      // Recently Completed panel would think the em-dash is a clickable
+      // link (it's not).
+      expect(placeholder.className).not.toContain('text-brand-accent');
+    });
+
+    it('forwards the title prop onto the placeholder when provided', () => {
+      render(<IssueLink number={null} title="audit (no closing issue)" />);
+      const placeholder = screen.getByTestId('issue-link-null');
+      expect(placeholder.getAttribute('title')).toBe(
+        'audit (no closing issue)',
+      );
+    });
+
+    it('does not crash when number is null (smoke test)', () => {
+      // Guards against the pre-#3425 regression mode where rendering a
+      // null issueNumber threw "cannot read property of null" or
+      // produced an `#null` href. The whole point of this branch is
+      // graceful handling.
+      expect(() => render(<IssueLink number={null} />)).not.toThrow();
+    });
+  });
 });
 
 describe('PRLink', () => {

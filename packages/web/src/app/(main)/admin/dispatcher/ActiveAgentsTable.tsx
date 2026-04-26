@@ -118,9 +118,18 @@ function ActiveAgentRow({
   // view-transitions (fired by `useViewTransitionUpdate` in
   // `DispatcherDashboard`) don't paint browser-managed
   // `::view-transition-*` pseudo-elements over an open full-list dialog.
-  const outerStyle = animated
-    ? ({ viewTransitionName: `issue-${agent.issueNumber}` } as CSSProperties)
-    : undefined;
+  //
+  // #3425: when `agent.issueNumber` is null (scheduled-skill agents:
+  // `/audit`, `/spotcheck`, `/dispatcher-daily-report` per migration 49)
+  // we drop the issue-keyed `viewTransitionName` and rely on the inner
+  // `agent-X` name only. Multiple concurrent null-issue rows would
+  // otherwise share the same `issue-null` ident, which the browser would
+  // collapse into one transition target — the inner agent-keyed name
+  // already provides a stable per-row identity for the Magic Move.
+  const outerStyle =
+    animated && agent.issueNumber !== null
+      ? ({ viewTransitionName: `issue-${agent.issueNumber}` } as CSSProperties)
+      : undefined;
   const innerStyle = animated
     ? ({ viewTransitionName: `agent-${agent.id}` } as CSSProperties)
     : undefined;

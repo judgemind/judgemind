@@ -58,6 +58,30 @@ describe('ActiveAgentsTable — unified (issue, priority, title) prefix', () => 
     );
     expect(screen.getByText('(title unavailable)')).toBeInTheDocument();
   });
+
+  // #3425: scheduled-skill agents (`/audit`, `/spotcheck`,
+  // `/dispatcher-daily-report`) have `issue_number = NULL`. Pre-#3425
+  // the dispatcher cockpit went dark — the GraphQL serializer threw on
+  // NULL → Int! and `IssueLink` declared `number: number`. The fix is
+  // bulk: schema + TS types both nullable, `IssueLink` renders an
+  // em-dash placeholder for null. This test pins the active-agents
+  // path so a future regression can't silently re-introduce the crash
+  // for the most common scheduled-skill case (a running audit agent).
+  it('#3425: renders without crashing when issueNumber is null (scheduled-skill agent)', () => {
+    const agent = makeAgent({
+      id: 'aaa93855-4a85-4785-af10-fc68d03aef59',
+      issueNumber: null,
+      issueTitle: null,
+      // Scheduled-skill agents have no priority/pN label either.
+      priority: null,
+      phase: 'audit',
+    });
+    expect(() =>
+      render(<ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />),
+    ).not.toThrow();
+    // IssueLink renders the em-dash placeholder span for null.
+    expect(screen.getByTestId('issue-link-null')).toBeInTheDocument();
+  });
 });
 
 describe('ActiveAgentsTable — phase tooltip', () => {

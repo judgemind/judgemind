@@ -64,6 +64,38 @@ describe('RecentCompletionsPanel', () => {
     expect(screen.getByText('—')).toBeInTheDocument();
   });
 
+  // #3425: scheduled-skill agents (`/audit`, `/spotcheck`,
+  // `/dispatcher-daily-report`) have `issue_number = NULL`. The whole
+  // dispatcher cockpit went dark when one of them landed in
+  // `recentCompletions` because the GraphQL serializer threw on
+  // NULL → Int! and `IssueLink` declared `number: number`. The fix
+  // makes both sides nullable; this test pins the rendered output for
+  // the audit/spotcheck case so the regression can't slip back in.
+  it('#3425: renders the IssueLink null branch when issueNumber is null (scheduled-skill agent)', () => {
+    const items = [
+      completion({
+        agentId: 'aaa93855-4a85-4785-af10-fc68d03aef59',
+        issueNumber: null,
+        // Scheduled-skill agents have null issue title too — the
+        // panel's existing `issueTitle ?? '(title unavailable)'`
+        // handling is what surfaces a useful label.
+        issueTitle: null,
+        prNumber: null,
+        // No priority either — claim-time priority capture is keyed
+        // off the issue's `priority/pN` label, which doesn't exist
+        // for scheduled-skill agents.
+        priority: null,
+      }),
+    ];
+    expect(() =>
+      render(<RecentCompletionsPanel completions={items} nowMs={now} />),
+    ).not.toThrow();
+    // IssueLink's null branch renders an em-dash span with this testid.
+    expect(screen.getByTestId('issue-link-null')).toBeInTheDocument();
+    // No anchor for an absent issue.
+    expect(screen.queryByTestId('issue-link-0')).not.toBeInTheDocument();
+  });
+
   // --- #2818 — density pass: "(no PR)" filler and "N min ago" column removed.
   it('#2818: renders nothing in place of a missing PR (no "(no PR)" text)', () => {
     const items = [completion({ prNumber: null, agentId: 'agent-2' })];
