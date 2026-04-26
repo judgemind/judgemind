@@ -1,16 +1,21 @@
 """Root conftest for scraper-framework package.
 
 Configures pytest to gracefully handle collection errors from test files
-that import scripts with heavy external dependencies (psycopg, boto3, etc.)
-not available in all CI environments.  These tests are collected and run
-in the 'scripts-tests' CI job which has the full dependency set.
+that reference scripts with heavy external dependencies (psycopg, boto3,
+scraper-framework internals) not installed in the scraper-framework-tests
+CI venv.  These tests are NOT currently run in any CI job — they are
+suppressed here as a transitional measure while follow-up issues (#3387)
+sweep and clean them up.
 """
 
 from __future__ import annotations
 
-# Test files that import scripts with dependencies beyond the
-# scraper-framework package.  These fail to import in CI's
-# scraper-framework-tests job but run in the scripts-tests job.
+# Test files that reference scripts with dependencies (psycopg, boto3,
+# framework) not installed in the scraper-framework-tests CI venv.
+# NOTE: these tests are NOT run anywhere in CI — they are ignored here
+# to prevent collection failures.  Entries are kept while follow-up
+# issues clean up the remaining dead tests; do not remove globs until
+# the underlying test files are deleted or relocated to scripts/tests/.
 collect_ignore_glob = [
     "tests/test_audit*.py",
     "tests/test_backfill*.py",
