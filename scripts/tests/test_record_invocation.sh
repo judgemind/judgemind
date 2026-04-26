@@ -262,6 +262,31 @@ else
          "psql.log: $(cat "$INVOCATIONS_DIR/psql.log")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# T6: recorder does NOT echo stdin to stdout by default
+# ══════════════════════════════════════════════════════════════════════════
+
+reset_log mytool
+result_file="$TEST_TMP/t6_stdout_result.txt"
+
+write_driver ". '$RECORDER' mytool"
+printf 'secret stdin content\n' | bash "$TEST_TMP/driver.sh" > "$result_file" 2>/dev/null || true
+
+if ! grep -q 'secret stdin content' "$result_file" 2>/dev/null; then
+    pass "T6: recorder does NOT echo stdin to stdout by default"
+else
+    fail "T6: recorder does NOT echo stdin to stdout by default" \
+         "stdout contained: $(cat "$result_file")"
+fi
+
+# Log side: STDIN: token must still appear in the log.
+if grep -q '^STDIN:secret stdin content' "$INVOCATIONS_DIR/mytool.log"; then
+    pass "T6: STDIN: token still written to log even when not echoed to stdout"
+else
+    fail "T6: STDIN: token still written to log even when not echoed to stdout" \
+         "log: $(cat "$INVOCATIONS_DIR/mytool.log")"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────
 
 echo ""
