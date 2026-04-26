@@ -257,7 +257,7 @@ class TestOrphanReap:
     def test_orphan_alive_matching_cmdline_killed(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        """Alive PID + matching cmdline → SIGTERM sent, row marked failed,
+        """Alive PID + matching cmdline → SIGTERM sent, row marked orphaned,
         ``diagnoser_orphan_killed`` event emitted."""
         d = _make_daemon(tmp_path)
         conn = d._conn  # type: ignore[assignment]
@@ -270,7 +270,7 @@ class TestOrphanReap:
         marked: list[dict[str, Any]] = []
         monkeypatch.setattr(
             d,
-            "_mark_diagnosis_failed",
+            "_mark_diagnosis_orphaned",
             lambda diagnosis_id, reason: marked.append(
                 {"id": diagnosis_id, "reason": reason}
             ),
@@ -325,7 +325,7 @@ class TestOrphanReap:
     def test_orphan_alive_recycled_pid_not_killed(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        """Alive PID + mismatched cmdline → no signal sent, row marked failed,
+        """Alive PID + mismatched cmdline → no signal sent, row marked orphaned,
         ``diagnoser_orphan_pid_recycled`` event emitted."""
         d = _make_daemon(tmp_path)
         conn = d._conn  # type: ignore[assignment]
@@ -338,7 +338,7 @@ class TestOrphanReap:
         marked: list[dict[str, Any]] = []
         monkeypatch.setattr(
             d,
-            "_mark_diagnosis_failed",
+            "_mark_diagnosis_orphaned",
             lambda diagnosis_id, reason: marked.append(
                 {"id": diagnosis_id, "reason": reason}
             ),
@@ -395,7 +395,7 @@ class TestOrphanReap:
     def test_orphan_dead_pid_logged_distinctly(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
-        """Dead PID → no signal, row marked failed, ``diagnoser_orphan_pid_dead``
+        """Dead PID → no signal, row marked orphaned, ``diagnoser_orphan_pid_dead``
         event emitted."""
         d = _make_daemon(tmp_path)
         conn = d._conn  # type: ignore[assignment]
@@ -408,7 +408,7 @@ class TestOrphanReap:
         marked: list[dict[str, Any]] = []
         monkeypatch.setattr(
             d,
-            "_mark_diagnosis_failed",
+            "_mark_diagnosis_orphaned",
             lambda diagnosis_id, reason: marked.append(
                 {"id": diagnosis_id, "reason": reason}
             ),
@@ -460,7 +460,7 @@ class TestOrphanReap:
     # ── Null-PID path: pre-PID-UPDATE crash ──────────────────────────────
 
     def test_orphan_null_pid_path(self, monkeypatch: Any, tmp_path: Path) -> None:
-        """Null subprocess_pid → no kill attempted, row marked failed,
+        """Null subprocess_pid → no kill attempted, row marked orphaned,
         ``diagnoser_orphan_pid_dead`` event emitted (no PID to check)."""
         d = _make_daemon(tmp_path)
         conn = d._conn  # type: ignore[assignment]
@@ -474,7 +474,7 @@ class TestOrphanReap:
         marked: list[dict[str, Any]] = []
         monkeypatch.setattr(
             d,
-            "_mark_diagnosis_failed",
+            "_mark_diagnosis_orphaned",
             lambda diagnosis_id, reason: marked.append(
                 {"id": diagnosis_id, "reason": reason}
             ),
