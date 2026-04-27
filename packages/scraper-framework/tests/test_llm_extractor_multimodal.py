@@ -972,6 +972,78 @@ class TestJoinPageRows:
         assert "Department C25" not in (rulings[0].extracted_case_title or "")
         assert rulings[1].extracted_case_number == "2024-00002"
 
+    @pytest.mark.parametrize(
+        "header_text,expected_date",
+        [
+            # Month-name format from OC PDFs.
+            (
+                "TENTATIVE RULINGS\nDEPARTMENT C27\nJUDGE BRADLEY ERDOSI\nMarch 16, 2026",
+                "2026-03-16",
+            ),
+            # ISO format regression — existing path must still match.
+            (
+                "Hearing Date: 2026-03-16",
+                "2026-03-16",
+            ),
+            # Slash format without leading zero.
+            (
+                "3/16/2026",
+                "2026-03-16",
+            ),
+            # Slash format with leading zero.
+            (
+                "03/16/2026",
+                "2026-03-16",
+            ),
+        ],
+    )
+    def test_header_date_narrative_formats(self, header_text: str, expected_date: str) -> None:
+        """_join_page_rows recognises narrative date formats in header rows (#3559)."""
+        rows = [
+            {
+                "entry_number": None,
+                "case_info": header_text,
+                "ruling_text": "",
+            },
+            {
+                "entry_number": 1,
+                "case_info": "2024-01393434 Smith v. Jones",
+                "ruling_text": "GRANTED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].hearing_date == expected_date, (
+            f"Expected {expected_date!r} from header {header_text!r}, "
+            f"got {rulings[0].hearing_date!r}"
+        )
+
+    def test_header_date_case_caption_does_not_bleed(self) -> None:
+        """A date inside a case caption (entry row) does NOT bleed into header_date (#3559).
+
+        The regex must only scan header rows (entry_number is None, ruling_text empty),
+        so a date like "filed 2024-01-15" in the case_info of a real ruling row
+        must not set hearing_date on sibling rulings.
+        """
+        rows = [
+            # Real ruling row (not a header) with a date in the case caption.
+            {
+                "entry_number": 1,
+                "case_info": "2024-01393434 Smith v. Jones — filed 2024-01-15",
+                "ruling_text": "GRANTED.",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Alpha v. Beta",
+                "ruling_text": "DENIED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        # Neither ruling should have a hearing_date derived from the case caption.
+        assert rulings[0].hearing_date is None
+        assert rulings[1].hearing_date is None
+
 
 # ---------------------------------------------------------------------------
 # Calendar header detection tests (#2096)

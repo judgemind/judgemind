@@ -2769,6 +2769,51 @@ class IngestionWorker:
             fallback_text=ruling_text,
         )
 
+        # When a multi-ruling document produces results but every entry is
+        # missing both judge and department, the header metadata was not
+        # captured by the LLM — write a best-effort telemetry row so the
+        # failure rate is dashboard-queryable (#3559).
+        if len(converted) > 1 and all(
+            cr.judge_name is None and cr.department is None for cr in converted
+        ):
+            try:
+                conn = self._get_connection()
+                with conn.cursor() as cur:
+                    cur.execute("SAVEPOINT multimodal_null_metadata_metric")
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO data_quality_metrics
+                                (recorded_at, county, metric_name,
+                                 metric_value, metadata)
+                            VALUES (now(), %s, %s, %s, %s::jsonb)
+                            """,
+                            (
+                                county,
+                                "multimodal_all_null_metadata",
+                                1,
+                                json.dumps(
+                                    {
+                                        "document_id": document_id,
+                                        "s3_key": event_data.get("s3_key"),
+                                        "state": state,
+                                        "county": county,
+                                        "scraper_id": event_data.get("scraper_id"),
+                                        "ruling_count": len(converted),
+                                    }
+                                ),
+                            ),
+                        )
+                        cur.execute("RELEASE SAVEPOINT multimodal_null_metadata_metric")
+                    except Exception:  # noqa: BLE001 — best-effort
+                        cur.execute("ROLLBACK TO SAVEPOINT multimodal_null_metadata_metric")
+                        raise
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                logger.debug(
+                    "multimodal_all_null_metadata telemetry write failed",
+                    exc_info=True,
+                )
+
         # Clean up stale split-child documents from a previous processing run
         # that produced more rulings than this run (#2295).  The new split IDs
         # will be upserted cleanly; any old IDs beyond the new count are

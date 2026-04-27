@@ -29,6 +29,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 import anthropic
 import structlog
@@ -3537,7 +3538,9 @@ def _append_ruling_from_case(
         )
         text = None
 
-    # Apply metadata overrides, then header extraction, for judge/dept/date.
+    # Metadata precedence: per-row scraper/DB values (metadata kwarg) win over
+    # header-extracted values (header_judge/dept/date), which are only used as a
+    # fallback.  Both layers default to None when no value is available.
     judge_name: str | None = None
     department: str | None = None
     hearing_date: str | None = None
@@ -3562,6 +3565,44 @@ def _append_ruling_from_case(
             ruling_text=text,
         )
     )
+
+
+def _parse_header_date(info: str) -> str | None:
+    """Extract a hearing date from a page-header string, returning ISO YYYY-MM-DD.
+
+    Tries three patterns in priority order so that the existing ISO path
+    wins over ambiguous slash or month-name matches (#3559):
+
+    1. ``Hearing Date: YYYY-MM-DD`` — explicit ISO label (existing behaviour).
+    2. Month-name: ``March 16, 2026`` — common in OC multimodal PDFs.
+    3. Slash: ``3/16/2026`` or ``03/16/2026`` — alternate courts.
+    """
+    # 1. Existing ISO path — must remain the highest-priority match.
+    m = re.search(r"Hearing Date:\s*(\d{4}-\d{2}-\d{2})", info)
+    if m:
+        return m.group(1)
+
+    # 2. Month-name format, e.g. "March 16, 2026".
+    m = re.search(
+        r"\b((?:January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+\d{1,2},\s*\d{4})\b",
+        info,
+    )
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%B %d, %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 3. Slash format, e.g. "3/16/2026" or "03/16/2026".
+    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", info)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    return None
 
 
 def _join_page_rows(
@@ -3599,10 +3640,9 @@ def _join_page_rows(
             dept_match = re.search(r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE)
             if dept_match and not header_dept:
                 header_dept = dept_match.group(1).strip()
-            # Extract hearing date from "Hearing Date: YYYY-MM-DD" pattern
-            date_match = re.search(r"Hearing Date:\s*(\d{4}-\d{2}-\d{2})", info)
-            if date_match and not header_date:
-                header_date = date_match.group(1)
+            # Extract hearing date from header (ISO, month-name, or slash formats).
+            if not header_date:
+                header_date = _parse_header_date(info)
 
     # Track entry_number -> case_index for cross-reference resolution (#2317).
     entry_number_to_index: dict[int, int] = {}
