@@ -2423,6 +2423,43 @@ handle_push_and_pr() {
         _rebase_rc=$?
         set -e
         log "push_and_pr_rebase_done" "exit_code=$_rebase_rc"
+        # #3614: post-rebase empty-diff guard — direct sibling of #3580's
+        # fix in handle_fix_ci. When ``git rebase origin/main`` succeeds
+        # but drops every commit (because the patches were already in
+        # baseline — typically because a sibling PR landed the same fix
+        # first, or the daemon is retrying an already-fixed issue), we
+        # have nothing to push and no PR to open. Pre-#3614 the code fell
+        # through to ``git push`` (which no-ops with "Everything up-to-
+        # date") and then ``gh pr create`` (which fails for an empty
+        # diff), and the agent reaped as
+        # ``push_and_pr_no_unmerged_files/failed`` — tripping the
+        # circuit breaker repeatedly across the cluster of issues
+        # (#2777, #2832, #2854, #3297, #3407, #3574, #3581).
+        #
+        # The fix: if the rebase succeeded AND the ahead-count just
+        # collapsed to 0, emit the existing ``{"no_op": true}`` envelope.
+        # ``transition_from_push_and_pr`` already routes that to
+        # PHASE_NO_OP terminal succeeded — exactly the right outcome
+        # for "fix is already in main." New log event
+        # ``push_and_pr_no_unmerged_files_already_applied`` distinguishes
+        # this from the pre-existing ``push_and_pr_no_op`` (which only
+        # fires when the working tree was clean at SHIP time, before
+        # the rebase) and from the terminal failure event
+        # ``push_and_pr_no_unmerged_files`` (which fires when the rebase
+        # actually FAILED with no unmerged files — a different code
+        # path, see #3465). Mirrors the rename in #3580 which split
+        # ``fix_ci_patch_empty`` into the new
+        # ``fix_ci_patch_empty_already_applied`` advance event.
+        if [[ "$_rebase_rc" -eq 0 ]]; then
+            _post_rebase_ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
+            if [[ "$_post_rebase_ahead" == "0" ]]; then
+                log "push_and_pr_no_unmerged_files_already_applied" \
+                    "post_rebase_ahead=$_post_rebase_ahead" \
+                    "reason=rebase_dropped_all_commits_already_in_baseline"
+                printf '{"no_op": true}'
+                return 0
+            fi
+        fi
         if [[ "$_rebase_rc" -ne 0 ]]; then
             # #3225: Before aborting, capture the conflict state so the
             # fix_conflict phase can feed it to the claude skill without

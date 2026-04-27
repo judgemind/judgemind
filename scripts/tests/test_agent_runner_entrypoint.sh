@@ -6768,6 +6768,329 @@ else
          "out: $(printf '%s' "$t63b_out" | grep "ralph_baseline_route_to_diagnoser")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T64: #3614 — handle_push_and_pr empty-diff after successful rebase.
+#
+# The bug: when an agent claims an issue whose fix has ALREADY shipped via
+# a sibling PR, the pre-push ``git rebase origin/main`` succeeds AND drops
+# the agent's commits (because the patches are already in main). The
+# post-rebase ``rev-list --count origin/main..HEAD`` returns 0 — there's
+# nothing to push. Pre-#3614 the entrypoint fell through to ``git push``
+# (no-op) + ``gh pr create`` (which fails because there's no diff) and
+# ultimately reaped the agent as ``push_and_pr_no_unmerged_files/failed``.
+#
+# Direct sibling of #3580 (which fixed the same bug class for
+# ``handle_fix_ci``). The fix mirrors #3580: after the successful rebase,
+# re-check the ahead-count and emit the existing ``{"no_op": true}``
+# envelope (transition_from_push_and_pr already routes that to PHASE_NO_OP
+# terminal succeeded). New log event ``push_and_pr_no_unmerged_files_
+# already_applied`` distinguishes from the existing terminal-fail event.
+#
+# Test A (the bug): pre-rebase ahead=1 (passes the existing #3039 no-op
+# guardrail), rebase succeeds (exit 0), post-rebase ahead=0. Assert:
+#   * ``push_and_pr_no_unmerged_files_already_applied`` log emitted.
+#   * ``git push`` NOT invoked.
+#   * ``gh pr create`` NOT invoked.
+#   * Function emits ``{"no_op": true}`` envelope.
+# Test MUST fail against unfixed code (where the post-rebase check doesn't
+# exist and the function falls through to push + PR create).
+#
+# Test B (happy path regression): pre-rebase ahead=1, rebase succeeds,
+# post-rebase ahead=1 (rebase replayed the agent's commits cleanly).
+# Assert: full push + PR create runs; envelope is NOT ``{"no_op": true}``.
+# Don't regress the working path.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Extract handle_push_and_pr + minimal dependencies. handle_push_and_pr
+# depends on log, db_exec, persist_phase_output (none of which it actually
+# calls in the empty-diff path, but the function body uses ``log`` heavily).
+t64_funcs="$TEST_TMP/t64-funcs.sh"
+printf 'exec 3>&1\n' > "$t64_funcs"
+
+for fn in db_exec db_query_one log persist_phase_output \
+          handle_push_and_pr; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t64_funcs"
+done
+
+if grep -q "^handle_push_and_pr()" "$t64_funcs"; then
+    pass "#3614 T64 setup — extracted handle_push_and_pr from entrypoint"
+else
+    fail "#3614 T64 setup — extracted handle_push_and_pr from entrypoint" \
+         "fixture head: $(head -c 400 "$t64_funcs")"
+fi
+
+# Per-test runner. The git stub is parameterised by a counter file so
+# successive ``rev-list --count`` calls can return different values
+# (pre-rebase vs post-rebase). The first call answers the existing #3039
+# no-op-on-clean-tree guardrail; the second call answers the new (this
+# PR) post-rebase empty-diff check.
+#
+# Stub control via env vars:
+#   T64_REV_LIST_PRE   — count returned for the FIRST rev-list call
+#                        (pre-rebase). Default 1 (something to push).
+#   T64_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
+#                        Default 1 (rebase preserved the agent's commits).
+#                        Set to 0 to simulate "rebase pulled in the fix".
+#   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
+#                        Default 0 (clean rebase).
+run_push_pr_test() {
+    _test_id="$1"
+    shift
+
+    _tworkspace="$TEST_TMP/${_test_id}-workspace"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_tworkspace" "$_trepo" "$_tstate" "$_tbin"
+    mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
+
+    # rev-list counter file — written/read by the git stub to alternate
+    # responses across calls.
+    printf '0\n' > "$_tstate/rev-list-call-count.txt"
+
+    # git stub — log every call, parameterise rev-list / push / rebase /
+    # fetch by env. ``git -C <dir> <subcmd>`` is normalised by stripping
+    # the -C arg.
+    cat > "$_tbin/git" <<'T64GITEOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -C) shift 2 || true; continue ;;
+        *) break ;;
+    esac
+done
+
+sub="${1:-}"
+case "$sub" in
+    rev-list)
+        # Returns T64_REV_LIST_PRE on first call, T64_REV_LIST_POST after.
+        _counter_file="${T_STATE_DIR}/rev-list-call-count.txt"
+        _n=$(cat "$_counter_file" 2>/dev/null || printf '0')
+        _next=$((_n + 1))
+        printf '%s\n' "$_next" > "$_counter_file"
+        if [[ "$_n" == "0" ]]; then
+            printf '%s\n' "${T64_REV_LIST_PRE:-1}"
+        else
+            printf '%s\n' "${T64_REV_LIST_POST:-1}"
+        fi
+        exit 0
+        ;;
+    fetch)
+        exit "${GIT_FETCH_EXIT:-0}"
+        ;;
+    rebase)
+        for _arg in "$@"; do
+            if [[ "$_arg" == "--abort" ]]; then exit 0; fi
+        done
+        exit "${GIT_REBASE_EXIT:-0}"
+        ;;
+    diff)
+        # ``git diff --name-only --diff-filter=U`` for conflict files.
+        # T64 doesn't drive the conflict path, but this keeps the stub
+        # robust if future tests do.
+        exit 0
+        ;;
+    push)
+        exit "${GIT_PUSH_EXIT:-0}"
+        ;;
+    commit)
+        exit "${GIT_COMMIT_EXIT:-0}"
+        ;;
+    rev-parse|merge-base)
+        printf 'deadbeefcafe\n'
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+T64GITEOF
+    chmod +x "$_tbin/git"
+
+    # gh stub — log invocations, default exit 0.
+    cat > "$_tbin/gh" <<'T64GHEOF'
+#!/usr/bin/env bash
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
+# gh pr create prints a PR URL on stdout (the entrypoint parses it).
+if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+    printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+fi
+exit "${GH_EXIT:-0}"
+T64GHEOF
+    chmod +x "$_tbin/gh"
+
+    # psql stub — log invocations.
+    cat > "$_tbin/psql" <<'T64PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
+exit 0
+T64PSQLEOF
+    chmod +x "$_tbin/psql"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_tbin/jq"
+    fi
+
+    set +e
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        PATH="$_tbin:$PATH" \
+        AGENT_ID="${_test_id}-dead-beef-cafe-000000000099" \
+        ISSUE_NUMBER="3614" \
+        AGENT_WORKSPACE="$_tworkspace" \
+        REPO_ROOT="$_trepo" \
+        BRANCH_NAME="agent/${_test_id}abcd" \
+        DATABASE_URL="postgres://test" \
+        AGENT_RUNNER_DRY_RUN="0" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            # shellcheck disable=SC1090
+            . "'"$t64_funcs"'"
+            handle_push_and_pr
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    PUSHPR_TEST_RC="$_trc"
+    PUSHPR_TEST_OUT="$_tout"
+    PUSHPR_TEST_STATE="$_tstate"
+}
+
+# ── Sub-test A: post-rebase empty diff → no_op envelope, no push, no PR ───
+
+run_push_pr_test "t64a" T64_REV_LIST_PRE=1 T64_REV_LIST_POST=0 GIT_REBASE_EXIT=0
+
+if [[ "$PUSHPR_TEST_RC" -eq 0 ]]; then
+    pass "#3614 T64A — handle_push_and_pr exits 0 on post-rebase empty-diff"
+else
+    fail "#3614 T64A — handle_push_and_pr exits 0 on post-rebase empty-diff" \
+         "rc=$PUSHPR_TEST_RC, output: $PUSHPR_TEST_OUT"
+fi
+
+# CRITICAL — new log event for the post-rebase already-applied case.
+if printf '%s' "$PUSHPR_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied"; then
+    pass "#3614 T64A — push_and_pr_no_unmerged_files_already_applied log event emitted"
+else
+    fail "#3614 T64A — push_and_pr_no_unmerged_files_already_applied log event emitted" \
+         "output: $PUSHPR_TEST_OUT"
+fi
+
+# CRITICAL — function must NOT have invoked ``git push``. Empty diff
+# means there's nothing to push; falling through to push would either
+# no-op (Everything up-to-date) or attempt a push that gh pr create
+# would then fail on for an empty-diff PR.
+if ! grep -qE "CALL .*\\bpush\\b" "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3614 T64A — git push NOT invoked on post-rebase empty-diff"
+else
+    fail "#3614 T64A — git push NOT invoked on post-rebase empty-diff" \
+         "git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# CRITICAL — function must NOT have invoked ``gh pr create``. With no
+# diff there's no PR to open; gh pr create would fail and the agent
+# would terminal as push_and_pr_pr_create_failed.
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3614 T64A — gh pr create NOT invoked on post-rebase empty-diff"
+else
+    fail "#3614 T64A — gh pr create NOT invoked on post-rebase empty-diff" \
+         "gh-log: $(cat "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# CRITICAL — emitted envelope must be the no_op success shape.
+# transition_from_push_and_pr routes ``no_op=true`` to PHASE_NO_OP terminal
+# succeeded — exactly the right outcome for "fix already in baseline".
+if printf '%s' "$PUSHPR_TEST_OUT" | grep -q '"no_op": true\|"no_op":true'; then
+    pass "#3614 T64A — handler emits {\"no_op\": true} envelope on post-rebase empty-diff"
+else
+    fail "#3614 T64A — handler emits {\"no_op\": true} envelope on post-rebase empty-diff" \
+         "output: $PUSHPR_TEST_OUT"
+fi
+
+# Negative: must NOT emit the rebase_failed/no_unmerged_files envelope —
+# that's the *failed-rebase-with-empty-conflict-files* path (already
+# handled by #3465). Here the rebase SUCCEEDED; the diff is empty
+# because the patches were already in main, not because rebase failed.
+if ! printf '%s' "$PUSHPR_TEST_OUT" | grep -q '"rebase_failed": true\|"rebase_failed":true'; then
+    pass "#3614 T64A — does NOT emit rebase_failed envelope on post-rebase empty-diff"
+else
+    fail "#3614 T64A — does NOT emit rebase_failed envelope on post-rebase empty-diff" \
+         "output: $PUSHPR_TEST_OUT"
+fi
+
+# Two rev-list calls: one pre-fetch (the existing #3039 no-op-on-clean-
+# tree guardrail at function entry) + one post-rebase (the new #3614
+# check after a successful rebase). The new check is what distinguishes
+# this from the pre-fix code, where rev-list was called only once and
+# the function fell through to push + gh pr create on empty post-rebase
+# diff.
+if [[ -f "$PUSHPR_TEST_STATE/git-log.txt" ]]; then
+    _rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$PUSHPR_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_rev_list_calls" == "2" ]]; then
+        pass "#3614 T64A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)"
+    else
+        fail "#3614 T64A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)" \
+             "found $_rev_list_calls call(s); git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt")"
+    fi
+fi
+
+# ── Sub-test B: happy path regression — rebase preserves agent's commits ──
+
+run_push_pr_test "t64b" T64_REV_LIST_PRE=1 T64_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+
+if [[ "$PUSHPR_TEST_RC" -eq 0 ]]; then
+    pass "#3614 T64B — handle_push_and_pr exits 0 on happy path"
+else
+    fail "#3614 T64B — handle_push_and_pr exits 0 on happy path" \
+         "rc=$PUSHPR_TEST_RC, output: $PUSHPR_TEST_OUT"
+fi
+
+# Happy path MUST invoke git push.
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3614 T64B — git push -u origin invoked on happy path"
+else
+    fail "#3614 T64B — git push -u origin invoked on happy path" \
+         "git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Happy path MUST invoke gh pr create.
+if grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3614 T64B — gh pr create invoked on happy path"
+else
+    fail "#3614 T64B — gh pr create invoked on happy path" \
+         "gh-log: $(cat "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# Happy path MUST NOT emit the new already-applied event.
+if ! printf '%s' "$PUSHPR_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied"; then
+    pass "#3614 T64B — push_and_pr_no_unmerged_files_already_applied NOT emitted on happy path"
+else
+    fail "#3614 T64B — push_and_pr_no_unmerged_files_already_applied NOT emitted on happy path" \
+         "output: $PUSHPR_TEST_OUT"
+fi
+
+# Happy path envelope must NOT be {"no_op": true} — the agent did push
+# real changes; transition_from_push_and_pr should advance to awaiting_ci,
+# not terminal as no_op succeeded.
+if ! printf '%s' "$PUSHPR_TEST_OUT" | grep -q '"no_op": true\|"no_op":true'; then
+    pass "#3614 T64B — happy-path envelope is NOT {\"no_op\": true}"
+else
+    fail "#3614 T64B — happy-path envelope is NOT {\"no_op\": true}" \
+         "output: $PUSHPR_TEST_OUT"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
