@@ -1509,16 +1509,22 @@ def clean_case_title(raw_title: str) -> str | None:
     # Collapse whitespace and newlines.
     cleaned = " ".join(raw_title.split())
 
-    # Dedupe repeated title segments (#2370) — Ventura LLM sometimes
-    # returns the same title 2-3x concatenated.
+    # Strip → dedupe → strip ordering (#3511): strip trailing case number
+    # first so dedupe sees a clean boundary; then dedupe repeated segments;
+    # then strip again in case dedupe surfaced a trailing fragment from a
+    # middle copy.  This handles titles like
+    # "A v. B A v. B 2024CUBC020894" → "A v. B".
+    without_cn = strip_trailing_case_number(cleaned)
+    if without_cn:
+        cleaned = without_cn
+
     deduped = dedupe_repeated_title(cleaned)
     if deduped:
         cleaned = deduped
 
-    # Strip trailing case numbers appended to the title (#2370).
-    without_cn = strip_trailing_case_number(cleaned)
-    if without_cn:
-        cleaned = without_cn
+    without_cn2 = strip_trailing_case_number(cleaned)
+    if without_cn2:
+        cleaned = without_cn2
 
     # --- Probate / estate / conservatorship / guardianship titles ---
     probate_m = re.match(
@@ -1877,16 +1883,17 @@ def extract_judge_name(ruling_text: str) -> str | None:
 # (new and old probate) plus common short fragments.
 _TRAILING_CASE_NUMBER_RE = re.compile(
     r"\s+(?:"
-    # Ventura new format: 4-digit year + 4-letter type + 6-digit sequence
-    r"\d{4}[A-Z]{4}\d{6}"
+    # Ventura new format: 4-digit year + 2-5 letters + 4-8 digits (case-insensitive)
+    r"\d{4}[A-Za-z]{2,5}\d{4,8}"
     # Ventura old-format probate (plus truncated PRL variants).
-    r"|\d{10,12}PR[A-Z]{1,3}"
+    r"|\d{10,12}PR[A-Za-z]{1,3}"
     # Generic CV... / CIV... / dash-separated formats
-    r"|CV[A-Z]{2,4}\d{5,}"
-    r"|CIV[A-Z]{2}\d{5,}"
+    r"|CV[A-Za-z]{2,4}\d{5,}"
+    r"|CIV[A-Za-z]{2}\d{5,}"
     r"|\d{2,4}-\d{5,}"
-    r"|\d{2}[A-Z]{2}CV\d{5,}"
+    r"|\d{2}[A-Za-z]{2}CV\d{5,}"
     r")\s*$",
+    re.IGNORECASE,
 )
 
 

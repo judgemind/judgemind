@@ -572,12 +572,16 @@ class VenturaTentativeRulingsScraper(BaseScraper):
                             strip_trailing_case_number,
                         )
 
-                        deduped = dedupe_repeated_title(doc.case_title)
-                        if deduped:
-                            doc.case_title = deduped
+                        # Strip → dedupe → strip ordering (#3511).
                         without_cn = strip_trailing_case_number(doc.case_title)
                         if without_cn:
                             doc.case_title = without_cn
+                        deduped = dedupe_repeated_title(doc.case_title)
+                        if deduped:
+                            doc.case_title = deduped
+                        without_cn2 = strip_trailing_case_number(doc.case_title)
+                        if without_cn2:
+                            doc.case_title = without_cn2
 
                     if not llm_used:
                         # Log that regex path was used for debugging.

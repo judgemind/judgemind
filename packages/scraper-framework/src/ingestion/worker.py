@@ -1555,17 +1555,10 @@ class IngestionWorker:
         # LLM sometimes appends (#2370).  These are cheap checks that
         # always run; they leave well-formed titles unchanged.
         if case_title:
-            deduped = dedupe_repeated_title(case_title)
-            if deduped and deduped != case_title:
-                logger.info(
-                    "Removed repeated title segments",
-                    extra={
-                        "document_id": document_id,
-                        "old_title": case_title[:120],
-                        "new_title": deduped[:120],
-                    },
-                )
-                case_title = deduped
+            # Strip → dedupe → strip ordering (#3511): strip trailing case
+            # number first so dedupe sees a clean boundary, then dedupe
+            # repeated segments, then strip again in case dedupe surfaced a
+            # trailing fragment from a middle copy.
             without_cn = strip_trailing_case_number(case_title)
             if without_cn and without_cn != case_title:
                 logger.info(
@@ -1577,6 +1570,28 @@ class IngestionWorker:
                     },
                 )
                 case_title = without_cn
+            deduped = dedupe_repeated_title(case_title)
+            if deduped and deduped != case_title:
+                logger.info(
+                    "Removed repeated title segments",
+                    extra={
+                        "document_id": document_id,
+                        "old_title": case_title[:120],
+                        "new_title": deduped[:120],
+                    },
+                )
+                case_title = deduped
+            without_cn2 = strip_trailing_case_number(case_title)
+            if without_cn2 and without_cn2 != case_title:
+                logger.info(
+                    "Stripped trailing case number from title (post-dedupe)",
+                    extra={
+                        "document_id": document_id,
+                        "old_title": case_title[:120],
+                        "new_title": without_cn2[:120],
+                    },
+                )
+                case_title = without_cn2
 
         # For LLM-extracted events, the LLM-provided case_title can be
         # messy (motion descriptions, case citations, multiple parties).
