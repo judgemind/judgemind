@@ -355,9 +355,12 @@ def _try_fresno_pdf_split(
     Detection gate: only triggers when event is Fresno county **and** content
     format is ``"pdf"`` — avoids false-positive matches on other courts.
 
-    When ``_split_rulings`` returns ``[]`` (single-ruling PDF or unexpected
-    layout), this function returns ``False`` so the existing LLM path handles
-    it (AC4).
+    When ``_split_rulings`` returns ``[]`` (no numbered entries found) or a
+    1-element list (single-ruling PDF), this function returns ``False`` so the
+    existing LLM path handles it (#3599, AC4).  The deterministic regex
+    extraction does not reliably populate ``outcome``/``motion_type`` for
+    single-ruling PDFs; falling through to ``_llm_enrich_fields`` restores
+    pre-#3553 behaviour.
 
     Mirrors the SD/LA pattern (``_try_sd_calendar_split`` #2447,
     ``_try_la_html_split`` #2450).
@@ -374,7 +377,13 @@ def _try_fresno_pdf_split(
 
     split_rulings = _split_rulings(ruling_text)
     if not split_rulings:
-        # Single-ruling PDF or unrecognised layout — fall through to LLM.
+        # No numbered entries found — fall through to LLM.
+        return False
+    if len(split_rulings) == 1:
+        # Single-ruling PDF — the deterministic regex extraction does not
+        # reliably populate outcome/motion_type. Fall through to the LLM
+        # path so _llm_enrich_fields fills those fields (matches pre-#3553
+        # behavior; AC4 of #3534, fix for #3599).
         return False
 
     logger.info(
@@ -390,9 +399,9 @@ def _try_fresno_pdf_split(
 
     from .split_ids import make_split_document_id
 
-    is_multi = len(split_rulings) > 1
+    # At this point len(split_rulings) > 1 — always generate split document IDs.
     for idx, sr in enumerate(split_rulings):
-        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        split_doc_id = make_split_document_id(document_id, idx)
         hearing_date_value: str | None = None
         if sr.hearing_date is not None:
             hearing_date_value = (

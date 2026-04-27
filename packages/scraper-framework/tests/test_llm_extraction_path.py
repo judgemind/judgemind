@@ -2899,3 +2899,86 @@ class TestFresnoPdfSplit:
             "_try_fresno_pdf_split must return False when content_format != 'pdf'."
         )
         assert dispatched == []
+
+    def test_single_numbered_ruling_falls_through_to_llm(self) -> None:
+        """Single-ruling Fresno PDFs (len == 1) must return False (#3599).
+
+        When ``_split_rulings`` returns a 1-element list, the deterministic
+        splitter cannot reliably populate outcome/motion_type, so the function
+        must fall through to the LLM path.  This is the regression assertion
+        for #3599: before the fix, len==1 would proceed through the split loop
+        and dispatch an event with ``_llm_extracted=True`` but without a real
+        LLM call, leaving outcome/motion_type as None.
+        """
+        from ingestion.worker import _try_fresno_pdf_split
+
+        dispatched: list = []
+
+        # One numbered entry — _split_rulings returns a 1-element list.
+        single_ruling_text = (
+            "(1) Tentative Ruling\n"
+            "Re: Smith v. Jones\n"
+            "Superior Court Case No. 25CECG00001\n"
+            "Hearing Date: April 28, 2026 (Dept. 503)\n"
+            "Motion: Demurrer to Complaint\n"
+            "Tentative Ruling:\n"
+            "To sustain the demurrer with leave to amend.\n"
+        )
+
+        event = _make_event(
+            scraper_id="ca-fresno-tentatives-civil",
+            state="CA",
+            county="Fresno",
+            content_format="pdf",
+        )
+        result = _try_fresno_pdf_split(
+            event,
+            event["document_id"],
+            single_ruling_text,
+            dispatched.append,
+        )
+
+        assert result is False, (
+            "_try_fresno_pdf_split must return False when _split_rulings "
+            "returns a 1-element list, so the caller falls through to the LLM."
+        )
+        assert dispatched == [], "No events should be dispatched for a single-ruling Fresno PDF."
+
+    def test_multi_ruling_still_dispatches_with_llm_extracted_flag(self) -> None:
+        """Multi-ruling Fresno PDFs still dispatch with _split_processed=True
+        and _llm_extracted=True (regression guard for #3534).
+
+        Uses the 403 fixture (8 rulings).  Checks that the ``_llm_extracted``
+        flag is set on every dispatched event so downstream workers skip a
+        redundant LLM call.
+        """
+        ruling_text = self._load_fixture_text("fresno_403_20260310_d019042f.pdf")
+        worker, _ = _make_worker()
+
+        with patch.object(worker, "process_event") as mock_process:
+            event = _make_event(
+                scraper_id="rebuild-ca-fresno",
+                state="CA",
+                county="Fresno",
+                content_format="pdf",
+                ruling_text=ruling_text,
+            )
+            result = worker._llm_split_document(
+                event,
+                event["document_id"],
+                ruling_text,
+                "CA",
+                "Fresno",
+            )
+
+        assert result is True
+        assert mock_process.call_count == 8
+
+        dispatched_events = [call.args[0] for call in mock_process.call_args_list]
+        for ev in dispatched_events:
+            assert ev.get("_split_processed") is True, (
+                f"Expected _split_processed=True on event {ev.get('case_number')!r}"
+            )
+            assert ev.get("_llm_extracted") is True, (
+                f"Expected _llm_extracted=True on event {ev.get('case_number')!r}"
+            )
