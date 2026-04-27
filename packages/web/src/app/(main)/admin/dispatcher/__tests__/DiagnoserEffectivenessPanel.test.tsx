@@ -84,6 +84,24 @@ describe('DiagnoserEffectivenessPanel', () => {
     expect(rows[2]).toHaveTextContent('1');
   });
 
+  it('renders (unknown) sentinel for null-action rows (#3588)', () => {
+    mockQueryResult = {
+      data: {
+        weeklyDiagnoserReport: [
+          makeRow({ recommendedAction: '(unknown)', observedOutcome: 'failed', count: 3 }),
+        ],
+      },
+      loading: false,
+      error: undefined,
+    };
+    render(<DiagnoserEffectivenessPanel />);
+    const rows = screen.getAllByTestId('diagnoser-effectiveness-row');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent('(unknown)');
+    expect(rows[0]).toHaveTextContent('failed');
+    expect(rows[0]).toHaveTextContent('3');
+  });
+
   it('renders skeleton placeholders while loading with no data yet', () => {
     mockQueryResult = {
       data: undefined,
