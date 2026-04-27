@@ -191,7 +191,7 @@ def probe_convergence_regression(
     return [
         Finding(
             probe="convergence_regression",
-            title=f"Ralph iteration p95 regression: {recent_p95:.1f} vs baseline {baseline_p95:.1f} ({ratio:.1f}x)",
+            title=f"[convergence-regression] Ralph iteration p95 regression: {recent_p95:.1f} vs baseline {baseline_p95:.1f} ({ratio:.1f}x)",
             body=(
                 f"The p95 ralph-iteration count over the recent 6-hour window is "
                 f"{recent_p95:.1f}, which is {ratio:.1f}x the baseline window p95 "
@@ -244,7 +244,7 @@ def probe_bad_outcome_streak(
     return [
         Finding(
             probe="bad_outcome_streak",
-            title=f"Bad-outcome streak: {streak} consecutive non-shipped terminals",
+            title=f"[bad-outcome-streak] Bad-outcome streak: {streak} consecutive non-shipped terminals",
             body=(
                 f"The last {streak} completed agents all ended in a non-shipped "
                 f"state (failed, crashed, terminated, etc.). The circuit breaker "
@@ -300,7 +300,7 @@ def probe_site_health(
                 findings.append(
                     Finding(
                         probe="site_health",
-                        title="DB document count is zero — possible data loss or pipeline stall",
+                        title="[site-health-doc-count] DB document count is zero — possible data loss or pipeline stall",
                         body=(
                             "A spot-check query against ``derived.documents`` returned 0 rows. "
                             "This may indicate the ingestion pipeline has stalled, the table "
@@ -317,7 +317,7 @@ def probe_site_health(
                 findings.append(
                     Finding(
                         probe="site_health",
-                        title="DB document-count probe failed",
+                        title="[site-health-doc-count] DB document-count probe failed",
                         body=(
                             f"The derived.documents count query returned an unexpected "
                             f"result (status={status}, body={body!r:.80}).\n\n"
@@ -333,11 +333,13 @@ def probe_site_health(
 
         # HTTP endpoint check
         if status != 200:
-            label = "GraphQL API" if "graphql" in endpoint.lower() else "site"
+            is_graphql = "graphql" in endpoint.lower()
+            label = "GraphQL API" if is_graphql else "site"
+            probe_id = "site-health-graphql" if is_graphql else "site-health-frontend"
             findings.append(
                 Finding(
                     probe="site_health",
-                    title=f"{label} endpoint unhealthy: {endpoint} returned HTTP {status}",
+                    title=f"[{probe_id}] {label} endpoint unhealthy: {endpoint} returned HTTP {status}",
                     body=(
                         f"The {label} endpoint ``{endpoint}`` returned HTTP {status}. "
                         f"Expected 200.\n\n"
