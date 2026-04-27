@@ -8230,7 +8230,8 @@ class DispatcherDaemon:
                     "UPDATE dispatcher.agents "
                     "SET status = 'succeeded', "
                     "    phase = 'done', "
-                    "    failure_summary = NULL "
+                    "    failure_summary = NULL, "
+                    "    ended_at = COALESCE(ended_at, now()) "
                     "WHERE agent_id = %s",
                     (agent_id,),
                 )
@@ -22552,7 +22553,8 @@ class DispatcherDaemon:
                     cur.execute(
                         "UPDATE dispatcher.agents "
                         "   SET status = 'failed', "
-                        "       phase = 'scheduled_skill_launch_failed' "
+                        "       phase = 'scheduled_skill_launch_failed', "
+                        "       ended_at = COALESCE(ended_at, now()) "
                         " WHERE agent_id = %s",
                         (agent_id,),
                     )

@@ -1,24 +1,27 @@
 """Issue #3574 — verify that every terminal-status UPDATE in
-``agent-runner-entrypoint.sh`` also writes ``ended_at``.
+``agent-runner-entrypoint.sh`` and ``daemon.py`` also writes ``ended_at``.
 
 Before the fix for #3574 two write paths stamped a terminal status
 without setting ``ended_at``, leaving rows with
 ``status IN ('failed','succeeded',...) AND ended_at IS NULL`` — "zombie"
 rows that are invisible to the ``agent_duration_s`` monitoring query.
 
-This test is a static lint of the shell script. It does not require a
-live database. Two classes:
+This test is a static lint of the shell script and daemon.py. It does
+not require a live database. Three classes:
 
 - ``TestTerminalStatusUpdates`` — asserts that every
   ``UPDATE dispatcher.agents`` block whose SET clause contains a
-  known terminal-status literal also contains ``ended_at``.
+  known terminal-status literal also contains ``ended_at`` (bash
+  entrypoint).
 - ``TestExternalTerminalObservedCallsMarkEnded`` — asserts that the
   external-terminal-observed early-exit path calls ``mark_ended``
   before ``exit 0``.
+- ``TestDaemonPyTerminalStatusUpdates`` — asserts that every
+  ``UPDATE dispatcher.agents`` block in ``daemon.py`` whose SET clause
+  contains a known terminal-status literal also contains ``ended_at``.
 
-**AC2 proof**: both classes fail against the pre-fix bash (where
-``agent_runner_reaped_failure`` and ``advance_phase`` omit ``ended_at``)
-and pass after the fix is applied.
+**AC2 proof**: classes fail against the pre-fix source (where the
+above UPDATEs omit ``ended_at``) and pass after the fix is applied.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import re
 from pathlib import Path
 
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[1] / "agent-runner-entrypoint.sh"
+_DAEMON_PY_PATH = Path(__file__).resolve().parents[1] / "daemon.py"
 
 # Terminal statuses from phase_transitions.TERMINAL_STATUSES.
 _TERMINAL_STATUS_LITERALS = frozenset(
@@ -253,4 +257,108 @@ class TestExternalTerminalObservedCallsMarkEnded:
         assert mark_pos < exit_pos, (
             f"mark_ended (pos {mark_pos}) must appear before exit 0 "
             f"(pos {exit_pos}) in the external_terminal_observed block"
+        )
+
+
+def _extract_daemon_update_blocks(source: str) -> list[str]:
+    """Extract contiguous UPDATE-statement blocks from Python source.
+
+    daemon.py uses multi-line Python string literals to hold SQL — each
+    fragment is a run of adjacent string literals that form a single
+    logical SQL statement.  We concatenate the raw text of each
+    ``cur.execute(...)`` call and then apply the same UPDATE-block
+    extraction as the shell helper.
+
+    Strategy: find every ``cur.execute(`` occurrence, grab the argument
+    text up to the matching closing ``)`` (handling nested parens), and
+    run ``_extract_update_blocks`` on the result.
+    """
+    blocks: list[str] = []
+    for m in re.finditer(r"cur\.execute\s*\(", source):
+        start = m.end()
+        # Walk forward, tracking paren depth and Python string quoting.
+        depth = 1
+        in_str: str | None = None
+        escape_next = False
+        end = None
+        for i, ch in enumerate(source[start:]):
+            if escape_next:
+                escape_next = False
+                continue
+            if (
+                ch == "\\"
+                and in_str is not None
+                and in_str != '"""'
+                and in_str != "'''"
+            ):
+                escape_next = True
+                continue
+            if in_str is None:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+                elif source[start + i : start + i + 3] in ('"""', "'''"):
+                    in_str = source[start + i : start + i + 3]
+                elif ch in ('"', "'"):
+                    in_str = ch
+            else:
+                if len(in_str) == 3:
+                    if source[start + i : start + i + 3] == in_str:
+                        in_str = None
+                else:
+                    if ch == in_str:
+                        in_str = None
+        if end is not None:
+            arg_text = source[start : start + end]
+            blocks.extend(_extract_update_blocks(arg_text))
+    return blocks
+
+
+class TestDaemonPyTerminalStatusUpdates:
+    """Every ``UPDATE dispatcher.agents`` in ``daemon.py`` that sets a
+    terminal status must also write ``ended_at``. (#3574)
+
+    This class is a static lint of the Python source — it does not
+    require a live database connection.  It will FAIL against pre-fix
+    ``daemon.py`` (where two inline UPDATEs set terminal statuses
+    without ``ended_at``) and pass after the fix.
+    """
+
+    def test_daemon_py_exists(self) -> None:
+        assert _DAEMON_PY_PATH.exists(), f"daemon.py not found at {_DAEMON_PY_PATH}"
+
+    def test_no_terminal_update_omits_ended_at(self) -> None:
+        """Broad sweep: no ``UPDATE dispatcher.agents`` block in daemon.py
+        sets a terminal-status literal AND omits ``ended_at``.
+
+        This catches both the known sites fixed in #3574
+        (``_dispatch_scheduled_skill`` launch-failure handler and
+        ``_restore_succeeded_and_advance_done``) and any future inline
+        UPDATEs that might be added.
+
+        Variable-form terminal writes (e.g. ``status = %s`` bound to a
+        terminal value at runtime) go through ``_mark_agent_terminal``
+        which already writes ``ended_at = now()`` — they are not detected
+        by this literal scan and are therefore out of scope here.
+        """
+        source = _DAEMON_PY_PATH.read_text(encoding="utf-8")
+        update_blocks = _extract_daemon_update_blocks(source)
+        offenders: list[str] = []
+        for block in update_blocks:
+            if "dispatcher.agents" not in block:
+                continue
+            sets_terminal_literal = any(
+                f"status = '{s}'" in block or f'status = "{s}"' in block
+                for s in _TERMINAL_STATUS_LITERALS
+            )
+            if sets_terminal_literal and "ended_at" not in block:
+                offenders.append(block)
+        assert offenders == [], (
+            f"Found {len(offenders)} UPDATE dispatcher.agents block(s) in "
+            f"daemon.py that set a terminal-status literal but omit "
+            f"ended_at (#3574):\n" + "\n---\n".join(offenders)
         )
