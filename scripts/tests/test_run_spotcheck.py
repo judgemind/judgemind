@@ -13,17 +13,23 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# DATABASE_URL is read at module import time; satisfy it before importing.
-os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
-
-# psycopg + boto3 are imported at module level; mock them so the import
-# succeeds in the lightweight scripts-tests environment.
+# ``run_spotcheck`` reads ``DATABASE_URL`` and imports ``psycopg`` / ``boto3``
+# at module load time.  Set the env var + install module mocks just long
+# enough to import, then restore the prior environment so this test module
+# does not leak state to siblings — ``test_spotcheck_fetch`` has a
+# ``DATABASE_URL``-conditional code path (see ``fetch.py`` line ~396) that
+# fails when this env var is set.
+_had_database_url = "DATABASE_URL" in os.environ
+if not _had_database_url:
+    os.environ["DATABASE_URL"] = "postgresql://test:test@localhost/test"
 sys.modules.setdefault("psycopg", MagicMock())
 sys.modules.setdefault("boto3", MagicMock())
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "spotcheck"))
 
 import run_spotcheck  # noqa: E402
+
+if not _had_database_url:
+    del os.environ["DATABASE_URL"]
 
 
 class TestSampleOriginalsFollowsPreviousVersionChain:
