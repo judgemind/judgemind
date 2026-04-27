@@ -2317,6 +2317,58 @@ class TestStripTrailingCaseNumber:
         # Should strip the malformed case number from the end
         assert strip_trailing_case_number(raw) == "In the Matter of Denise Guadalupe Mejia"
 
+    def test_strips_ventura_mixed_case_5_digit(self) -> None:
+        """Strip Ventura new-format case number with mixed-case letters and 5 digits (#3511)."""
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "X 2024Cubco20894"
+        assert strip_trailing_case_number(raw) == "X"
+
+    def test_strips_ventura_lowercase_5_digit(self) -> None:
+        """Strip Ventura new-format case number with all-lowercase letters and 5 digits (#3511)."""
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "X 2024cubco20894"
+        assert strip_trailing_case_number(raw) == "X"
+
+    def test_strips_4_digit_trailing(self) -> None:
+        """Strip Ventura new-format case number with 4-digit sequence (#3511)."""
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "X 2024CUBC0204"
+        assert strip_trailing_case_number(raw) == "X"
+
+    def test_strips_7_digit_trailing(self) -> None:
+        """Strip Ventura new-format case number with 7-digit sequence (#3511)."""
+        from ingestion.extract import strip_trailing_case_number
+
+        raw = "X 2024CUBC1234567"
+        assert strip_trailing_case_number(raw) == "X"
+
+
+class TestTitleCleanupOrdering:
+    """End-to-end tests for the strip → dedupe → strip cleanup ordering (#3511).
+
+    When a title contains both a repeated segment AND a trailing case number,
+    applying dedupe before strip leaves a residual case-number fragment from
+    the middle copy.  The correct order is strip → dedupe → strip so the
+    second strip removes any newly exposed trailing fragment.
+    """
+
+    def test_ventura_duplicate_title_with_trailing_case_number(self) -> None:
+        """Full cleanup: deduplicate then strip trailing case number (#3511)."""
+        from ingestion.extract import dedupe_repeated_title, strip_trailing_case_number
+
+        raw = (
+            "Jamonte Clay v. Community Memorial Health System "
+            "Jamonte Clay v. Community Memorial Health System "
+            "2024Cubco20894"
+        )
+        step1 = strip_trailing_case_number(raw)
+        step2 = dedupe_repeated_title(step1)
+        step3 = strip_trailing_case_number(step2)
+        assert step3 == "Jamonte Clay v. Community Memorial Health System"
+
 
 class TestIsProbateDecedentName:
     """Tests for is_probate_decedent_name() — checks whether a candidate
