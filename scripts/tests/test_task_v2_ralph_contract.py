@@ -257,16 +257,16 @@ class TestRalphNonTestableBranch:
         )
 
     def test_single_reviewer_pass_for_non_testable(self) -> None:
-        """The non-testable branch must accept a single Claude reviewer
-        pass (skip both Gemini reviews).
+        """The non-testable branch must skip both Gemini reviews and run
+        Claude + spec-drift reviewers only.
 
         Running Gemini code-review on a markdown-only diff produces no
         signal and wastes ~2-3 minutes of reviewer wall-clock.
         """
         content = _read_skill(RALPH_SKILL)
-        assert "Single-reviewer phase (non-testable branch)" in content, (
-            "/ralph must contain a 'Single-reviewer phase (non-testable "
-            "branch)' section that runs only Claude."
+        assert "Claude + spec-drift reviewer phase (non-testable branch)" in content, (
+            "/ralph must contain a 'Claude + spec-drift reviewer phase "
+            "(non-testable branch)' section."
         )
         assert "Skip the two Gemini reviews" in content, (
             "The non-testable single-reviewer phase must explicitly "
