@@ -31,7 +31,9 @@ The original court documents are authoritative. They are the source of truth —
 
 ---
 
-## Step 0a — Post-compaction recovery (READ FIRST after any context reset)
+## Step 0a — Post-compaction recovery (laptop dispatcher only; READ FIRST after any context reset)
+
+> **Daemon mode skip.** Under dispatcher v2 (Fargate; `scripts/dispatcher/daemon.py`) the daemon spawns `/spotcheck` from a `dispatcher.scheduled_skills` row in a fresh ECS container — there is no `tmp/agent-status/` to resume from, and `scripts/check-task-recovery.sh` does not run there. Skip this entire step in daemon mode. The status-file machinery below is laptop-only.
 
 If your context was just autocompacted (the summary references "previous conversation"), run the recovery check before anything else:
 

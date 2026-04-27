@@ -8,7 +8,9 @@ maxTurns: 200
 
 Perform a comprehensive codebase health audit, filing GitHub issues for every actionable finding. This skill is read-only — it analyzes and reports but never modifies source code.
 
-**Trigger:** The dispatcher spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/dispatcher_state.json`). It can also be invoked manually.
+**Trigger:** The laptop dispatcher spawns `/audit` every 20 merged PRs (tracked via `prs_since_last_audit` in `tmp/dispatcher_state.json`). It can also be invoked manually.
+
+> **Daemon-mode caveat.** Under dispatcher v2 (Fargate; `scripts/dispatcher/daemon.py`) `/audit` is fired by the daemon's `_scheduled_skills_tick` from a `dispatcher.scheduled_skills` row with `every_n_merges` (see `dispatcher-audit/SKILL.md` for the same machinery). The status-file mechanics in Steps 0 and 0a below are laptop-only — each ECS agent runs in a fresh container with no `tmp/agent-status/` to recover from, and the daemon owns agent state in `dispatcher.phase_transitions`. In daemon mode skip the status-file writes silently (best-effort observability, not a correctness gate); in laptop mode keep them.
 
 **Prerequisites:** Must be in a worktree. No special dependencies required — the audit uses Read, Grep, Glob, `mcp__github__*` tools (preferred for reads), and `gh` CLI (for writes and ops without MCP equivalents).
 
@@ -26,7 +28,9 @@ Create a working directory for audit state:
 {worktree}/tmp/audit/
 ```
 
-### Status file setup
+### Status file setup (laptop dispatcher only)
+
+> **Daemon mode skip.** Under dispatcher v2 the daemon owns agent state in `dispatcher.phase_transitions` and there is no `tmp/agent-status/` directory in the ECS container. Skip the status-file setup below silently. The rest of Step 0 (working directory, data fetch) still applies.
 
 Set up the agent status file for post-compaction recovery. The agent id is derived from the worktree path (e.g. `agent-ab4722a2`). Create the status directory if needed:
 
@@ -48,7 +52,9 @@ Use the Write tool to create or overwrite this file at each phase transition thr
 
 ---
 
-## Step 0a — Post-compaction recovery (READ FIRST after any context reset)
+## Step 0a — Post-compaction recovery (laptop dispatcher only; READ FIRST after any context reset)
+
+> **Daemon mode skip.** Under dispatcher v2 each phase runs in a fresh ECS container under a wall-clock budget — autocompaction is not a concern, and there is no status file to read. Skip this entire step in daemon mode.
 
 **When this applies:** Your context just went through autocompaction (the conversation summary references "previous conversation"), or you are otherwise starting a turn without a clear memory of which step you are in. Autocompaction preserves what was done but elides procedural imperatives, so the summary alone cannot tell you whether the audit is complete — the **status file** is authoritative (see #2545).
 

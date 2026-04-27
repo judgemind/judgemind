@@ -970,6 +970,22 @@ jobs:
         run: scripts/check-deprecated-models.sh
 
   # ---------------------------------------------------------------
+  # Spec / SKILL.md drift guard: diagnoser action vocabulary
+  # ---------------------------------------------------------------
+  # Asserts that .claude/skills/diagnose-failure/SKILL.md and the
+  # daemon's DIAGNOSER_ACTIONS frozenset (scripts/dispatcher/daemon.py)
+  # describe the same set of actions. Regression test for issue #3565
+  # (audit found drift on the 9th action `terminal`).
+  spec-action-vocabulary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check diagnoser action vocabulary parity
+        run: scripts/check-spec-action-vocabulary.sh
+      - name: Self-test the vocabulary checker
+        run: scripts/tests/test_check_spec_action_vocabulary.sh
+
+  # ---------------------------------------------------------------
   # Hardcoded model guard: enforce model ID centralization
   # ---------------------------------------------------------------
   hardcoded-models-check:

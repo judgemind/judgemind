@@ -128,22 +128,28 @@ The scheduler drives a per-phase state machine for each active agent. Each tick:
 5. **Advance per-agent state machines.** For each active agent, determine the next phase based on `dispatcher.agents.phase` and spawn the corresponding subprocess. Phase map (see §6a for skill definitions):
 
    ```
-   (new)                    → claim        [mechanical]
-   claim                    → planning     [claude -p /task-v2-plan]
-   planning                 → setup        [mechanical: install deps]
-   setup                    → ralph        [claude -p /task-v2-ralph]
-   ralph:ship               → summary      [claude -p /task-v2-summary]
-   ralph:ac_infeasible      → diagnose     [claude -p /diagnose-failure; §8]
-   summary:ok               → push_and_pr  [mechanical: git + gh pr create]
-   summary:ac_infeasible    → diagnose     [claude -p /diagnose-failure; §8]
-   push_and_pr              → ci_watch     [mechanical: gh run watch]
-   ci_watch:green           → merge        [mechanical: gh pr merge]
-   ci_watch:red             → ci_fix       [claude -p /task-v2-fix-ci]
-   merge                    → deploy_watch [mechanical: gh run watch on deploy wf]
-   deploy_watch             → verify       [claude -p /task-v2-verify]
-   verify                   → retro        [claude -p /task-v2-retro]
-   retro                    → done         [mechanical: cleanup]
+   (new)                       → claim             [mechanical]
+   claim                       → planning          [claude -p /task-v2-plan]
+   planning:coding             → setup             [mechanical: install deps]
+   planning:operational        → operational       [claude -p /task-v2-operational; #3507]
+   setup                       → ralph             [claude -p /task-v2-ralph]
+   ralph:ship                  → summary           [claude -p /task-v2-summary]
+   ralph:ac_infeasible         → diagnose          [claude -p /diagnose-failure; §8]
+   summary:ok                  → push_and_pr       [mechanical: git + gh pr create]
+   summary:ac_infeasible       → diagnose          [claude -p /diagnose-failure; §8]
+   push_and_pr                 → awaiting_ci       [mechanical: gh run watch]
+   awaiting_ci:green           → merge             [mechanical: gh pr merge]
+   awaiting_ci:red             → fix_ci            [claude -p /task-v2-fix-ci]
+   merge                       → awaiting_deploy   [mechanical: gh run watch on deploy wf]
+   awaiting_deploy             → verify            [claude -p /task-v2-verify]
+   verify                      → retro             [claude -p /task-v2-retro]
+   retro                       → done              [mechanical: cleanup]
+   operational:succeeded       → operational_done  [terminal: status=succeeded]
+   operational:blocked         → operational_failed [terminal: status=needs_review]
+   operational:failed          → diagnose          [hint=operational_failed; claude -p /diagnose-failure; §8]
    ```
+
+   Phase-name authority: real phase names live in `daemon.py` `AGENT_RUNNER_VALID_START_PHASES`, `agent-runner-entrypoint.sh` `phase_to_skill`, and `scripts/dispatcher/phase_transitions.py` `ACTIVE_PHASES`. The map above uses those names. (Earlier drafts used `ci_watch` / `deploy_watch` / `ci_fix`; those are spec-only legacy names that never matched the daemon — renamed to `awaiting_ci` / `awaiting_deploy` / `fix_ci` per the audit in #3565. NOTE: `scripts/dispatcher/phases.py` `PHASE_FLOW_FORWARD` keeps `ci_watch` / `deploy_watch` as **admin-UI display labels** for the phase-flow tooltip; that is intentional and orthogonal to the daemon's actual phase strings — see the docstring there. The admin UI module re-labels for display.)
 
 6. **Spawn subprocess for current phase.** For agents whose phase calls for an LLM: build the input bundle from `dispatcher.*` + git state, write to `{worktree}/tmp/dispatcher-input/<phase>.json`, spawn `claude -p '/task-v2-<phase> <agent_id>'` with `--max-turns 500` and the subprocess-wide 180-min timeout. Each phase reads the input JSON and writes `{worktree}/tmp/dispatcher-output/<phase>.json`, which the daemon parses and persists to `dispatcher.phase_outputs` before advancing `dispatcher.agents.phase`.
 7. **Reap completions.** For each subprocess that exited since last tick: parse exit code + output.json, update `dispatcher.agents.phase`, emit failure row if non-zero.
@@ -161,6 +167,8 @@ New skills in .claude/skills/task-v2-\*/SKILL.md, each narrowly scoped to one ph
 | `/task-v2-ralph`[^ralph-subagent][^ralph-runs-every-type][^ralph-ac-infeasible] | plan from above, worktree path | SHIP verdict + implementation diff in git, OR `AC_INFEASIBLE` verdict with `infeasible_acs` array (see footnote) | ~45-90 min (multi-invocation internally, same as today) |
 | `/task-v2-summary`[^summary-ac-infeasible][^summary-deferred-acs] | issue body + git diff | process-summary comment (AC mapping), commit message, PR body, `deferred_acs` array (see footnote), OR `AC_INFEASIBLE` verdict with `infeasible_acs` array (see footnote) | ~10 min |
 | `/task-v2-fix-ci` | PR #N, CI failure logs | patch + commit message, OR explicit "give up — blocker" signal | ~15-30 min |
+| `/task-v2-fix-conflict` | rebase-conflict bundle (`conflict_files`, base SHA, agent SHA) | resolved file set + commit, OR `unresolvable` signal naming the conflict-class | ~10-20 min |
+| `/task-v2-operational`[^operational-skill] | issue body + classification from plan (non-coding task) | structured verdict: `succeeded` / `blocked` / `failed`, `action_taken`, `evidence_md`, optional `block_reason` | ~10-30 min |
 | `/task-v2-verify`[^verify-deferred-acs] | PR #N, deploy status, AC list, `deferred_acs` from summary | verification evidence comment with per-criterion proof (including the deferred ACs, see footnote) | ~10-15 min |
 | `/task-v2-retro` | full agent history (phase_transitions, failures, PR URL) | retrospective issue body(s) to file | ~10 min |
 
@@ -174,6 +182,8 @@ New skills in .claude/skills/task-v2-\*/SKILL.md, each narrowly scoped to one ph
 
 [^summary-deferred-acs]: **Deferred-to-verify ACs — marker + heuristic.** Some ACs are only verifiable once the PR is merged and deployed (e.g. `Verify: query OpenSearch count against dev DB after rebuild_db --reset --county runs`). Summary cannot validate these against the pre-merge diff — checking them there would always flag unmet and force a spurious `needs_review`. Summary classifies each AC *before* running the diff validator: (a) **marker** — `Verify:` line begins with `(post-deploy)` → deferred; (b) **heuristic** — the `Verify:` line references a dev/prod artifact (`scripts/ecs-run-task.sh`, `curl dev.api...`, `POST /<index>/_count`, `rebuild_db`, `gh run watch` on a deploy workflow, etc.) → deferred; (c) otherwise → validate against the diff as today. Deferred ACs are listed in summary's output as `deferred_acs: [{index: N, reason: "marker" | "heuristic", verify_instruction: "<the Verify: line text>"}]` and are NOT counted toward `needs_review` or `AC_INFEASIBLE`. The marker is authoritative; when an author knows an AC is post-deploy, they write `Verify: (post-deploy) ...` and summary's classifier never reaches the heuristic. The heuristic exists because a large backlog of pre-convention issues is authored without the marker and cannot be retrofitted (their authors are ephemeral prior dispatcher runs). False-positive heuristic (tagging a code-verifiable AC as deferred) is benign: verify phase runs it post-deploy and either catches the gap or confirms the pass. False-negative (missing a post-deploy AC) is the current behavior — no regression.
 
+[^operational-skill]: **Operational handler (#3507).** Non-coding tasks — script runs, DB queries, gh actions, data rebuilds — bypass the ralph→summary→push_and_pr→merge pipeline entirely. Plan emits `task_type: "operational"` (`task-v2-plan/SKILL.md:62, 140-156`); the daemon routes through `phase_transitions.py:606-612` to `PHASE_OPERATIONAL`; the entrypoint executes `claude -p /task-v2-operational $AGENT_ID` (`agent-runner-entrypoint.sh:5077-5126`). Verdicts are consumed by `phase_transitions.py:642-674`: `succeeded` → `operational_done` terminal (status=succeeded, no PR); `blocked` → `operational_failed` terminal (status=needs_review); `failed` → `ROUTE_TO_DIAGNOSER` with hint `operational_failed`. Stuck-timeout cap is 3600 s (`daemon.py:1028`).
+
 [^verify-deferred-acs]: **Verify consumes `deferred_acs` from summary.** The verify phase today walks the issue's AC list and produces per-criterion proof against the deployed dev environment. With summary emitting `deferred_acs`, verify now has an explicit list of which ACs were skipped pre-merge — those are the first ones it runs (using the `verify_instruction` field carried forward from summary's output). Any AC not in `deferred_acs` was already validated against the diff by summary; verify can either re-confirm post-deploy (belt) or trust summary's pre-merge pass (skip and rely on CI). Default: re-run everything verify can, so the post-deploy evidence comment covers 100% of ACs. The comment explicitly labels which ACs were deferred and why (marker vs heuristic) so operators reading a PR trail can see which validations were time-shifted.
 
 **Per-phase context budget — measured in spike 0.3.** Analytical measurement (chars/3.5 heuristic + bounded tool-call estimates) against fixtures from #2513 (the 108-min long-tail candidate) + PR #2534 showed all six phases land comfortably inside the 200k-token window with 4×+ headroom. Peak was `/task-v2-fix-ci` at ~42k tokens (~21% of window); `/task-v2-ralph` stays bounded at ~39k (~20%) specifically because its worker+reviewer subagents run in fresh contexts (see the footnote on the ralph row). No sub-split is required. Spike 0.3 scheduled a follow-up empirical re-measurement on Fargate against production skills (#2714). See `docs/investigations/dispatcher-v2-spike-0.3.md`.
@@ -186,57 +196,11 @@ The daemon handles everything between: worktree setup, `git add/commit/push`, `g
 
 **Post-compaction recovery machinery from `/task` disappears.** The phase-split design means no individual phase runs long enough to autocompact. The daemon's resume-from-`phase`-on-boot is the structural equivalent, owned by Python rather than the LLM's status-file discipline.
 
-### 6b. Runner abstraction
+### 6b. Runner abstraction (today)
 
-Each per-phase subprocess is spawned through a `Runner` interface:
+**Today: claude-only.** Every phase subprocess is `claude -p '/<skill> <agent_id>'` with `--max-turns 500` and the container's MCP config path. There is no `Runner` Protocol class implementation in the codebase, no `GeminiRunner` / `CursorRunner` / `OpenCodeRunner` class, and no reader of `dispatcher.config.runner_by_phase` or `model_by_phase` in `daemon.py` — the seed config rows exist (§19) but nothing consumes them. The model used for each phase is implicit per the skill's frontmatter (`model: opus` / `sonnet` / `haiku` in .claude/skills/task-v2-\*/SKILL.md), not chosen by the daemon.
 
-```python
-class Runner(Protocol):
-    def run(
-        self,
-        skill: str,           # e.g. "task-v2-plan"
-        worktree: Path,
-        input_json: Path,     # {worktree}/tmp/dispatcher-input/<phase>.json
-        output_json: Path,    # {worktree}/tmp/dispatcher-output/<phase>.json
-        timeout_s: int,
-    ) -> RunResult: ...       # {exit_code, stderr_tail, duration_s}
-```
-
-First implementation: `ClaudeRunner` — shells out to `claude -p '/<skill> <agent_id>'` with `--max-turns 500` and the container's MCP config path.
-
-**Candidate secondary runners** (verified 2026-04-18):
-
-| Runner | Invocation | Agentic? | Hooks | Skills loaded from | MCP | Notes |
-|---|---|---|---|---|---|---|
-| **Claude Code** | `claude -p '/<skill> <id>'` | yes | `PreToolUse`, `PostToolUse`, `SubagentStop`, etc. — shell-exec, write directly to `dispatcher.failures` via `emit_failure.py` | `.claude/skills/` | yes | First-class. `--max-turns`, no `--timeout`; wrap with OS `timeout(1)`. |
-| **Gemini CLI** (`@google/gemini-cli`, [repo](https://github.com/google-gemini/gemini-cli)) | `gemini -p '<prompt>' --output-format stream-json` | yes | `BeforeTool`/`AfterTool`/`SessionStart`/`SessionEnd` — same `settings.json`-style shell-exec with stdin/stdout JSON, exit code `2` blocks. **Semantics are 1:1 with Claude, but event names differ** — Claude-spelled `PreToolUse` / `PostToolUse` entries in a shared `settings.json` are silently dropped by Gemini with a one-line startup warning, so `settings.json` matchers must be written per-runner (or mechanically converted via `gemini hooks migrate --from-claude`). Verified against Gemini CLI 0.38.2, spike 0.4 (#2686). | `.gemini/skills/` **or** `.agents/skills/` (cross-tool standard) | yes, native | Exit codes 0/1/41/53: `0` success, `1` invocation/flag-parse error, `41` auth missing, `53` turn-limit — *better* granularity than `claude -p`'s `1`-for-everything. Turn-limit mechanism is **`settings.json.model.maxSessionTurns`**, not a CLI flag (`--max-turns` does not exist in Gemini 0.38.2 and produces exit 1 if passed — the `GeminiRunner` writes the limit into the worktree's `.gemini/settings.json` before spawning). Auth: on Fargate use API key (`GEMINI_API_KEY`); OAuth free tier (1000 rpd on Gemini 3 Pro) requires interactive browser flow and is operator-laptop-only. Tool names differ (`read_file`/`write_file`/`run_shell_command`) so hook matchers need a rewrite layer. |
-| **OpenCode** ([sst/opencode](https://github.com/sst/opencode)) | `opencode run "<prompt>"` | yes | `tool.execute.before` / `tool.execute.after` as in-process TS/JS plugins (cleaner — live Postgres connection, typed args, mutate or throw-to-abort). **No `SubagentStop` equivalent** — closest is `session.idle` via a generic `event` firehose ([#5409](https://github.com/sst/opencode/issues/5409) tracks the gap) | `.claude/skills/` is read natively; commands need duplication in `.opencode/commands/` | yes | No `--max-turns` or `--timeout` flags — wrap with OS `timeout(1)`. Exit codes undocumented; verify empirically. |
-| **Cursor CLI** (`cursor-agent`, [docs](https://cursor.com/docs/cli/overview)) | `cursor-agent -p '<prompt>' -m <model>` | yes | `hooks.json` stdio-JSON shell-exec model (introduced Cursor 1.7, Oct 2025). 6 events: `beforeShellExecution`, `beforeReadFile`, `beforeMCPExecution`, `afterFileEdit`, `beforeSubmitPrompt`, `stop`. Exit 2 = deny (same convention as Claude). **Missing:** no `SessionStart`/`SessionEnd`, no generic `beforeFileEdit`, no `SubagentStop`. `beforeReadFile` supports secret-redaction before the LLM sees content — stronger than Claude there | `.cursor/rules/` (nestable `.mdc`); also reads `CLAUDE.md` and AGENTS.md natively; Skills via SKILL.md (Cursor 2.4+) | yes, via `mcp.json` | Known bugs: `-p` mode can hang indefinitely ([forum 150246](https://forum.cursor.com/t/cursor-agent-p-print-headless-mode-hangs-indefinitely-and-never-returns/150246)); sandbox + hook `"ask"` response is ignored ([forum 155438](https://forum.cursor.com/t/beforeshellexecution-returns-permission-ask-but-sandboxed-agent-shell-still-runs-the-command-sandbox-true/155438)). Validate with timeout wrapper before daemon use. |
-
-Runner selection lives in `dispatcher.config` as a per-phase map (`runner_by_phase`), defaulting to `claude` for every phase. Overriding is a single config update — no daemon redeploy. The same config can be overridden per agent (e.g. cost experiments on specific issues) via `dispatcher.agents.runner_override jsonb`.
-
-**Skills portability — use the `.agents/skills/` cross-tool standard.** Gemini CLI and OpenCode both agreed on `agentskills.io` (the SKILL.md frontmatter format Anthropic also uses) and both read `.agents/skills/` as a deliberately cross-tool path. Plan: keep our canonical skill files under .claude/skills/task-v2-\*/SKILL.md (Claude reads these directly), and symlink `.agents/skills/task-v2-*/` → the same directories so Gemini and OpenCode pick them up without duplication. OpenCode additionally reads `.claude/skills/` directly. Non-standard frontmatter fields (`allowed-tools`, `model`) silently drop on non-Claude runners — audit and move those into runner-specific adapters or inline instructions. Slash-command entry points are per-runner: `/task-v2-*` works in Claude; `.opencode/commands/*.md` must be duplicated for OpenCode; Gemini uses its own slash-command config.
-
-**Hooks parity.** Our `PreToolUse` / `SubagentStop` / `PostToolUse` hooks (§9) write directly to `dispatcher.failures`. Parity picture by runner:
-- **Claude Code and Gemini CLI — near-full parity, with naming caveat.** Both support shell-exec hooks with matcher regex, stdin/stdout JSON contracts, and exit-code-based blocking. `SessionStart`/`SessionEnd` map to our `SubagentStop` use case. `emit_failure.py` itself works unchanged (the stdin JSON payload has identical field shape — `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, verified in spike 0.4 #2686). **The event names differ, however:** Claude uses `PreToolUse` / `PostToolUse`; Gemini uses `BeforeTool` / `AfterTool`. A shared `settings.json` with both keys is safe — each runner silently drops the other's key with a one-line startup warning — but hook registration blocks must be written per-runner (or auto-converted via `gemini hooks migrate --from-claude`). Tool names also differ (`Read`/`Write`/`Bash` on Claude vs. `read_file`/`write_file`/`run_shell_command` on Gemini), so matcher regexes need a per-runner namespace.
-- **Cursor CLI — partial.** `beforeShellExecution` / `beforeReadFile` / `afterFileEdit` / `beforeMCPExecution` / `beforeSubmitPrompt` / `stop` cover the preflight and post-edit surface. Exit code 2 = deny (same convention as Claude), so `emit_failure.py` works with minimal adaptation. No `SessionStart`/`SessionEnd` or dedicated `SubagentStop` — fall back to daemon post-exit reconciliation for no-commit/no-push detection. `beforeReadFile`'s content-redaction capability is a bonus we don't get elsewhere (useful if we ever feed secrets through agents).
-- **OpenCode — partial.** `tool.execute.before`/`.after` cover the preflight/observability hooks (arguably *better* — typed args, mutate or throw-to-abort, live in-process Postgres connection). No `SubagentStop` equivalent; fall back to daemon post-exit reconciliation (PR-vs-GH check from Risk 1, git-state check on the worktree, `gh pr view` for branch state) to cover no-commit-on-exit / no-push-on-exit. Hooks are Bun/TS plugins, not shell commands — small shim required or the plugin shells out to `scripts/dispatcher/emit_failure.py`.
-- **Any runner without hooks** — everything routes through post-exit reconciliation at coarser granularity and higher latency. All paths converge on the same `dispatcher.failures` categories.
-
-**Model support.** Orthogonal to the runner choice: each runner exposes a different set of model providers.
-
-| Runner | Anthropic | Google | OpenAI | xAI | Open-weight | Local |
-|---|---|---|---|---|---|---|
-| **Claude Code** | yes — API, Bedrock, Vertex, Foundry (toggled via `CLAUDE_CODE_USE_*` env vars) | no (officially) | no (officially) — works via LiteLLM/Bifrost gateway, unsupported | no | no | no officially |
-| **Gemini CLI** | no | yes — AI Studio OAuth free tier + API key + Vertex | no | no | no | no |
-| **OpenCode** | yes — Anthropic API, Bedrock, Vertex | yes — AI Studio + Vertex | yes — direct + Azure | yes — Grok | yes — Groq, Together, Cerebras, DeepSeek, OpenRouter, HF | yes — Ollama, LM Studio, llama.cpp |
-| **Cursor CLI** | yes (curated) | yes (curated) | yes (curated) | partial (curated) | partial (curated) | no |
-
-Model selection at the CLI: Claude uses `--model <alias\|id>` (aliases `opus`/`sonnet`/`haiku` or full IDs like `claude-opus-4-7`) and `--max-turns <N>` for turn-limiting; Gemini uses `-m <model-id>` (aliases `auto`/`pro`/`flash`/`flash-lite`) and has **no `--max-turns` flag** — turn-limiting is `settings.json.model.maxSessionTurns`, written by the `GeminiRunner` into the worktree's `.gemini/settings.json` before spawning (verified against Gemini CLI 0.38.2 in spike 0.4 #2686); OpenCode uses `-m <provider>/<model>` (e.g. `anthropic/claude-opus-4-7`, `google/gemini-3-pro`, `openai/gpt-5`); Cursor uses `--model <id>` against its curated roster (enumerate via `cursor-agent models`). Model selection is stored in `dispatcher.config.model_by_phase` (parallel to `runner_by_phase`) and overridable per agent via `dispatcher.agents.model_override`.
-
-**Consequence for multi-model experiments.** If we want to mix, say, Opus 4.7 for planning + Gemini 3 Pro for summary + GPT-5 for CI-fix, the simplest path is **OpenCode as the single runner** — one binary, one config, three API keys. The alternative is one runner per phase (`ClaudeRunner` for Anthropic phases, `GeminiRunner` for Google phases, `OpenCodeRunner` only for OpenAI phases), which costs us three binaries and three auth models but keeps each runner's native feature set (e.g. Claude's `opusplan` auto plan-on-Opus / execute-on-Sonnet has no equivalent in OpenCode). Defer this decision until shadow-mode data tells us whether the model swap actually moves quality/cost metrics.
-
-**Cost/quality shadow mode.** A future experiment — `runner_shadow` in config lets a second runner execute the same phase in parallel with its output discarded and diff-logged to `dispatcher.phase_outputs` (distinguished by `phase='<phase>@shadow:<runner>'`). Useful for measuring "would Gemini have produced a similar plan?" without cutting over. Out of scope for Phase 1-4 migration; noted here so the schema doesn't preclude it. The Gemini free OAuth tier (1000 rpd on Gemini 3 Pro) is generous enough to run meaningful shadow traffic without a budget line.
+The multi-runner architecture (Cursor CLI, Gemini CLI, OpenCode candidate runners; per-phase / per-agent runner overrides; hooks-parity matrix; model-provider matrix; `runner_shadow` cost/quality shadow mode) is described in §F1 (Future Direction) — not yet shipped. When it does ship, the tracking issue (TBD) should also flip the `runner_by_phase` and `model_by_phase` seed values to read-and-honour rather than nominal-only.
 
 ### 6c. ECS execution mode (per-agent Fargate)
 
@@ -364,6 +328,11 @@ Note: `enableExecuteCommand` only takes effect on freshly-launched tasks. Tasks 
 | `summary_ac_infeasible` | 3 | Post-exit parse of summary output's `infeasible_acs` array | Summary found an unmet AC that is structurally impossible (references a non-existent symbol, self-contradicts, or out-of-scope) — diagnose immediately. Ralph's diff is discarded on this branch; diagnoser's `reissue` triggers a fresh plan→ralph. |
 | `ci_red_after_retries` | 3 | Scheduler | PR has failing CI and `dispatcher.agents.retries_used >= 3` — diagnose immediately |
 | `merge_unstick_exhausted` | 3 | Scheduler (merge-phase handler) | `gh pr merge --squash` rejected with `base branch policy prohibits the merge` after the daemon already auto-unstuck once by pushing an empty commit (#2641). Second occurrence in the same agent's lifetime — mechanical retry budget `MERGE_UNSTICK_MAX_ATTEMPTS=1` already spent. Diagnose immediately; typical causes are a real CI failure masquerading as a stale rollup, non-CI branch-protection requirements, or a GitHub API anomaly the daemon can't work around mechanically. |
+| `merge_conflict_at_push` | 3 | Entrypoint (push-and-pr / push-fix-ci handler) | `git push` rejected because the branch diverged from `origin/main` between agent's last fetch and push. Routed via `BYPASSED_TERMINAL_PHASES_TO_ROUTE` (`daemon.py:1326, 1372-1385`) — the diagnoser's preferred resolution is to invoke `/task-v2-fix-conflict` to rebase semantically. #2964. |
+| `conflict_unresolvable` | 3 | Entrypoint (post-`/task-v2-fix-conflict`) | `/task-v2-fix-conflict` exhausted its budget without resolving the rebase conflict. Bundle includes `conflict_files`, the base SHA, and the agent SHA so the diagnoser can decide between `block_and_comment`, `file_prerequisite_task`, or splitting the issue. Routed via `BYPASSED_TERMINAL_PHASES_TO_ROUTE` (`daemon.py:1304, 1373`). #3225. |
+| `verify_failed_post_merge` | 3 | Entrypoint (verify phase, post-merge) | `/task-v2-verify` reports unmet ACs against the deployed dev environment after a successful merge + deploy. Routed via `BYPASSED_TERMINAL_PHASES_TO_ROUTE` (`daemon.py:1275, 1381`). The diagnoser decides whether to file a follow-up issue, escalate, or reopen with reissue scope. #3071. |
+| `agent_runner_route_stub` | 3 | Entrypoint (any phase with no recognized next-phase routing) | The agent-runner hit a phase transition the entrypoint has no handler for (typically a daemon-level concept that wasn't propagated to the entrypoint). Generic terminal that always routes to the diagnoser with `route_hint` carrying the original phase. `daemon.py:1339, 1374`. #3366. |
+| `operational_failed` | 3 | Entrypoint (post-`/task-v2-operational`, verdict=`failed`) | `/task-v2-operational` exited with `verdict: "failed"` — the script run, DB query, or gh action errored in a way the operational skill could not classify as a clean `blocked`. Diagnoser decides between retry-with-hint (transient cause), block_and_comment (permanent cause), or escalate. `daemon.py:1321, 1385`. #3507. |
 
 **Escalation:** 3 failures on the same issue in 24h → add `status/needs-human` + `priority/p1` (no p0 — human-only), post comment with the full taxonomy history, fire Telegram with the issue URL. Daemon moves on. (For Tier 2/3 failures, the diagnoser may escalate sooner; see below.)
 
@@ -794,12 +763,88 @@ INSERT INTO dispatcher.config (key, value, updated_by) VALUES
   ('backoff_seconds',      '[60,300,900]', 'init'),
   ('idle_audit_every_n_prs', '20',   'init'),
   ('idle_spotcheck_cron',  '"0 14 * * *"', 'init'),
-  -- Runner selection: per-phase map. Overridable per-agent via dispatcher.agents.runner_override.
-  ('runner_by_phase', '{"plan":"claude","ralph":"claude","summary":"claude","fix_ci":"claude","verify":"claude","retro":"claude","diagnose":"claude"}', 'init'),
+  -- Runner selection: per-phase map. Reserved for the future multi-runner architecture (§F1) — no
+  -- code in daemon.py reads this column today; every phase runs `claude -p` regardless. Overridable
+  -- per-agent via dispatcher.agents.runner_override (also nominal-only today).
+  ('runner_by_phase', '{"plan":"claude","ralph":"claude","summary":"claude","fix_ci":"claude","fix_conflict":"claude","operational":"claude","verify":"claude","retro":"claude","diagnose":"claude"}', 'init'),
   -- Model selection: per-phase map. Values are runner-native model IDs (Claude aliases, OpenCode provider/model strings, etc.).
-  ('model_by_phase',  '{"plan":"opus","ralph":"sonnet","summary":"haiku","fix_ci":"sonnet","verify":"haiku","retro":"haiku","diagnose":"opus"}', 'init'),
-  ('runner_shadow',    '{}',         'init');  -- e.g. {"summary":"gemini"} runs gemini in parallel, output diff-logged only
+  -- Nominal today: the actual model is set by the skill frontmatter (model: opus etc.) on each .claude/skills/task-v2-*/SKILL.md (no backticks intentional — see #3565).
+  -- The `operational` value matches the `model: opus` frontmatter on `.claude/skills/task-v2-operational/SKILL.md`.
+  ('model_by_phase',  '{"plan":"opus","ralph":"sonnet","summary":"haiku","fix_ci":"sonnet","fix_conflict":"sonnet","operational":"opus","verify":"haiku","retro":"haiku","diagnose":"opus"}', 'init'),
+  ('runner_shadow',    '{}',         'init');  -- §F2 future experiment: e.g. {"summary":"gemini"} runs gemini in parallel, output diff-logged only
 ```
+
+---
+
+## Future Direction (aspirational, not yet shipped)
+
+This section collects design content that pre-dated the Phase 4 ECS rollout but never made it into shipped code. Spec content here is **not authoritative for current behavior** — the body of this document (§§1–19) describes today. Items in this section are referenced only by tracking issues; if you find code consuming them, the right move is to delete the dead consumer or land the missing producer.
+
+### F1. Multi-runner architecture (Cursor / Gemini / OpenCode)
+
+**Status: not implemented.** The seed `dispatcher.config.runner_by_phase` and `dispatcher.config.model_by_phase` rows exist (§19) but no code in `daemon.py` reads them. Today every phase is `claude -p` with the model chosen implicitly by the skill's frontmatter. This subsection captures the design as drafted in 2026-04-18 so a future runner-selection PR can pick it up without re-deriving everything.
+
+**Justification for keeping as Future Direction.** Multi-runner pays off only if (a) a non-Claude model demonstrably moves a quality/cost metric on at least one phase, OR (b) Anthropic capacity becomes a bottleneck. Neither is true today; building the abstraction now would be premature. The scaffolding cost (per-runner hook adapters, skill portability via `.agents/skills/`, per-runner exit-code parsers) is real.
+
+#### Runner Protocol (proposed)
+
+Each per-phase subprocess would be spawned through a `Runner` interface:
+
+```python
+class Runner(Protocol):
+    def run(
+        self,
+        skill: str,           # e.g. "task-v2-plan"
+        worktree: Path,
+        input_json: Path,     # {worktree}/tmp/dispatcher-input/<phase>.json
+        output_json: Path,    # {worktree}/tmp/dispatcher-output/<phase>.json
+        timeout_s: int,
+    ) -> RunResult: ...       # {exit_code, stderr_tail, duration_s}
+```
+
+First implementation would be `ClaudeRunner` — the existing `claude -p '/<skill> <agent_id>'` invocation factored behind the protocol.
+
+#### Candidate secondary runners (verified 2026-04-18)
+
+| Runner | Invocation | Agentic? | Hooks | Skills loaded from | MCP | Notes |
+|---|---|---|---|---|---|---|
+| **Claude Code** | `claude -p '/<skill> <id>'` | yes | `PreToolUse`, `PostToolUse`, `SubagentStop`, etc. — shell-exec, write directly to `dispatcher.failures` via `emit_failure.py` | `.claude/skills/` | yes | First-class. `--max-turns`, no `--timeout`; wrap with OS `timeout(1)`. |
+| **Gemini CLI** (`@google/gemini-cli`, [repo](https://github.com/google-gemini/gemini-cli)) | `gemini -p '<prompt>' --output-format stream-json` | yes | `BeforeTool`/`AfterTool`/`SessionStart`/`SessionEnd` — same `settings.json`-style shell-exec with stdin/stdout JSON, exit code `2` blocks. **Semantics are 1:1 with Claude, but event names differ** — Claude-spelled `PreToolUse` / `PostToolUse` entries in a shared `settings.json` are silently dropped by Gemini with a one-line startup warning, so `settings.json` matchers must be written per-runner (or mechanically converted via `gemini hooks migrate --from-claude`). Verified against Gemini CLI 0.38.2, spike 0.4 (#2686). | `.gemini/skills/` **or** `.agents/skills/` (cross-tool standard) | yes, native | Exit codes 0/1/41/53: `0` success, `1` invocation/flag-parse error, `41` auth missing, `53` turn-limit — *better* granularity than `claude -p`'s `1`-for-everything. Turn-limit mechanism is **`settings.json.model.maxSessionTurns`**, not a CLI flag (`--max-turns` does not exist in Gemini 0.38.2 and produces exit 1 if passed — the `GeminiRunner` writes the limit into the worktree's `.gemini/settings.json` before spawning). Auth: on Fargate use API key (`GEMINI_API_KEY`); OAuth free tier (1000 rpd on Gemini 3 Pro) requires interactive browser flow and is operator-laptop-only. Tool names differ (`read_file`/`write_file`/`run_shell_command`) so hook matchers need a rewrite layer. |
+| **OpenCode** ([sst/opencode](https://github.com/sst/opencode)) | `opencode run "<prompt>"` | yes | `tool.execute.before` / `tool.execute.after` as in-process TS/JS plugins (cleaner — live Postgres connection, typed args, mutate or throw-to-abort). **No `SubagentStop` equivalent** — closest is `session.idle` via a generic `event` firehose ([#5409](https://github.com/sst/opencode/issues/5409) tracks the gap) | `.claude/skills/` is read natively; commands need duplication in `.opencode/commands/` | yes | No `--max-turns` or `--timeout` flags — wrap with OS `timeout(1)`. Exit codes undocumented; verify empirically. |
+| **Cursor CLI** (`cursor-agent`, [docs](https://cursor.com/docs/cli/overview)) | `cursor-agent -p '<prompt>' -m <model>` | yes | `hooks.json` stdio-JSON shell-exec model (introduced Cursor 1.7, Oct 2025). 6 events: `beforeShellExecution`, `beforeReadFile`, `beforeMCPExecution`, `afterFileEdit`, `beforeSubmitPrompt`, `stop`. Exit 2 = deny (same convention as Claude). **Missing:** no `SessionStart`/`SessionEnd`, no generic `beforeFileEdit`, no `SubagentStop`. `beforeReadFile` supports secret-redaction before the LLM sees content — stronger than Claude there | `.cursor/rules/` (nestable `.mdc`); also reads `CLAUDE.md` and AGENTS.md natively; Skills via SKILL.md (Cursor 2.4+) | yes, via `mcp.json` | Known bugs: `-p` mode can hang indefinitely ([forum 150246](https://forum.cursor.com/t/cursor-agent-p-print-headless-mode-hangs-indefinitely-and-never-returns/150246)); sandbox + hook `"ask"` response is ignored ([forum 155438](https://forum.cursor.com/t/beforeshellexecution-returns-permission-ask-but-sandboxed-agent-shell-still-runs-the-command-sandbox-true/155438)). Validate with timeout wrapper before daemon use. |
+
+When implemented, runner selection would live in `dispatcher.config` as a per-phase map (`runner_by_phase`), defaulting to `claude` for every phase. Overriding would be a single config update — no daemon redeploy. The same config could be overridden per agent (e.g. cost experiments on specific issues) via `dispatcher.agents.runner_override jsonb`.
+
+#### Skills portability — `.agents/skills/` cross-tool standard
+
+Gemini CLI and OpenCode both agreed on `agentskills.io` (the SKILL.md frontmatter format Anthropic also uses) and both read `.agents/skills/` as a deliberately cross-tool path. Plan: keep canonical skill files under .claude/skills/task-v2-\*/SKILL.md (Claude reads these directly) and symlink `.agents/skills/task-v2-\*/` → the same directories so Gemini and OpenCode pick them up without duplication. OpenCode additionally reads `.claude/skills/` directly. Non-standard frontmatter fields (`allowed-tools`, `model`) silently drop on non-Claude runners — audit and move those into runner-specific adapters or inline instructions. Slash-command entry points are per-runner: `/task-v2-*` works in Claude; `.opencode/commands/*.md` must be duplicated for OpenCode; Gemini uses its own slash-command config.
+
+#### Hooks parity
+
+Our `PreToolUse` / `SubagentStop` / `PostToolUse` hooks (§9) write directly to `dispatcher.failures`. Parity picture by runner:
+- **Claude Code and Gemini CLI — near-full parity, with naming caveat.** Both support shell-exec hooks with matcher regex, stdin/stdout JSON contracts, and exit-code-based blocking. `SessionStart`/`SessionEnd` map to our `SubagentStop` use case. `emit_failure.py` itself works unchanged (the stdin JSON payload has identical field shape — `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, verified in spike 0.4 #2686). **The event names differ, however:** Claude uses `PreToolUse` / `PostToolUse`; Gemini uses `BeforeTool` / `AfterTool`. A shared `settings.json` with both keys is safe — each runner silently drops the other's key with a one-line startup warning — but hook registration blocks must be written per-runner (or auto-converted via `gemini hooks migrate --from-claude`). Tool names also differ (`Read`/`Write`/`Bash` on Claude vs. `read_file`/`write_file`/`run_shell_command` on Gemini), so matcher regexes need a per-runner namespace.
+- **Cursor CLI — partial.** `beforeShellExecution` / `beforeReadFile` / `afterFileEdit` / `beforeMCPExecution` / `beforeSubmitPrompt` / `stop` cover the preflight and post-edit surface. Exit code 2 = deny (same convention as Claude), so `emit_failure.py` works with minimal adaptation. No `SessionStart`/`SessionEnd` or dedicated `SubagentStop` — fall back to daemon post-exit reconciliation for no-commit/no-push detection. `beforeReadFile`'s content-redaction capability is a bonus we don't get elsewhere (useful if we ever feed secrets through agents).
+- **OpenCode — partial.** `tool.execute.before`/`.after` cover the preflight/observability hooks (arguably *better* — typed args, mutate or throw-to-abort, live in-process Postgres connection). No `SubagentStop` equivalent; fall back to daemon post-exit reconciliation (PR-vs-GH check from Risk 1, git-state check on the worktree, `gh pr view` for branch state) to cover no-commit-on-exit / no-push-on-exit. Hooks are Bun/TS plugins, not shell commands — small shim required or the plugin shells out to `scripts/dispatcher/emit_failure.py`.
+- **Any runner without hooks** — everything routes through post-exit reconciliation at coarser granularity and higher latency. All paths converge on the same `dispatcher.failures` categories.
+
+#### Model support
+
+Orthogonal to the runner choice: each runner exposes a different set of model providers.
+
+| Runner | Anthropic | Google | OpenAI | xAI | Open-weight | Local |
+|---|---|---|---|---|---|---|
+| **Claude Code** | yes — API, Bedrock, Vertex, Foundry (toggled via `CLAUDE_CODE_USE_*` env vars) | no (officially) | no (officially) — works via LiteLLM/Bifrost gateway, unsupported | no | no | no officially |
+| **Gemini CLI** | no | yes — AI Studio OAuth free tier + API key + Vertex | no | no | no | no |
+| **OpenCode** | yes — Anthropic API, Bedrock, Vertex | yes — AI Studio + Vertex | yes — direct + Azure | yes — Grok | yes — Groq, Together, Cerebras, DeepSeek, OpenRouter, HF | yes — Ollama, LM Studio, llama.cpp |
+| **Cursor CLI** | yes (curated) | yes (curated) | yes (curated) | partial (curated) | partial (curated) | no |
+
+Model selection at the CLI: Claude uses `--model <alias\|id>` (aliases `opus`/`sonnet`/`haiku` or full IDs like `claude-opus-4-7`) and `--max-turns <N>` for turn-limiting; Gemini uses `-m <model-id>` (aliases `auto`/`pro`/`flash`/`flash-lite`) and has **no `--max-turns` flag** — turn-limiting is `settings.json.model.maxSessionTurns`, written by the `GeminiRunner` into the worktree's `.gemini/settings.json` before spawning (verified against Gemini CLI 0.38.2 in spike 0.4 #2686); OpenCode uses `-m <provider>/<model>` (e.g. `anthropic/claude-opus-4-7`, `google/gemini-3-pro`, `openai/gpt-5`); Cursor uses `--model <id>` against its curated roster (enumerate via `cursor-agent models`). When implemented, model selection would be stored in `dispatcher.config.model_by_phase` (parallel to `runner_by_phase`) and overridable per agent via `dispatcher.agents.model_override`.
+
+**Consequence for multi-model experiments.** If we want to mix, say, Opus 4.7 for planning + Gemini 3 Pro for summary + GPT-5 for CI-fix, the simplest path would be **OpenCode as the single runner** — one binary, one config, three API keys. The alternative is one runner per phase (`ClaudeRunner` for Anthropic phases, `GeminiRunner` for Google phases, `OpenCodeRunner` only for OpenAI phases), which costs three binaries and three auth models but keeps each runner's native feature set (e.g. Claude's `opusplan` auto plan-on-Opus / execute-on-Sonnet has no equivalent in OpenCode). Defer this decision until shadow-mode data tells us whether the model swap actually moves quality/cost metrics.
+
+### F2. `runner_shadow` cost/quality shadow mode
+
+**Status: future experiment.** A second runner could execute the same phase in parallel with its output discarded and diff-logged to `dispatcher.phase_outputs` (distinguished by `phase='<phase>@shadow:<runner>'`). Useful for measuring "would Gemini have produced a similar plan?" without cutting over. Out of scope for Phases 1–4; the seed config row `('runner_shadow', '{}')` (§19) is reserved so the schema doesn't preclude it. The Gemini free OAuth tier (1000 rpd on Gemini 3 Pro) is generous enough to run meaningful shadow traffic without a budget line.
 
 ---
 

@@ -146,7 +146,7 @@ Filed issues: (list issue URLs, or "none" if 0 filed)
 Commented on existing issues: (list comment URLs, or "none" if 0 existing)
 ```
 
-The `FILED ISSUES` header (or any non-empty output) signals success to `handle_scheduled_skill` (agent-runner-entrypoint.sh line ~2082).
+The `FILED ISSUES` header (or any non-empty output) signals success to `handle_scheduled_skill` in `scripts/dispatcher/agent-runner-entrypoint.sh`. (Function-name reference rather than line number — the entrypoint is large and shifts; line cites drift, function names don't.)
 
 ---
 

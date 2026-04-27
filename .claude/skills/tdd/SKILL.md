@@ -5,6 +5,8 @@ argument-hint: ""
 
 # /tdd skill
 
+> **Scope: laptop dispatcher (pre-v2).** This is the laptop dispatcher pre-v2. The dispatcher v2 daemon (Fargate; `scripts/dispatcher/daemon.py`) is a separate artifact — nothing in this file applies to the daemon (which calls `/task-v2-ralph` and its inner `/ralph` instead). See `docs/specs/dispatcher-v2-spec.md`.
+
 Implement the current task using test-driven development. This skill assumes you are already in a worktree with a claimed issue (use `/task` first to set up).
 
 **When to use this skill:** Python packages (scrapers, API logic, NLP pipeline) and TypeScript packages (API, frontend) — any task where you can write and run tests locally.

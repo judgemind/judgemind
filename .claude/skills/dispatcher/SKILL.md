@@ -5,6 +5,8 @@ argument-hint: "[max-agents | #issue1 #issue2 ...]"
 
 # /dispatcher skill
 
+> **Scope: laptop dispatcher (pre-v2).** This is the laptop dispatcher pre-v2. The dispatcher v2 daemon (Fargate; `scripts/dispatcher/daemon.py`) is a separate artifact — nothing in this file applies to the daemon. See `docs/specs/dispatcher-v2-spec.md` for the daemon's contract.
+
 Enable dispatcher mode for the current interactive session. This transforms the session into an autonomous work queue manager that continuously launches `/task` agents, merges completed PRs, triages issues, and communicates via Telegram.
 
 **Dispatcher mode is opt-in.** Interactive sessions are general-purpose by default. The user invokes `/dispatcher` when they want autonomous queue management.

@@ -6,6 +6,8 @@ maxTurns: 200
 
 # /task skill
 
+> **Scope: laptop dispatcher (pre-v2).** This is the laptop dispatcher pre-v2. The dispatcher v2 daemon (Fargate; `scripts/dispatcher/daemon.py`) is a separate artifact — nothing in this file applies to the daemon (which uses the per-phase `/task-v2-*` skills). See `docs/specs/dispatcher-v2-spec.md`.
+
 Pick up one issue from the Judgemind backlog and complete it autonomously. Do not ask for confirmation at any point — work through every step and stop only when the PR is green and review has been requested (or when an investigation task has posted its findings, closed the issue, and unblocked any dependents).
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in a `/task` agent. All work runs synchronously in the foreground. The `/task` agent is already a background subagent from the dispatcher's perspective — further backgrounding causes completion notifications to surface in the wrong context (the dispatcher), leading to confusion and lost results.

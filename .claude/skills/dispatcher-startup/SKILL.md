@@ -5,6 +5,8 @@ argument-hint: "[max_slots=<N>] [skip=<csv>] [only=<#N1,#N2,...>] [agent_account
 
 # /dispatcher-startup skill
 
+> **Scope: laptop dispatcher (pre-v2).** This is the laptop dispatcher pre-v2. The dispatcher v2 daemon (Fargate; `scripts/dispatcher/daemon.py`) does its own startup-sweep work in-process (e.g. `recover_abandoned_agents`, queue scan) — nothing in this file applies to the daemon. See `docs/specs/dispatcher-v2-spec.md`.
+
 **Purpose.** Dispatcher startup historically burns roughly 100k tokens of main-context on raw `gh` / `mcp__github__*` output before the first `/task` agent spawns — `list_issues` over a busy `agent/ready` queue can exceed the MCP token ceiling on its own, and each `gh pr view --json statusCheckRollup,mergeable,mergeStateStatus` adds ~12k characters. The dispatcher rotates every ~40 loop iterations, so the main-context tax is paid fresh on every restart. This skill moves that work into a short-lived isolated subagent that returns ~40 lines of markdown.
 
 **Called by:** `/dispatcher` at startup (once per session), replacing inline startup steps 2–5. Not called by `/task`, `/ralph`, `/audit`, `/spotcheck`, or any other skill.

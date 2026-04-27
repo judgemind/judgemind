@@ -19,7 +19,7 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 
 Do not ask for confirmation. Work autonomously through every step.
 
-**IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 8 more mandatory steps remaining (A.2b through A.9: process summary, commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721). (Under dispatcher v2, the equivalent steps are owned by the daemon's `summary`, `push_and_pr`, `ci_watch`, `merge`, `deploy_watch`, `verify`, and `retro` phases.)
+**IMPORTANT — Ralph is NOT the end of the task.** When this skill completes, the calling `/task` workflow has 8 more mandatory steps remaining (A.2b through A.9: process summary, commit, push, PR, CI, merge, deploy, retrospective). Ralph completing means the code is ready — but the code has not been committed, pushed, reviewed by CI, or merged. Exiting after ralph is a known failure mode (#721). (Under dispatcher v2, the equivalent steps are owned by the daemon's `summary`, `push_and_pr`, `awaiting_ci`, `merge`, `awaiting_deploy`, `verify`, and `retro` phases.)
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in the ralph loop. All work runs synchronously in the foreground. Subagents (worker, reviewer) are already background tasks from the parent's perspective — further backgrounding causes completion notifications to surface in the wrong context and leads to lost results.
 
