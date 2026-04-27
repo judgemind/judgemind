@@ -93,6 +93,15 @@ export const TEST_COUNTY_REGISTRY = {
     counties: [] as const,
     courtCodes: [] as const,
   },
+
+  /**
+   * judge-assignments.integration.test.ts — department assignment history
+   * derived from rulings (CTE + ROW_NUMBER rewrite, #3595).
+   */
+  judgeAssignments: {
+    counties: ['Ventura'] as const,
+    courtCodes: ['ca-ventura-assignments-test'] as const,
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

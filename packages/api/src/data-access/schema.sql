@@ -1289,6 +1289,9 @@ CREATE INDEX idx_rulings_hearing_date ON derived.rulings USING btree (hearing_da
 CREATE INDEX idx_rulings_judge_id ON derived.rulings USING btree (judge_id);
 
 
+CREATE INDEX idx_rulings_judge_dept ON derived.rulings USING btree (judge_id, department) WHERE department IS NOT NULL;
+
+
 CREATE INDEX idx_rulings_judge_motion ON derived.rulings USING btree (judge_id, motion_type, outcome);
 
 

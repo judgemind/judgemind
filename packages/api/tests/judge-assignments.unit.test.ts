@@ -116,6 +116,15 @@ describe('getJudgeAssignments', () => {
     expect(sql).toContain('r.judge_id = $1');
     expect(params).toEqual(['judge-42']);
   });
+
+  it('uses ROW_NUMBER() CTE instead of correlated subquery', async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = { query: queryFn };
+    await getJudgeAssignments(pool as never, 'judge-42', 'Los Angeles');
+    const [sql] = queryFn.mock.calls[0];
+    expect(sql).toContain('ROW_NUMBER()');
+    expect(sql).not.toContain('SELECT c.case_type\n         FROM cases c');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -207,5 +216,18 @@ describe('getJudgeAssignmentsBatch', () => {
       countyByJudge,
     );
     expect(result).toEqual([[], []]);
+  });
+
+  it('uses ROW_NUMBER() CTE instead of correlated subquery', async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = { query: queryFn };
+    await getJudgeAssignmentsBatch(
+      pool as never,
+      ['judge-1'],
+      new Map([['judge-1', 'Los Angeles']]),
+    );
+    const [sql] = queryFn.mock.calls[0];
+    expect(sql).toContain('ROW_NUMBER()');
+    expect(sql).not.toContain('SELECT c.case_type\n         FROM cases c');
   });
 });

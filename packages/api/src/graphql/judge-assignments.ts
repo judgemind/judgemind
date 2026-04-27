@@ -50,26 +50,40 @@ export async function getJudgeAssignments(
     last_seen: string;
     case_type: string | null;
   }>(
-    `SELECT
-       r.department,
-       MIN(r.hearing_date)::text AS first_seen,
-       MAX(r.hearing_date)::text AS last_seen,
-       (
-         SELECT c.case_type
-         FROM cases c
-         JOIN rulings r2 ON r2.case_id = c.id
-         WHERE r2.judge_id = $1
-           AND r2.department = r.department
-           AND c.case_type IS NOT NULL
-         GROUP BY c.case_type
-         ORDER BY COUNT(*) DESC
-         LIMIT 1
-       ) AS case_type
-     FROM rulings r
-     WHERE r.judge_id = $1
-       AND r.department IS NOT NULL
-     GROUP BY r.department
-     ORDER BY MAX(r.hearing_date) DESC`,
+    `WITH dept_dates AS (
+       SELECT
+         r.department,
+         MIN(r.hearing_date)::text AS first_seen,
+         MAX(r.hearing_date)::text AS last_seen
+       FROM rulings r
+       WHERE r.judge_id = $1
+         AND r.department IS NOT NULL
+       GROUP BY r.department
+     ),
+     case_type_ranked AS (
+       SELECT
+         r.department,
+         c.case_type,
+         ROW_NUMBER() OVER (
+           PARTITION BY r.department
+           ORDER BY COUNT(*) DESC
+         ) AS rn
+       FROM rulings r
+       JOIN cases c ON c.id = r.case_id
+       WHERE r.judge_id = $1
+         AND r.department IS NOT NULL
+         AND c.case_type IS NOT NULL
+       GROUP BY r.department, c.case_type
+     )
+     SELECT
+       d.department,
+       d.first_seen,
+       d.last_seen,
+       ct.case_type
+     FROM dept_dates d
+     LEFT JOIN case_type_ranked ct
+       ON ct.department = d.department AND ct.rn = 1
+     ORDER BY d.last_seen DESC`,
     [judgeId],
   );
 
@@ -98,27 +112,43 @@ export async function getJudgeAssignmentsBatch(
     last_seen: string;
     case_type: string | null;
   }>(
-    `SELECT
-       r.judge_id,
-       r.department,
-       MIN(r.hearing_date)::text AS first_seen,
-       MAX(r.hearing_date)::text AS last_seen,
-       (
-         SELECT c.case_type
-         FROM cases c
-         JOIN rulings r2 ON r2.case_id = c.id
-         WHERE r2.judge_id = r.judge_id
-           AND r2.department = r.department
-           AND c.case_type IS NOT NULL
-         GROUP BY c.case_type
-         ORDER BY COUNT(*) DESC
-         LIMIT 1
-       ) AS case_type
-     FROM rulings r
-     WHERE r.judge_id = ANY($1)
-       AND r.department IS NOT NULL
-     GROUP BY r.judge_id, r.department
-     ORDER BY r.judge_id, MAX(r.hearing_date) DESC`,
+    `WITH dept_dates AS (
+       SELECT
+         r.judge_id,
+         r.department,
+         MIN(r.hearing_date)::text AS first_seen,
+         MAX(r.hearing_date)::text AS last_seen
+       FROM rulings r
+       WHERE r.judge_id = ANY($1)
+         AND r.department IS NOT NULL
+       GROUP BY r.judge_id, r.department
+     ),
+     case_type_ranked AS (
+       SELECT
+         r.judge_id,
+         r.department,
+         c.case_type,
+         ROW_NUMBER() OVER (
+           PARTITION BY r.judge_id, r.department
+           ORDER BY COUNT(*) DESC
+         ) AS rn
+       FROM rulings r
+       JOIN cases c ON c.id = r.case_id
+       WHERE r.judge_id = ANY($1)
+         AND r.department IS NOT NULL
+         AND c.case_type IS NOT NULL
+       GROUP BY r.judge_id, r.department, c.case_type
+     )
+     SELECT
+       d.judge_id,
+       d.department,
+       d.first_seen,
+       d.last_seen,
+       ct.case_type
+     FROM dept_dates d
+     LEFT JOIN case_type_ranked ct
+       ON ct.judge_id = d.judge_id AND ct.department = d.department AND ct.rn = 1
+     ORDER BY d.judge_id, d.last_seen DESC`,
     [judgeIds as string[]],
   );
 
