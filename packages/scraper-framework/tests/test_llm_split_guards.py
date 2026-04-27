@@ -79,9 +79,9 @@ class TestLlmSplitGuards:
         """
         _, llm_registry = _load_registries()
         if not llm_registry:
-            pytest.skip(
+            pytest.fail(
                 "No scraper modules export _llm_extract_rulings — "
-                "guard test is a no-op until a scraper joins the LLM registry"
+                "guard test cannot validate any scrapers; registry discovery may be broken"
             )
 
     @pytest.mark.parametrize("scraper_id", _LLM_SCRAPER_IDS, ids=_LLM_SCRAPER_IDS)

@@ -9,8 +9,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
-
 # Add eval scripts directory to path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 EVAL_DIR = REPO_ROOT / "scripts" / "eval"
@@ -74,8 +72,7 @@ class TestExtractHtmlText:
     def test_extracts_text_from_valid_fixture(self) -> None:
         """Should extract text from fixture with speechSynthesis div."""
         fixture_path = FIXTURES_DIR / "la_ruling_pas_p.html"
-        if not fixture_path.exists():
-            pytest.skip("Fixture not found")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
         text = extract_html_text(fixture_path)
         assert text is not None
         assert "DEPARTMENT P LAW AND MOTION RULINGS" in text
@@ -85,16 +82,14 @@ class TestExtractHtmlText:
     def test_returns_none_for_error_page(self) -> None:
         """Error pages without speechSynthesis div return None."""
         fixture_path = FIXTURES_DIR / "la_ruling_van_a.html"
-        if not fixture_path.exists():
-            pytest.skip("Fixture not found")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
         text = extract_html_text(fixture_path)
         assert text is None
 
     def test_multicase_fixture_contains_both_cases(self) -> None:
         """Multi-case fixtures should contain all case numbers."""
         fixture_path = FIXTURES_DIR / "la_ruling_response.html"
-        if not fixture_path.exists():
-            pytest.skip("Fixture not found")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
         text = extract_html_text(fixture_path)
         assert text is not None
         assert "24NNCV02551" in text

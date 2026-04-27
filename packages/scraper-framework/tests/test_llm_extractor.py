@@ -7,6 +7,7 @@ transient errors, chunking, metadata overrides, and token usage logging.
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import anthropic
@@ -1087,10 +1088,7 @@ class TestRetryConstants:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    True,  # noqa: FBT003 — Always skip in automated testing
-    reason="Integration test requires ANTHROPIC_API_KEY — run manually",
-)
+@pytest.mark.skipif(not os.getenv("ANTHROPIC_API_KEY"), reason="needs ANTHROPIC_API_KEY")
 class TestIntegration:
     """Integration tests against the real Anthropic API.
 

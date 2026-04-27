@@ -307,8 +307,10 @@ class TestLlmSplitRegistryDiscovery:
                 for factory in _discover_config_factories(mod):
                     expected_llm_ids.add(factory().scraper_id)
 
-        if not expected_llm_ids:
-            pytest.skip("No scraper modules export _llm_extract_rulings")
+        assert expected_llm_ids, (
+            "No scraper modules export _llm_extract_rulings — "
+            "registry discovery is broken or no LLM scrapers registered"
+        )
 
         actual_llm_ids = set(reingest._LLM_SPLIT_REGISTRY.keys())
         missing = expected_llm_ids - actual_llm_ids

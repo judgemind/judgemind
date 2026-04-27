@@ -11,8 +11,6 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from framework.llm_schema import ConfidenceLevel, FieldConfidence
 from ingestion.llm_extract import (
     _SYSTEM_PROMPT,
@@ -126,8 +124,7 @@ class TestPreprocessHtml:
     def test_real_la_fixture(self) -> None:
         """Test preprocessing against a real LA court ruling fixture."""
         fixture_path = FIXTURES_DIR / "la_ruling_response.html"
-        if not fixture_path.exists():
-            pytest.skip("LA fixture not available")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
         raw_html = fixture_path.read_text()
         result = preprocess_html(raw_html)
         # After preprocessing, the result should be much shorter than the raw HTML
@@ -138,8 +135,7 @@ class TestPreprocessHtml:
     def test_real_la_bh205_fixture(self) -> None:
         """Test preprocessing against the large BH205 LA fixture."""
         fixture_path = FIXTURES_DIR / "la_ruling_bh205.html"
-        if not fixture_path.exists():
-            pytest.skip("LA BH205 fixture not available")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
         raw_html = fixture_path.read_text()
         result = preprocess_html(raw_html)
         # The preprocessed text should be dramatically smaller
@@ -148,8 +144,7 @@ class TestPreprocessHtml:
     def test_real_la_com_a_fixture(self) -> None:
         """Test preprocessing against the COM A LA fixture."""
         fixture_path = FIXTURES_DIR / "la_ruling_com_a.html"
-        if not fixture_path.exists():
-            pytest.skip("LA COM A fixture not available")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
         raw_html = fixture_path.read_text()
         result = preprocess_html(raw_html)
         assert len(result) < len(raw_html)
@@ -981,8 +976,7 @@ class TestRealFixtures:
     def test_la_ruling_response_preprocessing(self) -> None:
         """Verify LA ruling HTML is preprocessed and sent to the LLM."""
         fixture_path = FIXTURES_DIR / "la_ruling_response.html"
-        if not fixture_path.exists():
-            pytest.skip("LA fixture not available")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
 
         raw_html = fixture_path.read_text()
         response_json = json.dumps(
@@ -1019,8 +1013,7 @@ class TestRealFixtures:
     def test_la_dept_header_fixture(self) -> None:
         """Test with the LA dept header fixture."""
         fixture_path = FIXTURES_DIR / "la_ruling_dept_header.html"
-        if not fixture_path.exists():
-            pytest.skip("LA dept header fixture not available")
+        assert fixture_path.exists(), f"Fixture missing: {fixture_path}"
 
         raw_html = fixture_path.read_text()
         response_json = json.dumps(
