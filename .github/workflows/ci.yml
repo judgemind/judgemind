@@ -34,6 +34,7 @@ jobs:
       hooks: ${{ steps.changes.outputs.hooks }}
       githooks: ${{ steps.changes.outputs.githooks }}
       dispatcher-terminals: ${{ steps.changes.outputs.dispatcher-terminals }}
+      dispatcher-dispatch-vocabulary: ${{ steps.changes.outputs.dispatcher-dispatch-vocabulary }}
       dispatcher-image: ${{ steps.changes.outputs.dispatcher-image }}
       any-testable: ${{ steps.any-testable.outputs.result }}
     steps:
@@ -146,6 +147,14 @@ jobs:
               # job are exercised on the PR that introduces them. Without this, the
               # paths filter makes the job SKIP on its own PR — the #2410/#2505
               # footgun. See scripts/check-ci-job-skipped.py.
+              - '.github/workflows/ci.yml'
+            dispatcher-dispatch-vocabulary:
+              - 'scripts/dispatcher/agent-runner-entrypoint.sh'
+              - 'scripts/dispatcher/phase_transitions.py'
+              - '.claude/skills/task-v2-*/SKILL.md'
+              # Include ci.yml so that edits to the dispatcher-dispatch-vocabulary-check
+              # job are exercised on the PR that introduces them. Without this, the
+              # paths filter makes the job SKIP on its own PR.
               - '.github/workflows/ci.yml'
             dispatcher-image:
               - 'Dockerfile.dispatcher'
@@ -1421,6 +1430,21 @@ jobs:
         run: scripts/check-dispatcher-terminals-consistent.sh
 
   # ---------------------------------------------------------------
+  # Dispatcher dispatch-vocabulary guard: verifies dispatch_transition_action()
+  # handles every TransitionAction enum value and FAILURE_HINT_* constant
+  # from phase_transitions.py. Runs when agent-runner-entrypoint.sh,
+  # phase_transitions.py, or any task-v2 skill SKILL.md changes.
+  # ---------------------------------------------------------------
+  dispatcher-dispatch-vocabulary-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.dispatcher-dispatch-vocabulary == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify dispatch_transition_action handles all TransitionAction values and hints
+        run: scripts/check-transition-dispatch-vocabulary.sh
+
+  # ---------------------------------------------------------------
   # ECS oneshot Docker integration test: run scripts in a container
   # ---------------------------------------------------------------
   ecs-oneshot-test:
@@ -1516,7 +1540,7 @@ jobs:
   # Always runs. Reports success only when every applicable job passed or was
   # skipped (path filter did not match). Branch protection requires this check.
   ci-passed:
-    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-image-version-check]
+    needs: [scraper-framework-tests, scraper-court-tests, ingestion-tests, nlp-tests, api-tests, web-tests, infra-validate, scripts-tests, coverage-check, deprecated-models-check, hardcoded-models-check, terraform-empty-resource-check, hardcoded-colors-check, admin-dispatcher-brand-accent-check, docs-tailwind-drift-check, llm-json-loads-check, oneshot-imports-check, oneshot-repo-paths-check, duplicate-functions-check, test-except-pass-check, markdown-links-check, schema-drift-check, dq-baselines-validate, ecs-oneshot-test, migration-files-check, migration-collision-check, nullable-column-reads-check, graphql-nullability-drift-check, sql-conflict-check, sql-column-check, playwright-browser-check, shard-coverage-check, apollo-keyfields-check, graphql-query-check, scraper-registry-check, preflight-hook-test, githooks-pre-push-test, ci-job-skipped-check, test-database-url-fallback-check, opensearch-url-fallback-check, no-api-github-fetch-check, dispatcher-terminal-consistency-check, dispatcher-dispatch-vocabulary-check, dispatcher-image-version-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
