@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import DataLoader from 'dataloader';
 
 // ---------------------------------------------------------------------------
 // Statically import computeGrantRate (no mocking needed for pure functions)
@@ -16,6 +17,7 @@ import { computeGrantRate } from '../src/graphql/judge-analytics';
 // ---------------------------------------------------------------------------
 
 const mockGet = vi.hoisted(() => vi.fn());
+const mockMGet = vi.hoisted(() => vi.fn());
 const mockSet = vi.hoisted(() => vi.fn());
 const mockDel = vi.hoisted(() => vi.fn());
 const mockConnect = vi.hoisted(() => vi.fn());
@@ -32,6 +34,7 @@ vi.mock('redis', () => ({
 function setupRedisClient(options?: { connectFails?: boolean }): void {
   const client = {
     get: mockGet,
+    mGet: mockMGet,
     set: mockSet,
     del: mockDel,
     connect: mockConnect,
@@ -402,5 +405,427 @@ describe('invalidateJudgeAnalyticsCache', () => {
 
     // del should not be called since Redis connection failed
     expect(mockDel).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getJudgeAnalyticsBatch
+// ---------------------------------------------------------------------------
+
+describe('getJudgeAnalyticsBatch', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.resetAllMocks();
+  });
+
+  it('returns empty Map for empty judgeIds and makes zero pool.query calls', async () => {
+    vi.resetModules();
+    setupRedisClient({ connectFails: true });
+    const queryFn = vi.fn();
+    const pool = { query: queryFn };
+
+    const { getJudgeAnalyticsBatch } = await import('../src/graphql/judge-analytics');
+    const result = await getJudgeAnalyticsBatch(pool as never, []);
+
+    expect(result).toBeInstanceOf(Map);
+    expect(result.size).toBe(0);
+    expect(queryFn).not.toHaveBeenCalled();
+  });
+
+  it('returns analytics for 3 judges with correct totals, outcomes, motion stats, and grantRate', async () => {
+    vi.resetModules();
+    setupRedisClient({ connectFails: true });
+
+    const queryFn = vi.fn();
+
+    // Query 1: total count per judge
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { judge_id: 'j1', count: 10 },
+        { judge_id: 'j2', count: 5 },
+        // j3 has no rulings — absent from this result
+      ],
+    });
+
+    // Query 2: outcomes per judge
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { judge_id: 'j1', outcome: 'granted', count: 6 },
+        { judge_id: 'j1', outcome: 'denied', count: 4 },
+        { judge_id: 'j2', outcome: 'granted', count: 3 },
+        { judge_id: 'j2', outcome: 'denied', count: 2 },
+      ],
+    });
+
+    // Query 3: motion type breakdown per judge
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        {
+          judge_id: 'j1',
+          motion_type: 'msj',
+          total: 10,
+          granted: 6,
+          denied: 3,
+          granted_in_part: 1,
+          other: 0,
+        },
+        {
+          judge_id: 'j2',
+          motion_type: 'mtd',
+          total: 5,
+          granted: 3,
+          denied: 2,
+          granted_in_part: 0,
+          other: 0,
+        },
+      ],
+    });
+
+    // Query 4: date ranges per judge
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { judge_id: 'j1', earliest: '2024-01-01', latest: '2025-01-01' },
+        { judge_id: 'j2', earliest: '2024-06-01', latest: '2024-12-01' },
+      ],
+    });
+
+    const pool = { query: queryFn };
+    const { getJudgeAnalyticsBatch } = await import('../src/graphql/judge-analytics');
+    const result = await getJudgeAnalyticsBatch(pool as never, ['j1', 'j2', 'j3']);
+
+    // Exactly 4 queries
+    expect(queryFn).toHaveBeenCalledTimes(4);
+
+    expect(result.size).toBe(3);
+
+    // j1 analytics
+    const j1 = result.get('j1');
+    expect(j1).not.toBeUndefined();
+    expect(j1!.judgeId).toBe('j1');
+    expect(j1!.totalRulings).toBe(10);
+    expect(j1!.rulingsByOutcome).toHaveLength(2);
+    expect(j1!.rulingsByOutcome.find((o) => o.outcome === 'granted')?.count).toBe(6);
+    expect(j1!.rulingsByMotionType).toHaveLength(1);
+    // grantRate = 6 / (6 + 3 + 1) = 0.6
+    expect(j1!.rulingsByMotionType[0].grantRate).toBeCloseTo(0.6, 5);
+    expect(j1!.earliestRuling).toBe('2024-01-01');
+    expect(j1!.latestRuling).toBe('2025-01-01');
+
+    // j2 analytics
+    const j2 = result.get('j2');
+    expect(j2).not.toBeUndefined();
+    expect(j2!.totalRulings).toBe(5);
+    // grantRate = 3 / (3 + 2 + 0) = 0.6
+    expect(j2!.rulingsByMotionType[0].grantRate).toBeCloseTo(0.6, 5);
+
+    // j3 — no rulings, should have zero-analytics entry
+    const j3 = result.get('j3');
+    expect(j3).not.toBeUndefined();
+    expect(j3!.judgeId).toBe('j3');
+    expect(j3!.totalRulings).toBe(0);
+    expect(j3!.rulingsByOutcome).toEqual([]);
+    expect(j3!.rulingsByMotionType).toEqual([]);
+    expect(j3!.earliestRuling).toBeNull();
+    expect(j3!.latestRuling).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getMultipleJudgeAnalytics (batched)
+// ---------------------------------------------------------------------------
+
+describe('getMultipleJudgeAnalytics (batched)', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.resetAllMocks();
+  });
+
+  it('issues at most 5 queries total for 10 judge IDs (AC #2)', async () => {
+    vi.resetModules();
+    setupRedisClient({ connectFails: true }); // Redis unavailable — forces batch DB path
+
+    const judgeIds = ['j1', 'j2', 'j3', 'j4', 'j5', 'j6', 'j7', 'j8', 'j9', 'j10'];
+    const queryFn = vi.fn();
+
+    // The judgeLoader will fire SELECT * FROM judges WHERE id = ANY($1) — 1 query
+    queryFn.mockResolvedValueOnce({
+      rows: judgeIds.map((id) => ({ id, canonical_name: `Judge ${id}`, is_active: true })),
+    });
+
+    // getJudgeAnalyticsBatch — 4 queries
+    // Query: total counts
+    queryFn.mockResolvedValueOnce({
+      rows: judgeIds.map((id) => ({ judge_id: id, count: 2 })),
+    });
+    // Query: outcomes
+    queryFn.mockResolvedValueOnce({
+      rows: judgeIds.map((id) => ({ judge_id: id, outcome: 'granted', count: 2 })),
+    });
+    // Query: motion types
+    queryFn.mockResolvedValueOnce({
+      rows: judgeIds.map((id) => ({
+        judge_id: id,
+        motion_type: 'msj',
+        total: 2,
+        granted: 2,
+        denied: 0,
+        granted_in_part: 0,
+        other: 0,
+      })),
+    });
+    // Query: date ranges
+    queryFn.mockResolvedValueOnce({
+      rows: judgeIds.map((id) => ({
+        judge_id: id,
+        earliest: '2025-01-01',
+        latest: '2025-06-01',
+      })),
+    });
+
+    const pool = { query: queryFn };
+
+    // Create a real DataLoader backed by the mock pool (mirrors judgeLoader in dataloader.ts)
+    const judgeLoader = new DataLoader<string, Record<string, unknown> | null>(async (ids) => {
+      const result = await pool.query('SELECT * FROM judges WHERE id = ANY($1)', [ids]);
+      const byId = new Map((result as { rows: Array<Record<string, unknown>> }).rows.map((r) => [r.id as string, r]));
+      return ids.map((id) => byId.get(id) ?? null);
+    });
+
+    const loaders = { judgeLoader };
+
+    const { getMultipleJudgeAnalytics } = await import('../src/graphql/judge-analytics');
+    const results = await getMultipleJudgeAnalytics(pool as never, loaders as never, judgeIds);
+
+    // ≤ 5 total DB queries (1 existence + 4 analytics)
+    expect(queryFn.mock.calls.length).toBeLessThanOrEqual(5);
+
+    expect(results).toHaveLength(10);
+    for (const r of results) {
+      expect(r).not.toBeNull();
+    }
+  });
+
+  it('filters non-existent judges and preserves input order with null entries', async () => {
+    vi.resetModules();
+    setupRedisClient({ connectFails: true });
+
+    const queryFn = vi.fn();
+
+    // judgeLoader: j1 and j3 exist, j2 does not
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { id: 'j1', canonical_name: 'Judge One', is_active: true },
+        { id: 'j3', canonical_name: 'Judge Three', is_active: true },
+      ],
+    });
+
+    // getJudgeAnalyticsBatch for [j1, j3]
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { judge_id: 'j1', count: 3 },
+        { judge_id: 'j3', count: 1 },
+      ],
+    });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { judge_id: 'j1', earliest: '2025-01-01', latest: '2025-06-01' },
+        { judge_id: 'j3', earliest: '2025-03-01', latest: '2025-03-01' },
+      ],
+    });
+
+    const pool = { query: queryFn };
+    const judgeLoader = new DataLoader<string, Record<string, unknown> | null>(async (ids) => {
+      const result = await pool.query('SELECT * FROM judges WHERE id = ANY($1)', [ids]);
+      const byId = new Map((result as { rows: Array<Record<string, unknown>> }).rows.map((r) => [r.id as string, r]));
+      return ids.map((id) => byId.get(id) ?? null);
+    });
+
+    const loaders = { judgeLoader };
+
+    const { getMultipleJudgeAnalytics } = await import('../src/graphql/judge-analytics');
+    const results = await getMultipleJudgeAnalytics(pool as never, loaders as never, ['j1', 'j2', 'j3']);
+
+    expect(results).toHaveLength(3);
+    expect(results[0]).not.toBeNull();
+    expect(results[0]!.judgeId).toBe('j1');
+    expect(results[1]).toBeNull(); // j2 does not exist
+    expect(results[2]).not.toBeNull();
+    expect(results[2]!.judgeId).toBe('j3');
+  });
+
+  it('caps input to 10 IDs', async () => {
+    vi.resetModules();
+    setupRedisClient({ connectFails: true });
+
+    const queryFn = vi.fn();
+
+    // Only 10 judges should be queried (not 11)
+    queryFn.mockResolvedValueOnce({ rows: [] }); // judgeLoader: all non-existent
+
+    const pool = { query: queryFn };
+    const judgeLoader = new DataLoader<string, Record<string, unknown> | null>(async (ids) => {
+      const result = await pool.query('SELECT * FROM judges WHERE id = ANY($1)', [ids]);
+      const byId = new Map((result as { rows: Array<Record<string, unknown>> }).rows.map((r) => [r.id as string, r]));
+      return ids.map((id) => byId.get(id) ?? null);
+    });
+
+    const loaders = { judgeLoader };
+
+    const elevenIds = ['j1', 'j2', 'j3', 'j4', 'j5', 'j6', 'j7', 'j8', 'j9', 'j10', 'j11'];
+
+    const { getMultipleJudgeAnalytics } = await import('../src/graphql/judge-analytics');
+    const results = await getMultipleJudgeAnalytics(pool as never, loaders as never, elevenIds);
+
+    // Should be capped to 10
+    expect(results).toHaveLength(10);
+
+    // The judgeLoader was called with at most 10 IDs
+    const loaderCallArgs = queryFn.mock.calls[0][1] as string[];
+    expect(loaderCallArgs.length).toBeLessThanOrEqual(10);
+  });
+
+  it('returns analytics even when batch Redis write-back throws', async () => {
+    vi.resetModules();
+
+    setupRedisClient();
+    // mGet returns all misses
+    mockMGet.mockResolvedValue([null, null]);
+    // set throws (write-back failure)
+    mockSet.mockRejectedValue(new Error('Redis set error'));
+
+    const queryFn = vi.fn();
+
+    // judgeLoader: j1 and j2 exist
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { id: 'j1', canonical_name: 'Judge One', is_active: true },
+        { id: 'j2', canonical_name: 'Judge Two', is_active: true },
+      ],
+    });
+
+    // getJudgeAnalyticsBatch — 4 queries
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { judge_id: 'j1', count: 3 },
+        { judge_id: 'j2', count: 2 },
+      ],
+    });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+
+    const pool = { query: queryFn };
+    const judgeLoader = new DataLoader<string, Record<string, unknown> | null>(async (ids) => {
+      const result = await pool.query('SELECT * FROM judges WHERE id = ANY($1)', [ids]);
+      const byId = new Map((result as { rows: Array<Record<string, unknown>> }).rows.map((r) => [r.id as string, r]));
+      return ids.map((id) => byId.get(id) ?? null);
+    });
+
+    const loaders = { judgeLoader };
+
+    const { getMultipleJudgeAnalytics } = await import('../src/graphql/judge-analytics');
+    const results = await getMultipleJudgeAnalytics(pool as never, loaders as never, ['j1', 'j2']);
+
+    // Should still return analytics despite write-back failure
+    expect(results).toHaveLength(2);
+    expect(results[0]).not.toBeNull();
+    expect(results[0]!.totalRulings).toBe(3);
+    expect(results[1]).not.toBeNull();
+    expect(results[1]!.totalRulings).toBe(2);
+  });
+
+  it('falls through to batch DB when Redis mGet throws', async () => {
+    vi.resetModules();
+
+    setupRedisClient();
+    mockMGet.mockRejectedValue(new Error('Redis mGet error'));
+    mockSet.mockResolvedValue('OK');
+
+    const queryFn = vi.fn();
+
+    // judgeLoader: j1 exists
+    queryFn.mockResolvedValueOnce({
+      rows: [{ id: 'j1', canonical_name: 'Judge One', is_active: true }],
+    });
+
+    // getJudgeAnalyticsBatch for [j1] — 4 queries
+    queryFn.mockResolvedValueOnce({ rows: [{ judge_id: 'j1', count: 7 }] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({
+      rows: [{ judge_id: 'j1', earliest: '2025-01-01', latest: '2025-06-01' }],
+    });
+
+    const pool = { query: queryFn };
+    const judgeLoader = new DataLoader<string, Record<string, unknown> | null>(async (ids) => {
+      const result = await pool.query('SELECT * FROM judges WHERE id = ANY($1)', [ids]);
+      const byId = new Map((result as { rows: Array<Record<string, unknown>> }).rows.map((r) => [r.id as string, r]));
+      return ids.map((id) => byId.get(id) ?? null);
+    });
+
+    const loaders = { judgeLoader };
+
+    const { getMultipleJudgeAnalytics } = await import('../src/graphql/judge-analytics');
+    const results = await getMultipleJudgeAnalytics(pool as never, loaders as never, ['j1']);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).not.toBeNull();
+    expect(results[0]!.totalRulings).toBe(7);
+  });
+
+  it('bypasses getJudgeAnalyticsBatch for cache-hit judges', async () => {
+    vi.resetModules();
+
+    setupRedisClient();
+    const analyticsForJ1 = {
+      judgeId: 'j1',
+      totalRulings: 99,
+      rulingsByOutcome: [],
+      rulingsByMotionType: [],
+      earliestRuling: null,
+      latestRuling: null,
+    };
+    // j1 is a Redis cache hit (via mGet); j2 is a miss
+    // mGet returns an array: [hit-for-j1, null-for-j2]
+    mockMGet.mockResolvedValue([JSON.stringify(analyticsForJ1), null]);
+    mockSet.mockResolvedValue('OK');
+
+    const queryFn = vi.fn();
+
+    // judgeLoader: both j1 and j2 exist
+    queryFn.mockResolvedValueOnce({
+      rows: [
+        { id: 'j1', canonical_name: 'Judge One', is_active: true },
+        { id: 'j2', canonical_name: 'Judge Two', is_active: true },
+      ],
+    });
+
+    // getJudgeAnalyticsBatch for [j2] only (j1 is a cache hit)
+    queryFn.mockResolvedValueOnce({ rows: [{ judge_id: 'j2', count: 5 }] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({ rows: [] });
+    queryFn.mockResolvedValueOnce({
+      rows: [{ judge_id: 'j2', earliest: '2025-01-01', latest: '2025-06-01' }],
+    });
+
+    const pool = { query: queryFn };
+    const judgeLoader = new DataLoader<string, Record<string, unknown> | null>(async (ids) => {
+      const result = await pool.query('SELECT * FROM judges WHERE id = ANY($1)', [ids]);
+      const byId = new Map((result as { rows: Array<Record<string, unknown>> }).rows.map((r) => [r.id as string, r]));
+      return ids.map((id) => byId.get(id) ?? null);
+    });
+
+    const loaders = { judgeLoader };
+
+    const { getMultipleJudgeAnalytics } = await import('../src/graphql/judge-analytics');
+    const results = await getMultipleJudgeAnalytics(pool as never, loaders as never, ['j1', 'j2']);
+
+    expect(results).toHaveLength(2);
+    // j1 should come from cache (totalRulings = 99)
+    expect(results[0]!.totalRulings).toBe(99);
+    // j2 from DB
+    expect(results[1]!.totalRulings).toBe(5);
   });
 });
