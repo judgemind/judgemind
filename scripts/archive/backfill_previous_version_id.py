@@ -350,7 +350,6 @@ def main() -> None:  # noqa: C901 -- acceptable complexity for a one-off script
 
         logger.info(
             "backfill_previous_version_id_summary",
-            event="backfill_previous_version_id_summary",
             total_scanned=total,
             linked=linked,
             unlinkable=unlinkable,

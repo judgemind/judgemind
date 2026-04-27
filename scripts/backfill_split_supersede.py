@@ -382,7 +382,6 @@ def main() -> None:  # noqa: C901 -- acceptable complexity for a one-off script
 
         logger.info(
             "backfill_split_supersede_summary",
-            event="backfill_split_supersede_summary",
             total_scanned=total,
             linked=linked,
             unverified=unverified,
