@@ -78,6 +78,9 @@ def test_probe_convergence_regression_flags_p95_jump() -> None:
     f = findings[0]
     assert isinstance(f, Finding)
     assert f.severity in ("warning", "critical")
+    assert f.title.startswith("[convergence-regression]"), (
+        f"Expected title to start with '[convergence-regression]', got: {f.title!r}"
+    )
     assert (
         "convergence" in f.title.lower()
         or "iteration" in f.title.lower()
@@ -110,6 +113,9 @@ def test_probe_bad_outcome_streak_at_threshold() -> None:
     f = findings[0]
     assert isinstance(f, Finding)
     assert f.should_file_issue is True
+    assert f.title.startswith("[bad-outcome-streak]"), (
+        f"Expected title to start with '[bad-outcome-streak]', got: {f.title!r}"
+    )
     assert "streak" in f.title.lower() or "outcome" in f.title.lower()
 
 
@@ -147,6 +153,12 @@ def test_probe_site_health_flags_non_200() -> None:
         "dev.judgemind.org" in t or "site" in t.lower() or "health" in t.lower()
         for t in titles
     ), f"Expected a finding about dev.judgemind.org, got titles: {titles}"
+    # The frontend finding must carry the stable probe-id prefix.
+    frontend_findings = [f for f in findings if "dev.judgemind.org" in f.title]
+    assert frontend_findings, f"Expected a frontend finding, got titles: {titles}"
+    assert frontend_findings[0].title.startswith("[site-health-frontend]"), (
+        f"Expected title to start with '[site-health-frontend]', got: {frontend_findings[0].title!r}"
+    )
 
 
 def test_probe_site_health_quiet_when_all_green() -> None:
@@ -171,6 +183,9 @@ def test_probe_site_health_flags_zero_document_count() -> None:
     assert len(findings) >= 1, (
         f"Expected at least 1 finding for zero docs, got {findings}"
     )
+    assert findings[0].title.startswith("[site-health-doc-count]"), (
+        f"Expected title to start with '[site-health-doc-count]', got: {findings[0].title!r}"
+    )
 
 
 def test_probe_site_health_flags_graphql_non_200() -> None:
@@ -188,6 +203,13 @@ def test_probe_site_health_flags_graphql_non_200() -> None:
     assert any("graphql" in t.lower() or "api" in t.lower() for t in titles), (
         f"Expected a finding about the GraphQL endpoint, got titles: {titles}"
     )
+    graphql_findings = [
+        f for f in findings if "graphql" in f.title.lower() or "api" in f.title.lower()
+    ]
+    assert graphql_findings, f"Expected a graphql finding, got titles: {titles}"
+    assert graphql_findings[0].title.startswith("[site-health-graphql]"), (
+        f"Expected title to start with '[site-health-graphql]', got: {graphql_findings[0].title!r}"
+    )
 
 
 def test_probe_site_health_handles_unparseable_doc_count() -> None:
@@ -201,6 +223,9 @@ def test_probe_site_health_handles_unparseable_doc_count() -> None:
     # count will be -1 (ValueError on "Internal Server Error"), status != 200
     assert len(findings) >= 1, (
         f"Expected at least 1 finding for unparseable count + non-200, got {findings}"
+    )
+    assert findings[0].title.startswith("[site-health-doc-count]"), (
+        f"Expected title to start with '[site-health-doc-count]', got: {findings[0].title!r}"
     )
 
 

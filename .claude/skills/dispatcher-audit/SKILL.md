@@ -81,7 +81,36 @@ For each finding where `should_file_issue` is `true`:
 
 Write the issue body to a temp file. Use the Write tool with content derived from the finding's `body` field. File path: `tmp/dispatcher-audit/issue-body-PROBE.txt` (replace `PROBE` with the finding's `probe` value, e.g. `convergence_regression`).
 
-Then create the GitHub issue:
+### Sub-step 3.0 — Check for existing open issue (MANDATORY dedup gate)
+
+Before filing a new issue, extract the stable probe-identifier prefix from `finding.title` (e.g. `[bad-outcome-streak]`, `[convergence-regression]`, `[site-health-frontend]`, `[site-health-graphql]`, `[site-health-doc-count]`). Search for an existing open issue with that prefix:
+
+```
+gh issue list \
+    --repo judgemind/judgemind \
+    --label source/dispatcher-audit \
+    --state open \
+    --search "[PROBE_PREFIX] in:title" \
+    --json number,title
+```
+
+Replace `[PROBE_PREFIX]` with the bracketed prefix from the finding's title (e.g. `[bad-outcome-streak]`).
+
+**Branch on result:**
+
+- **If one or more open issues match** (dedup hit): pick the lowest-numbered match and add a comment instead of filing a new issue. Skip `gh issue create`.
+
+  ```
+  gh issue comment ISSUE_NUMBER \
+      --repo judgemind/judgemind \
+      --body-file tmp/dispatcher-audit/issue-body-PROBE.txt
+  ```
+
+  Record the comment URL. Do **not** run `gh issue create` for this finding.
+
+- **If no match** (no existing open issue): proceed with `gh issue create` as normal (sub-step 3.1 below).
+
+### Sub-step 3.1 — Create new issue (only when no existing open issue found)
 
 ```
 gh issue create \
@@ -98,7 +127,7 @@ Replace `FINDING_TITLE` with the finding's `title` field.
 
 **Important:** Never use priority/p0. The maximum priority for dispatcher-audit findings is p2.
 
-Repeat for each finding with `should_file_issue=true`. Record the issue URL from each `gh issue create` output.
+Repeat sub-steps 3.0–3.1 for each finding with `should_file_issue=true`. Record the issue URL or comment URL from each action.
 
 ---
 
@@ -111,8 +140,10 @@ FILED ISSUES
 
 Dispatcher audit complete. Probes run: convergence_regression, bad_outcome_streak, site_health.
 Findings: N total, M filed as GitHub issues.
+Filed N new, commented on M existing.
 
 Filed issues: (list issue URLs, or "none" if 0 filed)
+Commented on existing issues: (list comment URLs, or "none" if 0 existing)
 ```
 
 The `FILED ISSUES` header (or any non-empty output) signals success to `handle_scheduled_skill` (agent-runner-entrypoint.sh line ~2082).
