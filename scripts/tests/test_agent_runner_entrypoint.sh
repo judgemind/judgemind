@@ -5216,6 +5216,157 @@ else
          "output: $t56_out"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test 57: #3494 — agent_runner_reaped_failure exits unconditionally.
+#
+# PR #3458 replaced ``advance_phase agent_runner_route_stub`` with
+# ``agent_runner_reaped_failure`` emitting descriptive phase strings
+# (phase_unknown, ralph_not_ship, post_claude_transition_unrecognized).
+# The dispatch loop had two bugs:
+#   (a) None of those strings were in TERMINAL_PHASES, so is_terminal()
+#       returned False. (Fixed by adding them to TERMINAL_PHASES.)
+#   (b) agent_runner_reaped_failure lacked ``exit 0``, so the `*)` arm
+#       could re-enter for unknown phases not yet in TERMINAL_PHASES.
+#       (Fixed by adding exit 0 to the function body.)
+#
+# T57a: For phases now in TERMINAL_PHASES (phase_unknown, ralph_not_ship,
+#   post_claude_transition_unrecognized) — the loop exits via the
+#   is_terminal() check BEFORE reaching the `*)` arm. No
+#   agent_runner_reaped_failure call occurs. Verifies the defense-in-depth
+#   fix: exit 0, no cap hit, phase_terminal logged.
+#
+# T57b: For a truly alien phase (not in any TERMINAL_PHASES, not in any
+#   case arm) — the `*)` arm fires and calls agent_runner_reaped_failure.
+#   The exit 0 fix ensures the loop does NOT spin. Verifies exit 0,
+#   exactly 1 reaped_failure line, no cap hit, and DB UPDATE lands.
+# ══════════════════════════════════════════════════════════════════════════
+
+# T57a: Phases now in TERMINAL_PHASES — exit via is_terminal(), no reaped_failure.
+_t57a_test_terminal_phase() {
+    # $1 = phase now in TERMINAL_PHASES; exits via phase_terminal path.
+    _phase="$1"
+    setup_fixtures
+    PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t57a-${_phase}.txt"
+    printf '%s\n' "$_phase" > "$PHASE_FIXTURE_FILE"
+
+    _t57a_workspace="$TEST_TMP/t57a-workspace-${_phase}"
+    mkdir -p "$_t57a_workspace"
+
+    set +e
+    _t57a_out=$(
+        AGENT_ID="57000000-3494-0000-0000-000000003494" \
+        ISSUE_NUMBER="3494" \
+        DATABASE_URL="postgres://test" \
+        GITHUB_TOKEN="" \
+        AGENT_WORKSPACE="$_t57a_workspace" \
+        REPO_URL="https://example.invalid/repo.git" \
+        PATH="$STUB_BIN:$PATH" \
+        INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+        PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+        PRIOR_PATCH_FIXTURE="" \
+        PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+        PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+        AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+        bash "$ENTRYPOINT" 2>&1
+    )
+    _t57a_rc=$?
+    set -e
+
+    # (1) Exit code 0 — clean exit via is_terminal() path.
+    if [[ "$_t57a_rc" -eq 0 ]]; then
+        pass "#3494 T57a [${_phase}] — exit code 0 (terminal phase exits cleanly)"
+    else
+        fail "#3494 T57a [${_phase}] — exit code 0 (terminal phase exits cleanly)" \
+             "rc=$_t57a_rc out tail: $(printf '%s' "$_t57a_out" | tail -c 800)"
+    fi
+
+    # (2) phase_terminal event logged — confirms is_terminal() fired.
+    if printf '%s' "$_t57a_out" | grep -q "phase_terminal"; then
+        pass "#3494 T57a [${_phase}] — phase_terminal event logged"
+    else
+        fail "#3494 T57a [${_phase}] — phase_terminal event logged" \
+             "out tail: $(printf '%s' "$_t57a_out" | tail -c 800)"
+    fi
+
+    # (3) phase_iteration_cap_hit ABSENT — loop did not spin to the cap.
+    if printf '%s' "$_t57a_out" | grep -q "phase_iteration_cap_hit"; then
+        fail "#3494 T57a [${_phase}] — phase_iteration_cap_hit absent (no loop spin)" \
+             "out tail: $(printf '%s' "$_t57a_out" | tail -c 800)"
+    else
+        pass "#3494 T57a [${_phase}] — phase_iteration_cap_hit absent (no loop spin)"
+    fi
+}
+
+_t57a_test_terminal_phase "phase_unknown"
+_t57a_test_terminal_phase "ralph_not_ship"
+_t57a_test_terminal_phase "post_claude_transition_unrecognized"
+
+# T57b: A truly alien phase not in TERMINAL_PHASES and not in any case arm —
+# the `*)` arm fires, calling agent_runner_reaped_failure. The exit 0 fix
+# ensures the loop does NOT spin for MAX_PHASE_ITERATIONS.
+# We use a synthetic phase name that can never be wired or terminal.
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t57b.txt"
+printf 'never_wired_3494_alien\n' > "$PHASE_FIXTURE_FILE"
+
+_t57b_workspace="$TEST_TMP/t57b-workspace"
+mkdir -p "$_t57b_workspace"
+
+set +e
+_t57b_out=$(
+    AGENT_ID="57bb0000-3494-0000-0000-000000003494" \
+    ISSUE_NUMBER="3494" \
+    DATABASE_URL="postgres://test" \
+    GITHUB_TOKEN="" \
+    AGENT_WORKSPACE="$_t57b_workspace" \
+    REPO_URL="https://example.invalid/repo.git" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+    PRIOR_PATCH_FIXTURE="" \
+    PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+    PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+    AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+    bash "$ENTRYPOINT" 2>&1
+)
+_t57b_rc=$?
+set -e
+
+# (1) Exit code 0 — agent_runner_reaped_failure exits cleanly via exit 0.
+if [[ "$_t57b_rc" -eq 0 ]]; then
+    pass "#3494 T57b [alien phase] — exit code 0 (exit 0 in reaped_failure)"
+else
+    fail "#3494 T57b [alien phase] — exit code 0 (exit 0 in reaped_failure)" \
+         "rc=$_t57b_rc out tail: $(printf '%s' "$_t57b_out" | tail -c 800)"
+fi
+
+# (2) Exactly 1 agent_runner_reaped_failure log line — no loop spin (AC3).
+_t57b_reaped_count=$(printf '%s' "$_t57b_out" | grep -c "agent_runner_reaped_failure" || true)
+if [[ "$_t57b_reaped_count" -eq 1 ]]; then
+    pass "#3494 T57b [alien phase] — exactly 1 agent_runner_reaped_failure line (AC3)"
+else
+    fail "#3494 T57b [alien phase] — exactly 1 agent_runner_reaped_failure line (AC3)" \
+         "count=$_t57b_reaped_count out: $(printf '%s' "$_t57b_out" | tail -c 800)"
+fi
+
+# (3) phase_iteration_cap_hit ABSENT — loop did not spin to the 10-iter cap.
+if printf '%s' "$_t57b_out" | grep -q "phase_iteration_cap_hit"; then
+    fail "#3494 T57b [alien phase] — phase_iteration_cap_hit absent (no loop spin)" \
+         "out tail: $(printf '%s' "$_t57b_out" | tail -c 800)"
+else
+    pass "#3494 T57b [alien phase] — phase_iteration_cap_hit absent (no loop spin)"
+fi
+
+# (4) psql.log contains UPDATE setting phase=phase_unknown (reaped_failure
+# uses "phase_unknown" as the terminal for unknown-phase events).
+# psql.log uses $'...' quoting so single quotes appear as \' in the log.
+if grep -q "SET phase = \\\\'phase_unknown\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3494 T57b [alien phase] — psql UPDATE for phase=phase_unknown landed"
+else
+    fail "#3494 T57b [alien phase] — psql UPDATE for phase=phase_unknown landed" \
+         "psql.log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

@@ -3825,6 +3825,15 @@ EOF
                 SET phase = '$_term_phase', status = 'failed'
               WHERE agent_id = '$AGENT_ID';"
     log "phase_advanced" "next_phase=$_term_phase" "status=failed"
+    # #3494 — exit unconditionally after marking the agent terminal in
+    # DB. This closes the dispatch loop: the while-loop re-reads the
+    # phase each iteration, and without this exit the loop would see the
+    # new phase_unknown / ralph_not_ship / *_transition_unrecognized
+    # value, find no matching case arm, fall to `*)`, and re-emit
+    # phase_unknown for up to MAX_PHASE_ITERATIONS (default 40) before
+    # the safety cap fires. With exit 0 the process terminates cleanly
+    # after the first call — exactly one reaped_failure log line.
+    exit 0
 }
 
 handle_ralph_not_ship_local() {
@@ -4364,12 +4373,12 @@ handle_awaiting_deploy() {
         _poll_count=$((_poll_count + 1))
         if [[ "$_poll_count" -gt "$_max_polls" ]]; then
             log "awaiting_deploy_max_polls_hit" "pr_number=$_pr_number" "poll_count=$_poll_count"
+            printf '{"timeout": true, "pr_number": %s, "max_polls": %s}' \
+                "$_pr_number" "$_poll_count"
             agent_runner_reaped_failure \
                 "awaiting_deploy_timeout" \
                 "deploy_max_polls" \
                 "pr=$_pr_number poll_count=$_poll_count last_state=$_last_state"
-            printf '{"timeout": true, "pr_number": %s, "max_polls": %s}' \
-                "$_pr_number" "$_poll_count"
             return 0
         fi
         if [[ -n "$_merge_sha" ]]; then
@@ -4416,12 +4425,12 @@ handle_awaiting_deploy() {
                 "merge_sha=$_merge_sha" \
                 "elapsed_s=$_elapsed" \
                 "last_state=$_last_state"
+            printf '{"timeout": true, "merge_sha": "%s", "elapsed_s": %s}' \
+                "$_merge_sha" "$_elapsed"
             agent_runner_reaped_failure \
                 "awaiting_deploy_timeout" \
                 "deploy_timeout" \
                 "pr=$_pr_number sha=$_merge_sha elapsed_s=$_elapsed"
-            printf '{"timeout": true, "merge_sha": "%s", "elapsed_s": %s}' \
-                "$_merge_sha" "$_elapsed"
             return 0
         fi
         sleep "$DEPLOY_POLL_INTERVAL"
