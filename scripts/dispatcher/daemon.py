@@ -1338,6 +1338,23 @@ FAILURE_CATEGORY_MERGE_CONFLICT_AT_PUSH = "merge_conflict_at_push"
 #: ``_reap_completed_agent_tasks`` for the routing site.
 FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
 
+#: #3656 — ECS-mode agent went silent inside the Fargate container
+#: (e.g. ``git push`` hung on auth/network, ``gh pr create`` blocked on
+#: a GitHub API outage, claude-p stalled mid-tool-loop). The container
+#: stays alive so the existing ``_reap_completed_agent_tasks`` STOPPED-
+#: lifecycle path never fires; pre-#3656 the daemon's per-phase stuck
+#: timer explicitly excluded ECS mode. The new daemon-side check (in
+#: :meth:`DispatcherDaemon._check_stuck_agents`) issues
+#: ``ecs:StopTask`` and routes the row through
+#: :meth:`_handle_agent_failure` under this category so the cap slot
+#: is freed promptly. Tier-2 first-occurrence: a hung agent is almost
+#: never self-healing and the diagnoser should look at the last known
+#: phase + last few log lines before deciding retry vs. escalate. The
+#: agent-runner Layer 1 timeouts (``push_and_pr_push_timeout`` etc.)
+#: are the cheap primary defense; this category is the systemic
+#: backstop for any internal hang the timeouts don't anticipate.
+FAILURE_CATEGORY_AGENT_SILENT_HANG = "agent_silent_hang"
+
 #: #3366 — terminal-phase → failure-category map for the bypass-prone
 #: terminals the ECS entrypoint emits with ``status='failed'`` AND
 #: container exit 0. The reaper observes these in the
@@ -1654,6 +1671,9 @@ TIER_2_FIRST_OCCURRENCE_CATEGORIES: frozenset[str] = frozenset(
         FAILURE_CATEGORY_FIX_CI_APPLY_FAILED,  # #3069
         FAILURE_CATEGORY_DEPLOY_FAILED,  # #3070
         FAILURE_CATEGORY_PHASE_OUTPUT_FETCH_FAILED,  # #3385
+        # #3656 — ECS-mode silent-hang reaper. Diagnoser inspects the
+        # last known phase + log tail to decide retry vs. escalate.
+        FAILURE_CATEGORY_AGENT_SILENT_HANG,
     }
 )
 
@@ -17179,32 +17199,40 @@ class DispatcherDaemon:
         :meth:`_stuck_timeout_for_phase` handles the lookup with live
         config overrides.
 
-        Each flagged agent gets a ``dispatcher.failures`` row with
-        ``category='stuck_timeout'``, is flipped to ``status='crashed'``,
-        and enqueues a retry marker so
-        :meth:`_process_retry_markers` can reset it with a fresh
+        **Subprocess-mode flagged agents** get a ``dispatcher.failures``
+        row with ``category='stuck_timeout'``, are flipped to
+        ``status='crashed'``, and enqueue a retry marker so
+        :meth:`_process_retry_markers` can reset them with a fresh
         worktree. After #2927 every running row is daemon-owned
         (label-only /task coordination), so no kind-filter is needed
         — the #2903 task-skill guard has been removed.
 
-        **Execution-mode filter (#3158).** The SELECT excludes
-        ``execution_mode = 'ecs'`` rows. The per-phase stuck timer was
-        designed for subprocess-mode agents, whose
-        ``phase_transitions.ts`` is written by the daemon itself — so a
-        stuck subprocess always surfaces as an older MAX(ts). ECS
-        agents run the phase loop inside an independent Fargate task
-        whose lifecycle belongs to ECS, not to the daemon: a truly-hung
-        ECS task is caught by :meth:`_reap_completed_agent_tasks` when
-        ECS transitions the task to STOPPED (container health check,
-        SIGKILL, OOM) and routed via :meth:`_handle_agent_failure` with
-        category ``agent_task_stopped_unexpectedly``. Applying the
-        per-phase timer to an ECS agent is a silent-agent-loss risk:
-        (a) it flips the row to ``crashed`` while the Fargate task
-        keeps running (zombie state), (b) it enqueues a retry marker
-        which :meth:`_resume_retrying_agent` would pick up and
-        silently fork to subprocess mode. NULL ``execution_mode``
-        (pre-#3091 migration 41 rows) defaults to subprocess via
-        ``COALESCE``.
+        **ECS-mode flagged agents (#3656).** Pre-#3656 the SELECT here
+        explicitly excluded ``execution_mode = 'ecs'`` (#3158), under
+        the assumption that a hung ECS task would surface as an ECS
+        STOPPED transition reaped by :meth:`_reap_completed_agent_tasks`
+        — but that requires the container to actually exit, which it
+        does not when the agent-runner's ``bash`` is alive while a
+        child ``git push`` blocks indefinitely on TCP retry. Observed
+        2026-04-27 on agent ``2ff6e282`` (#3608): 16+ minutes of
+        ``push_and_pr_push_begin`` silence followed by manual
+        ``aws ecs stop-task``. The cap slot was unusable for the full
+        duration. The fix removes the exclusion and adds a dedicated
+        ECS branch: when an ECS row exceeds its phase threshold, the
+        daemon issues ``ecs:StopTask(agent_task_arn)`` (best-effort,
+        delegated to :meth:`_force_stop_ecs_task`) and routes through
+        :meth:`_handle_agent_failure` with category
+        :data:`FAILURE_CATEGORY_AGENT_SILENT_HANG`. The diagnoser then
+        inspects the last known phase + log tail to choose retry
+        vs. file_prerequisite_task vs. escalate. No retry marker is
+        enqueued here — the diagnoser owns that decision.
+
+        NULL ``execution_mode`` (pre-#3091 migration 41 rows) defaults
+        to subprocess via ``COALESCE``. Agent-runner Layer 1 timeouts
+        (``push_and_pr_push_timeout`` etc.) are the cheap primary
+        defense and resolve in <5 min; this daemon-side reaper is the
+        15-minute systemic backstop for any internal hang the
+        timeouts don't anticipate.
 
         Returns the number of stuck agents flagged this tick (for
         logging). Exceptions are caught per-agent + logged; one bad
@@ -17212,41 +17240,56 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before stuck check"
 
-        # Candidate rows: every running subprocess-mode agent,
-        # regardless of elapsed time. The per-phase threshold
-        # comparison happens in Python so we can consult both the live
-        # config override and the module-level defaults without
-        # expressing them as SQL.
+        # Candidate rows: every running agent (subprocess or ECS) whose
+        # last phase_transition is older than its phase's threshold.
+        # The per-phase threshold comparison happens in Python so we
+        # can consult both the live config override and the module-
+        # level defaults without expressing them as SQL.
         #
-        # #3158: ``COALESCE(a.execution_mode, 'subprocess') <> 'ecs'``
-        # excludes ECS-mode agents — see method docstring for rationale.
+        # #3656: the SELECT no longer excludes ``execution_mode='ecs'``
+        # (the previous #3158 filter). The Python loop below branches
+        # on mode to deliver the right signal — SIGKILL/retry-marker
+        # for subprocess, ``ecs:StopTask`` + diagnoser for ECS.
         #
-        # Fields: agent_id, issue_number, phase, elapsed_seconds.
-        candidates: list[tuple[str, int | None, str | None, float]] = []
+        # Fields: agent_id, issue_number, phase, elapsed_seconds,
+        #         execution_mode, agent_task_arn.
+        candidates: list[
+            tuple[str, int | None, str | None, float, str, str | None]
+        ] = []
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
                     "SELECT a.agent_id, a.issue_number, a.phase, "
                     "       EXTRACT(EPOCH FROM ("
                     "           now() - COALESCE(pt.last_ts, a.started_at)"
-                    "       )) AS elapsed_seconds "
+                    "       )) AS elapsed_seconds, "
+                    "       COALESCE(a.execution_mode, 'subprocess') "
+                    "         AS execution_mode, "
+                    "       a.agent_task_arn "
                     "FROM dispatcher.agents a "
                     "LEFT JOIN LATERAL ("
                     "    SELECT MAX(ts) AS last_ts "
                     "    FROM dispatcher.phase_transitions "
                     "    WHERE agent_id = a.agent_id"
                     ") pt ON TRUE "
-                    "WHERE a.status = 'running' "
-                    "  AND COALESCE(a.execution_mode, 'subprocess') <> 'ecs'",
+                    "WHERE a.status = 'running'",
                 )
                 rows = cur.fetchall()
                 for row in rows:
+                    raw_mode = row[4] if len(row) > 4 else None
+                    mode = (
+                        str(raw_mode).lower() if raw_mode is not None else "subprocess"
+                    )
+                    raw_arn = row[5] if len(row) > 5 else None
+                    task_arn = str(raw_arn) if raw_arn is not None else None
                     candidates.append(
                         (
                             str(row[0]),
                             int(row[1]) if row[1] is not None else None,
                             str(row[2]) if row[2] is not None else None,
                             float(row[3]) if row[3] is not None else 0.0,
+                            mode,
+                            task_arn,
                         )
                     )
             self._conn.commit()
@@ -17270,11 +17313,58 @@ class DispatcherDaemon:
         overrides = self._read_stuck_timeout_overrides()
 
         flagged = 0
-        for agent_id, issue_number, phase, elapsed_seconds in candidates:
+        for (
+            agent_id,
+            issue_number,
+            phase,
+            elapsed_seconds,
+            execution_mode,
+            agent_task_arn,
+        ) in candidates:
             threshold = self._stuck_timeout_for_phase(phase, overrides=overrides)
             if elapsed_seconds < threshold:
                 continue
             try:
+                if execution_mode == "ecs":
+                    # #3656: ECS-mode silent-hang reaper. Issue
+                    # ``ecs:StopTask`` (best-effort — the
+                    # ``_handle_agent_failure`` row is the source of
+                    # truth even if the StopTask call itself fails),
+                    # then route through the unified failure path so
+                    # the diagnoser inspects last known phase + log
+                    # tail before deciding retry vs. escalate.
+                    self._force_stop_ecs_task(agent_id, agent_task_arn)
+                    self._log.warning(
+                        "daemon.agent_silent_hang_reaped",
+                        extra={
+                            "event": "agent_silent_hang_reaped",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "phase": phase,
+                            "stuck_seconds": int(elapsed_seconds),
+                            "threshold_seconds": threshold,
+                            "agent_task_arn": agent_task_arn,
+                        },
+                    )
+                    self._handle_agent_failure(
+                        agent_id=agent_id,
+                        phase=phase or "unknown",
+                        category=FAILURE_CATEGORY_AGENT_SILENT_HANG,
+                        stderr_tail="",
+                        exit_code=None,
+                        details={
+                            "stuck_seconds": int(elapsed_seconds),
+                            "threshold_seconds": threshold,
+                            "last_known_phase": phase,
+                            "execution_mode": execution_mode,
+                            "agent_task_arn": agent_task_arn,
+                        },
+                        issue_number=issue_number,
+                    )
+                    flagged += 1
+                    continue
+
                 failure_id = self._write_failure(
                     agent_id=agent_id,
                     category=FAILURE_CATEGORY_STUCK_TIMEOUT,
