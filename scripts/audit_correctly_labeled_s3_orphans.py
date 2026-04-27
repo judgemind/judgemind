@@ -75,6 +75,7 @@ COUNTY_PREFIXES: dict[str, str] = {
 
 # Classification result literals
 PRESENT_IN_DB = "present_in_db"
+PRESENT_IN_DB_VIA_CONTENT_HASH = "present_in_db_via_content_hash"
 MISLABELED = "mislabeled"
 CORRECTLY_LABELED_ORPHAN = "correctly_labeled_orphan"
 
@@ -131,6 +132,24 @@ def fetch_db_s3_keys(conn: object, county: str) -> set[str]:
     return {row[0] for row in rows if row[0]}
 
 
+def fetch_db_content_hashes(conn: object, county: str) -> set[str]:
+    """Return the set of content_hash values from derived.documents for *county*.
+
+    Queries: SELECT content_hash FROM derived.documents WHERE s3_key LIKE 'ca/<county>/%'
+
+    Filters by s3_key prefix (not content_hash) to avoid conflating cross-county
+    collisions. NULLs are excluded.
+    """
+    pattern = f"ca/{county}/%"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT content_hash FROM derived.documents WHERE s3_key LIKE %s",
+            (pattern,),
+        )
+        rows = cur.fetchall()
+    return {row[0] for row in rows if row[0]}
+
+
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
@@ -141,19 +160,23 @@ def classify(
     last_modified: datetime,
     s3: object,
     db_keys: set[str],
+    db_content_hashes: set[str],
     *,
     verify_bytes: bool = False,
 ) -> str:
-    """Classify one S3 object as present_in_db, mislabeled, or correctly_labeled_orphan.
+    """Classify one S3 object as present_in_db, present_in_db_via_content_hash, mislabeled, or correctly_labeled_orphan.
 
     Classification logic:
     1. If `key` is in db_keys → PRESENT_IN_DB (normal, healthy record).
-    2. If verify_bytes=True: HEAD the object, download its bytes, and SHA-256
+    2. Extract filename_hash from key. If filename_hash is in db_content_hashes →
+       PRESENT_IN_DB_VIA_CONTENT_HASH (dedup loser: the content exists in DB under
+       a different s3_key; the content-addressed naming contract guarantees the
+       filename hash equals the bytes hash, so set membership is sufficient).
+    3. If verify_bytes=False (bulk pass): an object absent from both sets is
+       classified CORRECTLY_LABELED_ORPHAN.
+    4. If verify_bytes=True: HEAD the object, download its bytes, and SHA-256
        them.  If the bytes hash does not match the filename hash → MISLABELED
        (migration artifact, handled by #2638).  If they match → CORRECTLY_LABELED_ORPHAN.
-    3. If verify_bytes=False (bulk pass): we trust the filename is correct per
-       the content-addressed naming contract.  An object absent from db_keys and
-       not verified as mislabeled is classified CORRECTLY_LABELED_ORPHAN.
 
     In practice the mislabeled class is bounded and already audited by #2638.
     The bulk pass (verify_bytes=False) is safe because any mislabeled object
@@ -166,17 +189,23 @@ def classify(
         last_modified: LastModified timestamp from list_objects_v2.
         s3: boto3 S3 client.
         db_keys: Set of s3_key values from derived.documents for this county.
+        db_content_hashes: Set of content_hash values from derived.documents for
+            this county. Used to detect dedup-loser keys whose content is already
+            present in the DB under a different s3_key.
         verify_bytes: If True, download the object and verify byte hash.
     """
     if key in db_keys:
         return PRESENT_IN_DB
 
+    # Extract the expected hash from the filename (content-addressed naming contract).
+    filename = key.rsplit("/", 1)[-1]
+    filename_hash = filename.split(".")[0]
+
+    if filename_hash in db_content_hashes:
+        return PRESENT_IN_DB_VIA_CONTENT_HASH
+
     if not verify_bytes:
         return CORRECTLY_LABELED_ORPHAN
-
-    # Extract the expected hash from the filename.
-    filename = key.rsplit("/", 1)[-1]
-    expected_hash = filename.split(".")[0]
 
     try:
         response = s3.get_object(Bucket=BUCKET, Key=key)
@@ -187,7 +216,7 @@ def classify(
         # Cannot verify; treat as correctly labeled to avoid false mislabels.
         return CORRECTLY_LABELED_ORPHAN
 
-    if actual_hash != expected_hash:
+    if actual_hash != filename_hash:
         return MISLABELED
 
     return CORRECTLY_LABELED_ORPHAN
@@ -244,12 +273,15 @@ def run_audit(
     for county, prefix in counties.items():
         logger.info("Scanning county=%s prefix=%s", county, prefix)
 
-        # Fetch DB keys for this county.
+        # Fetch DB keys and content hashes for this county.
         db_keys = fetch_db_s3_keys(conn, county)
         logger.info("  DB keys for %s: %d", county, len(db_keys))
+        db_content_hashes = fetch_db_content_hashes(conn, county)
+        logger.info("  DB content hashes for %s: %d", county, len(db_content_hashes))
 
         # Accumulate per-classification lists.
         in_db_count = 0
+        in_db_via_content_hash_count = 0
         orphan_keys: list[tuple[str, datetime, int]] = []
         mislabeled_count = 0
         orphans_by_month: dict[str, int] = defaultdict(int)
@@ -258,10 +290,12 @@ def run_audit(
             s3, prefix, limit=limit
         ):
             classification = classify(
-                key, last_modified, s3, db_keys, verify_bytes=False
+                key, last_modified, s3, db_keys, db_content_hashes, verify_bytes=False
             )
             if classification == PRESENT_IN_DB:
                 in_db_count += 1
+            elif classification == PRESENT_IN_DB_VIA_CONTENT_HASH:
+                in_db_via_content_hash_count += 1
             elif classification == MISLABELED:
                 mislabeled_count += 1
             else:
@@ -269,13 +303,16 @@ def run_audit(
                 orphans_by_month[_month_key(last_modified)] += 1
 
         orphan_count = len(orphan_keys)
-        total = in_db_count + orphan_count + mislabeled_count
+        total = (
+            in_db_count + in_db_via_content_hash_count + orphan_count + mislabeled_count
+        )
 
         logger.info(
-            "  %s: total=%d in_db=%d orphans=%d mislabeled=%d",
+            "  %s: total=%d in_db=%d in_db_via_content_hash=%d orphans=%d mislabeled=%d",
             county,
             total,
             in_db_count,
+            in_db_via_content_hash_count,
             orphan_count,
             mislabeled_count,
         )
@@ -285,7 +322,9 @@ def run_audit(
         sample_pool = random.sample(orphan_keys, sample_size) if sample_size > 0 else []
         sample_verified: list[dict] = []
         for s_key, s_lm, _s_size in sample_pool:
-            verified_cls = classify(s_key, s_lm, s3, db_keys, verify_bytes=True)
+            verified_cls = classify(
+                s_key, s_lm, s3, db_keys, db_content_hashes, verify_bytes=True
+            )
             sample_verified.append(
                 {
                     "key": s_key,
@@ -302,6 +341,7 @@ def run_audit(
         county_summary = {
             "total": total,
             "in_db": in_db_count,
+            "in_db_via_content_hash": in_db_via_content_hash_count,
             "orphans": orphan_count,
             "mislabeled": mislabeled_count,
             "orphans_by_month": dict(sorted(orphans_by_month.items())),
@@ -321,10 +361,13 @@ def _print_report(result: dict) -> None:
     print("=" * 60)
     for county, stats in result["counties"].items():
         print(f"\n{county.upper()}")
-        print(f"  Total flat-hash keys scanned: {stats['total']}")
-        print(f"  Present in DB:                {stats['in_db']}")
-        print(f"  Correctly-labeled orphans:    {stats['orphans']}")
-        print(f"  Mislabeled (migration bug):   {stats['mislabeled']}")
+        print(f"  Total flat-hash keys scanned:                  {stats['total']}")
+        print(f"  Present in DB:                                 {stats['in_db']}")
+        print(
+            f"  Present in DB (via content_hash dedup):        {stats['in_db_via_content_hash']}"
+        )
+        print(f"  Correctly-labeled orphans:                     {stats['orphans']}")
+        print(f"  Mislabeled (migration bug):                    {stats['mislabeled']}")
         if stats["orphans_by_month"]:
             print("  Orphans by month:")
             for month, cnt in sorted(stats["orphans_by_month"].items()):

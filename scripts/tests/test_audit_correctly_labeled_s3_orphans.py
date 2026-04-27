@@ -58,10 +58,12 @@ for _mod_name in list(_modules_to_mock.keys()):
 FLAT_HASH_RE = _script.FLAT_HASH_RE
 list_raw_flat_hash_keys = _script.list_raw_flat_hash_keys
 fetch_db_s3_keys = _script.fetch_db_s3_keys
+fetch_db_content_hashes = _script.fetch_db_content_hashes
 classify = _script.classify
 run_audit = _script.run_audit
 
 PRESENT_IN_DB = _script.PRESENT_IN_DB
+PRESENT_IN_DB_VIA_CONTENT_HASH = _script.PRESENT_IN_DB_VIA_CONTENT_HASH
 MISLABELED = _script.MISLABELED
 CORRECTLY_LABELED_ORPHAN = _script.CORRECTLY_LABELED_ORPHAN
 
@@ -228,17 +230,43 @@ class TestClassify:
         key = f"ca/santa_clara/superior_court/raw/{_VALID_HASH}.pdf"
         db_keys = {key}
         mock_s3 = MagicMock()
-        result = classify(key, _NOW, mock_s3, db_keys, verify_bytes=False)
+        result = classify(key, _NOW, mock_s3, db_keys, set(), verify_bytes=False)
         assert result == PRESENT_IN_DB
 
     def test_correctly_labeled_orphan_bulk_pass(self) -> None:
-        """classify returns CORRECTLY_LABELED_ORPHAN when key absent from db_keys (bulk)."""
+        """classify returns CORRECTLY_LABELED_ORPHAN when key absent from db_keys and db_content_hashes (bulk)."""
         key = f"ca/santa_clara/superior_court/raw/{_VALID_HASH}.pdf"
         db_keys: set[str] = set()
         mock_s3 = MagicMock()
-        result = classify(key, _NOW, mock_s3, db_keys, verify_bytes=False)
+        result = classify(key, _NOW, mock_s3, db_keys, set(), verify_bytes=False)
         assert result == CORRECTLY_LABELED_ORPHAN
         # Should not call S3 in bulk pass.
+        mock_s3.get_object.assert_not_called()
+
+    def test_present_in_db_via_content_hash_bulk_pass(self) -> None:
+        """classify returns PRESENT_IN_DB_VIA_CONTENT_HASH when filename hash is in db_content_hashes."""
+        key = f"ca/santa_clara/superior_court/raw/{_VALID_HASH}.pdf"
+        db_keys: set[str] = set()
+        db_content_hashes = {_VALID_HASH}
+        mock_s3 = MagicMock()
+        result = classify(
+            key, _NOW, mock_s3, db_keys, db_content_hashes, verify_bytes=False
+        )
+        assert result == PRESENT_IN_DB_VIA_CONTENT_HASH
+        # Should not call S3 — dedup is determined by set membership.
+        mock_s3.get_object.assert_not_called()
+
+    def test_present_in_db_via_content_hash_with_verify_bytes(self) -> None:
+        """classify returns PRESENT_IN_DB_VIA_CONTENT_HASH before byte-verify when hash matches."""
+        key = f"ca/santa_clara/superior_court/raw/{_VALID_HASH}.pdf"
+        db_keys: set[str] = set()
+        db_content_hashes = {_VALID_HASH}
+        mock_s3 = MagicMock()
+        result = classify(
+            key, _NOW, mock_s3, db_keys, db_content_hashes, verify_bytes=True
+        )
+        assert result == PRESENT_IN_DB_VIA_CONTENT_HASH
+        # Content-hash check is a short-circuit; S3 should not be called.
         mock_s3.get_object.assert_not_called()
 
     def test_correctly_labeled_orphan_with_byte_verify(self) -> None:
@@ -249,7 +277,7 @@ class TestClassify:
         db_keys: set[str] = set()
         mock_s3 = MagicMock()
         mock_s3.get_object.return_value = {"Body": BytesIO(content)}
-        result = classify(key, _NOW, mock_s3, db_keys, verify_bytes=True)
+        result = classify(key, _NOW, mock_s3, db_keys, set(), verify_bytes=True)
         assert result == CORRECTLY_LABELED_ORPHAN
         mock_s3.get_object.assert_called_once()
 
@@ -262,7 +290,7 @@ class TestClassify:
         db_keys: set[str] = set()
         mock_s3 = MagicMock()
         mock_s3.get_object.return_value = {"Body": BytesIO(content)}
-        result = classify(key, _NOW, mock_s3, db_keys, verify_bytes=True)
+        result = classify(key, _NOW, mock_s3, db_keys, set(), verify_bytes=True)
         assert result == MISLABELED
         # Confirm actual hash != wrong hash so we're testing the right thing.
         assert actual_hash != wrong_hash
@@ -273,7 +301,7 @@ class TestClassify:
         db_keys: set[str] = set()
         mock_s3 = MagicMock()
         mock_s3.get_object.side_effect = Exception("S3 error")
-        result = classify(key, _NOW, mock_s3, db_keys, verify_bytes=True)
+        result = classify(key, _NOW, mock_s3, db_keys, set(), verify_bytes=True)
         assert result == CORRECTLY_LABELED_ORPHAN
 
     def test_present_in_db_skips_byte_verify(self) -> None:
@@ -281,7 +309,7 @@ class TestClassify:
         key = f"ca/santa_clara/superior_court/raw/{_VALID_HASH}.pdf"
         db_keys = {key}
         mock_s3 = MagicMock()
-        result = classify(key, _NOW, mock_s3, db_keys, verify_bytes=True)
+        result = classify(key, _NOW, mock_s3, db_keys, set(), verify_bytes=True)
         assert result == PRESENT_IN_DB
         mock_s3.get_object.assert_not_called()
 
@@ -342,7 +370,80 @@ class TestFetchDbS3Keys:
 
 
 # ---------------------------------------------------------------------------
-# 5. run_audit — JSON output schema is stable
+# 5. fetch_db_content_hashes — correct LIKE query and return type
+# ---------------------------------------------------------------------------
+
+
+class TestFetchDbContentHashes:
+    def test_queries_with_correct_like_pattern(self) -> None:
+        """fetch_db_content_hashes issues LIKE 'ca/santa_clara/%' query on s3_key column."""
+        mock_conn = MagicMock()
+        cursor_mock = MagicMock()
+        cursor_mock.fetchall.return_value = [
+            (_VALID_HASH,),
+        ]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor_mock)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        hashes = fetch_db_content_hashes(mock_conn, "santa_clara")
+
+        assert isinstance(hashes, set)
+        assert _VALID_HASH in hashes
+
+        # Verify the query uses LIKE on s3_key with the right pattern.
+        call_args = cursor_mock.execute.call_args
+        query = call_args[0][0]
+        pattern = call_args[0][1][0]
+        assert "LIKE" in query
+        assert pattern == "ca/santa_clara/%"
+        assert "content_hash" in query
+        assert "s3_key" in query
+
+    def test_returns_empty_set_when_no_rows(self) -> None:
+        """fetch_db_content_hashes returns an empty set when DB has no matching rows."""
+        mock_conn = MagicMock()
+        cursor_mock = MagicMock()
+        cursor_mock.fetchall.return_value = []
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor_mock)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        hashes = fetch_db_content_hashes(mock_conn, "orange")
+        assert hashes == set()
+
+    def test_filters_none_content_hashes(self) -> None:
+        """fetch_db_content_hashes omits rows with NULL content_hash."""
+        mock_conn = MagicMock()
+        cursor_mock = MagicMock()
+        hash_val = "b" * 64
+        cursor_mock.fetchall.return_value = [
+            (hash_val,),
+            (None,),
+        ]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor_mock)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        hashes = fetch_db_content_hashes(mock_conn, "orange")
+        assert None not in hashes
+        assert len(hashes) == 1
+        assert hash_val in hashes
+
+    def test_orange_county_pattern(self) -> None:
+        """fetch_db_content_hashes uses 'ca/orange/%' pattern for orange county."""
+        mock_conn = MagicMock()
+        cursor_mock = MagicMock()
+        cursor_mock.fetchall.return_value = []
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor_mock)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        fetch_db_content_hashes(mock_conn, "orange")
+
+        call_args = cursor_mock.execute.call_args
+        pattern = call_args[0][1][0]
+        assert pattern == "ca/orange/%"
+
+
+# ---------------------------------------------------------------------------
+# 6. run_audit — JSON output schema is stable
 # ---------------------------------------------------------------------------
 
 
@@ -385,6 +486,7 @@ class TestRunAuditJsonSchema:
         county = result["counties"]["santa_clara"]
         assert "total" in county
         assert "in_db" in county
+        assert "in_db_via_content_hash" in county
         assert "orphans" in county
         assert "mislabeled" in county
         assert "orphans_by_month" in county
@@ -414,6 +516,58 @@ class TestRunAuditJsonSchema:
         assert county["orphans"] == 1
         assert county["in_db"] == 1
         assert county["total"] == 2
+
+    def test_in_db_via_content_hash_key_present_in_output(self) -> None:
+        """run_audit always includes in_db_via_content_hash key in county summary."""
+        key = f"ca/santa_clara/superior_court/raw/{_VALID_HASH}.pdf"
+        mock_s3 = self._make_s3_with_keys([key])
+        mock_conn = self._make_conn_with_db_keys([key])
+
+        result = run_audit(
+            mock_s3,
+            mock_conn,
+            {"santa_clara": "ca/santa_clara/"},
+            limit=None,
+            sample_head_objects=0,
+            output_json=True,
+        )
+
+        county = result["counties"]["santa_clara"]
+        assert "in_db_via_content_hash" in county
+        assert isinstance(county["in_db_via_content_hash"], int)
+
+    def test_dedup_loser_counted_as_in_db_via_content_hash(self) -> None:
+        """run_audit classifies a key as in_db_via_content_hash when its filename hash is in DB content hashes."""
+        dedup_loser_key = f"ca/orange/superior_court/raw/{_VALID_HASH}.pdf"
+
+        mock_s3 = self._make_s3_with_keys([dedup_loser_key])
+
+        # s3_keys query returns empty (key not present by s3_key)
+        # content_hashes query returns the hash (content present under different key)
+        mock_conn = MagicMock()
+        cursor_mock = MagicMock()
+        # First call → fetch_db_s3_keys → empty; second call → fetch_db_content_hashes → has the hash
+        cursor_mock.fetchall.side_effect = [[], [(_VALID_HASH,)]]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor_mock)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = run_audit(
+            mock_s3,
+            mock_conn,
+            {"orange": "ca/orange/"},
+            limit=None,
+            sample_head_objects=0,
+            output_json=True,
+        )
+
+        county = result["counties"]["orange"]
+        assert county["in_db_via_content_hash"] == 1
+        assert county["orphans"] == 0
+        assert county["in_db"] == 0
+        # total = in_db + in_db_via_content_hash + orphans + mislabeled
+        assert county["total"] == 1
+        # all_clean still True because there are no true orphans
+        assert result["all_clean"] is True
 
     def test_json_schema_sample_verified_fields(self) -> None:
         """sample_verified entries contain key, last_modified, and classification."""
