@@ -644,6 +644,101 @@ class TestPerChildExhaustionDoesNotConsumeMaxRetries:
 
 
 # ---------------------------------------------------------------------------
+# Non-exhaustion exceptions re-raise (covers the `raise` branches)
+# ---------------------------------------------------------------------------
+
+
+class TestNonExhaustionExceptionsReraise:
+    """Non-LlmEnrichmentExhaustedError exceptions must propagate out of split loops."""
+
+    def test_sd_calendar_reraises_non_exhaustion_exception(self) -> None:
+        """_try_sd_calendar_split re-raises ValueError (covers worker.py line 246)."""
+        fake_rulings = _make_fake_sd_rulings()[:1]
+
+        def raises_value_error(event_data: dict) -> None:
+            raise ValueError("non-exhaustion error")
+
+        with (
+            patch("courts.ca.sd_calendar.is_sd_calendar_html", return_value=True),
+            patch("courts.ca.sd_calendar._split_rulings", return_value=fake_rulings),
+        ):
+            event = _make_sd_event()
+            from ingestion.worker import _try_sd_calendar_split
+
+            with pytest.raises(ValueError, match="non-exhaustion error"):
+                _try_sd_calendar_split(
+                    event, event["document_id"], event["ruling_text"], raises_value_error
+                )
+
+    def test_la_html_reraises_non_exhaustion_exception(self) -> None:
+        """_try_la_html_split re-raises ValueError (covers worker.py line 355)."""
+        fake_rulings = _make_fake_la_rulings()[:1]
+
+        def raises_value_error(event_data: dict) -> None:
+            raise ValueError("non-exhaustion error")
+
+        with (
+            patch("courts.ca.la_tentatives.is_la_html", return_value=True),
+            patch("courts.ca.la_tentatives._split_rulings", return_value=fake_rulings),
+        ):
+            event = _make_la_event()
+            from ingestion.worker import _try_la_html_split
+
+            with pytest.raises(ValueError, match="non-exhaustion error"):
+                _try_la_html_split(
+                    event, event["document_id"], event["ruling_text"], raises_value_error
+                )
+
+    def test_fresno_pdf_reraises_non_exhaustion_exception(self) -> None:
+        """_try_fresno_pdf_split re-raises ValueError (covers worker.py line 468)."""
+        fake_rulings = _make_fake_fresno_rulings()  # must be >1 to pass the single-ruling guard
+
+        def raises_value_error(event_data: dict) -> None:
+            raise ValueError("non-exhaustion error")
+
+        with patch("courts.ca.fresno_tentatives._split_rulings", return_value=fake_rulings):
+            event = _make_fresno_event()
+            from ingestion.worker import _try_fresno_pdf_split
+
+            with pytest.raises(ValueError, match="non-exhaustion error"):
+                _try_fresno_pdf_split(
+                    event, event["document_id"], event["ruling_text"], raises_value_error
+                )
+
+    @patch("ingestion.worker.delete_stale_split_children", return_value=0)
+    @patch("ingestion.worker.batch_upsert_parties")
+    @patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+    @patch("ingestion.worker.psycopg")
+    def test_llm_split_reraises_non_exhaustion_exception(
+        self,
+        mock_psycopg: MagicMock,
+        mock_resolve_judge: MagicMock,
+        mock_batch_upsert: MagicMock,
+        mock_delete_stale: MagicMock,
+    ) -> None:
+        """_llm_split_document re-raises ValueError on split child (covers worker.py line 3073)."""
+        worker, _ = _make_worker()
+
+        fake_rulings = _make_fake_extracted_rulings()[:1]
+        mock_extractor = MagicMock()
+        mock_extractor.extract.return_value = fake_rulings
+        worker._get_framework_extractor = lambda: mock_extractor  # type: ignore[method-assign]
+
+        original_process_event = worker.process_event
+
+        def raises_value_error_on_split(event_data: dict) -> object:
+            if event_data.get("_split_processed"):
+                raise ValueError("non-exhaustion error on split child")
+            return original_process_event(event_data)
+
+        worker.process_event = raises_value_error_on_split  # type: ignore[method-assign]
+
+        event = _make_llm_event()
+        with pytest.raises(ValueError, match="non-exhaustion error on split child"):
+            worker.process_event(event)
+
+
+# ---------------------------------------------------------------------------
 # Helpers used by multiple test classes
 # ---------------------------------------------------------------------------
 
