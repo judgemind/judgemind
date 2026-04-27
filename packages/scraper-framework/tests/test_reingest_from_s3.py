@@ -11196,3 +11196,156 @@ class TestLlmExtractorExtractFromPdfBustCache:
         cache.get.assert_called_once()
         assert result
         assert result[0].extracted_case_number == "CACHED-PDF"
+
+
+# ---------------------------------------------------------------------------
+# Per-child LlmEnrichmentExhaustedError in multimodal reingest (#3600)
+# ---------------------------------------------------------------------------
+
+
+class TestMultimodalReingestPerChildExhaustion:
+    """Test that per-child LlmEnrichmentExhaustedError in _reparse_document_multimodal
+    does not abort remaining siblings (#3600).
+
+    Verifies that when enrichment is exhausted on the first child of a
+    3-ruling multimodal extraction, children 2 and 3 still land in results
+    with their regex-extracted fields intact.
+    """
+
+    def _make_doc_meta(self, doc_id: str = "test-doc-id-3600") -> dict:
+        return {
+            "document_id": doc_id,
+            "state": "CA",
+            "county": "Orange",
+            "court_name": "Orange County Superior Court",
+            "source_url": "https://court.example.com/ruling.pdf",
+            "captured_at": datetime(2026, 3, 1, 10, 0, 0),
+            "content_hash": "abc123hash",
+            "format": "pdf",
+            "case_number": None,
+            "case_title": None,
+            "hearing_date": date(2026, 3, 5),
+            "court_id": "court-id-1",
+            "scraper_id": "ca-oc-tentatives-civil",
+            "s3_key": "docs/test.pdf",
+            "s3_bucket": "test-bucket",
+        }
+
+    def test_first_child_exhaustion_does_not_abort_siblings(self) -> None:
+        """When first child's enrichment is exhausted, siblings 2 and 3 still land.
+
+        AC1 (reingest path): LlmEnrichmentExhaustedError on first child of a
+        3-ruling multimodal PDF → 3 result dicts are returned, children 2 and 3
+        have their enrichment fields populated, child 1 has unenriched defaults.
+        """
+        from framework.llm_enrichment import (
+            EnrichmentParties,
+            LlmEnrichmentExhaustedError,
+            LlmEnrichmentResult,
+        )
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor._client = None
+        mock_extractor._provider = None
+        mock_extractor._model = None
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number="30-2024-00001",
+                ruling_text="First ruling — GRANTED.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00002",
+                ruling_text="Second ruling — DENIED.",
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2024-00003",
+                ruling_text="Third ruling — CONTINUED.",
+            ),
+        ]
+
+        enrichment_success = LlmEnrichmentResult(
+            case_title="Sibling v. Survivor",
+            motion_type="msj",
+            outcome="denied",
+            parties=EnrichmentParties(plaintiffs=["Sibling"], defendants=["Survivor"]),
+        )
+
+        enrich_call_count = {"n": 0}
+
+        def enrich_side_effect(*args: object, **kwargs: object) -> LlmEnrichmentResult:
+            enrich_call_count["n"] += 1
+            if enrich_call_count["n"] == 1:
+                raise LlmEnrichmentExhaustedError("exhausted on first child")
+            return enrichment_success
+
+        mock_llm_client = MagicMock()
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(reingest, "enrich_ruling_with_retry", side_effect=enrich_side_effect),
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=mock_llm_client,
+                llm_provider="google",
+            )
+
+        # All 3 children must be in results (none dropped).
+        assert len(results) == 3, f"Expected 3 results, got {len(results)}"
+
+        # First child: enrichment was exhausted → unenriched fields remain as defaults.
+        first = results[0]
+        assert first["case_number"] == "30-2024-00001"
+        assert first["outcome"] is None  # multimodal extraction doesn't set this
+        assert first["motion_type"] is None  # same
+
+        # Children 2 and 3: enrichment succeeded → populated fields.
+        for child in results[1:]:
+            assert child["outcome"] == "denied"
+            assert child["motion_type"] == "msj"
+            assert child["case_title"] == "Sibling v. Survivor"
+
+    def test_all_child_exhaustion_returns_all_unenriched(self) -> None:
+        """When all children exhaust enrichment, all 3 unenriched results are returned."""
+        from framework.llm_enrichment import LlmEnrichmentExhaustedError
+        from framework.llm_schema import ExtractedRuling
+
+        doc_meta = self._make_doc_meta()
+        mock_extractor = MagicMock()
+        mock_extractor._client = None
+        mock_extractor._provider = None
+        mock_extractor._model = None
+        mock_extractor.extract_from_pdf.return_value = [
+            ExtractedRuling(
+                extracted_case_number=f"30-2024-0000{i}",
+                ruling_text=f"Ruling {i}.",
+            )
+            for i in range(3)
+        ]
+
+        mock_llm_client = MagicMock()
+
+        with (
+            patch.object(reingest, "_apply_regex_fallbacks"),
+            patch.object(
+                reingest,
+                "enrich_ruling_with_retry",
+                side_effect=LlmEnrichmentExhaustedError("exhausted"),
+            ),
+        ):
+            results = reingest._reparse_document_multimodal(
+                b"%PDF-1.4 fake pdf",
+                "ca-oc-tentatives-civil",
+                doc_meta,
+                mock_extractor,
+                llm_client=mock_llm_client,
+                llm_provider="google",
+            )
+
+        # All 3 children must land — no re-raise.
+        assert len(results) == 3
