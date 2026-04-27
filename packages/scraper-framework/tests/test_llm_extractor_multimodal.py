@@ -34,6 +34,7 @@ from framework.llm_extractor import (
     _is_new_case,
     _is_short_unsubstantive_ruling,
     _join_page_rows,
+    _parse_header_date,
     _parse_page_rows,
     _render_pdf_pages,
     _resolve_cross_references,
@@ -1043,6 +1044,22 @@ class TestJoinPageRows:
         # Neither ruling should have a hearing_date derived from the case caption.
         assert rulings[0].hearing_date is None
         assert rulings[1].hearing_date is None
+
+    def test_parse_header_date_invalid_month_name_returns_none(self) -> None:
+        """Month-name regex match with an out-of-range day returns None (#3559).
+
+        "February 30, 2026" matches the month-name regex but strptime raises
+        ValueError; the except branch must pass and return None.
+        """
+        assert _parse_header_date("February 30, 2026") is None
+
+    def test_parse_header_date_invalid_slash_returns_none(self) -> None:
+        """Slash-format regex match with an out-of-range month returns None (#3559).
+
+        "13/05/2026" matches the slash regex but strptime raises ValueError
+        (month 13 is invalid); the except branch must pass and return None.
+        """
+        assert _parse_header_date("13/05/2026") is None
 
 
 # ---------------------------------------------------------------------------
