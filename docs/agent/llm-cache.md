@@ -12,7 +12,7 @@ The cache stores **post-filter `ExtractedRuling[]` JSON** — not the raw model 
 llm-cache/{provider}-{model}/prompt-{prompt_hash}/{content_hash}.json
 ```
 
-- `{provider}-{model}` — e.g. `google-gemini-1.5-flash-8b` or `anthropic-claude-3-5-haiku-20241022`. Changes automatically when the configured model changes.
+- `{provider}-{model}` — e.g. `google-gemini-1.5-flash-8b` or `anthropic-claude-haiku-4-5-20251001`. Changes automatically when the configured model changes.
 - `prompt-{prompt_hash}` — SHA-256 of the system prompt text. Any edit to the prompt text produces a new hash, making old cache entries unreachable without `--bust-llm-cache`.
 - `{content_hash}` — SHA-256 of the raw document content (PDF bytes or text) **plus** any scraper-provided metadata (`judge_name`, `department`, `hearing_date`). Metadata is included because the LLM output may differ when metadata changes even for identical document content.
 
