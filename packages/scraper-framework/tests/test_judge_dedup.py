@@ -542,8 +542,8 @@ class TestResolveJudgeRosterIntegration:
         """When an alias already exists, roster is never consulted."""
         mock_conn, mock_cur = self._make_mock_conn()
 
-        # Step 1: alias found
-        mock_cur.fetchone.return_value = ("existing-judge-uuid",)
+        # Step 1: alias found — returns (judge_id, canonical_name) now (#3503)
+        mock_cur.fetchone.return_value = ("existing-judge-uuid", "John Smith")
 
         result = resolve_judge(mock_conn, "John Smith", "court-uuid-1")
 

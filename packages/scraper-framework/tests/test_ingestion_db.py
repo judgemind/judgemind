@@ -1072,7 +1072,8 @@ class TestResolveJudge:
     def test_returns_existing_alias(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchone.return_value = ("existing-judge-id",)
+        # Step 1 SELECT now returns (judge_id, canonical_name) (#3503)
+        cur.fetchone.return_value = ("existing-judge-id", "John Smith")
         result = resolve_judge(conn, "Hon. John Smith", "court-1")
         assert result == "existing-judge-id"
 
@@ -1108,7 +1109,8 @@ class TestResolveJudge:
     def test_strips_nul_from_raw_name(self) -> None:
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchone.return_value = ("existing-judge-id",)
+        # Step 1 SELECT now returns (judge_id, canonical_name) (#3503)
+        cur.fetchone.return_value = ("existing-judge-id", "John Smith")
         result = resolve_judge(conn, "John\x00 Smith", "court-1")
         assert result == "existing-judge-id"
         # Verify NUL was stripped from the name passed to SQL
@@ -1129,7 +1131,8 @@ class TestResolveJudge:
         """Verify alias lookup uses LOWER() for case-insensitive matching (#1453)."""
         conn = _mock_conn()
         cur = conn.cursor.return_value.__enter__.return_value
-        cur.fetchone.return_value = ("existing-judge-id",)
+        # Step 1 SELECT now returns (judge_id, canonical_name) (#3503)
+        cur.fetchone.return_value = ("existing-judge-id", "John Smith")
         resolve_judge(conn, "HON. JOHN SMITH", "court-1")
         sql = cur.execute.call_args_list[0][0][0]
         assert "LOWER" in sql

@@ -1401,8 +1401,8 @@ def test_resolve_judge_existing_alias() -> None:
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
-    # Simulate existing alias found
-    mock_cur.fetchone.return_value = ("existing-judge-uuid",)
+    # Simulate existing alias found — Step 1 SELECT now returns (judge_id, canonical_name) (#3503)
+    mock_cur.fetchone.return_value = ("existing-judge-uuid", "John A. Smith")
 
     result = resolve_judge(mock_conn, "Smith, John A.", "court-uuid-1")
 
@@ -2032,8 +2032,10 @@ def test_process_event_passes_county_max_output_tokens_to_llm(
 
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
-    # Return enough values for the full processing pipeline
-    mock_cur.fetchone.return_value = ("uuid-1",)
+    # Return enough values for the full processing pipeline.
+    # 2-tuple satisfies Step 1 resolve_judge (judge_id, canonical_name) (#3503);
+    # all other fetchone callers only unpack row[0] so the extra element is harmless.
+    mock_cur.fetchone.return_value = ("uuid-1", "uuid-1")
     mock_cur.fetchall.return_value = []
     mock_cur.rowcount = 1
 
@@ -2069,8 +2071,10 @@ def test_process_event_default_max_tokens_for_unconfigured_county(
 
     mock_conn, mock_cur = _make_mock_conn()
     mock_psycopg.connect.return_value = mock_conn
-    # Return enough values for the full processing pipeline
-    mock_cur.fetchone.return_value = ("uuid-1",)
+    # Return enough values for the full processing pipeline.
+    # 2-tuple satisfies Step 1 resolve_judge (judge_id, canonical_name) (#3503);
+    # all other fetchone callers only unpack row[0] so the extra element is harmless.
+    mock_cur.fetchone.return_value = ("uuid-1", "uuid-1")
     mock_cur.fetchall.return_value = []
     mock_cur.rowcount = 1
 
