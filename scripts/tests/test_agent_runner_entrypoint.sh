@@ -2276,6 +2276,150 @@ else
     fail "#3135 — unknown-phase fallback carries agent_id"
 fi
 
+# ── Test 21b: verify shim resilience — gh timeout/error (#3547) ────────────
+# Issue #3547 root cause: _fetch_merged_pr_info / _fetch_deploy_runs_for_sha /
+# _fetch_issue_bundle called _run() without try/except — a gh subprocess
+# TimeoutExpired propagated to main(), exiting non-zero, silently skipping
+# the input write, then claude hit the skill's input-missing guard.
+# Fix: wrap _run() in each gh helper with try/except. This test verifies
+# the shim still writes a well-formed input file even when every gh call
+# returns a non-zero exit code (simulating a timeout/network error).
+setup_fixtures
+
+t21b_repo="$TEST_TMP/t21b-repo"
+mkdir -p "$t21b_repo/.git"
+
+# Override the gh stub to fail every call — simulates a network outage
+# or GitHub rate-limit where gh exits non-zero on every invocation.
+cat > "$STUB_BIN/gh" <<'GHEOF_T21B'
+#!/usr/bin/env bash
+set -u
+INVOCATIONS_DIR="${INVOCATIONS_DIR}"
+. "$(dirname "$0")/_record_invocation.sh" gh "$@"
+# Simulate gh timeout/error: always exit 1 with an error message.
+printf 'simulated gh error\n' >&2
+exit 1
+GHEOF_T21B
+chmod +x "$STUB_BIN/gh"
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    DB_AGENT_PR_NUMBER="5047" \
+    python3 "$SHIM_PY" verify "3547aaaa-3547-3547-3547-3547aaaabbbb" 3547 "$t21b_repo" \
+    >/dev/null 2>&1
+t21b_rc=$?
+set -e
+
+# Restore the original gh stub for subsequent tests.
+setup_fixtures
+cat > "$STUB_BIN/gh" <<'GHEOF_RESTORE'
+#!/usr/bin/env bash
+set -u
+INVOCATIONS_DIR="${INVOCATIONS_DIR}"
+. "$(dirname "$0")/_record_invocation.sh" gh "$@"
+sub=""
+verb=""
+for arg in "$@"; do
+    case "$arg" in
+        --*|-*) continue ;;
+    esac
+    if [[ -z "$sub" ]]; then sub="$arg"; continue; fi
+    if [[ -z "$verb" ]]; then verb="$arg"; break; fi
+done
+case "$sub $verb" in
+    "pr create")
+        printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+        exit "${GH_PR_CREATE_EXIT:-0}"
+        ;;
+    "pr view")
+        if [[ -n "${GH_PR_FIXTURE:-}" && -f "$GH_PR_FIXTURE" ]]; then
+            cat "$GH_PR_FIXTURE"; exit 0
+        fi
+        if [[ -n "${GH_PR_VIEW_JSON_FIXTURE:-}" && -f "${GH_PR_VIEW_JSON_FIXTURE:-}" ]]; then
+            cat "$GH_PR_VIEW_JSON_FIXTURE"; exit 0
+        fi
+        printf '{"statusCheckRollup":[{"name":"ci-passed","status":"COMPLETED","conclusion":"SUCCESS"}],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"deadbeefcafe","mergeCommit":{"oid":"deadbeefcafe"}}\n'
+        exit 0
+        ;;
+    "pr diff")
+        if [[ -n "${GH_PR_DIFF_FIXTURE:-}" && -f "$GH_PR_DIFF_FIXTURE" ]]; then
+            cat "$GH_PR_DIFF_FIXTURE"; exit 0
+        fi
+        exit 1
+        ;;
+    "pr merge")
+        if [[ -n "${GH_PR_MERGE_STDERR:-}" ]]; then
+            printf '%s\n' "$GH_PR_MERGE_STDERR" >&2
+        fi
+        exit "${GH_PR_MERGE_EXIT:-0}"
+        ;;
+    "run list")
+        if [[ -n "${GH_RUN_LIST_FIXTURE:-}" && -f "${GH_RUN_LIST_FIXTURE:-}" ]]; then
+            cat "$GH_RUN_LIST_FIXTURE"; exit 0
+        fi
+        if [[ -n "${GH_RUN_LIST_JSON_FIXTURE:-}" && -f "${GH_RUN_LIST_JSON_FIXTURE:-}" ]]; then
+            cat "$GH_RUN_LIST_JSON_FIXTURE"; exit 0
+        fi
+        printf '[]\n'
+        exit 0
+        ;;
+    "run view")
+        exit "${GH_RUN_VIEW_EXIT:-0}"
+        ;;
+    "run watch")
+        exit 0
+        ;;
+    "issue view")
+        if [[ -n "${GH_ISSUE_FIXTURE:-}" && -f "$GH_ISSUE_FIXTURE" ]]; then
+            cat "$GH_ISSUE_FIXTURE"; exit 0
+        fi
+        exit 1
+        ;;
+    "issue comment"|"issue close"|"issue edit")
+        exit 0
+        ;;
+    "auth login"|"auth setup-git")
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+GHEOF_RESTORE
+chmod +x "$STUB_BIN/gh"
+
+t21b_input="$t21b_repo/tmp/dispatcher-input/verify.json"
+# Issue #3547: the shim must exit 0 and write the file even when every
+# gh call fails — the skill's own guard handles missing fields (e.g.
+# empty merged_commit_sha) rather than the entrypoint crashing.
+if [[ $t21b_rc -eq 0 && -f "$t21b_input" ]]; then
+    pass "#3547 — verify shim writes input even when gh returns errors"
+else
+    fail "#3547 — verify shim writes input even when gh returns errors" \
+         "rc=$t21b_rc, file_exists=$(test -f "$t21b_input" && echo yes || echo no)"
+fi
+
+# The base identifier fields must always be present regardless of gh success.
+if jq -e '.agent_id == "3547aaaa-3547-3547-3547-3547aaaabbbb"' \
+     "$t21b_input" >/dev/null 2>&1; then
+    pass "#3547 — verify shim carries agent_id in gh-error fallback"
+else
+    fail "#3547 — verify shim carries agent_id in gh-error fallback" \
+         "content: $(cat "$t21b_input" 2>/dev/null | head -c 200)"
+fi
+
+# worktree_path must equal REPO_ROOT (not a subprocess-lane path from the DB row).
+if jq -e --arg p "$t21b_repo" '.worktree_path == $p' \
+     "$t21b_input" >/dev/null 2>&1; then
+    pass "#3547 — verify shim sets worktree_path to REPO_ROOT in ECS lane"
+else
+    fail "#3547 — verify shim sets worktree_path to REPO_ROOT in ECS lane" \
+         "worktree_path: $(jq -r '.worktree_path' "$t21b_input" 2>/dev/null)"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════
 # Tests 22-26: Ralph HEAD-watcher (#3144)
 #
