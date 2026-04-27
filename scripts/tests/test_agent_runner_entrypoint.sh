@@ -7091,6 +7091,451 @@ else
          "output: $PUSHPR_TEST_OUT"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T65: #3651 — handle_ralph_baseline_rebase empty-rebase after abort.
+#
+# Direct sibling of #3614/PR #3645 (T64), which fixed the same bug class
+# for ``handle_push_and_pr``. Same fix shape, different code site:
+#
+# The bug: when the start-of-ralph baseline rebase fails AND the conflict-
+# files list is empty (the agent's commits were already in main — sibling
+# PR landed the same fix first, or the daemon is retrying an already-
+# fixed issue), pre-#3651 the entrypoint emitted the rebase_failed +
+# no_unmerged_files envelope, which transition_from_ralph routed to the
+# diagnoser as ``push_and_pr_no_unmerged_files`` — terminal-failing the
+# agent on what is actually a benign success. Cluster of stuck issues:
+# #2777, #2832, #2854, #3297, #3407, #3574, #3581 (circuit breaker
+# tripped 3rd time on 2026-04-27, see issue body).
+#
+# The fix: after the rebase --abort returns HEAD to ORIG_HEAD, re-check
+# ``git rev-list --count origin/main..HEAD``. If 0, emit the existing
+# ``{"no_op": true}`` envelope and a new log event
+# ``ralph_baseline_no_unmerged_files_already_applied``.
+# transition_from_ralph (#3651 Python-side fix) routes ``no_op=true`` to
+# PHASE_NO_OP terminal succeeded.
+#
+# Test A (the bug): _baseline_conflict_files_json="[]", git rev-list
+# returns 0 (post-abort ahead-count). Assert:
+#   * ``ralph_baseline_no_unmerged_files_already_applied`` log emitted.
+#   * Envelope is ``{"no_op": true, ...}``.
+#   * Envelope does NOT contain ``rebase_failed`` (the old path).
+# Test MUST fail against unfixed code (which always emitted the
+# rebase_failed/no_unmerged_files envelope on empty conflict files).
+#
+# Test B (real conflict regression): _baseline_conflict_files_json=
+# ["foo.py"]. Assert envelope is the rebase_failed/conflict_files shape
+# (route to fix_conflict). Don't regress real conflicts.
+#
+# Test C (post-abort still ahead — non-empty conflict files miss):
+# _baseline_conflict_files_json="[]", git rev-list returns 1. The
+# rebase actually failed for a non-already-applied reason (corrupt
+# state, fetch issue, etc.). Assert envelope is the OLD
+# rebase_failed/no_unmerged_files shape (route to diagnoser via the
+# existing #3465 path). Don't regress the non-already-applied case.
+#
+# Test D (dispatch path): drive the dispatch case statement with the
+# new ``{"no_op": true, ...}`` envelope, mocking transition_for to
+# return ``advance_with_status\tno_op\tsucceeded\t``. Assert
+# advance_phase is called with ("no_op", "succeeded") AND
+# agent_runner_reaped_failure is NOT called. Mirrors T63A's dispatch-
+# path test for the route_to_diagnoser case but exercises the new
+# advance_with_status branch.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Extract the #3651 envelope-construction block from the entrypoint via
+# awk. Boundary: from ``_ralph_baseline_output=""`` (a marker line added
+# in #3651) to the matching outer ``fi``. Walks ``if [[`` openings and
+# ``fi`` closings to get the nesting right. This matches T64's "extract
+# the actual production code path" approach, adapted for an inline block
+# (not a function — handle_ralph_baseline_rebase doesn't exist as a
+# function in the entrypoint, see issue body).
+t65_block="$TEST_TMP/t65-envelope-block.sh"
+awk '
+  /_ralph_baseline_output=""/ { in_block=1; depth=0 }
+  in_block {
+    print
+    if ($0 ~ /^[[:space:]]*if[[:space:]]+\[\[/) depth++
+    if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
+      depth--
+      if (depth == 0) exit
+    }
+  }
+' "$ENTRYPOINT" > "$t65_block"
+
+if grep -q "ralph_baseline_no_unmerged_files_already_applied" "$t65_block"; then
+    pass "#3651 T65 setup — extracted envelope block contains the new log event marker"
+else
+    fail "#3651 T65 setup — extracted envelope block contains the new log event marker" \
+         "block (head 800): $(head -c 800 "$t65_block")"
+fi
+
+if grep -qE 'rev-list[[:space:]]+--count[[:space:]]+origin/main\.\.HEAD' "$t65_block"; then
+    pass "#3651 T65 setup — extracted envelope block contains the post-abort rev-list check"
+else
+    fail "#3651 T65 setup — extracted envelope block contains the post-abort rev-list check" \
+         "block (head 800): $(head -c 800 "$t65_block")"
+fi
+
+# Per-test runner. Stubs ``git`` (only ``rev-list`` matters — the abort
+# already happened upstream of this block) and ``log`` (captured into a
+# state file). Parameters control:
+#   T65_CONFLICT_FILES_JSON  — value of ``_baseline_conflict_files_json``
+#                              ("[]" for empty, or a JSON array for real).
+#   T65_REV_LIST_AHEAD       — count returned by ``git rev-list``
+#                              (default 0 = collapsed to baseline).
+run_t65_envelope_test() {
+    _test_id="$1"
+    shift
+
+    _twork="$TEST_TMP/${_test_id}-work"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_twork" "$_trepo" "$_tstate" "$_tbin"
+
+    # git stub — only rev-list matters here. Logs every call.
+    cat > "$_tbin/git" <<'T65GITEOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in -C) shift 2 || true; continue ;; *) break ;; esac
+done
+
+case "${1:-}" in
+    rev-list) printf '%s\n' "${T65_REV_LIST_AHEAD:-0}"; exit 0 ;;
+    *) exit 0 ;;
+esac
+T65GITEOF
+    chmod +x "$_tbin/git"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_tbin/jq"
+    fi
+
+    # Drive the extracted envelope block with the test parameters.
+    set +e
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        PATH="$_tbin:$PATH" \
+        AGENT_WORKSPACE="$_twork" \
+        REPO_ROOT="$_trepo" \
+        AGENT_ID="t65-dead-beef-cafe-000000000099" \
+        ISSUE_NUMBER="3651" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            # The entrypoint defines log() which writes to fd 3; provide
+            # a test-shim that mirrors to stdout so assertions can
+            # grep the captured output.
+            log() { printf "%s\n" "LOG $*"; }
+            _baseline_conflict_files_json="${T65_CONFLICT_FILES_JSON:-[]}"
+            _baseline_rebase_stderr_tail='\''""'\''
+            # Now source the extracted envelope block. It assigns
+            # ``_ralph_baseline_output`` based on the inputs above.
+            # shellcheck disable=SC1090
+            . "'"$t65_block"'"
+            # Echo the resulting envelope so the test harness can
+            # inspect it.
+            printf "ENVELOPE %s\n" "$_ralph_baseline_output"
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    T65_TEST_RC="$_trc"
+    T65_TEST_OUT="$_tout"
+    T65_TEST_STATE="$_tstate"
+}
+
+# ── Sub-test A: empty conflict files + post-abort ahead=0 → no_op ─────────
+
+run_t65_envelope_test "t65a" T65_CONFLICT_FILES_JSON="[]" T65_REV_LIST_AHEAD=0
+
+if [[ "$T65_TEST_RC" -eq 0 ]]; then
+    pass "#3651 T65A — envelope block exits 0 on empty conflict files + ahead=0"
+else
+    fail "#3651 T65A — envelope block exits 0 on empty conflict files + ahead=0" \
+         "rc=$T65_TEST_RC, output: $T65_TEST_OUT"
+fi
+
+# CRITICAL — new log event must be emitted.
+if printf '%s' "$T65_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3651 T65A — ralph_baseline_no_unmerged_files_already_applied log event emitted"
+else
+    fail "#3651 T65A — ralph_baseline_no_unmerged_files_already_applied log event emitted" \
+         "output: $T65_TEST_OUT"
+fi
+
+# CRITICAL — envelope must be {"no_op": true, ...}.
+if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3651 T65A — envelope is {\"no_op\": true, ...} on already-applied path"
+else
+    fail "#3651 T65A — envelope is {\"no_op\": true, ...} on already-applied path" \
+         "output: $T65_TEST_OUT"
+fi
+
+# CRITICAL — envelope must NOT carry rebase_failed=true. The pre-#3651
+# code emitted ``{"rebase_failed": true, "no_unmerged_files": true, ...}``
+# which transition_from_ralph routed to the diagnoser as a terminal-
+# failure. The new path emits ``{"no_op": true, ...}`` which routes to
+# PHASE_NO_OP terminal succeeded. These envelopes are mutually exclusive.
+if ! printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
+    pass "#3651 T65A — envelope does NOT carry rebase_failed=true on already-applied path"
+else
+    fail "#3651 T65A — envelope does NOT carry rebase_failed=true on already-applied path" \
+         "output: $T65_TEST_OUT"
+fi
+
+# CRITICAL — git rev-list must have been invoked exactly once
+# (the new post-abort ahead-count check). Pre-#3651 the rev-list call
+# didn't exist on this code path at all; this assertion is the
+# behavioural fingerprint of the fix.
+if grep -cE "CALL .*\\brev-list\\b" "$T65_TEST_STATE/git-log.txt" 2>/dev/null | grep -q "^1$"; then
+    pass "#3651 T65A — git rev-list invoked exactly once (post-abort check)"
+else
+    _t65a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T65_TEST_STATE/git-log.txt" 2>/dev/null || printf '0')
+    fail "#3651 T65A — git rev-list invoked exactly once (post-abort check)" \
+         "found $_t65a_rev_list_calls call(s); git-log: $(cat "$T65_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# ── Sub-test B: non-empty conflict files → fix_conflict envelope (regression) ──
+
+run_t65_envelope_test "t65b" T65_CONFLICT_FILES_JSON='["packages/api/foo.py"]' T65_REV_LIST_AHEAD=1
+
+if [[ "$T65_TEST_RC" -eq 0 ]]; then
+    pass "#3651 T65B — envelope block exits 0 on real-conflict path"
+else
+    fail "#3651 T65B — envelope block exits 0 on real-conflict path" \
+         "rc=$T65_TEST_RC, output: $T65_TEST_OUT"
+fi
+
+# Real conflict envelope must carry conflict_files (route to fix_conflict).
+if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"conflict_files": \[.*"packages/api/foo\.py".*\]'; then
+    pass "#3651 T65B — real-conflict envelope carries conflict_files (routes to fix_conflict)"
+else
+    fail "#3651 T65B — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
+         "output: $T65_TEST_OUT"
+fi
+
+# Real conflict envelope must NOT be no_op.
+if ! printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3651 T65B — real-conflict envelope is NOT {\"no_op\": true}"
+else
+    fail "#3651 T65B — real-conflict envelope is NOT {\"no_op\": true}" \
+         "output: $T65_TEST_OUT"
+fi
+
+# Real conflict path must NOT emit the new already-applied log event.
+if ! printf '%s' "$T65_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3651 T65B — already-applied log NOT emitted on real-conflict path"
+else
+    fail "#3651 T65B — already-applied log NOT emitted on real-conflict path" \
+         "output: $T65_TEST_OUT"
+fi
+
+# Real conflict path must NOT call rev-list (the post-abort check is
+# only reached when conflict_files_json is empty).
+if ! grep -qE "CALL .*\\brev-list\\b" "$T65_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3651 T65B — git rev-list NOT invoked on real-conflict path"
+else
+    fail "#3651 T65B — git rev-list NOT invoked on real-conflict path" \
+         "git-log: $(cat "$T65_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# ── Sub-test C: empty conflict files but post-abort ahead=1 → diagnoser (regression) ──
+#
+# The rebase actually failed for a non-already-applied reason (corrupt
+# state, fetch issue, etc.) and the abort returned HEAD to ORIG_HEAD
+# which is still ahead of origin/main. Must preserve the existing
+# #3465 route_to_diagnoser path — only ahead=0 triggers the new no_op
+# terminal.
+
+run_t65_envelope_test "t65c" T65_CONFLICT_FILES_JSON="[]" T65_REV_LIST_AHEAD=1
+
+if [[ "$T65_TEST_RC" -eq 0 ]]; then
+    pass "#3651 T65C — envelope block exits 0 on empty-conflicts + still-ahead path"
+else
+    fail "#3651 T65C — envelope block exits 0 on empty-conflicts + still-ahead path" \
+         "rc=$T65_TEST_RC, output: $T65_TEST_OUT"
+fi
+
+# Still-ahead path must emit the OLD rebase_failed/no_unmerged_files
+# envelope (route_to_diagnoser via #3465).
+if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
+    pass "#3651 T65C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)"
+else
+    fail "#3651 T65C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)" \
+         "output: $T65_TEST_OUT"
+fi
+
+if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_unmerged_files": true'; then
+    pass "#3651 T65C — still-ahead envelope carries no_unmerged_files=true"
+else
+    fail "#3651 T65C — still-ahead envelope carries no_unmerged_files=true" \
+         "output: $T65_TEST_OUT"
+fi
+
+# Still-ahead path must NOT emit the new already-applied event.
+if ! printf '%s' "$T65_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3651 T65C — already-applied log NOT emitted on still-ahead path"
+else
+    fail "#3651 T65C — already-applied log NOT emitted on still-ahead path" \
+         "output: $T65_TEST_OUT"
+fi
+
+# Still-ahead path must NOT be a no_op envelope.
+if ! printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3651 T65C — still-ahead envelope is NOT {\"no_op\": true}"
+else
+    fail "#3651 T65C — still-ahead envelope is NOT {\"no_op\": true}" \
+         "output: $T65_TEST_OUT"
+fi
+
+# ── Sub-test D: dispatch with no_op envelope → advance_phase no_op succeeded ──
+#
+# The envelope-construction tests above (A/B/C) cover the entrypoint
+# side of the fix. This sub-test covers the dispatch case statement
+# (mirrors T63A's structure) for the new path: when transition_for
+# returns advance_with_status\tno_op\tsucceeded\t, the dispatch must
+# call advance_phase("no_op", "succeeded") and NOT call
+# agent_runner_reaped_failure.
+
+t65d_state_dir="$TEST_TMP/t65d-state"
+mkdir -p "$t65d_state_dir"
+
+_t65d_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'ralph' ]]; then
+        printf 'advance_with_status\tno_op\tsucceeded\t'
+    fi
+}
+"
+
+_t65d_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s status=%s\n' \"\${1:-}\" \"\${2:-}\" >> \"\${T65D_STATE_DIR}/advance-log.txt\"
+}
+"
+
+_t65d_reaped_failure_override="
+agent_runner_reaped_failure() {
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T65D_STATE_DIR}/reaped-log.txt\"
+}
+"
+
+# Reuse the t63 stub_bin (psql / git / gh stubs are sufficient for
+# advance_phase + log; we override transition_for / advance_phase /
+# agent_runner_reaped_failure inline).
+t65d_workspace="$TEST_TMP/t65d-workspace"
+t65d_repo_root="$TEST_TMP/t65d-repo"
+mkdir -p "$t65d_workspace" "$t65d_repo_root/tmp/dispatcher-input" "$t65d_repo_root/tmp/dispatcher-output"
+
+t65d_out=$(
+    set +eu
+    export T65D_STATE_DIR="$t65d_state_dir"
+    export AGENT_WORKSPACE="$t65d_workspace"
+    export REPO_ROOT="$t65d_repo_root"
+    export AGENT_ID="65656565-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="3651"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t63_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t65d_transition_for_override"
+    eval "$_t65d_advance_phase_override"
+    eval "$_t65d_reaped_failure_override"
+    # Drive the ralph_baseline rebase dispatch logic directly with the
+    # new no_op envelope (matches the entrypoint dispatch case statement).
+    _ralph_baseline_output='{"no_op": true, "rebase_dropped_all_commits": true, "post_abort_ahead": 0, "rebase_stderr_tail": "", "source_phase": "ralph"}'
+    persist_phase_output "ralph" "$_ralph_baseline_output"
+    _bt=$(transition_for "ralph" "$_ralph_baseline_output")
+    _ba=$(printf '%s' "$_bt" | cut -f1)
+    _bn=$(printf '%s' "$_bt" | cut -f2)
+    _bs=$(printf '%s' "$_bt" | cut -f3)
+    _bh=$(printf '%s' "$_bt" | cut -f4)
+    case "$_ba" in
+        advance)
+            advance_phase "$_bn"
+            ;;
+        advance_with_status)
+            advance_phase "$_bn" "$_bs"
+            ;;
+        route_to_diagnoser)
+            log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
+            case "$_bh" in
+                push_and_pr_no_unmerged_files)
+                    agent_runner_reaped_failure \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr_no_unmerged_files" \
+                        "ralph baseline rebase failed with no unmerged files (#3573)"
+                    ;;
+                *)
+                    log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
+                    agent_runner_reaped_failure \
+                        "diagnoser_route_unrecognized_hint" \
+                        "diagnoser_route_unrecognized_hint" \
+                        "ralph_baseline route_to_diagnoser received unrecognized hint=${_bh:-(empty)}"
+                    ;;
+            esac
+            ;;
+        *)
+            log "ralph_baseline_transition_unrecognized" "action=$_ba"
+            agent_runner_reaped_failure \
+                "ralph_baseline_transition_unrecognized" \
+                "ralph_baseline_transition_unrecognized" \
+                "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# T65D (1): subshell completed.
+if printf '%s' "$t65d_out" | grep -q "subshell_done"; then
+    pass "#3651 T65D [ralph_baseline no_op dispatch] — dispatch subshell ran to completion"
+else
+    fail "#3651 T65D [ralph_baseline no_op dispatch] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t65d_out" | tail -c 600)"
+fi
+
+# T65D (2): advance_phase called with ("no_op", "succeeded").
+if [[ -f "$t65d_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE no_op status=succeeded" "$t65d_state_dir/advance-log.txt"; then
+    pass "#3651 T65D [ralph_baseline no_op dispatch] — advance_phase called with (no_op, succeeded)"
+else
+    fail "#3651 T65D [ralph_baseline no_op dispatch] — advance_phase called with (no_op, succeeded)" \
+         "advance-log: $(cat "$t65d_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# T65D (3): agent_runner_reaped_failure NOT called (this is the key
+# behavioural distinction from the unfixed code, which terminal-failed
+# the agent as push_and_pr_no_unmerged_files).
+if [[ ! -f "$t65d_state_dir/reaped-log.txt" ]] || ! grep -q "REAPED_FAILURE" "$t65d_state_dir/reaped-log.txt"; then
+    pass "#3651 T65D [ralph_baseline no_op dispatch] — agent_runner_reaped_failure NOT called"
+else
+    fail "#3651 T65D [ralph_baseline no_op dispatch] — agent_runner_reaped_failure NOT called" \
+         "reaped-log: $(cat "$t65d_state_dir/reaped-log.txt" 2>/dev/null)"
+fi
+
+# T65D (4): ralph_baseline_route_to_diagnoser NOT emitted (the old
+# terminal-fail log line — this is the bug signature from the issue
+# trace, agent d511b0e8 at 20:59:33Z).
+if ! printf '%s' "$t65d_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
+    pass "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_route_to_diagnoser NOT emitted"
+else
+    fail "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_route_to_diagnoser NOT emitted" \
+         "out: $(printf '%s' "$t65d_out" | grep "ralph_baseline_route_to_diagnoser")"
+fi
+
+# T65D (5): ralph_baseline_transition_unrecognized NOT emitted (the
+# default-case fallthrough — must NOT fire on advance_with_status).
+if ! printf '%s' "$t65d_out" | grep -q "ralph_baseline_transition_unrecognized"; then
+    pass "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_transition_unrecognized NOT emitted"
+else
+    fail "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_transition_unrecognized NOT emitted" \
+         "out: $(printf '%s' "$t65d_out" | grep "ralph_baseline_transition_unrecognized")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

@@ -858,6 +858,86 @@ class TestTransitionFromRalphNoUnmergedFiles:
 
 
 # --------------------------------------------------------------------------
+# transition_from_ralph — no_op branch (#3651)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromRalphNoOp:
+    """#3651: start-of-ralph baseline rebase collapses to baseline because
+    the agent's commits were already in main (sibling PR landed the same
+    fix first, or the daemon is retrying an already-fixed issue). Direct
+    sibling of #3614/PR #3645 — same fix shape, different code site.
+
+    The entrypoint detects this via post-rebase
+    ``git rev-list --count origin/main..HEAD == 0`` and emits the existing
+    ``{"no_op": true}`` envelope. ``transition_from_ralph`` MUST recognise
+    that envelope and route to PHASE_NO_OP terminal succeeded — exactly
+    the right outcome for "fix is already in main." Without this branch,
+    the no_op envelope falls through to the verdict check and routes to
+    ``ralph_not_ship`` diagnoser, terminal-failing the agent on a benign
+    case (the cluster of stuck issues #2777, #2832, #2854, #3297, #3407,
+    #3574, #3581).
+    """
+
+    def test_no_op_marks_no_op_terminal_succeeded(self) -> None:
+        result = pt.transition_from_ralph({"no_op": True})
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_NO_OP
+        assert result.terminal_status == pt.AgentStatus.SUCCEEDED.value
+
+    def test_no_op_with_already_applied_context(self) -> None:
+        # Defensive: the entrypoint also sends a reason field. Transition
+        # must still route to PHASE_NO_OP regardless of extra context.
+        result = pt.transition_from_ralph(
+            {
+                "no_op": True,
+                "reason": "rebase_dropped_all_commits_already_in_baseline",
+                "source_phase": "ralph",
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_NO_OP
+        assert result.terminal_status == pt.AgentStatus.SUCCEEDED.value
+
+    def test_no_op_takes_precedence_over_no_unmerged_files(self) -> None:
+        # If both no_op and the older no_unmerged_files keys are present,
+        # no_op must win — the agent's commits are already in main, which
+        # is a benign success, not a failure to route to the diagnoser.
+        result = pt.transition_from_ralph(
+            {
+                "no_op": True,
+                "rebase_failed": True,
+                "no_unmerged_files": True,
+                "rebase_stderr_tail": "stale tail",
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_NO_OP
+        assert result.terminal_status == pt.AgentStatus.SUCCEEDED.value
+
+    def test_no_op_takes_precedence_over_rebase_failed(self) -> None:
+        # If both no_op and rebase_failed are present, no_op must win
+        # so we never advance to fix_conflict on what is actually a
+        # benign no-change case.
+        result = pt.transition_from_ralph(
+            {
+                "no_op": True,
+                "rebase_failed": True,
+                "conflict_files": ["x.py"],
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_NO_OP
+
+    def test_no_op_false_does_not_match(self) -> None:
+        # ``no_op=False`` (or absent) must NOT trigger the new branch.
+        # SHIP verdict still advances to summary as before.
+        result = pt.transition_from_ralph({"no_op": False, "verdict": "SHIP"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_SUMMARY
+
+
+# --------------------------------------------------------------------------
 # transition_from_merge
 # --------------------------------------------------------------------------
 

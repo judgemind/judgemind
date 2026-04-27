@@ -4792,17 +4792,60 @@ while true; do
                         log "ralph_baseline_rebase_conflict" \
                             "exit_code=$_baseline_rebase_rc" \
                             "conflict_files_json=$_baseline_conflict_files_json"
-                        # #3465: build the synthetic ralph-phase output with
-                        # the rebase_failed envelope. If the conflict-files
-                        # list is empty, emit the no_unmerged_files variant
-                        # so the transition shim routes to the diagnoser
-                        # instead of fix_conflict. Otherwise emit the
-                        # conflict_files shape so fix_conflict can consume
-                        # the bundle.
+                        # #3651: post-rebase empty-diff guard — direct
+                        # sibling of #3614/PR #3645's fix in
+                        # ``handle_push_and_pr``. When the start-of-ralph
+                        # baseline rebase fails AND the conflict-files
+                        # list is empty AND the post-abort ahead-count
+                        # collapses to 0, the agent's commits were
+                        # already in main (typically because a sibling
+                        # PR landed the same fix first, or the daemon
+                        # is retrying an already-fixed issue). Pre-#3651
+                        # this fell through to the no_unmerged_files
+                        # envelope, which transition_from_ralph routed
+                        # to the diagnoser as
+                        # ``push_and_pr_no_unmerged_files`` — terminal-
+                        # failing the agent on what is actually a benign
+                        # success (the cluster of stuck issues #2777,
+                        # #2832, #2854, #3297, #3407, #3574, #3581,
+                        # tripping the circuit breaker repeatedly).
+                        #
+                        # The fix: if the conflict-files list is empty
+                        # AND the rebase --abort returned HEAD to a
+                        # commit already in origin/main (ahead-count 0),
+                        # emit the existing ``{"no_op": true}`` envelope.
+                        # ``transition_from_ralph`` (#3651) routes that
+                        # to PHASE_NO_OP terminal succeeded — exactly
+                        # the right outcome for "fix is already in
+                        # main." The new log event
+                        # ``ralph_baseline_no_unmerged_files_already_applied``
+                        # distinguishes this advance event from the
+                        # pre-existing
+                        # ``ralph_baseline_route_to_diagnoser`` (which
+                        # still fires when the rebase actually failed
+                        # for a non-already-applied reason — same code
+                        # path as #3465). Mirrors PR #3645's
+                        # ``push_and_pr_no_unmerged_files_already_applied``.
+                        _ralph_baseline_output=""
                         if [[ "$_baseline_conflict_files_json" == "[]" ]]; then
-                            _ralph_baseline_output=$(printf '{"rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
-                                "$_baseline_rebase_stderr_tail")
+                            _post_abort_ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
+                            if [[ "$_post_abort_ahead" == "0" ]]; then
+                                log "ralph_baseline_no_unmerged_files_already_applied" \
+                                    "post_abort_ahead=$_post_abort_ahead" \
+                                    "reason=rebase_dropped_all_commits_already_in_baseline"
+                                _ralph_baseline_output=$(printf '{"no_op": true, "rebase_dropped_all_commits": true, "post_abort_ahead": 0, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
+                                    "$_baseline_rebase_stderr_tail")
+                            else
+                                # #3465 path: rebase actually failed for
+                                # a non-already-applied reason (corrupt
+                                # state, fetch issue, etc.) — route to
+                                # the diagnoser as before.
+                                _ralph_baseline_output=$(printf '{"rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
+                                    "$_baseline_rebase_stderr_tail")
+                            fi
                         else
+                            # #3225 path: real rebase conflict — route
+                            # to fix_conflict with the file bundle.
                             _ralph_baseline_output=$(printf '{"rebase_failed": true, "conflict_files": %s, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
                                 "$_baseline_conflict_files_json" "$_baseline_rebase_stderr_tail")
                         fi

@@ -699,7 +699,36 @@ def transition_from_ralph(output: Mapping[str, Any] | None) -> PhaseTransition:
     this function advances to ``fix_conflict``. The start-of-ralph
     path takes precedence over verdict parsing because no claude
     skill has run yet.
+
+    #3651 — direct sibling of #3614/PR #3645 (which fixed the same
+    bug class for ``handle_push_and_pr``). When the start-of-ralph
+    baseline rebase fails AND the post-rebase ahead-count collapses
+    to 0 (because the agent's commits were already in main —
+    typically because a sibling PR landed the same fix first, or
+    the daemon is retrying an already-fixed issue), the entrypoint
+    emits ``{"no_op": true}`` instead of the rebase_failed envelope.
+    This branch routes that to ``PHASE_NO_OP`` terminal succeeded —
+    exactly the right outcome for "fix is already in main." Without
+    this branch, the no_op envelope would fall through to the
+    verdict check and route to ``ralph_not_ship`` diagnoser,
+    terminal-failing the agent on a benign case (the cluster of
+    stuck issues #2777, #2832, #2854, #3297, #3407, #3574, #3581).
     """
+    # #3651: start-of-ralph baseline rebase collapsed to baseline (the
+    # agent's commits were already in main). MUST come before the
+    # rebase_failed / no_unmerged_files branches so the no_op envelope
+    # never gets misrouted to the diagnoser. Mirrors the precedence in
+    # transition_from_push_and_pr where no_op wins over rebase_failed.
+    if output and output.get("no_op"):
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE_WITH_STATUS,
+            next_phase=PHASE_NO_OP,
+            terminal_status=AgentStatus.SUCCEEDED.value,
+            reason=(
+                "ralph baseline rebase dropped all commits "
+                "(already in main) — no_op terminal (#3651)"
+            ),
+        )
     # #3465: start-of-ralph baseline rebase exited non-zero but produced
     # no unmerged files. MUST come before the generic rebase_failed branch
     # so the empty bundle never reaches fix_conflict.
