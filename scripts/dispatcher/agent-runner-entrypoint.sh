@@ -2545,6 +2545,52 @@ handle_push_and_pr() {
             # fix_conflict (which would immediately return unresolvable
             # on an empty bundle).
             if [[ "$_conflict_files_json" == "[]" ]]; then
+                # #3662: post-abort ahead-count check — direct sibling of
+                # #3651/PR #3657 (which fixed the same bug class for
+                # ``handle_ralph_baseline_rebase``) and #3614/PR #3645
+                # (which fixed the rebase-exit-0 empty-diff variant for
+                # this same handle_push_and_pr handler). When the rebase
+                # exits non-zero AND ``git diff --diff-filter=U`` is
+                # empty AND the post-abort ahead-count collapses to 0,
+                # the agent's commits are already in main (typically
+                # because a sibling PR landed the same fix first, or
+                # this is a post-fix_conflict re-rebase whose resolution
+                # turned out to be redundant with parallel main). Pre-
+                # #3662 this fell through to the no_unmerged_files
+                # envelope, which transition_from_push_and_pr routed to
+                # the diagnoser as ``push_and_pr_no_unmerged_files`` —
+                # terminal-failing the agent on a benign success and
+                # tripping the circuit breaker repeatedly across the
+                # cluster of stuck issues (#3581 hit it 6× by 2026-04-27).
+                #
+                # The fix: if the conflict-files list is empty AND the
+                # rebase --abort returned HEAD to a commit already in
+                # origin/main (ahead-count 0), emit the existing
+                # ``{"no_op": true}`` envelope.
+                # ``transition_from_push_and_pr`` (#3645) already routes
+                # ``no_op=true`` to PHASE_NO_OP terminal succeeded —
+                # exactly the right outcome for "fix is already in
+                # main." The new log event
+                # ``push_and_pr_no_unmerged_files_already_applied_post_rebase_failure``
+                # distinguishes this advance event from the pre-existing
+                # ``push_and_pr_no_unmerged_files_already_applied`` (the
+                # rebase-rc=0 empty-diff path from #3614, lines ~2453-
+                # 2462) and from the terminal failure event
+                # ``push_and_pr_no_unmerged_files`` (which still fires
+                # when the rebase actually failed for a non-already-
+                # applied reason — the existing #3465 path below).
+                _post_abort_ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
+                if [[ "$_post_abort_ahead" == "0" ]]; then
+                    log "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure" \
+                        "post_abort_ahead=$_post_abort_ahead" \
+                        "reason=rebase_dropped_all_commits_already_in_baseline_post_fix_conflict"
+                    printf '{"no_op": true, "rebase_dropped_all_commits": true, "post_abort_ahead": 0, "rebase_stderr_tail": %s}' \
+                        "$_rebase_stderr_tail"
+                    return 0
+                fi
+                # #3465 path: rebase actually failed for a non-already-
+                # applied reason (corrupt state, fetch issue, etc.) —
+                # route to the diagnoser as before.
                 printf '{"no_op": false, "rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": %s}' \
                     "$_rebase_stderr_tail"
             else
