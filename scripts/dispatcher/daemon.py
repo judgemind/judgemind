@@ -1383,6 +1383,10 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
     # #3507 — operational skill returned failed/unrecognized verdict.
     "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
+    # #3333 — push_and_pr detected incomplete summary output or WIP-prefixed
+    # title. Classified as phase_output_missing so the diagnoser can re-run
+    # the summary phase and retry.
+    "summary_output_incomplete": FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's

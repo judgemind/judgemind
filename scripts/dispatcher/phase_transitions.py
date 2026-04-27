@@ -504,6 +504,12 @@ FAILURE_HINT_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: ``FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES`` in daemon.py.
 FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
 
+#: #3333 — push_and_pr detected that the summary skill output was incomplete
+#: (missing pr_title or pr_body_md) or the pr_title was WIP-prefixed.
+#: Maps to ``FAILURE_CATEGORY_PHASE_OUTPUT_MISSING`` in daemon.py so the
+#: diagnoser sweep treats it as a retryable skill-output failure.
+FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE = "summary_output_incomplete"
+
 #: #3507 — The operational skill returned ``verdict=failed`` or an
 #: unrecognized verdict. Maps to ``FAILURE_CATEGORY_OPERATIONAL_FAILED``
 #: in daemon.py.
@@ -818,6 +824,26 @@ def transition_from_push_and_pr(
             next_phase=PHASE_NO_OP,
             terminal_status=AgentStatus.SUCCEEDED.value,
             reason="push_and_pr no-op SHIP (#3039)",
+        )
+    # #3333: summary skill output was incomplete or pr_title was WIP-prefixed.
+    # MUST come before rebase_failed branches — summary validation runs before
+    # the push, so rebase_failed and summary_output_incomplete should never
+    # co-occur, but if they somehow do, incomplete output wins (no orphan
+    # branch was created).
+    if output and output.get("summary_output_incomplete"):
+        return PhaseTransition(
+            action=TransitionAction.ROUTE_TO_DIAGNOSER,
+            failure_hint=FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE,
+            reason=(
+                "push_and_pr summary output incomplete or WIP-prefixed title — "
+                "routing to diagnoser (#3333)"
+            ),
+            context={
+                "title_is_wip": output.get("title_is_wip"),
+                "has_title": output.get("has_title"),
+                "has_body": output.get("has_body"),
+                "source_phase": "push_and_pr",
+            },
         )
     # #3465: rebase exited non-zero but produced no unmerged files.
     # MUST come before the generic rebase_failed branch so the empty
@@ -1435,6 +1461,7 @@ __all__ = [
     "FAILURE_HINT_PLAN_BLOCKED",
     "FAILURE_HINT_CONFLICT_UNRESOLVABLE",
     "FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES",
+    "FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE",
     "FAILURE_HINT_OPERATIONAL_FAILED",
     # Transition dataclass + enum
     "PhaseTransition",

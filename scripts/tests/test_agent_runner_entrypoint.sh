@@ -658,7 +658,18 @@ EOF
 PRIOR_PATCH_FIXTURE=""
 
 t2_workspace="$TEST_TMP/t2-workspace"
-mkdir -p "$t2_workspace"
+# #3333: WIP/empty validation in handle_push_and_pr requires a non-empty,
+# non-WIP summary.json. Pre-create it so the happy-path sequence reaches
+# push_and_pr → gh pr create. (The summary skill stub returns verdict=OK
+# but doesn't write to the file, so we seed it here.)
+mkdir -p "$t2_workspace/repo/tmp/dispatcher-output"
+cat > "$t2_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(test): happy-path pipeline test (#3090)\n\nCloses #3090",
+  "pr_title": "feat(test): happy-path pipeline test (#3090)",
+  "pr_body_md": "## Summary\nHappy-path test fixture.\n\nCloses #3090\n"
+}
+EOF
 
 set +e
 out=$(AGENT_ID="11111111-2222-3333-4444-555555555555" \
@@ -1117,7 +1128,16 @@ printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
 PRIOR_PATCH_FIXTURE=""
 
 t8_workspace="$TEST_TMP/t8-workspace"
-mkdir -p "$t8_workspace"
+# #3333: WIP/empty validation requires a valid summary.json so handle_push_and_pr
+# reaches git push + gh pr create.
+mkdir -p "$t8_workspace/repo/tmp/dispatcher-output"
+cat > "$t8_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(agent-runner): mechanical push_and_pr phase (#3117)\n\nCloses #3117",
+  "pr_title": "feat(agent-runner): mechanical push_and_pr phase (#3117)",
+  "pr_body_md": "## Summary\nMechanical push_and_pr test fixture.\n\nCloses #3117\n"
+}
+EOF
 
 set +e
 out=$(AGENT_ID="88888888-9999-aaaa-bbbb-cccccccccccc" \
@@ -3120,7 +3140,16 @@ printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
 PRIOR_PATCH_FIXTURE=""
 
 t35_workspace="$TEST_TMP/t35-workspace"
-mkdir -p "$t35_workspace"
+# #3333: WIP/empty validation runs before the rebase, so T35 needs a valid
+# summary.json (non-empty, non-WIP title + body) to reach the rebase path.
+mkdir -p "$t35_workspace/repo/tmp/dispatcher-output"
+cat > "$t35_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(agent-runner): rebase conflict test (#3176)",
+  "pr_title": "feat(agent-runner): rebase conflict test (#3176)",
+  "pr_body_md": "## Summary\nRebase conflict fixture.\n\nCloses #3176\n"
+}
+EOF
 
 # The git stub needs to return non-zero on rebase. The only way to
 # condition the stub is via env var — add GIT_REBASE_EXIT.
@@ -3155,6 +3184,242 @@ if grep -F "rebase" "$INVOCATIONS_DIR/git.log" | grep -F "abort" >/dev/null 2>&1
 else
     fail "#3176 T35 — rebase conflict triggers git rebase --abort" \
          "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# #3333 — handle_push_and_pr WIP-title rejection + --fill removal.
+#
+# AC-1: WIP-prefixed title → summary_output_incomplete envelope, no push.
+# AC-2: empty title or empty body → same envelope.
+# AC-3: no gh pr create --fill remains (grep guard).
+# AC-4(d): good title+body regression guard — T34 above already covers this.
+# ══════════════════════════════════════════════════════════════════════════
+
+# AC-3 guard: assert --fill is not present in handle_push_and_pr.
+if grep -F 'gh pr create' "$ENTRYPOINT" | grep -F -- '--fill' >/dev/null 2>&1; then
+    fail "#3333 AC-3 — no gh pr create --fill in handle_push_and_pr" \
+         "found: $(grep -F 'gh pr create' "$ENTRYPOINT" | grep -F -- '--fill')"
+else
+    pass "#3333 AC-3 — no gh pr create --fill in handle_push_and_pr"
+fi
+
+# ── Test T34a: WIP-prefixed pr_title → rejected, no push, summary_output_incomplete ─
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t34a.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t34a_workspace="$TEST_TMP/t34a-workspace"
+mkdir -p "$t34a_workspace/repo/tmp/dispatcher-output"
+cat > "$t34a_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "WIP: ralph output",
+  "pr_title": "WIP: ralph output",
+  "pr_body_md": "good body content describing the change"
+}
+EOF
+
+set +e
+t34a_out=$(run_post_pr_phase "push_and_pr" "$t34a_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t34a_out" | grep -q "push_and_pr_summary_output_incomplete"; then
+    pass "#3333 T34a — WIP title emits push_and_pr_summary_output_incomplete"
+else
+    fail "#3333 T34a — WIP title emits push_and_pr_summary_output_incomplete" \
+         "out tail: $(printf '%s' "$t34a_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t34a_out" | grep -q 'push_and_pr_summary_output_incomplete'; then
+    pass "#3333 T34a — WIP title: log has push_and_pr_summary_output_incomplete"
+else
+    fail "#3333 T34a — WIP title: log has push_and_pr_summary_output_incomplete" \
+         "out tail: $(printf '%s' "$t34a_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t34a_out" | grep -q '"title_is_wip": "true"'; then
+    pass "#3333 T34a — WIP title: log has title_is_wip: true"
+else
+    fail "#3333 T34a — WIP title: log has title_is_wip: true" \
+         "out tail: $(printf '%s' "$t34a_out" | tail -c 500)"
+fi
+
+# No push should have been attempted.
+if grep -F "push" "$INVOCATIONS_DIR/git.log" | grep -F "origin" | grep -v "fetch" | grep -v "rebase" >/dev/null 2>&1; then
+    fail "#3333 T34a — WIP title: no git push attempted" \
+         "git log: $(cat "$INVOCATIONS_DIR/git.log")"
+else
+    pass "#3333 T34a — WIP title: no git push attempted"
+fi
+
+# No gh pr create should have been invoked.
+if grep -F "pr" "$INVOCATIONS_DIR/gh.log" | grep -F "create" >/dev/null 2>&1; then
+    fail "#3333 T34a — WIP title: no gh pr create invoked" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
+else
+    pass "#3333 T34a — WIP title: no gh pr create invoked"
+fi
+
+# ── Test T34b: lower-case wip with leading whitespace → rejected ────────────
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t34b.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t34b_workspace="$TEST_TMP/t34b-workspace"
+mkdir -p "$t34b_workspace/repo/tmp/dispatcher-output"
+cat > "$t34b_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "  wip: x",
+  "pr_title": "  wip: x",
+  "pr_body_md": "good body content describing the change"
+}
+EOF
+
+set +e
+t34b_out=$(run_post_pr_phase "push_and_pr" "$t34b_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t34b_out" | grep -q "push_and_pr_summary_output_incomplete"; then
+    pass "#3333 T34b — leading-space wip title rejected"
+else
+    fail "#3333 T34b — leading-space wip title rejected" \
+         "out tail: $(printf '%s' "$t34b_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t34b_out" | grep -q '"title_is_wip": "true"'; then
+    pass "#3333 T34b — leading-space wip: title_is_wip: true"
+else
+    fail "#3333 T34b — leading-space wip: title_is_wip: true" \
+         "out tail: $(printf '%s' "$t34b_out" | tail -c 500)"
+fi
+
+# ── Test T34c: empty pr_title → rejected with has_title: false ─────────────
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t34c.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t34c_workspace="$TEST_TMP/t34c-workspace"
+mkdir -p "$t34c_workspace/repo/tmp/dispatcher-output"
+cat > "$t34c_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(agent-runner): real post-PR handlers",
+  "pr_title": "",
+  "pr_body_md": "good body content describing the change"
+}
+EOF
+
+set +e
+t34c_out=$(run_post_pr_phase "push_and_pr" "$t34c_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t34c_out" | grep -q "push_and_pr_summary_output_incomplete"; then
+    pass "#3333 T34c — empty title emits push_and_pr_summary_output_incomplete"
+else
+    fail "#3333 T34c — empty title emits push_and_pr_summary_output_incomplete" \
+         "out tail: $(printf '%s' "$t34c_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t34c_out" | grep -q '"has_title": "false"'; then
+    pass "#3333 T34c — empty title: has_title: false"
+else
+    fail "#3333 T34c — empty title: has_title: false" \
+         "out tail: $(printf '%s' "$t34c_out" | tail -c 500)"
+fi
+
+# ── Test T34d: empty pr_body_md → rejected with has_body: false ────────────
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t34d.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t34d_workspace="$TEST_TMP/t34d-workspace"
+mkdir -p "$t34d_workspace/repo/tmp/dispatcher-output"
+cat > "$t34d_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(agent-runner): real post-PR handlers",
+  "pr_title": "feat(agent-runner): real post-PR handlers",
+  "pr_body_md": ""
+}
+EOF
+
+set +e
+t34d_out=$(run_post_pr_phase "push_and_pr" "$t34d_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+if printf '%s' "$t34d_out" | grep -q "push_and_pr_summary_output_incomplete"; then
+    pass "#3333 T34d — empty body emits push_and_pr_summary_output_incomplete"
+else
+    fail "#3333 T34d — empty body emits push_and_pr_summary_output_incomplete" \
+         "out tail: $(printf '%s' "$t34d_out" | tail -c 500)"
+fi
+
+if printf '%s' "$t34d_out" | grep -q '"has_body": "false"'; then
+    pass "#3333 T34d — empty body: has_body: false"
+else
+    fail "#3333 T34d — empty body: has_body: false" \
+         "out tail: $(printf '%s' "$t34d_out" | tail -c 500)"
+fi
+
+# ── Test T34e: mid-string wipe NOT rejected (regression guard) ──────────────
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t34e.txt"
+printf 'push_and_pr\n' > "$PHASE_FIXTURE_FILE"
+
+t34e_workspace="$TEST_TMP/t34e-workspace"
+mkdir -p "$t34e_workspace/repo/tmp/dispatcher-output"
+cat > "$t34e_workspace/repo/tmp/dispatcher-output/summary.json" <<'EOF'
+{
+  "commit_message": "feat(agent-runner): wipe stale tokens (#3333)",
+  "pr_title": "feat(agent-runner): wipe stale tokens (#3333)",
+  "pr_body_md": "## Summary\nRemoves stale token cache.\n\nCloses #3333\n"
+}
+EOF
+
+set +e
+t34e_out=$(run_post_pr_phase "push_and_pr" "$t34e_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GIT_REV_LIST_COUNT=1" \
+    "CLAUDE_VERDICT_FIXTURE=")
+set -e
+
+# This title is NOT wip-prefixed — it should proceed to gh pr create.
+if printf '%s' "$t34e_out" | grep -q "push_and_pr_summary_output_incomplete"; then
+    fail "#3333 T34e — mid-string wipe NOT rejected (regression guard)" \
+         "out tail: $(printf '%s' "$t34e_out" | tail -c 500)"
+else
+    pass "#3333 T34e — mid-string wipe NOT rejected (regression guard)"
+fi
+
+if grep -F "pr" "$INVOCATIONS_DIR/gh.log" | grep -F "create" | grep -F -- "--title" >/dev/null 2>&1; then
+    pass "#3333 T34e — mid-string wipe: gh pr create --title invoked"
+else
+    fail "#3333 T34e — mid-string wipe: gh pr create --title invoked" \
+         "gh log: $(cat "$INVOCATIONS_DIR/gh.log")"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
