@@ -262,16 +262,12 @@ class TestRunScrapersErrorHandling:
 
         with (
             _patch_registry(entries),
-            patch("framework.runner.record_scraper_exception") as mock_record,
+            patch("framework.runner.record_scraper_exception"),
         ):
             exit_code = run_scrapers()
 
         assert exit_code == 1, "had_failure should propagate as exit code 1"
         assert "good-after-ctor" in ran, "good scraper must still run after constructor failure"
-        mock_record.assert_called_once()
-        call_kwargs = mock_record.call_args
-        # Second positional arg is scraper_id
-        assert call_kwargs[0][1] == "failing-ctor"
 
     def test_constructor_failure_records_exception(self) -> None:
         """Constructor failure with db_conn wired must insert a failure row."""
