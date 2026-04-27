@@ -49,6 +49,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
+from typing import Any
 
 import httpx
 import structlog
@@ -824,8 +825,9 @@ class LATentativeRulingsScraper(BaseScraper):
         event_bus: EventBus | None = None,
         dept_judge_map: dict[str, str] | None = None,
         court_directory: CourtDirectory | None = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(config, archiver=archiver, event_bus=event_bus)
+        super().__init__(config, archiver=archiver, event_bus=event_bus, **kwargs)
         self._dept_judge_map: dict[str, str] = dept_judge_map or {}
         self._court_directory = court_directory
         self._court_id: str = "ca_los_angeles"
@@ -1021,8 +1023,9 @@ class LAAppellateTentativeRulingsScraper(BaseScraper):
         config: ScraperConfig,
         archiver: S3Archiver | None = None,
         event_bus: EventBus | None = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(config, archiver=archiver, event_bus=event_bus)
+        super().__init__(config, archiver=archiver, event_bus=event_bus, **kwargs)
 
     def fetch_documents(self) -> list[CapturedDocument]:
         docs: list[CapturedDocument] = []

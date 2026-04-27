@@ -17,6 +17,8 @@ Integration issue: #903
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from framework import BaseScraper, CapturedDocument, ScraperConfig
@@ -58,8 +60,9 @@ class SDPipelineScraper(BaseScraper):
         headless: bool = True,
         archiver: S3Archiver | None = None,
         event_bus: EventBus | None = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(config, archiver=archiver, event_bus=event_bus)
+        super().__init__(config, archiver=archiver, event_bus=event_bus, **kwargs)
         self._day_numbers = day_numbers
         self._proxy_url = proxy_url
         self._headless = headless
