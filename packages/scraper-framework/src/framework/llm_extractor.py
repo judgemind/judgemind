@@ -2153,11 +2153,24 @@ class LlmExtractor:
 
         # Per-page extraction: one LLM call per page.
         all_rows: list[dict] = []
+        any_page_failed = False
         for page_idx, (img_bytes, media_type) in enumerate(page_images):
             page_rows = self._extract_single_page(
                 img_bytes, media_type, metadata=metadata, usage=usage, page_index=page_idx
             )
-            all_rows.extend(page_rows)
+            if page_rows:
+                all_rows.extend(page_rows)
+            else:
+                # A page returned no rows — either the page is genuinely empty
+                # or the LLM call failed after retries.  Track this so we skip
+                # the cache write below: caching a partial result would poison
+                # subsequent reads with an incomplete ruling set (#3517).
+                any_page_failed = True
+                logger.warning(
+                    "llm_extractor.page_partial_failure",
+                    page_index=page_idx,
+                    total_pages=len(page_images),
+                )
 
         self._log_usage(usage)
 
@@ -2168,8 +2181,13 @@ class LlmExtractor:
         # Join rows into cases and convert to ExtractedRuling objects.
         rulings = _join_page_rows(all_rows, metadata=metadata)
 
-        # Write to cache
-        if self._cache is not None and rulings:
+        # Write to cache ONLY if all pages succeeded.  If any page returned []
+        # (throttling, timeout, or API failure after retries), the result is
+        # partial and must NOT be cached — caching a partial result causes
+        # subsequent reads to serve the incomplete ruling set permanently,
+        # producing UNKNOWN-prefixed rulings for cases that do have a case
+        # number on the skipped page (#3517).
+        if self._cache is not None and rulings and not any_page_failed:
             self._cache.put(
                 PDF_PER_PAGE_PROMPT,
                 content_key,
