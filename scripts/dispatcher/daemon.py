@@ -4702,6 +4702,9 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before claim checks"
 
+        # exec-mode-agnostic (#3158): orphan-PR scan covers all failed agents
+        # regardless of how they were launched; execution_mode does not affect
+        # PR resurrection eligibility.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
