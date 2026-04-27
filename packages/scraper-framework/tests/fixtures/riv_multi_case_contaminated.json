@@ -38,6 +38,44 @@
       "note": "To Be Relieved as Counsel heading absorbed"
     }
   ],
+  "title_cost_itemization_concat": [
+    {
+      "input": "VELASQUEZ vs MONTENEGRO Court Reporter Fees Interpreter Fees Models, Enlargements and Photocopies of Exhibits",
+      "expected_title": "VELASQUEZ vs MONTENEGRO",
+      "case_number": "64cd3d72-placeholder",
+      "note": "LLM appended cost-itemization line items from Motion to Tax Costs after the party-name caption"
+    },
+    {
+      "input": "SMITH vs JONES Interpreter Fees",
+      "expected_title": "SMITH vs JONES",
+      "case_number": "CVRI2500001",
+      "note": "Interpreter Fees cost-item suffix leaked into title"
+    },
+    {
+      "input": "ACME COURT REPORTING SERVICES INC vs JONES",
+      "expected_title": "ACME COURT REPORTING SERVICES INC vs JONES",
+      "case_number": "CVRI2500002",
+      "note": "Negative: plaintiff name contains 'Court Reporting' — must NOT be stripped"
+    },
+    {
+      "input": "JONES vs FEES INC",
+      "expected_title": "JONES vs FEES INC",
+      "case_number": "CVRI2500003",
+      "note": "Negative: bare 'Fees' is part of a defendant company name — must NOT be stripped"
+    },
+    {
+      "input": "JONES vs ATTORNEY FEES LLC",
+      "expected_title": "JONES vs ATTORNEY FEES LLC",
+      "case_number": "CVRI2500004",
+      "note": "Negative: 'Attorney Fees' is part of a defendant company name — must NOT be stripped"
+    },
+    {
+      "input": "SMITH vs COSTS RECOVERY CORP",
+      "expected_title": "SMITH vs COSTS RECOVERY CORP",
+      "case_number": "CVRI2500005",
+      "note": "Negative: bare 'Costs' is part of a defendant company name — must NOT be stripped"
+    }
+  ],
   "cross_case_ruling_text": [
     {
       "own_case_number": "CVRI2500796",

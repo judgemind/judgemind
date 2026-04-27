@@ -25,6 +25,7 @@ import pytest
 
 from framework.llm_extractor import (
     _sanitize_riverside_rulings,
+    _sanitize_title_cost_itemization_tail,
     _sanitize_title_motion_tail,
     _truncate_cross_case_ruling_text,
 )
@@ -215,3 +216,149 @@ def test_riverside_prompt_contains_cross_case_guard() -> None:
     assert (
         "foreign" in prompt_lower or "next numbered" in prompt_lower or "next entry" in prompt_lower
     )
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_title_cost_itemization_tail — cost-itemization title guard (#3555)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param(
+            {
+                "input": (
+                    "VELASQUEZ vs MONTENEGRO "
+                    "Court Reporter Fees Interpreter Fees Models, Enlargements "
+                    "and Photocopies of Exhibits"
+                ),
+                "expected_title": "VELASQUEZ vs MONTENEGRO",
+            },
+            id="velasquez_full_cost_itemization",
+        ),
+        pytest.param(
+            {
+                "input": "SMITH vs JONES Interpreter Fees",
+                "expected_title": "SMITH vs JONES",
+            },
+            id="smith_interpreter_fees",
+        ),
+        pytest.param(
+            {
+                "input": "GARCIA vs HERNANDEZ Photocopies of Exhibits",
+                "expected_title": "GARCIA vs HERNANDEZ",
+            },
+            id="garcia_photocopies",
+        ),
+        # Negative cases — clean titles must be returned unchanged
+        pytest.param(
+            {
+                "input": "VELASQUEZ vs MONTENEGRO",
+                "expected_title": "VELASQUEZ vs MONTENEGRO",
+            },
+            id="clean_caption_unchanged",
+        ),
+        pytest.param(
+            {
+                "input": "ACME COURT REPORTING SERVICES INC vs JONES",
+                "expected_title": "ACME COURT REPORTING SERVICES INC vs JONES",
+            },
+            id="court_reporting_in_plaintiff_name_preserved",
+        ),
+        pytest.param(
+            {
+                "input": "SMITH vs COUNTY COURT REPORTING SERVICES INC",
+                "expected_title": "SMITH vs COUNTY COURT REPORTING SERVICES INC",
+            },
+            id="court_reporting_in_defendant_name_preserved",
+        ),
+        pytest.param(
+            {
+                "input": "JONES vs FEES INC",
+                "expected_title": "JONES vs FEES INC",
+            },
+            id="fees_in_defendant_company_name_preserved",
+        ),
+        pytest.param(
+            {
+                "input": "JONES vs ATTORNEY FEES LLC",
+                "expected_title": "JONES vs ATTORNEY FEES LLC",
+            },
+            id="attorney_fees_in_defendant_name_preserved",
+        ),
+        pytest.param(
+            {
+                "input": "SMITH vs COSTS RECOVERY CORP",
+                "expected_title": "SMITH vs COSTS RECOVERY CORP",
+            },
+            id="costs_in_defendant_name_preserved",
+        ),
+    ],
+)
+def test_sanitize_title_strips_cost_itemization_tail(entry: dict) -> None:
+    """Cost-itemization tails are stripped; legitimate party names are preserved."""
+    result = _sanitize_title_cost_itemization_tail(entry["input"])
+    assert result == entry["expected_title"]
+
+
+# ---------------------------------------------------------------------------
+# RIVERSIDE_SYSTEM_PROMPT — new prompt guard tests (#3555)
+# ---------------------------------------------------------------------------
+
+
+def test_riverside_prompt_contains_motion_type_outcome_boundary_guard() -> None:
+    """RIVERSIDE_SYSTEM_PROMPT must contain per-entry motion_type/outcome boundary rule (5b)."""
+    # Rule 5b must instruct the LLM never to carry forward motion_type / outcome
+    # from a previous entry.
+    assert "motion_type" in RIVERSIDE_SYSTEM_PROMPT
+    assert "outcome" in RIVERSIDE_SYSTEM_PROMPT
+    prompt_lower = RIVERSIDE_SYSTEM_PROMPT.lower()
+    assert (
+        "never carry forward" in prompt_lower
+        or "carry forward" in prompt_lower
+        or "only from that entry" in prompt_lower
+        or "derived only from" in prompt_lower
+    )
+
+
+def test_riverside_prompt_contains_cost_itemization_stop_tokens() -> None:
+    """RIVERSIDE_SYSTEM_PROMPT must reference cost-itemization stop tokens in rule 4a."""
+    assert "Court Reporter" in RIVERSIDE_SYSTEM_PROMPT
+    assert "Interpreter Fees" in RIVERSIDE_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_title_cost_itemization_tail — edge case: no adversarial separator
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_title_cost_itemization_tail_no_separator_returns_unchanged() -> None:
+    """A title with no v./vs. separator is returned unchanged even if it has cost words."""
+    # This exercises the early-return guard (line 939) — no adversarial
+    # separator means the function must not strip anything.
+    title = "Costs"
+    result = _sanitize_title_cost_itemization_tail(title)
+    assert result == title
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_riverside_rulings — cost-itemization tail path via orchestrator
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_riverside_rulings_strips_cost_itemization_tail() -> None:
+    """_sanitize_riverside_rulings strips cost-itemization tail and logs the change (#3555)."""
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500001",
+        extracted_case_title=(
+            "VELASQUEZ vs MONTENEGRO "
+            "Court Reporter Fees Interpreter Fees Models, Enlargements "
+            "and Photocopies of Exhibits"
+        ),
+        ruling_text="Tentative Ruling: GRANT motion to tax costs.",
+    )
+    result = _sanitize_riverside_rulings([ruling], case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    assert result[0].extracted_case_title == "VELASQUEZ vs MONTENEGRO"
+    # ruling_text should be unchanged (no cross-case contamination)
+    assert result[0].ruling_text == "Tentative Ruling: GRANT motion to tax costs."
