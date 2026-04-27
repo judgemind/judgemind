@@ -1879,17 +1879,25 @@ def _reparse_document_multimodal(
 def _supersede_document(
     conn: psycopg.Connection,
     document_id: str,
+    change_type: str = "split_supersede",
 ) -> None:
     """Mark a document as superseded (replaced by split children).
 
-    Sets ``documents.status = 'superseded'`` so the original unsplit
-    document is excluded from future queries and reingest runs.
-    The row is preserved for audit trail purposes.
+    Sets ``documents.status = 'superseded'`` and ``change_type`` so the
+    original unsplit document is excluded from future queries and reingest
+    runs.  The row is preserved for audit trail purposes.
 
     Also deletes any ruling rows that reference the original document,
     since the split children create their own ruling rows with correct
     per-ruling text.  Without this, the old single-ruling row (with
     corrupted or merged text) would persist alongside the new split rows.
+
+    Parameters
+    ----------
+    change_type:
+        Reason code written to ``documents.change_type``.  Defaults to
+        ``'split_supersede'`` (the live split path).  Pass a different
+        value when calling from a backfill or test context.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -1898,8 +1906,9 @@ def _supersede_document(
         )
         deleted = cur.rowcount
         cur.execute(
-            "UPDATE documents SET status = 'superseded' WHERE id = %s::uuid",
-            (document_id,),
+            "UPDATE documents SET status = 'superseded', change_type = %s"
+            " WHERE id = %s::uuid",
+            (change_type, document_id),
         )
     logger.debug(
         "Superseded document %s (deleted %d old ruling(s))",
