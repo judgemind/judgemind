@@ -233,3 +233,56 @@ describe('ActiveAgentsTable — #3206 view-transition gate while dialog open', (
     );
   });
 });
+
+describe('ActiveAgentsTable — two-line row layout (#3583)', () => {
+  it('renders agent-details line wrapper containing the phase chip and agent ID', () => {
+    const agent = makeAgent();
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const agentLine = screen.getByTestId(`active-agent-line-agent-${agent.id}`);
+    expect(agentLine).toBeInTheDocument();
+    // Phase chip is inside the agent-details line.
+    const phaseChip = screen.getByTestId(`active-agent-phase-${agent.id}`);
+    expect(agentLine.contains(phaseChip)).toBe(true);
+    // Short agent ID text is inside the agent-details line.
+    expect(agentLine.textContent).toContain('aabbccdd');
+  });
+
+  it('renders issue-details line wrapper containing the title element', () => {
+    const agent = makeAgent();
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const issueLine = screen.getByTestId(`active-agent-line-issue-${agent.id}`);
+    expect(issueLine).toBeInTheDocument();
+    // Title is inside the issue-details line.
+    const title = screen.getByTestId('active-agent-title');
+    expect(issueLine.contains(title)).toBe(true);
+  });
+
+  it('renders the title element with break-words class (not truncate)', () => {
+    const agent = makeAgent();
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const title = screen.getByTestId('active-agent-title');
+    expect(title.className).toContain('break-words');
+    expect(title.className).not.toContain('truncate');
+  });
+
+  it('renders agent-details and issue-details line wrappers as siblings inside inner wrapper', () => {
+    const agent = makeAgent();
+    render(
+      <ActiveAgentsTable agents={[agent]} onAgentAction={vi.fn()} />,
+    );
+    const inner = screen.getByTestId(`active-agent-inner-${agent.id}`);
+    const agentLine = screen.getByTestId(`active-agent-line-agent-${agent.id}`);
+    const issueLine = screen.getByTestId(`active-agent-line-issue-${agent.id}`);
+    // Both line wrappers are direct children of the inner wrapper.
+    expect(inner.contains(agentLine)).toBe(true);
+    expect(inner.contains(issueLine)).toBe(true);
+    // They are siblings — same parent.
+    expect(agentLine.parentElement).toBe(issueLine.parentElement);
+  });
+});
