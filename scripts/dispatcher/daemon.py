@@ -4556,6 +4556,24 @@ class DispatcherDaemon:
                     },
                 )
                 continue
+            # Orphan-PR recovery guard (#3508): if the most recent failed
+            # agent for this issue has an open MERGEABLE+green PR, defer
+            # to the resurrection sweep rather than spawning a fresh agent.
+            # Checked AFTER cooldown (cheap DB-only check) and BEFORE the
+            # trust check (which shells out to check-issue-author.sh) to
+            # avoid wasted subprocess forks. Returns False on any transient
+            # error so the claim path is never permanently blocked by a
+            # gh/DB hiccup.
+            if self._orphan_pr_recovery_pending(issue_number):
+                self._log.info(
+                    "daemon.claim_deferred_orphan_pr",
+                    extra={
+                        "event": "claim_deferred_orphan_pr",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                    },
+                )
+                continue
             if not self._issue_author_trusted(issue_number):
                 self._log.info(
                     "daemon.candidate_skipped",
@@ -4650,6 +4668,102 @@ class DispatcherDaemon:
             # we don't double-claim on a DB hiccup.
             return True
         return bool(row[0]) if row else False
+
+    def _orphan_pr_recovery_pending(self, issue_number: int) -> bool:
+        """True if the most recent failed agent for *issue_number* has an
+        open, MERGEABLE, green PR that the resurrection sweep should handle.
+
+        The claim path calls this AFTER ``_issue_in_cooldown`` (cheap
+        DB-only gate) and BEFORE ``_issue_author_trusted`` (shells out to
+        ``check-issue-author.sh``) so the trust check is skipped when
+        resurrection is pending.  Returning True causes ``_pick_candidate_issue``
+        to defer the claim to the orphan-PR resurrection sweep; returning
+        False (including on any error) lets the claim proceed normally.
+
+        Logic mirrors :meth:`_resurrect_orphan_pr_agents` so the two code
+        paths use the same lookback, budget cap, and classifier:
+
+        1. SELECT the most-recent ``status='failed' AND pr_number IS NOT NULL
+           AND ended_at IS NOT NULL AND ended_at > now() - ORPHAN_PR_RESURRECTION_LOOKBACK``
+           row for *issue_number*.
+        2. If no row → False (nothing to resurrect).
+        3. Count past resurrections via :meth:`_count_orphan_pr_resurrections`.
+           If ``>= ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS`` → False (budget
+           exhausted; resurrection sweep won't pick it up either, so let
+           the claim proceed).
+        4. Fetch PR status via :meth:`_fetch_pr_status`. If None → False
+           (don't block claim on transient ``gh`` failure).
+        5. Run :func:`phase_transitions.transition_from_awaiting_ci` and
+           map reason to rollup state.  Return True iff ``green``.
+
+        Any DB error returns False and logs
+        ``claim_deferred_orphan_pr_check_failed`` at ``info`` level (NOT
+        exception) — a transient error must never permanently defer a claim.
+        """
+        assert self._conn is not None, "connect() must run before claim checks"
+
+        # exec-mode-agnostic (#3158): orphan-PR scan covers all failed agents
+        # regardless of how they were launched; execution_mode does not affect
+        # PR resurrection eligibility.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, pr_number "
+                    "FROM dispatcher.agents "
+                    "WHERE issue_number = %s "
+                    "  AND status = 'failed' "
+                    "  AND pr_number IS NOT NULL "
+                    "  AND ended_at IS NOT NULL "
+                    "  AND ended_at > now() - %s "
+                    "ORDER BY ended_at DESC "
+                    "LIMIT 1",
+                    (issue_number, ORPHAN_PR_RESURRECTION_LOOKBACK),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._log.info(
+                "daemon.claim_deferred_orphan_pr_check_failed",
+                extra={
+                    "event": "claim_deferred_orphan_pr_check_failed",
+                    "run_id": self._run_id,
+                    "issue_number": issue_number,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return False
+
+        if row is None:
+            # No recent failed agent with a PR — nothing to defer to.
+            return False
+
+        agent_id = str(row[0])
+        pr_number = int(row[1])
+
+        # Budget check — if the sweep already hit the cap, let the claim
+        # proceed (resurrection won't pick it up).
+        past_attempts = self._count_orphan_pr_resurrections(agent_id)
+        if past_attempts is None or past_attempts >= ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS:
+            return False
+
+        # PR-state guard — same classifier as the sweep.
+        pr_status = self._fetch_pr_status(pr_number)
+        if pr_status is None:
+            # Transient gh failure — don't block claim on a missing status.
+            return False
+
+        _reason_to_state = {
+            "CI green": "green",
+            "CI red": "red",
+            "CI pending": "pending",
+            "CI conflict — routing to fix_conflict (#3431)": "conflict",
+        }
+        ci_transition = transition_from_awaiting_ci(pr_status)
+        rollup_state = _reason_to_state.get(ci_transition.reason, "pending")
+        return rollup_state == "green"
 
     def _issue_author_trusted(self, issue_number: int) -> bool:
         """Run ``scripts/check-issue-author.sh`` and return True iff exit 0.
@@ -13351,6 +13465,10 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before resurrection"
 
+        # Import lazily so tests that run without psycopg installed can
+        # still import the daemon module (mirrors the pattern in _atomic_claim).
+        import psycopg  # noqa: PLC0415 — lazy import
+
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -13372,6 +13490,24 @@ class DispatcherDaemon:
                 )
             self._conn.commit()
             return True
+        except psycopg.errors.UniqueViolation:
+            # A concurrent agent INSERT already claimed this issue (the
+            # claim path and the resurrection sweep fired in the same tick
+            # window). Log at INFO — this is an expected race, not an error.
+            # Do NOT use _log.exception here (no traceback needed).
+            self._log.info(
+                "daemon.orphan_pr_resurrect_blocked_by_active",
+                extra={
+                    "event": "orphan_pr_resurrect_blocked_by_active",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return False
         except Exception:
             self._log.exception(
                 "daemon.orphan_pr_resurrect_failed",
