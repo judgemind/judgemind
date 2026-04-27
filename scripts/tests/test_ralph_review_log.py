@@ -871,3 +871,205 @@ class TestLogDissentOverride:
         assert json.loads(lines[0])["type"] == "review"
         assert json.loads(lines[1])["type"] == "review"
         assert json.loads(lines[2])["type"] == "dissent_override"
+
+
+class TestNormalizeReviewerVerdicts4Reviewer:
+    """4-reviewer tests for _normalize_reviewer_verdicts (spec-drift slot)."""
+
+    def test_spec_drift_ship_included(self, state_dir: Path) -> None:
+        """spec-drift SHIP appears in the normalized dict."""
+        from ralph_review_log import _normalize_reviewer_verdicts
+
+        verdicts = {
+            "gemini-2.5-pro": "SHIP",
+            "claude": "SHIP",
+            "spec-drift": "SHIP",
+        }
+        result = _normalize_reviewer_verdicts(verdicts)
+        assert "spec-drift" in result
+        assert result["spec-drift"] == "SHIP"
+
+    def test_spec_drift_revise_included(self, state_dir: Path) -> None:
+        """spec-drift REVISE appears in the normalized dict."""
+        from ralph_review_log import _normalize_reviewer_verdicts
+
+        verdicts = {
+            "gemini-2.5-pro": "SHIP",
+            "claude": "SHIP",
+            "spec-drift": "REVISE",
+        }
+        result = _normalize_reviewer_verdicts(verdicts)
+        assert "spec-drift" in result
+        assert result["spec-drift"] == "REVISE"
+
+    def test_spec_drift_skipped_excluded(self, state_dir: Path) -> None:
+        """spec-drift SKIPPED is excluded from normalized dict (same as other reviewers)."""
+        from ralph_review_log import _normalize_reviewer_verdicts
+
+        verdicts = {
+            "gemini-2.5-pro": "SHIP",
+            "claude": "SHIP",
+            "spec-drift": "SKIPPED",
+        }
+        result = _normalize_reviewer_verdicts(verdicts)
+        assert "spec-drift" not in result
+
+    def test_spec_drift_missing_excluded(self, state_dir: Path) -> None:
+        """When spec-drift key is absent the reviewer is excluded."""
+        from ralph_review_log import _normalize_reviewer_verdicts
+
+        verdicts = {
+            "gemini-2.5-pro": "SHIP",
+            "claude": "SHIP",
+        }
+        result = _normalize_reviewer_verdicts(verdicts)
+        assert "spec-drift" not in result
+
+    def test_all_four_reviewers_active(self, state_dir: Path) -> None:
+        """All four reviewers included when all are active."""
+        from ralph_review_log import _normalize_reviewer_verdicts
+
+        verdicts = {
+            "gemini-2.5-pro": "SHIP",
+            "gemini-2.5-pro-adversarial": "SHIP",
+            "claude": "REVISE",
+            "spec-drift": "SHIP",
+        }
+        result = _normalize_reviewer_verdicts(verdicts)
+        assert len(result) == 4
+        assert result["gemini"] == "SHIP"
+        assert result["adversarial"] == "SHIP"
+        assert result["claude"] == "REVISE"
+        assert result["spec-drift"] == "SHIP"
+
+
+class TestDetectPersistentDissent4Reviewer:
+    """4-reviewer persistent-dissent tests."""
+
+    def test_spec_drift_solo_dissent_detected(self, state_dir: Path) -> None:
+        """spec-drift says REVISE for 2 consecutive iterations while all others SHIP."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "REVISE"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro-adversarial", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "spec-drift", "verdict": "REVISE"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "spec-drift"
+        assert result["consecutive_count"] == 2
+        assert result["iterations"] == [1, 2]
+
+    def test_spec_drift_ship_does_not_trigger_dissent(self, state_dir: Path) -> None:
+        """spec-drift SHIP with other reviewers SHIP — no dissent."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "SHIP"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 2, "model": "spec-drift", "verdict": "SHIP"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is None
+
+    def test_spec_drift_and_claude_both_revise_no_override(
+        self, state_dir: Path
+    ) -> None:
+        """When spec-drift AND claude both say REVISE, that's genuine concern — no override."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "REVISE"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 2, "model": "spec-drift", "verdict": "REVISE"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is None
+
+    def test_spec_drift_skipped_treated_as_absent(self, state_dir: Path) -> None:
+        """SKIPPED spec-drift is excluded; 3-reviewer dissent detection still works."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "SKIPPED"},
+            {"iteration": 2, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 2, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 2, "model": "spec-drift", "verdict": "SKIPPED"},
+        ]
+        result = detect_persistent_dissent(
+            state_dir, current_iteration=2, reviews=reviews
+        )
+        assert result is not None
+        assert result["dissenter"] == "claude"
+        assert result["consecutive_count"] == 2
+
+
+class TestLogSummarySpecDrift:
+    """Tests for log_summary spec_drift_only_catches tracking."""
+
+    def test_spec_drift_only_catches_tracked(self, state_dir: Path) -> None:
+        """When spec-drift is the only REVISE reviewer, it's tracked as spec_drift_only_catches."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "REVISE"},
+        ]
+        log_summary(
+            state_dir,
+            total_iterations=1,
+            final_verdict="SHIP",
+            reviews=reviews,
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert record.get("spec_drift_only_catches") == [1]
+        assert "gemini_only_catches" not in record
+        assert "claude_only_catches" not in record
+
+    def test_spec_drift_catch_not_counted_when_others_also_revise(
+        self, state_dir: Path
+    ) -> None:
+        """spec-drift REVISE with claude also REVISE — not a spec-drift-only catch."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "REVISE"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "REVISE"},
+        ]
+        log_summary(
+            state_dir,
+            total_iterations=1,
+            final_verdict="SHIP",
+            reviews=reviews,
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert "spec_drift_only_catches" not in record
+
+    def test_spec_drift_skipped_not_counted(self, state_dir: Path) -> None:
+        """SKIPPED spec-drift should not appear in spec_drift_only_catches."""
+        reviews = [
+            {"iteration": 1, "model": "gemini-2.5-pro", "verdict": "SHIP"},
+            {"iteration": 1, "model": "claude", "verdict": "SHIP"},
+            {"iteration": 1, "model": "spec-drift", "verdict": "SKIPPED"},
+        ]
+        log_summary(
+            state_dir,
+            total_iterations=1,
+            final_verdict="SHIP",
+            reviews=reviews,
+        )
+        log_path = state_dir / "review-log.jsonl"
+        record = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert "spec_drift_only_catches" not in record

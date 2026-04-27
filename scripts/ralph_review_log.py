@@ -116,6 +116,7 @@ def log_summary(
     gemini_only_catches: list[int] = []
     claude_only_catches: list[int] = []
     adversarial_only_catches: list[int] = []
+    spec_drift_only_catches: list[int] = []
 
     by_iteration = _group_reviews_by_iteration(reviews)
 
@@ -140,6 +141,8 @@ def log_summary(
                 claude_only_catches.append(it)
             elif revisers == {"adversarial"}:
                 adversarial_only_catches.append(it)
+            elif revisers == {"spec-drift"}:
+                spec_drift_only_catches.append(it)
 
     total_compared = agreement_count + disagreement_count
     agreement_rate = (
@@ -162,6 +165,8 @@ def log_summary(
         record["claude_only_catches"] = claude_only_catches
     if adversarial_only_catches:
         record["adversarial_only_catches"] = adversarial_only_catches
+    if spec_drift_only_catches:
+        record["spec_drift_only_catches"] = spec_drift_only_catches
 
     _append_record(state_dir, record)
 
@@ -211,8 +216,8 @@ def _normalize_reviewer_verdicts(
 ) -> dict[str, str]:
     """Map raw model names to canonical reviewer names with their verdicts.
 
-    Returns a dict with keys from {"gemini", "adversarial", "claude"} mapped
-    to their verdict strings.  Only includes reviewers that are present and
+    Returns a dict with keys from {"gemini", "adversarial", "claude", "spec-drift"}
+    mapped to their verdict strings.  Only includes reviewers that are present and
     not SKIPPED.
     """
     gemini_v = verdicts.get("gemini-2.5-pro", verdicts.get("gemini", "SKIPPED"))
@@ -226,6 +231,8 @@ def _normalize_reviewer_verdicts(
             claude_v = v
             break
 
+    spec_drift_v = verdicts.get("spec-drift", "SKIPPED")
+
     result: dict[str, str] = {}
     if gemini_v != "SKIPPED":
         result["gemini"] = gemini_v
@@ -233,6 +240,8 @@ def _normalize_reviewer_verdicts(
         result["adversarial"] = adversarial_v
     if claude_v != "SKIPPED":
         result["claude"] = claude_v
+    if spec_drift_v != "SKIPPED":
+        result["spec-drift"] = spec_drift_v
     return result
 
 
