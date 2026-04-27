@@ -5057,7 +5057,7 @@ class TestSupersedeDocument:
     """Tests for _supersede_document()."""
 
     def test_executes_delete_and_update_queries(self) -> None:
-        """Deletes old rulings then marks document as superseded."""
+        """Deletes old rulings then marks document as superseded with change_type."""
         conn = MagicMock()
         cur = MagicMock()
         cur.rowcount = 1
@@ -5076,12 +5076,34 @@ class TestSupersedeDocument:
         delete_params = cur.execute.call_args_list[0][0][1]
         assert delete_params == (str(_DOC_ID_1),)
 
-        # Second call: UPDATE document status to superseded
+        # Second call: UPDATE document status to superseded with change_type
         update_sql = cur.execute.call_args_list[1][0][0]
         assert "UPDATE documents" in update_sql
         assert "superseded" in update_sql
+        assert "change_type" in update_sql
         update_params = cur.execute.call_args_list[1][0][1]
-        assert update_params == (str(_DOC_ID_1),)
+        assert "split_supersede" in update_params
+        assert str(_DOC_ID_1) in update_params
+
+    def test_custom_change_type_kwarg(self) -> None:
+        """Passing a custom change_type renders it into the UPDATE params."""
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.rowcount = 0
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        conn.cursor.return_value = ctx
+
+        reingest._supersede_document(conn, str(_DOC_ID_2), change_type="test_custom")
+
+        assert cur.execute.call_count == 2
+
+        update_sql = cur.execute.call_args_list[1][0][0]
+        assert "change_type" in update_sql
+        update_params = cur.execute.call_args_list[1][0][1]
+        assert "test_custom" in update_params
+        assert str(_DOC_ID_2) in update_params
 
 
 # ---------------------------------------------------------------------------
