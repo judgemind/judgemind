@@ -9,11 +9,11 @@ model: sonnet
 
 Ralph phase for the dispatcher v2 per-phase task pipeline (`docs/specs/dispatcher-v2-spec.md` §6a). Executes the plan produced by `/task-v2-plan` through an iterative worker + reviewer loop, and exits when the implementation is SHIP-ready (or blocked).
 
-**Ralph runs for every change type.** There is no short-circuit. `/task-v2-plan` is read-only by contract (see `.claude/skills/task-v2-plan/SKILL.md`), so for non-testable change types — `docs`, `db_migration`, `dx_tooling`, `no_deployed_component` — ralph is still the phase that produces the committed diff. The inner `/ralph` skill adapts its worker and reviewer behavior based on `plan.change_type` (no TDD for docs-only edits, looser reviewer criteria, single-reviewer pass acceptable). See the §Design decision section below.
+**Ralph runs for every change type.** There is no short-circuit. `/task-v2-plan` is read-only by contract (see `.claude/skills/task-v2-plan/SKILL.md`), so for non-testable change types — `docs`, `db_migration`, `dx_tooling`, `no_deployed_component` — ralph is still the phase that produces the committed diff. The inner `/ralph` skill adapts its worker and reviewer behavior based on `plan.change_type` (no TDD for docs-only edits, looser reviewer criteria, two-reviewer pass (Claude + spec-drift) acceptable). See the §Design decision section below.
 
 ## Invocation context
 
-This skill **MUST** be invoked from a context that has the `Task` tool available. Step 1 spawns `/ralph` as a Task-tool subagent, which in turn spawns its own worker and three reviewers as Task-tool subagents. Without the Task tool, this skill cannot run its core loop — it will exit cleanly with `verdict=BLOCKED` and a descriptive `block_reason`, but no implementation work happens.
+This skill **MUST** be invoked from a context that has the `Task` tool available. Step 1 spawns `/ralph` as a Task-tool subagent, which in turn spawns its own worker and four reviewers as Task-tool subagents. Without the Task tool, this skill cannot run its core loop — it will exit cleanly with `verdict=BLOCKED` and a descriptive `block_reason`, but no implementation work happens.
 
 **Supported invocation paths:**
 
@@ -41,7 +41,7 @@ This is the harness-limitation path surfaced by the Phase 1 gate smoke test (iss
 
 - `echo ITER_START <n>` at the top of each outer-skill iteration (Step 2 re-entry via the Step 2.5 pre-push gate counts as a new iteration).
 - `echo WORKER_START <n>` immediately before spawning the `/ralph` worker subagent (Step 2 / Step 2.5 re-invocation path).
-- `echo REVIEWER_START gemini-standard` / `echo REVIEWER_START gemini-adversarial` / `echo REVIEWER_START claude` — the inner `/ralph` skill emits these before each reviewer pass. Listed here so grep queries and operators know what to expect.
+- `echo REVIEWER_START gemini-standard` / `echo REVIEWER_START gemini-adversarial` / `echo REVIEWER_START claude` / `echo REVIEWER_START spec-drift` — the inner `/ralph` skill emits these before each reviewer pass. Listed here so grep queries and operators know what to expect.
 - `echo PYTEST_START` before the `bash .githooks/pre-push` invocation in Step 2.5b (the pre-push hook invokes pytest internally; this heartbeat fires once per Step 2.5 attempt).
 - `echo PUSH_START` is not fired by ralph itself — that one lives on the daemon's git-push path, which already has its own structured-log event (`daemon.git_push_started`) and does not go through a subprocess stream. Documented here for symmetry so operators know why they will not see it in the ralph jsonl.
 
@@ -75,7 +75,7 @@ This rule binds the `/ralph` worker, every reviewer pass, and any prose ralph wr
 
 ---
 
-**Implementation choice (per issue #2732):** This skill invokes the existing `/ralph` skill as its inner loop. `/ralph` already implements the worker + three-reviewer cycle with fresh-context Task-tool subagents and per-iteration state files under `{worktree}/tmp/ralph/`. `/task-v2-ralph` is the thin outer wrapper that (a) seeds `task.md` from `plan.json`, (b) invokes `/ralph`, (c) runs the local pre-push gate (Step 2.5), (d) parses `{worktree}/tmp/ralph/ralph-done.txt` into the output JSON. Keeps the implementation in one place and ensures parity with the current `/task` workflow's ralph behavior.
+**Implementation choice (per issue #2732):** This skill invokes the existing `/ralph` skill as its inner loop. `/ralph` already implements the worker + four-reviewer cycle with fresh-context Task-tool subagents and per-iteration state files under `{worktree}/tmp/ralph/`. `/task-v2-ralph` is the thin outer wrapper that (a) seeds `task.md` from `plan.json`, (b) invokes `/ralph`, (c) runs the local pre-push gate (Step 2.5), (d) parses `{worktree}/tmp/ralph/ralph-done.txt` into the output JSON. Keeps the implementation in one place and ensures parity with the current `/task` workflow's ralph behavior.
 
 ---
 
@@ -85,8 +85,8 @@ This rule binds the `/ralph` worker, every reviewer pass, and any prose ralph wr
 
 **Current decision (#2845).** Ralph runs for every change type. The outer `/task-v2-ralph` skill no longer consults `change_type` for routing — it always seeds `task.md`, always invokes `/ralph`, always parses the result. The inner `/ralph` skill reads `## Change type` from `task.md` and adapts:
 
-- **Testable change types** (`api`, `scraper`, `ingestion`, `web`, `backfill_script`, `agent_skill`): full TDD + 3-reviewer loop, same as today.
-- **Non-testable change types** (`docs`, `db_migration`, `dx_tooling`, `no_deployed_component`): worker skips TDD + diff-coverage gates; reviewer step accepts "no tests added" when the diff is docs-only and performs a single Claude-only review (the Gemini code-review passes are skipped because they add no signal on markdown/config-only edits).
+- **Testable change types** (`api`, `scraper`, `ingestion`, `web`, `backfill_script`, `agent_skill`): full TDD + 4-reviewer loop (Gemini standard, Gemini adversarial, Claude, spec-drift).
+- **Non-testable change types** (`docs`, `db_migration`, `dx_tooling`, `no_deployed_component`): worker skips TDD + diff-coverage gates; reviewer step accepts "no tests added" when the diff is docs-only and performs a two-reviewer pass — Claude + spec-drift (the Gemini code-review passes are skipped because they add no signal on markdown/config-only edits).
 
 See `.claude/skills/ralph/SKILL.md` §"Change-type-aware behavior" for the inner branch.
 
@@ -270,8 +270,8 @@ Create `{worktree}/tmp/ralph/` if it does not exist. Write:
 
 **Taxonomy — which change types are testable:**
 
-- **Testable:** `api`, `scraper`, `ingestion`, `web`, `backfill_script`, `agent_skill`. Worker writes failing tests first; reviewers require tests for every acceptance criterion; loop runs all three reviewers.
-- **Non-testable:** `docs`, `db_migration`, `dx_tooling`, `no_deployed_component`. Worker implements the plan's "What will change" section directly; pre-PR checks still run on any Python/TypeScript files actually touched; diff-coverage is skipped; reviewers accept "no tests added" without a REVISE; only the Claude reviewer runs (Gemini passes are skipped).
+- **Testable:** `api`, `scraper`, `ingestion`, `web`, `backfill_script`, `agent_skill`. Worker writes failing tests first; reviewers require tests for every acceptance criterion; loop runs all four reviewers (Gemini standard, Gemini adversarial, Claude, spec-drift).
+- **Non-testable:** `docs`, `db_migration`, `dx_tooling`, `no_deployed_component`. Worker implements the plan's "What will change" section directly; pre-PR checks still run on any Python/TypeScript files actually touched; diff-coverage is skipped; reviewers accept "no tests added" without a REVISE; Claude and spec-drift reviewers run (Gemini passes are skipped).
 - **Unknown:** treat as testable (fail-open). The plan author (`/task-v2-plan`) owns the `change_type` enum; this skill accepts unfamiliar values by running the full loop rather than silently skipping work.
 
 The `## Testable` line exists so the inner `/ralph` worker and reviewer prompts have a single, explicit signal to branch on — avoids re-deriving the set from `## Change type` in every subagent.
@@ -286,8 +286,8 @@ Spawn the `/ralph` skill as a Task-tool subagent (so its own internal worker+rev
 
 `/ralph` handles the full worker → reviewer(s) cycle, with each sub-invocation spawning its own fresh-context subagent (Task tool). It branches on `## Testable` in `task.md`:
 
-- **Testable:** worker runs TDD + pre-PR checks + diff-coverage. Reviewers: Gemini standard → Gemini adversarial → Claude. All three must SHIP (or the persistent-dissent override applies).
-- **Non-testable:** worker implements the plan directly + runs pre-PR checks applicable to the touched file types. Reviewer: Claude only. No Gemini passes, no diff-coverage gate, no "missing tests" REVISE.
+- **Testable:** worker runs TDD + pre-PR checks + diff-coverage. Reviewers: Gemini standard → Gemini adversarial → Claude → spec-drift. All four must SHIP (or the persistent-dissent override applies).
+- **Non-testable:** worker implements the plan directly + runs pre-PR checks applicable to the touched file types. Reviewers: Claude + spec-drift. No Gemini passes, no diff-coverage gate, no "missing tests" REVISE.
 
 `/ralph` writes `ralph-done.txt` when any of the following is true:
 
@@ -401,7 +401,7 @@ Ralph is the long-tail phase by design. Each iteration (worker + reviewer(s)) is
 
 Expected peak: ~30-45k tokens across 5 iterations. Well inside the 200k limit.
 
-For non-testable change types, the budget is tighter: worker runs without TDD and only one reviewer runs, so iterations typically converge in 1-2 cycles at ~10-15k tokens total.
+For non-testable change types, the budget is tighter: worker runs without TDD and two reviewers run (Claude + spec-drift), so iterations typically converge in 1-2 cycles at ~10-15k tokens total.
 
 The Task-tool availability check (Step 0) is cheap: a single tool-registry probe, no subprocess.
 
@@ -417,7 +417,7 @@ The Step 2.5 commit + pre-push gate is cheap on the green path — the commit is
 
 ## Worked example — testable change, 1-iteration SHIP
 
-Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: yes`), Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all three reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5a commits the diff with message `"WIP: ralph output"`. Step 2.5b runs `.githooks/pre-push` against the committed state — the hook's per-package ruff, pytest, and diff-coverage checks pass (the inner worker already ran them per-package in iteration 1). Step 3 parses `ralph-done.txt` = `SHIP`, captures `changed_files` via `git diff --name-only origin/main...HEAD`, emits output. The ralph commit stays in place; the daemon's `push_and_pr` phase amends it with summary's conventional-commits message.
+Input `plan.json` has `change_type=scraper` — a one-file scraper fix. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: yes`), Step 2 invokes `/ralph`, worker applies the one-line fix + regression test, all four reviewers agree SHIP on iteration 1. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5a commits the diff with message `"WIP: ralph output"`. Step 2.5b runs `.githooks/pre-push` against the committed state — the hook's per-package ruff, pytest, and diff-coverage checks pass (the inner worker already ran them per-package in iteration 1). Step 3 parses `ralph-done.txt` = `SHIP`, captures `changed_files` via `git diff --name-only origin/main...HEAD`, emits output. The ralph commit stays in place; the daemon's `push_and_pr` phase amends it with summary's conventional-commits message.
 
 Output `ralph.json`:
 
@@ -440,7 +440,7 @@ Output `ralph.json`:
 
 ## Worked example — non-testable change (docs), 1-iteration SHIP
 
-Input `plan.json` has `change_type=docs`. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: no`), Step 2 invokes `/ralph`. The worker reads `## Testable: no`, skips TDD, implements the plan's "What will change" section (e.g. edits `docs/agent/unattended-patterns.md`), runs `scripts/check-markdown-links.sh` on any touched markdown files, and writes `COMPLETE`. Only the Claude reviewer runs — verifies acceptance criteria against the diff, confirms no stale references remain, writes `SHIP` to `review-result.txt`. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5a commits with placeholder message. Step 2.5b runs `.githooks/pre-push` against the committed state — the hook re-runs `check-markdown-links.sh`, which passes. Step 3 emits SHIP.
+Input `plan.json` has `change_type=docs`. Step 0 confirms the Task tool is available, Step 1 seeds state (with `## Testable: no`), Step 2 invokes `/ralph`. The worker reads `## Testable: no`, skips TDD, implements the plan's "What will change" section (e.g. edits `docs/agent/unattended-patterns.md`), runs `scripts/check-markdown-links.sh` on any touched markdown files, and writes `COMPLETE`. The Claude and spec-drift reviewers run — both verify acceptance criteria against the diff, confirm no stale references remain, and both write `SHIP` to their result files. Ralph writes `ralph-done.txt` = `SHIP` at iteration 1. Step 2.5a commits with placeholder message. Step 2.5b runs `.githooks/pre-push` against the committed state — the hook re-runs `check-markdown-links.sh`, which passes. Step 3 emits SHIP.
 
 Output `ralph.json`:
 

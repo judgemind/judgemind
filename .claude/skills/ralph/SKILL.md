@@ -1,5 +1,5 @@
 ---
-description: Ralph loop — iterative work-review cycle with fresh context each iteration. Spawns a worker subagent to implement, then runs up to three reviewers sequentially (Gemini standard, Gemini adversarial, Claude). Loops until all required reviewers agree to SHIP or max iterations reached. Called by /task for implementation tasks.
+description: Ralph loop — iterative work-review cycle with fresh context each iteration. Spawns a worker subagent to implement, then runs up to four reviewers sequentially (Gemini standard, Gemini adversarial, Claude, spec-drift). Loops until all required reviewers agree to SHIP or max iterations reached. Called by /task for implementation tasks.
 argument-hint: ""
 maxTurns: 200
 ---
@@ -13,7 +13,7 @@ Implement the current task using a ralph loop: an iterative work-then-review cyc
 **When to use:** Code, docs, agent-skill, dx-tooling, or any other in-repo implementation task the calling workflow hands off. Ralph adapts its inner behavior to the change type — see §"Change-type-aware behavior" below.
 
 - **Called by `/task` (laptop dispatcher)** Path A for testable code tasks (Python, TypeScript). The caller handles non-testable tasks itself in the legacy path; this is unchanged for laptop workflows.
-- **Called by `/task-v2-ralph` (dispatcher v2)** for every change type. The per-phase pipeline has no short-circuit: plan is read-only, ralph always implements. Non-testable types (docs, db_migration, dx_tooling, no_deployed_component) take the single-reviewer, no-TDD branch.
+- **Called by `/task-v2-ralph` (dispatcher v2)** for every change type. The per-phase pipeline has no short-circuit: plan is read-only, ralph always implements. Non-testable types (docs, db_migration, dx_tooling, no_deployed_component) take the two-reviewer (Claude + spec-drift), no-TDD branch.
 
 **Local dev iteration for ingestion/extraction tasks:** When the task involves the ingestion pipeline, scraper logic, LLM extraction, or enrichment, use the local dev stack for faster iteration. The local DB + S3 cache (`S3_CACHE_DIR=/tmp/judgemind-archive`) enables running the full pipeline locally. After implementing changes, run `scripts/rebuild_db.sh --skip-reset` to re-process documents and verify data correctness against source documents. The LLM result cache makes subsequent rebuilds near-instant. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify extracted values match source documents.
 
@@ -29,8 +29,8 @@ Ralph reads `## Testable` from `{worktree}/tmp/ralph/task.md` (seeded by the cal
 
 | `## Testable` | Worker runs | Reviewer(s) run | Rationale |
 |---|---|---|---|
-| `yes` (testable) | Full TDD: failing tests first, then implement, then full pre-PR checks (ruff, pytest, lint/typecheck, diff-coverage ≥ 90%) | Gemini standard → Gemini adversarial → Claude (all three required, with persistent-dissent override) | Code change benefits from TDD and triple-reviewer cross-perspective. |
-| `no` (non-testable: `docs`, `db_migration`, `dx_tooling`, `no_deployed_component`) | Implement the plan's "What will change" section directly; run pre-PR checks that apply to touched file types (ruff/format on any `.py`, markdown-link check on any `.md`, terraform fmt on any `.tf`, etc.); skip pytest and diff-coverage gates | Claude reviewer only (skip both Gemini passes) | Pure documentation, CI-config, or migration-SQL edits have no test suite to iterate against. The Gemini code-review passes add no signal on these diffs. |
+| `yes` (testable) | Full TDD: failing tests first, then implement, then full pre-PR checks (ruff, pytest, lint/typecheck, diff-coverage ≥ 90%) | Gemini standard → Gemini adversarial → Claude → Spec-drift (all four required, with persistent-dissent override) | Code change benefits from TDD and four-reviewer cross-perspective. |
+| `no` (non-testable: `docs`, `db_migration`, `dx_tooling`, `no_deployed_component`) | Implement the plan's "What will change" section directly; run pre-PR checks that apply to touched file types (ruff/format on any `.py`, markdown-link check on any `.md`, terraform fmt on any `.tf`, etc.); skip pytest and diff-coverage gates | Claude reviewer + Spec-drift reviewer (skip both Gemini passes) | Pure documentation, CI-config, or migration-SQL edits have no test suite to iterate against. The Gemini code-review passes add no signal on these diffs. Spec-drift still runs to check for stale doc references. |
 
 When `## Testable: no`, the reviewer MUST NOT issue a REVISE for "no tests added" or "diff-coverage gate not satisfied" — those checks do not apply to the non-testable branch. Reviewer still verifies acceptance criteria, correctness, scope, stale references, and docs consistency.
 
@@ -95,6 +95,8 @@ Create the state directory and seed the task file:
 ├── review-log.jsonl           # structured review log (appended by gemini_review.py and the loop)
 ├── touched-packages.txt       # Python packages with code changes (written by worker step 4)
 ├── infeasible-acs.json        # written only on AC_INFEASIBLE verdict (worker / reviewer)
+├── spec-drift-result.txt      # Spec-drift reviewer verdict: "SHIP", "REVISE", or "SKIPPED"
+├── spec-drift-feedback.md     # Spec-drift reviewer findings (testable and non-testable)
 └── ralph-done.txt             # completion signal for the calling /task workflow
 ```
 
@@ -122,11 +124,13 @@ Create todos using `TaskCreate` to track progress through the ralph loop:
 2. "Ralph iteration 1 — Gemini review" (activeForm: "Gemini reviewing iteration 1")
 3. "Ralph iteration 1 — adversarial review" (activeForm: "Adversarial reviewing iteration 1")
 4. "Ralph iteration 1 — Claude review" (activeForm: "Claude reviewing iteration 1")
+5. "Ralph iteration 1 — spec-drift review" (activeForm: "Spec-drift reviewing iteration 1")
 
 **Non-testable branch (`## Testable: no`):**
 
 1. "Ralph iteration 1 — worker" (activeForm: "Implementing iteration 1")
 2. "Ralph iteration 1 — Claude review" (activeForm: "Claude reviewing iteration 1")
+3. "Ralph iteration 1 — spec-drift review" (activeForm: "Spec-drift reviewing iteration 1")
 
 Only create todos for the current iteration. When a REVISE triggers the next iteration, create new todos for that iteration at that time.
 
@@ -244,10 +248,10 @@ After the worker subagent completes, read `{worktree}/tmp/ralph/work-status.txt`
 
 Run this sub-step only when `## Testable: yes` (or the line is missing). For `## Testable: no`, skip to 2b' below.
 
-Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running three sequential reviewers for iteration N`.
+Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running four sequential reviewers for iteration N`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ralph-reviewer (N)"`
 
-**All three reviewers run sequentially in the foreground.** This eliminates background `<task-notification>` noise that disrupts the dispatcher when multiple agents are running. Do **not** use `run_in_background` for any reviewer.
+**All four reviewers run sequentially in the foreground.** This eliminates background `<task-notification>` noise that disrupts the dispatcher when multiple agents are running. Do **not** use `run_in_background` for any reviewer.
 
 **Pre-generate diff and changed files before launching reviewers.** This must happen once, before any reviewer starts. Run these two commands sequentially (as separate Bash tool calls):
 
@@ -271,7 +275,7 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 
 Both files must exist and be non-empty before launching reviewers. The `gemini-review.sh` script will skip its own diff generation when it detects these files already exist.
 
-**Run all three reviewers sequentially (foreground only — no `run_in_background`), capturing per-reviewer wall-clock time:**
+**Run all four reviewers sequentially (foreground only — no `run_in_background`), capturing per-reviewer wall-clock time:**
 
 Before each reviewer starts, note the current time (run `date +%s` to get epoch seconds). After each reviewer completes, run `date +%s` again and compute the delta. Store the per-reviewer seconds for the timing detail.
 
@@ -301,21 +305,31 @@ Before each reviewer starts, note the current time (run `date +%s` to get epoch 
    ```
    Compute: `claude_secs = end - start`
 
-**After all three reviewers complete**, end the reviewer phase with per-reviewer timing detail:
+4. **Spec-drift Claude reviewer subagent** — Capture start time, spawn via the Agent tool (foreground, after Claude review has completed), using the prompt at `.claude/skills/spec-drift-reviewer/SKILL.md`, capture end time after the agent completes:
+   ```
+   date +%s
+   ```
+   (Run spec-drift reviewer agent — see `.claude/skills/spec-drift-reviewer/SKILL.md`)
+   ```
+   date +%s
+   ```
+   Compute: `spec_drift_secs = end - start`
+
+**After all four reviewers complete**, end the reviewer phase with per-reviewer timing detail:
 ```
-python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <gemini_standard_secs>, "gemini_adversarial": <gemini_adversarial_secs>, "claude": <claude_secs>}'
+python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <gemini_standard_secs>, "gemini_adversarial": <gemini_adversarial_secs>, "claude": <claude_secs>, "spec_drift": <spec_drift_secs>}'
 ```
 
-### 2b' — Single-reviewer phase (non-testable branch)
+### 2b' — Claude + spec-drift reviewer phase (non-testable branch)
 
 Run this sub-step only when `## Testable: no`.
 
-Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running Claude reviewer for iteration N (non-testable)`.
+Write status: `phase: ralph-reviewer (iteration N)`, `summary: Running Claude and spec-drift reviewers for iteration N (non-testable)`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ralph-reviewer (N)"`
 
 **Pre-generate diff and changed files before launching the reviewer.** Same procedure as 2b — write `{worktree}/tmp/ralph/diff.txt` and `{worktree}/tmp/ralph/changed_files.txt`.
 
-**Skip the two Gemini reviews** — they are code-review-oriented and add no signal on docs / db_migration / dx_tooling / no_deployed_component diffs. The non-testable branch accepts a single Claude review.
+**Skip the two Gemini reviews** — they are code-review-oriented and add no signal on docs / db_migration / dx_tooling / no_deployed_component diffs. The non-testable branch runs Claude review plus the spec-drift reviewer (skip both Gemini passes only).
 
 Write `SKIPPED` to both `{worktree}/tmp/ralph/gemini-review-result.txt` and `{worktree}/tmp/ralph/adversarial-result.txt` so the decision logic in §2e can read them uniformly. Write `Skipped: non-testable change type (see task.md ## Testable: no).` to each of `gemini-feedback.md` and `adversarial-feedback.md` for audit.
 
@@ -329,9 +343,19 @@ date +%s
 ```
 Compute: `claude_secs = end - start`
 
+**Run the spec-drift Claude reviewer** — capture start time, spawn via the Agent tool (foreground, after Claude review has completed), using the prompt at `.claude/skills/spec-drift-reviewer/SKILL.md`, capture end time:
+```
+date +%s
+```
+(Run spec-drift reviewer agent — see `.claude/skills/spec-drift-reviewer/SKILL.md`)
+```
+date +%s
+```
+Compute: `spec_drift_secs = end - start`
+
 End the reviewer phase with per-reviewer timing detail (Gemini entries marked zero since they were skipped):
 ```
-python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": 0, "gemini_adversarial": 0, "claude": <claude_secs>}'
+python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": 0, "gemini_adversarial": 0, "claude": <claude_secs>, "spec_drift": <spec_drift_secs>}'
 ```
 
 ### Claude reviewer prompt
@@ -402,8 +426,9 @@ After the reviewer(s) complete, read:
 - `{worktree}/tmp/ralph/gemini-review-result.txt` (Gemini standard — `SKIPPED` on non-testable branch)
 - `{worktree}/tmp/ralph/adversarial-result.txt` (Gemini adversarial — `SKIPPED` on non-testable branch)
 - `{worktree}/tmp/ralph/review-result.txt` (Claude — always runs)
+- `{worktree}/tmp/ralph/spec-drift-result.txt` (Spec-drift — always runs, may be `SKIPPED` for pure leaf-code changes)
 
-### 2d — Log Claude review record
+### 2d — Log Claude and spec-drift review records
 
 After reading the Claude reviewer's verdict and feedback, log a structured review record by writing and running a small Python script.
 
@@ -431,6 +456,20 @@ log_review(
     feedback=feedback,
     diff_stats=diff_stats,
 )
+
+# Also log the spec-drift reviewer verdict
+spec_drift_result_path = state_dir / "spec-drift-result.txt"
+spec_drift_feedback_path = state_dir / "spec-drift-feedback.md"
+if spec_drift_result_path.exists():
+    sd_verdict = spec_drift_result_path.read_text(encoding="utf-8").strip()
+    sd_feedback = spec_drift_feedback_path.read_text(encoding="utf-8") if spec_drift_feedback_path.exists() else ""
+    log_review(
+        state_dir,
+        iteration=iteration,
+        model="spec-drift",
+        verdict=sd_verdict,
+        feedback=sd_feedback,
+    )
 ```
 
 Run this script with any available Python 3 interpreter (e.g. a venv python from one of the packages, or `python3`). The `ralph_review_log` module is stdlib-only and does not need a venv.
@@ -439,14 +478,14 @@ Run this script with any available Python 3 interpreter (e.g. a venv python from
 
 **Required-reviewer agreement to SHIP** depends on the branch:
 
-- **Testable branch:** all three reviewers must agree to SHIP (with persistent-dissent override). Claude **SHIP** AND (Gemini standard **SHIP** or **SKIPPED**) AND (Gemini adversarial **SHIP** or **SKIPPED**) → SHIP.
-- **Non-testable branch:** Claude alone must SHIP. Both Gemini entries are always **SKIPPED** on this branch, so the same predicate — Claude SHIP AND Gemini standard SHIP-or-SKIPPED AND Gemini adversarial SHIP-or-SKIPPED — reduces to Claude SHIP. The predicate is uniform across branches.
+- **Testable branch:** all four reviewers must agree to SHIP (with persistent-dissent override). Claude **SHIP** AND (Gemini standard **SHIP** or **SKIPPED**) AND (Gemini adversarial **SHIP** or **SKIPPED**) AND (Spec-drift **SHIP** or **SKIPPED**) → SHIP.
+- **Non-testable branch:** Claude SHIP AND Spec-drift SHIP-or-SKIPPED. Both Gemini entries are always **SKIPPED** on this branch. When spec-drift is also SKIPPED (pure leaf-code non-testable diff), the predicate reduces to Claude SHIP. The predicate — Claude SHIP AND Gemini standard SHIP-or-SKIPPED AND Gemini adversarial SHIP-or-SKIPPED AND Spec-drift SHIP-or-SKIPPED — is uniform across branches.
 
 If the predicate is satisfied: the loop is done. Continue to Step 3.
 
 **AC_INFEASIBLE short-circuit.** If the worker wrote `AC_INFEASIBLE` to `work-status.txt` OR the Claude reviewer wrote `AC_INFEASIBLE` to `review-result.txt`, the loop terminates immediately with verdict `AC_INFEASIBLE`. Do NOT run subsequent reviewers. Do NOT run the next iteration. Do NOT invoke the persistent-dissent override (it does not apply to AC_INFEASIBLE). Write `AC_INFEASIBLE` to `{worktree}/tmp/ralph/ralph-done.txt` along with the iteration count, leave `infeasible-acs.json` in place, and return to the caller — the outer `/task-v2-ralph` wrapper will read both files and emit the dispatcher-facing JSON.
 
-- **Persistent-dissent override** (testable branch only): If ANY reviewer says **REVISE**, first check whether this is a persistent solo-dissent pattern. The override logic only applies when multiple reviewers actually ran — on the non-testable branch where only Claude runs, there is no dissent to override. Write and run a small Python script (`{worktree}/tmp/ralph/check_dissent.py`):
+- **Persistent-dissent override** (testable branch only): If ANY reviewer says **REVISE**, first check whether this is a persistent solo-dissent pattern. The override logic only applies when multiple reviewers actually ran — on the non-testable branch where only Claude and spec-drift run (Gemini is SKIPPED), the persistent-dissent override still applies if one of them issues a solo REVISE for 2+ consecutive iterations. Write and run a small Python script (`{worktree}/tmp/ralph/check_dissent.py`):
 
   ```python
   import sys
@@ -476,7 +515,7 @@ If the predicate is satisfied: the loop is done. Continue to Step 3.
   - If the script outputs "NONE", no persistent dissent was detected. Proceed with the normal REVISE logic below.
 
 - If the required reviewer(s) say **REVISE** (and no persistent-dissent override applies): Increment iteration. If `iteration > max_iterations`, stop the loop and comment on the issue that the ralph loop hit its max iterations — block the issue with `scripts/block-issue.sh <issue> <blocker>` (if applicable) or add `status/blocked` manually, and return with failure. Otherwise:
-  - Consolidate feedback from ALL reviewers that said REVISE into `{worktree}/tmp/ralph/feedback.md`. Include feedback from `gemini-feedback.md`, `adversarial-feedback.md`, and/or `feedback.md` as appropriate. On the non-testable branch, only Claude's `feedback.md` is relevant (the Gemini files are SKIPPED placeholders).
+  - Consolidate feedback from ALL reviewers that said REVISE into `{worktree}/tmp/ralph/feedback.md`. Include feedback from `gemini-feedback.md`, `adversarial-feedback.md`, and/or `feedback.md` as appropriate. On the non-testable branch, Claude's `feedback.md` and spec-drift's `spec-drift-feedback.md` are relevant (the Gemini files are SKIPPED placeholders).
   - Bump `iteration.txt` to the next value and create new todos for the next iteration (using the branch-appropriate todo list from Step 1), then return to 2a.
 
 ### 2f — Per-iteration patch persistence (daemon-owned, #3042)
@@ -583,7 +622,7 @@ Under dispatcher v2, the calling `/task-v2-ralph` skill parses `ralph-done.txt` 
 - **Unmet acceptance criteria are always REVISE.** Reviewers must verify every acceptance criterion individually. Code quality alone is not sufficient for SHIP — all locally-verifiable acceptance criteria must be met.
 - **"No tests added" is not a REVISE reason on the non-testable branch.** Applying test-coverage standards to a docs-only or migration-only diff is a category error that deadlocks the loop. The reviewer must distinguish the branches by reading `## Testable` in `task.md`.
 - **AC_INFEASIBLE requires citable evidence (issue #3010).** The worker or Claude reviewer may surface `AC_INFEASIBLE` when an AC references a non-existent symbol, self-contradicts another AC, or depends on out-of-scope work — see §"AC_INFEASIBLE emit rules". "Hard to implement", "max iterations exhausted", and ambiguous wording are NOT triggers. When uncertain, prefer REVISE — the diagnoser cannot reason about a hunch.
-- **Persistent-dissent override** (testable branch only). If one reviewer says REVISE for 2+ consecutive iterations while the other two say SHIP, and the detection function (`detect_persistent_dissent`) confirms the pattern, the loop treats it as SHIP. This prevents a single reviewer from blocking convergence on theoretical grounds that the other reviewers have already evaluated and dismissed. The override is logged to `review-log.jsonl` with type `dissent_override` for audit. This override only applies when exactly one reviewer dissents — if two reviewers REVISE, that is a genuine concern and the override does not trigger. On the non-testable branch, only Claude reviews, so the override is inapplicable and the REVISE path always re-runs the worker.
+- **Persistent-dissent override** (testable branch only). If one reviewer says REVISE for 2+ consecutive iterations while the other active reviewers (from the 4-reviewer set: Gemini standard, Gemini adversarial, Claude, spec-drift) all say SHIP, and the detection function (`detect_persistent_dissent`) confirms the pattern, the loop treats it as SHIP. This prevents a single reviewer from blocking convergence on theoretical grounds that the other reviewers have already evaluated and dismissed. The override is logged to `review-log.jsonl` with type `dissent_override` for audit. This override only applies when exactly one reviewer dissents — if two reviewers REVISE, that is a genuine concern and the override does not trigger. On the non-testable branch where spec-drift is SKIPPED for pure leaf-code diffs, only Claude actively reviews; the override is inapplicable and the REVISE path always re-runs the worker.
 - **Do not use `run_in_background` anywhere in the ralph loop.** All commands — test suites, lint, format checks, git commands, reviewer invocations, and worker subagents — must run in the foreground. Subagents are already running as background tasks from the parent's perspective. Further backgrounding causes completion notifications to route to the wrong context, leading to confusion and lost results.
 
 ---
