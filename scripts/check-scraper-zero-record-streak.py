@@ -281,7 +281,13 @@ def has_historical_nonzero(runs: list[tuple[datetime, int, str]]) -> bool:
 # ``check_zero_record_streaks``.  Using a private sentinel (instead of None)
 # allows callers to distinguish "auto-load from registry" (default) from
 # "explicitly disable the check" (pass None).
-_SENTINEL: set[str] = object()  # type: ignore[assignment]
+
+
+class _Sentinel:
+    """Private sentinel type for the ``known_scraper_ids`` default."""
+
+
+_SENTINEL: _Sentinel = _Sentinel()
 
 
 def check_zero_record_streaks(
@@ -294,7 +300,7 @@ def check_zero_record_streaks(
     scraper_id: str | None = None,
     exclusions: set[str] | None = None,
     frequent_scraper_ids: set[str] | None = None,
-    known_scraper_ids: set[str] | None = _SENTINEL,  # type: ignore[assignment]
+    known_scraper_ids: set[str] | None | _Sentinel = _SENTINEL,
 ) -> CheckResult:
     """Run the zero-record streak check.
 

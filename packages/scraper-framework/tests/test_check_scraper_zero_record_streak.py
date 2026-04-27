@@ -502,6 +502,23 @@ class TestUnknownScraperIdWarning:
 
 
 # ---------------------------------------------------------------------------
+# Sentinel typing regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestSentinelTyping:
+    """Regression lock — ensure _SENTINEL is a dedicated type, not a fake set."""
+
+    def test_sentinel_is_not_a_set(self) -> None:
+        """_SENTINEL must not be typed as a set; the dishonest annotation is gone."""
+        assert not isinstance(zrs._SENTINEL, set)
+
+    def test_sentinel_is_not_none(self) -> None:
+        """_SENTINEL must not be None — preserves the three-way sentinel/None/set distinction."""
+        assert zrs._SENTINEL is not None
+
+
+# ---------------------------------------------------------------------------
 # CLI smoke tests
 # ---------------------------------------------------------------------------
 
