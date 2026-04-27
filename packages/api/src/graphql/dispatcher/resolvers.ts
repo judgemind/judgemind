@@ -248,8 +248,8 @@ async function queryRecentFailures(pool: Pool, sinceHours: number): Promise<Row[
 
 /** Shape returned by the weekly diagnoser SQL query. */
 interface DiagnoserEffectivenessRow {
-  recommended_action: string;
-  observed_outcome: string;
+  recommended_action: string | null; // NULL when recommendation->>'action' is absent
+  observed_outcome: string | null; // NULL when outcome->>'retry_outcome' is absent
   count: string; // pg returns bigint count as string
   day: string;
 }
@@ -272,8 +272,8 @@ async function queryWeeklyDiagnoserReport(pool: Pool): Promise<DiagnoserEffectiv
 /** Convert a dispatcher.diagnoses rollup row into the GraphQL DiagnoserEffectivenessRow shape. */
 function diagnoserRowToGraphQL(row: DiagnoserEffectivenessRow): Record<string, unknown> {
   return {
-    recommendedAction: row.recommended_action,
-    observedOutcome: row.observed_outcome,
+    recommendedAction: row.recommended_action ?? '(unknown)',
+    observedOutcome: row.observed_outcome ?? '(unknown)',
     count: parseInt(row.count, 10),
     day: row.day,
   };
