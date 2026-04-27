@@ -30,7 +30,7 @@ from dispatcher import phase_transitions as pt  # noqa: E402
 
 
 class TestTransitionFromPlan:
-    """Plan-phase transitions: happy path + BLOCKED terminal."""
+    """Plan-phase transitions: happy path + BLOCKED terminal + task_type routing (#3507)."""
 
     def test_happy_path_advances_to_ralph(self) -> None:
         result = pt.transition_from_plan({"plan_doc": "..."})
@@ -65,6 +65,56 @@ class TestTransitionFromPlan:
     def test_blocked_verdict_lowercase_still_matches(self) -> None:
         # Verdict matching is case-insensitive via str.upper().
         result = pt.transition_from_plan({"verdict": "blocked"})
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_PLAN_BLOCKED
+
+    # ── #3507 — task_type routing tests ─────────────────────────────────
+
+    def test_task_type_operational_routes_to_operational(self) -> None:
+        # When plan emits task_type=operational, transition must advance
+        # to PHASE_OPERATIONAL (bypassing ralph entirely).
+        result = pt.transition_from_plan(
+            {"task_type": "operational", "plan_text": "run rebuild_db.py"}
+        )
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_OPERATIONAL
+        assert result.terminal_status is None
+
+    def test_task_type_operational_lowercase_routes(self) -> None:
+        # task_type comparison is case-insensitive.
+        result = pt.transition_from_plan({"task_type": "OPERATIONAL"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_OPERATIONAL
+
+    def test_task_type_coding_routes_to_ralph(self) -> None:
+        # task_type=coding is explicitly the default coding path.
+        result = pt.transition_from_plan({"task_type": "coding"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_RALPH
+
+    def test_missing_task_type_defaults_to_ralph(self) -> None:
+        # Absent task_type (e.g. output from an older plan skill) must
+        # not break existing coding pipeline behavior.
+        result = pt.transition_from_plan({"plan_text": "fix the bug"})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_RALPH
+
+    def test_none_task_type_defaults_to_ralph(self) -> None:
+        # Explicit None task_type is treated as absent.
+        result = pt.transition_from_plan({"task_type": None})
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_RALPH
+
+    def test_blocked_takes_precedence_over_task_type_operational(self) -> None:
+        # If plan emits both BLOCKED verdict AND task_type=operational,
+        # BLOCKED must win — plan said no-go.
+        result = pt.transition_from_plan(
+            {
+                "verdict": "BLOCKED",
+                "block_reason": "ambiguous AC",
+                "task_type": "operational",
+            }
+        )
         assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
         assert result.next_phase == pt.PHASE_PLAN_BLOCKED
 
@@ -1134,6 +1184,125 @@ class TestVerdictExtraction:
         assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
 
 
+# --------------------------------------------------------------------------
+# transition_from_operational (#3507)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromOperational:
+    """Operational-phase transitions (#3507): succeeded terminal, blocked
+    needs_review terminal, failed/missing/unrecognized → diagnoser."""
+
+    def test_succeeded_advances_to_operational_done_with_status(self) -> None:
+        result = pt.transition_from_operational(
+            {
+                "verdict": "succeeded",
+                "action_taken": "ran rebuild_db.py --county Santa Clara",
+                "evidence_md": "## Evidence\n\n4821 rows.",
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_OPERATIONAL_DONE
+        assert result.terminal_status == pt.AgentStatus.SUCCEEDED.value
+        assert result.failure_hint is None
+        assert result.context.get("evidence_md") == "## Evidence\n\n4821 rows."
+        assert (
+            result.context.get("action_taken")
+            == "ran rebuild_db.py --county Santa Clara"
+        )
+
+    def test_succeeded_uppercase_still_matches(self) -> None:
+        # Verdict matching is case-insensitive.
+        result = pt.transition_from_operational({"verdict": "SUCCEEDED"})
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_OPERATIONAL_DONE
+
+    def test_blocked_advances_to_operational_failed_with_needs_review(self) -> None:
+        result = pt.transition_from_operational(
+            {
+                "verdict": "blocked",
+                "block_reason": "JUDGEMIND_DB_URL secret not set in dev",
+                "evidence_md": None,
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_OPERATIONAL_FAILED
+        assert result.terminal_status == pt.AgentStatus.NEEDS_REVIEW.value
+        assert result.failure_hint is None
+        assert (
+            result.context.get("block_reason")
+            == "JUDGEMIND_DB_URL secret not set in dev"
+        )
+
+    def test_blocked_uppercase_still_matches(self) -> None:
+        result = pt.transition_from_operational({"verdict": "BLOCKED"})
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_OPERATIONAL_FAILED
+        assert result.terminal_status == pt.AgentStatus.NEEDS_REVIEW.value
+
+    def test_failed_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_operational(
+            {
+                "verdict": "failed",
+                "block_reason": "ECS task exited with code 1",
+                "evidence_md": "Last log line: ConnectionRefusedError",
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+        assert result.next_phase is None
+        assert result.context.get("verdict") == "FAILED"
+        assert (
+            result.context.get("evidence_md") == "Last log line: ConnectionRefusedError"
+        )
+
+    def test_failed_uppercase_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_operational({"verdict": "FAILED"})
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+
+    def test_missing_verdict_routes_to_diagnoser(self) -> None:
+        # A missing verdict signals the skill failed to produce structured
+        # output — route to diagnoser so it can investigate.
+        result = pt.transition_from_operational({})
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+        assert result.context.get("verdict") == ""
+
+    def test_none_output_routes_to_diagnoser(self) -> None:
+        # Defensive — subprocess failure may produce None output.
+        result = pt.transition_from_operational(None)
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+
+    def test_unrecognized_verdict_routes_to_diagnoser(self) -> None:
+        # An unrecognized verdict (e.g. "partial") routes to diagnoser
+        # rather than silently treating as succeeded or blocked.
+        result = pt.transition_from_operational({"verdict": "partial"})
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_OPERATIONAL_FAILED
+        assert result.context.get("verdict") == "PARTIAL"
+
+    def test_operational_done_is_terminal(self) -> None:
+        assert pt.is_terminal_phase(pt.PHASE_OPERATIONAL_DONE) is True
+
+    def test_operational_failed_is_terminal(self) -> None:
+        assert pt.is_terminal_phase(pt.PHASE_OPERATIONAL_FAILED) is True
+
+    def test_operational_is_active_not_terminal(self) -> None:
+        assert pt.is_terminal_phase(pt.PHASE_OPERATIONAL) is False
+        assert pt.PHASE_OPERATIONAL in pt.ACTIVE_PHASES
+
+    def test_operational_in_verdict_driven_dispatch(self) -> None:
+        # operational must be in the verdict-driven dispatch table so
+        # next_phase_from_verdict can route it correctly.
+        result = pt.next_phase_from_verdict(
+            pt.PHASE_OPERATIONAL, {"verdict": "succeeded"}
+        )
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_OPERATIONAL_DONE
+
+
 class TestModuleContractInvariants:
     """Higher-level properties that catch drift between functions."""
 
@@ -1177,6 +1346,8 @@ class TestModuleContractInvariants:
         # Sanity-check the most-used paths.
         advance_cases = [
             pt.transition_from_plan({}),
+            pt.transition_from_operational({"verdict": "succeeded"}),
+            pt.transition_from_operational({"verdict": "blocked"}),
             pt.transition_from_ralph({"verdict": "SHIP"}),
             pt.transition_from_summary({}),
             pt.transition_from_push_and_pr({}),
@@ -1211,6 +1382,8 @@ class TestModuleContractInvariants:
             pt.transition_from_fix_ci({"verdict": "BLOCKED"}),
             pt.transition_from_verify({"verdict": "FAILED"}),
             pt.transition_from_awaiting_deploy(deploy_succeeded=False),
+            pt.transition_from_operational({"verdict": "failed"}),
+            pt.transition_from_operational({}),
         ]
         for t in diagnoser_cases:
             assert t.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER, (

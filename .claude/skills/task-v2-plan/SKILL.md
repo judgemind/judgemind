@@ -59,6 +59,7 @@ Write `{worktree}/tmp/dispatcher-output/plan.json` with these fields, then exit 
   "issue_number": <int>,
   "go": true|false,
   "block_reason": null | "<string>",
+  "task_type": "coding" | "operational",
   "plan_text": "<markdown, ≤500 words>",
   "acceptance_criteria": ["<criterion 1>", "<criterion 2>", ...],
   "scope_check": [
@@ -136,6 +137,24 @@ Set `change_type` from this table (used by `/task-v2-verify` to pick the verific
 
 Set `dependencies_to_install` to the packages ralph's worker will need. The daemon runs `scripts/install-package-venv.sh <pkg>` for each entry in the `setup` phase before spawning ralph. Examples: `scraper-framework`, `nlp-pipeline`, `api`, `web`. Empty list for docs-only, terraform-only, or `.claude/`-only changes.
 
+## Step 4.5 — Classify task_type
+
+Set `task_type` to one of two values. This controls which pipeline branch the daemon runs after plan:
+
+| task_type | When | Pipeline |
+|---|---|---|
+| `coding` | The task requires writing or editing code, tests, docs, or config files in the repo (i.e., a PR will be opened). This is the default for any issue that touches source files. | plan → ralph → summary → push+PR → CI → merge → deploy → verify → retro |
+| `operational` | The task requires only running a script, executing a DB query, firing a gh action, adding/removing labels, rebuilding derived data, or any other operational action — **no code change, no PR**. | plan → operational skill → done |
+
+**Decision tree:**
+
+1. Does the acceptance criteria require editing any file tracked in git (Python, TypeScript, SQL, YAML, Markdown, Terraform, shell scripts, skill SKILL.md files)? → `coding`
+2. Does the issue ask to run `rebuild_db.py`, `scripts/ecs-run-task.sh`, `scripts/dev-db-query.sh`, a one-off ECS task, or a gh label/close/comment action only? → `operational`
+3. Does the issue ask to restore a specific county's data, reprocess a batch of documents, backfill derived records, or similar "run a script against the DB" work? → `operational`
+4. Unclear? Default to `coding` — the operational path skips all code-review guardrails, so false-positives here bypass the safety net.
+
+**Important:** When `task_type=operational`, set `dependencies_to_install=[]` (the operational skill does not need a ralph venv). `change_type` should still reflect what kind of system is affected (e.g. `dx_tooling`, `backfill_script`, `no_deployed_component`).
+
 ## Step 5 — Write the plan
 
 For `go=true`, write `plan_text` as ≤500 words of markdown covering:
@@ -190,6 +209,7 @@ For an issue "fix(scraping): Orange County department parsing drops leading zero
 - `scope_check`: one entry for `re.search(r"dept=(\d+)"` grep, `locations_found: ["packages/scraper-framework/src/courts/ca/orange.py:142", "packages/scraper-framework/src/courts/ca/riverside.py:98"]`, `in_scope: false, note: "Riverside uses same pattern — file follow-up to audit all counties"`.
 - `relevant_files`: `["packages/scraper-framework/src/courts/ca/orange.py", "packages/scraper-framework/tests/courts/ca/test_orange.py"]`.
 - `change_type`: `scraper`.
+- `task_type`: `coding`.
 - `dependencies_to_install`: `["scraper-framework"]`.
 - `plan_text`: covers the one-line regex fix, the new regression test against a fixture, the out-of-scope note for Riverside, and the AC verification map.
 - `collapsed_comments`: result of `collapse_comments(issue_comments)` — empty list when no issue comments, or the collapsed/verbatim list otherwise.
@@ -199,6 +219,17 @@ For an issue "docs(agent): add retro phase to task skill" where the task skill d
 
 - `go`: false.
 - `block_reason`: `"issue references .claude/skills/task/SKILL.md §5 but that section was removed in #2710; acceptance criteria need sharpening against current skill structure"`.
+
+For an issue "ops: restore Santa Clara county data after SC outage (#2419)":
+
+- `acceptance_criteria`: `["Santa Clara county rulings are queryable in the DB after rebuild.", "Row count matches pre-outage snapshot."]`
+- `scope_check`: one entry confirming `rebuild_db.py --county "Santa Clara"` is the right script.
+- `relevant_files`: `["scripts/rebuild_db.py", "docs/agent/infrastructure-reference.md"]`.
+- `change_type`: `backfill_script`.
+- `task_type`: `operational`.
+- `dependencies_to_install`: `[]`.
+- `plan_text`: "Run `rebuild_db.py --county 'Santa Clara'` via ECS oneshot. Query derived.rulings to confirm count. Post evidence comment and close issue."
+- `go`: true.
 
 ## Reminders
 

@@ -1311,6 +1311,14 @@ FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: reissue, etc.).
 FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
 
+#: #3507 — the ``/task-v2-operational`` skill returned ``verdict=failed``
+#: or an unrecognized verdict (script errored, DB unreachable, ECS task
+#: timed out, unexpected output). Route through the empowered diagnoser
+#: so it can decide retry / escalate / close the issue. Operational
+#: tasks have no PR to rebuild, so ``respawn_at=operational`` is the
+#: likely directive on a transient failure.
+FAILURE_CATEGORY_OPERATIONAL_FAILED = "operational_failed"
+
 #: daemon-side ``_push_and_open_pr`` pre-push rebase against ``origin/main``
 #: hit a conflict; rebase was aborted and worktree restored. No mechanical
 #: retry — proper LLM-resolution path is the follow-up issue. Tier-3.
@@ -1372,6 +1380,8 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
     # #3465 — rebase exited non-zero with no unmerged files.
     "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
+    # #3507 — operational skill returned failed/unrecognized verdict.
+    "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's
@@ -9468,6 +9478,20 @@ class DispatcherDaemon:
             return
         if self._check_killswitch_and_abort(agent_id, "planning", issue_number):
             return
+        # #3507 — branch on task_type. Operational tasks bypass ralph
+        # entirely and run the operational skill directly. Coding tasks
+        # (or any unrecognized task_type) continue to ralph as before.
+        _plan_output: dict[str, Any] = {}
+        try:
+            _fetched = self._fetch_phase_output(agent_id, "plan")
+            if _fetched is not None:
+                _plan_output = _fetched
+        except Exception:
+            pass  # non-fatal; default to coding path
+        _task_type = str(_plan_output.get("task_type") or "").lower().strip()
+        if _task_type == "operational":
+            self._run_operational_phase(agent_id, issue_number, worktree)
+            return
         ok = self._run_ralph_phase(agent_id, issue_number, worktree)
         if not ok:
             return
@@ -10962,6 +10986,166 @@ class DispatcherDaemon:
             return False
 
         return True
+
+    def _run_operational_phase(
+        self, agent_id: str, issue_number: int, worktree: Path
+    ) -> None:
+        """Run ``/task-v2-operational`` for tasks classified as operational.
+
+        #3507 — Operational tasks (``task_type='operational'``) bypass the
+        ralph → summary → push+PR pipeline. The operational skill executes
+        a script / DB query / gh action directly, posts evidence to the
+        issue, and closes the issue on success. No PR, no CI, no merge.
+
+        Mirrors the structure of :meth:`_run_plan_phase` with three
+        possible outcomes:
+
+        * ``succeeded`` — advance to ``operational_done`` with
+          ``status='succeeded'``.
+        * ``blocked`` — advance to ``operational_failed`` with
+          ``status='needs_review'`` (operator must intervene).
+        * ``failed`` / missing / unrecognized — route through
+          ``_handle_agent_failure`` so the diagnoser picks it up.
+        """
+        from scripts.dispatcher.phase_transitions import transition_from_operational
+
+        self._update_agent_phase(agent_id, "operational")
+
+        # Write the operational input bundle. Mirrors plan_input shape plus
+        # the plan output so the skill has both issue context and the plan.
+        try:
+            bundle = self._fetch_issue_bundle(issue_number)
+        except RuntimeError as exc:
+            self._log.warning(
+                "daemon.operational_issue_fetch_failed",
+                extra={
+                    "event": "operational_issue_fetch_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "detail": str(exc),
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="failed",
+                phase="operational",
+                exit_code=None,
+                issue_number=issue_number,
+            )
+            return
+
+        # Fetch the plan output so the operational skill has full plan context.
+        plan_output: dict[str, Any] = {}
+        try:
+            fetched = self._fetch_phase_output(agent_id, "plan")
+            if fetched is not None:
+                plan_output = fetched
+        except Exception:
+            pass  # non-fatal; the operational skill falls back to issue body
+
+        operational_input = {
+            "agent_id": agent_id,
+            "worktree_path": str(worktree),
+            "repo_root": str(worktree),
+            "plan_text": plan_output.get("plan_text", ""),
+            "acceptance_criteria": plan_output.get("acceptance_criteria", []),
+            **bundle,
+        }
+        self._write_phase_input(worktree, "operational", operational_input)
+
+        exit_code = self._run_subprocess_or_fail(
+            agent_id, "operational", worktree, issue_number=issue_number
+        )
+        if exit_code is None:
+            return
+
+        operational_output = self._read_phase_output(worktree, "operational")
+        if operational_output is None:
+            extra: dict[str, Any] = {
+                "event": "phase_output_missing",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": "operational",
+            }
+            preview = self._extract_log_preview(worktree, "operational")
+            if preview:
+                extra["stderr_preview"] = preview
+            self._log.warning("daemon.phase_output_missing", extra=extra)
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="operational",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail=preview or "",
+                exit_code=exit_code,
+                details={"missing_phase_output": "operational"},
+                issue_number=issue_number,
+            )
+            return
+
+        self._persist_phase_output(
+            agent_id,
+            "operational",
+            operational_output,
+            log_text=self._read_full_phase_log(worktree, "operational") or None,
+            usage=self._parse_phase_usage(worktree, "operational"),
+        )
+
+        transition = transition_from_operational(operational_output)
+        self._log.info(
+            "daemon.operational_phase_transition",
+            extra={
+                "event": "operational_phase_transition",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "action": transition.action.value,
+                "next_phase": transition.next_phase,
+                "terminal_status": transition.terminal_status,
+                "failure_hint": transition.failure_hint,
+            },
+        )
+
+        if transition.action.value == "advance_with_status":
+            self._mark_agent_terminal(
+                agent_id,
+                status=transition.terminal_status or "succeeded",
+                phase=transition.next_phase or "operational_done",
+                exit_code=exit_code,
+                issue_number=issue_number,
+            )
+        elif transition.action.value == "route_to_diagnoser":
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="operational",
+                category=FAILURE_CATEGORY_OPERATIONAL_FAILED,
+                stderr_tail=self._extract_log_preview(worktree, "operational") or "",
+                exit_code=exit_code,
+                details={
+                    "verdict": operational_output.get("verdict"),
+                    "block_reason": operational_output.get("block_reason"),
+                    "evidence_md": operational_output.get("evidence_md"),
+                },
+                issue_number=issue_number,
+            )
+        else:
+            # Unrecognized transition — crash the agent so the operator sees it.
+            self._log.error(
+                "daemon.operational_transition_unrecognized",
+                extra={
+                    "event": "operational_transition_unrecognized",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "action": transition.action.value,
+                },
+            )
+            self._mark_agent_terminal(
+                agent_id,
+                status="crashed",
+                phase="operational",
+                exit_code=exit_code,
+                issue_number=issue_number,
+            )
 
     def _run_ralph_phase(
         self, agent_id: str, issue_number: int, worktree: Path
