@@ -15,9 +15,9 @@
 -- See: #3595
 
 CREATE INDEX IF NOT EXISTS idx_rulings_judge_dept
-    ON rulings (judge_id, department) WHERE department IS NOT NULL;
+    ON derived.rulings (judge_id, department) WHERE department IS NOT NULL;
 
 
 -- Down Migration
 
-DROP INDEX IF EXISTS idx_rulings_judge_dept;
+DROP INDEX IF EXISTS derived.idx_rulings_judge_dept;
