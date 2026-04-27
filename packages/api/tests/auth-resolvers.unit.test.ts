@@ -12,6 +12,22 @@ import type { QueryResult } from 'pg';
 import type { FastifyReply } from 'fastify';
 
 // ---------------------------------------------------------------------------
+// Mock google-auth-library
+// ---------------------------------------------------------------------------
+
+// verifyIdToken mock — tests override this via vi.mocked(mockVerifyIdToken)
+const mockVerifyIdToken = vi.fn();
+const mockGetPayload = vi.fn();
+
+vi.mock('google-auth-library', () => {
+  return {
+    OAuth2Client: vi.fn().mockImplementation(() => ({
+      verifyIdToken: mockVerifyIdToken,
+    })),
+  };
+});
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -47,6 +63,12 @@ function fakeGoogleIdToken(payload: Record<string, unknown>): string {
   return `${header}.${body}.fakesig`;
 }
 
+/** Create a mock ticket returned by verifyIdToken. */
+function makeTicket(payload: Record<string, unknown> | null) {
+  mockGetPayload.mockReturnValue(payload);
+  return { getPayload: mockGetPayload };
+}
+
 // ---------------------------------------------------------------------------
 // Tests for completeGoogleAuth
 // ---------------------------------------------------------------------------
@@ -64,6 +86,8 @@ describe('completeGoogleAuth — unit tests', () => {
     originalFetch = globalThis.fetch;
     originalClientId = process.env.GOOGLE_CLIENT_ID;
     originalClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    mockVerifyIdToken.mockReset();
+    mockGetPayload.mockReset();
   });
 
   afterEach(() => {
@@ -87,14 +111,17 @@ describe('completeGoogleAuth — unit tests', () => {
     const googlePayload = {
       sub: 'google-123',
       email: 'newuser@gmail.com',
+      email_verified: true,
       name: 'New User',
     };
 
-    // Mock fetch for Google token exchange
+    // Mock fetch for Google token exchange — verifyIdToken mock handles payload extraction
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ id_token: fakeGoogleIdToken(googlePayload) }),
     } as Response);
+
+    mockVerifyIdToken.mockResolvedValue(makeTicket(googlePayload));
 
     const newUser = {
       id: 'user-uuid-1',
@@ -129,6 +156,8 @@ describe('completeGoogleAuth — unit tests', () => {
     expect(result.user.email).toBe('newuser@gmail.com');
     expect(result.user.displayName).toBe('New User');
     expect(globalThis.fetch).toHaveBeenCalledOnce();
+    // Verify verifyIdToken was called (not raw base64 decode)
+    expect(mockVerifyIdToken).toHaveBeenCalledOnce();
     // Verify refresh token cookie was set
     expect(reply.header).toHaveBeenCalled();
   });
@@ -141,6 +170,7 @@ describe('completeGoogleAuth — unit tests', () => {
     const googlePayload = {
       sub: 'google-456',
       email: 'existing@gmail.com',
+      email_verified: true,
       name: 'Existing User',
     };
 
@@ -148,6 +178,8 @@ describe('completeGoogleAuth — unit tests', () => {
       ok: true,
       json: async () => ({ id_token: fakeGoogleIdToken(googlePayload) }),
     } as Response);
+
+    mockVerifyIdToken.mockResolvedValue(makeTicket(googlePayload));
 
     const existingUser = {
       id: 'user-uuid-2',
@@ -199,6 +231,7 @@ describe('completeGoogleAuth — unit tests', () => {
     const googlePayload = {
       sub: 'google-789',
       email: 'linked@gmail.com',
+      email_verified: true,
       name: 'Linked User',
     };
 
@@ -206,6 +239,8 @@ describe('completeGoogleAuth — unit tests', () => {
       ok: true,
       json: async () => ({ id_token: fakeGoogleIdToken(googlePayload) }),
     } as Response);
+
+    mockVerifyIdToken.mockResolvedValue(makeTicket(googlePayload));
 
     const existingUser = {
       id: 'user-uuid-3',
@@ -297,6 +332,76 @@ describe('completeGoogleAuth — unit tests', () => {
     await expect(
       resolvers.Mutation.completeGoogleAuth({}, { code: 'auth-code' }, ctx),
     ).rejects.toThrow('Google OAuth is not configured');
+  });
+
+  it('throws when email_verified is false (AC #2)', async () => {
+    process.env.GOOGLE_CLIENT_ID = 'test-client-id';
+    process.env.GOOGLE_CLIENT_SECRET = 'test-client-secret';
+    const resolvers = await loadResolvers();
+
+    const googlePayload = {
+      sub: 'google-unverified',
+      email: 'unverified@gmail.com',
+      email_verified: false,
+      name: 'Unverified User',
+    };
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id_token: fakeGoogleIdToken(googlePayload) }),
+    } as Response);
+
+    mockVerifyIdToken.mockResolvedValue(makeTicket(googlePayload));
+
+    const pool = mockPool([]);
+    const reply = mockReply();
+    const ctx = { pool, reply, user: null, ip: '127.0.0.1', cookieHeader: '' };
+
+    await expect(
+      resolvers.Mutation.completeGoogleAuth({}, { code: 'auth-code-unverified' }, ctx),
+    ).rejects.toThrow('Google account email is not verified');
+  });
+
+  it('throws when verifyIdToken rejects with audience error (AC #3)', async () => {
+    process.env.GOOGLE_CLIENT_ID = 'test-client-id';
+    process.env.GOOGLE_CLIENT_SECRET = 'test-client-secret';
+    const resolvers = await loadResolvers();
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id_token: 'header.payload.sig' }),
+    } as Response);
+
+    mockVerifyIdToken.mockRejectedValue(new Error('Token audience mismatch'));
+
+    const pool = mockPool([]);
+    const reply = mockReply();
+    const ctx = { pool, reply, user: null, ip: '127.0.0.1', cookieHeader: '' };
+
+    await expect(
+      resolvers.Mutation.completeGoogleAuth({}, { code: 'auth-code-bad-aud' }, ctx),
+    ).rejects.toThrow('Invalid Google ID token');
+  });
+
+  it('throws when verifyIdToken returns null payload', async () => {
+    process.env.GOOGLE_CLIENT_ID = 'test-client-id';
+    process.env.GOOGLE_CLIENT_SECRET = 'test-client-secret';
+    const resolvers = await loadResolvers();
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id_token: 'header.payload.sig' }),
+    } as Response);
+
+    mockVerifyIdToken.mockResolvedValue(makeTicket(null));
+
+    const pool = mockPool([]);
+    const reply = mockReply();
+    const ctx = { pool, reply, user: null, ip: '127.0.0.1', cookieHeader: '' };
+
+    await expect(
+      resolvers.Mutation.completeGoogleAuth({}, { code: 'auth-code-null-payload' }, ctx),
+    ).rejects.toThrow('Invalid Google ID token');
   });
 });
 
