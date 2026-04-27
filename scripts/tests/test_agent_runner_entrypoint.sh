@@ -4737,14 +4737,14 @@ for _ev in fix_conflict_handler_done fix_conflict_persist_done \
 done
 
 # ══════════════════════════════════════════════════════════════════════════
-# DEPLOY_WORKFLOWS default — static regression guard (#3185)
+# DEPLOY_WORKFLOW_NAMES_BASH default — static regression guard (#3185, #3514)
 # ══════════════════════════════════════════════════════════════════════════
 
-if grep -qE '^DEPLOY_WORKFLOWS=.*deploy-agent-runner\.yml' "$ENTRYPOINT"; then
-    pass "#3185 — DEPLOY_WORKFLOWS default includes deploy-agent-runner.yml"
+if grep -qE '^DEPLOY_WORKFLOW_NAMES_BASH=.*Deploy Agent Runner' "$ENTRYPOINT"; then
+    pass "#3185 — DEPLOY_WORKFLOW_NAMES_BASH default includes 'Deploy Agent Runner'"
 else
-    fail "#3185 — DEPLOY_WORKFLOWS default includes deploy-agent-runner.yml" \
-         "deploy-agent-runner.yml not found in DEPLOY_WORKFLOWS default in $ENTRYPOINT"
+    fail "#3185 — DEPLOY_WORKFLOW_NAMES_BASH default includes 'Deploy Agent Runner'" \
+         "'Deploy Agent Runner' not found in DEPLOY_WORKFLOW_NAMES_BASH default in $ENTRYPOINT"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -5721,6 +5721,182 @@ if [[ ! -f "$t59_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t5
 else
     fail "#3507 T59 [operational failed] — advance_phase not called on route_to_diagnoser" \
          "advance-log: $(cat "$t59_state_dir/advance-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 60a (#3514 regression): prior completed-success run with DIFFERENT
+# headSha + actual run for merge_sha with IN_PROGRESS → deploy_state=pending.
+#
+# This reproduces the exact production failure from PR #3509: gh returns
+# both a prior run (different SHA, COMPLETED/SUCCESS) and the current run
+# (matching SHA, IN_PROGRESS). The matcher must filter by headSha so the
+# prior completed run does NOT advance the phase prematurely.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60a.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+# The default gh pr view fixture has mergeCommit.oid = "deadbeefcafe".
+# The prior run has a DIFFERENT headSha to exercise the filter.
+t60a_runs="$TEST_TMP/t60a-runs.json"
+cat > "$t60a_runs" <<'EOF'
+[
+  {"databaseId": 100, "workflowName": "Deploy Agent Runner", "status": "COMPLETED", "conclusion": "SUCCESS", "createdAt": "2026-04-01T03:00:00Z", "headSha": "aabbccddeeff0011"},
+  {"databaseId": 101, "workflowName": "Deploy Agent Runner", "status": "IN_PROGRESS", "conclusion": null, "createdAt": "2026-04-27T03:02:00Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t60a_workspace="$TEST_TMP/t60a-workspace"
+set +e
+t60a_out=$(run_post_pr_phase "awaiting_deploy" "$t60a_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60a_runs" \
+    "AGENT_RUNNER_AWAITING_DEPLOY_TIMEOUT_SECONDS=0" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+if printf '%s' "$t60a_out" | grep -q "awaiting_deploy_timeout"; then
+    pass "#3514 T60a — prior completed-success with different headSha → pending → timeout (not premature success)"
+else
+    fail "#3514 T60a — prior completed-success with different headSha → pending → timeout (not premature success)" \
+         "out tail: $(printf '%s' "$t60a_out" | tail -c 600)"
+fi
+
+# Phase must NOT advance to verify (no premature success).
+_t60a_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t60a_final" != "verify" ]]; then
+    pass "#3514 T60a — phase does NOT advance to verify on prior-sha match"
+else
+    fail "#3514 T60a — phase does NOT advance to verify on prior-sha match" \
+         "phase advanced to: $_t60a_final"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 60b (#3514 regression): empty match-set → grace window → verify.
+#
+# No deploy runs exist yet for the merge SHA. The matcher returns "none"
+# and after the grace window elapses the agent advances to verify
+# (docs-only PR semantic). This documents and locks the current behaviour.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60b.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t60b_runs="$TEST_TMP/t60b-runs.json"
+printf '[]' > "$t60b_runs"
+
+t60b_workspace="$TEST_TMP/t60b-workspace"
+set +e
+t60b_out=$(run_post_pr_phase "awaiting_deploy" "$t60b_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60b_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0")
+set -e
+
+if printf '%s' "$t60b_out" | grep -q "awaiting_deploy_no_runs"; then
+    pass "#3514 T60b — empty match-set → no_runs branch hit"
+else
+    fail "#3514 T60b — empty match-set → no_runs branch hit" \
+         "out tail: $(printf '%s' "$t60b_out" | tail -c 500)"
+fi
+
+if grep -q "SET phase = \\\\'verify\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3514 T60b — empty match-set → advances to verify"
+else
+    fail "#3514 T60b — empty match-set → advances to verify" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 60c (#3514 regression): two-run fixture — one COMPLETED+SUCCESS
+# Deploy Agent Runner + one IN_PROGRESS Deploy Dispatcher, both with
+# matching merge_sha → deploy_state=pending (any in_progress blocks success).
+#
+# This is the exact production failure scenario from PR #3509.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60c.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t60c_runs="$TEST_TMP/t60c-runs.json"
+cat > "$t60c_runs" <<'EOF'
+[
+  {"databaseId": 200, "workflowName": "Deploy Agent Runner", "status": "COMPLETED", "conclusion": "SUCCESS", "createdAt": "2026-04-27T03:02:47Z", "headSha": "deadbeefcafe"},
+  {"databaseId": 201, "workflowName": "Deploy Dispatcher", "status": "IN_PROGRESS", "conclusion": null, "createdAt": "2026-04-27T03:02:50Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t60c_workspace="$TEST_TMP/t60c-workspace"
+set +e
+t60c_out=$(run_post_pr_phase "awaiting_deploy" "$t60c_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60c_runs" \
+    "AGENT_RUNNER_AWAITING_DEPLOY_TIMEOUT_SECONDS=0" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+if printf '%s' "$t60c_out" | grep -q "awaiting_deploy_timeout"; then
+    pass "#3514 T60c — two-run fixture (one SUCCESS, one IN_PROGRESS) → pending → timeout"
+else
+    fail "#3514 T60c — two-run fixture (one SUCCESS, one IN_PROGRESS) → pending → timeout" \
+         "out tail: $(printf '%s' "$t60c_out" | tail -c 600)"
+fi
+
+_t60c_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t60c_final" != "verify" ]]; then
+    pass "#3514 T60c — phase does NOT advance to verify while Deploy Dispatcher in_progress"
+else
+    fail "#3514 T60c — phase does NOT advance to verify while Deploy Dispatcher in_progress" \
+         "phase advanced to: $_t60c_final"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test 60d (#3514 regression): matching headSha COMPLETED+SUCCESS →
+# deploy_state=success → phase advances to verify.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60d.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t60d_runs="$TEST_TMP/t60d-runs.json"
+cat > "$t60d_runs" <<'EOF'
+[
+  {"databaseId": 300, "workflowName": "Deploy Agent Runner", "status": "COMPLETED", "conclusion": "SUCCESS", "createdAt": "2026-04-27T03:05:00Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t60d_workspace="$TEST_TMP/t60d-workspace"
+set +e
+t60d_out=$(run_post_pr_phase "awaiting_deploy" "$t60d_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60d_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+if printf '%s' "$t60d_out" | grep -q 'deploy_state.*success\|"deploy_state": "success"'; then
+    pass "#3514 T60d — matching headSha COMPLETED+SUCCESS → deploy_state=success"
+else
+    fail "#3514 T60d — matching headSha COMPLETED+SUCCESS → deploy_state=success" \
+         "out tail: $(printf '%s' "$t60d_out" | tail -c 600)"
+fi
+
+if grep -q "SET phase = \\\\'verify\\\\'" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3514 T60d — deploy success → phase advances to verify"
+else
+    fail "#3514 T60d — deploy success → phase advances to verify" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

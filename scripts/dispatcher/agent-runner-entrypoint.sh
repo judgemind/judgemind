@@ -3648,12 +3648,18 @@ FIX_CONFLICT_MAX_ATTEMPTS="${AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS:-2}"
 # daemon.py.
 STALE_ROLLUP_MARKER="base branch policy prohibits the merge"
 
-# Deploy workflow filenames we watch on the merge SHA. Mirrors the
-# ``DEPLOY_WORKFLOW_NAMES`` frozenset in daemon.py (which reads
-# ``workflowName``); the entrypoint queries by workflow-file path
-# instead (``--workflow <file>.yml``) because bash stubs can match
-# file names more reliably than display names.
-DEPLOY_WORKFLOWS="${AGENT_RUNNER_DEPLOY_WORKFLOWS:-deploy-api.yml deploy-dispatcher.yml deploy-scraper.yml deploy-production.yml deploy-production-web.yml terraform.yml deploy-agent-runner.yml}"
+# Deploy workflow display names we watch on the merge SHA. Must match
+# the ``name:`` field in each ``.github/workflows/`` file. Mirrors the
+# ``DEPLOY_WORKFLOW_NAMES`` frozenset in daemon.py exactly — both paths
+# post-filter ``gh run list`` output by ``workflowName``.
+#
+# IMPORTANT (#3514): we intentionally do NOT use multi-``--workflow``
+# flags with ``gh run list``. The ``-w``/``--workflow`` flag is
+# single-valued; when invoked multiple times only the LAST value is
+# honoured, silently dropping all other workflows from the result.
+# Instead we fetch all runs for the commit and post-filter by
+# ``workflowName`` via ``jq``. See ``find_deploy_runs`` below.
+DEPLOY_WORKFLOW_NAMES_BASH="${AGENT_RUNNER_DEPLOY_WORKFLOW_NAMES:-Deploy API|Deploy Dispatcher|Deploy Scraper|Deploy Production|Deploy Production (Web)|Terraform|Deploy Agent Runner}"
 
 read_pr_number() {
     # Query ``dispatcher.agents.pr_number`` for the current agent.
@@ -4308,32 +4314,50 @@ handle_merge() {
 }
 
 find_deploy_runs() {
-    # $1 = merge SHA. Writes the JSON array response from
-    # ``gh run list --commit <sha> --workflow <w1> --workflow <w2> ...
-    # --json databaseId,workflowName,status,conclusion,createdAt``
-    # to ``$AGENT_WORKSPACE/deploy-runs.json``. On failure writes ``[]``.
+    # $1 = merge SHA. Fetches ``gh run list --commit <sha>`` (no
+    # ``--workflow`` flags — see note below) and post-filters the JSON
+    # via ``jq`` to keep only entries whose ``workflowName`` is in
+    # ``$DEPLOY_WORKFLOW_NAMES_BASH`` AND whose ``headSha`` equals the
+    # merge SHA. Writes the filtered array to
+    # ``$AGENT_WORKSPACE/deploy-runs.json``. On failure writes ``[]``.
+    #
+    # NOTE (#3514): multi-``--workflow`` is intentionally NOT used here.
+    # ``gh run list --workflow`` is single-valued; when multiple ``-w``
+    # flags are passed, only the last value is honoured and all other
+    # workflows are silently dropped from the result. This caused the
+    # awaiting_deploy false-positive in PR #3509 where Deploy Dispatcher
+    # was excluded from the match set while still in_progress. We
+    # instead fetch all runs for the commit and post-filter by display
+    # name, mirroring daemon.py's ``_find_deploy_runs``.
     _sha="$1"
     _out_file="$AGENT_WORKSPACE/deploy-runs.json"
-    # Build the --workflow flag list from $DEPLOY_WORKFLOWS (space-
-    # separated file names). Bash 3.2: use positional args.
-    set --
-    for _w in $DEPLOY_WORKFLOWS; do
-        set -- "$@" --workflow "$_w"
-    done
+    _raw_file="$AGENT_WORKSPACE/deploy-runs-raw.json"
     set +e
     gh run list \
         --repo judgemind/judgemind \
         --commit "$_sha" \
-        "$@" \
-        --json databaseId,workflowName,status,conclusion,createdAt \
+        --json databaseId,workflowName,status,conclusion,createdAt,headSha \
         --limit 20 \
-        > "$_out_file" \
+        > "$_raw_file" \
         2> "$AGENT_WORKSPACE/gh-run-list.stderr.log"
     _gh_rc=$?
     set -e
     if [[ "$_gh_rc" -ne 0 ]]; then
         printf '[]' > "$_out_file"
+        return 0
     fi
+    # Post-filter: keep only entries whose workflowName is in the deploy
+    # names list and whose headSha matches the merge SHA (defensive
+    # guard — ``--commit`` already filters server-side, but gh may
+    # return runs for nearby commits under edge-case pagination).
+    _names_pipe="$DEPLOY_WORKFLOW_NAMES_BASH"
+    jq --arg sha "$_sha" --arg names_pipe "$_names_pipe" \
+        '[.[] | select(
+            (.workflowName as $n | ($names_pipe | split("|") | index($n)) != null)
+            and .headSha == $sha
+        )]' \
+        "$_raw_file" > "$_out_file" 2>/dev/null \
+        || printf '[]' > "$_out_file"
     return 0
 }
 
@@ -4382,9 +4406,31 @@ handle_awaiting_deploy() {
                 "pr=$_pr_number poll_count=$_poll_count last_state=$_last_state"
             return 0
         fi
+        _now_poll_ts=$(date -u +%s)
+        _elapsed_poll=$((_now_poll_ts - _start_ts))
         if [[ -n "$_merge_sha" ]]; then
             find_deploy_runs "$_merge_sha"
             _state=$(classify_deploy_runs "$AGENT_WORKSPACE/deploy-runs.json")
+            # Per-poll structured detail log: one line per matched run
+            # plus a summary. Visible in CloudWatch as awaiting_deploy_poll_detail.
+            # Satisfies AC#5 (instrumentation: merge_sha, matched_run_count,
+            # run_id, run_head_sha, run_status, run_conclusion, elapsed_seconds).
+            _matched_count=$(jq 'if type == "array" then length else 0 end' \
+                "$AGENT_WORKSPACE/deploy-runs.json" 2>/dev/null || printf '0')
+            log "awaiting_deploy_poll_detail" \
+                "pr_number=$_pr_number" \
+                "merge_sha=$_merge_sha" \
+                "deploy_state=$_state" \
+                "matched_run_count=$_matched_count" \
+                "elapsed_seconds=$_elapsed_poll"
+            # Log individual run details for observability.
+            if [[ -s "$AGENT_WORKSPACE/deploy-runs.json" ]]; then
+                jq -r '.[] | "run_id=\(.databaseId) run_head_sha=\(.headSha // "?") run_status=\(.status // "?") run_conclusion=\(.conclusion // "?") workflow=\(.workflowName // "?")"' \
+                    "$AGENT_WORKSPACE/deploy-runs.json" 2>/dev/null \
+                    | while IFS= read -r _run_line; do
+                        log "awaiting_deploy_run_detail" "pr_number=$_pr_number" "$_run_line"
+                    done
+            fi
         else
             _state="pending"
         fi

@@ -306,6 +306,54 @@ class TestDeployWorkflowNamesContents:
 
 
 # --------------------------------------------------------------------------
+# _find_deploy_runs — regression guard: no --workflow flag (#3514)
+# --------------------------------------------------------------------------
+
+
+class TestFindDeployRuns_MultiWorkflowGuard:
+    """Regression guard (#3514): daemon._find_deploy_runs must NOT pass any
+    ``--workflow`` flag to ``gh run list``.
+
+    The ``-w``/``--workflow`` flag is single-valued; when multiple flags are
+    passed only the LAST value is honoured, silently dropping all other
+    workflows.  The ECS entrypoint had this bug (fixed in the same PR).
+    This class ensures daemon.py's ``_find_deploy_runs`` never regresses to
+    the entrypoint.sh pattern.
+    """
+
+    def test_no_workflow_flag_in_gh_run_list(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        captured_cmds: list[list[str]] = []
+
+        def fake_run(
+            cmd: list[str], *args: Any, **kwargs: Any
+        ) -> subprocess.CompletedProcess:
+            captured_cmds.append(list(cmd))
+            r: subprocess.CompletedProcess = subprocess.CompletedProcess(cmd, 0)
+            r.stdout = "[]"
+            r.stderr = ""
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        d, _conn, _handler = _make_daemon(tmp_path)
+        d._find_deploy_runs("deadbeefcafe0011")
+
+        # At least one ``gh run list`` call must have been made.
+        gh_run_list_calls = [c for c in captured_cmds if c[:3] == ["gh", "run", "list"]]
+        assert gh_run_list_calls, (
+            "_find_deploy_runs must invoke 'gh run list'; no such call captured"
+        )
+        # None of the gh run list calls may contain --workflow.
+        for cmd in gh_run_list_calls:
+            assert "--workflow" not in cmd, (
+                f"daemon._find_deploy_runs passed '--workflow' to gh run list — "
+                f"this reintroduces the #3514 bug where only the last workflow "
+                f"is matched.  Post-filter by workflowName instead.  cmd={cmd}"
+            )
+
+
+# --------------------------------------------------------------------------
 # _extract_merge_sha
 # --------------------------------------------------------------------------
 
