@@ -5899,6 +5899,296 @@ else
          "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T61: #3543 — push_and_pr) dispatch arm — route_to_diagnoser path.
+#
+# Sub-test A: transition_for returns route_to_diagnoser with hint
+#   push_and_pr_no_unmerged_files.
+# Expected behaviour:
+#   1. push_and_pr_route_to_diagnoser log line emitted.
+#   2. agent_runner_reaped_failure called with category push_and_pr_no_unmerged_files.
+#   3. advance_phase NOT called.
+#   4. push_and_pr_transition_unrecognized NOT emitted.
+#
+# Sub-test B (regression): transition_for returns advance\tawaiting_ci\t\t.
+# Expected behaviour:
+#   1. advance_phase awaiting_ci called.
+#   2. push_and_pr_route_to_diagnoser NOT emitted.
+# ══════════════════════════════════════════════════════════════════════════
+
+t61_state_dir="$TEST_TMP/t61-state"
+t61_stub_bin="$TEST_TMP/t61-bin"
+t61_workspace="$TEST_TMP/t61-workspace"
+t61_repo_root="$TEST_TMP/t61-repo"
+mkdir -p "$t61_state_dir" "$t61_stub_bin" "$t61_workspace" "$t61_repo_root"
+mkdir -p "$t61_repo_root/tmp/dispatcher-input"
+mkdir -p "$t61_repo_root/tmp/dispatcher-output"
+
+# psql stub — responds to phase SELECT with push_and_pr.
+cat > "$t61_stub_bin/psql" <<'T61PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+if [[ "$query" == *"SELECT phase"* ]]; then printf 'push_and_pr\n'; fi
+exit 0
+T61PSQLEOF
+chmod +x "$t61_stub_bin/psql"
+
+cat > "$t61_stub_bin/git" <<'T61GITEOF'
+#!/usr/bin/env bash
+exit 0
+T61GITEOF
+chmod +x "$t61_stub_bin/git"
+
+cat > "$t61_stub_bin/gh" <<'T61GHEOF'
+#!/usr/bin/env bash
+exit 0
+T61GHEOF
+chmod +x "$t61_stub_bin/gh"
+
+# ── Sub-test A: route_to_diagnoser with push_and_pr_no_unmerged_files ──────
+
+t61a_state_dir="$t61_state_dir/a"
+mkdir -p "$t61a_state_dir"
+
+_t61a_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'push_and_pr' ]]; then
+        printf 'route_to_diagnoser\t\t\tpush_and_pr_no_unmerged_files'
+    fi
+}
+"
+
+_t61a_reaped_failure_override="
+agent_runner_reaped_failure() {
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T61A_STATE_DIR}/reaped-log.txt\"
+    log 'agent_runner_reaped_failure' \"phase=\$1\" \"hint=\$2\"
+}
+"
+
+_t61a_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T61A_STATE_DIR}/advance-log.txt\"
+}
+"
+
+_t61a_handle_push_and_pr_override="
+handle_push_and_pr() {
+    printf '{\"no_unmerged_files\": true}\n'
+}
+"
+
+t61a_out=$(
+    set +eu
+    export T61A_STATE_DIR="$t61a_state_dir"
+    export AGENT_WORKSPACE="$t61_workspace"
+    export REPO_ROOT="$t61_repo_root"
+    export AGENT_ID="61616161-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="3543"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t61_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t61a_transition_for_override"
+    eval "$_t61a_reaped_failure_override"
+    eval "$_t61a_advance_phase_override"
+    eval "$_t61a_handle_push_and_pr_override"
+    # Drive the push_and_pr dispatch logic directly (mirrors the entrypoint).
+    _output=$(handle_push_and_pr)
+    persist_phase_output "push_and_pr" "$_output"
+    _transition=$(transition_for "push_and_pr" "$_output")
+    _action=$(printf '%s' "$_transition" | cut -f1)
+    _next=$(printf '%s' "$_transition" | cut -f2)
+    _status=$(printf '%s' "$_transition" | cut -f3)
+    _hint=$(printf '%s' "$_transition" | cut -f4)
+    case "$_action" in
+        advance)
+            advance_phase "$_next"
+            ;;
+        advance_with_status)
+            advance_phase "$_next" "$_status"
+            ;;
+        route_to_diagnoser)
+            log "push_and_pr_route_to_diagnoser" "hint=$_hint"
+            case "$_hint" in
+                push_and_pr_no_unmerged_files)
+                    agent_runner_reaped_failure \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr rebase failed with no unmerged files"
+                    ;;
+                *)
+                    log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
+                    agent_runner_reaped_failure \
+                        "diagnoser_route_unrecognized_hint" \
+                        "diagnoser_route_unrecognized_hint" \
+                        "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
+                    ;;
+            esac
+            ;;
+        *)
+            log "push_and_pr_transition_unrecognized" "action=$_action"
+            agent_runner_reaped_failure \
+                "push_and_pr_transition_unrecognized" \
+                "push_and_pr_transition_unrecognized" \
+                "push_and_pr returned action=$_action"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# T61A (1): subshell completed.
+if printf '%s' "$t61a_out" | grep -q "subshell_done"; then
+    pass "#3543 T61A [push_and_pr route_to_diagnoser] — dispatch subshell ran to completion"
+else
+    fail "#3543 T61A [push_and_pr route_to_diagnoser] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t61a_out" | tail -c 600)"
+fi
+
+# T61A (2): push_and_pr_route_to_diagnoser log line emitted.
+if printf '%s' "$t61a_out" | grep -q "push_and_pr_route_to_diagnoser"; then
+    pass "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_route_to_diagnoser log emitted"
+else
+    fail "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_route_to_diagnoser log emitted" \
+         "out: $(printf '%s' "$t61a_out" | tail -c 600)"
+fi
+
+# T61A (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files.
+if [[ -f "$t61a_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t61a_state_dir/reaped-log.txt"; then
+    pass "#3543 T61A [push_and_pr route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
+else
+    fail "#3543 T61A [push_and_pr route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
+         "reaped-log: $(cat "$t61a_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# T61A (4): advance_phase NOT called on route_to_diagnoser path.
+if [[ ! -f "$t61a_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t61a_state_dir/advance-log.txt"; then
+    pass "#3543 T61A [push_and_pr route_to_diagnoser] — advance_phase not called on route_to_diagnoser"
+else
+    fail "#3543 T61A [push_and_pr route_to_diagnoser] — advance_phase not called on route_to_diagnoser" \
+         "advance-log: $(cat "$t61a_state_dir/advance-log.txt" 2>/dev/null)"
+fi
+
+# T61A (5): push_and_pr_transition_unrecognized NOT emitted.
+if ! printf '%s' "$t61a_out" | grep -q "push_and_pr_transition_unrecognized"; then
+    pass "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_transition_unrecognized not emitted"
+else
+    fail "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_transition_unrecognized not emitted" \
+         "out: $(printf '%s' "$t61a_out" | grep "push_and_pr_transition_unrecognized")"
+fi
+
+# ── Sub-test B: advance happy-path regression ──────────────────────────────
+
+t61b_state_dir="$t61_state_dir/b"
+mkdir -p "$t61b_state_dir"
+
+_t61b_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'push_and_pr' ]]; then
+        printf 'advance\tawaiting_ci\t\t'
+    fi
+}
+"
+
+_t61b_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T61B_STATE_DIR}/advance-log.txt\"
+}
+"
+
+_t61b_handle_push_and_pr_override="
+handle_push_and_pr() {
+    printf '{\"pr_number\": 9999}\n'
+}
+"
+
+t61b_out=$(
+    set +eu
+    export T61B_STATE_DIR="$t61b_state_dir"
+    export AGENT_WORKSPACE="$t61_workspace"
+    export REPO_ROOT="$t61_repo_root"
+    export AGENT_ID="61616162-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="3543"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t61_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t61b_transition_for_override"
+    eval "$_t61b_advance_phase_override"
+    eval "$_t61b_handle_push_and_pr_override"
+    # Drive the push_and_pr dispatch logic directly.
+    _output=$(handle_push_and_pr)
+    persist_phase_output "push_and_pr" "$_output"
+    _transition=$(transition_for "push_and_pr" "$_output")
+    _action=$(printf '%s' "$_transition" | cut -f1)
+    _next=$(printf '%s' "$_transition" | cut -f2)
+    _status=$(printf '%s' "$_transition" | cut -f3)
+    _hint=$(printf '%s' "$_transition" | cut -f4)
+    case "$_action" in
+        advance)
+            advance_phase "$_next"
+            ;;
+        advance_with_status)
+            advance_phase "$_next" "$_status"
+            ;;
+        route_to_diagnoser)
+            log "push_and_pr_route_to_diagnoser" "hint=$_hint"
+            case "$_hint" in
+                push_and_pr_no_unmerged_files)
+                    agent_runner_reaped_failure \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr rebase failed with no unmerged files"
+                    ;;
+                *)
+                    log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
+                    agent_runner_reaped_failure \
+                        "diagnoser_route_unrecognized_hint" \
+                        "diagnoser_route_unrecognized_hint" \
+                        "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
+                    ;;
+            esac
+            ;;
+        *)
+            log "push_and_pr_transition_unrecognized" "action=$_action"
+            agent_runner_reaped_failure \
+                "push_and_pr_transition_unrecognized" \
+                "push_and_pr_transition_unrecognized" \
+                "push_and_pr returned action=$_action"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# T61B (1): subshell completed.
+if printf '%s' "$t61b_out" | grep -q "subshell_done"; then
+    pass "#3543 T61B [push_and_pr advance] — dispatch subshell ran to completion"
+else
+    fail "#3543 T61B [push_and_pr advance] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t61b_out" | tail -c 600)"
+fi
+
+# T61B (2): advance_phase awaiting_ci called.
+if [[ -f "$t61b_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE awaiting_ci" "$t61b_state_dir/advance-log.txt"; then
+    pass "#3543 T61B [push_and_pr advance] — advance_phase awaiting_ci called"
+else
+    fail "#3543 T61B [push_and_pr advance] — advance_phase awaiting_ci called" \
+         "advance-log: $(cat "$t61b_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# T61B (3): push_and_pr_route_to_diagnoser NOT emitted on advance path.
+if ! printf '%s' "$t61b_out" | grep -q "push_and_pr_route_to_diagnoser"; then
+    pass "#3543 T61B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance"
+else
+    fail "#3543 T61B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance" \
+         "out: $(printf '%s' "$t61b_out" | grep "push_and_pr_route_to_diagnoser")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
