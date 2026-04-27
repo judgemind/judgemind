@@ -68,6 +68,9 @@ def _make_worker() -> tuple[IngestionWorker, MagicMock]:
         s3_client=s3_mock,
         archive_bucket="test-bucket",
     )
+    # Disable enrichment client by default so process_event tests don't trigger
+    # live LLM calls that now raise LlmEnrichmentExhaustedError.
+    worker._enrichment_client = None
     return worker, os_mock
 
 

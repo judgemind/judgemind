@@ -664,6 +664,83 @@ def _summarize_validation_results(conn: Any, started_at: datetime) -> dict[str, 
         }
 
 
+def _check_null_motion_rate(
+    conn: Any,
+    started_at: datetime,
+    *,
+    county: str | None = None,
+    min_denominator: int = 50,
+    threshold: float = 0.02,
+) -> dict[str, Any]:
+    """Query null-motion rate among long-text rulings since *started_at*.
+
+    Returns a dict with keys ``null_motion``, ``long_text_count``, and
+    ``exceeds_threshold`` (bool).  Returns all-zero sentinel on any DB failure
+    so a connectivity issue does not block the rebuild exit path.
+
+    Parameters
+    ----------
+    conn :
+        Open psycopg connection.
+    started_at :
+        Timestamp marking the start of the rebuild — only rulings created at
+        or after this timestamp are evaluated.
+    county : str | None
+        When set, scopes the query to this county (case-insensitive match
+        against ``derived.courts.county``).
+    min_denominator : int
+        Minimum long-text ruling count required before the gate fires.
+        Prevents false-positives on micro-county runs with small sample sizes.
+    threshold : float
+        Null-motion rate above which the gate fires (default 0.02 = 2%).
+    """
+    try:
+        with conn.cursor() as cur:
+            if county:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE r.motion_type IS NULL) AS null_motion,
+                        COUNT(*) AS long_text_count
+                    FROM derived.rulings r
+                    JOIN derived.documents d ON d.id = r.document_id
+                    JOIN derived.cases c ON c.id = r.case_id
+                    JOIN derived.courts ct ON ct.id = c.court_id
+                    WHERE r.created_at >= %s
+                      AND length(r.ruling_text) > 1000
+                      AND lower(ct.county) = lower(%s)
+                    """,
+                    (started_at, county),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE r.motion_type IS NULL) AS null_motion,
+                        COUNT(*) AS long_text_count
+                    FROM derived.rulings r
+                    WHERE r.created_at >= %s
+                      AND length(r.ruling_text) > 1000
+                    """,
+                    (started_at,),
+                )
+            row = cur.fetchone()
+        null_motion = int(row[0]) if row else 0
+        long_text_count = int(row[1]) if row else 0
+        if long_text_count < min_denominator:
+            exceeds = False
+        else:
+            exceeds = (null_motion / long_text_count) > threshold
+        return {
+            "null_motion": null_motion,
+            "long_text_count": long_text_count,
+            "exceeds_threshold": exceeds,
+        }
+    except Exception:
+        logger.warning("Could not query null-motion rate — skipping gate")
+        return {"null_motion": 0, "long_text_count": 0, "exceeds_threshold": False}
+
+
 def _clamp_concurrency_to_budget(
     requested: int,
     max_connections: int,
@@ -1741,6 +1818,12 @@ def main() -> None:
     # zero accepted/flagged validation results.
     validation_zero_pass_reason: str | None = None
 
+    # Initialize the null-motion-excess reason outside the try block so it's
+    # always in scope for the post-finally exit check.  Set when the
+    # post-rebuild null-motion rate among long-text rulings exceeds 2% and
+    # the sample size is at least 50 (#3549).
+    null_motion_excess_reason: str | None = None
+
     # Wrap the rebuild in try/finally so the completion marker is always
     # written when --reset was used, even if the rebuild fails partway (#2222).
     try:
@@ -2160,6 +2243,31 @@ def main() -> None:
                 rejected=vs["rejected"],
                 top_reasons=vs["top_reasons"],
             )
+
+        # Post-rebuild null-motion rate gate (#3549).  Queries rulings created
+        # during this rebuild window and fires exit code 4 when more than 2% of
+        # long-text rulings (length > 1000) are missing motion_type AND the
+        # sample is large enough to be meaningful (>= 50 rows).  Deferred
+        # after conn.close() so the dev environment returns to a clean state.
+        nm = _check_null_motion_rate(
+            conn,
+            rebuild_started_at,
+            county=args.county if hasattr(args, "county") else None,
+        )
+        if nm["exceeds_threshold"]:
+            null_motion_rate = nm["null_motion"] / nm["long_text_count"]
+            logger.error(
+                "Null-motion rate exceeds 2%",
+                null_motion=nm["null_motion"],
+                long_text_count=nm["long_text_count"],
+                null_motion_rate=round(null_motion_rate, 4),
+                threshold=0.02,
+            )
+            null_motion_excess_reason = (
+                f"Post-rebuild null-motion rate {null_motion_rate:.1%} "
+                f"({nm['null_motion']}/{nm['long_text_count']} long-text rulings) "
+                f"exceeds 2% threshold."
+            )
     finally:
         # Clear the rebuild-in-progress marker so the data quality check
         # resumes normal P1 alerting.  Runs even if the rebuild fails
@@ -2195,6 +2303,18 @@ def main() -> None:
             validation_zero_pass_reason=validation_zero_pass_reason,
         )
         sys.exit(3)
+
+    # Propagate null-motion-rate excess as exit code 4 (#3549).  Deferred
+    # after conn.close() so the dev environment returns to a clean state.
+    # Exit code 4 is distinct from 1 (missing DATABASE_URL / no keys),
+    # 2 (retry-cap abort), and 3 (county-scoped zero validation pass).
+    if null_motion_excess_reason is not None:
+        logger.error(
+            "Exiting non-zero because post-rebuild null-motion rate exceeds 2% "
+            "— run scripts/backfill_llm_enrichment.py to populate motion_type.",
+            null_motion_excess_reason=null_motion_excess_reason,
+        )
+        sys.exit(4)
 
 
 if __name__ == "__main__":

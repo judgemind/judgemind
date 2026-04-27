@@ -24,6 +24,7 @@ See: https://github.com/judgemind/judgemind/issues/2175
 from __future__ import annotations
 
 import json
+import time
 from enum import StrEnum
 
 import structlog
@@ -389,6 +390,115 @@ def enrich_ruling(
 
     logger.warning("llm_enrichment.json_parse_failed_after_retry")
     return LlmEnrichmentResult()
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+
+class LlmEnrichmentExhaustedError(Exception):
+    """Raised when all retry attempts for LLM enrichment have been exhausted.
+
+    This is raised by ``enrich_ruling_with_retry`` when ``enrich_ruling``
+    returns ``None`` (API-level failure) or raises an exception on every
+    attempt.  It is deliberately NOT raised when ``enrich_ruling`` returns an
+    ``LlmEnrichmentResult`` with all-``None`` fields — that represents a
+    successful LLM call that extracted nothing (e.g. text too short), not a
+    transient infrastructure failure.
+    """
+
+
+def enrich_ruling_with_retry(
+    ruling_text: str,
+    *,
+    provider: str = "google",
+    model: str | None = None,
+    client: object | None = None,
+    max_attempts: int = 5,
+) -> LlmEnrichmentResult | None:
+    """Call ``enrich_ruling`` with exponential-backoff retries.
+
+    Retries when ``enrich_ruling`` returns ``None`` (LLM API failure) or
+    raises an exception.  Does NOT retry when it returns an
+    ``LlmEnrichmentResult`` with all-``None`` fields (the LLM responded but
+    could not extract structured data — that is a content, not infrastructure,
+    failure).
+
+    Parameters
+    ----------
+    ruling_text : str
+        Plain text of the ruling, already transcribed.
+    provider : str
+        LLM provider (``"google"`` or ``"anthropic"``).
+    model : str | None
+        Model ID override.  ``None`` uses the provider default.
+    client : object | None
+        Pre-created provider client for connection reuse.
+    max_attempts : int
+        Total number of attempts including the first (default 5).  Delays
+        follow ``2 ** attempt`` seconds (2s, 4s, 8s, 16s between attempts 1–4).
+
+    Returns
+    -------
+    LlmEnrichmentResult | None
+        The enrichment result when at least one field was extracted, or
+        ``None`` when the LLM responded successfully but could not extract
+        anything (all-``None`` fields).
+
+    Raises
+    ------
+    LlmEnrichmentExhaustedError
+        When every attempt returns ``None`` or raises an exception.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            result = enrich_ruling(
+                ruling_text,
+                provider=provider,
+                model=model,
+                client=client,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning(
+                "llm_enrichment.retry_on_exception",
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                error=str(exc),
+            )
+            if attempt < max_attempts - 1:
+                time.sleep(2**attempt)
+            continue
+
+        if result is None:
+            # Transient API failure — retry.
+            logger.warning(
+                "llm_enrichment.retry_on_none",
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+            )
+            if attempt < max_attempts - 1:
+                time.sleep(2**attempt)
+            continue
+
+        # LLM responded; may have all-None fields (content failure, not infra).
+        # Either way this is not a transient failure — return immediately.
+        has_data = (
+            result.case_title is not None
+            or result.motion_type is not None
+            or result.outcome is not None
+            or result.parties.plaintiffs
+            or result.parties.defendants
+        )
+        return result if has_data else None
+
+    # All attempts exhausted.
+    raise LlmEnrichmentExhaustedError(
+        f"LLM enrichment failed after {max_attempts} attempts"
+        + (f": {last_exc}" if last_exc is not None else " (API returned None)")
+    )
 
 
 # ---------------------------------------------------------------------------

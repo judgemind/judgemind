@@ -17,6 +17,8 @@ from datetime import date, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 _SCRIPTS_DIR = os.path.join(
     os.path.dirname(__file__),
     "..",
@@ -6420,6 +6422,20 @@ class TestQualityQueriesSchemaValidation:
 class TestReparseDocumentMultimodal:
     """Tests for ``_reparse_document_multimodal()``."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_enrich(self) -> Any:
+        """Patch enrich_ruling_with_retry to a no-op for multimodal extraction tests.
+
+        Tests in this class exercise ``_reparse_document_multimodal`` mechanics
+        (extraction, fallback, metadata propagation) — not LLM enrichment.
+        Without this patch, the MagicMock extractor's ``_client`` attribute is a
+        truthy MagicMock that triggers real ``enrich_ruling_with_retry`` calls which
+        would fail and raise ``LlmEnrichmentExhaustedError`` in these non-enrichment
+        tests.
+        """
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=None):
+            yield
+
     def _make_doc_meta(
         self,
         doc_id: str = "test-doc-id",
@@ -7296,7 +7312,9 @@ class TestApplyLlmEnrichment:
             defendants=["Jones"],
         )
 
-        with patch.object(reingest, "enrich_ruling", return_value=enrichment) as mock_enrich:
+        with patch.object(
+            reingest, "enrich_ruling_with_retry", return_value=enrichment
+        ) as mock_enrich:
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7340,7 +7358,7 @@ class TestApplyLlmEnrichment:
             defendants=["Party"],
         )
 
-        with patch.object(reingest, "enrich_ruling", return_value=enrichment):
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=enrichment):
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7360,7 +7378,7 @@ class TestApplyLlmEnrichment:
         assert "parties" not in methods
 
     def test_skipped_when_all_fields_present(self) -> None:
-        """enrich_ruling is not called if no enrichment is needed."""
+        """enrich_ruling_with_retry is not called if no enrichment is needed."""
         extracted = self._make_extracted(
             outcome="granted",
             motion_type="msj",
@@ -7369,7 +7387,7 @@ class TestApplyLlmEnrichment:
         )
         mock_client = MagicMock()
 
-        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+        with patch.object(reingest, "enrich_ruling_with_retry") as mock_enrich:
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7385,7 +7403,7 @@ class TestApplyLlmEnrichment:
         extracted = self._make_extracted(ruling_text=None)
         mock_client = MagicMock()
 
-        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+        with patch.object(reingest, "enrich_ruling_with_retry") as mock_enrich:
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7401,7 +7419,7 @@ class TestApplyLlmEnrichment:
         extracted = self._make_extracted(ruling_text="   \n\t  ")
         mock_client = MagicMock()
 
-        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+        with patch.object(reingest, "enrich_ruling_with_retry") as mock_enrich:
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7416,7 +7434,7 @@ class TestApplyLlmEnrichment:
         """Regex-only mode (no client) must not attempt enrichment."""
         extracted = self._make_extracted()
 
-        with patch.object(reingest, "enrich_ruling") as mock_enrich:
+        with patch.object(reingest, "enrich_ruling_with_retry") as mock_enrich:
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=None,
@@ -7429,12 +7447,12 @@ class TestApplyLlmEnrichment:
         assert extracted["outcome"] is None
         assert extracted["motion_type"] is None
 
-    def test_llm_returns_none_does_not_raise(self) -> None:
-        """LLM API failure (enrich_ruling returns None) is handled gracefully."""
+    def test_llm_returns_empty_result_is_handled_gracefully(self) -> None:
+        """LLM returning all-None result (empty LlmEnrichmentResult) is a no-op."""
         extracted = self._make_extracted()
         mock_client = MagicMock()
 
-        with patch.object(reingest, "enrich_ruling", return_value=None):
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=None):
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7446,24 +7464,26 @@ class TestApplyLlmEnrichment:
         assert extracted["outcome"] is None
         assert extracted["motion_type"] is None
 
-    def test_llm_exception_does_not_raise(self) -> None:
-        """Unexpected exceptions from enrich_ruling are caught and logged."""
+    def test_llm_exhausted_raises(self) -> None:
+        """Terminal LLM exhaustion propagates LlmEnrichmentExhaustedError."""
+        from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
         extracted = self._make_extracted()
         mock_client = MagicMock()
 
-        with patch.object(reingest, "enrich_ruling", side_effect=RuntimeError("boom")):
-            reingest._apply_llm_enrichment(
-                extracted,
-                llm_client=mock_client,
-                llm_provider="google",
-                llm_model=None,
-                document_id="doc-1",
-            )
-
-        assert extracted["outcome"] is None
-        assert extracted["motion_type"] is None
-        # The extraction_methods dict should be unmodified by the failed call.
-        assert extracted["extraction_methods"] == {"_all": "multimodal"}
+        with patch.object(
+            reingest,
+            "enrich_ruling_with_retry",
+            side_effect=LlmEnrichmentExhaustedError("exhausted"),
+        ):
+            with pytest.raises(LlmEnrichmentExhaustedError):
+                reingest._apply_llm_enrichment(
+                    extracted,
+                    llm_client=mock_client,
+                    llm_provider="google",
+                    llm_model=None,
+                    document_id="doc-1",
+                )
 
     def test_defaults_provider_to_google(self) -> None:
         """A None provider is normalized to 'google'."""
@@ -7471,7 +7491,9 @@ class TestApplyLlmEnrichment:
         mock_client = MagicMock()
         enrichment = self._make_enrichment_result(outcome="granted")
 
-        with patch.object(reingest, "enrich_ruling", return_value=enrichment) as mock_enrich:
+        with patch.object(
+            reingest, "enrich_ruling_with_retry", return_value=enrichment
+        ) as mock_enrich:
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7493,7 +7515,7 @@ class TestApplyLlmEnrichment:
             # No parties extracted.
         )
 
-        with patch.object(reingest, "enrich_ruling", return_value=enrichment):
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=enrichment):
             reingest._apply_llm_enrichment(
                 extracted,
                 llm_client=mock_client,
@@ -7511,6 +7533,66 @@ class TestApplyLlmEnrichment:
         assert methods["case_title"] == "llm_enrichment"
         assert "motion_type" not in methods
         assert "parties" not in methods
+
+    @patch("framework.llm_enrichment.time.sleep")
+    @patch("framework.llm_enrichment.enrich_ruling")
+    def test_apply_llm_enrichment_retries_on_transient_then_succeeds(
+        self,
+        mock_enrich_ruling: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """_apply_llm_enrichment retries on transient None results and succeeds on 4th call."""
+        from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+        populated = LlmEnrichmentResult(
+            case_title="Lopez v. City",
+            motion_type="demurrer",
+            outcome="denied",
+            parties=EnrichmentParties(plaintiffs=["Lopez"], defendants=["City"]),
+        )
+        mock_enrich_ruling.side_effect = [None, None, None, populated]
+
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+
+        reingest._apply_llm_enrichment(
+            extracted,
+            llm_client=mock_client,
+            llm_provider="google",
+            llm_model=None,
+            document_id="doc-retry-1",
+        )
+
+        assert extracted["motion_type"] == "demurrer"
+        assert extracted["outcome"] == "denied"
+        assert mock_enrich_ruling.call_count == 4
+        assert mock_sleep.call_count == 3
+
+    @patch("framework.llm_enrichment.time.sleep")
+    @patch("framework.llm_enrichment.enrich_ruling")
+    def test_apply_llm_enrichment_raises_on_terminal_exhaustion(
+        self,
+        mock_enrich_ruling: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """_apply_llm_enrichment raises LlmEnrichmentExhaustedError after 5 None returns."""
+        from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+        mock_enrich_ruling.return_value = None
+
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+
+        with pytest.raises(LlmEnrichmentExhaustedError):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-retry-2",
+            )
+
+        assert mock_enrich_ruling.call_count == 5
 
 
 class TestReparseMultimodalCallsEnrichment:
@@ -7565,7 +7647,9 @@ class TestReparseMultimodalCallsEnrichment:
 
         with (
             patch.object(reingest, "_apply_regex_fallbacks"),
-            patch.object(reingest, "enrich_ruling", return_value=enrichment_result) as mock_enrich,
+            patch.object(
+                reingest, "enrich_ruling_with_retry", return_value=enrichment_result
+            ) as mock_enrich,
         ):
             results = reingest._reparse_document_multimodal(
                 b"%PDF-1.4 fake pdf",
@@ -7577,7 +7661,7 @@ class TestReparseMultimodalCallsEnrichment:
                 llm_model="gemini-2.0-flash-lite",
             )
 
-        # enrich_ruling must have been called with the multimodal ruling_text.
+        # enrich_ruling_with_retry must have been called with the multimodal ruling_text.
         mock_enrich.assert_called_once()
         call_kwargs = mock_enrich.call_args.kwargs
         call_args = mock_enrich.call_args.args
@@ -7633,7 +7717,9 @@ class TestReparseMultimodalCallsEnrichment:
 
         with (
             patch.object(reingest, "_apply_regex_fallbacks"),
-            patch.object(reingest, "enrich_ruling", side_effect=fake_enrich) as mock_enrich,
+            patch.object(
+                reingest, "enrich_ruling_with_retry", side_effect=fake_enrich
+            ) as mock_enrich,
         ):
             results = reingest._reparse_document_multimodal(
                 b"%PDF-1.4 fake pdf",
@@ -7670,7 +7756,7 @@ class TestReparseMultimodalCallsEnrichment:
 
         with (
             patch.object(reingest, "_apply_regex_fallbacks"),
-            patch.object(reingest, "enrich_ruling") as mock_enrich,
+            patch.object(reingest, "enrich_ruling_with_retry") as mock_enrich,
         ):
             results = reingest._reparse_document_multimodal(
                 b"%PDF-1.4 fake pdf",
@@ -7714,7 +7800,9 @@ class TestReparseMultimodalCallsEnrichment:
 
         with (
             patch.object(reingest, "_apply_regex_fallbacks"),
-            patch.object(reingest, "enrich_ruling", return_value=enrichment_result) as mock_enrich,
+            patch.object(
+                reingest, "enrich_ruling_with_retry", return_value=enrichment_result
+            ) as mock_enrich,
         ):
             results = reingest._reparse_document_multimodal(
                 b"%PDF-1.4 fake pdf",
@@ -7725,14 +7813,14 @@ class TestReparseMultimodalCallsEnrichment:
                 llm_provider="google",
             )
 
-        # enrich_ruling called only once — for the ruling with text.
+        # enrich_ruling_with_retry called only once — for the ruling with text.
         assert mock_enrich.call_count == 1
         assert len(results) == 2
         assert results[0]["outcome"] == "granted"
         assert results[1]["outcome"] is None  # Text nulled by guard, enrichment skipped.
 
-    def test_enrichment_failure_does_not_break_pipeline(self) -> None:
-        """If enrich_ruling returns None, the ruling is still produced successfully."""
+    def test_enrichment_empty_result_does_not_break_pipeline(self) -> None:
+        """If enrich_ruling_with_retry returns None (empty result), ruling is still produced."""
         from framework.llm_schema import ExtractedRuling
 
         doc_meta = self._make_doc_meta()
@@ -7747,7 +7835,7 @@ class TestReparseMultimodalCallsEnrichment:
 
         with (
             patch.object(reingest, "_apply_regex_fallbacks"),
-            patch.object(reingest, "enrich_ruling", return_value=None),
+            patch.object(reingest, "enrich_ruling_with_retry", return_value=None),
         ):
             results = reingest._reparse_document_multimodal(
                 b"%PDF-1.4 fake pdf",
@@ -7796,7 +7884,9 @@ class TestReparseMultimodalCallsEnrichment:
 
         with (
             patch.object(reingest, "_apply_regex_fallbacks"),
-            patch.object(reingest, "enrich_ruling", return_value=enrichment_result) as mock_enrich,
+            patch.object(
+                reingest, "enrich_ruling_with_retry", return_value=enrichment_result
+            ) as mock_enrich,
         ):
             reingest._reparse_document_multimodal(
                 b"%PDF-1.4 fake pdf",

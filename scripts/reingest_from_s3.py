@@ -172,7 +172,7 @@ import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
 from framework.extraction_config import get_county_extraction_config  # noqa: E402
-from framework.llm_enrichment import enrich_ruling  # noqa: E402
+from framework.llm_enrichment import enrich_ruling_with_retry  # noqa: E402
 from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
@@ -1461,8 +1461,10 @@ def _apply_llm_enrichment(
       guard result) -- enrichment cannot extract from nothing.
     * No-op when all enrichment fields are already populated.
     * No-op when ``llm_client`` is ``None`` (regex-only mode).
-    * Never raises.  LLM failures are logged and the ``extracted`` dict
-      is left unchanged for those fields.
+    * Retries up to 5 attempts with exponential backoff on transient LLM
+      failures.  Raises ``LlmEnrichmentExhaustedError`` on terminal
+      exhaustion so the caller surfaces the failure rather than committing
+      a NULL-enrichment row.
     * Only fills fields that are currently missing -- never overwrites
       existing values, matching the worker's precedence behaviour.
     * Sets ``extraction_methods[field] = "llm_enrichment"`` for each
@@ -1500,24 +1502,18 @@ def _apply_llm_enrichment(
     if has_case_title and has_motion_type and has_outcome and has_parties:
         return
 
-    try:
-        result = enrich_ruling(
-            ruling_text,
-            provider=llm_provider or "google",
-            model=llm_model,
-            client=llm_client,
-        )
-    except Exception:
-        logger.warning(
-            "LLM enrichment raised — enrichment fields may remain missing",
-            document_id=document_id,
-            exc_info=True,
-        )
-        return
+    result = enrich_ruling_with_retry(
+        ruling_text,
+        provider=llm_provider or "google",
+        model=llm_model,
+        client=llm_client,
+    )
 
     if result is None:
-        logger.warning(
-            "LLM enrichment API call failed",
+        # LLM responded but extracted nothing (all-None fields).  Not a
+        # transient failure — leave fields unchanged.
+        logger.info(
+            "LLM enrichment returned empty result — no fields populated",
             document_id=document_id,
         )
         return

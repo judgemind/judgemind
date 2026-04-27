@@ -109,6 +109,10 @@ def _make_worker(pg_dsn: str = "postgresql://localhost/test") -> tuple[Ingestion
     # Prevent real Anthropic API calls: when no framework extractor is available,
     # _llm_split_document returns False and single-document processing proceeds.
     worker._get_framework_extractor = lambda: None  # type: ignore[method-assign]
+    # Disable enrichment client by default so process_event tests don't trigger
+    # live LLM calls.  Tests that exercise enrichment explicitly set
+    # worker._enrichment_client = MagicMock().
+    worker._enrichment_client = None
     return worker, os_mock
 
 
@@ -4952,19 +4956,25 @@ def test_llm_enrich_fields_returns_none_for_empty_result(
     assert result is None
 
 
+@patch("framework.llm_enrichment.time.sleep")
 @patch("framework.llm_enrichment.enrich_ruling")
-def test_llm_enrich_fields_returns_none_for_api_failure(
+def test_llm_enrich_fields_raises_on_api_failure(
     mock_enrich_ruling: MagicMock,
+    mock_sleep: MagicMock,
 ) -> None:
-    """_llm_enrich_fields returns None when LLM API call fails (returns None)."""
+    """_llm_enrich_fields raises LlmEnrichmentExhaustedError when LLM API always returns None."""
+    from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
     mock_enrich_ruling.return_value = None
 
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
-    assert result is None
+    with pytest.raises(LlmEnrichmentExhaustedError):
+        worker._llm_enrich_fields("Some ruling text.", "doc-1")
+
+    assert mock_enrich_ruling.call_count == 5
 
 
 def test_enrichment_enabled_by_default() -> None:
@@ -4972,6 +4982,109 @@ def test_enrichment_enabled_by_default() -> None:
     worker, _ = _make_worker()
     assert worker._llm_enrichment_enabled is True
     assert worker._llm_enrichment_enabled is True
+
+
+@patch("framework.llm_enrichment.time.sleep")
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_retries_on_transient_then_succeeds(
+    mock_enrich_ruling: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """_llm_enrich_fields retries on transient None results and succeeds on 4th call."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    populated = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type="msj",
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+    mock_enrich_ruling.side_effect = [None, None, None, populated]
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("The motion for summary judgment is GRANTED.", "doc-1")
+
+    assert result is not None
+    assert result.motion_type == "msj"
+    assert result.outcome == "granted"
+    assert mock_enrich_ruling.call_count == 4
+    assert mock_sleep.call_count == 3
+
+
+@patch("framework.llm_enrichment.time.sleep")
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_retries_on_exception_then_succeeds(
+    mock_enrich_ruling: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """_llm_enrich_fields retries on exceptions and succeeds on 4th call."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+
+    populated = LlmEnrichmentResult(
+        case_title="Garcia v. State Farm",
+        motion_type="motion_to_compel",
+        outcome="granted_in_part",
+        parties=EnrichmentParties(plaintiffs=["Garcia"], defendants=["State Farm"]),
+    )
+    err = RuntimeError("ServiceUnavailable")
+    mock_enrich_ruling.side_effect = [err, err, err, populated]
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("The motion to compel is GRANTED IN PART.", "doc-2")
+
+    assert result is not None
+    assert result.motion_type == "motion_to_compel"
+    assert mock_enrich_ruling.call_count == 4
+    assert mock_sleep.call_count == 3
+
+
+@patch("framework.llm_enrichment.time.sleep")
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_raises_on_terminal_exhaustion(
+    mock_enrich_ruling: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """_llm_enrich_fields raises LlmEnrichmentExhaustedError after 5 None returns."""
+    from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+    mock_enrich_ruling.return_value = None
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    with pytest.raises(LlmEnrichmentExhaustedError):
+        worker._llm_enrich_fields("The motion is GRANTED.", "doc-3")
+
+    assert mock_enrich_ruling.call_count == 5
+
+
+@patch("framework.llm_enrichment.time.sleep")
+@patch("framework.llm_enrichment.enrich_ruling")
+def test_llm_enrich_fields_does_not_retry_on_empty_result(
+    mock_enrich_ruling: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """_llm_enrich_fields does NOT retry when LLM responds with all-None fields."""
+    from framework.llm_enrichment import LlmEnrichmentResult
+
+    mock_enrich_ruling.return_value = LlmEnrichmentResult()
+
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    result = worker._llm_enrich_fields("Some ruling text.", "doc-4")
+
+    assert result is None
+    assert mock_enrich_ruling.call_count == 1
+    assert mock_sleep.call_count == 0
 
 
 # ---------------------------------------------------------------------------
