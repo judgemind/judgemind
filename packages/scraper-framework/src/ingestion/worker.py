@@ -237,7 +237,23 @@ def _try_sd_calendar_split(
             "hearing_date": hearing_date_value or event_data.get("hearing_date"),
             "parties": sr.parties if sr.parties else event_data.get("parties", []),
         }
-        dispatch(split_event)
+        try:
+            dispatch(split_event)
+        except Exception as _exc:
+            from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+            if not isinstance(_exc, LlmEnrichmentExhaustedError):
+                raise
+            logger.critical(
+                "per-child enrichment exhausted on SD calendar split — ruling permanently lost",
+                extra={
+                    "document_id": document_id,
+                    "_split_index": idx,
+                    "_split_count": len(split_rulings),
+                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "error": str(_exc),
+                },
+            )
 
     return True
 
@@ -330,7 +346,23 @@ def _try_la_html_split(
             "hearing_date": hearing_date_value or event_data.get("hearing_date"),
             "parties": sr.parties if sr.parties else event_data.get("parties", []),
         }
-        dispatch(split_event)
+        try:
+            dispatch(split_event)
+        except Exception as _exc:
+            from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+            if not isinstance(_exc, LlmEnrichmentExhaustedError):
+                raise
+            logger.critical(
+                "per-child enrichment exhausted on LA HTML split — ruling permanently lost",
+                extra={
+                    "document_id": document_id,
+                    "_split_index": idx,
+                    "_split_count": len(split_rulings),
+                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "error": str(_exc),
+                },
+            )
 
     return True
 
@@ -427,7 +459,23 @@ def _try_fresno_pdf_split(
             "outcome": sr.outcome or event_data.get("outcome"),
             "hearing_date": hearing_date_value or event_data.get("hearing_date"),
         }
-        dispatch(split_event)
+        try:
+            dispatch(split_event)
+        except Exception as _exc:
+            from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+            if not isinstance(_exc, LlmEnrichmentExhaustedError):
+                raise
+            logger.critical(
+                "per-child enrichment exhausted on Fresno PDF split — ruling permanently lost",
+                extra={
+                    "document_id": document_id,
+                    "_split_index": idx,
+                    "_split_count": len(split_rulings),
+                    "case_number": sr.case_number or event_data.get("case_number"),
+                    "error": str(_exc),
+                },
+            )
 
     return True
 
@@ -3016,7 +3064,23 @@ class IngestionWorker:
                 "parties": cr.parties if cr.parties else event_data.get("parties", []),
             }
 
-            self.process_event(split_event)
+            try:
+                self.process_event(split_event)
+            except Exception as _exc:
+                from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+                if not isinstance(_exc, LlmEnrichmentExhaustedError):
+                    raise
+                logger.critical(
+                    "per-child enrichment exhausted on LLM split — ruling permanently lost",
+                    extra={
+                        "document_id": document_id,
+                        "_split_index": cr.split_index,
+                        "_split_count": cr.split_count,
+                        "case_number": cr.case_number or event_data.get("case_number"),
+                        "error": str(_exc),
+                    },
+                )
 
         return True
 
