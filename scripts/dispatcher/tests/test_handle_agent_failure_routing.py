@@ -45,6 +45,7 @@ from dispatcher.daemon import (  # noqa: E402
     BYPASSED_TERMINAL_PHASES_TO_ROUTE,
     FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
     FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
+    FAILURE_CATEGORY_OPERATIONAL_FAILED,
     TIER_3_CATEGORIES,
 )
 
@@ -142,6 +143,7 @@ class TestBypassedTerminalConstants:
             "fix_ci_blocked": FAILURE_CATEGORY_FIX_CI_BLOCKED,
             "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
             "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
+            "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
         }
 
 
