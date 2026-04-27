@@ -1196,6 +1196,80 @@ def resolve_judge_from_department(
     return None
 
 
+def _maybe_arbitrate(
+    cur: psycopg.Cursor,
+    judge_id: str,
+    raw_name: str,
+    incoming_canonical: str,
+    roster_normalized: str,
+    source: str,
+    confidence: float = 1.0,
+) -> bool:
+    """Check corroborating evidence and promote incoming_canonical if warranted.
+
+    Queries non-roster aliases for ``incoming_canonical`` on the given judge.
+    If >=1 distinct non-roster source already corroborates the incoming spelling,
+    promotes it to the new canonical name, demotes the roster name as an alias,
+    and inserts the caller's raw name under the caller's source.
+
+    Returns True if promotion occurred, False otherwise.
+    """
+    cur.execute(
+        """
+        SELECT LOWER(raw_name), source
+        FROM judge_aliases
+        WHERE judge_id = %s::uuid
+          AND source NOT IN ('roster_match', 'roster')
+          AND LOWER(raw_name) = LOWER(%s)
+        """,
+        (judge_id, incoming_canonical),
+    )
+    alias_rows = cur.fetchall()
+    existing_non_roster_sources = {
+        row_alias[1] for row_alias in alias_rows if row_alias[1] is not None
+    }
+    if not existing_non_roster_sources:
+        return False
+
+    # Promote incoming spelling as the new canonical
+    cur.execute(
+        """
+        UPDATE judges SET canonical_name = %s, updated_at = NOW()
+        WHERE id = %s::uuid
+        """,
+        (incoming_canonical, judge_id),
+    )
+    # Preserve the demoted roster name as an alias
+    cur.execute(
+        """
+        INSERT INTO judge_aliases
+            (judge_id, raw_name, source, confidence, is_verified)
+        VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
+        ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
+        """,
+        (judge_id, roster_normalized, confidence),
+    )
+    # Insert the incoming raw name as alias with caller's source
+    cur.execute(
+        """
+        INSERT INTO judge_aliases
+            (judge_id, raw_name, source, confidence, is_verified)
+        VALUES (%s::uuid, %s, %s, 1.0, FALSE)
+        ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
+        """,
+        (judge_id, raw_name, source),
+    )
+    logger.info(
+        "resolve_judge: arbitration promoted %r over roster typo %r "
+        "(corroborated by sources=%r) for judge %s",
+        incoming_canonical,
+        roster_normalized,
+        existing_non_roster_sources,
+        judge_id,
+    )
+    return True
+
+
 def resolve_judge(
     conn: psycopg.Connection,
     raw_name: str,
@@ -1244,7 +1318,7 @@ def resolve_judge(
         # same name arrives in different casing — see #1453)
         cur.execute(
             """
-            SELECT ja.judge_id
+            SELECT ja.judge_id, j.canonical_name
             FROM judge_aliases ja
             JOIN judges j ON j.id = ja.judge_id
             WHERE LOWER(ja.raw_name) = LOWER(%s) AND j.court_id = %s::uuid
@@ -1255,7 +1329,21 @@ def resolve_judge(
         row = cur.fetchone()
         if row is not None:
             judge_id: str = str(row[0])
+            matched_canonical: str = str(row[1])
             logger.debug("resolve_judge: found existing alias for %r -> %s", raw_name, judge_id)
+            # Step 1 arbitration (#3503): if the matched judge's canonical differs
+            # from the incoming canonical and a source is provided, run arbitration
+            # so that corroborating evidence accumulated across calls can promote
+            # the incoming spelling even after Step 1 short-circuits future steps.
+            if source and matched_canonical.lower() != canonical.lower():
+                _maybe_arbitrate(
+                    cur,
+                    judge_id,
+                    raw_name,
+                    incoming_canonical=canonical,
+                    roster_normalized=matched_canonical,
+                    source=source,
+                )
             return judge_id
 
         # Step 2: Check judges table for exact canonical_name + court_id match
@@ -1371,85 +1459,46 @@ def resolve_judge(
                     row = cur.fetchone()
                     if row is not None:
                         judge_id = str(row[0])
-                        # Step 3b arbitration (#3484): when the incoming canonical
-                        # differs from the roster canonical, check whether the
-                        # incoming spelling has independent source corroboration.
-                        # If >=1 distinct non-roster source already supports the
-                        # incoming spelling, promote it to the new canonical name
-                        # and demote the roster typo to an alias.
+                        # Step 3b arbitration (#3484/#3503): when the incoming
+                        # canonical differs from the roster canonical, check
+                        # whether the incoming spelling has independent source
+                        # corroboration.  Delegate to _maybe_arbitrate which
+                        # promotes if >=1 distinct non-roster source already
+                        # supports the incoming spelling.
                         incoming_canonical = canonical  # the normalized incoming name
-                        if incoming_canonical.lower() != roster_normalized.lower() and source:
-                            # Query judge_aliases for the matched judge to find
-                            # distinct non-roster sources that corroborate the
-                            # incoming spelling.
-                            cur.execute(
-                                """
-                                SELECT LOWER(raw_name), source
-                                FROM judge_aliases
-                                WHERE judge_id = %s::uuid
-                                  AND source NOT IN ('roster_match', 'roster')
-                                  AND LOWER(raw_name) = LOWER(%s)
-                                """,
-                                (judge_id, incoming_canonical),
+                        if (
+                            incoming_canonical.lower() != roster_normalized.lower()
+                            and source
+                            and _maybe_arbitrate(
+                                cur,
+                                judge_id,
+                                raw_name,
+                                incoming_canonical=incoming_canonical,
+                                roster_normalized=roster_normalized,
+                                source=source,
+                                confidence=confidence,
                             )
-                            alias_rows = cur.fetchall()
-                            # Count distinct non-roster sources already in aliases
-                            existing_non_roster_sources = {
-                                row_alias[1] for row_alias in alias_rows if row_alias[1] is not None
-                            }
-                            # Promote if >=1 distinct non-roster source already
-                            # corroborates the incoming spelling in the alias table.
-                            # The alias table records a prior call from a non-roster
-                            # source, constituting independent corroboration.
-                            if existing_non_roster_sources:
-                                # Promote incoming spelling as the new canonical
-                                cur.execute(
-                                    """
-                                    UPDATE judges SET canonical_name = %s, updated_at = NOW()
-                                    WHERE id = %s::uuid
-                                    """,
-                                    (incoming_canonical, judge_id),
-                                )
-                                # Preserve the demoted roster name as an alias
-                                cur.execute(
-                                    """
-                                    INSERT INTO judge_aliases
-                                        (judge_id, raw_name, source, confidence, is_verified)
-                                    VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
-                                    ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
-                                    """,
-                                    (judge_id, roster_normalized, confidence),
-                                )
-                                # Insert the incoming raw name as alias with caller's source
-                                cur.execute(
-                                    """
-                                    INSERT INTO judge_aliases
-                                        (judge_id, raw_name, source, confidence, is_verified)
-                                    VALUES (%s::uuid, %s, %s, 1.0, FALSE)
-                                    ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
-                                    """,
-                                    (judge_id, raw_name, source),
-                                )
-                                logger.info(
-                                    "resolve_judge: arbitration promoted %r over roster typo %r "
-                                    "(corroborated by sources=%r) for judge %s",
-                                    incoming_canonical,
-                                    roster_normalized,
-                                    existing_non_roster_sources,
-                                    judge_id,
-                                )
-                                return judge_id
+                        ):
+                            return judge_id
 
-                        # No arbitration needed (or no source label) — link via
-                        # roster_match alias as before
+                        # No arbitration needed (or no corroboration yet) — link
+                        # via the caller's source when available so the next call
+                        # can accumulate corroborating evidence (#3503).
+                        # When source is None or canonicals match, fall back to
+                        # 'roster_match' as before.
+                        fall_through_source = (
+                            source
+                            if (source and incoming_canonical.lower() != roster_normalized.lower())
+                            else "roster_match"
+                        )
                         cur.execute(
                             """
                             INSERT INTO judge_aliases
                                 (judge_id, raw_name, source, confidence, is_verified)
-                            VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
+                            VALUES (%s::uuid, %s, %s, %s, FALSE)
                             ON CONFLICT DO NOTHING
                             """,
-                            (judge_id, raw_name, confidence),
+                            (judge_id, raw_name, fall_through_source, confidence),
                         )
                         logger.info(
                             "resolve_judge: roster match %r -> %r (confidence=%.2f) -> %s",
