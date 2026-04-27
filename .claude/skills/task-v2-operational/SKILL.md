@@ -156,6 +156,24 @@ For each acceptance criterion, run the verification check described in `plan_tex
 
 If any verification fails: capture the failure output and emit `verdict=failed` with the failure evidence in `evidence_md`.
 
+## Step 4.5 — Time-budget discipline (#3524)
+
+The supervisor flags operational agents as stuck after 3600s (60 min). Respect
+that budget in your own retry loop: do not exhaust the entire window on
+repetitive validation attempts against the same data.
+
+**Rule:** If you have run the operation and validate more than 3 times against
+the same data without the success criterion being met, do NOT keep retrying.
+Emit `verdict=blocked` with `block_reason` describing the non-converging
+condition and `evidence_md` containing the last validation output. Looping is
+the bug.
+
+**Why:** Repeating the same ECS run or DB query when the underlying data has
+not changed cannot produce a different result. A BLOCKED verdict routes to the
+operator / diagnoser so the root cause (data not populated, wrong script args,
+missing dependency) can be fixed — rather than burning the 60-min budget and
+having the supervisor catch the agent as stuck anyway.
+
 ## Step 5 — Post evidence comment and close issue
 
 Write the evidence markdown to a temp file then post:

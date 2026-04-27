@@ -1025,6 +1025,7 @@ STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     "fix_ci": 18000,  # 5 hr (was 30 min) — single /task-v2-fix-ci, issue #2885
     "verify": 3000,  # 50 min (was unset, fell back to 30 min global) — issue #2885
     "retro": 3000,  # 50 min (was 20 min) — single /task-v2-retro, issue #2885
+    "operational": 3600,  # 60 min — most ops finish in ~30 min; 2× headroom, issue #3524
     "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
     "force_stopped": 60,  # 1 min — #2884 operator force_stop terminal phase
     "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
@@ -4756,7 +4757,10 @@ class DispatcherDaemon:
         # Budget check — if the sweep already hit the cap, let the claim
         # proceed (resurrection won't pick it up).
         past_attempts = self._count_orphan_pr_resurrections(agent_id)
-        if past_attempts is None or past_attempts >= ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS:
+        if (
+            past_attempts is None
+            or past_attempts >= ORPHAN_PR_RESURRECTION_MAX_ATTEMPTS
+        ):
             return False
 
         # PR-state guard — same classifier as the sweep.
