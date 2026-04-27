@@ -58,7 +58,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -155,6 +155,7 @@ class CheckResult:
     insufficient_history: list[InsufficientHistory]
     checked_count: int
     excluded_count: int
+    unknown_scrapers: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,31 @@ def _fetch_recent_runs(
             sid, started_at, records, status = row[0], row[1], row[2], row[3]
             out.setdefault(sid, []).append((started_at, int(records), status))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Registry helpers — known scraper IDs
+# ---------------------------------------------------------------------------
+
+
+def _load_known_scraper_ids() -> set[str] | None:
+    """Return the set of all registered scraper IDs from framework.runner.
+
+    Returns ``None`` when the framework package is not importable (e.g. when
+    running in an environment without the scraper-framework venv active).  In
+    that case callers should treat *all* fetched IDs as known to avoid false
+    positives.
+    """
+    try:
+        from framework.runner import get_scraper_ids  # type: ignore[import-not-found]
+
+        return set(get_scraper_ids())
+    except ImportError:
+        logger.debug(
+            "framework.runner not importable — unknown-scraper check skipped. "
+            "Activate the scraper-framework venv to enable this check."
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +277,12 @@ def has_historical_nonzero(runs: list[tuple[datetime, int, str]]) -> bool:
 # Main check
 # ---------------------------------------------------------------------------
 
+# Sentinel value for the ``known_scraper_ids`` parameter of
+# ``check_zero_record_streaks``.  Using a private sentinel (instead of None)
+# allows callers to distinguish "auto-load from registry" (default) from
+# "explicitly disable the check" (pass None).
+_SENTINEL: set[str] = object()  # type: ignore[assignment]
+
 
 def check_zero_record_streaks(
     conn: psycopg.Connection,  # type: ignore[type-arg]
@@ -262,6 +294,7 @@ def check_zero_record_streaks(
     scraper_id: str | None = None,
     exclusions: set[str] | None = None,
     frequent_scraper_ids: set[str] | None = None,
+    known_scraper_ids: set[str] | None = _SENTINEL,  # type: ignore[assignment]
 ) -> CheckResult:
     """Run the zero-record streak check.
 
@@ -281,10 +314,16 @@ def check_zero_record_streaks(
         exclusions: Scrapers to skip. Defaults to ``EXCLUSIONS``.
         frequent_scraper_ids: Scraper IDs that run more than once per day.
             Defaults to ``FREQUENT_SCRAPER_IDS``.
+        known_scraper_ids: Set of registered scraper IDs from
+            ``framework.runner.get_scraper_ids()``.  When the sentinel is
+            passed (the default), the function calls
+            ``_load_known_scraper_ids()`` automatically.  Pass ``None``
+            explicitly to disable the unknown-ID check (e.g. in environments
+            without the venv).  Pass a set to override (useful in tests).
 
     Returns:
-        ``CheckResult`` with breaches, insufficient-history entries, and
-        counts for logging/summary output.
+        ``CheckResult`` with breaches, insufficient-history entries, unknown
+        scraper IDs, and counts for logging/summary output.
     """
     excl = exclusions if exclusions is not None else EXCLUSIONS
     freq = (
@@ -293,17 +332,27 @@ def check_zero_record_streaks(
         else FREQUENT_SCRAPER_IDS
     )
 
+    # Resolve known IDs: sentinel → auto-load; explicit None → skip check.
+    if known_scraper_ids is _SENTINEL:
+        known_scraper_ids = _load_known_scraper_ids()
+
     cutoff = now - timedelta(days=lookback_days)
     by_scraper = _fetch_recent_runs(conn, cutoff, scraper_id)
 
     breaches: list[Breach] = []
     insufficient: list[InsufficientHistory] = []
+    unknown: list[str] = []
     checked = 0
     excluded = 0
 
     for sid in sorted(by_scraper.keys()):
         if sid in excl:
             excluded += 1
+            continue
+
+        # Partition: unknown scraper IDs are likely test pollution.
+        if known_scraper_ids is not None and sid not in known_scraper_ids:
+            unknown.append(sid)
             continue
 
         runs = by_scraper[sid]
@@ -354,11 +403,19 @@ def check_zero_record_streaks(
                 )
             )
 
+    if unknown:
+        logger.warning(
+            "WARNING: unknown scraper IDs in telemetry.scraper_runs "
+            "(likely test pollution): %s",
+            ", ".join(sorted(unknown)),
+        )
+
     return CheckResult(
         breaches=breaches,
         insufficient_history=insufficient,
         checked_count=checked,
         excluded_count=excluded,
+        unknown_scrapers=sorted(unknown),
     )
 
 
@@ -383,6 +440,7 @@ def format_json(result: CheckResult) -> str:
         "insufficient_history": [asdict(ih) for ih in result.insufficient_history],
         "checked_count": result.checked_count,
         "excluded_count": result.excluded_count,
+        "unknown_scrapers": result.unknown_scrapers,
         "healthy": len(result.breaches) == 0,
     }
     return json.dumps(payload, indent=2, sort_keys=True)
@@ -397,6 +455,15 @@ def format_text(result: CheckResult) -> str:
         f"{len(result.breaches)} breach(es), "
         f"{len(result.insufficient_history)} insufficient-history."
     )
+
+    if result.unknown_scrapers:
+        lines.append("")
+        lines.append(
+            "WARNING: unknown scraper IDs in telemetry.scraper_runs "
+            "(likely test pollution):"
+        )
+        for uid in result.unknown_scrapers:
+            lines.append(f"  * {uid}")
 
     if result.breaches:
         lines.append("")
