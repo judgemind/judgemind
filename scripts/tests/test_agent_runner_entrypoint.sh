@@ -2289,9 +2289,12 @@ setup_fixtures
 t21b_repo="$TEST_TMP/t21b-repo"
 mkdir -p "$t21b_repo/.git"
 
-# Override the gh stub to fail every call — simulates a network outage
-# or GitHub rate-limit where gh exits non-zero on every invocation.
-cat > "$STUB_BIN/gh" <<'GHEOF_T21B'
+# Override gh to fail every call in a test-specific bin dir so we don't
+# redefine $STUB_BIN/gh (which would trigger the duplicate-stub guard).
+t21b_bin="$TEST_TMP/t21b-bin"
+mkdir -p "$t21b_bin"
+ln -sf "$STUB_BIN/_record_invocation.sh" "$t21b_bin/_record_invocation.sh"
+cat > "$t21b_bin/gh" <<'GHEOF_T21B'
 #!/usr/bin/env bash
 set -u
 INVOCATIONS_DIR="${INVOCATIONS_DIR}"
@@ -2300,12 +2303,12 @@ INVOCATIONS_DIR="${INVOCATIONS_DIR}"
 printf 'simulated gh error\n' >&2
 exit 1
 GHEOF_T21B
-chmod +x "$STUB_BIN/gh"
+chmod +x "$t21b_bin/gh"
 
 set +e
 DATABASE_URL="postgres://test" \
     GITHUB_REPO="judgemind/judgemind" \
-    PATH="$STUB_BIN:$PATH" \
+    PATH="$t21b_bin:$STUB_BIN:$PATH" \
     INVOCATIONS_DIR="$INVOCATIONS_DIR" \
     DB_AGENT_PR_NUMBER="5047" \
     python3 "$SHIM_PY" verify "3547aaaa-3547-3547-3547-3547aaaabbbb" 3547 "$t21b_repo" \
@@ -2313,83 +2316,8 @@ DATABASE_URL="postgres://test" \
 t21b_rc=$?
 set -e
 
-# Restore the original gh stub for subsequent tests.
+# t21b_bin is not on PATH after this point; $STUB_BIN/gh was never touched.
 setup_fixtures
-cat > "$STUB_BIN/gh" <<'GHEOF_RESTORE'
-#!/usr/bin/env bash
-set -u
-INVOCATIONS_DIR="${INVOCATIONS_DIR}"
-. "$(dirname "$0")/_record_invocation.sh" gh "$@"
-sub=""
-verb=""
-for arg in "$@"; do
-    case "$arg" in
-        --*|-*) continue ;;
-    esac
-    if [[ -z "$sub" ]]; then sub="$arg"; continue; fi
-    if [[ -z "$verb" ]]; then verb="$arg"; break; fi
-done
-case "$sub $verb" in
-    "pr create")
-        printf 'https://github.com/judgemind/judgemind/pull/9999\n'
-        exit "${GH_PR_CREATE_EXIT:-0}"
-        ;;
-    "pr view")
-        if [[ -n "${GH_PR_FIXTURE:-}" && -f "$GH_PR_FIXTURE" ]]; then
-            cat "$GH_PR_FIXTURE"; exit 0
-        fi
-        if [[ -n "${GH_PR_VIEW_JSON_FIXTURE:-}" && -f "${GH_PR_VIEW_JSON_FIXTURE:-}" ]]; then
-            cat "$GH_PR_VIEW_JSON_FIXTURE"; exit 0
-        fi
-        printf '{"statusCheckRollup":[{"name":"ci-passed","status":"COMPLETED","conclusion":"SUCCESS"}],"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"deadbeefcafe","mergeCommit":{"oid":"deadbeefcafe"}}\n'
-        exit 0
-        ;;
-    "pr diff")
-        if [[ -n "${GH_PR_DIFF_FIXTURE:-}" && -f "$GH_PR_DIFF_FIXTURE" ]]; then
-            cat "$GH_PR_DIFF_FIXTURE"; exit 0
-        fi
-        exit 1
-        ;;
-    "pr merge")
-        if [[ -n "${GH_PR_MERGE_STDERR:-}" ]]; then
-            printf '%s\n' "$GH_PR_MERGE_STDERR" >&2
-        fi
-        exit "${GH_PR_MERGE_EXIT:-0}"
-        ;;
-    "run list")
-        if [[ -n "${GH_RUN_LIST_FIXTURE:-}" && -f "${GH_RUN_LIST_FIXTURE:-}" ]]; then
-            cat "$GH_RUN_LIST_FIXTURE"; exit 0
-        fi
-        if [[ -n "${GH_RUN_LIST_JSON_FIXTURE:-}" && -f "${GH_RUN_LIST_JSON_FIXTURE:-}" ]]; then
-            cat "$GH_RUN_LIST_JSON_FIXTURE"; exit 0
-        fi
-        printf '[]\n'
-        exit 0
-        ;;
-    "run view")
-        exit "${GH_RUN_VIEW_EXIT:-0}"
-        ;;
-    "run watch")
-        exit 0
-        ;;
-    "issue view")
-        if [[ -n "${GH_ISSUE_FIXTURE:-}" && -f "$GH_ISSUE_FIXTURE" ]]; then
-            cat "$GH_ISSUE_FIXTURE"; exit 0
-        fi
-        exit 1
-        ;;
-    "issue comment"|"issue close"|"issue edit")
-        exit 0
-        ;;
-    "auth login"|"auth setup-git")
-        exit 0
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-GHEOF_RESTORE
-chmod +x "$STUB_BIN/gh"
 
 t21b_input="$t21b_repo/tmp/dispatcher-input/verify.json"
 # Issue #3547: the shim must exit 0 and write the file even when every
