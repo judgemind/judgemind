@@ -111,6 +111,7 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 - **`/dispatcher`** — Opt-in autonomous work queue manager. See `.claude/skills/dispatcher/SKILL.md`.
 - **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
 - **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings.
+- **`/dispatcher-audit`** — Periodic dispatcher operational-health probes (convergence regression, bad-outcome streak, site health). Files GitHub issues for findings. Triggered by the daemon scheduler every 6 hours.
 
 ### Dispatcher-internal phase skills
 
@@ -118,6 +119,7 @@ The dispatcher v2 pipeline decomposes each task into per-phase subagents. Operat
 
 - **`/task-v2-plan`** — Reads issue + comments, produces a plan document and go/no-go signal.
 - **`/task-v2-ralph`** — Iterative worker + reviewer loop; returns SHIP verdict plus committed diff.
+- **`/task-v2-operational`** — Operational handler for non-coding tasks (script runs, DB queries, gh actions, data rebuilds). Runs without creating a PR. Selected by the daemon when the plan phase emits `task_type=operational`.
 - **`/task-v2-summary`** — Produces process-summary comment, commit message, PR title, and PR body.
 - **`/task-v2-verify`** — Reads merged PR + deploy status + acceptance criteria; posts verification-evidence comment.
 - **`/task-v2-fix-ci`** — Reads CI failure logs and PR diff; produces a patch commit or blocker signal.
@@ -184,9 +186,10 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 - **Prefer Edit over Write for existing files.** Edit sends only the diff. Write sends the entire file content — a 60KB file is ~20K output tokens. Reserve Write for new files or full rewrites.
 - **Don't re-Read a file you already Read in full.**
 - **Use Bash only for shell-only operations** — git, gh CLI, running tests, pip install, terraform, etc.
-- **GitHub reads: MCP for single objects, `gh --json` for lists and wide rollups.** See `docs/agent/github-api-access.md`. Tools are deferred; load with `ToolSearch` before first use.
+- **GitHub reads: MCP for single objects, `gh --json` for lists and wide rollups.** See `docs/agent/github-api-access.md`.
 - **GitHub writes: `gh` CLI** (`gh issue create`, `gh pr create`, `gh pr merge --squash --delete-branch`, etc.). See `docs/agent/gh-to-mcp-migration.md`.
 - **AWS reads: MCP-first for ECS + CloudWatch.** See `docs/agent/aws-api-access.md`. `scripts/ecs-*.sh` wrappers stay for launch-and-stream-logs. `aws` CLI for writes, S3, and interactive Exec. Never call `aws secretsmanager get-secret-value` directly — use `scripts/with-secret.sh`.
+- **Deferred tools require schema loading.** GitHub MCP, AWS MCP, `TodoWrite`, `Monitor`, `EnterWorktree`/`ExitWorktree`, `WebFetch`/`WebSearch`, and `Cron*` appear by name only in `<system-reminder>` messages — call them directly and you'll hit `InputValidationError`. Load with `ToolSearch query="select:Name1,Name2"` before first invocation.
 - **Parallelize independent Bash calls** to reduce wall-clock time.
 - `sudo` and `rm` always prompt; split commands to avoid triggering prompts.
 
