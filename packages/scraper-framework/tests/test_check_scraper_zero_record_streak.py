@@ -178,7 +178,12 @@ class TestCheckZeroRecordStreaks:
         assert result.breaches[0].threshold == 2
 
     def test_brand_new_scraper_with_zeros_is_insufficient_history(self) -> None:
-        """No historical nonzero run = insufficient_history, NOT breach."""
+        """No historical nonzero run = insufficient_history, NOT breach.
+
+        Pass ``known_scraper_ids=None`` to disable the unknown-scraper
+        partition so a fictional scraper ID can exercise the
+        insufficient-history path without being filtered out first.
+        """
         rows = [
             ("ca-new-scraper", NOW - timedelta(hours=1), 0, "success"),
             ("ca-new-scraper", NOW - timedelta(hours=25), 0, "success"),
@@ -192,6 +197,7 @@ class TestCheckZeroRecordStreaks:
             daily_threshold=2,
             frequent_scraper_ids=set(),
             exclusions=set(),
+            known_scraper_ids=None,  # disable unknown-ID check for this unit test
         )
         assert not result.breaches
         assert len(result.insufficient_history) == 1
@@ -355,6 +361,144 @@ class TestOutputFormatting:
         assert "BREACHES" in text
         assert "INSUFFICIENT HISTORY" in text
         assert "(none)" in text
+
+
+# ---------------------------------------------------------------------------
+# Unknown scraper ID (fixture-pollution) warning tests
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownScraperIdWarning:
+    """Verify that scraper IDs absent from the registry are routed to the
+    ``unknown_scrapers`` warning category and skipped in the streak check."""
+
+    def test_unknown_id_appears_in_unknown_scrapers(self) -> None:
+        """An ID not in ``known_scraper_ids`` must end up in
+        ``CheckResult.unknown_scrapers`` and NOT in breaches or
+        insufficient_history."""
+        rows = [
+            ("test-stub", NOW - timedelta(hours=1), 0, "success"),
+            ("test-stub", NOW - timedelta(hours=25), 0, "success"),
+            # No historical nonzero run — would be insufficient_history if
+            # it were a known scraper; it should be unknown instead.
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-la-tentatives-civil"},  # test-stub is NOT here
+        )
+        assert result.unknown_scrapers == ["test-stub"]
+        assert result.checked_count == 0
+        assert result.excluded_count == 0
+        assert not result.breaches
+        assert not result.insufficient_history
+
+    def test_unknown_ids_are_not_streak_checked(self) -> None:
+        """Unknown scrapers with a breach-length streak must NOT appear in
+        breaches — they are suppressed as potential test pollution."""
+        rows = [
+            # Unknown scraper with a long zero-record streak
+            ("good", NOW - timedelta(hours=1), 0, "success"),
+            ("good", NOW - timedelta(hours=25), 0, "success"),
+            ("good", NOW - timedelta(hours=49), 5, "success"),
+            # Known scraper, also with a streak — this one SHOULD breach
+            ("ca-oc-tentatives", NOW - timedelta(hours=2), 0, "success"),
+            ("ca-oc-tentatives", NOW - timedelta(hours=26), 0, "success"),
+            ("ca-oc-tentatives", NOW - timedelta(hours=50), 18, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids={"ca-oc-tentatives"},  # "good" is NOT here
+        )
+        assert "good" in result.unknown_scrapers
+        # The known scraper breaches normally
+        assert len(result.breaches) == 1
+        assert result.breaches[0].scraper_id == "ca-oc-tentatives"
+        assert result.checked_count == 1
+
+    def test_multiple_unknown_ids_all_reported(self) -> None:
+        """All unknown scraper IDs are collected in ``unknown_scrapers``, sorted."""
+        rows = [
+            ("failing", NOW - timedelta(hours=1), 0, "success"),
+            ("run-raiser", NOW - timedelta(hours=2), 0, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids=set(),  # no known scrapers → both are unknown
+        )
+        assert sorted(result.unknown_scrapers) == ["failing", "run-raiser"]
+        assert result.checked_count == 0
+        assert not result.breaches
+
+    def test_none_known_scrapers_disables_partition(self) -> None:
+        """Passing ``known_scraper_ids=None`` disables the unknown-ID check:
+        all fetched IDs are treated as known and streak-checked normally."""
+        rows = [
+            ("test-stub", NOW - timedelta(hours=1), 0, "success"),
+            ("test-stub", NOW - timedelta(hours=25), 0, "success"),
+            ("test-stub", NOW - timedelta(hours=49), 3, "success"),
+        ]
+        conn = _mock_conn(rows)
+        result = check_zero_record_streaks(
+            conn,
+            now=NOW,
+            threshold=3,
+            daily_threshold=2,
+            frequent_scraper_ids=set(),
+            exclusions=set(),
+            known_scraper_ids=None,  # disabled — treat everything as known
+        )
+        # The scraper has streak=2 (daily threshold=2) → breach
+        assert len(result.breaches) == 1
+        assert result.breaches[0].scraper_id == "test-stub"
+        assert result.unknown_scrapers == []
+
+    def test_format_text_includes_unknown_warning(self) -> None:
+        """``format_text`` lists unknown scrapers in a WARNING block."""
+        result = CheckResult(
+            breaches=[],
+            insufficient_history=[],
+            checked_count=0,
+            excluded_count=0,
+            unknown_scrapers=["test-stub", "good"],
+        )
+        text = format_text(result)
+        assert "WARNING" in text
+        assert "test-stub" in text
+        assert "good" in text
+        assert "test pollution" in text
+
+    def test_format_json_includes_unknown_scrapers_key(self) -> None:
+        """``format_json`` includes an ``unknown_scrapers`` array."""
+        import json as _json
+
+        result = CheckResult(
+            breaches=[],
+            insufficient_history=[],
+            checked_count=0,
+            excluded_count=0,
+            unknown_scrapers=["test-stub"],
+        )
+        payload = _json.loads(format_json(result))
+        assert "unknown_scrapers" in payload
+        assert payload["unknown_scrapers"] == ["test-stub"]
 
 
 # ---------------------------------------------------------------------------

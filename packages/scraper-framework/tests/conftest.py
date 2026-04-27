@@ -196,6 +196,31 @@ def _disable_llm_s3_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _block_telemetry_db_writes() -> Generator[None, None, None]:
+    """Prevent any test from accidentally writing to ``telemetry.scraper_runs``.
+
+    Two layers of protection applied for the full test session:
+
+    1. ``DATABASE_URL`` is patched to the empty string so that
+       ``framework.runner._connect_db`` short-circuits its early-return guard
+       (``if not database_url: return None``).
+    2. ``framework.runner._connect_db`` is patched directly to return ``None``
+       in case any code path reads DATABASE_URL before the env patch takes
+       effect, or if a future refactor skips the env-var check.
+
+    Tests that need a real (mock) DB connection apply their own
+    ``patch("framework.runner._connect_db", ...)`` which takes precedence
+    over this session-level patch within their context-manager scope —
+    the stacked patches in ``TestConnectDb`` (test_runner.py:850-879) and
+    the ``Test*RecordScraperRun*`` / ``TestRecordScraperException*`` classes
+    are unaffected.
+    """
+    with patch.dict(os.environ, {"DATABASE_URL": ""}):
+        with patch("framework.runner._connect_db", return_value=None):
+            yield
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _fast_retry_sleeps() -> Generator[None, None, None]:
     """Replace ``time.sleep`` in the retry module with a no-op.
 
