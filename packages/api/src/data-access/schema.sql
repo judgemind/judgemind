@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 49 migrations.
+-- Generated from 56 migrations.
 
 
 
@@ -1278,6 +1278,9 @@ CREATE INDEX idx_party_aliases_raw_name ON derived.party_aliases USING btree (lo
 
 
 CREATE INDEX idx_rulings_case_id ON derived.rulings USING btree (case_id);
+
+
+CREATE INDEX idx_rulings_case_judge ON derived.rulings USING btree (case_id, judge_id);
 
 
 CREATE INDEX idx_rulings_court_id ON derived.rulings USING btree (court_id);
