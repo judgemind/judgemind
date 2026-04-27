@@ -255,6 +255,35 @@ class TestExtractedRuling:
         with pytest.raises(ValidationError):
             ExtractedRuling(case_type="invalid_type")
 
+    def test_extracted_ruling_entry_number_field(self) -> None:
+        """entry_number field exists, serializes correctly, and defaults to None."""
+        # Instantiation with entry_number set
+        ruling = ExtractedRuling(entry_number=5)
+        assert ruling.entry_number == 5
+
+        # Round-trip via model_dump / model_validate
+        dumped = ruling.model_dump()
+        assert dumped["entry_number"] == 5
+        restored = ExtractedRuling.model_validate(dumped)
+        assert restored.entry_number == 5
+
+        # Round-trip via JSON serialization
+        json_str = ruling.model_dump_json()
+        restored_json = ExtractedRuling.model_validate_json(json_str)
+        assert restored_json.entry_number == 5
+
+        # Legacy serialized rows that lack the field default to None
+        legacy_dict = {
+            "extracted_case_number": "2024-00001",
+            "ruling_text": "The motion is GRANTED.",
+        }
+        legacy_ruling = ExtractedRuling.model_validate(legacy_dict)
+        assert legacy_ruling.entry_number is None
+
+        # Default is None when not specified
+        default_ruling = ExtractedRuling()
+        assert default_ruling.entry_number is None
+
     def test_distinguishes_raw_from_resolved(self) -> None:
         """Verify extracted_ prefix fields exist and non-prefixed don't."""
         ruling = ExtractedRuling(

@@ -1748,9 +1748,9 @@ def _drop_short_unsubstantive_rulings(
 # written, the new logic takes effect on cache read — avoiding an expensive
 # cache-busting reingest.
 #
-# ``_resolve_cross_references`` and ``_propagate_document_fields`` are NOT
-# re-applied here because they need the pre-join row state (entry numbers
-# and metadata that are discarded once we have ``ExtractedRuling`` objects).
+# ``_propagate_document_fields`` is NOT re-applied here — it operates on the
+# text-extraction ``ExtractionResult``, not ``ExtractedRuling[]``, so it is
+# structurally not portable to the PDF cache-hit path.
 
 
 def _apply_pdf_cache_hit_filters(
@@ -1763,14 +1763,18 @@ def _apply_pdf_cache_hit_filters(
     Mirrors the subset of filters in :func:`_join_page_rows` that operate
     purely on the final ``ExtractedRuling[]`` list.  Order matches
     ``_join_page_rows`` so the cache-hit output is equivalent to what a
-    fresh extraction would produce (for rulings that do not rely on
-    cross-reference resolution, which requires pre-join row state).
+    fresh extraction would produce.
+
+    Cross-reference resolution (#3608) runs first so stub rulings that carry
+    ``entry_number`` are resolved before the drop/dedup filters discard them,
+    mirroring the filter ordering in the fresh-extract path.
 
     Logs ``llm_extractor.cache_hit_filters_dropped`` at info level if the
     filters dropped rows — useful for observing the effect of filter
     widening in production without re-running LLM calls.
     """
     original_count = len(rulings)
+    rulings = _resolve_cross_references(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
     rulings = _truncate_concatenated_case_titles(rulings)
@@ -1861,7 +1865,7 @@ _XREF_STUB_MAX_TEXT_LENGTH = 2000
 
 def _resolve_cross_references(
     rulings: list[ExtractedRuling],
-    entry_number_to_index: dict[int, int],
+    entry_number_to_index: dict[int, int] | None = None,
 ) -> list[ExtractedRuling]:
     """Resolve cross-reference entries by copying ruling_text from the referenced entry (#2317).
 
@@ -1896,8 +1900,16 @@ def _resolve_cross_references(
     rulings:
         List of ``ExtractedRuling`` objects from ``_join_page_rows``.
     entry_number_to_index:
-        Mapping from calendar line entry_number to index in ``rulings``.
+        Mapping from calendar line entry_number to index in ``rulings``.  When
+        ``None`` (cache-hit path), the map is built from each ruling's
+        ``entry_number`` field so resolution works without pre-join row state.
     """
+    # When no map is provided (cache-hit path), build it from per-ruling entry_number.
+    if entry_number_to_index is None:
+        entry_number_to_index = {
+            r.entry_number: i for i, r in enumerate(rulings) if r.entry_number is not None
+        }
+
     # Build reverse map: index -> entry_number (for "order above" lookups).
     index_to_entry: dict[int, int] = {v: k for k, v in entry_number_to_index.items()}
 
@@ -3516,6 +3528,7 @@ def _append_ruling_from_case(
     header_judge: str | None,
     header_dept: str | None,
     header_date: str | None,
+    entry_number: int | None = None,
 ) -> None:
     """Append one ``ExtractedRuling`` built from a single case_info string.
 
@@ -3563,6 +3576,7 @@ def _append_ruling_from_case(
             department=department,
             hearing_date=hearing_date,
             ruling_text=text,
+            entry_number=entry_number,
         )
     )
 
@@ -3659,6 +3673,7 @@ def _join_page_rows(
                 {
                     "case_info": row["case_info"],
                     "ruling_text": row["ruling_text"],
+                    "entry_number": row["entry_number"],
                 }
             )
             # Record entry_number -> case index for cross-reference lookups.
@@ -3679,6 +3694,7 @@ def _join_page_rows(
                     {
                         "case_info": row["case_info"],
                         "ruling_text": row["ruling_text"],
+                        "entry_number": row["entry_number"],
                     }
                 )
 
@@ -3703,6 +3719,10 @@ def _join_page_rows(
         sub_case_infos = _split_fused_case_info(case["case_info"])
         for idx, sub_info in enumerate(sub_case_infos):
             sub_text = case["ruling_text"] if idx == 0 else None
+            # Only the first sub-case of a fused split inherits the row's
+            # entry_number — subsequent sub-cases stay None because the
+            # original entry_number unambiguously refers to the first ruling.
+            sub_entry_number = case["entry_number"] if idx == 0 else None
             _append_ruling_from_case(
                 rulings,
                 sub_info,
@@ -3711,6 +3731,7 @@ def _join_page_rows(
                 header_judge=header_judge,
                 header_dept=header_dept,
                 header_date=header_date,
+                entry_number=sub_entry_number,
             )
 
     # Remap entry_number_to_index to point at the first sub-case's ruling

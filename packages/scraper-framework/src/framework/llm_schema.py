@@ -121,6 +121,9 @@ class ExtractedRuling(BaseModel):
     case_type: ExtractionCaseType | None = None
     confidence: FieldConfidence = Field(default_factory=FieldConfidence)
     cross_reference_source: int | None = None  # entry_number ruling_text was copied from
+    # Calendar line number from the source PDF; preserved so that
+    # _resolve_cross_references can run on the cache-hit path (#3608).
+    entry_number: int | None = None
 
 
 # ---------------------------------------------------------------------------
