@@ -4896,12 +4896,37 @@ while true; do
             _action=$(printf '%s' "$_transition" | cut -f1)
             _next=$(printf '%s' "$_transition" | cut -f2)
             _status=$(printf '%s' "$_transition" | cut -f3)
+            _hint=$(printf '%s' "$_transition" | cut -f4)
             case "$_action" in
                 advance)
                     advance_phase "$_next"
                     ;;
                 advance_with_status)
                     advance_phase "$_next" "$_status"
+                    ;;
+                route_to_diagnoser)
+                    # Issue #3543 — push_and_pr rebase failure with no
+                    # unmerged files. transition_from_push_and_pr emits
+                    # ROUTE_TO_DIAGNOSER with hint=push_and_pr_no_unmerged_files
+                    # (#3465). Route to the descriptive terminal so the
+                    # daemon's BYPASSED_TERMINAL_PHASES_TO_ROUTE picks it
+                    # up for the diagnoser sweep.
+                    log "push_and_pr_route_to_diagnoser" "hint=$_hint"
+                    case "$_hint" in
+                        push_and_pr_no_unmerged_files)
+                            agent_runner_reaped_failure \
+                                "push_and_pr_no_unmerged_files" \
+                                "push_and_pr_no_unmerged_files" \
+                                "push_and_pr rebase failed with no unmerged files"
+                            ;;
+                        *)
+                            log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
+                            agent_runner_reaped_failure \
+                                "diagnoser_route_unrecognized_hint" \
+                                "diagnoser_route_unrecognized_hint" \
+                                "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
+                            ;;
+                    esac
                     ;;
                 *)
                     # Issue #3455 — descriptive terminal instead of
@@ -4910,7 +4935,7 @@ while true; do
                     agent_runner_reaped_failure \
                         "push_and_pr_transition_unrecognized" \
                         "push_and_pr_transition_unrecognized" \
-                        "push_and_pr returned action=$_action (not advance / advance_with_status)"
+                        "push_and_pr returned action=$_action (not advance / advance_with_status / route_to_diagnoser)"
                     ;;
             esac
             ;;

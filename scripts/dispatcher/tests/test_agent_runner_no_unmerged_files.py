@@ -108,3 +108,33 @@ class TestRouteToDignoserListsPushAndPrNoUnmergedFiles:
             "route_to_diagnoser dispatch case must include "
             "`push_and_pr_no_unmerged_files` in the descriptive-hint allow-list (#3465)"
         )
+
+
+class TestPushAndPrCaseArmHasRouteToDiagnoser:
+    """The push_and_pr) case-arm must contain a ``route_to_diagnoser)``
+    arm and a ``push_and_pr_no_unmerged_files)`` hint sub-case (#3543)."""
+
+    @staticmethod
+    def _push_and_pr_block(text: str) -> str:
+        """Return the substring between ``push_and_pr)`` and the next
+        top-level ``fix_conflict)`` arm."""
+        start = text.find("        push_and_pr)\n")
+        end = text.find("        fix_conflict)\n", start)
+        assert start != -1, "push_and_pr) arm not found in entrypoint"
+        assert end != -1, "fix_conflict) arm not found after push_and_pr) arm"
+        return text[start:end]
+
+    def test_push_and_pr_arm_has_route_to_diagnoser(self) -> None:
+        text = _script_text()
+        block = self._push_and_pr_block(text)
+        assert re.search(r"route_to_diagnoser\)", block), (
+            "push_and_pr) case-arm must contain a route_to_diagnoser) arm (#3543)"
+        )
+
+    def test_push_and_pr_arm_has_no_unmerged_files_hint(self) -> None:
+        text = _script_text()
+        block = self._push_and_pr_block(text)
+        assert re.search(r"push_and_pr_no_unmerged_files\)", block), (
+            "push_and_pr) case-arm must contain a push_and_pr_no_unmerged_files) "
+            "hint sub-case (#3543)"
+        )
