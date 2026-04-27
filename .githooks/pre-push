@@ -235,34 +235,31 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
         if [ -x "$pkg_dir/.venv/bin/pytest" ]; then
             echo "pre-push: running tests for Python package '$pkg'..." >&2
-            # Use pytest-xdist when available for parallel test execution
-            # (8x speedup on the 7200-test scraper-framework suite with
-            # 4 vCPU in the Fargate dispatcher; negligible overhead on
-            # small suites). Defensive check against venvs built before
-            # pytest-xdist was added to the package's dev deps.
-            if "$pkg_dir/.venv/bin/python" -c "import xdist" 2>/dev/null; then
-                xdist_flag="-n auto"
-            else
-                xdist_flag=""
-            fi
-            # Use pytest-testmon when available to skip tests whose
-            # covered source lines haven't changed since the last run
-            # (#2997). State is kept in $pkg_dir/.testmondata (gitignored,
-            # per-worktree). First run is a full suite; subsequent runs
-            # within the same worktree (e.g. ralph iteration 2+) re-run
-            # only the tests whose coverage map intersects the diff.
-            # Flag order matters: testmon filters the test list, xdist
-            # parallelizes whatever testmon selects. Defensive check
-            # mirrors the xdist pattern above so pre-push still works
-            # on venvs built before pytest-testmon was added to dev deps.
-            if "$pkg_dir/.venv/bin/python" -c "import testmon" 2>/dev/null; then
-                testmon_flag="--testmon"
-            else
-                testmon_flag=""
-            fi
+            # pytest-testmon and pytest-xdist both interfere with pytest-cov:
+            # - testmon + pytest-cov: both use coverage.py simultaneously;
+            #   testmon's internal measurement suppresses pytest-cov's, so
+            #   coverage.xml reflects only module-level imports (~22% for
+            #   scraper-framework) rather than the full suite (~96%).
+            # - xdist + pytest-cov: worker coverage is not forwarded to the
+            #   controller by default; coverage.xml only reflects the
+            #   coordinator process (~25% for scraper-framework).
+            # Running the full suite serially without either flag produces
+            # correct coverage and is required for the floor check to pass.
+            # (pytest-testmon is still used to build/update .testmondata so
+            # subsequent ralph iterations benefit from selective re-runs —
+            # it just must not run at the same time as pytest-cov.)
+            testmon_flag=""
+            xdist_flag=""
             if ! run_check "$pkg" "pytest" "$pkg_dir/.venv/bin/pytest" $testmon_flag $xdist_flag "$pkg_dir/tests/" -x -q --tb=line; then
                 echo "  Run: $pkg_dir/.venv/bin/pytest $pkg_dir/tests/ -v --tb=short" >&2
                 failures=$((failures + 1))
+            fi
+            # pytest-cov writes coverage.xml relative to CWD (the repo root
+            # when run from the hook), not relative to the package rootdir.
+            # Sync it to the package dir so the coverage floor check below
+            # reads the fresh file instead of a stale one from a prior run.
+            if [ -f "coverage.xml" ] && [ "coverage.xml" -nt "$pkg_dir/coverage.xml" ] 2>/dev/null; then
+                cp "coverage.xml" "$pkg_dir/coverage.xml"
             fi
         else
             echo "  WARNING: pytest not found for $pkg — skipping tests" >&2

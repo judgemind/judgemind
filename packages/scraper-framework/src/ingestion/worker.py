@@ -335,6 +335,94 @@ def _try_la_html_split(
     return True
 
 
+def _try_fresno_pdf_split(
+    event_data: dict[str, Any],
+    document_id: str,
+    ruling_text: str,
+    dispatch: Any,
+) -> bool:
+    """If *ruling_text* is a Fresno multi-ruling PDF, deterministically split
+    it into per-case rulings and dispatch one synthetic split event per case
+    via *dispatch*.  Returns True if the split ran, False otherwise.
+
+    This path bypasses the LLM entirely — Fresno PDFs contain numbered ruling
+    entries (``(20) Tentative Ruling``, ``(21) Tentative Ruling``, etc.) that
+    are cheap to parse with the existing regex-based ``_split_rulings``
+    function in ``courts.ca.fresno_tentatives``.  Sending multi-ruling PDFs
+    through the LLM previously produced cross-case contamination: every ruling
+    was mis-attributed to the case referenced in the page-1 preamble.
+
+    Detection gate: only triggers when event is Fresno county **and** content
+    format is ``"pdf"`` — avoids false-positive matches on other courts.
+
+    When ``_split_rulings`` returns ``[]`` (single-ruling PDF or unexpected
+    layout), this function returns ``False`` so the existing LLM path handles
+    it (AC4).
+
+    Mirrors the SD/LA pattern (``_try_sd_calendar_split`` #2447,
+    ``_try_la_html_split`` #2450).
+    """
+    county = event_data.get("county") or ""
+    if county.upper() != "FRESNO":
+        return False
+    if event_data.get("content_format") != "pdf":
+        return False
+
+    # Lazy import to avoid a circular dependency between the worker and
+    # the courts package at module load time.
+    from courts.ca.fresno_tentatives import _split_rulings
+
+    split_rulings = _split_rulings(ruling_text)
+    if not split_rulings:
+        # Single-ruling PDF or unrecognised layout — fall through to LLM.
+        return False
+
+    logger.info(
+        "Fresno PDF deterministic split dispatching %d ruling(s)",
+        len(split_rulings),
+        extra={
+            "document_id": document_id,
+            "ruling_count": len(split_rulings),
+            "scraper_id": event_data.get("scraper_id"),
+            "extraction_method": "fresno_pdf_deterministic",
+        },
+    )
+
+    from .split_ids import make_split_document_id
+
+    is_multi = len(split_rulings) > 1
+    for idx, sr in enumerate(split_rulings):
+        split_doc_id = make_split_document_id(document_id, idx) if is_multi else document_id
+        hearing_date_value: str | None = None
+        if sr.hearing_date is not None:
+            hearing_date_value = (
+                sr.hearing_date.date().isoformat()
+                if isinstance(sr.hearing_date, datetime)
+                else str(sr.hearing_date)
+            )
+
+        split_event: dict[str, Any] = {
+            **event_data,
+            "document_id": split_doc_id,
+            "_original_document_id": document_id,
+            "_split_processed": True,
+            "_llm_extracted": True,  # Skip further LLM attempts.
+            "_split_index": idx,
+            "_split_count": len(split_rulings),
+            "ruling_text": sr.ruling_text,
+            "ruling_text_html": None,
+            "case_number": sr.case_number or event_data.get("case_number"),
+            "case_title": sr.case_title or event_data.get("case_title"),
+            "department": sr.department or event_data.get("department"),
+            "motion_type": sr.motion_type or event_data.get("motion_type"),
+            "outcome": sr.outcome or event_data.get("outcome"),
+            "hearing_date": hearing_date_value or event_data.get("hearing_date"),
+        }
+        dispatch(split_event)
+
+    return True
+
+
 # Fields that LLM extraction can populate when missing from the scraper event.
 EXTRACTABLE_FIELDS = (
     "hearing_date",
@@ -2447,6 +2535,21 @@ class IngestionWorker:
         # and parties from the HTML.  This path is taken regardless of
         # scraper_id so any future LA HTML capture paths stay correct.
         if ruling_text and _try_la_html_split(
+            event_data, document_id, ruling_text, self.process_event
+        ):
+            return True
+
+        # ------------------------------------------------------------------
+        # Fresno multi-ruling PDF deterministic split (#3534)
+        # ------------------------------------------------------------------
+        # Fresno PDFs contain numbered ruling entries like ``(20) Tentative
+        # Ruling``.  The LLM previously mis-attributed every ruling in a
+        # multi-ruling PDF to the case referenced in the page-1 preamble.
+        # The deterministic ``_split_rulings`` in ``fresno_tentatives`` is
+        # county+format gated (Fresno + pdf only) so it never fires for other
+        # counties.  Single-ruling PDFs (``_split_rulings`` returns ``[]``)
+        # fall through to the normal LLM path below.
+        if ruling_text and _try_fresno_pdf_split(
             event_data, document_id, ruling_text, self.process_event
         ):
             return True
