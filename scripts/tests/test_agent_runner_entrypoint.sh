@@ -6768,6 +6768,156 @@ else
          "out: $(printf '%s' "$t63b_out" | grep "ralph_baseline_route_to_diagnoser")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T60e (#3587 AC3): cancelled-only fixture for merge_sha →
+# deploy_state=cancelled → dispatch logs awaiting_deploy_cancelled,
+# phase does NOT advance to verify, no awaiting_deploy_failed emitted.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60e.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t60e_runs="$TEST_TMP/t60e-runs.json"
+cat > "$t60e_runs" <<'EOF'
+[
+  {"databaseId": 400, "workflowName": "Deploy Agent Runner", "status": "COMPLETED", "conclusion": "CANCELLED", "createdAt": "2026-04-27T05:00:00Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t60e_workspace="$TEST_TMP/t60e-workspace"
+set +e
+t60e_out=$(run_post_pr_phase "awaiting_deploy" "$t60e_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60e_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+# (1) awaiting_deploy_cancelled must be logged.
+if printf '%s' "$t60e_out" | grep -q "awaiting_deploy_cancelled"; then
+    pass "#3587 T60e — cancelled deploy → awaiting_deploy_cancelled logged"
+else
+    fail "#3587 T60e — cancelled deploy → awaiting_deploy_cancelled logged" \
+         "out tail: $(printf '%s' "$t60e_out" | tail -c 600)"
+fi
+
+# (2) phase must NOT advance to verify.
+_t60e_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t60e_final" != "verify" ]]; then
+    pass "#3587 T60e — cancelled deploy → phase does NOT advance to verify"
+else
+    fail "#3587 T60e — cancelled deploy → phase does NOT advance to verify" \
+         "phase advanced to: $_t60e_final"
+fi
+
+# (3) awaiting_deploy_failed must NOT be emitted (not a hard failure).
+if ! printf '%s' "$t60e_out" | grep -q "awaiting_deploy_failed"; then
+    pass "#3587 T60e — cancelled deploy → awaiting_deploy_failed NOT emitted"
+else
+    fail "#3587 T60e — cancelled deploy → awaiting_deploy_failed NOT emitted" \
+         "out lines with awaiting_deploy_failed: $(printf '%s' "$t60e_out" | grep 'awaiting_deploy_failed')"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T60f (#3587 AC4): poller crash — assert phase_outputs carries
+# structured output, NOT empty {}. Simulated by injecting a bad JSON
+# runs fixture that makes jq fail so classify_deploy_runs returns 'none',
+# combined with AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0 so it advances.
+# The goal is to ensure persist_phase_output gets a non-empty payload.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60f.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+# Empty array fixture → classify_deploy_runs returns 'none' → awaiting_deploy_no_runs
+# after grace expires → payload '{"deploy_state": "none", ...}' (non-empty).
+t60f_runs="$TEST_TMP/t60f-runs.json"
+printf '[]' > "$t60f_runs"
+
+t60f_workspace="$TEST_TMP/t60f-workspace"
+set +e
+t60f_out=$(run_post_pr_phase "awaiting_deploy" "$t60f_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60f_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0")
+set -e
+
+# Phase must advance to verify (no-deploy-applicable path).
+_t60f_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t60f_final" == "verify" ]]; then
+    pass "#3587 T60f — no-runs grace path → phase advances to verify"
+else
+    fail "#3587 T60f — no-runs grace path → phase advances to verify" \
+         "phase: $_t60f_final"
+fi
+
+# persist_phase_output must have received a non-empty payload (not just "{}").
+# The phase_outputs INSERT in psql.log carries the JSON escaped as \\'...\\'.
+if grep -q "phase_output" "$INVOCATIONS_DIR/psql.log"; then
+    # Extract what was persisted and check it is not just empty braces.
+    _t60f_payload=$(grep "phase_output" "$INVOCATIONS_DIR/psql.log" | tail -1)
+    if printf '%s' "$_t60f_payload" | grep -qE '"deploy_state"'; then
+        pass "#3587 T60f — persist_phase_output carries structured payload (not empty {})"
+    else
+        fail "#3587 T60f — persist_phase_output carries structured payload (not empty {})" \
+             "payload line: $_t60f_payload"
+    fi
+else
+    fail "#3587 T60f — persist_phase_output carries structured payload (not empty {})" \
+         "no phase_output in psql.log"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T60g (#3587 regression for printf-after-reaped_failure bug):
+# stage _state=failure (COMPLETED+FAILURE for merge_sha) and assert that
+# phase_outputs.awaiting_deploy.output_json is NOT {} — it carries the
+# structured {"deploy_state": "failure", ...} payload.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t60g.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t60g_runs="$TEST_TMP/t60g-runs.json"
+cat > "$t60g_runs" <<'EOF'
+[
+  {"databaseId": 500, "workflowName": "Deploy Agent Runner", "status": "COMPLETED", "conclusion": "FAILURE", "createdAt": "2026-04-27T06:00:00Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t60g_workspace="$TEST_TMP/t60g-workspace"
+set +e
+t60g_out=$(run_post_pr_phase "awaiting_deploy" "$t60g_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t60g_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+# (1) awaiting_deploy_failed reaped_failure must be emitted.
+if printf '%s' "$t60g_out" | grep -q "agent_runner_reaped_failure.*awaiting_deploy_failed\|terminal_phase=awaiting_deploy_failed"; then
+    pass "#3587 T60g — deploy failure → awaiting_deploy_failed reaped_failure emitted"
+else
+    fail "#3587 T60g — deploy failure → awaiting_deploy_failed reaped_failure emitted" \
+         "out tail: $(printf '%s' "$t60g_out" | tail -c 600)"
+fi
+
+# (2) phase_outputs payload must carry deploy_state=failure (NOT empty {}).
+# This is the direct regression test for the printf-after-reaped_failure bug.
+_t60g_payload=$(grep "phase_output\|persist_phase" "$INVOCATIONS_DIR/psql.log" 2>/dev/null | tail -1 || printf '')
+if printf '%s' "$t60g_out" | grep -q '"deploy_state": "failure"\|deploy_state.*failure'; then
+    pass "#3587 T60g — printf-before-reaped_failure fix: output_json carries deploy_state payload"
+else
+    fail "#3587 T60g — printf-before-reaped_failure fix: output_json carries deploy_state payload" \
+         "out tail: $(printf '%s' "$t60g_out" | tail -c 600)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

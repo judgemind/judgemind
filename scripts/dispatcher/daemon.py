@@ -1263,6 +1263,16 @@ FAILURE_CATEGORY_FIX_CI_APPLY_FAILED = "fix_ci_apply_failed"
 #: ``daemon.deploy_failed`` CloudWatch event alone.
 FAILURE_CATEGORY_DEPLOY_FAILED = "deploy_failed"
 
+#: Issue #3587 — deploy workflow run completed with ``conclusion=CANCELLED``
+#: (typically caused by a concurrency group cancellation when a follow-on
+#: push triggers a newer workflow run). Split out of :data:`FAILURE_CATEGORY_DEPLOY_FAILED`
+#: so the diagnoser can distinguish "infra broken" from "run cancelled by
+#: a subsequent push" and choose the appropriate action (e.g. wait for
+#: the next deploy run vs. escalate). Diagnoser-actionable: the next
+#: Deploy Dispatcher run for the merge SHA usually succeeds; the diagnoser
+#: can ``retry``, ``wait``, or ``block_and_comment`` based on run context.
+FAILURE_CATEGORY_DEPLOY_CANCELLED = "deploy_cancelled"
+
 #: Tier-3 category from issue #3071 — post-merge ``/task-v2-verify``
 #: subprocess returned ``verdict='FAILED'``. Genuine regression signal
 #: (the deployed code didn't behave as expected). Post-merge context
@@ -1384,6 +1394,9 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     # #3586 — ralph returned non-SHIP verdict; diagnoser takes over from
     # the former local handler so it can file prereqs / close / escalate.
     "ralph_not_ship": FAILURE_CATEGORY_RALPH_NOT_SHIP,
+    # #3587 — deploy run for the merge SHA had conclusion=CANCELLED.
+    # Diagnoser-actionable: distinguish concurrency-cancel from infra failure.
+    "awaiting_deploy_cancelled": FAILURE_CATEGORY_DEPLOY_CANCELLED,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's
@@ -15431,6 +15444,40 @@ class DispatcherDaemon:
         if deploy_state == "pending":
             return
 
+        # Issue #3587: cancelled deploy run — route to diagnoser via
+        # ``_handle_agent_failure`` with FAILURE_CATEGORY_DEPLOY_CANCELLED.
+        # Do NOT use the transition catalog for this branch — the catalog
+        # only knows deploy_succeeded (True/False); cancelled is a third
+        # state that should never be treated as a hard failure.
+        if deploy_state == "cancelled":
+            self._log.warning(
+                "daemon.deploy_cancelled",
+                extra={
+                    "event": "deploy_cancelled",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "merge_sha": merge_sha,
+                    "deploy_runs": deploy_runs,
+                },
+            )
+            issue_number_val = agent.get("issue_number")
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_deploy",
+                category=FAILURE_CATEGORY_DEPLOY_CANCELLED,
+                stderr_tail="",
+                exit_code=None,
+                details={
+                    "pr_number": pr_number,
+                    "merge_sha": merge_sha,
+                    "deploy_runs": deploy_runs,
+                    "issue_number": issue_number_val,
+                },
+                issue_number=issue_number_val,
+            )
+            return
+
         # Dispatch through the pure phase-transition catalog (#2976).
         # transition_from_awaiting_deploy(deploy_succeeded) drives the
         # next-phase DECISION; all side-effect logic (logging, failure-
@@ -15549,12 +15596,16 @@ class DispatcherDaemon:
 
     @staticmethod
     def _classify_deploy_runs(runs: list[dict[str, Any]]) -> str:
-        """Return ``'pending'``, ``'success'``, ``'failure'``, or ``'none'``.
+        """Return ``'pending'``, ``'success'``, ``'failure'``, ``'cancelled'``, or ``'none'``.
 
         * ``none`` — no deploy run matched (doc-only PR etc.).
         * ``pending`` — any run in a non-terminal state.
         * ``failure`` — at least one run terminal with failure-type
-          conclusion.
+          conclusion (excluding ``CANCELLED``).
+        * ``cancelled`` — all terminal runs have ``conclusion=CANCELLED``
+          (no hard failures). Issue #3587: split out of the ``failure``
+          bucket so a concurrency-cancelled deploy routes to the diagnoser
+          rather than terminal-failing immediately.
         * ``success`` — all runs terminal with success/skipped/neutral.
         """
         if not runs:
@@ -15562,6 +15613,8 @@ class DispatcherDaemon:
         success_conclusions = {"SUCCESS", "SKIPPED", "NEUTRAL"}
         has_pending = False
         has_failure = False
+        has_cancelled = False
+        has_success = False
         for run in runs:
             status = str(run.get("status") or "").upper()
             if status != "COMPLETED":
@@ -15572,12 +15625,20 @@ class DispatcherDaemon:
                 continue
             conclusion = str(run.get("conclusion") or "").upper()
             if conclusion in success_conclusions:
-                continue
-            has_failure = True
+                has_success = True
+            elif conclusion == "CANCELLED":
+                has_cancelled = True
+            else:
+                has_failure = True
         if has_pending:
             return "pending"
         if has_failure:
             return "failure"
+        # Issue #3587: only surface "cancelled" when there are no successful
+        # runs alongside the cancellation. A SUCCESS + CANCELLED mix means at
+        # least one deploy workflow succeeded; treat that as overall success.
+        if has_cancelled and not has_success:
+            return "cancelled"
         return "success"
 
     # ── verify (final) ──────────────────────────────────────────────────

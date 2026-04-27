@@ -281,6 +281,42 @@ class TestClassifyDeployRuns:
         ]
         assert daemon.DispatcherDaemon._classify_deploy_runs(runs) == "failure"
 
+    def test_cancelled_only_returns_cancelled(self) -> None:
+        # Issue #3587 AC3: a run with conclusion=CANCELLED (no hard failures)
+        # must return "cancelled", NOT "failure".
+        runs = [
+            {
+                "status": "COMPLETED",
+                "conclusion": "CANCELLED",
+            }
+        ]
+        assert daemon.DispatcherDaemon._classify_deploy_runs(runs) == "cancelled"
+
+    def test_cancelled_with_success_returns_success(self) -> None:
+        # A mix where one run succeeds and another is cancelled should not
+        # surface as cancelled — the successful run wins.
+        runs = [
+            {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"status": "COMPLETED", "conclusion": "CANCELLED"},
+        ]
+        assert daemon.DispatcherDaemon._classify_deploy_runs(runs) == "success"
+
+    def test_failure_beats_cancelled(self) -> None:
+        # A hard failure takes precedence over a cancelled run.
+        runs = [
+            {"status": "COMPLETED", "conclusion": "CANCELLED"},
+            {"status": "COMPLETED", "conclusion": "FAILURE"},
+        ]
+        assert daemon.DispatcherDaemon._classify_deploy_runs(runs) == "failure"
+
+    def test_pending_beats_cancelled(self) -> None:
+        # A pending run takes precedence over a cancelled run.
+        runs = [
+            {"status": "IN_PROGRESS"},
+            {"status": "COMPLETED", "conclusion": "CANCELLED"},
+        ]
+        assert daemon.DispatcherDaemon._classify_deploy_runs(runs) == "pending"
+
 
 # --------------------------------------------------------------------------
 # DEPLOY_WORKFLOW_NAMES contents — regression guard (#3185)
@@ -1356,6 +1392,107 @@ class TestAwaitingDeployFailure:
             and "failed" in e[1]
         ]
         assert failed_updates
+
+
+# --------------------------------------------------------------------------
+# _advance_awaiting_deploy — cancelled → route to diagnoser (AC3, #3587)
+# --------------------------------------------------------------------------
+
+
+class TestAwaitingDeployCancelled:
+    """Issue #3587 AC3 — conclusion=CANCELLED must NOT terminal-fail the agent
+    directly. Instead ``_advance_awaiting_deploy`` must route via
+    ``_handle_agent_failure`` with ``FAILURE_CATEGORY_DEPLOY_CANCELLED``
+    so the diagnoser sweep picks it up.
+    """
+
+    def test_advance_awaiting_deploy_cancelled_routes_to_diagnoser_not_terminal(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        d, conn, handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = ""
+            if cmd[:3] == ["gh", "pr", "view"]:
+                r.stdout = json.dumps(
+                    {
+                        "statusCheckRollup": [],
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "head-sha",
+                        "mergeCommit": {"oid": "merge-sha-cancel"},
+                    }
+                )
+                return r
+            if cmd[:3] == ["gh", "run", "list"]:
+                r.stdout = json.dumps(
+                    [
+                        {
+                            "databaseId": 222,
+                            "workflowName": "Deploy Agent Runner",
+                            "status": "COMPLETED",
+                            "conclusion": "CANCELLED",
+                            "createdAt": "2026-04-27T04:00:00Z",
+                        }
+                    ]
+                )
+                return r
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        # Capture _handle_agent_failure calls instead of letting them run
+        # (avoids stubbing the full DB cursor state for this narrow assertion).
+        handle_failure_calls: list[dict[str, Any]] = []
+
+        def fake_handle_failure(**kwargs: Any) -> None:
+            handle_failure_calls.append(kwargs)
+
+        monkeypatch.setattr(d, "_handle_agent_failure", fake_handle_failure)
+
+        agent = {
+            "agent_id": "a2",
+            "issue_number": 42,
+            "phase": "awaiting_deploy",
+            "pr_number": 101,
+            "worktree_path": str(tmp_path),
+            "retries_used": 0,
+        }
+        d._advance_awaiting_deploy(agent)
+
+        # The deploy_cancelled event must be logged.
+        assert handler.events("deploy_cancelled"), (
+            "Expected 'deploy_cancelled' log event but none found"
+        )
+
+        # _handle_agent_failure must be called with the cancelled category.
+        assert handle_failure_calls, (
+            "_handle_agent_failure must be called for cancelled deploy state"
+        )
+        assert (
+            handle_failure_calls[0]["category"]
+            == daemon.FAILURE_CATEGORY_DEPLOY_CANCELLED
+        ), (
+            f"Expected FAILURE_CATEGORY_DEPLOY_CANCELLED, got "
+            f"{handle_failure_calls[0]['category']!r}"
+        )
+
+        # The agent must NOT be directly terminal-failed via _mark_agent_terminal
+        # (that path belongs to the non-diagnoser branches).
+        terminal_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and e[1] is not None
+            and "failed" in e[1]
+        ]
+        assert terminal_updates == [], (
+            "Cancelled deploy must NOT directly mark agent as failed; "
+            f"got {terminal_updates!r}"
+        )
 
 
 # --------------------------------------------------------------------------

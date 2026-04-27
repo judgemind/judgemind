@@ -3833,9 +3833,12 @@ classify_pr_rollup() {
 
 classify_deploy_runs() {
     # $1 = path to ``gh run list --json status,conclusion,...`` stdout.
-    # Prints one of: success / failure / pending / none. Matches
-    # ``_classify_deploy_runs`` in daemon.py. ``none`` means no
+    # Prints one of: success / failure / cancelled / pending / none.
+    # Matches ``_classify_deploy_runs`` in daemon.py. ``none`` means no
     # matching deploy runs — caller treats as "no deploy applicable".
+    # Issue #3587: split ``cancelled`` out of the ``failure`` bucket so
+    # a concurrency-cancelled deploy (conclusion=CANCELLED) routes to
+    # the diagnoser instead of terminal-failing.
     _runs_file="$1"
     if [[ ! -s "$_runs_file" ]]; then
         printf 'none'
@@ -3850,9 +3853,15 @@ classify_deploy_runs() {
                 | (.conclusion // "" | ascii_upcase) as $co
                 | if $st != "COMPLETED" then "pending"
                   elif ($co == "SUCCESS" or $co == "SKIPPED" or $co == "NEUTRAL") then "ok"
+                  elif $co == "CANCELLED" then "cancelled"
                   else "failure" end]) as $outcomes
+              # Issue #3587: pending > failure > cancelled-only > success.
+              # "cancelled" only surfaces when there are no "ok" (success)
+              # outcomes alongside the cancellation. A SUCCESS + CANCELLED
+              # mix means at least one workflow succeeded — treat as success.
               | if ($outcomes | index("pending")) then "pending"
                 elif ($outcomes | index("failure")) then "failure"
+                elif (($outcomes | index("cancelled")) != null) and (($outcomes | index("ok")) == null) then "cancelled"
                 else "success" end
             end;
         classify
@@ -4366,9 +4375,11 @@ handle_awaiting_deploy() {
     # ``_advance_awaiting_deploy``.
     _pr_number=$(read_pr_number)
     if [[ -z "$_pr_number" ]]; then
+        # Issue #3587: printf BEFORE agent_runner_reaped_failure so the
+        # captured _output is non-empty when the subshell exits.
+        printf '{"missing_pr": true}'
         agent_runner_reaped_failure "awaiting_deploy_failed" "missing_pr" \
             "pr_number NULL on agent row"
-        printf '{"missing_pr": true}'
         return 0
     fi
 
@@ -4439,11 +4450,23 @@ handle_awaiting_deploy() {
             return 0
         fi
         if [[ "$_state" == "failure" ]]; then
+            # Issue #3587: printf BEFORE agent_runner_reaped_failure so the
+            # captured _output is non-empty when the subshell exits (the
+            # exit 0 inside reaped_failure terminates the subshell before
+            # any subsequent printf can run).
+            printf '{"deploy_state": "failure", "merge_sha": "%s"}' "$_merge_sha"
             agent_runner_reaped_failure \
                 "awaiting_deploy_failed" \
                 "deploy_failed" \
                 "pr=$_pr_number sha=$_merge_sha"
-            printf '{"deploy_state": "failure", "merge_sha": "%s"}' "$_merge_sha"
+            return 0
+        fi
+        if [[ "$_state" == "cancelled" ]]; then
+            # Issue #3587: conclusion=CANCELLED is NOT a hard failure.
+            # Return a structured payload so the dispatch arm routes to
+            # awaiting_deploy_cancelled (diagnoser-actionable) instead
+            # of terminal-failing with awaiting_deploy_failed.
+            printf '{"deploy_state": "cancelled", "merge_sha": "%s"}' "$_merge_sha"
             return 0
         fi
         _now_ts=$(date -u +%s)
@@ -5207,7 +5230,10 @@ while true; do
             # the merge SHA, advance to verify on success / no-run
             # grace, terminal failure on timeout / any deploy
             # workflow failure.
+            # #3587: capture exit code alongside output so transient
+            # crashes can be distinguished from structured failures.
             _output=$(handle_awaiting_deploy)
+            _rc=$?
             persist_phase_output "awaiting_deploy" "$_output"
             _deploy_state=$(printf '%s' "$_output" | jq -r '.deploy_state // ""' 2>/dev/null)
             _timeout=$(printf '%s' "$_output" | jq -r '.timeout // false' 2>/dev/null)
@@ -5216,7 +5242,21 @@ while true; do
             elif [[ "$_deploy_state" == "success" || "$_deploy_state" == "none" ]]; then
                 advance_phase "verify"
             elif [[ "$_deploy_state" == "failure" ]]; then
+                # agent_runner_reaped_failure already called inside
+                # handle_awaiting_deploy before returning the failure payload.
                 :
+            elif [[ "$_deploy_state" == "cancelled" ]]; then
+                # Issue #3587: route cancelled deploy to diagnoser via the
+                # descriptive-terminal path (BYPASSED_TERMINAL_PHASES_TO_ROUTE).
+                # Do NOT terminal-fail directly — the diagnoser determines
+                # the appropriate response (retry, escalate, block, etc.).
+                log "awaiting_deploy_cancelled" \
+                    "deploy_state=cancelled" \
+                    "output=$_output"
+                agent_runner_reaped_failure \
+                    "awaiting_deploy_cancelled" \
+                    "deploy_cancelled" \
+                    "deploy run cancelled for merge_sha — routed to diagnoser"
             else
                 log "awaiting_deploy_unrecognized_output" "output=$_output"
                 agent_runner_reaped_failure \
