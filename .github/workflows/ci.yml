@@ -50,7 +50,6 @@ jobs:
             scraper-framework:
               - 'packages/scraper-framework/src/framework/**'
               - 'packages/scraper-framework/src/ingestion/**'
-              - 'packages/scraper-framework/src/templates/**'
               - 'packages/scraper-framework/src/validation/**'
               - 'packages/scraper-framework/tests/**'
               - 'packages/scraper-framework/pyproject.toml'
