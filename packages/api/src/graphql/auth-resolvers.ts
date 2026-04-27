@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { GraphQLError } from 'graphql';
+import { OAuth2Client } from 'google-auth-library';
 import {
   hashPassword,
   verifyPassword,
@@ -40,6 +41,8 @@ const APP_URL = process.env.APP_URL ?? 'http://localhost:3000';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? '';
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI ?? `${APP_URL}/auth/google/callback`;
+
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 function userRow(row: Row) {
   return {
@@ -330,14 +333,32 @@ export const authResolvers = {
         });
       }
 
-      // Decode ID token (Google's id_token is a JWT — verify via Google's public keys in production)
-      const [, payloadB64] = tokenData.id_token.split('.');
-      const googlePayload = JSON.parse(Buffer.from(payloadB64, 'base64').toString()) as {
-        sub: string;
-        email: string;
-        email_verified?: boolean;
-        name?: string;
-      };
+      // Verify ID token using Google's public keys (validates iss, aud, exp, and signature)
+      let googlePayload: { sub: string; email: string; email_verified?: boolean; name?: string };
+      try {
+        const ticket = await googleClient.verifyIdToken({
+          idToken: tokenData.id_token,
+          audience: GOOGLE_CLIENT_ID,
+        });
+        const payload = ticket.getPayload();
+        if (!payload) {
+          throw new GraphQLError('Invalid Google ID token', {
+            extensions: { code: 'BAD_USER_INPUT' },
+          });
+        }
+        googlePayload = payload as typeof googlePayload;
+      } catch (err) {
+        if (err instanceof GraphQLError) throw err;
+        throw new GraphQLError('Invalid Google ID token', {
+          extensions: { code: 'BAD_USER_INPUT' },
+        });
+      }
+
+      if (googlePayload.email_verified !== true) {
+        throw new GraphQLError('Google account email is not verified', {
+          extensions: { code: 'UNAUTHENTICATED' },
+        });
+      }
 
       const { sub: googleId, email, name } = googlePayload;
 
