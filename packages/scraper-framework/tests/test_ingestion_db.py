@@ -1344,6 +1344,22 @@ class TestLooksLikeValidJudgeNameTruncation:
         """'John K' — single character, not a suffix — rejected."""
         assert _looks_like_valid_judge_name("John K") is False
 
+    def test_accepts_asian_surname_vu(self) -> None:
+        """'Nathan Nhan Vu' — AC2: 2-char surname 'Vu' is a valid Vietnamese name."""
+        assert _looks_like_valid_judge_name("Nathan Nhan Vu") is True
+
+    def test_accepts_asian_surname_lo(self) -> None:
+        """'Thomas J. Lo' — AC3: 2-char surname 'Lo' is a valid Asian name."""
+        assert _looks_like_valid_judge_name("Thomas J. Lo") is True
+
+    def test_accepts_asian_surname_wu(self) -> None:
+        """'Jane Wu' — 2-char surname 'Wu' is a valid Chinese name."""
+        assert _looks_like_valid_judge_name("Jane Wu") is True
+
+    def test_accepts_asian_surname_ng(self) -> None:
+        """'David Ng' — 2-char consonant-only surname 'Ng' is a valid Cantonese name."""
+        assert _looks_like_valid_judge_name("David Ng") is True
+
 
 # ---------------------------------------------------------------------------
 # _strip_middle_initials
