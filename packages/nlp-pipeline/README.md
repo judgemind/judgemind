@@ -1,14 +1,12 @@
 # nlp-pipeline
 
-NLP processing pipeline for Judgemind court documents. Handles document classification, entity extraction, summarization, embedding generation, and version diffing. This package implements the Tier 1 AI capabilities described in the architecture spec.
+NLP processing pipeline for Judgemind court documents. Handles document classification, entity extraction, and summarization. This package implements the Tier 1 AI capabilities described in the architecture spec.
 
 ## Key Entry Points
 
 - **`src/classification/classifier.py`** -- Document type and motion type classification using LLM or rule-based methods.
 - **`src/entity_extraction/`** -- Named entity extraction (judges, attorneys, parties) from court document text.
 - **`src/summarization/`** -- AI-generated document summaries (one-paragraph summaries cached at ingestion time).
-- **`src/embedding/`** -- Vector embedding generation using open-source models (sentence-transformers). Stored in Qdrant for semantic search.
-- **`src/version_diff/`** -- LLM-based classification of document revisions as substantive or cosmetic.
 
 ## What It Consumes (Inputs)
 
@@ -21,12 +19,10 @@ NLP processing pipeline for Judgemind court documents. Handles document classifi
 
 - **Structured extraction results** -- Classified document types, extracted entities, motion types.
 - **Document summaries** -- Cached in PostgreSQL `rulings.summary` column.
-- **Vector embeddings** -- Stored in Qdrant for semantic search and RAG retrieval.
-- **Version classifications** -- Substantive vs. cosmetic change labels for revised documents.
 
 ## Current State
 
-The classification and entity extraction modules are implemented. Summarization, embedding generation, and version diffing are defined but not yet integrated into the production ingestion pipeline. Currently, field extraction is handled inline by the `scraper-framework` ingestion worker (Tier 2 LLM extraction in `ingestion/llm_extract.py`). The plan is to migrate these capabilities into this package as standalone pipeline stages consuming Redis Streams events.
+Classification, entity extraction, and summarization are implemented. Embedding generation and version diffing are planned future pipeline stages but are not yet implemented in this package. Currently, field extraction is handled inline by the `scraper-framework` ingestion worker (Tier 2 LLM extraction in `ingestion/llm_extract.py`). The plan is to migrate these and additional capabilities into this package as standalone pipeline stages consuming Redis Streams events.
 
 ## Install, Test, and Run Locally
 

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/classification", "src/embedding", "src/entity_extraction", "src/summarization", "src/version_diff"]
+packages = ["src/classification", "src/entity_extraction", "src/summarization"]
 
 [project]
 name = "judgemind-nlp-pipeline"
@@ -40,4 +40,4 @@ ignore = ["ANN401"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "--cov=classification --cov=embedding --cov=entity_extraction --cov=summarization --cov=version_diff --cov-report=term --cov-report=html:htmlcov --cov-report=xml:coverage.xml"
+addopts = "--cov=classification --cov=entity_extraction --cov=summarization --cov-report=term --cov-report=html:htmlcov --cov-report=xml:coverage.xml"
