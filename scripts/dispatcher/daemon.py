@@ -1383,6 +1383,11 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
     # #3507 — operational skill returned failed/unrecognized verdict.
     "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
+    # #3587 — deploy run failed, cancelled, or poller crashed. Route to
+    # diagnoser so it can inspect the deploy outcome and re-queue if the
+    # cancellation was a transient concurrency event (a later push
+    # superseded this run but the merge_sha deploy actually succeeded).
+    "awaiting_deploy_failed": FAILURE_CATEGORY_DEPLOY_FAILED,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's

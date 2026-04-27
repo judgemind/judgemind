@@ -6768,6 +6768,230 @@ else
          "out: $(printf '%s' "$t63b_out" | grep "ralph_baseline_route_to_diagnoser")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T64a (#3587): cancelled-only fixture — single run with matching
+# headSha, status=COMPLETED, conclusion=CANCELLED.
+#
+# Expected:
+#   1. classify emits deploy_state=cancelled (NOT failure).
+#   2. Terminal phase = awaiting_deploy_failed (NOT unrecognized_output).
+#   3. awaiting_deploy_classify_outcome log line is emitted with
+#      deploy_state=cancelled.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t64a.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t64a_runs="$TEST_TMP/t64a-runs.json"
+cat > "$t64a_runs" <<'EOF'
+[
+  {"databaseId": 400, "workflowName": "Deploy Dispatcher", "status": "COMPLETED", "conclusion": "CANCELLED", "createdAt": "2026-04-27T04:00:00Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t64a_workspace="$TEST_TMP/t64a-workspace"
+set +e
+t64a_out=$(run_post_pr_phase "awaiting_deploy" "$t64a_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t64a_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+# (1) awaiting_deploy_classify_outcome log line emitted with cancelled.
+if printf '%s' "$t64a_out" | grep -q "awaiting_deploy_classify_outcome" && \
+   printf '%s' "$t64a_out" | grep "awaiting_deploy_classify_outcome" | grep -q "deploy_state=cancelled"; then
+    pass "#3587 T64a [cancelled run] — awaiting_deploy_classify_outcome emitted with deploy_state=cancelled"
+else
+    fail "#3587 T64a [cancelled run] — awaiting_deploy_classify_outcome emitted with deploy_state=cancelled" \
+         "out tail: $(printf '%s' "$t64a_out" | tail -c 600)"
+fi
+
+# (2) awaiting_deploy_cancelled log line emitted.
+if printf '%s' "$t64a_out" | grep -q "awaiting_deploy_cancelled"; then
+    pass "#3587 T64a [cancelled run] — awaiting_deploy_cancelled log line emitted"
+else
+    fail "#3587 T64a [cancelled run] — awaiting_deploy_cancelled log line emitted" \
+         "out tail: $(printf '%s' "$t64a_out" | tail -c 600)"
+fi
+
+# (3) terminal phase = awaiting_deploy_failed (NOT unrecognized_output).
+_t64a_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t64a_final" == "awaiting_deploy_failed" ]]; then
+    pass "#3587 T64a [cancelled run] — terminal phase = awaiting_deploy_failed"
+else
+    fail "#3587 T64a [cancelled run] — terminal phase = awaiting_deploy_failed" \
+         "actual final phase: $_t64a_final"
+fi
+
+# (4) unrecognized_output NOT emitted.
+if ! printf '%s' "$t64a_out" | grep -q "awaiting_deploy_unrecognized_output"; then
+    pass "#3587 T64a [cancelled run] — awaiting_deploy_unrecognized_output not emitted"
+else
+    fail "#3587 T64a [cancelled run] — awaiting_deploy_unrecognized_output not emitted" \
+         "out: $(printf '%s' "$t64a_out" | grep "awaiting_deploy_unrecognized_output")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T64b (#3587 AC1 reinforcement): empty runs BEFORE grace window.
+# No deploy runs exist yet; grace window has NOT elapsed. Assert the phase
+# does NOT advance to verify prematurely — it should timeout instead.
+# (After grace window → verify is covered by T60b.)
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t64b.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t64b_runs="$TEST_TMP/t64b-runs.json"
+printf '[]' > "$t64b_runs"
+
+t64b_workspace="$TEST_TMP/t64b-workspace"
+set +e
+t64b_out=$(run_post_pr_phase "awaiting_deploy" "$t64b_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t64b_runs" \
+    "AGENT_RUNNER_AWAITING_DEPLOY_TIMEOUT_SECONDS=0" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+# Phase should NOT advance to verify (grace window not elapsed).
+_t64b_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t64b_final" != "verify" ]]; then
+    pass "#3587 T64b [empty-pre-grace] — phase does NOT advance to verify before grace window"
+else
+    fail "#3587 T64b [empty-pre-grace] — phase does NOT advance to verify before grace window" \
+         "phase advanced to: $_t64b_final"
+fi
+
+# Phase should timeout (not premature success/verify).
+if printf '%s' "$t64b_out" | grep -q "awaiting_deploy_timeout"; then
+    pass "#3587 T64b [empty-pre-grace] — phase timeouts (not premature verify)"
+else
+    fail "#3587 T64b [empty-pre-grace] — phase timeouts (not premature verify)" \
+         "out tail: $(printf '%s' "$t64b_out" | tail -c 600)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T64c (#3587 AC3): poll-crash fixture — gh run list exits non-zero.
+# Assert handle_awaiting_deploy retries (no immediate terminal), emits
+# awaiting_deploy_poll_error log line, and eventually terminals after
+# exhausting _max_poll_errors (set to 1 for test speed).
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t64c.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t64c_workspace="$TEST_TMP/t64c-workspace"
+set +e
+t64c_out=$(run_post_pr_phase "awaiting_deploy" "$t64c_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_EXIT=1" \
+    "AGENT_RUNNER_DEPLOY_MAX_POLL_ERRORS=1" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+# (1) awaiting_deploy_poll_error log line emitted.
+if printf '%s' "$t64c_out" | grep -q "awaiting_deploy_poll_error"; then
+    pass "#3587 T64c [poll-crash] — awaiting_deploy_poll_error log line emitted"
+else
+    fail "#3587 T64c [poll-crash] — awaiting_deploy_poll_error log line emitted" \
+         "out tail: $(printf '%s' "$t64c_out" | tail -c 600)"
+fi
+
+# (2) terminal phase = awaiting_deploy_failed (via poll_error exhaustion).
+_t64c_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t64c_final" == "awaiting_deploy_failed" ]]; then
+    pass "#3587 T64c [poll-crash] — terminal phase = awaiting_deploy_failed after poll-error exhaustion"
+else
+    fail "#3587 T64c [poll-crash] — terminal phase = awaiting_deploy_failed after poll-error exhaustion" \
+         "actual final phase: $_t64c_final"
+fi
+
+# (3) NOT immediate terminal on first error — reaped with deploy_poll_error category.
+if printf '%s' "$t64c_out" | grep -q "agent_runner_reaped_failure" && \
+   printf '%s' "$t64c_out" | grep "agent_runner_reaped_failure" | grep -q "deploy_poll_error"; then
+    pass "#3587 T64c [poll-crash] — reaped with deploy_poll_error category"
+else
+    fail "#3587 T64c [poll-crash] — reaped with deploy_poll_error category" \
+         "out: $(printf '%s' "$t64c_out" | grep "agent_runner_reaped_failure")"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T64d (#3587 AC4 subshell-exit regression): one run COMPLETED+FAILURE
+# on the merge_sha. Assert:
+#   1. phase_outputs.awaiting_deploy.output_json is the structured
+#      {"deploy_state":"failure",...} envelope, NOT "{}".
+#   2. Terminal phase = awaiting_deploy_failed (NOT unrecognized_output).
+#
+# This is the subshell-exit ordering bug fix: printf must emit the JSON
+# envelope BEFORE agent_runner_reaped_failure calls exit 0.
+# ══════════════════════════════════════════════════════════════════════════
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t64d.txt"
+printf 'awaiting_deploy\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t64d_runs="$TEST_TMP/t64d-runs.json"
+cat > "$t64d_runs" <<'EOF'
+[
+  {"databaseId": 500, "workflowName": "Deploy Dispatcher", "status": "COMPLETED", "conclusion": "FAILURE", "createdAt": "2026-04-27T05:00:00Z", "headSha": "deadbeefcafe"}
+]
+EOF
+
+t64d_workspace="$TEST_TMP/t64d-workspace"
+set +e
+t64d_out=$(run_post_pr_phase "awaiting_deploy" "$t64d_workspace" \
+    "PHASE_FIXTURE_FILE=$PHASE_FIXTURE_FILE" \
+    "PRIOR_PATCH_FIXTURE=" \
+    "PR_NUMBER_FIXTURE=9999" \
+    "GH_RUN_LIST_JSON_FIXTURE=$t64d_runs" \
+    "AGENT_RUNNER_DEPLOY_GRACE_SECONDS=9999")
+set -e
+
+# (1) deploy_state=failure in output (structured envelope was emitted).
+if printf '%s' "$t64d_out" | grep -q '"deploy_state": "failure"\|deploy_state.*failure'; then
+    pass "#3587 T64d [subshell-exit regression] — deploy_state=failure in log output"
+else
+    fail "#3587 T64d [subshell-exit regression] — deploy_state=failure in log output" \
+         "out tail: $(printf '%s' "$t64d_out" | tail -c 600)"
+fi
+
+# (2) terminal phase = awaiting_deploy_failed (NOT unrecognized_output).
+_t64d_final=$(cat "$PHASE_FIXTURE_FILE" 2>/dev/null || printf '')
+if [[ "$_t64d_final" == "awaiting_deploy_failed" ]]; then
+    pass "#3587 T64d [subshell-exit regression] — terminal phase = awaiting_deploy_failed"
+else
+    fail "#3587 T64d [subshell-exit regression] — terminal phase = awaiting_deploy_failed" \
+         "actual final phase: $_t64d_final"
+fi
+
+# (3) unrecognized_output NOT emitted (envelope was captured by parent shell).
+if ! printf '%s' "$t64d_out" | grep -q "awaiting_deploy_unrecognized_output"; then
+    pass "#3587 T64d [subshell-exit regression] — awaiting_deploy_unrecognized_output NOT emitted"
+else
+    fail "#3587 T64d [subshell-exit regression] — awaiting_deploy_unrecognized_output NOT emitted" \
+         "out: $(printf '%s' "$t64d_out" | grep "awaiting_deploy_unrecognized_output")"
+fi
+
+# (4) Verify psql persist_phase_output was called with non-empty JSON for
+#     awaiting_deploy (structured envelope, not "{}").
+# The persist_phase_output call uses psql with the output JSON. Check the
+# psql log for the deploy_state keyword.
+if grep -q "deploy_state" "$INVOCATIONS_DIR/psql.log"; then
+    pass "#3587 T64d [subshell-exit regression] — psql log contains deploy_state (non-empty envelope persisted)"
+else
+    fail "#3587 T64d [subshell-exit regression] — psql log contains deploy_state (non-empty envelope persisted)" \
+         "psql log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

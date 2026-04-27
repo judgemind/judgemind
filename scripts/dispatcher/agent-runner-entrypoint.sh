@@ -3833,13 +3833,28 @@ classify_pr_rollup() {
 
 classify_deploy_runs() {
     # $1 = path to ``gh run list --json status,conclusion,...`` stdout.
-    # Prints one of: success / failure / pending / none. Matches
-    # ``_classify_deploy_runs`` in daemon.py. ``none`` means no
-    # matching deploy runs — caller treats as "no deploy applicable".
+    # Prints one of: success / failure / cancelled / pending / none / poll_error.
+    # Matches ``_classify_deploy_runs`` in daemon.py.
+    #   - "none"       — no matching deploy runs (grace-window logic applies).
+    #   - "poll_error" — sentinel null written by find_deploy_runs on gh failure.
+    #   - "cancelled"  — a run for the merge SHA was CANCELLED (separate from
+    #                    failure so the caller can route to the diagnoser rather
+    #                    than treating a concurrency-cancelled run as a hard
+    #                    deploy failure, #3587).
     _runs_file="$1"
     if [[ ! -s "$_runs_file" ]]; then
         printf 'none'
         return 0
+    fi
+    # Check for null sentinel (written by find_deploy_runs on gh API failure).
+    _first_char=$(head -c 1 "$_runs_file" 2>/dev/null || printf '')
+    if [[ "$_first_char" == "n" ]]; then
+        # Content is "null" — this is the poll-error sentinel, not an empty array.
+        _sentinel_content=$(cat "$_runs_file" 2>/dev/null || printf '')
+        if [[ "$_sentinel_content" == "null" ]]; then
+            printf 'poll_error'
+            return 0
+        fi
     fi
     _state=$(jq -r '
         def classify:
@@ -3850,9 +3865,11 @@ classify_deploy_runs() {
                 | (.conclusion // "" | ascii_upcase) as $co
                 | if $st != "COMPLETED" then "pending"
                   elif ($co == "SUCCESS" or $co == "SKIPPED" or $co == "NEUTRAL") then "ok"
+                  elif $co == "CANCELLED" then "cancelled"
                   else "failure" end]) as $outcomes
               | if ($outcomes | index("pending")) then "pending"
                 elif ($outcomes | index("failure")) then "failure"
+                elif ($outcomes | index("cancelled")) then "cancelled"
                 else "success" end
             end;
         classify
@@ -4435,7 +4452,16 @@ find_deploy_runs() {
     _gh_rc=$?
     set -e
     if [[ "$_gh_rc" -ne 0 ]]; then
-        printf '[]' > "$_out_file"
+        # Distinguish API/network failure from "no runs found": write a
+        # null sentinel so classify_deploy_runs can return "poll_error"
+        # instead of "none". "none" would start the grace-window timer
+        # prematurely on a transient gh outage; "poll_error" lets the
+        # caller retry with a bounded counter (#3587).
+        printf 'null' > "$_out_file"
+        log "find_deploy_runs_gh_error" \
+            "merge_sha=$_sha" \
+            "gh_rc=$_gh_rc" \
+            "stderr=$(head -c 200 "$AGENT_WORKSPACE/gh-run-list.stderr.log" 2>/dev/null || true)"
         return 0
     fi
     # Post-filter: keep only entries whose workflowName is in the deploy
@@ -4485,7 +4511,9 @@ handle_awaiting_deploy() {
     _start_ts=$(date -u +%s)
     _last_state=""
     _poll_count=0
+    _poll_error_count=0
     _max_polls="${AGENT_RUNNER_DEPLOY_MAX_POLLS:-60}"
+    _max_poll_errors="${AGENT_RUNNER_DEPLOY_MAX_POLL_ERRORS:-5}"
     while true; do
         _poll_count=$((_poll_count + 1))
         if [[ "$_poll_count" -gt "$_max_polls" ]]; then
@@ -4517,12 +4545,19 @@ handle_awaiting_deploy() {
                 "elapsed_seconds=$_elapsed_poll"
             # Log individual run details for observability.
             if [[ -s "$AGENT_WORKSPACE/deploy-runs.json" ]]; then
-                jq -r '.[] | "run_id=\(.databaseId) run_head_sha=\(.headSha // "?") run_status=\(.status // "?") run_conclusion=\(.conclusion // "?") workflow=\(.workflowName // "?")"' \
+                jq -r 'if type == "array" then .[] | "run_id=\(.databaseId) run_head_sha=\(.headSha // "?") run_status=\(.status // "?") run_conclusion=\(.conclusion // "?") workflow=\(.workflowName // "?")" else empty end' \
                     "$AGENT_WORKSPACE/deploy-runs.json" 2>/dev/null \
                     | while IFS= read -r _run_line; do
                         log "awaiting_deploy_run_detail" "pr_number=$_pr_number" "$_run_line"
                     done
             fi
+            # Structured classify outcome log for self-diagnosis (#3587).
+            log "awaiting_deploy_classify_outcome" \
+                "pr_number=$_pr_number" \
+                "merge_sha=$_merge_sha" \
+                "deploy_state=$_state" \
+                "poll_count=$_poll_count" \
+                "poll_error_count=$_poll_error_count"
         else
             _state="pending"
         fi
@@ -4535,12 +4570,48 @@ handle_awaiting_deploy() {
             return 0
         fi
         if [[ "$_state" == "failure" ]]; then
+            # #3587: printf BEFORE agent_runner_reaped_failure so the JSON
+            # envelope reaches the parent shell's command substitution. The
+            # reaper calls exit 0, which terminates the subshell; any printf
+            # after it is unreachable and the parent sees empty $_output.
+            printf '{"deploy_state": "failure", "merge_sha": "%s"}' "$_merge_sha"
             agent_runner_reaped_failure \
                 "awaiting_deploy_failed" \
                 "deploy_failed" \
                 "pr=$_pr_number sha=$_merge_sha"
-            printf '{"deploy_state": "failure", "merge_sha": "%s"}' "$_merge_sha"
             return 0
+        fi
+        if [[ "$_state" == "cancelled" ]]; then
+            # #3587: a concurrency-cancelled run (superseded by a later push)
+            # is NOT a hard deploy failure. Emit the envelope and let the
+            # dispatch case arm call agent_runner_reaped_failure so the
+            # diagnoser can route it via BYPASSED_TERMINAL_PHASES_TO_ROUTE.
+            printf '{"deploy_state": "cancelled", "merge_sha": "%s"}' "$_merge_sha"
+            return 0
+        fi
+        if [[ "$_state" == "poll_error" ]]; then
+            # #3587: gh run list returned non-zero (transient API/network
+            # failure). Treat as pending for retry purposes — do NOT
+            # immediately terminal-fail. After _max_poll_errors consecutive
+            # errors, give up and terminal-fail with a distinct category so
+            # the diagnoser knows this was a poller crash, not a deploy failure.
+            _poll_error_count=$((_poll_error_count + 1))
+            log "awaiting_deploy_poll_error" \
+                "pr_number=$_pr_number" \
+                "merge_sha=$_merge_sha" \
+                "poll_error_count=$_poll_error_count" \
+                "max_poll_errors=$_max_poll_errors"
+            if [[ "$_poll_error_count" -ge "$_max_poll_errors" ]]; then
+                printf '{"deploy_state": "poll_error", "merge_sha": "%s", "poll_error_count": %s}' \
+                    "$_merge_sha" "$_poll_error_count"
+                agent_runner_reaped_failure \
+                    "awaiting_deploy_failed" \
+                    "deploy_poll_error" \
+                    "pr=$_pr_number sha=$_merge_sha consecutive_poll_errors=$_poll_error_count"
+                return 0
+            fi
+            # Retry — fall through to sleep and next iteration.
+            _state="pending"
         fi
         _now_ts=$(date -u +%s)
         _elapsed=$((_now_ts - _start_ts))
@@ -5300,8 +5371,21 @@ while true; do
                 :
             elif [[ "$_deploy_state" == "success" || "$_deploy_state" == "none" ]]; then
                 advance_phase "verify"
-            elif [[ "$_deploy_state" == "failure" ]]; then
+            elif [[ "$_deploy_state" == "failure" || "$_deploy_state" == "poll_error" ]]; then
+                # agent_runner_reaped_failure already called inside
+                # handle_awaiting_deploy before printf emitted the envelope.
                 :
+            elif [[ "$_deploy_state" == "cancelled" ]]; then
+                # #3587: concurrency-cancelled deploy. Route to diagnoser via
+                # BYPASSED_TERMINAL_PHASES_TO_ROUTE so the diagnoser can
+                # evaluate whether a later run succeeded for this merge.
+                log "awaiting_deploy_cancelled" \
+                    "deploy_state=cancelled" \
+                    "output=$_output"
+                agent_runner_reaped_failure \
+                    "awaiting_deploy_failed" \
+                    "deploy_cancelled" \
+                    "deploy run was cancelled (concurrency cancel) pr=$(printf '%s' "$_output" | jq -r '.merge_sha // ""' 2>/dev/null)"
             else
                 log "awaiting_deploy_unrecognized_output" "output=$_output"
                 agent_runner_reaped_failure \

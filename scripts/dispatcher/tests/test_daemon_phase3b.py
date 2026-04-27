@@ -2269,3 +2269,31 @@ class TestVerifyPhaseIoRoot:
         assert not baseline_path.exists(), (
             f"Plan input must NOT be written to baseline_repo_root: {baseline_path}"
         )
+
+
+class TestBypassedTerminalPhasesRouteGuard:
+    """Guard tests asserting that BYPASSED_TERMINAL_PHASES_TO_ROUTE contains
+    the expected phase→category mappings so the diagnoser sweep picks them up.
+
+    Mirrors the pattern established by earlier guard tests (#3514, #3587).
+    Each entry here documents a terminal phase that bypasses the default
+    failure path and routes to the empowered diagnoser instead.
+    """
+
+    def test_awaiting_deploy_failed_routes_to_deploy_failed(self) -> None:
+        """#3587 — ``awaiting_deploy_failed`` must map to
+        ``FAILURE_CATEGORY_DEPLOY_FAILED`` so that cancelled/crash terminal
+        phases from handle_awaiting_deploy reach the diagnoser sweep rather
+        than silently dying without routing.
+        """
+        assert "awaiting_deploy_failed" in daemon.BYPASSED_TERMINAL_PHASES_TO_ROUTE, (
+            "awaiting_deploy_failed must be in BYPASSED_TERMINAL_PHASES_TO_ROUTE "
+            "(added by #3587 to route cancelled/poll-crash deploy terminals to diagnoser)"
+        )
+        assert (
+            daemon.BYPASSED_TERMINAL_PHASES_TO_ROUTE["awaiting_deploy_failed"]
+            == daemon.FAILURE_CATEGORY_DEPLOY_FAILED
+        ), (
+            "awaiting_deploy_failed must map to FAILURE_CATEGORY_DEPLOY_FAILED, "
+            f"got {daemon.BYPASSED_TERMINAL_PHASES_TO_ROUTE['awaiting_deploy_failed']!r}"
+        )
