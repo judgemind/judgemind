@@ -687,6 +687,51 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 15: pytest runs with CWD = package dir; coverage.xml lands
+#              in pkg dir, NOT repo root (#2548)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds testpkg with a stub pytest that writes coverage.xml to its CWD.
+# With the old hook (CWD = repo root) the file would appear at $WORK/coverage.xml.
+# With the fixed hook (CWD = pkg_dir) it appears at $WORK/packages/testpkg/coverage.xml.
+echo "[scenario 15] pytest CWD = package dir; coverage.xml lands in pkg (#2548)"
+init_workspace
+git -C "$WORK" checkout --quiet -b feature-pytest-cwd
+
+seed_testpkg
+mkdir -p "$WORK/packages/testpkg/.venv/bin"
+
+# Stub ruff: always exits 0 so pytest path is reached.
+cat > "$WORK/packages/testpkg/.venv/bin/ruff" <<'RUFF'
+#!/usr/bin/env bash
+exit 0
+RUFF
+chmod +x "$WORK/packages/testpkg/.venv/bin/ruff"
+
+# Stub pytest: writes coverage.xml containing a sentinel to its CWD and exits 0.
+cat > "$WORK/packages/testpkg/.venv/bin/pytest" <<'PYTEST'
+#!/usr/bin/env bash
+echo "sentinel-coverage-2548" > coverage.xml
+exit 0
+PYTEST
+chmod +x "$WORK/packages/testpkg/.venv/bin/pytest"
+
+git -C "$WORK" add packages/testpkg
+git -C "$WORK" commit --quiet -m "feat: add testpkg"
+feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+run_hook "refs/heads/feature-pytest-cwd $feat_sha refs/heads/feature-pytest-cwd $ZERO_SHA"
+
+if [ "$hook_rc" -ne 0 ]; then
+    report_fail "hook should exit 0 with stub pytest that passes (#2548)" "$hook_out"
+elif [ ! -f "$WORK/packages/testpkg/coverage.xml" ]; then
+    report_fail "packages/testpkg/coverage.xml must exist — pytest must run with CWD = pkg_dir (#2548)" "$hook_out"
+elif [ -f "$WORK/coverage.xml" ]; then
+    report_fail "coverage.xml must NOT exist in repo root — pytest must not run with CWD = repo root (#2548)" "$hook_out"
+else
+    report_pass "pytest CWD = package dir: coverage.xml lands in pkg dir, not repo root (#2548)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
