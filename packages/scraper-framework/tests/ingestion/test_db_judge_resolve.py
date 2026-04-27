@@ -445,3 +445,80 @@ class TestStep1ArbitrationWireUp:
         assert "roster_match" not in last_insert, (
             f"Expected fall-through INSERT to NOT use 'roster_match', got: {last_insert}"
         )
+
+
+class TestStep1Deterministic:
+    """Tests that Step-1 judge alias lookup is deterministic (issue #3539).
+
+    The Step-1 SELECT must carry an explicit ORDER BY clause so that when
+    multiple judge_aliases rows match the same raw_name + court_id, the
+    same row is always chosen.  Without ORDER BY the database may return
+    any matching row, producing a different judge_id on successive calls.
+    """
+
+    def test_step1_deterministic_order_by_present(self) -> None:
+        """Step-1 SQL contains ORDER BY ja.created_at ASC, ja.judge_id ASC before LIMIT 1.
+
+        Structural assertion: inspect the SQL string emitted by the first
+        cur.execute call and verify:
+          (a) it queries judge_aliases (ja),
+          (b) it contains an ORDER BY referencing both created_at and judge_id,
+          (c) ORDER BY appears before LIMIT 1 in the SQL text.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+
+        # Step 1 returns a deterministic row immediately.
+        mock_cur.fetchone.side_effect = [
+            ("judge-uuid-1", "Matthew C. Braner"),
+        ]
+
+        result = resolve_judge(mock_conn, "MATTHEW C. BRANER", "court-uuid-10")
+
+        assert result == "judge-uuid-1"
+
+        # The very first execute call must be the Step-1 alias lookup.
+        first_call = mock_cur.execute.call_args_list[0]
+        sql: str = first_call[0][0]
+
+        assert "judge_aliases ja" in sql, (
+            f"Expected Step-1 SQL to reference 'judge_aliases ja', got:\n{sql}"
+        )
+        assert "ORDER BY" in sql, f"Expected Step-1 SQL to contain ORDER BY, got:\n{sql}"
+        assert "created_at" in sql, f"Expected ORDER BY to reference 'created_at', got:\n{sql}"
+        assert "judge_id" in sql, f"Expected ORDER BY to reference 'judge_id', got:\n{sql}"
+        order_by_pos = sql.index("ORDER BY")
+        limit_pos = sql.index("LIMIT 1")
+        assert order_by_pos < limit_pos, (
+            f"Expected ORDER BY to appear before LIMIT 1 in Step-1 SQL, got:\n{sql}"
+        )
+
+    def test_step1_two_calls_consistent(self) -> None:
+        """Two resolve_judge calls with the same Step-1 hit return the same judge_id.
+
+        Both calls also emit identical Step-1 SQL (same ORDER BY clause),
+        confirming the determinism guarantee is present in every invocation.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+
+        # Both calls resolve via Step 1.
+        mock_cur.fetchone.side_effect = [
+            ("judge-uuid-42", "John A. Smith"),  # call 1 Step 1
+            ("judge-uuid-42", "John A. Smith"),  # call 2 Step 1
+        ]
+
+        result1 = resolve_judge(mock_conn, "JOHN A. SMITH", "court-uuid-11")
+        result2 = resolve_judge(mock_conn, "JOHN A. SMITH", "court-uuid-11")
+
+        assert result1 == "judge-uuid-42", f"Call 1 returned unexpected judge_id: {result1}"
+        assert result2 == "judge-uuid-42", f"Call 2 returned unexpected judge_id: {result2}"
+        assert result1 == result2, "Both calls must return the same judge_id"
+
+        # Both execute calls should be Step-1 alias lookups with identical SQL.
+        assert mock_cur.execute.call_count >= 2, (
+            f"Expected at least 2 execute calls, got {mock_cur.execute.call_count}"
+        )
+        sql1: str = mock_cur.execute.call_args_list[0][0][0]
+        sql2: str = mock_cur.execute.call_args_list[1][0][0]
+
+        assert sql1 == sql2, f"Step-1 SQL differed between calls:\nCall 1: {sql1}\nCall 2: {sql2}"
+        assert "ORDER BY" in sql1, f"Expected Step-1 SQL to contain ORDER BY, got:\n{sql1}"

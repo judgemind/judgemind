@@ -1322,6 +1322,7 @@ def resolve_judge(
             FROM judge_aliases ja
             JOIN judges j ON j.id = ja.judge_id
             WHERE LOWER(ja.raw_name) = LOWER(%s) AND j.court_id = %s::uuid
+            ORDER BY ja.created_at ASC, ja.judge_id ASC
             LIMIT 1
             """,
             (raw_name, court_id),
