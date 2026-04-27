@@ -1,7 +1,19 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 
-const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-jwt-secret-change-in-production';
+const DEV_JWT_SECRET = 'dev-jwt-secret-change-in-production';
+
+if (
+  process.env.NODE_ENV === 'production' &&
+  (!process.env.JWT_SECRET || process.env.JWT_SECRET === DEV_JWT_SECRET)
+) {
+  throw new Error(
+    'JWT_SECRET must be set to a non-default value in production. ' +
+      'Set JWT_SECRET to a random secret of at least 64 characters.',
+  );
+}
+
+const JWT_SECRET = process.env.JWT_SECRET ?? DEV_JWT_SECRET;
 const ACCESS_TOKEN_EXPIRY = '15m';
 const REFRESH_TOKEN_EXPIRY_DAYS = 30;
 

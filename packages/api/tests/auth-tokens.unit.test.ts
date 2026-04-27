@@ -58,7 +58,7 @@ describe('signVerificationToken / verifyVerificationToken', () => {
   });
 
   it('rejects a token with wrong purpose', () => {
-    const secret = process.env.JWT_SECRET ?? 'dev-jwt-secret-change-in-production';
+    const secret = 'test-jwt-secret-not-real';
     const badToken = jwt.sign({ sub: 'user-1', purpose: 'password-reset' }, secret, {
       expiresIn: '24h',
     });
@@ -121,5 +121,35 @@ describe('hashRefreshToken', () => {
   it('matches the hash from generateRefreshToken', () => {
     const { token, hash } = generateRefreshToken();
     expect(hashRefreshToken(token)).toBe(hash);
+  });
+});
+
+describe('JWT_SECRET load-time guard', () => {
+  it('throws when NODE_ENV=production and JWT_SECRET is unset', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('JWT_SECRET', '');
+    vi.resetModules();
+    await expect(import('../src/auth/tokens')).rejects.toThrow(
+      'JWT_SECRET must be set to a non-default value in production',
+    );
+    vi.unstubAllEnvs();
+  });
+
+  it('throws when NODE_ENV=production and JWT_SECRET equals the dev literal', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('JWT_SECRET', 'dev-jwt-secret-change-in-production');
+    vi.resetModules();
+    await expect(import('../src/auth/tokens')).rejects.toThrow(
+      'JWT_SECRET must be set to a non-default value in production',
+    );
+    vi.unstubAllEnvs();
+  });
+
+  it('does NOT throw when NODE_ENV is non-production and JWT_SECRET is unset', async () => {
+    vi.stubEnv('NODE_ENV', 'development');
+    vi.stubEnv('JWT_SECRET', '');
+    vi.resetModules();
+    await expect(import('../src/auth/tokens')).resolves.toBeDefined();
+    vi.unstubAllEnvs();
   });
 });

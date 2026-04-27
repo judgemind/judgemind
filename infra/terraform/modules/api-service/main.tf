@@ -157,6 +157,28 @@ resource "aws_lb_listener" "http_redirect" {
   }
 }
 
+# ─── JWT Secret ─────────────────────────────────────────────────────────────
+
+resource "random_password" "jwt_secret" {
+  length           = 64
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+resource "aws_secretsmanager_secret" "jwt" {
+  name                    = "judgemind/${var.environment}/api/jwt_secret"
+  description             = "JWT signing secret for Judgemind API (${var.environment})"
+  recovery_window_in_days = var.environment == "production" ? 30 : 0
+}
+
+# NOTE: This secret_version IS Terraform-managed — the value is derived from
+# a random_password resource. Do NOT add ignore_changes here; Terraform must
+# keep the secret in sync with the generated password.
+resource "aws_secretsmanager_secret_version" "jwt" {
+  secret_id     = aws_secretsmanager_secret.jwt.id
+  secret_string = jsonencode({ secret = random_password.jwt_secret.result })
+}
+
 # ─── IAM: Secrets Manager access for the execution role ─────────────────────
 # The execution role needs to read secrets to inject DATABASE_URL and
 # OpenSearch credentials into the container at launch.
@@ -188,6 +210,7 @@ resource "aws_iam_role_policy" "api_secrets" {
         Resource = compact([
           var.db_connection_secret_arn,
           var.opensearch_credentials_secret_arn,
+          aws_secretsmanager_secret.jwt.arn,
         ])
       }
     ]
@@ -304,6 +327,10 @@ resource "aws_ecs_task_definition" "api" {
           {
             name      = "DATABASE_URL"
             valueFrom = "${var.db_connection_secret_arn}:url::"
+          },
+          {
+            name      = "JWT_SECRET"
+            valueFrom = "${aws_secretsmanager_secret.jwt.arn}:secret::"
           }
         ],
         var.opensearch_credentials_secret_arn != "" ? [
