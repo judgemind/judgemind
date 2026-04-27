@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,45 @@ from fetch import (
     fetch_manifest,
     register_strategy,
 )
+
+
+class TestOriginalsStrategyRecursiveChain:
+    """OriginalsStrategy query must use WITH RECURSIVE to walk multi-hop chains (#3537)."""
+
+    def _get_derived_sql(self, tmp_path: Path) -> str:
+        """Capture the SQL passed to _run_db_query by OriginalsStrategy.expand."""
+        captured: list[str] = []
+
+        def capture_sql(sql: str, params: Any = None) -> list[dict[str, Any]]:
+            captured.append(sql)
+            return []
+
+        item_dir = tmp_path / "test-doc"
+        item_dir.mkdir()
+        strategy = OriginalsStrategy()
+        with (
+            patch("fetch._fetch_s3_object", return_value=False),
+            patch("fetch._run_db_query", side_effect=capture_sql),
+        ):
+            strategy.expand("ca/contra_costa/doc_a.pdf", item_dir)
+
+        assert captured, "Expected _run_db_query to be called at least once"
+        return captured[0]
+
+    def test_query_uses_recursive_cte(self, tmp_path: Path) -> None:
+        sql = self._get_derived_sql(tmp_path)
+        assert "WITH RECURSIVE" in sql, (
+            "OriginalsStrategy must use WITH RECURSIVE to walk multi-hop "
+            "previous_version_id chains (#3537)."
+        )
+
+    def test_query_recursion_joins_previous_version_id(self, tmp_path: Path) -> None:
+        sql = self._get_derived_sql(tmp_path)
+        normalized = re.sub(r"\s+", " ", sql).lower()
+        assert "d.id = td.previous_version_id" in normalized, (
+            "Recursive arm must join target_docs td ON d.id = td.previous_version_id "
+            "to walk each hop of the supersede chain."
+        )
 
 
 class TestStrategyRegistry:
@@ -81,16 +121,16 @@ class TestRulingsStrategy:
         item_dir.mkdir()
 
         db_response = [
-                {
-                    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-                    "ruling_text": "The motion is GRANTED.",
-                    "outcome": "granted",
-                    "s3_key": "CA/LA/doc.pdf",
-                    "s3_bucket": "judgemind-documents-dev",
-                    "doc_format": "pdf",
-                    "case_id": "test-case-id",
-                }
-            ]
+            {
+                "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "ruling_text": "The motion is GRANTED.",
+                "outcome": "granted",
+                "s3_key": "CA/LA/doc.pdf",
+                "s3_bucket": "judgemind-documents-dev",
+                "doc_format": "pdf",
+                "case_id": "test-case-id",
+            }
+        ]
 
         strategy = RulingsStrategy()
         with (
@@ -108,14 +148,14 @@ class TestRulingsStrategy:
         item_dir.mkdir()
 
         db_response = [
-                {
-                    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-                    "s3_key": "CA/LA/doc.pdf",
-                    "s3_bucket": "judgemind-documents-dev",
-                    "doc_format": "pdf",
-                    "case_id": "test-case-id",
-                }
-            ]
+            {
+                "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "s3_key": "CA/LA/doc.pdf",
+                "s3_bucket": "judgemind-documents-dev",
+                "doc_format": "pdf",
+                "case_id": "test-case-id",
+            }
+        ]
 
         strategy = RulingsStrategy()
         with (
@@ -136,14 +176,14 @@ class TestRulingsStrategy:
         item_dir.mkdir()
 
         db_response = [
-                {
-                    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-                    "s3_key": "CA/LA/doc.pdf",
-                    "s3_bucket": "judgemind-documents-dev",
-                    "doc_format": "pdf",
-                    "case_id": "test-case-id",
-                }
-            ]
+            {
+                "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "s3_key": "CA/LA/doc.pdf",
+                "s3_bucket": "judgemind-documents-dev",
+                "doc_format": "pdf",
+                "case_id": "test-case-id",
+            }
+        ]
 
         strategy = RulingsStrategy()
         with (
@@ -178,14 +218,14 @@ class TestRulingsStrategy:
         item_dir.mkdir()
 
         db_response = [
-                {
-                    "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
-                    "s3_key": "CA/LA/doc.html",
-                    "s3_bucket": "judgemind-documents-dev",
-                    "doc_format": "html",
-                    "case_id": "test-case-id",
-                }
-            ]
+            {
+                "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+                "s3_key": "CA/LA/doc.html",
+                "s3_bucket": "judgemind-documents-dev",
+                "doc_format": "html",
+                "case_id": "test-case-id",
+            }
+        ]
 
         strategy = RulingsStrategy()
         with (
@@ -206,8 +246,8 @@ class TestOriginalsStrategy:
         item_dir.mkdir()
 
         derived_response = [
-                {"ruling_id": "ruling-1", "case_number": "BC123"},
-            ]
+            {"ruling_id": "ruling-1", "case_number": "BC123"},
+        ]
 
         strategy = OriginalsStrategy()
         with (
@@ -225,9 +265,9 @@ class TestOriginalsStrategy:
         item_dir.mkdir()
 
         derived_response = [
-                {"ruling_id": "ruling-1", "case_number": "BC123"},
-                {"ruling_id": "ruling-2", "case_number": "BC456"},
-            ]
+            {"ruling_id": "ruling-1", "case_number": "BC123"},
+            {"ruling_id": "ruling-2", "case_number": "BC456"},
+        ]
 
         strategy = OriginalsStrategy()
         with (
@@ -245,9 +285,9 @@ class TestOriginalsStrategy:
         item_dir.mkdir()
 
         derived_response = [
-                {"ruling_id": "ruling-1", "case_number": "BC123"},
-                {"ruling_id": "ruling-2", "case_number": "BC456"},
-            ]
+            {"ruling_id": "ruling-1", "case_number": "BC123"},
+            {"ruling_id": "ruling-2", "case_number": "BC456"},
+        ]
 
         strategy = OriginalsStrategy()
         with (

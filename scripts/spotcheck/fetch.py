@@ -353,25 +353,24 @@ class OriginalsStrategy(ExpansionStrategy):
         # queried S3 key is a content-hash-dedup *loser* (#2569): the
         # loser's document row is marked superseded with its rulings
         # deleted, while the actual rulings for those cases live on the
-        # *winner*'s document (a different s3_key).  We follow the
-        # ``documents.previous_version_id`` link so either the winner or
-        # the loser S3 key surfaces the canonical rulings.
-        #
-        # The subquery collects (a) any document that currently has this
-        # s3_key and (b) any document that points to one of those docs
-        # via ``previous_version_id`` (the winner when this key is a
-        # loser), then the outer query fetches rulings linked to ANY of
-        # those doc ids.
+        # *winner*'s document (a different s3_key).  Walk the full
+        # ``previous_version_id`` chain (loser → winner → terminal) so
+        # any key in a multi-hop supersede chain surfaces all canonical
+        # rulings.  The recursive arm joins
+        # ``documents d ON d.id = td.previous_version_id`` to follow
+        # each hop until no further successor exists.
         #
         # Escape single quotes in the S3 key for SQL safety.
         safe_key = entity_id.replace("'", "''")
         query = (
-            "WITH target_docs AS ("
-            "  SELECT id FROM documents WHERE s3_key = '" + safe_key + "' "
+            "WITH RECURSIVE target_docs AS ("
+            "  SELECT id, previous_version_id FROM documents WHERE s3_key = '"
+            + safe_key
+            + "' "
             "  UNION "
-            "  SELECT previous_version_id AS id FROM documents "
-            "  WHERE s3_key = '" + safe_key + "' "
-            "    AND previous_version_id IS NOT NULL "
+            "  SELECT d.id, d.previous_version_id "
+            "  FROM documents d "
+            "  JOIN target_docs td ON d.id = td.previous_version_id "
             ") "
             "SELECT r.id::text AS ruling_id, r.outcome::text, "
             "r.motion_type, r.hearing_date::text, r.department, "

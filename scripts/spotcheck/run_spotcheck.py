@@ -18,6 +18,7 @@ The result JSON is written to:
 The caller can download it with:
     aws s3 cp s3://<bucket>/spotcheck/<timestamp>.json tmp/spotcheck/data.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,15 +34,23 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 BUCKET = os.environ.get("JUDGEMIND_ARCHIVE_BUCKET", "judgemind-document-archive-dev")
 
 ALL_COUNTIES = [
-    "Los Angeles", "Orange", "Riverside", "San Bernardino",
-    "Santa Clara", "Ventura", "Contra Costa", "Fresno",
-    "San Francisco", "San Diego",
+    "Los Angeles",
+    "Orange",
+    "Riverside",
+    "San Bernardino",
+    "Santa Clara",
+    "Ventura",
+    "Contra Costa",
+    "Fresno",
+    "San Francisco",
+    "San Diego",
 ]
 
 
 def sample_rulings(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
     """Sample N random rulings for a county with full context."""
-    cur.execute("""
+    cur.execute(
+        """
         SELECT
             r.id::text AS ruling_id,
             r.outcome::text,
@@ -66,7 +75,9 @@ def sample_rulings(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
         WHERE c.county = %s
         ORDER BY random()
         LIMIT %s
-    """, (county, n))
+    """,
+        (county, n),
+    )
     columns = [desc[0] for desc in cur.description]
     return [dict(zip(columns, row)) for row in cur.fetchall()]
 
@@ -74,7 +85,8 @@ def sample_rulings(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
 def sample_originals(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
     """Sample N random original documents and their derived rulings."""
     # Sample from documents table (not S3) to avoid orphaned keys
-    cur.execute("""
+    cur.execute(
+        """
         WITH sampled AS (
             SELECT DISTINCT ON (d.s3_key)
                 d.s3_key, d.s3_bucket, d.id::text AS doc_id
@@ -85,7 +97,9 @@ def sample_originals(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
         )
         SELECT s3_key, s3_bucket, doc_id FROM sampled
         ORDER BY random() LIMIT %s
-    """, (county, n))
+    """,
+        (county, n),
+    )
     sampled_docs = cur.fetchall()
 
     originals = []
@@ -94,15 +108,18 @@ def sample_originals(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
         # S3 key is a content-hash-dedup *loser* (#2569): the loser's document
         # row is marked superseded with its rulings deleted, while the actual
         # rulings for those cases live on the *winner*'s document (a different
-        # s3_key).  Follow ``documents.previous_version_id`` so either the
-        # winner or the loser key surfaces the canonical rulings.  Mirrors the
-        # CTE pattern in ``scripts/spotcheck/fetch.py`` ``OriginalsStrategy``.
-        cur.execute("""
-            WITH target_docs AS (
-                SELECT id FROM documents WHERE s3_key = %s
+        # s3_key).  Walk the full ``previous_version_id`` chain
+        # (loser → winner → terminal) so any key in a multi-hop supersede
+        # chain surfaces all canonical rulings.  Mirrors the CTE pattern in
+        # ``scripts/spotcheck/fetch.py`` ``OriginalsStrategy``.
+        cur.execute(
+            """
+            WITH RECURSIVE target_docs AS (
+                SELECT id, previous_version_id FROM documents WHERE s3_key = %s
                 UNION
-                SELECT previous_version_id AS id FROM documents
-                WHERE s3_key = %s AND previous_version_id IS NOT NULL
+                SELECT d.id, d.previous_version_id
+                FROM documents d
+                JOIN target_docs td ON d.id = td.previous_version_id
             )
             SELECT r.id::text AS ruling_id, r.outcome::text,
                    r.motion_type, r.hearing_date::text, r.department,
@@ -115,20 +132,24 @@ def sample_originals(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
             JOIN cases cs ON r.case_id = cs.id
             LEFT JOIN judges j ON r.judge_id = j.id
             ORDER BY r.id
-        """, (s3_key, s3_key))
+        """,
+            (s3_key,),
+        )
         cols = [desc[0] for desc in cur.description]
         derived = [dict(zip(cols, row)) for row in cur.fetchall()]
 
         case_titles = list({r["case_title"] for r in derived if r.get("case_title")})
 
-        originals.append({
-            "s3_key": s3_key,
-            "s3_bucket": s3_bucket,
-            "derived_count": len(derived),
-            "all_same_case": len(case_titles) == 1 and len(derived) > 1,
-            "distinct_case_titles": len(case_titles),
-            "derived_rulings": derived,
-        })
+        originals.append(
+            {
+                "s3_key": s3_key,
+                "s3_bucket": s3_bucket,
+                "derived_count": len(derived),
+                "all_same_case": len(case_titles) == 1 and len(derived) > 1,
+                "distinct_case_titles": len(case_titles),
+                "derived_rulings": derived,
+            }
+        )
 
     return originals
 
@@ -156,7 +177,9 @@ def get_county_stats(cur: psycopg.Cursor) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run bidirectional spotcheck")
-    parser.add_argument("--n", type=int, default=10, help="Samples per county per direction")
+    parser.add_argument(
+        "--n", type=int, default=10, help="Samples per county per direction"
+    )
     parser.add_argument("--county", help="Single county to check (default: all)")
     args = parser.parse_args()
 
@@ -187,8 +210,10 @@ def main() -> None:
                     result["originals_by_county"][county] = []
                     continue
 
-                print(f"Sampling {county} ({stats['ruling_count']} rulings)...",
-                      file=sys.stderr)
+                print(
+                    f"Sampling {county} ({stats['ruling_count']} rulings)...",
+                    file=sys.stderr,
+                )
 
                 result["rulings_by_county"][county] = sample_rulings(
                     cur, county, args.n
@@ -211,8 +236,10 @@ def main() -> None:
     )
 
     print(f"\nResult written to s3://{BUCKET}/{s3_key}", file=sys.stderr)
-    print(f"Download with: aws s3 cp s3://{BUCKET}/{s3_key} tmp/spotcheck/data.json",
-          file=sys.stderr)
+    print(
+        f"Download with: aws s3 cp s3://{BUCKET}/{s3_key} tmp/spotcheck/data.json",
+        file=sys.stderr,
+    )
 
     # Also print a compact summary to stdout (this shows in CloudWatch logs)
     summary = {
@@ -225,8 +252,9 @@ def main() -> None:
         same_case_count = sum(1 for o in originals if o.get("all_same_case"))
         zero_derived = sum(1 for o in originals if o.get("derived_count", 0) == 0)
         null_judges = sum(1 for r in rulings if not r.get("judge_name"))
-        unknown_cases = sum(1 for r in rulings
-                          if (r.get("case_number") or "").startswith("UNKNOWN"))
+        unknown_cases = sum(
+            1 for r in rulings if (r.get("case_number") or "").startswith("UNKNOWN")
+        )
         null_departments = sum(1 for r in rulings if not r.get("department"))
         empty_ruling_text = sum(
             1 for r in rulings if (r.get("ruling_text_length") or 0) == 0
@@ -236,12 +264,14 @@ def main() -> None:
         )
         # Also check originals' derived rulings for empty text and long titles
         orig_empty_text = sum(
-            1 for o in originals
+            1
+            for o in originals
             for dr in o.get("derived_rulings", [])
             if (dr.get("ruling_text_length") or 0) == 0
         )
         orig_long_titles = sum(
-            1 for o in originals
+            1
+            for o in originals
             for dr in o.get("derived_rulings", [])
             if len(dr.get("case_title") or "") > 100
         )
