@@ -1117,6 +1117,24 @@ class TestJoinPageRows:
             == "2026-03-16"
         )
 
+    def test_parse_header_date_labeled_month_name_invalid_returns_none(self) -> None:
+        """Labeled month-name regex match with an out-of-range day falls through (#3601).
+
+        "Hearing Date February 30, 2026" matches the labeled month-name regex but
+        strptime raises ValueError; the except branch must pass and the function
+        continues to the bare fallbacks (which also fail), returning None.
+        """
+        assert _parse_header_date("Hearing Date February 30, 2026") is None
+
+    def test_parse_header_date_labeled_slash_invalid_returns_none(self) -> None:
+        """Labeled slash regex match with an out-of-range month falls through (#3601).
+
+        "Hearing Date 13/05/2026" matches the labeled slash regex but strptime raises
+        ValueError (month 13 is invalid); the except branch must pass and the function
+        continues to the bare fallbacks (which also fail), returning None.
+        """
+        assert _parse_header_date("Hearing Date 13/05/2026") is None
+
 
 # ---------------------------------------------------------------------------
 # Calendar header detection tests (#2096)
