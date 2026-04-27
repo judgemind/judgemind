@@ -111,6 +111,9 @@ elif [[ "$sql" == *"total_terminals_in_window"* ]]; then
     cat <<'TOTALS'
 [{"total_terminals_in_window":2,"total_greens_in_window":1,"total_diagnoses_in_window":1}]
 TOTALS
+# cooldown / stuck-loop watch — returns empty for happy-path
+elif [[ "$sql" == *"issue_cooldown_remaining_seconds"* ]]; then
+    echo "[]"
 else
     echo "Stub: unrecognised SQL shape" >&2
     echo "$sql" | head -5 >&2
@@ -209,6 +212,8 @@ if [[ "$sql" == *"concurrency_cap"* ]]; then
     echo '[{"cap":null,"flipped_by":null}]'
 elif [[ "$sql" == *"total_terminals_in_window"* ]]; then
     echo '[{"total_terminals_in_window":0,"total_greens_in_window":0,"total_diagnoses_in_window":0}]'
+elif [[ "$sql" == *"issue_cooldown_remaining_seconds"* ]]; then
+    echo "[]"
 else
     echo "[]"
 fi
