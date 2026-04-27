@@ -1061,6 +1061,26 @@ class TestJoinPageRows:
         """
         assert _parse_header_date("13/05/2026") is None
 
+    def test_parse_header_date_labeled_slash_wins_over_unlabeled(self) -> None:
+        """Labeled slash date takes priority over an earlier unlabeled slash date (#3601).
+
+        When a header contains both a bare slash date ("Filed 1/15/2024") and a
+        labeled slash date ("Hearing Date 3/16/2026"), the labeled date must win.
+        """
+        assert _parse_header_date("Filed 1/15/2024 — Hearing Date 3/16/2026") == "2026-03-16"
+
+    def test_parse_header_date_labeled_month_name_wins_over_unlabeled(self) -> None:
+        """Labeled month-name date takes priority over an earlier unlabeled month-name date (#3601).
+
+        When a header contains both a bare month-name date ("Filed January 15, 2024")
+        and a labeled month-name date ("Hearing Date March 16, 2026"), the labeled
+        date must win.
+        """
+        assert (
+            _parse_header_date("Filed January 15, 2024 — Hearing Date March 16, 2026")
+            == "2026-03-16"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Calendar header detection tests (#2096)

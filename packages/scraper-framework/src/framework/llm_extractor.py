@@ -3570,19 +3570,48 @@ def _append_ruling_from_case(
 def _parse_header_date(info: str) -> str | None:
     """Extract a hearing date from a page-header string, returning ISO YYYY-MM-DD.
 
-    Tries three patterns in priority order so that the existing ISO path
-    wins over ambiguous slash or month-name matches (#3559):
+    Tries five patterns in priority order so that labeled dates win over bare
+    dates when both appear in the same header (e.g. "Filed 1/15/2024 — Hearing
+    Date 3/16/2026" resolves to 2026-03-16, not 2024-01-15) (#3601):
 
-    1. ``Hearing Date: YYYY-MM-DD`` — explicit ISO label (existing behaviour).
-    2. Month-name: ``March 16, 2026`` — common in OC multimodal PDFs.
-    3. Slash: ``3/16/2026`` or ``03/16/2026`` — alternate courts.
+    1. ``Hearing Date: YYYY-MM-DD`` — explicit ISO label (highest priority).
+    2. Month-name labeled: ``Hearing Date March 16, 2026`` (#3601).
+    3. Slash labeled: ``Hearing Date 3/16/2026`` (#3601).
+    4. Month-name bare: ``March 16, 2026`` — fallback for OC multimodal PDFs.
+    5. Slash bare: ``3/16/2026`` or ``03/16/2026`` — fallback for other courts.
     """
     # 1. Existing ISO path — must remain the highest-priority match.
     m = re.search(r"Hearing Date:\s*(\d{4}-\d{2}-\d{2})", info)
     if m:
         return m.group(1)
 
-    # 2. Month-name format, e.g. "March 16, 2026".
+    # 2. Month-name with label prefix, e.g. "Hearing Date March 16, 2026".
+    m = re.search(
+        r"(?:Hearing Date|Calendar Date|Date)[:\s]+"
+        r"((?:January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+\d{1,2},\s*\d{4})",
+        info,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%B %d, %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 3. Slash format with label prefix, e.g. "Hearing Date 3/16/2026".
+    m = re.search(
+        r"(?:Hearing Date|Calendar Date|Date)[:\s]+(\d{1,2}/\d{1,2}/\d{4})",
+        info,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # 4. Month-name bare format, e.g. "March 16, 2026" (OC multimodal PDFs).
     m = re.search(
         r"\b((?:January|February|March|April|May|June|July|August|September|"
         r"October|November|December)\s+\d{1,2},\s*\d{4})\b",
@@ -3594,7 +3623,7 @@ def _parse_header_date(info: str) -> str | None:
         except ValueError:
             pass
 
-    # 3. Slash format, e.g. "3/16/2026" or "03/16/2026".
+    # 5. Slash bare format, e.g. "3/16/2026" or "03/16/2026".
     m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", info)
     if m:
         try:
