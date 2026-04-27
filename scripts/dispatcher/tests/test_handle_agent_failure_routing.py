@@ -46,6 +46,7 @@ from dispatcher.daemon import (  # noqa: E402
     FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
     FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
     FAILURE_CATEGORY_OPERATIONAL_FAILED,
+    FAILURE_CATEGORY_RALPH_NOT_SHIP,
     TIER_3_CATEGORIES,
 )
 
@@ -125,12 +126,13 @@ class TestBypassedTerminalConstants:
         # post-claude ``route_to_diagnoser`` arm in
         # agent-runner-entrypoint.sh. Each phase maps to its
         # FAILURE_CATEGORY so the diagnoser sweep picks them up.
-        # ``ralph_not_ship`` is intentionally NOT here — it's handled
-        # locally by the entrypoint.
+        # Issue #3586 adds ``ralph_not_ship`` — reversed from the
+        # #3455 local-handler path; the diagnoser now handles it.
         from dispatcher.daemon import (
             FAILURE_CATEGORY_FIX_CI_BLOCKED,
             FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
+            FAILURE_CATEGORY_RALPH_NOT_SHIP,
             FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
             FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
         )
@@ -144,6 +146,7 @@ class TestBypassedTerminalConstants:
             "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
             "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
+            "ralph_not_ship": FAILURE_CATEGORY_RALPH_NOT_SHIP,
         }
 
 
@@ -406,3 +409,80 @@ class TestReapRoutesBypassedTerminals:
         mock_finalize.assert_called_once_with(agent_id, issue_number)
         assert summary["reaped_success"] == 1
         assert summary["reaped_failure"] == 0
+
+    def test_ralph_not_ship_routes_through_handle_agent_failure(self) -> None:
+        """Issue #3586 — ``ralph_not_ship`` terminal phase routes through
+        ``_handle_agent_failure`` (not the defunct local handler from #3455).
+
+        AC #2 regression contract: this test MUST FAIL against pre-#3586
+        code (where ``ralph_not_ship`` was absent from
+        ``BYPASSED_TERMINAL_PHASES_TO_ROUTE``).
+        """
+        d = self._make_reaper_daemon()
+        cur = d._main_conn._cursor  # type: ignore[attr-defined]
+        agent_id = "agent-ralph-not-ship"
+        issue_number = 99010
+        arn = "arn:aws:ecs:us-west-2:123:task/test/ralph-not-ship"
+
+        # 1. Initial SELECT for active agent rows.
+        cur.fetchall_queue = [
+            [
+                self._agent_row(
+                    agent_id, issue_number, arn, "ralph_not_ship", "failed"
+                )
+            ],
+        ]
+        # 2. _read_agent_status_phase + _build_bypassed_terminal_details
+        #    fetches: terminal phase_outputs row, then ralph phase_outputs row.
+        cur.fetch_queue = [
+            ("failed", "ralph_not_ship"),  # _read_agent_status_phase
+            (
+                {
+                    "category": "ralph_not_ship",
+                    "reason": "ralph cannot proceed without prerequisite #2840",
+                },
+            ),  # terminal phase_outputs row
+            (
+                {
+                    "verdict": "BLOCKED",
+                    "iterations_used": 3,
+                    "block_reason": "ralph cannot proceed without prerequisite #2840",
+                },
+            ),  # ralph phase_outputs row
+        ]
+
+        d._ecs_client.describe_tasks.return_value = {  # type: ignore[attr-defined]
+            "tasks": [
+                {
+                    "taskArn": arn,
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 0}],
+                }
+            ]
+        }
+
+        with patch.object(d, "_handle_agent_failure") as mock_handle:
+            with patch.object(d, "_clear_agent_task_arn") as mock_clear:
+                summary = d._reap_completed_agent_tasks()
+
+        mock_handle.assert_called_once()
+        kwargs = mock_handle.call_args.kwargs
+        assert kwargs["agent_id"] == agent_id
+        assert kwargs["category"] == FAILURE_CATEGORY_RALPH_NOT_SHIP
+        assert kwargs["phase"] == "ralph_not_ship"
+        assert kwargs["issue_number"] == issue_number
+        # block_reason carried through as stderr_tail for diagnoser §Step 1.
+        assert (
+            "prerequisite #2840" in kwargs["details"]["stderr_tail"]
+        ), f"block_reason not in stderr_tail: {kwargs['details'].get('stderr_tail')!r}"
+        assert kwargs["details"]["terminal_phase"] == "ralph_not_ship"
+
+        # ARN clear ran so the next reap tick excludes the row.
+        mock_clear.assert_called_once_with(
+            agent_id=agent_id, issue_number=issue_number, branch="route_to_diagnoser"
+        )
+
+        # Counted as a failure reap, not a success reap.
+        assert summary["reaped_failure"] == 1
+        assert summary["reaped_success"] == 0

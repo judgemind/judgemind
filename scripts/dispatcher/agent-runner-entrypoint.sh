@@ -3935,108 +3935,12 @@ EOF
     exit 0
 }
 
-handle_ralph_not_ship_local() {
-    # Issue #3455 Path B — handle ``ralph_not_ship`` locally instead of
-    # routing to the diagnoser. Pre-#3455 this hint hit the
-    # ``advance_phase agent_runner_route_stub`` fall-through (line ~4433)
-    # because the daemon-side ralph_not_ship handler was never wired —
-    # 14 agents died at ``diagnoser_route_stub`` for absent-handler
-    # reasons. The empowered diagnoser doesn't add value here: ralph
-    # already wrote a ``block_reason`` explaining why it couldn't ship.
-    # We just relay that reason to the issue as a comment, add
-    # ``status/blocked``, and emit a clean terminal.
-    #
-    # $1 = the ralph phase output JSON (so we can extract block_reason).
-    _ralph_output="${1:-}"
-    _block_reason=$(printf '%s' "$_ralph_output" | jq -r '.block_reason // ""' 2>/dev/null)
-    _verdict=$(printf '%s' "$_ralph_output" | jq -r '.verdict // ""' 2>/dev/null)
-    _iterations_used=$(printf '%s' "$_ralph_output" | jq -r '.iterations_used // ""' 2>/dev/null)
-    log "ralph_not_ship_local_handler" \
-        "issue_number=$ISSUE_NUMBER" \
-        "verdict=$_verdict" \
-        "iterations_used=$_iterations_used" \
-        "block_reason_preview=$(printf '%s' "$_block_reason" | head -c 120)"
-
-    if [[ -n "$ISSUE_NUMBER" ]]; then
-        # Compose the comment body in a temp file to avoid heredoc /
-        # quoted-string preflight issues. ``$AGENT_WORKSPACE`` is the
-        # entrypoint's writable scratch dir.
-        _comment_file="$AGENT_WORKSPACE/ralph-not-ship-comment.md"
-        {
-            printf '## Ralph determined it cannot ship\n\n'
-            if [[ -n "$_verdict" && "$_verdict" != "null" ]]; then
-                printf 'Verdict: `%s`\n\n' "$_verdict"
-            fi
-            if [[ -n "$_iterations_used" && "$_iterations_used" != "null" && "$_iterations_used" != "" ]]; then
-                printf 'Iterations used: %s\n\n' "$_iterations_used"
-            fi
-            if [[ -n "$_block_reason" && "$_block_reason" != "null" ]]; then
-                printf '**Block reason from ralph:**\n\n'
-                printf '> %s\n\n' "$_block_reason"
-            else
-                printf 'Ralph did not provide a structured block_reason.\n\n'
-            fi
-            printf 'Adding `status/blocked` so the issue stays off the queue '
-            printf 'until a human reviews the block reason and decides whether '
-            printf 'to clarify the AC, file a prerequisite, or close as NOOP.\n'
-            printf '\n'
-            printf '_Posted by the agent-runner ralph_not_ship local handler '
-            printf '(#3455). The diagnoser was not invoked — ralph already '
-            printf 'identified the block; relaying its reasoning verbatim is '
-            printf 'cheaper and more honest than another LLM pass over the '
-            printf 'same evidence._\n'
-        } > "$_comment_file" 2> "$AGENT_WORKSPACE/ralph-not-ship-comment.stderr.log"
-
-        set +e
-        gh issue comment "$ISSUE_NUMBER" \
-            --repo judgemind/judgemind \
-            --body-file "$_comment_file" \
-            > "$AGENT_WORKSPACE/ralph-not-ship-comment.stdout.log" \
-            2>> "$AGENT_WORKSPACE/ralph-not-ship-comment.stderr.log"
-        _comment_rc=$?
-        set -e
-        if [[ "$_comment_rc" -ne 0 ]]; then
-            log "ralph_not_ship_local_comment_failed" \
-                "issue_number=$ISSUE_NUMBER" "exit_code=$_comment_rc"
-        else
-            log "ralph_not_ship_local_comment_posted" \
-                "issue_number=$ISSUE_NUMBER"
-        fi
-
-        # Add status/blocked + remove agent/ready so the issue is fully
-        # off the queue until human review. Both ops are idempotent.
-        set +e
-        gh issue edit "$ISSUE_NUMBER" \
-            --repo judgemind/judgemind \
-            --add-label status/blocked \
-            --remove-label agent/ready \
-            > "$AGENT_WORKSPACE/ralph-not-ship-label.stdout.log" \
-            2> "$AGENT_WORKSPACE/ralph-not-ship-label.stderr.log"
-        _label_rc=$?
-        set -e
-        if [[ "$_label_rc" -ne 0 ]]; then
-            log "ralph_not_ship_local_label_failed" \
-                "issue_number=$ISSUE_NUMBER" "exit_code=$_label_rc"
-        else
-            log "ralph_not_ship_local_label_applied" \
-                "issue_number=$ISSUE_NUMBER"
-        fi
-    else
-        log "ralph_not_ship_local_no_issue_number" \
-            "skipping comment + label edits — no ISSUE_NUMBER set"
-    fi
-
-    # Always emit the descriptive terminal. The reason carries the
-    # block_reason so operators / failure dashboards see the cause.
-    _reason_for_terminal="$_block_reason"
-    if [[ -z "$_reason_for_terminal" ]]; then
-        _reason_for_terminal="ralph emitted non-SHIP verdict ${_verdict:-(missing)} without block_reason"
-    fi
-    agent_runner_reaped_failure \
-        "ralph_not_ship" \
-        "ralph_not_ship" \
-        "$_reason_for_terminal"
-}
+# handle_ralph_not_ship_local was removed in #3586. ``ralph_not_ship``
+# is now routed through the diagnoser via the descriptive-terminal arm
+# in the post-claude dispatch (see BYPASSED_TERMINAL_PHASES_TO_ROUTE).
+# The local handler was defined in #3455 and handled by posting a
+# comment + adding status/blocked; those actions are now the diagnoser's
+# responsibility based on block_reason analysis.
 
 fetch_pr_status() {
     # $1 = pr_number. Writes the JSON response from
@@ -4997,8 +4901,19 @@ while true; do
                                 "fix_conflict skill returned unresolvable or budget exhausted"
                             ;;
                         ralph_not_ship)
-                            log "ralph_not_ship_local" "hint=$_hint"
-                            handle_ralph_not_ship_local "$_output"
+                            # #3586 — route through diagnoser via
+                            # BYPASSED_TERMINAL_PHASES_TO_ROUTE (reversed
+                            # from the #3455 local-handler path).
+                            # Pass block_reason as the third arg so the
+                            # failures-row reason/stderr_tail carries
+                            # ralph's structured block_reason for the
+                            # diagnoser to act on.
+                            _block_reason=$(printf '%s' "$_output" | jq -r '.block_reason // ""' 2>/dev/null)
+                            log "diagnoser_route_ralph_not_ship" "hint=$_hint" "phase=$_current"
+                            agent_runner_reaped_failure \
+                                "ralph_not_ship" \
+                                "ralph_not_ship" \
+                                "$_block_reason"
                             ;;
                         ralph_ac_infeasible|summary_ac_infeasible|fix_ci_blocked|verify_failed_post_merge|push_and_pr_no_unmerged_files)
                             # Descriptive terminal — the daemon's
