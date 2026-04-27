@@ -70,9 +70,9 @@ python3 {worktree}/scripts/phase_timer.py start {worktree} <phase>
 
 The timer automatically closes the previous phase when a new one starts, so you only need `start` calls at each transition — no explicit `end` calls are needed during normal flow.
 
-**For ralph-reviewer phases**, after all three reviewers complete, end the phase with per-reviewer timing detail (see the ralph SKILL.md for how to capture per-reviewer seconds):
+**For ralph-reviewer phases**, after all four reviewers complete, end the phase with per-reviewer timing detail (see the ralph SKILL.md for how to capture per-reviewer seconds):
 ```
-python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <secs>, "gemini_adversarial": <secs>, "claude": <secs>}'
+python3 {worktree}/scripts/phase_timer.py end {worktree} --detail '{"gemini_standard": <secs>, "gemini_adversarial": <secs>, "claude": <secs>, "spec_drift": <secs>}'
 ```
 
 **At task completion** (in Step 5d, before cleanup), generate the timing summary:
