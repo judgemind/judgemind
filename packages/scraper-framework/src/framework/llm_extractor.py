@@ -1373,6 +1373,28 @@ _PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Contra Costa probate calendar-pointer signals (#3609).  These match
+# calendar-listing rows from CC dept 30 "alternate sheet" PDFs where every
+# numbered entry is a pointer to the full calendar, not a ruling body.
+# They are identified by EITHER:
+#   (a) a time-prefixed "HEARING IN RE" phrase (``9:00 AM HEARING IN RE:``)
+#   (b) the literal pointer phrase ``see also alternate sheet`` / ``see alt sheet``
+# These rows may be 110-180 chars — well above _CALENDAR_LISTING_MAX_LENGTH —
+# so they MUST be matched by an explicit pointer check that bypasses the
+# length gate.  The disposition-verb guard (_RULING_VERB_RE) is applied
+# *after* this check to preserve any real one-liner ruling that incidentally
+# contains "HEARING IN RE" as part of its text.
+_PROBATE_CALENDAR_LISTING_RE = re.compile(
+    r"(?:"
+    r"\d{1,2}:\d{2}\s*(?:AM|PM)\s+HEARING\s+IN\s+RE\b"
+    r"|"
+    r"HEARING\s+IN\s+RE\b"
+    r"|"
+    r"see\s+also\s+alt(?:ernate)?\s*sheet"
+    r")",
+    re.IGNORECASE,
+)
+
 # Disposition verbs — if any of these appear, the text is a real ruling,
 # not a bare calendar listing.  Limited to *past-participle* forms so that
 # motion labels like "Motion to Continue" or "Petition to Approve" (which
@@ -1475,6 +1497,13 @@ def _is_calendar_listing_only(text: str | None) -> bool:
         "Demurrer\nMotion to Strike"
         "Motion for Attorneys' Fees"
 
+    Also covers Contra Costa probate calendar-pointer rows (#3609) that are
+    110-180 chars (above ``_CALENDAR_LISTING_MAX_LENGTH``) but are
+    unambiguously listings because they contain explicit pointer signals::
+
+        "9:00 AM HEARING IN RE: PETITION FOR ... --see also alternate sheet"
+        "HEARING IN RE: ESTATE OF ROBERT A. HARRIS --see also alternate sheet"
+
     These are distinguishable from real short rulings because real rulings
     contain a disposition verb (GRANTED/DENIED/SUSTAINED/etc.) used as a
     substantive verb rather than as a bare listing marker.  The filter is
@@ -1484,6 +1513,10 @@ def _is_calendar_listing_only(text: str | None) -> bool:
 
     The evaluation order is:
 
+    0. **Pointer exemption** — if the text matches ``_PROBATE_CALENDAR_LISTING_RE``
+       (explicit CC probate calendar-pointer signal) AND does NOT contain a
+       disposition verb, accept as a listing regardless of length.  This must
+       run BEFORE the length gate so that 110-180 char pointer rows are caught.
     1. Reject text longer than ``_CALENDAR_LISTING_MAX_LENGTH``.
     2. Accept bare continuance lines (``Cont. to 4/20``, ``CONTINUED TO
        10/6/26``) — these contain the ``CONTINUED`` disposition verb but
@@ -1506,6 +1539,11 @@ def _is_calendar_listing_only(text: str | None) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
+    # Step 0: Explicit CC probate calendar-pointer signals bypass the length
+    # gate.  A real ruling that incidentally mentions "HEARING IN RE" will
+    # still be preserved because the disposition-verb guard fires first.
+    if _PROBATE_CALENDAR_LISTING_RE.search(stripped) and not _RULING_VERB_RE.search(stripped):
+        return True
     # Too long to be a calendar listing.
     if len(stripped) > _CALENDAR_LISTING_MAX_LENGTH:
         return False
