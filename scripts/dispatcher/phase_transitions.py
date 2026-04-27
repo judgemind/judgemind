@@ -275,6 +275,21 @@ PHASE_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
 #: PR or worktree to retry against.
 PHASE_SCHEDULED_SKILL_FAILED = "scheduled_skill_failed"
 
+#: #3507 — Operational phase (``/task-v2-operational``). Non-coding tasks
+#: that need only a script run / DB query / gh action bypass the
+#: ralph → summary → push+PR pipeline entirely. Entered when the plan
+#: phase emits ``task_type="operational"``.
+PHASE_OPERATIONAL = "operational"
+
+#: #3507 — Operational succeeded terminal. The operational skill posted
+#: evidence, closed the issue, and completed without creating a PR.
+PHASE_OPERATIONAL_DONE = "operational_done"
+
+#: #3507 — Operational failed terminal. The operational skill returned
+#: ``verdict=blocked`` — the task needs operator review before it can
+#: proceed. Routed to ``needs_review`` status so the operator can see it.
+PHASE_OPERATIONAL_FAILED = "operational_failed"
+
 # ---------------------------------------------------------------------------
 # Verdict constants — the string values produced by the phase-output JSONs.
 # ---------------------------------------------------------------------------
@@ -400,6 +415,9 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_RALPH_BASELINE_TRANSITION_UNRECOGNIZED,
         PHASE_POST_CLAUDE_TRANSITION_UNRECOGNIZED,
         PHASE_PUSH_AND_PR_TRANSITION_UNRECOGNIZED,
+        # #3507 — operational pipeline terminals.
+        PHASE_OPERATIONAL_DONE,
+        PHASE_OPERATIONAL_FAILED,
     }
 )
 
@@ -486,6 +504,11 @@ FAILURE_HINT_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: ``FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES`` in daemon.py.
 FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
 
+#: #3507 — The operational skill returned ``verdict=failed`` or an
+#: unrecognized verdict. Maps to ``FAILURE_CATEGORY_OPERATIONAL_FAILED``
+#: in daemon.py.
+FAILURE_HINT_OPERATIONAL_FAILED = "operational_failed"
+
 
 # ---------------------------------------------------------------------------
 # Transition dataclass.
@@ -559,6 +582,11 @@ def transition_from_plan(output: Mapping[str, Any] | None) -> PhaseTransition:
 
     Blocked path: plan emitted ``verdict='BLOCKED'`` — terminal failure
     with ``status='plan_blocked'``.
+
+    #3507 — Operational path: plan emitted ``task_type='operational'``
+    — advance to the ``operational`` phase, bypassing ralph → summary
+    → push+PR entirely. Coding tasks (or any other task_type) continue
+    to ``ralph`` as before.
     """
     verdict = _verdict(output)
     if verdict == VERDICT_BLOCKED:
@@ -572,13 +600,78 @@ def transition_from_plan(output: Mapping[str, Any] | None) -> PhaseTransition:
                 "block_reason": (output or {}).get("block_reason"),
             },
         )
-    # Any non-BLOCKED output from plan is treated as "plan done,
-    # proceed to ralph". Plan does not have a SHIP / AC_INFEASIBLE
-    # branch — it's either BLOCKED or done.
+    # #3507 — Branch on task_type. operational tasks bypass ralph
+    # entirely; all other task_types (including missing/None) default
+    # to ralph so the existing pipeline is unchanged.
+    task_type = str((output or {}).get("task_type") or "").lower().strip()
+    if task_type == "operational":
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE,
+            next_phase=PHASE_OPERATIONAL,
+            reason="plan classified task_type=operational",
+        )
+    # Any non-BLOCKED, non-operational output from plan is treated as
+    # "plan done, proceed to ralph". Plan does not have a SHIP /
+    # AC_INFEASIBLE branch — it's either BLOCKED, operational, or done.
     return PhaseTransition(
         action=TransitionAction.ADVANCE,
         next_phase=PHASE_RALPH,
         reason="plan completed",
+    )
+
+
+def transition_from_operational(output: Mapping[str, Any] | None) -> PhaseTransition:
+    """Return the phase transition after ``/task-v2-operational`` runs.
+
+    #3507 — Operational-task verdicts (lower-case from the skill, upper-
+    cased here via :func:`_verdict` for comparison):
+
+    * ``succeeded`` — the operational task completed. Advance to
+      ``operational_done`` with ``status='succeeded'``. No PR, no CI, no
+      merge. The skill is expected to have already posted evidence and
+      closed the issue before emitting this verdict.
+    * ``blocked`` — the task needs operator attention before it can
+      proceed (e.g. missing secret, environment not ready). Advance to
+      ``operational_failed`` with ``status='needs_review'`` so the
+      operator can see it in the cockpit.
+    * ``failed`` / missing / unrecognized — the skill encountered a
+      genuine failure (script errored, DB unreachable, etc.). Route to
+      the diagnoser with hint ``operational_failed`` so it can decide
+      whether to retry, escalate, or close the issue.
+    """
+    verdict = _verdict(output)
+    if verdict == "SUCCEEDED":
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE_WITH_STATUS,
+            next_phase=PHASE_OPERATIONAL_DONE,
+            terminal_status=AgentStatus.SUCCEEDED.value,
+            reason="operational succeeded",
+            context={
+                "evidence_md": (output or {}).get("evidence_md"),
+                "action_taken": (output or {}).get("action_taken"),
+            },
+        )
+    if verdict == "BLOCKED":
+        return PhaseTransition(
+            action=TransitionAction.ADVANCE_WITH_STATUS,
+            next_phase=PHASE_OPERATIONAL_FAILED,
+            terminal_status=AgentStatus.NEEDS_REVIEW.value,
+            reason="operational blocked — needs operator review",
+            context={
+                "block_reason": (output or {}).get("block_reason"),
+                "evidence_md": (output or {}).get("evidence_md"),
+            },
+        )
+    # failed, missing, or unrecognized — route to diagnoser.
+    return PhaseTransition(
+        action=TransitionAction.ROUTE_TO_DIAGNOSER,
+        failure_hint=FAILURE_HINT_OPERATIONAL_FAILED,
+        reason=f"operational non-succeeded verdict: {verdict or '(missing)'}",
+        context={
+            "verdict": verdict,
+            "block_reason": (output or {}).get("block_reason"),
+            "evidence_md": (output or {}).get("evidence_md"),
+        },
     )
 
 
@@ -1178,6 +1271,8 @@ _VERDICT_DRIVEN_TRANSITIONS: dict[
     PHASE_FIX_CI: transition_from_fix_ci,
     PHASE_FIX_CONFLICT: transition_from_fix_conflict,
     PHASE_VERIFY: transition_from_verify,
+    # #3507 — operational pipeline.
+    PHASE_OPERATIONAL: transition_from_operational,
 }
 
 
@@ -1256,6 +1351,8 @@ ACTIVE_PHASES: frozenset[str] = frozenset(
         PHASE_AWAITING_DEPLOY,
         PHASE_VERIFY,
         PHASE_RETRO,
+        # #3507 — operational pipeline.
+        PHASE_OPERATIONAL,
     }
 )
 
@@ -1309,6 +1406,10 @@ __all__ = [
     "PHASE_RALPH_BASELINE_TRANSITION_UNRECOGNIZED",
     "PHASE_POST_CLAUDE_TRANSITION_UNRECOGNIZED",
     "PHASE_PUSH_AND_PR_TRANSITION_UNRECOGNIZED",
+    # #3507 — operational pipeline phases
+    "PHASE_OPERATIONAL",
+    "PHASE_OPERATIONAL_DONE",
+    "PHASE_OPERATIONAL_FAILED",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",
@@ -1334,6 +1435,7 @@ __all__ = [
     "FAILURE_HINT_PLAN_BLOCKED",
     "FAILURE_HINT_CONFLICT_UNRESOLVABLE",
     "FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES",
+    "FAILURE_HINT_OPERATIONAL_FAILED",
     # Transition dataclass + enum
     "PhaseTransition",
     "TransitionAction",
@@ -1349,6 +1451,7 @@ __all__ = [
     "transition_from_awaiting_deploy",
     "transition_from_verify",
     "transition_from_retro",
+    "transition_from_operational",
     # Convenience helpers
     "next_phase_from_verdict",
     "is_terminal_phase",

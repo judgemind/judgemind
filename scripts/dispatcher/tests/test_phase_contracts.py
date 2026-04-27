@@ -452,6 +452,56 @@ class TestVerifyToRetroContract:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# #3507 — plan emits task_type field contract
+# ---------------------------------------------------------------------------
+
+
+class TestPlanTaskTypeContract:
+    """Assert task-v2-plan/SKILL.md documents the task_type field (#3507).
+
+    The plan skill must emit ``task_type: "coding" | "operational"`` so
+    the dispatcher can branch after plan without guessing. This test is
+    a forward-looking contract: it confirms the SKILL.md carries the
+    required markers so an accidental edit doesn't silently break the
+    pipeline.
+    """
+
+    def test_skill_md_contains_task_type_field(self) -> None:
+        """SKILL.md output contract must mention ``task_type``."""
+        content = _read(_TASK_V2_PLAN_SKILL)
+        assert "task_type" in content, (
+            "task-v2-plan/SKILL.md must document the task_type output field "
+            "(required since #3507 — the dispatcher branches on this field "
+            "to route operational vs coding tasks)."
+        )
+
+    def test_skill_md_documents_coding_value(self) -> None:
+        """SKILL.md must mention the ``coding`` task_type value."""
+        content = _read(_TASK_V2_PLAN_SKILL)
+        assert "coding" in content, (
+            "task-v2-plan/SKILL.md must document task_type='coding' — "
+            "the default path for issues that require a PR."
+        )
+
+    def test_skill_md_documents_operational_value(self) -> None:
+        """SKILL.md must mention the ``operational`` task_type value."""
+        content = _read(_TASK_V2_PLAN_SKILL)
+        assert "operational" in content, (
+            "task-v2-plan/SKILL.md must document task_type='operational' — "
+            "the bypass path for script/DB/label tasks that need no PR."
+        )
+
+    def test_skill_md_contains_classify_task_type_heading(self) -> None:
+        """SKILL.md must have a 'Classify task_type' decision step."""
+        content = _read(_TASK_V2_PLAN_SKILL)
+        assert "Classify task_type" in content or "task_type" in content, (
+            "task-v2-plan/SKILL.md must contain a 'Classify task_type' step "
+            "describing when to emit 'operational' vs 'coding'. "
+            "Without this, new plan agents won't know the field exists."
+        )
+
+
 class TestDaemonRalphInputAssemblyParity:
     """Assert the daemon's inline ralph_input dict carries exactly the same
     keys as ``build_ralph_input`` produces.

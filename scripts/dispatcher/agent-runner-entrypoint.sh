@@ -1819,6 +1819,7 @@ phase_to_skill() {
         fix_conflict)   printf 'fix-conflict' ;;  # #3225
         verify)         printf 'verify' ;;
         retro)          printf 'retro' ;;
+        operational)    printf 'operational' ;;  # #3507
         *)              die "no_skill_mapping_for_phase=$1" ;;
     esac
 }
@@ -4939,6 +4940,56 @@ while true; do
             # just invokes the handler and lets the next loop tick
             # observe the new phase row.
             handle_fix_ci >/dev/null
+            ;;
+        operational)
+            # #3507: operational phase. Runs the /task-v2-operational
+            # skill for tasks that need only a script run / DB query / gh
+            # action — no code change, no PR. Modeled on the verify)
+            # arm: run_claude_phase + persist_phase_output +
+            # transition_for dispatch.
+            #
+            # Verdicts from /task-v2-operational:
+            #   succeeded → advance_with_status → operational_done/succeeded
+            #   blocked   → advance_with_status → operational_failed/needs_review
+            #   failed / missing / unrecognized → route_to_diagnoser
+            #     → agent_runner_reaped_failure "operational_failed"
+            _output=$(run_claude_phase "operational")
+            persist_phase_output "operational" "$_output"
+            _transition=$(transition_for "operational" "$_output")
+            _action=$(printf '%s' "$_transition" | cut -f1)
+            _next=$(printf '%s' "$_transition" | cut -f2)
+            _status=$(printf '%s' "$_transition" | cut -f3)
+            _hint=$(printf '%s' "$_transition" | cut -f4)
+            log "operational_transition_shim_done" \
+                "action=$_action" \
+                "next=$_next" \
+                "status=$_status" \
+                "hint=$_hint"
+            case "$_action" in
+                advance)
+                    advance_phase "$_next"
+                    ;;
+                advance_with_status)
+                    advance_phase "$_next" "$_status"
+                    ;;
+                route_to_diagnoser)
+                    # operational_failed is the only hint expected here.
+                    # Route to the descriptive terminal so the diagnoser
+                    # sweep picks it up via BYPASSED_TERMINAL_PHASES_TO_ROUTE.
+                    log "operational_route_to_diagnoser" "hint=$_hint"
+                    agent_runner_reaped_failure \
+                        "operational_failed" \
+                        "operational_failed" \
+                        "operational skill returned non-succeeded verdict — hint=$_hint"
+                    ;;
+                *)
+                    log "operational_transition_unrecognized" "action=$_action"
+                    agent_runner_reaped_failure \
+                        "post_claude_transition_unrecognized" \
+                        "post_claude_transition_unrecognized" \
+                        "operational returned action=$_action (not advance / advance_with_status / route_to_diagnoser)"
+                    ;;
+            esac
             ;;
         awaiting_ci)
             # #3176: real implementation — poll ``gh pr view`` rollup,

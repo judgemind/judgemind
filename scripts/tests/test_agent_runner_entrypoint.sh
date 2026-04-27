@@ -5367,6 +5367,362 @@ else
          "psql.log tail: $(tail -c 500 "$INVOCATIONS_DIR/psql.log")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T58: #3507 — operational) dispatch arm — succeeded path.
+#
+# Scenario: the dispatch loop reads phase=operational and the
+# /task-v2-operational skill returns verdict=succeeded. Expected behaviour:
+#   1. run_claude_phase "operational" is invoked (phase_to_skill maps it).
+#   2. persist_phase_output "operational" is called with the output.
+#   3. transition_for "operational" returns advance_with_status
+#      operational_done succeeded.
+#   4. advance_phase "operational_done" "succeeded" is called → DB UPDATE.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Extract the operational case and its dependencies from the real entrypoint.
+t58_funcs="$TEST_TMP/t58-funcs.sh"
+printf 'exec 3>&1\n' > "$t58_funcs"
+
+for fn in db_exec db_query_one log persist_phase_output \
+          phase_to_skill \
+          read_phase_output \
+          write_phase_input \
+          run_claude_phase \
+          advance_phase \
+          agent_runner_reaped_failure \
+          transition_for; do
+    awk -v FN="^${fn}\\(\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t58_funcs"
+done
+
+# Sanity: phase_to_skill maps operational.
+if grep -q "operational)" "$t58_funcs"; then
+    pass "#3507 T58 setup — operational) arm exists in extracted functions"
+else
+    fail "#3507 T58 setup — operational) arm exists in extracted functions" \
+         "grep target: 'operational)' in funcs (head 200): $(head -c 200 "$t58_funcs")"
+fi
+
+# Build a minimal workspace.
+t58_workspace="$TEST_TMP/t58-workspace"
+t58_repo_root="$TEST_TMP/t58-repo"
+t58_state_dir="$TEST_TMP/t58-state"
+t58_stub_bin="$TEST_TMP/t58-bin"
+mkdir -p "$t58_workspace" "$t58_repo_root" "$t58_state_dir" "$t58_stub_bin"
+
+# Pre-create dispatcher-input and dispatcher-output dirs.
+mkdir -p "$t58_repo_root/tmp/dispatcher-input"
+mkdir -p "$t58_repo_root/tmp/dispatcher-output"
+
+# Seed the operational skill output with verdict=succeeded.
+cat > "$t58_repo_root/tmp/dispatcher-output/operational.json" <<'T58OUTJSON'
+{
+  "agent_id": "58585858-dead-beef-cafe-000000000001",
+  "issue_number": 2419,
+  "verdict": "succeeded",
+  "action_taken": "ran rebuild_db.py --county Santa Clara; 4821 rows restored",
+  "evidence_md": "## Evidence\n\n4821 rows in derived.rulings.",
+  "block_reason": null
+}
+T58OUTJSON
+
+# psql stub: records all queries; responds to phase SELECT with "operational".
+cat > "$t58_stub_bin/psql" <<'T58PSQLEOF'
+#!/usr/bin/env bash
+set -u
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) shift; query="$1" ;;
+    esac
+    shift || true
+done
+printf 'CALL %s\n' "$query" >> "${T58_STATE_DIR}/psql-log.txt"
+if [[ "$query" == *"SELECT phase"*"FROM dispatcher.agents"* ]]; then
+    printf 'operational\n'
+fi
+exit 0
+T58PSQLEOF
+chmod +x "$t58_stub_bin/psql"
+
+# claude stub: just logs invocation and exits 0 (run_claude_phase reads from
+# the dispatcher-output JSON, not from claude's stdout in the entrypoint's
+# read_phase_output path).
+cat > "$t58_stub_bin/claude" <<'T58CLAUDEEOF'
+#!/usr/bin/env bash
+printf 'CLAUDE_INVOKED %s\n' "$*" >> "${T58_STATE_DIR}/claude-log.txt"
+printf '{"result": "stub"}\n'
+exit 0
+T58CLAUDEEOF
+chmod +x "$t58_stub_bin/claude"
+
+# git stub: no-op.
+cat > "$t58_stub_bin/git" <<'T58GITEOF'
+#!/usr/bin/env bash
+exit 0
+T58GITEOF
+chmod +x "$t58_stub_bin/git"
+
+# gh stub: no-op.
+cat > "$t58_stub_bin/gh" <<'T58GHEOF'
+#!/usr/bin/env bash
+exit 0
+T58GHEOF
+chmod +x "$t58_stub_bin/gh"
+
+# transition_for stub: returns advance_with_status\toperational_done\tsucceeded\t
+# for the operational phase. Extracted as a shell function replacement below.
+# We override transition_for in the sourced functions file.
+_t58_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'operational' ]]; then
+        printf 'advance_with_status\toperational_done\tsucceeded\t'
+    else
+        printf 'advance\t%s\t\t' \"\${2:-done}\"
+    fi
+}
+"
+
+# advance_phase stub: records the call.
+_t58_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s %s\n' \"\${1:-}\" \"\${2:-}\" >> \"\${T58_STATE_DIR}/advance-log.txt\"
+}
+"
+
+# Run the operational case in a subshell.
+t58_out=$(
+    set +eu
+    export T58_STATE_DIR="$t58_state_dir"
+    export AGENT_WORKSPACE="$t58_workspace"
+    export REPO_ROOT="$t58_repo_root"
+    export AGENT_ID="58585858-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="2419"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t58_stub_bin:$PATH"
+    # Source the extracted functions + overrides.
+    source "$t58_funcs"
+    eval "$_t58_transition_for_override"
+    eval "$_t58_advance_phase_override"
+    # Invoke just the operational dispatch logic inline.
+    _output=$(run_claude_phase "operational")
+    persist_phase_output "operational" "$_output"
+    _transition=$(transition_for "operational" "$_output")
+    _action=$(printf '%s' "$_transition" | cut -f1)
+    _next=$(printf '%s' "$_transition" | cut -f2)
+    _status=$(printf '%s' "$_transition" | cut -f3)
+    log "operational_transition_shim_done" "action=$_action" "next=$_next" "status=$_status"
+    case "$_action" in
+        advance_with_status)
+            advance_phase "$_next" "$_status"
+            ;;
+        advance)
+            advance_phase "$_next"
+            ;;
+        *)
+            printf 'UNEXPECTED_ACTION %s\n' "$_action"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# (1) subshell exited / produced output.
+if printf '%s' "$t58_out" | grep -q "subshell_done"; then
+    pass "#3507 T58 [operational succeeded] — dispatch subshell ran to completion"
+else
+    fail "#3507 T58 [operational succeeded] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t58_out" | tail -c 600)"
+fi
+
+# (2) transition_shim_done logged with advance_with_status.
+if printf '%s' "$t58_out" | grep -q "operational_transition_shim_done.*advance_with_status"; then
+    pass "#3507 T58 [operational succeeded] — transition_shim_done logged advance_with_status"
+else
+    fail "#3507 T58 [operational succeeded] — transition_shim_done logged advance_with_status" \
+         "out: $(printf '%s' "$t58_out" | tail -c 600)"
+fi
+
+# (3) advance_phase called with operational_done succeeded.
+if [[ -f "$t58_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE operational_done succeeded" "$t58_state_dir/advance-log.txt"; then
+    pass "#3507 T58 [operational succeeded] — advance_phase operational_done succeeded called"
+else
+    fail "#3507 T58 [operational succeeded] — advance_phase operational_done succeeded called" \
+         "advance-log: $(cat "$t58_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# (4) claude was invoked with /task-v2-operational.
+if [[ -f "$t58_state_dir/claude-log.txt" ]] && grep -q "operational" "$t58_state_dir/claude-log.txt"; then
+    pass "#3507 T58 [operational succeeded] — claude invoked with operational skill"
+else
+    fail "#3507 T58 [operational succeeded] — claude invoked with operational skill" \
+         "claude-log: $(cat "$t58_state_dir/claude-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T59: #3507 — operational) dispatch arm — failed/diagnoser path.
+#
+# Scenario: the /task-v2-operational skill returns verdict=failed.
+# Expected behaviour:
+#   1. transition_for returns route_to_diagnoser.
+#   2. agent_runner_reaped_failure "operational_failed" is called.
+#   3. No advance_phase call is made.
+# ══════════════════════════════════════════════════════════════════════════
+
+t59_workspace="$TEST_TMP/t59-workspace"
+t59_repo_root="$TEST_TMP/t59-repo"
+t59_state_dir="$TEST_TMP/t59-state"
+t59_stub_bin="$TEST_TMP/t59-bin"
+mkdir -p "$t59_workspace" "$t59_repo_root" "$t59_state_dir" "$t59_stub_bin"
+
+mkdir -p "$t59_repo_root/tmp/dispatcher-input"
+mkdir -p "$t59_repo_root/tmp/dispatcher-output"
+
+# Seed operational output with verdict=failed.
+cat > "$t59_repo_root/tmp/dispatcher-output/operational.json" <<'T59OUTJSON'
+{
+  "agent_id": "59595959-dead-beef-cafe-000000000001",
+  "issue_number": 2419,
+  "verdict": "failed",
+  "action_taken": null,
+  "evidence_md": "ECS task exited with code 1",
+  "block_reason": null
+}
+T59OUTJSON
+
+# psql stub.
+cat > "$t59_stub_bin/psql" <<'T59PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+if [[ "$query" == *"SELECT phase"* ]]; then printf 'operational\n'; fi
+exit 0
+T59PSQLEOF
+chmod +x "$t59_stub_bin/psql"
+
+cat > "$t59_stub_bin/claude" <<'T59CLAUDEEOF'
+#!/usr/bin/env bash
+printf '{"result": "stub"}\n'
+exit 0
+T59CLAUDEEOF
+chmod +x "$t59_stub_bin/claude"
+
+cat > "$t59_stub_bin/git" <<'T59GITEOF'
+#!/usr/bin/env bash
+exit 0
+T59GITEOF
+chmod +x "$t59_stub_bin/git"
+
+cat > "$t59_stub_bin/gh" <<'T59GHEOF'
+#!/usr/bin/env bash
+exit 0
+T59GHEOF
+chmod +x "$t59_stub_bin/gh"
+
+_t59_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'operational' ]]; then
+        printf 'route_to_diagnoser\t\t\toperational_failed'
+    fi
+}
+"
+
+_t59_reaped_failure_override="
+agent_runner_reaped_failure() {
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T59_STATE_DIR}/reaped-log.txt\"
+    log 'agent_runner_reaped_failure' \"phase=\$1\" \"hint=\$2\"
+}
+"
+
+_t59_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T59_STATE_DIR}/advance-log.txt\"
+}
+"
+
+t59_out=$(
+    set +eu
+    export T59_STATE_DIR="$t59_state_dir"
+    export AGENT_WORKSPACE="$t59_workspace"
+    export REPO_ROOT="$t59_repo_root"
+    export AGENT_ID="59595959-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="2419"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t59_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t59_transition_for_override"
+    eval "$_t59_reaped_failure_override"
+    eval "$_t59_advance_phase_override"
+    _output=$(run_claude_phase "operational")
+    persist_phase_output "operational" "$_output"
+    _transition=$(transition_for "operational" "$_output")
+    _action=$(printf '%s' "$_transition" | cut -f1)
+    _next=$(printf '%s' "$_transition" | cut -f2)
+    _status=$(printf '%s' "$_transition" | cut -f3)
+    _hint=$(printf '%s' "$_transition" | cut -f4)
+    log "operational_transition_shim_done" "action=$_action" "next=$_next" "hint=$_hint"
+    case "$_action" in
+        advance_with_status)
+            advance_phase "$_next" "$_status"
+            ;;
+        advance)
+            advance_phase "$_next"
+            ;;
+        route_to_diagnoser)
+            log "operational_route_to_diagnoser" "hint=$_hint"
+            agent_runner_reaped_failure \
+                "operational_failed" \
+                "operational_failed" \
+                "operational skill returned non-succeeded verdict"
+            ;;
+        *)
+            printf 'UNEXPECTED_ACTION %s\n' "$_action"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# (1) subshell completed.
+if printf '%s' "$t59_out" | grep -q "subshell_done"; then
+    pass "#3507 T59 [operational failed] — dispatch subshell ran to completion"
+else
+    fail "#3507 T59 [operational failed] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t59_out" | tail -c 600)"
+fi
+
+# (2) transition logged route_to_diagnoser.
+if printf '%s' "$t59_out" | grep -q "operational_transition_shim_done.*route_to_diagnoser"; then
+    pass "#3507 T59 [operational failed] — transition_shim_done logged route_to_diagnoser"
+else
+    fail "#3507 T59 [operational failed] — transition_shim_done logged route_to_diagnoser" \
+         "out: $(printf '%s' "$t59_out" | tail -c 600)"
+fi
+
+# (3) agent_runner_reaped_failure called with operational_failed.
+if [[ -f "$t59_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE operational_failed" "$t59_state_dir/reaped-log.txt"; then
+    pass "#3507 T59 [operational failed] — agent_runner_reaped_failure called with operational_failed"
+else
+    fail "#3507 T59 [operational failed] — agent_runner_reaped_failure called with operational_failed" \
+         "reaped-log: $(cat "$t59_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# (4) advance_phase NOT called on failure path.
+if [[ ! -f "$t59_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t59_state_dir/advance-log.txt"; then
+    pass "#3507 T59 [operational failed] — advance_phase not called on route_to_diagnoser"
+else
+    fail "#3507 T59 [operational failed] — advance_phase not called on route_to_diagnoser" \
+         "advance-log: $(cat "$t59_state_dir/advance-log.txt" 2>/dev/null)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
