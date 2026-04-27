@@ -3657,8 +3657,16 @@ advance_phase() {
     _next="$1"
     _status="${2:-}"
     if [[ -n "$_status" ]]; then
+        # #3574 — terminal-status writes also stamp ended_at so monitoring
+        # never sees rows with status IN (failed,succeeded,...) AND ended_at IS NULL.
+        # The COALESCE is idempotent: a prior mark_ended call (or a daemon write)
+        # already set ended_at; COALESCE(non-NULL, now()) is a no-op.
+        # Only the 2-arg form (terminal write) includes ended_at — the 1-arg
+        # form (phase advance without status change) does not, to avoid
+        # prematurely closing non-terminal transitions.
         db_exec "UPDATE dispatcher.agents
-                    SET phase = '$_next', status = '$_status'
+                    SET phase = '$_next', status = '$_status',
+                        ended_at = COALESCE(ended_at, now())
                   WHERE agent_id = '$AGENT_ID';"
     else
         db_exec "UPDATE dispatcher.agents
@@ -3921,7 +3929,8 @@ ON CONFLICT (agent_id, phase, attempt) DO UPDATE
 EOF
     set -e
     db_exec "UPDATE dispatcher.agents
-                SET phase = '$_term_phase', status = 'failed'
+                SET phase = '$_term_phase', status = 'failed',
+                    ended_at = COALESCE(ended_at, now())
               WHERE agent_id = '$AGENT_ID';"
     log "phase_advanced" "next_phase=$_term_phase" "status=failed"
     # #3494 — exit unconditionally after marking the agent terminal in
@@ -4728,12 +4737,15 @@ while true; do
 
     # Issue #3166: observe external-terminal status written by a diagnoser,
     # supervisor, or killswitch before running the next phase handler.
-    # If terminal, exit 0 immediately — do NOT call mark_ended, because the
-    # external writer already owns the row's ended_at/status and we must not
-    # race it.  Same semantics as _check_killswitch_and_abort.
+    # If terminal, call mark_ended (idempotent: WHERE ended_at IS NULL) then
+    # exit 0. The external writer may have already stamped ended_at — the
+    # COALESCE/WHERE guard in mark_ended makes the call a safe no-op in that
+    # case. #3574 added mark_ended here to prevent zombie rows where the
+    # external writer set status but left ended_at NULL.
     _current_status=$(read_agent_status)
     if is_terminal_status "$_current_status"; then
         log "external_terminal_observed" "status=$_current_status" "after_phase=$_current"
+        mark_ended
         exit 0
     fi
 
