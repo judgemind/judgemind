@@ -2378,6 +2378,35 @@ handle_push_and_pr() {
         log "push_and_pr_summary_output_missing" "path=$_summary_path"
     fi
 
+    # ── #3333: WIP-title + empty-title/body guard — runs BEFORE the push
+    # so a bad summary.json never orphans a branch on origin. Equivalent
+    # to daemon.py's pr_title.lstrip().upper().startswith("WIP") check.
+    # Order: validate → (amend) → rebase → push → PR-create.
+    _has_title="false"
+    _has_body="false"
+    _title_is_wip="false"
+    [[ -n "$_pr_title" ]] && _has_title="true"
+    [[ -n "$_pr_body_md" ]] && _has_body="true"
+    # Portable bash 3.2: strip leading whitespace, upper-case, then grep
+    # for a WIP prefix.  ``printf | sed | tr | grep`` avoids bash-only
+    # ``${var^^}`` and ``[[ =~ ]]`` Unicode edge-cases.
+    _pr_title_trimmed=$(printf '%s' "$_pr_title" | sed 's/^[[:space:]]*//')
+    _pr_title_upper=$(printf '%s' "$_pr_title_trimmed" | tr '[:lower:]' '[:upper:]')
+    if printf '%s' "$_pr_title_upper" | grep -qE '^WIP'; then
+        _title_is_wip="true"
+    fi
+    if [[ "$_has_title" == "false" || "$_has_body" == "false" || "$_title_is_wip" == "true" ]]; then
+        _pr_title_preview=$(printf '%s' "$_pr_title" | head -c 80)
+        log "push_and_pr_summary_output_incomplete" \
+            "has_title=$_has_title" \
+            "has_body=$_has_body" \
+            "title_is_wip=$_title_is_wip" \
+            "pr_title_preview=$_pr_title_preview"
+        printf '{"no_op": false, "summary_output_incomplete": true, "title_is_wip": %s, "has_title": %s, "has_body": %s}' \
+            "$_title_is_wip" "$_has_title" "$_has_body"
+        return 0
+    fi
+
     # ── #3176: amend ralph's placeholder commit with summary's
     # conventional-commits message. Mirrors the daemon's
     # ``git commit --amend -F <file>`` — see daemon.py ~L10914.
@@ -2574,33 +2603,22 @@ Closes #${ISSUE_NUMBER}
         fi
     fi
 
-    # ── #3176: open the PR with summary's pr_title + pr_body_md when
-    # available. Fall back to ``--fill`` so a missing summary still
-    # produces a PR (degraded but not abandoned).
+    # ── #3176/#3333: open the PR with summary's pr_title + pr_body_md.
+    # The validation above guarantees both are non-empty and non-WIP,
+    # so we no longer need a ``--fill`` fallback — that branch is gone.
     log "push_and_pr_pr_create_begin"
     _pr_body_path="$AGENT_WORKSPACE/pr_body.md"
     set +e
-    if [[ -n "$_pr_title" && -n "$_pr_body_md" ]]; then
-        printf '%s' "$_pr_body_md" > "$_pr_body_path"
-        gh pr create \
-            --repo judgemind/judgemind \
-            --base main \
-            --head "$BRANCH_NAME" \
-            --title "$_pr_title" \
-            --body-file "$_pr_body_path" \
-            > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
-            2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
-        _pr_rc=$?
-    else
-        gh pr create \
-            --repo judgemind/judgemind \
-            --base main \
-            --head "$BRANCH_NAME" \
-            --fill \
-            > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
-            2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
-        _pr_rc=$?
-    fi
+    printf '%s' "$_pr_body_md" > "$_pr_body_path"
+    gh pr create \
+        --repo judgemind/judgemind \
+        --base main \
+        --head "$BRANCH_NAME" \
+        --title "$_pr_title" \
+        --body-file "$_pr_body_path" \
+        > "$AGENT_WORKSPACE/gh-pr-create.stdout.log" \
+        2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
+    _pr_rc=$?
     set -e
     log "push_and_pr_pr_create_done" "exit_code=$_pr_rc"
     if [[ "$_pr_rc" -ne 0 ]]; then
@@ -5066,6 +5084,12 @@ while true; do
                                 "push_and_pr_no_unmerged_files" \
                                 "push_and_pr_no_unmerged_files" \
                                 "push_and_pr rebase failed with no unmerged files"
+                            ;;
+                        summary_output_incomplete)
+                            agent_runner_reaped_failure \
+                                "summary_output_incomplete" \
+                                "summary_output_incomplete" \
+                                "summary skill output incomplete or WIP-prefixed title"
                             ;;
                         *)
                             log "push_and_pr_route_unrecognized_hint" "hint=$_hint"

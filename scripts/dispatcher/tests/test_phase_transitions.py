@@ -806,6 +806,71 @@ class TestTransitionFromPushAndPrNoUnmergedFiles:
 
 
 # --------------------------------------------------------------------------
+# transition_from_push_and_pr — summary_output_incomplete branch (#3333)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromPushAndPrSummaryOutputIncomplete:
+    """#3333: push_and_pr detects incomplete summary output or WIP-prefixed
+    title → route to diagnoser with FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE."""
+
+    def test_summary_output_incomplete_routes_to_diagnoser(self) -> None:
+        result = pt.transition_from_push_and_pr(
+            {
+                "no_op": False,
+                "summary_output_incomplete": True,
+                "title_is_wip": True,
+                "has_title": True,
+                "has_body": True,
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE
+        assert result.context["title_is_wip"] is True
+        assert result.context["has_title"] is True
+        assert result.context["has_body"] is True
+        assert result.context["source_phase"] == "push_and_pr"
+
+    def test_summary_output_incomplete_missing_title_routes_to_diagnoser(
+        self,
+    ) -> None:
+        result = pt.transition_from_push_and_pr(
+            {
+                "no_op": False,
+                "summary_output_incomplete": True,
+                "title_is_wip": False,
+                "has_title": False,
+                "has_body": True,
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE
+        assert result.context["has_title"] is False
+        assert result.context["has_body"] is True
+        assert result.context["title_is_wip"] is False
+
+    def test_summary_output_incomplete_takes_precedence_over_rebase_failed(
+        self,
+    ) -> None:
+        # Defensive: both flags set (shouldn't co-occur because validation runs
+        # before the push, but if they do, summary_output_incomplete wins so
+        # no orphan branch interpretation confusion arises).
+        result = pt.transition_from_push_and_pr(
+            {
+                "no_op": False,
+                "summary_output_incomplete": True,
+                "title_is_wip": True,
+                "has_title": True,
+                "has_body": True,
+                "rebase_failed": True,
+                "conflict_files": ["some/file.py"],
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_SUMMARY_OUTPUT_INCOMPLETE
+
+
+# --------------------------------------------------------------------------
 # transition_from_ralph — no_unmerged_files branch (#3465)
 # --------------------------------------------------------------------------
 
