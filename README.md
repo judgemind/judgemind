@@ -70,3 +70,11 @@ Apache 2.0. See [LICENSE](LICENSE).
 ## Why This Exists
 
 Solo practitioners, public defenders, legal aid attorneys, law students, and self-represented litigants deserve access to the same litigation intelligence tools that large firms take for granted. Judgemind makes that free.
+
+## 💰 Bounty Contribution
+
+- **Task:** perf(api): getMultipleJudgeAnalytics issues N×4 queries instead of 4 batched que
+- **Reward:** $1
+- **Source:** GitHub-Paid
+- **Date:** 2026-04-28
+
