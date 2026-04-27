@@ -4103,8 +4103,9 @@ fi
 #         advance to terminal ``fix_ci_failed``.
 #   T46 — PATCHED with empty commit_message → treated as BLOCKED,
 #         ``fix_ci_missing_commit_message`` event, terminal.
-#   T47 — PATCHED with stub that stages nothing (empty diff) → treated
-#         as BLOCKED, ``fix_ci_patch_empty`` event, terminal.
+#   T47 — PATCHED with stub that stages nothing (empty diff) → advance
+#         to awaiting_ci, ``fix_ci_patch_empty_already_applied`` event
+#         (#3580 — pre-#3580 this was terminal fix_ci_failed/patch_empty).
 #   T48 — PATCHED but ``git push`` fails → ``fix_ci_git_push_failed``
 #         event, terminal.
 #   T49 — FLAKY verdict → advance to awaiting_ci, no commit attempted.
@@ -4429,48 +4430,101 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T47: PATCHED but ``git diff --cached --quiet`` returns 0
-# (no staged changes) → treated as BLOCKED via fix_ci_patch_empty event.
+# Test T47: #3580 — PATCHED but ``git diff --cached --quiet`` returns 0
+# (no staged changes) → advance to awaiting_ci, NOT terminal-fail.
+#
+# Empty-staged-diff after a PATCHED verdict is normal when the fix is
+# already in the rebased baseline (e.g. a sibling PR landed it first, or
+# this is an idempotent retry). The skill's PATCHED verdict was correct
+# in concluding "the fix is in"; the agent-runner's job is to advance to
+# awaiting_ci so the next supervisor tick observes the now-green CI
+# rollup. The previous behavior (terminal fix_ci_failed/patch_empty)
+# left the issue stuck in a cooldown loop forever — the daemon would
+# re-claim, the rebase would still pull in the fix, and the diff would
+# still be empty.
+#
+# Log event renamed: fix_ci_patch_empty → fix_ci_patch_empty_already_applied
+# so CloudWatch dashboards can distinguish "fix already in baseline,
+# advancing" from a real failure class.
+#
+# This test asserts the POST-fix behavior. It MUST fail against the
+# pre-#3580 entrypoint where the empty-diff branch reaped the agent as
+# fix_ci_failed.
 # ══════════════════════════════════════════════════════════════════════════
 
 t47_json='{"verdict": "PATCHED", "commit_message": "fix(area): thing — CI (#9999)", "changed_files": []}'
 run_fix_ci_test "t47" "$t47_json" GIT_DIFF_CACHED_EXIT=0
 
 if [[ "$FIXCI_TEST_RC" -eq 0 ]]; then
-    pass "#3245 T47 — handle_fix_ci exits 0 on PATCHED+empty-diff"
+    pass "#3580 T47 — handle_fix_ci exits 0 on PATCHED+empty-diff"
 else
-    fail "#3245 T47 — handle_fix_ci exits 0 on PATCHED+empty-diff" \
+    fail "#3580 T47 — handle_fix_ci exits 0 on PATCHED+empty-diff" \
          "rc=$FIXCI_TEST_RC, output: $FIXCI_TEST_OUT"
 fi
 
-# Diagnostic log event emitted.
-if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patch_empty"; then
-    pass "#3245 T47 — fix_ci_patch_empty log event emitted"
+# New log event for the "already applied" sub-case.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patch_empty_already_applied"; then
+    pass "#3580 T47 — fix_ci_patch_empty_already_applied log event emitted"
 else
-    fail "#3245 T47 — fix_ci_patch_empty log event emitted" \
+    fail "#3580 T47 — fix_ci_patch_empty_already_applied log event emitted" \
          "output: $FIXCI_TEST_OUT"
 fi
 
-# git add ran (the stub succeeds), but no commit / push.
+# git add ran (the stub succeeds), but no commit / push (nothing to commit).
 if grep -qE "CALL .*\\badd\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3245 T47 — git add ran (before empty-diff detection)"
+    pass "#3580 T47 — git add ran (before empty-diff detection)"
 else
-    fail "#3245 T47 — git add ran (before empty-diff detection)" \
+    fail "#3580 T47 — git add ran (before empty-diff detection)" \
          "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 if ! grep -qE "CALL .*\\bcommit\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3245 T47 — no git commit attempted after empty-diff detection"
+    pass "#3580 T47 — no git commit attempted on empty-diff (nothing to commit)"
 else
-    fail "#3245 T47 — no git commit attempted after empty-diff detection" \
+    fail "#3580 T47 — no git commit attempted on empty-diff (nothing to commit)" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+if ! grep -qE "CALL .*\\bpush\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3580 T47 — no git push attempted on empty-diff (nothing to push)"
+else
+    fail "#3580 T47 — no git push attempted on empty-diff (nothing to push)" \
          "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
-# Terminal fix_ci_failed.
-if grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
-    pass "#3245 T47 — advances to fix_ci_failed terminal on empty-diff"
+# CRITICAL: must advance to awaiting_ci (let next supervisor tick observe
+# the now-green rollup), NOT terminal-fail to fix_ci_failed.
+if grep -q "SET phase = 'awaiting_ci'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3580 T47 — advances to awaiting_ci on empty-diff (fix already in baseline)"
 else
-    fail "#3245 T47 — advances to fix_ci_failed terminal on empty-diff" \
+    fail "#3580 T47 — advances to awaiting_ci on empty-diff (fix already in baseline)" \
          "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# Negative: must NOT have terminal-failed to fix_ci_failed.
+if ! grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3580 T47 — does NOT advance to fix_ci_failed on empty-diff"
+else
+    fail "#3580 T47 — does NOT advance to fix_ci_failed on empty-diff" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# Negative: the OLD log event name (used for terminal failure) must NOT
+# appear — downstream telemetry consumers split on the new name.
+if ! printf '%s' "$FIXCI_TEST_OUT" | grep -qE '\bfix_ci_patch_empty\b' \
+    || printf '%s' "$FIXCI_TEST_OUT" | grep -q 'fix_ci_patch_empty_already_applied'; then
+    # Either the bare event isn't there at all, or it's only the longer
+    # already-applied variant (which contains the old token as a prefix).
+    # Use a stricter check: confirm the bare event with no suffix.
+    if ! printf '%s' "$FIXCI_TEST_OUT" \
+        | grep -E 'fix_ci_patch_empty([^_]|$)' \
+        | grep -qv 'fix_ci_patch_empty_already_applied'; then
+        pass "#3580 T47 — old fix_ci_patch_empty terminal event NOT emitted"
+    else
+        fail "#3580 T47 — old fix_ci_patch_empty terminal event NOT emitted" \
+             "output: $FIXCI_TEST_OUT"
+    fi
+else
+    fail "#3580 T47 — old fix_ci_patch_empty terminal event NOT emitted" \
+         "output: $FIXCI_TEST_OUT"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
