@@ -552,7 +552,7 @@ class SDTentativeRulingsScraper(BaseScraper):
         event_bus: EventBus | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(config, archiver=archiver, event_bus=event_bus)
+        super().__init__(config, archiver=archiver, event_bus=event_bus, **kwargs)
         self._case_numbers = case_numbers or []
         self._proxy_url = proxy_url or os.environ.get("SD_PROXY_URL")
         self._headless = headless

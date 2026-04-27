@@ -213,6 +213,100 @@ class TestRunScrapersErrorHandling:
 
         assert exit_code == 1
 
+    def test_constructor_failure_does_not_cascade(self) -> None:
+        """A TypeError in scraper __init__ must NOT stop subsequent scrapers.
+
+        Regression guard for #3499: runner passed db_conn to scrapers whose
+        __init__ did not accept it, causing one TypeError to take down all
+        remaining scrapers in the same sweep.
+        """
+        ran: list[str] = []
+
+        class ConstructorFailingScraper(BaseScraper):
+            def __init__(self, **kwargs: object) -> None:
+                raise TypeError("__init__() got an unexpected keyword argument 'db_conn'")
+
+            def fetch_documents(self) -> list[CapturedDocument]:  # pragma: no cover
+                return []
+
+            def parse_document(self, doc: CapturedDocument) -> CapturedDocument:  # pragma: no cover
+                return doc
+
+        class TrackingStub(StubScraper):
+            def fetch_documents(self) -> list[CapturedDocument]:
+                ran.append(self.config.scraper_id)
+                return []
+
+        def config_fail(s3_bucket: str = "") -> ScraperConfig:
+            return ScraperConfig(
+                scraper_id="failing-ctor",
+                state="CA",
+                county="Fail",
+                court="Court",
+                target_urls=["https://example.com"],
+            )
+
+        def config_good(s3_bucket: str = "") -> ScraperConfig:
+            return ScraperConfig(
+                scraper_id="good-after-ctor",
+                state="CA",
+                county="Good",
+                court="Court",
+                target_urls=["https://example.com"],
+            )
+
+        entries = [
+            ("failing-ctor", ConstructorFailingScraper, config_fail),
+            ("good-after-ctor", TrackingStub, config_good),
+        ]
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner.record_scraper_exception"),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 1, "had_failure should propagate as exit code 1"
+        assert "good-after-ctor" in ran, "good scraper must still run after constructor failure"
+
+    def test_constructor_failure_records_exception(self) -> None:
+        """Constructor failure with db_conn wired must insert a failure row."""
+
+        class ConstructorFailingScraper(BaseScraper):
+            def __init__(self, **kwargs: object) -> None:
+                raise TypeError("db_conn not accepted")
+
+            def fetch_documents(self) -> list[CapturedDocument]:  # pragma: no cover
+                return []
+
+            def parse_document(self, doc: CapturedDocument) -> CapturedDocument:  # pragma: no cover
+                return doc
+
+        entries = [("ctor-fail-db", ConstructorFailingScraper, _stub_config)]
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            _patch_registry(entries),
+            patch("framework.runner._connect_db", return_value=mock_conn),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 1
+        insert_calls = [
+            c
+            for c in mock_cursor.execute.call_args_list
+            if len(c[0]) > 0 and "INSERT INTO scraper_runs" in str(c[0][0])
+        ]
+        assert len(insert_calls) == 1, "must record exactly one failure row for the ctor error"
+        params = insert_calls[0][0][1]
+        # scraper_id is the registry key, passed to record_scraper_exception
+        assert params[0] == "ctor-fail-db"
+        assert params[4] == "failure"  # status
+        assert "db_conn not accepted" in params[7]  # error_message
+
     def test_partial_failure_still_runs_remaining(self) -> None:
         ran = []
 

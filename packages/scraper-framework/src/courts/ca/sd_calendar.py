@@ -46,6 +46,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import httpx
 import structlog
@@ -490,8 +491,9 @@ class SDCalendarScraper(BaseScraper):
         archiver: S3Archiver | None = None,
         event_bus: EventBus | None = None,
         day_numbers: list[int] | None = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(config, archiver=archiver, event_bus=event_bus)
+        super().__init__(config, archiver=archiver, event_bus=event_bus, **kwargs)
         # Which day numbers (1-5) to fetch.  Default: [2] (tomorrow).
         self._day_numbers = day_numbers or [2]
 
