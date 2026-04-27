@@ -139,7 +139,7 @@ def _make_daemon(
 
 
 class TestCheckStuckAgentsExecutionModeFilter:
-    """The supervisor stuck-timeout scan must not flag ECS-mode agents.
+    """The supervisor stuck-timeout scan dispatches by execution_mode.
 
     Pre-#3158, the SELECT returned every ``status='running'`` row and
     applied the per-phase threshold uniformly. For a long ECS ralph
@@ -148,15 +148,33 @@ class TestCheckStuckAgentsExecutionModeFilter:
     :meth:`_resume_retrying_agent`) would silently fork the agent to
     subprocess mode on the next scheduler tick.
 
-    Post-#3158, the SELECT carries
-    ``COALESCE(a.execution_mode, 'subprocess') <> 'ecs'`` so ECS rows
-    never reach the per-phase timer. An ECS task that's actually hung
-    is caught by :meth:`_reap_completed_agent_tasks` when ECS itself
-    stops it.
+    #3158 added ``COALESCE(a.execution_mode, 'subprocess') <> 'ecs'``
+    to the SELECT so ECS rows never reached the per-phase timer at
+    all. The premise was that a hung ECS task would surface as a
+    STOPPED transition reaped by :meth:`_reap_completed_agent_tasks`,
+    but that requires the container to actually exit — which it does
+    not when the agent-runner's ``bash`` is alive while a child
+    network IO blocks indefinitely (observed 2026-04-27 on agent
+    ``2ff6e282`` for 16+ minutes, #3608).
+
+    #3656 reverses the SELECT-side exclusion and replaces it with a
+    Python-side dispatch in :meth:`_check_stuck_agents`. The SELECT
+    now returns ``execution_mode`` and ``agent_task_arn`` for every
+    running row; the Python loop calls ``_force_stop_ecs_task`` +
+    routes through ``_handle_agent_failure`` with category
+    :data:`FAILURE_CATEGORY_AGENT_SILENT_HANG` for ECS agents, and
+    keeps the legacy stuck_timeout + retry-marker path for
+    subprocess agents.
     """
 
-    def test_select_filters_execution_mode_ecs(self, tmp_path: Path) -> None:
-        """The SELECT excludes ``execution_mode = 'ecs'`` via COALESCE."""
+    def test_select_returns_execution_mode_and_task_arn(self, tmp_path: Path) -> None:
+        """The SELECT returns execution_mode + agent_task_arn for branching.
+
+        Issue #3656: pre-#3158 the SELECT filtered ECS out at the SQL
+        layer; post-#3656 it returns every running row with the two
+        extra columns the Python branch needs to dispatch
+        (subprocess → stuck_timeout, ECS → agent_silent_hang).
+        """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [[]]
 
@@ -172,8 +190,23 @@ class TestCheckStuckAgentsExecutionModeFilter:
         ]
         assert selects, "expected _check_stuck_agents to issue the SELECT"
         sql, _params = selects[0]
-        assert "COALESCE(a.execution_mode, 'subprocess') <> 'ecs'" in sql, (
-            "_check_stuck_agents must filter out execution_mode='ecs' rows. "
+        # The SELECT must return both columns the Python dispatch
+        # branch needs to route ECS rows to the silent-hang reaper.
+        assert "execution_mode" in sql, (
+            "_check_stuck_agents SELECT must return execution_mode "
+            "for the Python-side dispatch branch (#3656). "
+            "Actual SQL: " + sql
+        )
+        assert "agent_task_arn" in sql, (
+            "_check_stuck_agents SELECT must return agent_task_arn "
+            "for ecs:StopTask delivery (#3656). "
+            "Actual SQL: " + sql
+        )
+        # The pre-#3656 hard SQL exclusion is gone — the dispatch
+        # happens in Python instead.
+        assert "<> 'ecs'" not in sql, (
+            "_check_stuck_agents SELECT must NOT exclude execution_mode='ecs' "
+            "in the WHERE clause (#3656 reaper requires ECS rows in candidates). "
             "Actual SQL: " + sql
         )
 

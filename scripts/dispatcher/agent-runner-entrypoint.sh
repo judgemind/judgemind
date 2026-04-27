@@ -2408,12 +2408,22 @@ handle_push_and_pr() {
     # and the agent terminates without opening an orphan PR.
     log "push_and_pr_fetch_main_begin"
     set +e
-    git -C "$REPO_ROOT" fetch origin main \
+    # #3656: bound network IO at NETWORK_TIMEOUT_SECONDS — a hung
+    # ``git fetch`` would otherwise pin the cap slot indefinitely.
+    # ``timeout`` exits 124 on SIGTERM-after-timeout; the existing
+    # best-effort fetch-failure path (logged + fall through to push)
+    # handles 124 cleanly without a separate envelope branch.
+    timeout "$NETWORK_TIMEOUT_SECONDS" \
+        git -C "$REPO_ROOT" fetch origin main \
         > "$AGENT_WORKSPACE/git-fetch-main.stdout.log" \
         2> "$AGENT_WORKSPACE/git-fetch-main.stderr.log"
     _fetch_rc=$?
     set -e
     log "push_and_pr_fetch_main_done" "exit_code=$_fetch_rc"
+    if [[ "$_fetch_rc" -eq 124 ]]; then
+        log "push_and_pr_fetch_main_timeout" \
+            "elapsed_seconds=$NETWORK_TIMEOUT_SECONDS"
+    fi
     if [[ "$_fetch_rc" -eq 0 ]]; then
         log "push_and_pr_rebase_begin"
         set +e
@@ -2566,12 +2576,33 @@ handle_push_and_pr() {
 
     log "push_and_pr_push_begin" "branch=$BRANCH_NAME"
     set +e
-    git -C "$REPO_ROOT" push -u origin "$BRANCH_NAME" \
+    # #3656: bound ``git push`` network IO at NETWORK_TIMEOUT_SECONDS.
+    # Pre-#3656 the bare push could hang indefinitely on kernel TCP
+    # retry of an already-broken socket — observed for 16+ minutes on
+    # agent 2ff6e282 (#3608) before manual ``aws ecs stop-task``. The
+    # ``timeout`` wrapper guarantees ``handle_push_and_pr`` always
+    # returns within NETWORK_TIMEOUT_SECONDS + a few seconds of
+    # bookkeeping, freeing the cap slot for a fresh agent.
+    timeout "$NETWORK_TIMEOUT_SECONDS" \
+        git -C "$REPO_ROOT" push -u origin "$BRANCH_NAME" \
         > "$AGENT_WORKSPACE/git-push.stdout.log" \
         2> "$AGENT_WORKSPACE/git-push.stderr.log"
     _push_rc=$?
     set -e
     log "push_and_pr_push_done" "exit_code=$_push_rc"
+    if [[ "$_push_rc" -eq 124 ]]; then
+        # #3656: timeout fired — emit a distinct envelope so the
+        # diagnoser can differentiate a hung push from a non-zero exit
+        # (PAT scope, pre-push hook, etc.). The ``reason=push_timeout``
+        # field flows through ``transition_from_push_and_pr`` into the
+        # ``dispatcher.failures`` row so CloudWatch Logs Insights
+        # queries can grep for ``push_timeout`` to count incidents.
+        log "push_and_pr_push_timeout" \
+            "elapsed_seconds=$NETWORK_TIMEOUT_SECONDS" \
+            "branch=$BRANCH_NAME"
+        printf '{"no_op": false, "push_failed": true, "reason": "push_timeout"}'
+        return 0
+    fi
     if [[ "$_push_rc" -ne 0 ]]; then
         log "push_and_pr_push_failed" "exit_code=$_push_rc"
         # Emit a minimal failure envelope; the transition shim will
@@ -2617,9 +2648,14 @@ Closes #${ISSUE_NUMBER}
     log "push_and_pr_pr_create_begin"
     _pr_body_path="$AGENT_WORKSPACE/pr_body.md"
     set +e
+    # #3656: bound ``gh pr create`` network IO at NETWORK_TIMEOUT_SECONDS
+    # — same hung-network defense as the ``git push`` site above. A
+    # GitHub API outage / token-rotation hang on ``gh pr create`` would
+    # otherwise pin the cap slot indefinitely.
     if [[ -n "$_pr_title" && -n "$_pr_body_md" ]]; then
         printf '%s' "$_pr_body_md" > "$_pr_body_path"
-        gh pr create \
+        timeout "$NETWORK_TIMEOUT_SECONDS" \
+            gh pr create \
             --repo judgemind/judgemind \
             --base main \
             --head "$BRANCH_NAME" \
@@ -2629,7 +2665,8 @@ Closes #${ISSUE_NUMBER}
             2> "$AGENT_WORKSPACE/gh-pr-create.stderr.log"
         _pr_rc=$?
     else
-        gh pr create \
+        timeout "$NETWORK_TIMEOUT_SECONDS" \
+            gh pr create \
             --repo judgemind/judgemind \
             --base main \
             --head "$BRANCH_NAME" \
@@ -2640,6 +2677,15 @@ Closes #${ISSUE_NUMBER}
     fi
     set -e
     log "push_and_pr_pr_create_done" "exit_code=$_pr_rc"
+    if [[ "$_pr_rc" -eq 124 ]]; then
+        # #3656: timeout fired during ``gh pr create``. Emit a distinct
+        # envelope (``reason=pr_create_timeout``) so the diagnoser can
+        # differentiate a hung create from a non-zero exit.
+        log "push_and_pr_pr_create_timeout" \
+            "elapsed_seconds=$NETWORK_TIMEOUT_SECONDS"
+        printf '{"no_op": false, "pr_create_failed": true, "reason": "pr_create_timeout"}'
+        return 0
+    fi
     if [[ "$_pr_rc" -ne 0 ]]; then
         log "push_and_pr_pr_create_failed" "exit_code=$_pr_rc"
         printf '{"no_op": false, "pr_create_failed": true}'
@@ -3776,6 +3822,21 @@ FIX_CONFLICT_MAX_ATTEMPTS="${AGENT_RUNNER_FIX_CONFLICT_MAX_ATTEMPTS:-2}"
 # protection rejection. Matches ``STALE_ROLLUP_STDERR_MARKER`` in
 # daemon.py.
 STALE_ROLLUP_MARKER="base branch policy prohibits the merge"
+
+# #3656: hard timeout (seconds) on network-blocking git/gh operations
+# inside ``handle_push_and_pr`` — ``git fetch origin main``, ``git
+# push``, and ``gh pr create``. Wraps each call in ``timeout`` so a
+# hung network IO does not silently consume an ECS cap slot for hours.
+# The agent-runner container's ``bash`` keeps running while a child
+# ``git push`` blocks indefinitely on auth-retry / network drop, so
+# Fargate's "container alive" liveness signal is not enough — every
+# observed hang in 2026-04-27 (#3608 / agent 2ff6e282) was the daemon
+# silently waiting on the kernel's TCP retry of an already-broken
+# socket. Default 300s leaves plenty of headroom for a healthy push +
+# PR-create round trip while bounding the worst case to 5 minutes.
+# Tests override to 1 (or use a stub ``timeout`` shim) to drive the
+# 124-exit branch deterministically.
+NETWORK_TIMEOUT_SECONDS="${AGENT_RUNNER_NETWORK_TIMEOUT_SECONDS:-300}"
 
 # Deploy workflow display names we watch on the merge SHA. Must match
 # the ``name:`` field in each ``.github/workflows/`` file. Mirrors the
