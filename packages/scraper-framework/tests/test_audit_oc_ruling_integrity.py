@@ -23,11 +23,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-# Import will fail until the script exists — skip the entire module if so.
-try:
-    import audit_oc_ruling_integrity as audit
-except ImportError:
-    pytest.skip("audit_oc_ruling_integrity.py not yet created", allow_module_level=True)
+import audit_oc_ruling_integrity as audit  # noqa: E402, I001
 
 
 # ---------------------------------------------------------------------------

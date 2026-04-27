@@ -762,8 +762,7 @@ class TestFixtureLoading:
     def test_load_and_score_real_fixtures(self) -> None:
         """Integration test: load real fixtures and score a perfect extraction."""
         fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
-        if not fixtures_dir.exists():
-            pytest.skip("Enrichment fixtures not found")
+        assert fixtures_dir.exists(), f"Enrichment fixtures missing: {fixtures_dir}"
 
         # Import the CLI module's load function
         sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
@@ -823,8 +822,7 @@ class TestFixtureLoading:
     def test_load_fixtures_county_filter(self) -> None:
         """Test that county filter works."""
         fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
-        if not fixtures_dir.exists():
-            pytest.skip("Enrichment fixtures not found")
+        assert fixtures_dir.exists(), f"Enrichment fixtures missing: {fixtures_dir}"
 
         sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
         from eval_enrichment import load_fixtures
@@ -840,8 +838,7 @@ class TestFixtureLoading:
     def test_load_fixtures_includes_acceptable_alternatives(self) -> None:
         """Verify that acceptable_alternatives are loaded from fixture JSON."""
         fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
-        if not fixtures_dir.exists():
-            pytest.skip("Enrichment fixtures not found")
+        assert fixtures_dir.exists(), f"Enrichment fixtures missing: {fixtures_dir}"
 
         sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
         from eval_enrichment import load_fixtures
@@ -854,8 +851,7 @@ class TestFixtureLoading:
     def test_load_fixtures_includes_case_title_in_text(self) -> None:
         """Verify that case_title_in_text flag is loaded from fixture JSON."""
         fixtures_dir = Path(__file__).resolve().parent / "fixtures" / "enrichment"
-        if not fixtures_dir.exists():
-            pytest.skip("Enrichment fixtures not found")
+        assert fixtures_dir.exists(), f"Enrichment fixtures missing: {fixtures_dir}"
 
         sys.path.insert(0, str(SCRIPTS_EVAL_DIR))
         from eval_enrichment import load_fixtures
@@ -944,8 +940,7 @@ class TestDefaultFixturesPathValidation:
         """DEFAULT_FIXTURES_DIR must contain at least MIN_TOTAL_FIXTURES fixtures."""
         from eval_enrichment import DEFAULT_FIXTURES_DIR, MIN_TOTAL_FIXTURES, load_fixtures
 
-        if not DEFAULT_FIXTURES_DIR.is_dir():
-            pytest.skip("DEFAULT_FIXTURES_DIR does not exist or is not a directory")
+        assert DEFAULT_FIXTURES_DIR.is_dir(), f"Enrichment fixtures missing: {DEFAULT_FIXTURES_DIR}"
 
         fixtures = load_fixtures(DEFAULT_FIXTURES_DIR)
         assert len(fixtures) >= MIN_TOTAL_FIXTURES, (
@@ -958,8 +953,7 @@ class TestDefaultFixturesPathValidation:
         """DEFAULT_FIXTURES_DIR must contain county subdirectories."""
         from eval_enrichment import DEFAULT_FIXTURES_DIR
 
-        if not DEFAULT_FIXTURES_DIR.is_dir():
-            pytest.skip("DEFAULT_FIXTURES_DIR does not exist or is not a directory")
+        assert DEFAULT_FIXTURES_DIR.is_dir(), f"Enrichment fixtures missing: {DEFAULT_FIXTURES_DIR}"
 
         county_dirs = [d.name for d in sorted(DEFAULT_FIXTURES_DIR.iterdir()) if d.is_dir()]
         assert len(county_dirs) >= 5, (
