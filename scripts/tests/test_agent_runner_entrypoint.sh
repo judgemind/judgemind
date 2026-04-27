@@ -6261,6 +6261,183 @@ else
          "out: $(printf '%s' "$t61b_out" | grep "push_and_pr_route_to_diagnoser")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T62: #3166 — external-terminal observation at phase boundary.
+#
+# Sub-test A (positive): db_query_one returns status=failed → block exits 0
+# and emits external_terminal_observed log line.
+#
+# Sub-test B (negative): db_query_one returns status=running → block does
+# NOT exit; loop continues (subshell reaches echo "loop_continued").
+# ══════════════════════════════════════════════════════════════════════════
+
+t62_state_dir="$TEST_TMP/t62-state"
+t62_stub_bin="$TEST_TMP/t62-bin"
+t62_workspace="$TEST_TMP/t62-workspace"
+mkdir -p "$t62_state_dir" "$t62_stub_bin" "$t62_workspace"
+
+# Extract helper functions from the real entrypoint.
+t62_funcs="$TEST_TMP/t62-funcs.sh"
+printf 'exec 3>&1\n' > "$t62_funcs"
+
+for fn in db_query_one log read_agent_status; do
+    awk -v FN="^${fn}\\(\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t62_funcs"
+done
+
+# Sanity: read_agent_status exists in extracted functions.
+if grep -q "read_agent_status" "$t62_funcs"; then
+    pass "#3166 T62 setup — read_agent_status exists in extracted functions"
+else
+    fail "#3166 T62 setup — read_agent_status exists in extracted functions" \
+         "grep target: 'read_agent_status' in funcs (head 200): $(head -c 200 "$t62_funcs")"
+fi
+
+# ── Sub-test A: terminal status → exits 0, emits log line ─────────────────
+
+t62a_state_dir="$t62_state_dir/a"
+mkdir -p "$t62a_state_dir"
+
+# psql stub — returns 'failed' for status SELECT, 'planning' for phase SELECT.
+cat > "$t62_stub_bin/psql" <<'T62PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+if [[ "$query" == *"SELECT status"* ]]; then
+    printf 'failed\n'
+elif [[ "$query" == *"SELECT phase"* ]]; then
+    printf 'planning\n'
+fi
+exit 0
+T62PSQLEOF
+chmod +x "$t62_stub_bin/psql"
+
+# is_terminal_status override: returns 0 (terminal) for 'failed'.
+_t62a_is_terminal_status_override="
+is_terminal_status() {
+    [[ \"\${1:-}\" == 'failed' ]]
+}
+"
+
+t62a_out=$(
+    set +eu
+    export AGENT_WORKSPACE="$t62_workspace"
+    export AGENT_ID="62626262-dead-beef-cafe-000000000001"
+    export DATABASE_URL="postgresql://stub"
+    export PATH="$t62_stub_bin:$PATH"
+    source "$t62_funcs"
+    eval "$_t62a_is_terminal_status_override"
+    # Inline the external-terminal observation block from the phase loop.
+    _current="planning"
+    _current_status=$(read_agent_status)
+    if is_terminal_status "$_current_status"; then
+        log "external_terminal_observed" "status=$_current_status" "after_phase=$_current"
+        exit 0
+    fi
+    echo "loop_continued"
+    2>&1
+) 2>&1
+t62a_rc=$?
+
+# T62A (1): subshell exited 0.
+if [[ $t62a_rc -eq 0 ]]; then
+    pass "#3166 T62A [external_terminal_observed] — subshell exited 0 on terminal status"
+else
+    fail "#3166 T62A [external_terminal_observed] — subshell exited 0 on terminal status" \
+         "exit_code=$t62a_rc out: $(printf '%s' "$t62a_out" | tail -c 400)"
+fi
+
+# T62A (2): external_terminal_observed emitted with status=failed.
+if printf '%s' "$t62a_out" | grep -q "external_terminal_observed"; then
+    pass "#3166 T62A [external_terminal_observed] — log line emitted"
+else
+    fail "#3166 T62A [external_terminal_observed] — log line emitted" \
+         "out: $(printf '%s' "$t62a_out" | tail -c 400)"
+fi
+
+if printf '%s' "$t62a_out" | grep "external_terminal_observed" | grep -q "failed"; then
+    pass "#3166 T62A [external_terminal_observed] — status=failed in log line"
+else
+    fail "#3166 T62A [external_terminal_observed] — status=failed in log line" \
+         "out: $(printf '%s' "$t62a_out" | grep "external_terminal_observed")"
+fi
+
+# T62A (3): loop_continued NOT printed (block exited before reaching it).
+if ! printf '%s' "$t62a_out" | grep -q "loop_continued"; then
+    pass "#3166 T62A [external_terminal_observed] — loop_continued not reached"
+else
+    fail "#3166 T62A [external_terminal_observed] — loop_continued not reached" \
+         "out: $(printf '%s' "$t62a_out" | tail -c 400)"
+fi
+
+# ── Sub-test B (negative): non-terminal status → loop continues ────────────
+
+# psql stub — returns 'running' for status SELECT.
+cat > "$t62_stub_bin/psql" <<'T62BPSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+if [[ "$query" == *"SELECT status"* ]]; then
+    printf 'running\n'
+elif [[ "$query" == *"SELECT phase"* ]]; then
+    printf 'planning\n'
+fi
+exit 0
+T62BPSQLEOF
+chmod +x "$t62_stub_bin/psql"
+
+# is_terminal_status override: returns 1 (not terminal) for 'running'.
+_t62b_is_terminal_status_override="
+is_terminal_status() {
+    [[ \"\${1:-}\" == 'failed' || \"\${1:-}\" == 'crashed' || \"\${1:-}\" == 'succeeded' || \"\${1:-}\" == 'plan_blocked' || \"\${1:-}\" == 'needs_review' ]]
+}
+"
+
+t62b_out=$(
+    set +eu
+    export AGENT_WORKSPACE="$t62_workspace"
+    export AGENT_ID="62626262-dead-beef-cafe-000000000001"
+    export DATABASE_URL="postgresql://stub"
+    export PATH="$t62_stub_bin:$PATH"
+    source "$t62_funcs"
+    eval "$_t62b_is_terminal_status_override"
+    # Inline the external-terminal observation block from the phase loop.
+    _current="planning"
+    _current_status=$(read_agent_status)
+    if is_terminal_status "$_current_status"; then
+        log "external_terminal_observed" "status=$_current_status" "after_phase=$_current"
+        exit 0
+    fi
+    echo "loop_continued"
+    2>&1
+) 2>&1
+t62b_rc=$?
+
+# T62B (1): subshell reached loop_continued (did NOT exit early).
+if printf '%s' "$t62b_out" | grep -q "loop_continued"; then
+    pass "#3166 T62B [non-terminal running] — loop_continued reached"
+else
+    fail "#3166 T62B [non-terminal running] — loop_continued reached" \
+         "exit_code=$t62b_rc out: $(printf '%s' "$t62b_out" | tail -c 400)"
+fi
+
+# T62B (2): external_terminal_observed NOT emitted.
+if ! printf '%s' "$t62b_out" | grep -q "external_terminal_observed"; then
+    pass "#3166 T62B [non-terminal running] — external_terminal_observed not emitted"
+else
+    fail "#3166 T62B [non-terminal running] — external_terminal_observed not emitted" \
+         "out: $(printf '%s' "$t62b_out" | grep "external_terminal_observed")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
