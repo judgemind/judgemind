@@ -584,16 +584,31 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
             if scraper_id in sf_civil_scraper_ids and sf_dept_judge_map:
                 extra_kwargs["dept_judge_map"] = sf_dept_judge_map
 
-            scraper = scraper_cls(
-                config=config,
-                archiver=archiver,
-                event_bus=event_bus,
-                db_conn=db_conn,
-                **extra_kwargs,
-            )
-
-            run_start = time.monotonic()
             run_started_at = datetime.now(UTC)
+            run_start = time.monotonic()
+
+            try:
+                scraper = scraper_cls(
+                    config=config,
+                    archiver=archiver,
+                    event_bus=event_bus,
+                    db_conn=db_conn,
+                    **extra_kwargs,
+                )
+            except Exception as exc:
+                log.error("Scraper construction failed", error=str(exc))
+                if db_conn:
+                    record_scraper_exception(
+                        db_conn,
+                        scraper_id,
+                        config,
+                        run_started_at,
+                        str(exc),
+                        time.monotonic() - run_start,
+                        court_id_cache,
+                    )
+                had_failure = True
+                continue
 
             try:
                 health = scraper.run()

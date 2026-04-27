@@ -598,7 +598,7 @@ class SFCivilTentativeRulingsScraper(BaseScraper):
         proxy_url: str | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(config=config, archiver=archiver, event_bus=event_bus)
+        super().__init__(config=config, archiver=archiver, event_bus=event_bus, **kwargs)
         self._dept_judge_map: dict[str, str] = dept_judge_map or {}
         self._session_id: str | None = session_id
         self._headless: bool = headless
