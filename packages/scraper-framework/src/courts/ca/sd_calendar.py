@@ -703,14 +703,16 @@ def is_sd_calendar_html(text: str | None) -> bool:
     :mod:`scripts.rebuild_db`) through the same deterministic splitter as
     live ``ca-sd-calendar`` captures.
 
-    The check is a cheap substring test on the first 4 KB of the content
-    — the header ``<h1>CIVIL CALENDAR For ...</h1>`` appears early in every
-    SD calendar page.
+    The check is a cheap substring test on the first 64 KB of the content.
+    Production pages prepend an inline ``<style>`` block before the
+    ``<h1>CIVIL CALENDAR For …</h1>`` header, pushing it to ~21 KB on real
+    captures; 64 KB gives ample headroom while keeping the scan O(n) and
+    essentially free.
     """
     if not text:
         return False
     # Only scan the head of the document to keep the check cheap.
-    head = text[:4096]
+    head = text[:65536]
     return "CIVIL CALENDAR For" in head
 
 

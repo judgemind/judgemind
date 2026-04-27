@@ -1202,9 +1202,15 @@ class TestIsSDCalendarHtml:
     def test_returns_false_for_none(self) -> None:
         assert is_sd_calendar_html(None) is False
 
-    def test_matches_header_in_first_4kb(self) -> None:
-        """The detector only scans the first 4 KB — padding past 4 KB fails."""
-        padding = "x" * 5000
+    def test_is_sd_calendar_html_full(self) -> None:
+        """Production fixture with ~25 KB CSS preamble: header past 4 KB but within 64 KB."""
+        html = _load_html("sd_calendar_full.html")
+        assert is_sd_calendar_html(html) is True
+        assert len(_split_rulings(html)) >= 1
+
+    def test_rejects_header_past_64kb(self) -> None:
+        """The detector only scans the first 64 KB — padding past 64 KB fails."""
+        padding = "x" * 70000
         html = padding + "<h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>"
         assert is_sd_calendar_html(html) is False
 
