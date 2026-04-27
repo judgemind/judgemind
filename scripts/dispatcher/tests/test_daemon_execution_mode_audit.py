@@ -134,29 +134,51 @@ def _make_daemon(
 
 
 # --------------------------------------------------------------------------
-# Fix 1 — _check_stuck_agents filters execution_mode='ecs'
+# Fix 1 — _check_stuck_agents handles BOTH execution modes (#3656)
 # --------------------------------------------------------------------------
 
 
 class TestCheckStuckAgentsExecutionModeFilter:
-    """The supervisor stuck-timeout scan must not flag ECS-mode agents.
+    """The supervisor stuck-timeout scan must reap BOTH execution modes.
 
-    Pre-#3158, the SELECT returned every ``status='running'`` row and
-    applied the per-phase threshold uniformly. For a long ECS ralph
-    exceeding 15h the scan would flip the ECS row to ``crashed`` and
-    enqueue a retry marker — which (absent the #3158 fix in
-    :meth:`_resume_retrying_agent`) would silently fork the agent to
-    subprocess mode on the next scheduler tick.
+    History:
 
-    Post-#3158, the SELECT carries
-    ``COALESCE(a.execution_mode, 'subprocess') <> 'ecs'`` so ECS rows
-    never reach the per-phase timer. An ECS task that's actually hung
-    is caught by :meth:`_reap_completed_agent_tasks` when ECS itself
-    stops it.
+    * Pre-#3158, the SELECT returned every ``status='running'`` row and
+      applied the per-phase threshold uniformly. For a long ECS ralph
+      exceeding 15h the scan would flip the ECS row to ``crashed`` and
+      enqueue a retry marker — which (absent the #3158 fix in
+      :meth:`_resume_retrying_agent`) would silently fork the agent to
+      subprocess mode on the next scheduler tick.
+    * #3158 (2026-04-…) added
+      ``COALESCE(a.execution_mode, 'subprocess') <> 'ecs'`` so ECS rows
+      never reached the per-phase timer. The premise: a hung ECS task
+      would surface as a STOPPED transition reaped by
+      :meth:`_reap_completed_agent_tasks`.
+    * #3656 (2026-04-27) — the premise was wrong. ``bash`` keeps
+      running while a child ``git push`` blocks indefinitely, so ECS
+      never STOPs the task. Observed for 16+ minutes on agent
+      ``2ff6e282`` (#3608) before manual ``aws ecs stop-task``. The
+      fix removes the exclusion: the SELECT returns every
+      ``status='running'`` row plus ``execution_mode`` and
+      ``agent_task_arn``, and the Python loop branches by mode —
+      subprocess takes the legacy ``stuck_timeout`` + retry-marker
+      path; ECS takes a new ``ecs:StopTask`` + ``agent_silent_hang``
+      → diagnoser path. See
+      :class:`~dispatcher.tests.test_daemon_stuck_check_ecs_silent_hang.TestEcsSilentHangReaper`
+      for the ECS-branch coverage.
     """
 
-    def test_select_filters_execution_mode_ecs(self, tmp_path: Path) -> None:
-        """The SELECT excludes ``execution_mode = 'ecs'`` via COALESCE."""
+    def test_select_no_longer_filters_execution_mode_ecs(self, tmp_path: Path) -> None:
+        """The SELECT carries no ``<> 'ecs'`` clause (#3656).
+
+        Asserts both directions of the change at once:
+
+        * The legacy filter substring is absent — confirms #3158's
+          exclusion was actually removed.
+        * The new SELECT pulls ``execution_mode`` and
+          ``agent_task_arn`` so the Python loop has the data it needs
+          to dispatch the ECS branch.
+        """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [[]]
 
@@ -172,9 +194,20 @@ class TestCheckStuckAgentsExecutionModeFilter:
         ]
         assert selects, "expected _check_stuck_agents to issue the SELECT"
         sql, _params = selects[0]
-        assert "COALESCE(a.execution_mode, 'subprocess') <> 'ecs'" in sql, (
-            "_check_stuck_agents must filter out execution_mode='ecs' rows. "
-            "Actual SQL: " + sql
+        # #3656 — the legacy #3158 filter is gone.
+        assert "<> 'ecs'" not in sql, (
+            "#3656 removed the execution_mode='ecs' exclusion; the SELECT "
+            "should now reap ECS rows too. Actual SQL: " + sql
+        )
+        # The mode + arn columns are present so the Python loop can
+        # dispatch ECS rows to ``ecs:StopTask`` + ``_handle_agent_failure``.
+        assert "execution_mode" in sql, (
+            "#3656 — SELECT must return execution_mode for the Python "
+            "branch dispatch. Actual SQL: " + sql
+        )
+        assert "agent_task_arn" in sql, (
+            "#3656 — SELECT must return agent_task_arn so _force_stop_ecs_task "
+            "can issue the StopTask call. Actual SQL: " + sql
         )
 
     def test_subprocess_agent_still_flagged_on_timeout(self, tmp_path: Path) -> None:

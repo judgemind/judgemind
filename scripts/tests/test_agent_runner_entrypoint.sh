@@ -568,6 +568,26 @@ ln -sf "$(command -v python3)" "$STUB_BIN/python3"
 # date + sed + tr + printf + cut are shell built-ins or coreutils;
 # the test inherits whatever the parent shell has on PATH.
 
+# #3656: handle_push_and_pr now wraps git fetch / git push / gh pr create
+# in ``timeout NETWORK_TIMEOUT_SECONDS`` to bound silent-hang risk.
+# Most pre-#3656 tests (T50, T51, T52, T64, the integration paths) do
+# NOT exercise the 124-exit branch — they need a passthrough ``timeout``
+# binary so the wrapped commands run identically to the pre-#3656 path.
+# macOS does not ship coreutils' ``timeout(1)`` so ``command -v timeout``
+# returns nothing and a real PATH lookup would exit 127, breaking those
+# tests on operator laptops. This stub matches GNU ``timeout(1)``
+# semantics for the no-timer-fired path: drop the seconds arg, exec
+# the inner command transparently. Tests that DO exercise the 124
+# branch (T66, #3656) override this stub in their own per-test ``$_tbin``
+# directory. See #3656 for the full layered defense rationale.
+cat > "$STUB_BIN/timeout" <<'TIMEOUTEOF'
+#!/usr/bin/env bash
+# argv: <seconds> <inner-cmd> <inner-args...>
+shift  # discard the seconds arg
+exec "$@"
+TIMEOUTEOF
+chmod +x "$STUB_BIN/timeout"
+
 # ── Test fixtures ──────────────────────────────────────────────────────────
 
 setup_fixtures() {
@@ -6816,6 +6836,12 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t64_funcs"
 done
 
+# #3656: handle_push_and_pr now references NETWORK_TIMEOUT_SECONDS
+# (the ``timeout`` wrapper around git fetch / git push / gh pr create).
+# T64 doesn't drive the 124-exit branch — it just needs the constant
+# defined so the wrapped commands run normally under ``set -u``.
+grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t64_funcs"
+
 if grep -q "^handle_push_and_pr()" "$t64_funcs"; then
     pass "#3614 T64 setup — extracted handle_push_and_pr from entrypoint"
 else
@@ -6913,6 +6939,22 @@ case "$sub" in
 esac
 T64GITEOF
     chmod +x "$_tbin/git"
+
+    # #3656: passthrough ``timeout`` stub. handle_push_and_pr now wraps
+    # git fetch / git push / gh pr create in ``timeout NETWORK_TIMEOUT_SECONDS``.
+    # T64 does NOT exercise the 124-exit branch — it just needs a
+    # ``timeout`` binary on PATH that execs the inner command transparently
+    # so the test runs identically pre- and post-#3656. macOS does not
+    # ship coreutils' ``timeout(1)``, so a real ``timeout`` lookup would
+    # exit 127 and break the test on operator laptops. This stub matches
+    # GNU ``timeout`` semantics for the no-timer-fired path.
+    cat > "$_tbin/timeout" <<'T64TIMEOUTEOF'
+#!/usr/bin/env bash
+# argv: <seconds> <inner-cmd> <inner-args...>
+shift  # discard the seconds arg
+exec "$@"
+T64TIMEOUTEOF
+    chmod +x "$_tbin/timeout"
 
     # gh stub — log invocations, default exit 0.
     cat > "$_tbin/gh" <<'T64GHEOF'
@@ -7984,6 +8026,453 @@ if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
              "found $_t66c_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
     fi
 fi
+
+# Test T67: #3656 — network-blocking ops in handle_push_and_pr are wrapped
+# in ``timeout NETWORK_TIMEOUT_SECONDS``, and a 124 exit emits a
+# distinct ``*_timeout`` log + structured failure envelope.
+#
+# Pre-#3656 a hung ``git push`` (network drop, GitHub auth retry loop,
+# PAT mid-rotation) would block indefinitely — observed for 16+ minutes
+# on agent 2ff6e282 (#3608) before manual ``aws ecs stop-task``. The
+# fix wraps the call in ``timeout`` so a hang surfaces as a clean 124
+# exit routed through ``handle_push_and_pr``'s existing failure path.
+#
+# Three sub-tests cover the three wrapped sites (git push, gh pr create,
+# git fetch). Each uses a stub ``timeout`` shim that returns 124
+# unconditionally for the targeted call — emulating "outer process
+# killed inner subprocess after the timer fired" — so we can drive
+# the 124 branch deterministically without burning real wall-clock
+# seconds.
+#
+# Self-contained per the issue's "don't share fixture stubs across
+# test markers" rule. Marker churn for this fix:
+#   * Original PR #3661 used T65 — collided with the (merged-first)
+#     #3657 T65 for #3651's ralph_baseline empty-rebase test.
+#   * Re-dispatch initially used T66 with a ``T66_*`` env namespace —
+#     collided with the (merged-during-CI) #3666 T66 for #3662's
+#     post-fix_conflict re-rebase test.
+#   * Final marker T67 with a self-contained ``T67_*`` env namespace
+#     and its own ``run_t67_test`` driver. No shared fixture state
+#     with T64/T65/T66 — each test block owns its $_tbin per-test
+#     stub directory and env vars.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Extract handle_push_and_pr + minimal dependencies (mirrors T64's
+# extraction). We need ``log``, ``db_exec``, ``persist_phase_output``,
+# and ``handle_push_and_pr`` itself plus the ``NETWORK_TIMEOUT_SECONDS``
+# constant from the post-function config block.
+t67_funcs="$TEST_TMP/t67-funcs.sh"
+printf 'exec 3>&1\n' > "$t67_funcs"
+
+for fn in db_exec db_query_one log persist_phase_output \
+          handle_push_and_pr; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t67_funcs"
+done
+
+# Append the NETWORK_TIMEOUT_SECONDS constant declaration so
+# ``handle_push_and_pr`` finds it when sourced standalone.
+grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t67_funcs"
+
+if grep -q "^NETWORK_TIMEOUT_SECONDS=" "$t67_funcs"; then
+    pass "#3656 T67 setup — extracted NETWORK_TIMEOUT_SECONDS constant"
+else
+    fail "#3656 T67 setup — extracted NETWORK_TIMEOUT_SECONDS constant" \
+         "fixture tail: $(tail -c 400 "$t67_funcs")"
+fi
+
+if grep -q "^handle_push_and_pr()" "$t67_funcs"; then
+    pass "#3656 T67 setup — extracted handle_push_and_pr from entrypoint"
+else
+    fail "#3656 T67 setup — extracted handle_push_and_pr from entrypoint" \
+         "fixture head: $(head -c 400 "$t67_funcs")"
+fi
+
+# Per-test runner with a stub ``timeout`` binary that can be
+# parameterised to return 124 only for the targeted command (git
+# fetch / git push / gh pr create) and pass-through for everything
+# else. This is more realistic than env-toggling all three calls
+# because it lets us assert that ONE site fires its timeout while
+# the OTHERS run normally.
+#
+# Stub control via env vars:
+#   T67_TIMEOUT_TARGET — substring to match in the timeout's argv.
+#                        When the substring matches, ``timeout`` exits
+#                        124 without invoking the inner command.
+#                        Otherwise it execs the inner command directly.
+#                        Examples: "fetch", "push", "pr create".
+#   T67_REV_LIST_PRE   — count returned for the FIRST rev-list call
+#                        (pre-rebase). Default 1 (something to push).
+#   T67_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
+#                        Default 1 (rebase preserved the agent's commits).
+#   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
+#                        Default 0 (clean rebase).
+run_t67_test() {
+    _test_id="$1"
+    shift
+
+    _tworkspace="$TEST_TMP/${_test_id}-workspace"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_tworkspace" "$_trepo" "$_tstate" "$_tbin"
+    mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
+
+    # rev-list counter file — written/read by the git stub to alternate
+    # responses across calls (mirrors T64's pattern).
+    printf '0\n' > "$_tstate/rev-list-call-count.txt"
+
+    # ``timeout`` stub — the heart of T67. Logs every call. When the
+    # T67_TIMEOUT_TARGET substring appears in the inner command argv,
+    # exits 124 (mirroring real ``timeout`` behaviour after SIGTERM
+    # on timer expiry). Otherwise execs the inner command directly so
+    # other ``timeout``-wrapped calls in the same test run normally.
+    cat > "$_tbin/timeout" <<'T67TIMEOUTEOF'
+#!/usr/bin/env bash
+set -u
+# argv: <seconds> <inner-cmd> <inner-args...>
+_secs="${1:-}"
+shift || true
+_inner_argv="$*"
+printf 'CALL secs=%s argv=%s\n' "$_secs" "$_inner_argv" \
+    >> "${T_STATE_DIR}/timeout-log.txt"
+# T67_TIMEOUT_TARGET — substring match against the inner argv.
+if [[ -n "${T67_TIMEOUT_TARGET:-}" && "$_inner_argv" == *"${T67_TIMEOUT_TARGET}"* ]]; then
+    # Emulate real ``timeout(1)`` after SIGTERM-on-timer-expiry.
+    exit 124
+fi
+# No match — exec the inner command transparently.
+exec "$@"
+T67TIMEOUTEOF
+    chmod +x "$_tbin/timeout"
+
+    # git stub — reused pattern from T64. Records every invocation;
+    # returns parameterised exit codes for fetch/push/rebase.
+    cat > "$_tbin/git" <<'T67GITEOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -C) shift 2 || true; continue ;;
+        *) break ;;
+    esac
+done
+
+sub="${1:-}"
+case "$sub" in
+    rev-list)
+        _counter_file="${T_STATE_DIR}/rev-list-call-count.txt"
+        _n=$(cat "$_counter_file" 2>/dev/null || printf '0')
+        _next=$((_n + 1))
+        printf '%s\n' "$_next" > "$_counter_file"
+        if [[ "$_n" == "0" ]]; then
+            printf '%s\n' "${T67_REV_LIST_PRE:-1}"
+        else
+            printf '%s\n' "${T67_REV_LIST_POST:-1}"
+        fi
+        exit 0
+        ;;
+    fetch)
+        exit "${GIT_FETCH_EXIT:-0}"
+        ;;
+    rebase)
+        for _arg in "$@"; do
+            if [[ "$_arg" == "--abort" ]]; then exit 0; fi
+        done
+        exit "${GIT_REBASE_EXIT:-0}"
+        ;;
+    diff)
+        exit 0
+        ;;
+    push)
+        exit "${GIT_PUSH_EXIT:-0}"
+        ;;
+    commit)
+        exit "${GIT_COMMIT_EXIT:-0}"
+        ;;
+    rev-parse|merge-base)
+        printf 'deadbeefcafe\n'
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+T67GITEOF
+    chmod +x "$_tbin/git"
+
+    # gh stub — log + return PR URL on ``pr create``, exit 0 by default.
+    cat > "$_tbin/gh" <<'T67GHEOF'
+#!/usr/bin/env bash
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
+if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+    printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+fi
+exit "${GH_EXIT:-0}"
+T67GHEOF
+    chmod +x "$_tbin/gh"
+
+    # psql stub — log only.
+    cat > "$_tbin/psql" <<'T67PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
+exit 0
+T67PSQLEOF
+    chmod +x "$_tbin/psql"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_tbin/jq"
+    fi
+
+    set +e
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        PATH="$_tbin:$PATH" \
+        AGENT_ID="${_test_id}-dead-beef-cafe-000000000099" \
+        ISSUE_NUMBER="3656" \
+        AGENT_WORKSPACE="$_tworkspace" \
+        REPO_ROOT="$_trepo" \
+        BRANCH_NAME="agent/${_test_id}abcd" \
+        DATABASE_URL="postgres://test" \
+        AGENT_RUNNER_DRY_RUN="0" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            # shellcheck disable=SC1090
+            . "'"$t67_funcs"'"
+            handle_push_and_pr
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    T67_TEST_RC="$_trc"
+    T67_TEST_OUT="$_tout"
+    T67_TEST_STATE="$_tstate"
+}
+
+# ── Sub-test A: ``git push`` timeout → push_timeout envelope ────────────────
+#
+# T67_TIMEOUT_TARGET="push -u" matches only the ``git push -u origin``
+# call site (not ``git fetch`` or ``gh pr create``). Asserts:
+#   * ``push_and_pr_push_timeout`` log emitted with elapsed_seconds.
+#   * Envelope is ``{"no_op": false, "push_failed": true, "reason": "push_timeout"}``.
+#   * ``gh pr create`` is NOT invoked (function returns at the timeout).
+# Test would fail against unfixed code (no timeout wrapper, no
+# ``*_timeout`` log, push hang-forever).
+run_t67_test "t67a" T67_TIMEOUT_TARGET="push -u" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+
+if [[ "$T67_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T67A — handle_push_and_pr exits 0 on git push timeout"
+else
+    fail "#3656 T67A — handle_push_and_pr exits 0 on git push timeout" \
+         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — push_timeout log event emitted.
+if printf '%s' "$T67_TEST_OUT" | grep -q "push_and_pr_push_timeout"; then
+    pass "#3656 T67A — push_and_pr_push_timeout log event emitted"
+else
+    fail "#3656 T67A — push_and_pr_push_timeout log event emitted" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — log includes elapsed_seconds field (not bare event).
+# The ``log`` helper emits structured JSON, so the field appears as
+# ``"elapsed_seconds": "300"`` — match either JSON-quoted or
+# key=value forms to keep the assertion implementation-agnostic.
+if printf '%s' "$T67_TEST_OUT" \
+    | grep "push_and_pr_push_timeout" \
+    | grep -qE '("?elapsed_seconds"?[[:space:]]*[:=][[:space:]]*"?[0-9]+)'; then
+    pass "#3656 T67A — push timeout log includes elapsed_seconds"
+else
+    fail "#3656 T67A — push timeout log includes elapsed_seconds" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — envelope has the reason=push_timeout discriminator.
+if printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"push_timeout"'; then
+    pass "#3656 T67A — envelope contains reason=push_timeout"
+else
+    fail "#3656 T67A — envelope contains reason=push_timeout" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — push_failed=true so the transition shim still routes
+# through the existing failure path.
+if printf '%s' "$T67_TEST_OUT" | grep -qE '"push_failed":[[:space:]]*true'; then
+    pass "#3656 T67A — envelope contains push_failed=true"
+else
+    fail "#3656 T67A — envelope contains push_failed=true" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — gh pr create NOT invoked (function returned early).
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T67_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3656 T67A — gh pr create NOT invoked after push timeout"
+else
+    fail "#3656 T67A — gh pr create NOT invoked after push timeout" \
+         "gh-log: $(cat "$T67_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# Sanity — the timeout stub WAS invoked at least once (proves the
+# ``timeout`` wrapper is on the call path, not silently absent).
+if grep -q "argv=git" "$T67_TEST_STATE/timeout-log.txt" 2>/dev/null; then
+    pass "#3656 T67A — timeout wrapper invoked on git command"
+else
+    fail "#3656 T67A — timeout wrapper invoked on git command" \
+         "timeout-log: $(cat "$T67_TEST_STATE/timeout-log.txt" 2>/dev/null)"
+fi
+
+# ── Sub-test B: ``gh pr create`` timeout → pr_create_timeout envelope ──────
+#
+# T67_TIMEOUT_TARGET="pr create" matches only the ``gh pr create`` call.
+# git push runs normally (so we exercise the path past the push site).
+run_t67_test "t67b" T67_TIMEOUT_TARGET="pr create" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+
+if [[ "$T67_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T67B — handle_push_and_pr exits 0 on gh pr create timeout"
+else
+    fail "#3656 T67B — handle_push_and_pr exits 0 on gh pr create timeout" \
+         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — pr_create_timeout log event emitted.
+if printf '%s' "$T67_TEST_OUT" | grep -q "push_and_pr_pr_create_timeout"; then
+    pass "#3656 T67B — push_and_pr_pr_create_timeout log event emitted"
+else
+    fail "#3656 T67B — push_and_pr_pr_create_timeout log event emitted" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — envelope has the pr_create_timeout reason discriminator.
+if printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"pr_create_timeout"'; then
+    pass "#3656 T67B — envelope contains reason=pr_create_timeout"
+else
+    fail "#3656 T67B — envelope contains reason=pr_create_timeout" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — pr_create_failed=true (preserves existing failure routing).
+if printf '%s' "$T67_TEST_OUT" | grep -qE '"pr_create_failed":[[:space:]]*true'; then
+    pass "#3656 T67B — envelope contains pr_create_failed=true"
+else
+    fail "#3656 T67B — envelope contains pr_create_failed=true" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — git push DID run (path got past the push call site,
+# proving the timeout target was scoped to ``gh pr create`` only).
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T67_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3656 T67B — git push DID run (timeout was scoped to gh pr create)"
+else
+    fail "#3656 T67B — git push DID run (timeout was scoped to gh pr create)" \
+         "git-log: $(cat "$T67_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# ── Sub-test C: ``git fetch`` timeout → fetch_main_timeout log only ─────────
+#
+# T67_TIMEOUT_TARGET="fetch origin" matches only the pre-push
+# ``git fetch origin main``. The fetch is best-effort by design — a
+# 124 should emit the timeout log but fall through to the push (which
+# we then let succeed). Asserts:
+#   * ``push_and_pr_fetch_main_timeout`` log emitted.
+#   * Function continues to git push (not early-return on fetch
+#     timeout — fetch failure has always been best-effort, and #3656
+#     preserves that).
+#   * Final envelope is NOT the push_timeout shape (fetch timeout
+#     should not look like a push timeout to the diagnoser).
+run_t67_test "t67c" T67_TIMEOUT_TARGET="fetch origin" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+
+if [[ "$T67_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T67C — handle_push_and_pr exits 0 on git fetch timeout (best-effort)"
+else
+    fail "#3656 T67C — handle_push_and_pr exits 0 on git fetch timeout (best-effort)" \
+         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — fetch_main_timeout log event emitted.
+if printf '%s' "$T67_TEST_OUT" | grep -q "push_and_pr_fetch_main_timeout"; then
+    pass "#3656 T67C — push_and_pr_fetch_main_timeout log event emitted"
+else
+    fail "#3656 T67C — push_and_pr_fetch_main_timeout log event emitted" \
+         "output: $T67_TEST_OUT"
+fi
+
+# CRITICAL — git push DID run (best-effort fetch failure falls through).
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T67_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3656 T67C — git push DID run after fetch timeout (best-effort fall-through)"
+else
+    fail "#3656 T67C — git push DID run after fetch timeout (best-effort fall-through)" \
+         "git-log: $(cat "$T67_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Final envelope must NOT be the push_timeout shape (the fetch
+# timeout fell through to a successful push + PR create).
+if ! printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"push_timeout"'; then
+    pass "#3656 T67C — final envelope is NOT push_timeout (fetch fell through)"
+else
+    fail "#3656 T67C — final envelope is NOT push_timeout (fetch fell through)" \
+         "output: $T67_TEST_OUT"
+fi
+
+# ── Sub-test D: happy-path regression — no timeout target → all run ─────────
+#
+# T67_TIMEOUT_TARGET unset (empty). The ``timeout`` stub falls through
+# to exec the inner command, so every wrapped site behaves exactly as
+# pre-#3656. Asserts no ``*_timeout`` log fires and the happy-path
+# envelope is unchanged.
+run_t67_test "t67d" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+
+if [[ "$T67_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T67D — handle_push_and_pr exits 0 on happy path (no timeouts)"
+else
+    fail "#3656 T67D — handle_push_and_pr exits 0 on happy path (no timeouts)" \
+         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+fi
+
+# Happy path emits NO ``*_timeout`` log lines.
+if ! printf '%s' "$T67_TEST_OUT" | grep -qE "(push|pr_create|fetch_main)_timeout"; then
+    pass "#3656 T67D — no *_timeout log events on happy path"
+else
+    fail "#3656 T67D — no *_timeout log events on happy path" \
+         "output: $T67_TEST_OUT"
+fi
+
+# Happy path envelope does NOT carry a reason field (push_timeout /
+# pr_create_timeout discriminators are absent).
+if ! printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"(push_timeout|pr_create_timeout)"'; then
+    pass "#3656 T67D — happy-path envelope has no timeout reason field"
+else
+    fail "#3656 T67D — happy-path envelope has no timeout reason field" \
+         "output: $T67_TEST_OUT"
+fi
+
+# Both push and pr create DID run.
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T67_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3656 T67D — git push ran on happy path"
+else
+    fail "#3656 T67D — git push ran on happy path" \
+         "git-log: $(cat "$T67_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+if grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T67_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3656 T67D — gh pr create ran on happy path"
+else
+    fail "#3656 T67D — gh pr create ran on happy path" \
+         "gh-log: $(cat "$T67_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────────────
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
