@@ -2276,6 +2276,78 @@ else
     fail "#3135 — unknown-phase fallback carries agent_id"
 fi
 
+# ── Test 21b: verify shim resilience — gh timeout/error (#3547) ────────────
+# Issue #3547 root cause: _fetch_merged_pr_info / _fetch_deploy_runs_for_sha /
+# _fetch_issue_bundle called _run() without try/except — a gh subprocess
+# TimeoutExpired propagated to main(), exiting non-zero, silently skipping
+# the input write, then claude hit the skill's input-missing guard.
+# Fix: wrap _run() in each gh helper with try/except. This test verifies
+# the shim still writes a well-formed input file even when every gh call
+# returns a non-zero exit code (simulating a timeout/network error).
+setup_fixtures
+
+t21b_repo="$TEST_TMP/t21b-repo"
+mkdir -p "$t21b_repo/.git"
+
+# Override gh to fail every call in a test-specific bin dir so we don't
+# redefine $STUB_BIN/gh (which would trigger the duplicate-stub guard).
+t21b_bin="$TEST_TMP/t21b-bin"
+mkdir -p "$t21b_bin"
+ln -sf "$STUB_BIN/_record_invocation.sh" "$t21b_bin/_record_invocation.sh"
+cat > "$t21b_bin/gh" <<'GHEOF_T21B'
+#!/usr/bin/env bash
+set -u
+INVOCATIONS_DIR="${INVOCATIONS_DIR}"
+. "$(dirname "$0")/_record_invocation.sh" gh "$@"
+# Simulate gh timeout/error: always exit 1 with an error message.
+printf 'simulated gh error\n' >&2
+exit 1
+GHEOF_T21B
+chmod +x "$t21b_bin/gh"
+
+set +e
+DATABASE_URL="postgres://test" \
+    GITHUB_REPO="judgemind/judgemind" \
+    PATH="$t21b_bin:$STUB_BIN:$PATH" \
+    INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+    DB_AGENT_PR_NUMBER="5047" \
+    python3 "$SHIM_PY" verify "3547aaaa-3547-3547-3547-3547aaaabbbb" 3547 "$t21b_repo" \
+    >/dev/null 2>&1
+t21b_rc=$?
+set -e
+
+# t21b_bin is not on PATH after this point; $STUB_BIN/gh was never touched.
+setup_fixtures
+
+t21b_input="$t21b_repo/tmp/dispatcher-input/verify.json"
+# Issue #3547: the shim must exit 0 and write the file even when every
+# gh call fails — the skill's own guard handles missing fields (e.g.
+# empty merged_commit_sha) rather than the entrypoint crashing.
+if [[ $t21b_rc -eq 0 && -f "$t21b_input" ]]; then
+    pass "#3547 — verify shim writes input even when gh returns errors"
+else
+    fail "#3547 — verify shim writes input even when gh returns errors" \
+         "rc=$t21b_rc, file_exists=$(test -f "$t21b_input" && echo yes || echo no)"
+fi
+
+# The base identifier fields must always be present regardless of gh success.
+if jq -e '.agent_id == "3547aaaa-3547-3547-3547-3547aaaabbbb"' \
+     "$t21b_input" >/dev/null 2>&1; then
+    pass "#3547 — verify shim carries agent_id in gh-error fallback"
+else
+    fail "#3547 — verify shim carries agent_id in gh-error fallback" \
+         "content: $(cat "$t21b_input" 2>/dev/null | head -c 200)"
+fi
+
+# worktree_path must equal REPO_ROOT (not a subprocess-lane path from the DB row).
+if jq -e --arg p "$t21b_repo" '.worktree_path == $p' \
+     "$t21b_input" >/dev/null 2>&1; then
+    pass "#3547 — verify shim sets worktree_path to REPO_ROOT in ECS lane"
+else
+    fail "#3547 — verify shim sets worktree_path to REPO_ROOT in ECS lane" \
+         "worktree_path: $(jq -r '.worktree_path' "$t21b_input" 2>/dev/null)"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════
 # Tests 22-26: Ralph HEAD-watcher (#3144)
 #

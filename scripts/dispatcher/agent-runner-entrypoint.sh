@@ -844,7 +844,22 @@ def _fetch_issue_bundle(repo: str, issue_number: int) -> dict:
         "--json",
         "number,title,body,labels,comments,updatedAt",
     ]
-    outcome = _run(cmd, timeout=30)
+    try:
+        outcome = _run(cmd, timeout=30)
+    except Exception:
+        # Timeout or other subprocess error — best-effort: return empty
+        # bundle so the skill's guard clause still produces a clean
+        # go=false rather than propagating the exception to main().
+        return {
+            "issue_number": issue_number,
+            "issue_title": "",
+            "issue_body": "",
+            "issue_comments": [],
+            "issue_labels": [],
+            "blocked_by": [],
+            "parent_issue": None,
+            "issue_updated_at": "",
+        }
     if outcome.returncode != 0:
         # Fall back to empty bundle so the skill's guard clause still
         # produces a clean go=false rather than a crash. The daemon's
@@ -915,7 +930,10 @@ def _fetch_pr_status(repo: str, pr_number: int) -> dict:
         "--json",
         "statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit",
     ]
-    outcome = _run(cmd, timeout=30)
+    try:
+        outcome = _run(cmd, timeout=30)
+    except Exception:
+        return {}
     if outcome.returncode != 0:
         return {}
     try:
@@ -930,7 +948,10 @@ def _fetch_pr_diff(repo: str, pr_number: int) -> str:
     if not pr_number:
         return ""
     cmd = ["gh", "pr", "diff", str(pr_number), "--repo", repo]
-    outcome = _run(cmd, timeout=60)
+    try:
+        outcome = _run(cmd, timeout=60)
+    except Exception:
+        return ""
     if outcome.returncode != 0:
         return ""
     return outcome.stdout or ""
@@ -1026,7 +1047,10 @@ def _fetch_merged_pr_info(repo: str, pr_number: int) -> dict:
         "--json",
         "state,mergeCommit,headRefOid",
     ]
-    outcome = _run(cmd, timeout=30)
+    try:
+        outcome = _run(cmd, timeout=30)
+    except Exception:
+        return {"merge_commit_sha": "", "pr_state": ""}
     if outcome.returncode != 0:
         return {"merge_commit_sha": "", "pr_state": ""}
     try:
@@ -1069,7 +1093,10 @@ def _fetch_deploy_runs_for_sha(repo: str, sha: str) -> list[dict]:
         "--json",
         "databaseId,workflowName,conclusion,status,headSha,createdAt,updatedAt",
     ]
-    outcome = _run(cmd, timeout=30)
+    try:
+        outcome = _run(cmd, timeout=30)
+    except Exception:
+        return []
     if outcome.returncode != 0:
         return []
     try:
@@ -1722,15 +1749,42 @@ def main() -> int:
     repo_root = Path(sys.argv[4]).resolve()
     github_repo = os.environ.get("GITHUB_REPO", "judgemind/judgemind")
 
-    payload = _build_input(phase, agent_id, issue_number, repo_root, github_repo)
+    try:
+        payload = _build_input(phase, agent_id, issue_number, repo_root, github_repo)
+    except Exception as exc:
+        # Defensive belt: _build_input's per-helper try/except should
+        # prevent propagation, but an unforeseen exception (new code
+        # path, import error) must NOT silently swallow here — it must
+        # exit 2 so write_phase_input() logs phase_input_write_failed
+        # and the caller (run_claude_phase) can emit a diagnostic event
+        # instead of letting claude hit the skill's input-missing guard.
+        print(
+            f"phase_input_shim: unhandled exception building {phase} input: {exc}",
+            file=sys.stderr,
+        )
+        return 2
 
     input_dir = repo_root / "tmp" / "dispatcher-input"
-    input_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        input_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(
+            f"phase_input_shim: failed to create input dir {input_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     # Normalize skill-suffix naming for the on-disk file (daemon writes
     # `fix-ci.json` even though the phase-column value is `fix_ci`).
     file_phase = phase
     out_path = input_dir / f"{file_phase}.json"
-    out_path.write_text(json.dumps(payload, indent=2, default=str))
+    try:
+        out_path.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception as exc:
+        print(
+            f"phase_input_shim: failed to write {out_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     print(str(out_path))
     return 0
 
@@ -1748,14 +1802,22 @@ fi
 write_phase_input() {
     _phase_suffix="$1"
     _issue_for_input="${ISSUE_NUMBER:-0}"
+    _input_log="$AGENT_WORKSPACE/phase-input-$_phase_suffix.log"
     if ! python3 "$PHASE_INPUT_SHIM" \
         "$_phase_suffix" \
         "$AGENT_ID" \
         "$_issue_for_input" \
         "$REPO_ROOT" \
-        > "$AGENT_WORKSPACE/phase-input-$_phase_suffix.log" \
-        2>> "$AGENT_WORKSPACE/phase-input-$_phase_suffix.log"; then
-        log "phase_input_write_failed" "phase=$_phase_suffix"
+        > "$_input_log" \
+        2>> "$_input_log"; then
+        # Issue #3547: capture the shim's stderr tail so CloudWatch
+        # operators can distinguish a gh-timeout from a missing DB row
+        # without a second deploy-instrument cycle.
+        _shim_err_tail=$(tail -c 512 "$_input_log" 2>/dev/null \
+            | tr '\n\r\t' '   ' || printf '')
+        log "phase_input_write_failed" \
+            "phase=$_phase_suffix" \
+            "shim_err_tail=$_shim_err_tail"
         return 1
     fi
     log "phase_input_written" "phase=$_phase_suffix"
