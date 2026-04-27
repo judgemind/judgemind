@@ -465,6 +465,80 @@ PAYLOAD
     fi
 }
 
+# ── Polling tests (#3556) ──────────────────────────────────────────────────
+
+# Mock aws CLI that returns None for the first N list-tasks calls, then returns
+# a real task ARN. A state file in a temp dir tracks the call count.
+# execute-command is stubbed as a no-op so polling-success tests don't need a
+# full SSM payload.
+setup_mock_aws_poll_then_arn() {
+    local empty_calls="$1"   # number of list-tasks calls that return None
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local mock_bin="$tmpdir/bin"
+    local state_file="$tmpdir/call_count"
+    mkdir -p "$mock_bin"
+    echo "0" > "$state_file"
+
+    cat > "$mock_bin/aws" << MOCK_AWS
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "list-tasks" ]]; then
+    count=\$(cat "$state_file")
+    count=\$((count + 1))
+    echo "\$count" > "$state_file"
+    if [[ "\$count" -le $empty_calls ]]; then
+        echo "None"
+    else
+        echo "arn:aws:ecs:us-west-2:000000000000:task/fake-cluster/fake-task-id"
+    fi
+    exit 0
+fi
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
+    # No-op stub — we only care that the script reached this stage.
+    echo "[]"
+    exit 0
+fi
+echo "Mock aws: unexpected command: \$*" >&2
+exit 1
+MOCK_AWS
+    chmod +x "$mock_bin/aws"
+    echo "$mock_bin"
+}
+
+test_polls_until_task_appears() {
+    # list-tasks returns None on the first 2 calls, then a real ARN on the 3rd.
+    # The script should retry and eventually reach the execute-command stage.
+    local mock_bin
+    mock_bin=$(setup_mock_aws_poll_then_arn 2)
+    local output rc=0
+    output=$(LIST_TASKS_POLL_TIMEOUT_SECS=10 run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+
+    # Success means the script proceeded past list-tasks (reached execute-command).
+    # The mock execute-command exits 0, so the overall exit code should be 0.
+    if [[ $rc -eq 0 && "$output" != *"no running task found"* ]]; then
+        pass "polls until task appears: proceeds to execute-command on 3rd try"
+    else
+        fail "polls until task appears: proceeds to execute-command on 3rd try" \
+            "rc=$rc output=$output"
+    fi
+}
+
+test_polls_then_gives_up_with_clear_error() {
+    # list-tasks always returns None. With a short timeout, the script should
+    # give up and exit non-zero with the "no running task" error message.
+    local mock_bin
+    mock_bin=$(setup_mock_aws_no_tasks)
+    local output rc=0
+    output=$(LIST_TASKS_POLL_TIMEOUT_SECS=2 run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+
+    if [[ $rc -ne 0 && "$output" == *"no running task"* ]]; then
+        pass "polls then gives up: exits non-zero with 'no running task' error"
+    else
+        fail "polls then gives up: exits non-zero with 'no running task' error" \
+            "rc=$rc output=$output"
+    fi
+}
+
 # ── Run all ────────────────────────────────────────────────────────────────
 
 test_no_args_shows_usage
@@ -484,6 +558,8 @@ test_strips_ssm_banners_and_trailer
 test_strips_cannot_perform_start_session_trailer
 test_strips_own_line_cannot_perform
 test_empty_output_after_strip_is_ok
+test_polls_until_task_appears
+test_polls_then_gives_up_with_clear_error
 
 echo ""
 echo "────────────────────────────────────────────────"
