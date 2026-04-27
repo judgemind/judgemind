@@ -434,21 +434,21 @@ describe('DispatcherDashboard — #2860 circuit-breaker banner', () => {
   });
 });
 
-describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () => {
+// #2967 originally wrapped poll state updates in document.startViewTransition
+// to drive Magic Move animations. #3584 reverted that because the root
+// viewport snapshot caused operator-visible header flicker on every 2s poll.
+// The data-mirror effect now always updates synchronously.
+describe('DispatcherDashboard — #3584 synchronous poll state update (no view-transition)', () => {
   beforeEach(() => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
     mockRefetch.mockClear();
   });
 
-  it('wraps subsequent poll state updates in document.startViewTransition when available', async () => {
-    // Stub the View Transitions API on the jsdom document. We capture
-    // the callback the hook passes in so we can assert that the state
-    // mutation happens *inside* the transition (flushSync + setState),
-    // not eagerly.
-    const captured: Array<() => void> = [];
+  it('does NOT call startViewTransition on a poll-driven update (#3584)', async () => {
+    // Install the stub — post-fix, it must never be called.
     const startViewTransition = vi.fn((cb: () => void) => {
-      captured.push(cb);
+      cb();
       return { finished: Promise.resolve() };
     });
     (
@@ -457,9 +457,6 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
       }
     ).startViewTransition = startViewTransition;
 
-    // Also pin `matchMedia` to a non-reducing response so the hook
-    // does not short-circuit on the reduced-motion branch. jsdom does
-    // not implement matchMedia natively.
     const originalMatchMedia = window.matchMedia;
     (window as unknown as { matchMedia: typeof window.matchMedia }).matchMedia =
       ((query: string) => ({
@@ -474,16 +471,11 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
       })) as typeof window.matchMedia;
 
     try {
-      // Initial frame — state A. First render initialises the mirror
-      // synchronously; no transition wrapping on the very first paint
-      // (no prior frame to transition from).
       mockQueryData = { dispatcherState: { ...BASE_STATE } };
       const { rerender } = renderDashboard();
       expect(startViewTransition).not.toHaveBeenCalled();
 
-      // Simulate a poll landing a *new* data reference. Apollo always
-      // returns a fresh object on each network reply, so reference
-      // equality is the trigger the mirror watches.
+      // Simulate a poll landing a *new* data reference.
       mockQueryData = {
         dispatcherState: {
           ...BASE_STATE,
@@ -492,14 +484,14 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
       };
       rerender(<DispatcherDashboard />);
 
+      // Wait for the effect to run and verify state was updated
+      // (queueDepth reflected in the badge).
       await waitFor(() => {
-        expect(startViewTransition).toHaveBeenCalledTimes(1);
+        expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 99');
       });
-      // The callback passed in must be a function — the hook runs it
-      // via `flushSync` to satisfy the View Transitions snapshot
-      // contract. We confirm it is callable and idempotent.
-      expect(typeof captured[0]).toBe('function');
-      expect(() => captured[0]()).not.toThrow();
+      // startViewTransition must never have been called — the update is
+      // now synchronous per #3584.
+      expect(startViewTransition).not.toHaveBeenCalled();
     } finally {
       delete (
         document as unknown as {
@@ -512,15 +504,12 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
     }
   });
 
-  it('falls through cleanly when startViewTransition is undefined (Firefox today)', () => {
-    // Ensure no global stub leaks in from a previous test.
+  it('renders updated poll data without startViewTransition (Firefox-like env)', async () => {
     delete (
       document as unknown as {
         startViewTransition?: (cb: () => void) => unknown;
       }
     ).startViewTransition;
-    // Initial render on a "Firefox-like" environment — must not throw
-    // and must render the panels with the state we provided.
     mockQueryData = {
       dispatcherState: {
         ...BASE_STATE,
@@ -528,7 +517,9 @@ describe('DispatcherDashboard — #2967 Magic Move state update wrapping', () =>
       },
     };
     renderDashboard();
-    expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 7');
+    await waitFor(() => {
+      expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 7');
+    });
   });
 });
 
@@ -988,13 +979,13 @@ describe('DispatcherDashboard — DiagnoserEffectivenessPanel (#2800)', () => {
   });
 });
 
-// #3220: the root view-transition wrapper itself must be skipped while
-// any cockpit dialog is open. Even without named transition targets,
-// `document.startViewTransition` snapshots the entire viewport into
-// `::view-transition-*(root)` and cross-fades for ~250ms — during which
-// native scrollbars vanish and reappear, producing a 2s on/off flicker
-// on the dialog's scrollable body that matches the poll cadence.
-describe('DispatcherDashboard — #3220 root view-transition gate while dialog open', () => {
+// #3220 originally tested that the root view-transition wrapper was skipped
+// while a dialog was open. #3584 reverted the view-transition wrapping on
+// polls entirely — startViewTransition is never called on any poll update.
+// The dialog-open / dialog-closed distinction no longer affects the poll
+// path; the per-row `view-transition-name` suppression (#3206) is still
+// tested in the '#3206 dialog-open view-transition gate' describe above.
+describe('DispatcherDashboard — #3220 / #3584 no view-transition on any poll (with or without dialog)', () => {
   beforeEach(() => {
     mockControlMutate.mockClear();
     mockSetConfigMutate.mockClear();
@@ -1004,16 +995,8 @@ describe('DispatcherDashboard — #3220 root view-transition gate while dialog o
     mockQueueFullData.COMPLETED = undefined;
   });
 
-  function installViewTransitionStub(): {
-    startViewTransition: ReturnType<typeof vi.fn>;
-    restore: () => void;
-  } {
+  it('does NOT call startViewTransition on a poll update while a dialog is open', async () => {
     const startViewTransition = vi.fn((cb: () => void): unknown => {
-      // Run the callback so `setRenderedData` actually commits —
-      // otherwise subsequent rerenders see a stale mirror. The real
-      // API wraps this in `flushSync`, but for the purpose of
-      // asserting "was startViewTransition called?" we don't need to
-      // reproduce the snapshot semantics.
       cb();
       return { finished: Promise.resolve() };
     });
@@ -1023,153 +1006,60 @@ describe('DispatcherDashboard — #3220 root view-transition gate while dialog o
       }
     ).startViewTransition = startViewTransition;
 
-    const originalMatchMedia = window.matchMedia;
-    (window as unknown as { matchMedia: typeof window.matchMedia }).matchMedia =
-      ((query: string) => ({
-        matches: false,
-        media: query,
-        onchange: null,
-        addListener: () => {},
-        removeListener: () => {},
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        dispatchEvent: () => false,
-      })) as typeof window.matchMedia;
-
-    return {
-      startViewTransition,
-      restore: () => {
-        delete (
-          document as unknown as {
-            startViewTransition?: (cb: () => void) => unknown;
-          }
-        ).startViewTransition;
-        (
-          window as unknown as { matchMedia: typeof window.matchMedia }
-        ).matchMedia = originalMatchMedia;
-      },
-    };
-  }
-
-  it('does NOT call startViewTransition on a poll-driven update while a dialog is open', async () => {
-    const { startViewTransition, restore } = installViewTransitionStub();
     try {
-      // Initial frame — first render initialises the mirror synchronously.
       mockQueryData = { dispatcherState: { ...BASE_STATE } };
       mockQueueFullData.READY = {
-        dispatcherQueueFull: {
-          kind: 'READY',
-          queueItems: [],
-          completions: [],
-        },
+        dispatcherQueueFull: { kind: 'READY', queueItems: [], completions: [] },
       };
       const { rerender } = renderDashboard();
-      expect(startViewTransition).not.toHaveBeenCalled();
-
-      // Open the Ready dialog. Opening the dialog is itself a React
-      // state update (`setFullDialogKind('READY')`), and the effect
-      // that mirrors Apollo's `data` has `fullDialogKind` in its
-      // dependency list — but there's no new `data` reference yet, so
-      // the effect's early-returns (`data === lastAppliedDataRef.current`)
-      // short-circuit and no transition fires.
       fireEvent.click(screen.getByTestId('queue-ready-count'));
       await screen.findByTestId('queue-full-dialog');
-      expect(startViewTransition).not.toHaveBeenCalled();
 
-      // Now simulate a poll landing a *new* `data` reference while the
-      // dialog is open. With the #3220 gate in place, the effect takes
-      // the synchronous branch (`fullDialogKind !== null`) and never
-      // calls `startViewTransitionUpdate`.
-      mockQueryData = {
-        dispatcherState: {
-          ...BASE_STATE,
-          queueDepth: 42,
-        },
-      };
+      mockQueryData = { dispatcherState: { ...BASE_STATE, queueDepth: 42 } };
       rerender(<DispatcherDashboard />);
 
-      // Give the effect a tick to run. `waitFor` will retry until the
-      // timeout; we expect it to *still* be zero at the end, so we
-      // just yield once and assert.
       await waitFor(() => {
-        // The dialog is still open — sanity check.
         expect(screen.queryByTestId('queue-full-dialog')).not.toBeNull();
       });
       expect(startViewTransition).not.toHaveBeenCalled();
     } finally {
-      restore();
+      delete (
+        document as unknown as {
+          startViewTransition?: (cb: () => void) => unknown;
+        }
+      ).startViewTransition;
     }
   });
 
-  it('DOES call startViewTransition on a poll-driven update when no dialog is open (regression guard)', async () => {
-    const { startViewTransition, restore } = installViewTransitionStub();
+  it('does NOT call startViewTransition on a poll update when no dialog is open (#3584)', async () => {
+    const startViewTransition = vi.fn((cb: () => void): unknown => {
+      cb();
+      return { finished: Promise.resolve() };
+    });
+    (
+      document as unknown as {
+        startViewTransition?: (cb: () => void) => unknown;
+      }
+    ).startViewTransition = startViewTransition;
+
     try {
       mockQueryData = { dispatcherState: { ...BASE_STATE } };
       const { rerender } = renderDashboard();
       expect(startViewTransition).not.toHaveBeenCalled();
 
-      // New data reference arrives — no dialog open, so the wrapper fires.
-      mockQueryData = {
-        dispatcherState: {
-          ...BASE_STATE,
-          queueDepth: 42,
-        },
-      };
+      mockQueryData = { dispatcherState: { ...BASE_STATE, queueDepth: 42 } };
       rerender(<DispatcherDashboard />);
 
       await waitFor(() => {
-        expect(startViewTransition).toHaveBeenCalledTimes(1);
-      });
-    } finally {
-      restore();
-    }
-  });
-
-  it('resumes wrapping poll updates in startViewTransition after the dialog closes', async () => {
-    const { startViewTransition, restore } = installViewTransitionStub();
-    try {
-      mockQueryData = { dispatcherState: { ...BASE_STATE } };
-      mockQueueFullData.READY = {
-        dispatcherQueueFull: {
-          kind: 'READY',
-          queueItems: [],
-          completions: [],
-        },
-      };
-      const { rerender } = renderDashboard();
-
-      // Open the dialog.
-      fireEvent.click(screen.getByTestId('queue-ready-count'));
-      await screen.findByTestId('queue-full-dialog');
-
-      // Poll lands while dialog is open — no transition.
-      mockQueryData = {
-        dispatcherState: { ...BASE_STATE, queueDepth: 1 },
-      };
-      rerender(<DispatcherDashboard />);
-      await waitFor(() => {
-        expect(screen.queryByTestId('queue-full-dialog')).not.toBeNull();
+        expect(screen.getByTestId('queue-ready-count')).toHaveTextContent('0 / 42');
       });
       expect(startViewTransition).not.toHaveBeenCalled();
-
-      // Close the dialog — QueueFullDialog's `onClose` flips the kind
-      // to null. We trigger it by pressing Escape on the dialog, which
-      // Radix handles by firing onOpenChange(false).
-      fireEvent.keyDown(document.body, { key: 'Escape', code: 'Escape' });
-      await waitFor(() => {
-        expect(screen.queryByTestId('queue-full-dialog')).toBeNull();
-      });
-
-      // Next poll with a new data reference should now be wrapped.
-      mockQueryData = {
-        dispatcherState: { ...BASE_STATE, queueDepth: 2 },
-      };
-      rerender(<DispatcherDashboard />);
-      await waitFor(() => {
-        expect(startViewTransition).toHaveBeenCalledTimes(1);
-      });
     } finally {
-      restore();
+      delete (
+        document as unknown as {
+          startViewTransition?: (cb: () => void) => unknown;
+        }
+      ).startViewTransition;
     }
   });
 });

@@ -54,9 +54,9 @@ export function DiagnoserEffectivenessPanel() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row, idx) => (
+            {rows.map((row) => (
               <tr
-                key={idx}
+                key={`${row.day}|${row.recommendedAction}|${row.observedOutcome}`}
                 className="border-t border-border hover:bg-muted/50"
                 data-testid="diagnoser-effectiveness-row"
               >

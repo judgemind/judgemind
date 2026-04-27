@@ -5,7 +5,6 @@ import { notFound } from 'next/navigation';
 import { useMutation, useQuery } from '@apollo/client';
 import { useAuth } from '@/providers/AuthProvider';
 import { ErrorBanner } from '@/components/ErrorBanner';
-import { useViewTransitionUpdate } from '@/hooks/useViewTransition';
 import { PAGE_TITLE } from '@/lib/typography';
 import {
   DISPATCHER_CONTROL_MUTATION,
@@ -138,49 +137,37 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     }
   }, [error]);
 
-  // Magic Move wiring (#2967). Apollo's `useQuery` pushes poll results
-  // straight into `data`, but Magic Move needs the DOM mutation to happen
-  // *inside* a `document.startViewTransition` callback so the browser
-  // can snapshot the old frame, run the React render, then animate each
-  // `view-transition-name` from its old position to its new one. We
-  // mirror `data` into a local `renderedData` state and flip it through
-  // the view-transition wrapper; the panel components render from the
-  // mirror, so every poll update (and every imperative `refetch()`)
-  // flows through the animation path without changing Apollo's cache
-  // behaviour. On first paint we initialise synchronously — the very
-  // first frame would have no "old" snapshot to animate from anyway.
+  // Data mirror for rendered state (#2967 / #3584). Apollo's `useQuery`
+  // pushes poll results straight into `data`; we mirror that into a local
+  // `renderedData` so the panel components always render from a stable
+  // reference that is only updated inside this effect.
   //
-  // #3220: also bypass the wrapper while any cockpit dialog is open.
-  // #3206 stripped `viewTransitionName` from panel rows when a dialog is
-  // open, but `document.startViewTransition` *always* snapshots the root
-  // viewport into `::view-transition-*(root)` regardless of whether any
-  // named targets exist. Native scrollbars are browser UI — not DOM
-  // content — so they're not captured in the root snapshot and briefly
-  // disappear during the ~250ms cross-fade. On the dialog's
-  // `max-h-[60vh] overflow-y-auto` body, that produces a 2s on/off
-  // scrollbar flicker matching the poll cadence. Synchronous update
-  // while a dialog is open side-steps the root transition entirely.
-  // When the dialog closes, the next poll goes back through
-  // `startViewTransitionUpdate` and Magic Move resumes on the panels.
+  // #2967 originally wrapped updates in `document.startViewTransition` to
+  // drive Magic Move animations on every poll cycle. #3584 reverted that:
+  // `document.startViewTransition` snapshots the *entire root viewport*
+  // (including the Header in app/layout.tsx) into `::view-transition-*(root)`
+  // and cross-fades it for ~250ms, causing cockpit row text and the header
+  // logo region to flicker on every 2s poll regardless of whether any
+  // named transition targets exist. React's keyed reconciliation already
+  // preserves DOM-node identity for unchanged rows, so the view-transition
+  // wrapper buys nothing and only adds operator-visible flicker.
+  //
+  // Per-row `view-transition-name` style spreads in ActiveAgentsTable /
+  // RecentCompletionsPanel / QueuePanel / QueueFullDialog are harmless once
+  // `startViewTransition` is never called and are left in place for any
+  // future scoped use.
   const [renderedData, setRenderedData] = useState<DispatcherStateData | undefined>(
     data,
   );
-  const startViewTransitionUpdate = useViewTransitionUpdate();
   const lastAppliedDataRef = useRef<DispatcherStateData | undefined>(data);
   useEffect(() => {
     if (data === undefined) return;
     if (data === lastAppliedDataRef.current) return;
-    const hasPrior = lastAppliedDataRef.current !== undefined;
     lastAppliedDataRef.current = data;
-    if (!hasPrior || fullDialogKind !== null) {
-      // First successful fetch — no prior frame to transition from.
-      // Dialog open (#3220) — skip the root view-transition to avoid
-      // scrollbar flicker on the dialog's scroll container.
-      setRenderedData(data);
-      return;
-    }
-    startViewTransitionUpdate(() => setRenderedData(data));
-  }, [data, fullDialogKind, startViewTransitionUpdate]);
+    // Synchronous update — React's keyed reconciliation preserves DOM-node
+    // identity for unchanged rows without any view-transition wrapper.
+    setRenderedData(data);
+  }, [data]);
 
   const [dispatcherControl, { loading: controlLoading }] =
     useMutation<DispatcherControlData>(DISPATCHER_CONTROL_MUTATION);
@@ -343,12 +330,11 @@ function DispatcherDashboardInner({ authReady }: { authReady: boolean }) {
     return <ErrorBanner message="Failed to load dispatcher state." onRetry={() => void refetch()} />;
   }
 
-  // `showInitialLoad` was historically `loading && !state`. After the
-  // Magic Move mirror (#2967) it also needs to cover the one-render
-  // gap between Apollo populating `data` and the useEffect flipping
-  // `renderedData`: if we render before the effect commits, `state`
-  // would be undefined even though data is ready. `data && !state`
-  // catches that frame and keeps the skeleton up.
+  // `showInitialLoad` was historically `loading && !state`. The data-mirror
+  // pattern (#2967) introduced a one-render gap between Apollo populating
+  // `data` and the useEffect flipping `renderedData`: if we render before the
+  // effect commits, `state` would be undefined even though data is ready.
+  // `data && !state` catches that frame and keeps the skeleton up.
   const showInitialLoad = (loading && !state) || (data !== undefined && !state);
 
   return (
