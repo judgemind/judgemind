@@ -702,6 +702,7 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
   const ISSUE_B = 1002;
   const ISSUE_C = 1003;
   const insertedAgentIds3001: string[] = [];
+  const fixtureCreatedAt = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
   beforeAll(async () => {
     // Insert a run for the snapshot.
@@ -716,9 +717,9 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
 
     // Insert queue snapshot with issues A, B, C.
     const issuesJson = JSON.stringify([
-      { number: ISSUE_A, title: 'Issue A (never attempted)', labels: ['priority/p2', 'agent/ready'], createdAt: '2026-04-01T00:00:00Z' },
-      { number: ISSUE_B, title: 'Issue B (running agent)', labels: ['priority/p2', 'agent/ready'], createdAt: '2026-04-01T00:00:00Z' },
-      { number: ISSUE_C, title: 'Issue C (failed, in cooldown)', labels: ['priority/p2', 'agent/ready'], createdAt: '2026-04-01T00:00:00Z' },
+      { number: ISSUE_A, title: 'Issue A (never attempted)', labels: ['priority/p2', 'agent/ready'], createdAt: fixtureCreatedAt },
+      { number: ISSUE_B, title: 'Issue B (running agent)', labels: ['priority/p2', 'agent/ready'], createdAt: fixtureCreatedAt },
+      { number: ISSUE_C, title: 'Issue C (failed, in cooldown)', labels: ['priority/p2', 'agent/ready'], createdAt: fixtureCreatedAt },
     ]);
     await pool.query(
       `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, issues_json, run_id)
@@ -834,6 +835,7 @@ describe('dispatcherQueueFull — admin (#3159)', () => {
   const READY_BASE = 31590;
   const BLOCKED_BASE = 31700;
   const COMPLETED_AGENT_BASE = `dqf-3159-${MARKER}-`;
+  const fixtureCreatedAt = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
   beforeAll(async () => {
     queueRunId = await insertRun();
@@ -844,7 +846,7 @@ describe('dispatcherQueueFull — admin (#3159)', () => {
       number: READY_BASE + i,
       title: `ready test ${i}`,
       labels: ['priority/p2', 'agent/ready'],
-      createdAt: '2026-04-01T00:00:00Z',
+      createdAt: fixtureCreatedAt,
     }));
     await pool.query(
       `INSERT INTO dispatcher.queue_snapshots
@@ -863,7 +865,7 @@ describe('dispatcherQueueFull — admin (#3159)', () => {
       number: BLOCKED_BASE + i,
       title: `blocked test ${i}`,
       labels: ['priority/p2', 'status/blocked'],
-      createdAt: '2026-04-01T00:00:00Z',
+      createdAt: fixtureCreatedAt,
       body: '',
     }));
     await pool.query(
@@ -1072,7 +1074,7 @@ describe('weeklyDiagnoserReport — admin', () => {
       detectedBy: 'scheduler',
     });
 
-    const dayTs = '2026-04-20T12:00:00Z'; // within 7 days of "now" in tests
+    const dayTs = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(); // within 7 days of now
     // Two 'retry' / 'succeeded' rows on the same day → count 2
     await insertDiagnosis({
       agentId,
