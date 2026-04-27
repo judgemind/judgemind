@@ -32,6 +32,76 @@ if not _had_database_url:
     del os.environ["DATABASE_URL"]
 
 
+class TestSampleOriginalsRecursiveChain:
+    """The originals query must use WITH RECURSIVE to walk multi-hop chains (#3537)."""
+
+    def _get_per_doc_sql(self) -> str:
+        """Return the SQL from the second execute() call (the per-doc rulings query)."""
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [("ca/contra_costa/doc_a.pdf", "bucket", "doc-a")],
+            [],
+        ]
+        cur.description = [("ruling_id",)]
+        run_spotcheck.sample_originals(cur, "Contra Costa", 1)
+        return cur.execute.call_args_list[1][0][0]
+
+    def test_query_uses_recursive_cte(self) -> None:
+        sql = self._get_per_doc_sql()
+        assert "WITH RECURSIVE" in sql, (
+            "sample_originals must use WITH RECURSIVE to walk multi-hop "
+            "previous_version_id chains (#3537)."
+        )
+
+    def test_query_recursion_joins_previous_version_id(self) -> None:
+        import re
+
+        sql = self._get_per_doc_sql()
+        normalized = re.sub(r"\s+", " ", sql).lower()
+        assert "d.id = td.previous_version_id" in normalized, (
+            "Recursive arm must join target_docs td ON d.id = td.previous_version_id "
+            "to walk each hop of the supersede chain."
+        )
+
+    def test_chain_returns_rulings_from_terminal_doc(self) -> None:
+        """A 3-doc chain A→B→C: sampling A's s3_key must surface C's ruling."""
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [("key_A", "bucket", "doc-A")],
+            [
+                (
+                    "ruling-C",
+                    "granted",
+                    None,
+                    None,
+                    None,
+                    "BC001",
+                    "Smith v Jones",
+                    "Judge Smith",
+                    150,
+                    "text preview",
+                )
+            ],
+        ]
+        cur.description = [
+            ("ruling_id",),
+            ("outcome",),
+            ("motion_type",),
+            ("hearing_date",),
+            ("department",),
+            ("case_number",),
+            ("case_title",),
+            ("judge_name",),
+            ("ruling_text_length",),
+            ("ruling_text_preview",),
+        ]
+        result = run_spotcheck.sample_originals(cur, "Contra Costa", 1)
+        assert len(result) == 1
+        original = result[0]
+        assert original["derived_count"] == 1
+        assert original["derived_rulings"][0]["ruling_id"] == "ruling-C"
+
+
 class TestSampleOriginalsFollowsPreviousVersionChain:
     """The originals query must follow ``previous_version_id`` (#2569)."""
 
