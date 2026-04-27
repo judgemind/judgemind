@@ -841,54 +841,35 @@ class IngestionWorker:
         if not ruling_text or not ruling_text.strip():
             return None
 
-        from framework.llm_enrichment import enrich_ruling
+        from framework.llm_enrichment import enrich_ruling_with_retry
 
         t0 = time.monotonic()
-        try:
-            result = enrich_ruling(
-                ruling_text,
-                provider=self._llm_provider or "google",
-                model=self._llm_model,
-                client=self._enrichment_client,
-            )
-        except Exception as exc:
-            latency_ms = round((time.monotonic() - t0) * 1000)
-            logger.warning(
-                "LLM enrichment failed — enrichment fields may be missing",
-                extra={
-                    "document_id": document_id,
-                    "enrichment_latency_ms": latency_ms,
-                    "error": str(exc),
-                },
-            )
-            return None
+        result = enrich_ruling_with_retry(
+            ruling_text,
+            provider=self._llm_provider or "google",
+            model=self._llm_model,
+            client=self._enrichment_client,
+        )
         latency_ms = round((time.monotonic() - t0) * 1000)
 
         if result is None:
-            logger.warning(
-                "LLM enrichment API call failed",
+            # LLM responded but extracted nothing (all-None fields, e.g. text
+            # too short).  Not a transient failure — return None without retry.
+            logger.info(
+                "LLM enrichment completed with empty result",
                 extra={
                     "document_id": document_id,
                     "enrichment_latency_ms": latency_ms,
                 },
             )
             return None
-
-        # Check if the result is empty (all fields None / empty)
-        has_data = (
-            result.case_title is not None
-            or result.motion_type is not None
-            or result.outcome is not None
-            or result.parties.plaintiffs
-            or result.parties.defendants
-        )
 
         logger.info(
             "LLM enrichment completed",
             extra={
                 "document_id": document_id,
                 "enrichment_latency_ms": latency_ms,
-                "has_data": has_data,
+                "has_data": True,
                 "case_title": result.case_title[:80] if result.case_title else None,
                 "motion_type": result.motion_type,
                 "outcome": result.outcome,
@@ -897,7 +878,7 @@ class IngestionWorker:
             },
         )
 
-        return result if has_data else None
+        return result
 
     @staticmethod
     def _apply_enrichment_result(

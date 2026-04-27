@@ -80,6 +80,9 @@ def _make_worker(
                 llm_client=None,
             )
 
+    # Disable enrichment so process_event tests don't trigger live LLM calls
+    # that now raise LlmEnrichmentExhaustedError (#3549).
+    worker._enrichment_client = None
     return worker, os_mock
 
 
