@@ -7536,6 +7536,455 @@ else
          "out: $(printf '%s' "$t65d_out" | grep "ralph_baseline_transition_unrecognized")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T66: #3662 — handle_push_and_pr post-fix_conflict re-rebase exit 128
+# with empty conflict files AND post-abort ahead-count 0.
+#
+# Direct sibling of #3651/PR #3657 (T65) and #3614/PR #3645 (T64). Same bug
+# class, third sibling code site:
+#
+# T64 (#3614) fixed: handle_push_and_pr rebase exits 0 + drops all commits
+#                    (post-rebase ahead-count 0).
+# T65 (#3651) fixed: handle_ralph_baseline_rebase rebase exits non-zero +
+#                    empty conflict files + post-abort ahead-count 0.
+# T66 (#3662) fixes: handle_push_and_pr rebase exits non-zero + empty
+#                    conflict files + post-abort ahead-count 0.
+#
+# This third sibling fires when a fix_conflict skill resolves real conflicts
+# and commits, then push_and_pr re-rebases against fresh origin/main, the
+# rebase exits 128, and the conflict-files list is empty (because the
+# resolution turned out to be redundant — sibling PR landed in parallel,
+# or the fix produced an empty commit). Pre-#3662 this fell through to the
+# no_unmerged_files envelope, which transition_from_push_and_pr routed to
+# the diagnoser as ``push_and_pr_no_unmerged_files`` — terminal-failing
+# the agent on a benign success and tripping the circuit breaker
+# repeatedly (#3581 hit it 6× by 2026-04-27).
+#
+# The fix: after rebase --abort, when conflict-files JSON is empty AND
+# the post-abort ahead-count is 0, emit ``{"no_op": true, ...}`` and a
+# new log event ``push_and_pr_no_unmerged_files_already_applied_post_rebase_failure``.
+# transition_from_push_and_pr (#3645) already handles ``no_op=true`` →
+# PHASE_NO_OP terminal succeeded.
+#
+# Test A (the bug): rebase exits 128, conflict-files empty, post-abort
+# ahead=0. Assert:
+#   * ``push_and_pr_no_unmerged_files_already_applied_post_rebase_failure``
+#     log emitted.
+#   * Envelope is ``{"no_op": true, ...}``.
+#   * Envelope does NOT contain ``rebase_failed`` or ``no_unmerged_files``.
+#   * ``git push`` NOT invoked.
+#   * ``gh pr create`` NOT invoked.
+# Test MUST fail against unfixed code (which always emitted the
+# rebase_failed/no_unmerged_files envelope on empty conflict files +
+# rebase rc != 0).
+#
+# Test B (real conflict regression): rebase exits 128, conflict-files
+# non-empty (real conflict). Assert envelope is the rebase_failed/
+# conflict_files shape (route to fix_conflict). Don't regress real
+# conflicts.
+#
+# Test C (post-abort still ahead — non-already-applied regression):
+# rebase exits 128, conflict-files empty, post-abort ahead=1 (rebase
+# actually failed for a non-already-applied reason — corrupt state,
+# fetch issue, etc.). Assert envelope is the OLD rebase_failed/
+# no_unmerged_files shape (route to diagnoser via the existing #3465
+# path). Don't regress the non-already-applied diagnoser route.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Reuse T64's extracted handle_push_and_pr fixture ($t64_funcs) — same
+# function under test, different code path within it. The T64 test
+# established that the extraction works; this test exercises a different
+# branch of the same function.
+if [[ -s "$t64_funcs" ]] && grep -q "^handle_push_and_pr()" "$t64_funcs"; then
+    pass "#3662 T66 setup — handle_push_and_pr fixture (from T64) is available"
+else
+    fail "#3662 T66 setup — handle_push_and_pr fixture (from T64) is available" \
+         "fixture missing or empty: $t64_funcs"
+fi
+
+# Per-test runner. Drives handle_push_and_pr into the rebase-rc=128
+# empty-conflicts path. Stub control via env vars:
+#   T66_REV_LIST_PRE   — count returned for the FIRST rev-list call
+#                        (pre-rebase #3039 guardrail). Default 1.
+#   T66_REV_LIST_POST  — count for the SECOND rev-list call (the new
+#                        #3662 post-abort ahead check). Default 0
+#                        (commits already in baseline).
+#   T66_DIFF_FILES     — content for ``git diff --name-only --diff-
+#                        filter=U`` stdout. Default empty (no conflict
+#                        files). Set to file paths to simulate a real
+#                        conflict.
+#   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
+#                        Default 128 (the failure case under test).
+run_t66_push_pr_test() {
+    _test_id="$1"
+    shift
+
+    _tworkspace="$TEST_TMP/${_test_id}-workspace"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_tworkspace" "$_trepo" "$_tstate" "$_tbin"
+    mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
+
+    # rev-list counter file — alternates pre-rebase / post-abort responses.
+    printf '0\n' > "$_tstate/rev-list-call-count.txt"
+
+    # Stage the diff-files stdout for the conflict-files capture step.
+    # T66_DIFF_FILES is passed as a KEY=VAL ``env`` arg in "$@" (mirrors
+    # T64's parameterisation pattern) so it isn't set as a regular bash
+    # var here. Parse it out of the args explicitly so the file content
+    # matches the env value the entrypoint will see.
+    _t66_diff_files=""
+    for _a in "$@"; do
+        case "$_a" in
+            T66_DIFF_FILES=*) _t66_diff_files="${_a#T66_DIFF_FILES=}" ;;
+        esac
+    done
+    printf '%s' "$_t66_diff_files" > "$_tstate/diff-files-output.txt"
+
+    cat > "$_tbin/git" <<'T66GITEOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -C) shift 2 || true; continue ;;
+        *) break ;;
+    esac
+done
+
+sub="${1:-}"
+case "$sub" in
+    rev-list)
+        _counter_file="${T_STATE_DIR}/rev-list-call-count.txt"
+        _n=$(cat "$_counter_file" 2>/dev/null || printf '0')
+        _next=$((_n + 1))
+        printf '%s\n' "$_next" > "$_counter_file"
+        if [[ "$_n" == "0" ]]; then
+            printf '%s\n' "${T66_REV_LIST_PRE:-1}"
+        else
+            printf '%s\n' "${T66_REV_LIST_POST:-0}"
+        fi
+        exit 0
+        ;;
+    fetch)
+        exit "${GIT_FETCH_EXIT:-0}"
+        ;;
+    rebase)
+        for _arg in "$@"; do
+            if [[ "$_arg" == "--abort" ]]; then exit 0; fi
+        done
+        exit "${GIT_REBASE_EXIT:-128}"
+        ;;
+    diff)
+        # ``git diff --name-only --diff-filter=U`` for conflict files.
+        for _a in "$@"; do
+            if [[ "$_a" == "--diff-filter=U" ]]; then
+                cat "${T_STATE_DIR}/diff-files-output.txt"
+                exit 0
+            fi
+        done
+        # ``git diff <merge-base>..ORIG_HEAD`` for original-patch capture.
+        exit 0
+        ;;
+    push)
+        exit "${GIT_PUSH_EXIT:-0}"
+        ;;
+    commit)
+        exit "${GIT_COMMIT_EXIT:-0}"
+        ;;
+    rev-parse|merge-base)
+        printf 'deadbeefcafe\n'
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+T66GITEOF
+    chmod +x "$_tbin/git"
+
+    cat > "$_tbin/gh" <<'T66GHEOF'
+#!/usr/bin/env bash
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
+if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+    printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+fi
+exit "${GH_EXIT:-0}"
+T66GHEOF
+    chmod +x "$_tbin/gh"
+
+    cat > "$_tbin/psql" <<'T66PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
+exit 0
+T66PSQLEOF
+    chmod +x "$_tbin/psql"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_tbin/jq"
+    fi
+
+    set +e
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        PATH="$_tbin:$PATH" \
+        AGENT_ID="${_test_id}-dead-beef-cafe-000000000099" \
+        ISSUE_NUMBER="3662" \
+        AGENT_WORKSPACE="$_tworkspace" \
+        REPO_ROOT="$_trepo" \
+        BRANCH_NAME="agent/${_test_id}abcd" \
+        DATABASE_URL="postgres://test" \
+        AGENT_RUNNER_DRY_RUN="0" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            # shellcheck disable=SC1090
+            . "'"$t64_funcs"'"
+            handle_push_and_pr
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    T66_TEST_RC="$_trc"
+    T66_TEST_OUT="$_tout"
+    T66_TEST_STATE="$_tstate"
+}
+
+# ── Sub-test A: rebase rc=128 + empty conflict files + post-abort ahead=0 ──
+#   Expect: no_op envelope, new log event, NO push, NO PR create.
+
+run_t66_push_pr_test "t66a" \
+    T66_REV_LIST_PRE=1 T66_REV_LIST_POST=0 \
+    T66_DIFF_FILES="" \
+    GIT_REBASE_EXIT=128
+
+if [[ "$T66_TEST_RC" -eq 0 ]]; then
+    pass "#3662 T66A — handle_push_and_pr exits 0 on empty-conflicts post-rebase-failure already-applied"
+else
+    fail "#3662 T66A — handle_push_and_pr exits 0 on empty-conflicts post-rebase-failure already-applied" \
+         "rc=$T66_TEST_RC, output: $T66_TEST_OUT"
+fi
+
+# CRITICAL — new log event must be emitted (the behavioural fingerprint
+# of the fix). Distinct from push_and_pr_no_unmerged_files_already_applied
+# (which is the rebase-rc=0 path from #3614) and from the terminal-fail
+# event push_and_pr_no_unmerged_files (the existing #3465 diagnoser path
+# that we explicitly do NOT take here).
+if printf '%s' "$T66_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3662 T66A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted"
+else
+    fail "#3662 T66A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted" \
+         "output: $T66_TEST_OUT"
+fi
+
+# CRITICAL — envelope must be {"no_op": true, ...}.
+if printf '%s' "$T66_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3662 T66A — envelope is {\"no_op\": true, ...} on already-applied path"
+else
+    fail "#3662 T66A — envelope is {\"no_op\": true, ...} on already-applied path" \
+         "output: $T66_TEST_OUT"
+fi
+
+# CRITICAL — envelope must NOT carry rebase_failed=true. Pre-#3662 the
+# code emitted ``{"rebase_failed": true, "no_unmerged_files": true, ...}``
+# which transition_from_push_and_pr routed to the diagnoser as a
+# terminal-failure. The new path emits ``{"no_op": true, ...}`` which
+# routes to PHASE_NO_OP terminal succeeded. Mutually exclusive.
+if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3662 T66A — envelope does NOT carry rebase_failed=true on already-applied path"
+else
+    fail "#3662 T66A — envelope does NOT carry rebase_failed=true on already-applied path" \
+         "output: $T66_TEST_OUT"
+fi
+
+# CRITICAL — envelope must NOT carry no_unmerged_files=true. Same
+# mutually-exclusive reason as above.
+if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
+    pass "#3662 T66A — envelope does NOT carry no_unmerged_files=true on already-applied path"
+else
+    fail "#3662 T66A — envelope does NOT carry no_unmerged_files=true on already-applied path" \
+         "output: $T66_TEST_OUT"
+fi
+
+# CRITICAL — function must NOT have invoked ``git push``. The empty diff
+# means there's nothing to push; falling through to push would attempt
+# a push the daemon would then reap as push_and_pr_no_unmerged_files.
+if ! grep -qE "CALL .*\\bpush\\b" "$T66_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3662 T66A — git push NOT invoked on already-applied post-rebase-failure"
+else
+    fail "#3662 T66A — git push NOT invoked on already-applied post-rebase-failure" \
+         "git-log: $(cat "$T66_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# CRITICAL — function must NOT have invoked ``gh pr create``. With no
+# diff there's no PR to open.
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T66_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3662 T66A — gh pr create NOT invoked on already-applied post-rebase-failure"
+else
+    fail "#3662 T66A — gh pr create NOT invoked on already-applied post-rebase-failure" \
+         "gh-log: $(cat "$T66_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# Two rev-list calls: pre-rebase #3039 guardrail + new #3662 post-abort
+# ahead-count check. Pre-#3662 there was only one rev-list call on this
+# code path (the pre-rebase guardrail) — the second call is the
+# behavioural fingerprint of the fix.
+if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
+    _t66a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T66_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t66a_rev_list_calls" == "2" ]]; then
+        pass "#3662 T66A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
+    else
+        fail "#3662 T66A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
+             "found $_t66a_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
+    fi
+fi
+
+# ── Sub-test B: rebase rc=128 + non-empty conflict files (real conflict) ──
+#   Expect: rebase_failed/conflict_files envelope (route to fix_conflict).
+
+run_t66_push_pr_test "t66b" \
+    T66_REV_LIST_PRE=1 T66_REV_LIST_POST=1 \
+    T66_DIFF_FILES="packages/api/foo.py
+packages/scraper-framework/bar.py" \
+    GIT_REBASE_EXIT=128
+
+if [[ "$T66_TEST_RC" -eq 0 ]]; then
+    pass "#3662 T66B — handle_push_and_pr exits 0 on real-conflict path"
+else
+    fail "#3662 T66B — handle_push_and_pr exits 0 on real-conflict path" \
+         "rc=$T66_TEST_RC, output: $T66_TEST_OUT"
+fi
+
+# Real conflict envelope must carry conflict_files (routes to fix_conflict).
+if printf '%s' "$T66_TEST_OUT" | grep -qE '"conflict_files":[[:space:]]*\[.*"packages/api/foo\.py".*\]'; then
+    pass "#3662 T66B — real-conflict envelope carries conflict_files (routes to fix_conflict)"
+else
+    fail "#3662 T66B — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Real conflict envelope must carry rebase_failed=true (this is the
+# #3225 path — fix_conflict skill consumes the envelope).
+if printf '%s' "$T66_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3662 T66B — real-conflict envelope carries rebase_failed=true"
+else
+    fail "#3662 T66B — real-conflict envelope carries rebase_failed=true" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Real conflict envelope must NOT be no_op.
+if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3662 T66B — real-conflict envelope is NOT {\"no_op\": true}"
+else
+    fail "#3662 T66B — real-conflict envelope is NOT {\"no_op\": true}" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Real conflict path must NOT emit the new already-applied log event.
+if ! printf '%s' "$T66_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3662 T66B — already-applied-post-rebase-failure log NOT emitted on real-conflict path"
+else
+    fail "#3662 T66B — already-applied-post-rebase-failure log NOT emitted on real-conflict path" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Real conflict path must NOT call rev-list a second time (the post-abort
+# check is only reached when conflict_files_json is empty). Exactly one
+# call (the pre-rebase #3039 guardrail).
+if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
+    _t66b_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T66_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t66b_rev_list_calls" == "1" ]]; then
+        pass "#3662 T66B — git rev-list invoked exactly once (post-abort check skipped on real conflict)"
+    else
+        fail "#3662 T66B — git rev-list invoked exactly once (post-abort check skipped on real conflict)" \
+             "found $_t66b_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
+    fi
+fi
+
+# ── Sub-test C: rebase rc=128 + empty conflict files + post-abort ahead=1 ──
+#   The rebase actually failed for a non-already-applied reason — must
+#   preserve the existing #3465 route_to_diagnoser path. Don't regress.
+
+run_t66_push_pr_test "t66c" \
+    T66_REV_LIST_PRE=1 T66_REV_LIST_POST=1 \
+    T66_DIFF_FILES="" \
+    GIT_REBASE_EXIT=128
+
+if [[ "$T66_TEST_RC" -eq 0 ]]; then
+    pass "#3662 T66C — handle_push_and_pr exits 0 on empty-conflicts + still-ahead path"
+else
+    fail "#3662 T66C — handle_push_and_pr exits 0 on empty-conflicts + still-ahead path" \
+         "rc=$T66_TEST_RC, output: $T66_TEST_OUT"
+fi
+
+# Still-ahead path must emit the OLD rebase_failed/no_unmerged_files
+# envelope (the existing #3465 route_to_diagnoser path).
+if printf '%s' "$T66_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3662 T66C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)"
+else
+    fail "#3662 T66C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)" \
+         "output: $T66_TEST_OUT"
+fi
+
+if printf '%s' "$T66_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
+    pass "#3662 T66C — still-ahead envelope carries no_unmerged_files=true"
+else
+    fail "#3662 T66C — still-ahead envelope carries no_unmerged_files=true" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Still-ahead path must NOT emit the new already-applied event.
+if ! printf '%s' "$T66_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3662 T66C — already-applied-post-rebase-failure log NOT emitted on still-ahead path"
+else
+    fail "#3662 T66C — already-applied-post-rebase-failure log NOT emitted on still-ahead path" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Still-ahead path must NOT be a no_op envelope.
+if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3662 T66C — still-ahead envelope is NOT {\"no_op\": true}"
+else
+    fail "#3662 T66C — still-ahead envelope is NOT {\"no_op\": true}" \
+         "output: $T66_TEST_OUT"
+fi
+
+# Still-ahead path must NOT invoke git push or gh pr create — the
+# entrypoint returns early after emitting the diagnoser-route envelope.
+if ! grep -qE "CALL .*\\bpush\\b" "$T66_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3662 T66C — git push NOT invoked on still-ahead diagnoser-route path"
+else
+    fail "#3662 T66C — git push NOT invoked on still-ahead diagnoser-route path" \
+         "git-log: $(cat "$T66_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T66_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3662 T66C — gh pr create NOT invoked on still-ahead diagnoser-route path"
+else
+    fail "#3662 T66C — gh pr create NOT invoked on still-ahead diagnoser-route path" \
+         "gh-log: $(cat "$T66_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# Still-ahead path runs the new post-abort rev-list check (the fix
+# unconditionally probes ahead-count when conflict_files_json is empty).
+# Behavioural fingerprint that the new code path is exercised.
+if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
+    _t66c_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T66_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t66c_rev_list_calls" == "2" ]]; then
+        pass "#3662 T66C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
+    else
+        fail "#3662 T66C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
+             "found $_t66c_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
+    fi
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
