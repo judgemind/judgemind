@@ -95,53 +95,48 @@ class TestNoRouteStubInExecutableLines:
         )
 
 
-class TestRalphNotShipLocalHandlerExists:
-    """Issue #3455 — the new handler that handles ``ralph_not_ship``
-    locally instead of routing to the diagnoser."""
+class TestRalphNotShipDescriptiveTerminal:
+    """Issue #3586 — ``ralph_not_ship`` is now routed through the
+    diagnoser via the descriptive-terminal path (BYPASSED_TERMINAL_PHASES_TO_ROUTE),
+    not handled locally by the defunct ``handle_ralph_not_ship_local``
+    function from #3455."""
 
-    def test_handle_ralph_not_ship_local_function_defined(self) -> None:
+    def test_handle_ralph_not_ship_local_function_not_defined(self) -> None:
+        """The local handler must be gone — #3586 removed it."""
         text = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
-        # Match the function definition opening — ``handle_ralph_not_ship_local() {``.
-        assert re.search(
+        assert not re.search(
             r"^handle_ralph_not_ship_local\s*\(\s*\)\s*\{",
             text,
             re.MULTILINE,
-        ), "handle_ralph_not_ship_local function not defined"
+        ), (
+            "handle_ralph_not_ship_local function must not be defined (#3586 removed it)"
+        )
 
-    def test_handler_posts_comment_with_block_reason(self) -> None:
+    def test_route_to_diagnoser_dispatches_ralph_not_ship_as_descriptive_terminal(
+        self,
+    ) -> None:
+        """Verify the ``ralph_not_ship)`` case arm now calls
+        ``agent_runner_reaped_failure "ralph_not_ship"`` directly
+        (descriptive-terminal path) rather than the local handler."""
         text = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
-        # The handler body should reference both gh issue comment + the
-        # block_reason it relays.
-        assert "gh issue comment" in text
-        assert "block_reason" in text
-        # And it should add status/blocked + remove agent/ready.
-        assert "--add-label status/blocked" in text
-        assert "--remove-label agent/ready" in text
-
-    def test_handler_emits_ralph_not_ship_terminal(self) -> None:
-        text = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
-        # The handler should call agent_runner_reaped_failure with
-        # the ``ralph_not_ship`` terminal phase.
+        # The case arm should call agent_runner_reaped_failure with
+        # "ralph_not_ship" as the phase arg — no handle_ralph_not_ship_local call.
         assert re.search(
-            r'agent_runner_reaped_failure\s*\\?\s*\n?\s*"ralph_not_ship"',
+            r'agent_runner_reaped_failure\s*\\\s*\n\s*"ralph_not_ship"',
             text,
-        ), "handler must emit `ralph_not_ship` terminal via agent_runner_reaped_failure"
+        ), (
+            "ralph_not_ship case arm must emit descriptive terminal via "
+            'agent_runner_reaped_failure "ralph_not_ship" (#3586)'
+        )
 
-    def test_route_to_diagnoser_dispatches_ralph_not_ship_locally(self) -> None:
-        """Verify the case-block in the post-claude dispatch arm calls
-        the local handler for ``ralph_not_ship`` (not advance_phase to
-        agent_runner_route_stub)."""
-        text = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
-        # Look for the ``ralph_not_ship)`` case arm calling
-        # ``handle_ralph_not_ship_local``.
-        m = re.search(
-            r"ralph_not_ship\)\s*\n\s*log\b[^\n]*\n\s*handle_ralph_not_ship_local",
-            text,
-        )
-        assert m is not None, (
-            "route_to_diagnoser case arm should dispatch `ralph_not_ship` to "
-            "handle_ralph_not_ship_local (not route_stub)"
-        )
+    def test_ralph_not_ship_case_arm_not_calling_local_handler(self) -> None:
+        """Double-check: the ralph_not_ship case arm must NOT call
+        handle_ralph_not_ship_local anywhere in executable code."""
+        for lineno, line in _executable_lines():
+            assert "handle_ralph_not_ship_local" not in line, (
+                f"handle_ralph_not_ship_local found in executable code at L{lineno} "
+                "(#3586 removed this function)"
+            )
 
 
 class TestReapedFailureExitsUnconditionally:

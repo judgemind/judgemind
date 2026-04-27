@@ -225,7 +225,19 @@ If the conflict is structural (semantic collision — function rewritten on main
 
 ### Per-category guidance — `agent_runner_route_stub` (#3366) — historical
 
-Pre-#3455 the agent-runner entrypoint hit a transition shape it didn't know how to route (often `ralph_not_ship` — ralph terminated with a non-SHIP verdict) and emitted `agent_runner_route_stub`. Post-#3455 those fall-throughs are eliminated — the entrypoint emits descriptive terminal phases (`ralph_baseline_transition_unrecognized`, `push_and_pr_transition_unrecognized`, `phase_unknown_<phase>`, etc.) via `agent_runner_reaped_failure`, and `ralph_not_ship` is handled locally (post comment + add `status/blocked`) without bouncing to the diagnoser. If you do see an `agent_runner_route_stub` row in the wild, that's a pre-#3455 agent or a regression — read `context.details.route_hint`, the agent's commits (`git log --oneline origin/main..HEAD`), and the latest reviewer feedback (`{worktree}/tmp/ralph/*-feedback.md` if present), and route to `retry_with_hint` (write a hint, set `next_directive=respawn_at=ralph` if you reset the agent's commits, otherwise `terminal`) or to the inline-#3455 `terminal` shape with `action_taken="block_and_comment"`.
+Pre-#3455 the agent-runner entrypoint hit a transition shape it didn't know how to route (often `ralph_not_ship` — ralph terminated with a non-SHIP verdict) and emitted `agent_runner_route_stub`. Post-#3455 those fall-throughs are eliminated — the entrypoint emits descriptive terminal phases (`ralph_baseline_transition_unrecognized`, `push_and_pr_transition_unrecognized`, `phase_unknown_<phase>`, etc.) via `agent_runner_reaped_failure`. Post-#3586 `ralph_not_ship` is routed through the diagnoser (see below). If you do see an `agent_runner_route_stub` row in the wild, that's a pre-#3455 agent or a regression — read `context.details.route_hint`, the agent's commits (`git log --oneline origin/main..HEAD`), and the latest reviewer feedback (`{worktree}/tmp/ralph/*-feedback.md` if present), and route to `retry_with_hint` (write a hint, set `next_directive=respawn_at=ralph` if you reset the agent's commits, otherwise `terminal`) or to the inline-#3455 `terminal` shape with `action_taken="block_and_comment"`.
+
+### Per-category guidance — `ralph_not_ship` (#3586)
+
+Routed here when ralph terminated with a non-SHIP verdict (typically `BLOCKED` — the implementation cannot proceed without a prerequisite). The agent-runner passes ralph's `block_reason` as the third arg to `agent_runner_reaped_failure`, so `context.details.stderr_tail` carries the block_reason verbatim. The ralph phase_outputs row (if present) also surfaces `verdict`, `iterations_used`, and `block_reason` via `context.details`.
+
+**Typical actions based on block_reason content:**
+
+- **`file_prerequisite_task`** — when the block_reason names a missing dependency, external prerequisite, or upstream issue that must land first. File a `type/task` issue for the prerequisite, then write `next_directive=terminal` with `action_taken="file_prerequisite_task"` and a `block_issued_number` in the directive. The daemon will `block_and_comment` automatically.
+- **`block_and_comment`** — when the block is in operator territory (ambiguous AC, product decision needed, requires human judgment). Post an informative comment on the issue, add `status/blocked`, remove `agent/ready`. Write `next_directive=terminal` with `action_taken="block_and_comment"`.
+- **`close`** — when the issue is stale, the block_reason reveals the task is a NOOP (already done, unreachable by design), or AC cannot be satisfied by any reasonable implementation. Write `next_directive=terminal` with `action_taken="close"`.
+- **`escalate`** — when the block_reason is ambiguous and you cannot determine the right action. Write `next_directive=terminal` with `action_taken="escalate"`.
+- **inline-#3455 `terminal` shape** — for any of the above, prefer `action="terminal"` with a descriptive `action_taken` + `summary` so the diagnoser collapses the executor layer rather than delegating back to the daemon.
 
 ### Per-category guidance — AC-infeasibility (#3010)
 

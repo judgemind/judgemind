@@ -1362,13 +1362,11 @@ FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
 #: ``advance_with_status`` (terminal status), not ``route_to_diagnoser``,
 #: so the daemon has its own explicit handling for it.
 #:
-#: ``ralph_not_ship`` is intentionally NOT in this map. Issue #3455
-#: handles that hint locally in the agent-runner entrypoint
-#: (``handle_ralph_not_ship_local``) — ralph already wrote a structured
-#: ``block_reason`` and the diagnoser doesn't add value there. The
-#: terminal phase still reads ``ralph_not_ship`` for operator visibility,
-#: but no diagnoser is invoked. Same shape as ``conflict_unresolvable``
-#: legacy treatment minus the routing.
+#: ``ralph_not_ship`` was intentionally NOT in this map (issue #3455 /
+#: local handler). Issue #3586 reverses that decision: the diagnoser
+#: CAN add value — ``file_prerequisite_task``, ``block_and_comment``,
+#: ``close``, or ``escalate`` based on the ``block_reason`` ralph
+#: surfaced — so we now route it through the same bypass-terminal sweep.
 BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "conflict_unresolvable": FAILURE_CATEGORY_CONFLICT_UNRESOLVABLE,
     "agent_runner_route_stub": FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
@@ -1383,6 +1381,9 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
     # #3507 — operational skill returned failed/unrecognized verdict.
     "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
+    # #3586 — ralph returned non-SHIP verdict; diagnoser takes over from
+    # the former local handler so it can file prereqs / close / escalate.
+    "ralph_not_ship": FAILURE_CATEGORY_RALPH_NOT_SHIP,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's
@@ -12269,6 +12270,44 @@ class DispatcherDaemon:
                         ):
                             if key in raw:
                                 details[key] = raw[key]
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+
+        if terminal_phase == "ralph_not_ship":
+            # #3586 — pull the ralph phase_outputs row to surface
+            # verdict, iterations_used, and block_reason for the
+            # diagnoser. The entrypoint passes block_reason as the
+            # third arg to agent_runner_reaped_failure (written to the
+            # terminal-phase row's ``reason`` field above), but the
+            # ralph row has the full structured output.
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT output_json FROM dispatcher.phase_outputs "
+                        "WHERE agent_id = %s AND phase = 'ralph' "
+                        "ORDER BY ts DESC LIMIT 1",
+                        (agent_id,),
+                    )
+                    row = cur.fetchone()
+                self._conn.commit()
+                if row is not None and row[0] is not None:
+                    raw = row[0]
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except json.JSONDecodeError:
+                            raw = {}
+                    if isinstance(raw, dict):
+                        for key in ("verdict", "iterations_used", "block_reason"):
+                            if key in raw:
+                                details[key] = raw[key]
+                        # Ensure block_reason also surfaces as stderr_tail
+                        # so diagnoser §Step 1 verbatim-quote rule applies.
+                        if "block_reason" in raw and "stderr_tail" not in details:
+                            details["stderr_tail"] = raw["block_reason"]
             except Exception:
                 try:
                     self._conn.rollback()
