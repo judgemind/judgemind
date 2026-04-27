@@ -90,7 +90,20 @@ def sample_originals(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
 
     originals = []
     for s3_key, s3_bucket, doc_id in sampled_docs:
+        # A naive ``WHERE d.s3_key = <key>`` misses rulings when the queried
+        # S3 key is a content-hash-dedup *loser* (#2569): the loser's document
+        # row is marked superseded with its rulings deleted, while the actual
+        # rulings for those cases live on the *winner*'s document (a different
+        # s3_key).  Follow ``documents.previous_version_id`` so either the
+        # winner or the loser key surfaces the canonical rulings.  Mirrors the
+        # CTE pattern in ``scripts/spotcheck/fetch.py`` ``OriginalsStrategy``.
         cur.execute("""
+            WITH target_docs AS (
+                SELECT id FROM documents WHERE s3_key = %s
+                UNION
+                SELECT previous_version_id AS id FROM documents
+                WHERE s3_key = %s AND previous_version_id IS NOT NULL
+            )
             SELECT r.id::text AS ruling_id, r.outcome::text,
                    r.motion_type, r.hearing_date::text, r.department,
                    cs.case_number, cs.case_title,
@@ -98,12 +111,11 @@ def sample_originals(cur: psycopg.Cursor, county: str, n: int) -> list[dict]:
                    length(r.ruling_text) AS ruling_text_length,
                    left(r.ruling_text, 300) AS ruling_text_preview
             FROM rulings r
-            JOIN documents d ON r.document_id = d.id
+            JOIN target_docs td ON r.document_id = td.id
             JOIN cases cs ON r.case_id = cs.id
             LEFT JOIN judges j ON r.judge_id = j.id
-            WHERE d.s3_key = %s
             ORDER BY r.id
-        """, (s3_key,))
+        """, (s3_key, s3_key))
         cols = [desc[0] for desc in cur.description]
         derived = [dict(zip(cols, row)) for row in cur.fetchall()]
 
