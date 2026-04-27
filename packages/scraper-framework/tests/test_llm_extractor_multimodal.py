@@ -2869,6 +2869,100 @@ class TestExtractSinglePageRetry:
         # Page 1 succeeded, page 2 failed — should still get page 1 results.
         assert len(rulings) == 1
 
+    def test_extract_from_pdf_retry_exhausted_partial_page_does_not_poison_cache(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """Partial page failure after retry exhaustion must NOT write result to cache (#3517).
+
+        When one page exhausts retries and returns [], the cache must NOT be
+        written with the partial result. Caching a partial extraction poisons
+        subsequent reads — future callers see an incomplete ruling set with
+        UNKNOWN-prefixed case numbers for cases that appeared on the failed page.
+        """
+        from unittest.mock import MagicMock
+
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.01
+        ext._max_retries = 1
+
+        # Wire up a cache mock.
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None  # No cached result.
+        ext._cache = mock_cache
+
+        page1_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
+        # Page 1 succeeds, page 2 fails (returns None from the API).
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[
+                    (b"\x89PNG_page1", "image/png"),
+                    (b"\x89PNG_page2", "image/png"),
+                ],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[page1_response, None],
+            ),
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        # We still get page 1's results.
+        assert len(rulings) == 1
+        # The cache must NOT have been written — a partial result must not be cached.
+        mock_cache.put.assert_not_called()
+
+    def test_extract_from_pdf_retry_all_pages_success_writes_cache(
+        self, sample_pdf_bytes: bytes
+    ) -> None:
+        """When all pages succeed after retry, the result IS written to cache (#3517).
+
+        Confirms the fix does not break the normal cache-write path.
+        """
+        from unittest.mock import MagicMock
+
+        with patch.object(anthropic, "Anthropic"):
+            ext = LlmExtractor(api_key="test-key")
+        ext._base_delay = 0.01
+        ext._max_retries = 1
+
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        ext._cache = mock_cache
+
+        page1_response = _make_llm_response(SINGLE_PAGE_ROWS_JSON)
+        page2_response = _make_llm_response(
+            json.dumps(
+                [
+                    {
+                        "entry_number": 2,
+                        "case_info": "2024-00567890 Garcia v. State Farm",
+                        "ruling_text": "The motion is GRANTED.",
+                    }
+                ]
+            )
+        )
+        with (
+            patch(
+                "framework.llm_extractor._render_pdf_pages",
+                return_value=[
+                    (b"\x89PNG_page1", "image/png"),
+                    (b"\x89PNG_page2", "image/png"),
+                ],
+            ),
+            patch(
+                "ingestion.llm_providers.call_llm_with_images",
+                side_effect=[page1_response, page2_response],
+            ),
+        ):
+            rulings = ext.extract_from_pdf(sample_pdf_bytes)
+
+        # Both pages succeeded — two rulings extracted.
+        assert len(rulings) == 2
+        # The cache MUST have been written (complete result).
+        mock_cache.put.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _build_user_message_for_page
