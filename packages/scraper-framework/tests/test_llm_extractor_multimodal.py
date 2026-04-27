@@ -910,6 +910,42 @@ class TestJoinPageRows:
         """Empty row list returns empty ruling list."""
         assert _join_page_rows([]) == []
 
+    def test_join_page_rows_populates_entry_number(self) -> None:
+        """_join_page_rows sets entry_number on each ExtractedRuling (#3608).
+
+        Verifies that the calendar line number from each row is stored in the
+        resulting ExtractedRuling so the cache-hit resolver can use it.
+        """
+        rows = [
+            {
+                "entry_number": 1,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": "The demurrer is OVERRULED. Plaintiff's claim survives.",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Gamma v. Delta",
+                "ruling_text": "Motion for summary judgment is DENIED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].entry_number == 1
+        assert rulings[1].entry_number == 2
+
+    def test_join_page_rows_no_entry_number_stays_none(self) -> None:
+        """Rows without entry_number produce rulings with entry_number=None."""
+        rows = [
+            {
+                "entry_number": None,
+                "case_info": "2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED. The motion is approved.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].entry_number is None
+
     def test_case_info_merging_for_continuation(self) -> None:
         """Continuation case_info is appended to previous case."""
         rows = [
@@ -3457,6 +3493,41 @@ class TestResolveCrossReferences:
         ]
         entry_map = {1: 0}
         result = _resolve_cross_references(rulings, entry_map)
+        assert result[0].ruling_text == "See Line 1 for tentative ruling."
+        assert result[0].cross_reference_source is None
+
+    def test_resolves_from_per_ruling_entry_numbers(self) -> None:
+        """entry_number_to_index=None builds the map from per-ruling entry_number fields.
+
+        This is the cache-hit path (#3608): cached ExtractedRuling[] carry
+        entry_number but there's no pre-join row state to pass an explicit map.
+        Resolution must match the behaviour of the fresh-extract path.
+        """
+        long_text = "The motion is GRANTED. " * 10  # > 100 chars
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="2024-00001",
+                ruling_text=long_text,
+                entry_number=1,
+            ),
+            ExtractedRuling(
+                extracted_case_number="2024-00002",
+                ruling_text="See Line 1 for tentative ruling.",
+                entry_number=2,
+            ),
+        ]
+        # Pass entry_number_to_index=None — resolver must build the map itself.
+        result = _resolve_cross_references(rulings, None)
+        assert result[1].ruling_text == long_text
+        assert result[1].cross_reference_source == 1
+
+    def test_none_map_no_entry_numbers_no_crash(self) -> None:
+        """entry_number_to_index=None with no entry_number fields is a no-op."""
+        rulings = [
+            self._make_ruling("2024-00001", "See Line 1 for tentative ruling."),
+        ]
+        # No entry_number on any ruling → empty map → no resolution.
+        result = _resolve_cross_references(rulings, None)
         assert result[0].ruling_text == "See Line 1 for tentative ruling."
         assert result[0].cross_reference_source is None
 

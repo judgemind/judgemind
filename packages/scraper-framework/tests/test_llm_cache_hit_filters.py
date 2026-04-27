@@ -194,6 +194,52 @@ class TestApplyPdfCacheHitFilters:
         """Empty input yields empty output."""
         assert _apply_pdf_cache_hit_filters([], content_key="abc123def456") == []
 
+    def test_resolve_cross_references_on_cache_hit(self) -> None:
+        """_apply_pdf_cache_hit_filters resolves stub rulings via entry_number (#3608).
+
+        Simulates the Santa Clara cache-hit scenario: two cached ExtractedRuling
+        objects where the stub (entry_number=2) points to the target
+        (entry_number=1) via "See Line 1 below for...".  Without the fix, the
+        resolver was not called on the cache-hit path and the stub persisted.
+        """
+        target_text = (
+            "The demurrer is OVERRULED. Defendant's motion to dismiss is DENIED. "
+            "Plaintiff has adequately stated a claim for breach of contract and "
+            "the Court finds the allegations sufficient to survive demurrer. "
+            "Defendant shall file an answer within twenty (20) days of this ruling."
+        )
+        stub_text = (
+            "**Order on Defendants' Demurrer to the Fifth Cause of Action**\n\n"
+            "See Line 1 below for complete tentative ruling."
+        )
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="20CV374597",
+                extracted_case_title="Regional Medical v. County of SC",
+                ruling_text=target_text,
+                entry_number=1,
+            ),
+            ExtractedRuling(
+                extracted_case_number="20CV374598",
+                extracted_case_title="Doe v. County of SC",
+                ruling_text=stub_text,
+                entry_number=2,
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+
+        # Both rulings survive (neither is a calendar listing or short text).
+        assert len(result) == 2
+
+        # Stub (index 1) must have been resolved: ruling_text replaced with
+        # the target's text and cross_reference_source set to 1.
+        assert result[1].ruling_text == target_text
+        assert result[1].cross_reference_source == 1
+
+        # Target (index 0) is unchanged.
+        assert result[0].ruling_text == target_text
+        assert result[0].cross_reference_source is None
+
 
 class TestApplyTextCacheHitFilters:
     """Unit tests for ``_apply_text_cache_hit_filters`` (#2513)."""
