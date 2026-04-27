@@ -116,7 +116,7 @@ if [[ "$PKG_TYPE" == "python" ]]; then
     # Run tests to generate coverage (unless --skip-tests)
     if [[ "$SKIP_TESTS" == "false" ]]; then
         echo "Running pytest with coverage for $PACKAGE..." >&2
-        if ! "$PYTEST" "$PKG_DIR/tests/" -x -q --tb=line 2>&1; then
+        if ! (cd "$PKG_DIR" && "$PYTEST" tests/ -x -q --tb=line) 2>&1; then
             echo "" >&2
             echo "FAILED: Tests failed for $PACKAGE. Fix tests before checking diff coverage." >&2
             exit 1

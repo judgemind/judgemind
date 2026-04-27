@@ -250,17 +250,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             # it just must not run at the same time as pytest-cov.)
             testmon_flag=""
             xdist_flag=""
-            if ! run_check "$pkg" "pytest" "$pkg_dir/.venv/bin/pytest" $testmon_flag $xdist_flag "$pkg_dir/tests/" -x -q --tb=line; then
-                echo "  Run: $pkg_dir/.venv/bin/pytest $pkg_dir/tests/ -v --tb=short" >&2
+            if ! run_check "$pkg" "pytest" bash -c "cd $(printf '%q' "$pkg_dir") && ./.venv/bin/pytest $testmon_flag $xdist_flag tests/ -x -q --tb=line"; then
+                echo "  Run: cd $pkg_dir && ./.venv/bin/pytest tests/ -v --tb=short" >&2
                 failures=$((failures + 1))
             fi
-            # pytest-cov writes coverage.xml relative to CWD (the repo root
-            # when run from the hook), not relative to the package rootdir.
-            # Sync it to the package dir so the coverage floor check below
-            # reads the fresh file instead of a stale one from a prior run.
-            if [ -f "coverage.xml" ] && [ "coverage.xml" -nt "$pkg_dir/coverage.xml" ] 2>/dev/null; then
-                cp "coverage.xml" "$pkg_dir/coverage.xml"
-            fi
+            # pytest-cov writes coverage.xml relative to CWD. Running pytest
+            # with CWD = pkg_dir ensures coverage.xml lands in pkg_dir, where
+            # the coverage floor check below expects it.
         else
             echo "  WARNING: pytest not found for $pkg — skipping tests" >&2
             echo "  Install with: $pkg_dir/.venv/bin/pip install -e '.[dev]'" >&2
