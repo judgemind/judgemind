@@ -129,6 +129,7 @@ class TestBypassedTerminalConstants:
         # locally by the entrypoint.
         from dispatcher.daemon import (
             FAILURE_CATEGORY_FIX_CI_BLOCKED,
+            FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
             FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
             FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
@@ -144,6 +145,7 @@ class TestBypassedTerminalConstants:
             "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
             "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
+            "summary_output_incomplete": FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
         }
 
 
