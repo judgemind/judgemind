@@ -1159,6 +1159,41 @@ describe('weeklyDiagnoserReport — admin', () => {
     expect(excluded).toBeUndefined();
   });
 
+  it('null recommended_action surfaces as (unknown) bucket (#3588)', async () => {
+    // Seed: agent + failure + diagnosis with recommendation={} (no action key).
+    const agentId = await insertAgent({ issueNumber: 800003, status: 'failed', phase: 'ralph' });
+    const failureId = await insertFailure({
+      agentId,
+      category: 'subprocess_crash',
+      detectedBy: 'scheduler',
+    });
+    const dayTs = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(); // within 7 days
+    // recommendation={} → recommendation->>'action' returns NULL in SQL
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: {},
+      outcome: { retry_outcome: 'failed' },
+      completedAt: dayTs,
+    });
+
+    const body = await gql(QUERY, undefined, adminToken);
+    // The null-action row must NOT cause a GraphQL serialisation error.
+    expect(body.errors).toBeUndefined();
+    const rows = body.data?.weeklyDiagnoserReport as Array<{
+      recommendedAction: string;
+      observedOutcome: string;
+      count: number;
+      day: string;
+    }>;
+    expect(Array.isArray(rows)).toBe(true);
+    // A bucket with recommendedAction === '(unknown)' must be present.
+    const unknownBucket = rows.find((r) => r.recommendedAction === '(unknown)');
+    expect(unknownBucket).toBeDefined();
+    expect(unknownBucket!.observedOutcome).toBe('failed');
+    expect(unknownBucket!.count).toBeGreaterThanOrEqual(1);
+  });
+
   it('non-admin returns "not found" error', async () => {
     const body = await gql(QUERY, undefined, userToken);
     expect(body.errors).toBeDefined();
