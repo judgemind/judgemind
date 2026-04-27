@@ -17,6 +17,7 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
 
   const app = Fastify({
     logger: process.env.NODE_ENV !== 'test',
+    trustProxy: true,
   });
 
   // ── CORS ────────────────────────────────────────────────────────────────
@@ -92,7 +93,7 @@ export async function buildApp(db?: Pool, os?: Client): Promise<FastifyInstance>
         // Fresh DataLoaders, auth context, and OpenSearch client per request.
         context: async () => {
           const user = await extractUser(req, pool);
-          const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
+          const ip = req.ip ?? 'unknown';
           const cookieHeader =
             typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
           // #2884: X-MFA-Token parsing removed with the MFA re-auth gate.
