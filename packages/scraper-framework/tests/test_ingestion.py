@@ -6221,3 +6221,190 @@ def test_insert_ruling_content_hash_collision_supersedes_loser_force_update() ->
     # must not touch the winner's ruling row.
     all_sql = [call.args[0] if call.args else "" for call in cur.execute.call_args_list]
     assert not any("UPDATE rulings SET" in s for s in all_sql)
+
+
+# ---------------------------------------------------------------------------
+# #3559 — multimodal_all_null_metadata telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_llm_split_writes_multimodal_all_null_metadata_metric() -> None:
+    """When a multi-ruling doc has all-null judge/department, write telemetry (#3559).
+
+    Feeds a synthetic event through ``_llm_split_document`` where the
+    framework extractor returns two ``ExtractedRuling`` objects, both with
+    ``extracted_judge_name=None`` and ``department=None``.  Asserts that one
+    ``data_quality_metrics`` row with ``metric_name="multimodal_all_null_metadata"``
+    is written inside a savepoint-protected block, mirroring the
+    ``zero_ruling_extraction`` pattern.
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    # Two rulings, both with null judge_name and department — triggers the
+    # multimodal_all_null_metadata telemetry path.
+    null_ruling_1 = ExtractedRuling(
+        extracted_case_number="30-2024-00000001",
+        extracted_case_title="Alpha v. Beta",
+        extracted_judge_name=None,
+        department=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="GRANTED.",
+        case_type=None,
+    )
+    null_ruling_2 = ExtractedRuling(
+        extracted_case_number="30-2024-00000002",
+        extracted_case_title="Gamma v. Delta",
+        extracted_judge_name=None,
+        department=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="DENIED.",
+        case_type=None,
+    )
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = [null_ruling_1, null_ruling_2]
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000001",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/multi-ruling.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert any("INSERT INTO data_quality_metrics" in s for s in executed_sql), (
+        "Multi-ruling all-null-metadata must write a data_quality_metrics row (#3559)."
+    )
+    # Verify the metric params.
+    metric_calls = [
+        call
+        for call in mock_cur.execute.call_args_list
+        if "INSERT INTO data_quality_metrics" in call[0][0]
+    ]
+    assert len(metric_calls) == 1
+    params = metric_calls[0][0][1]
+    # (county, metric_name, metric_value, metadata_json)
+    assert params[0] == "Orange"
+    assert params[1] == "multimodal_all_null_metadata"
+    assert params[2] == 1
+    meta = json.loads(params[3])
+    assert meta["document_id"] == "multimodal-doc-0000-0000-000000000001"
+    assert meta["s3_key"] == "ca/orange/superior_court/raw/multi-ruling.pdf"
+    assert meta["state"] == "CA"
+    assert meta["ruling_count"] == 2
+    # Savepoint must be used for best-effort protection.
+    assert any("SAVEPOINT multimodal_null_metadata_metric" in s for s in executed_sql)
+
+
+def test_llm_split_multimodal_null_metadata_insert_failure_swallowed() -> None:
+    """Inner savepoint rollback executes when the metric INSERT fails (#3559).
+
+    When cur.execute raises on the INSERT, the inner handler must issue
+    ROLLBACK TO SAVEPOINT and re-raise; the outer handler swallows the error
+    so _llm_split_document still returns True (telemetry is best-effort).
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    null_ruling_1 = ExtractedRuling(
+        extracted_case_number="30-2024-00000003",
+        extracted_case_title="Alpha v. Beta",
+        extracted_judge_name=None,
+        department=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="GRANTED.",
+        case_type=None,
+    )
+    null_ruling_2 = ExtractedRuling(
+        extracted_case_number="30-2024-00000004",
+        extracted_case_title="Gamma v. Delta",
+        extracted_judge_name=None,
+        department=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="DENIED.",
+        case_type=None,
+    )
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = [null_ruling_1, null_ruling_2]
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000002",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/multi-ruling-fail.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    def _raise_on_insert(sql: str, *args: object, **kwargs: object) -> None:
+        if "INSERT INTO data_quality_metrics" in sql:
+            raise Exception("simulated DB write error")
+
+    mock_cur.execute.side_effect = _raise_on_insert
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert any(
+        "ROLLBACK TO SAVEPOINT multimodal_null_metadata_metric" in s for s in executed_sql
+    ), "Inner handler must roll back the savepoint on INSERT failure (#3559)."
