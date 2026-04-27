@@ -644,6 +644,17 @@ _VALID_SHORT_FINAL_WORDS = {
     "ii",
     "iii",
     "iv",
+    # Common 2-character Asian surnames that are legitimate but would otherwise
+    # be rejected by the _MIN_SURNAME_LENGTH or vowel-check rules.
+    "vu",  # Vietnamese
+    "lo",  # Chinese/Vietnamese
+    "li",  # Chinese
+    "wu",  # Chinese
+    "xu",  # Chinese
+    "hu",  # Chinese
+    "lu",  # Chinese
+    "fu",  # Chinese
+    "ng",  # Cantonese (consonant-only, also blocked by vowel rule)
 }
 
 # Minimum length for the last word to be considered a plausible surname
