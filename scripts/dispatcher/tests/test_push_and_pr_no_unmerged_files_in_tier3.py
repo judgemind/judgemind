@@ -16,12 +16,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Add the dispatcher package to sys.path so we can import daemon symbols.
-_DISPATCHER_DIR = Path(__file__).resolve().parents[1]
-if str(_DISPATCHER_DIR) not in sys.path:
-    sys.path.insert(0, str(_DISPATCHER_DIR))
+# Make ``scripts`` importable without installing the repo as a package.
+_SCRIPTS = Path(__file__).resolve().parents[2]
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
-from daemon import (  # noqa: E402
+from dispatcher.daemon import (  # noqa: E402
     FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
     TIER_3_CATEGORIES,
 )
