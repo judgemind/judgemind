@@ -139,21 +139,43 @@ if [[ -z "$stripped" ]]; then
 fi
 
 # ─── Resolve a running task ARN ──────────────────────────────────────────────
+# Poll list-tasks for up to LIST_TASKS_POLL_TIMEOUT_SECS (default 60 s),
+# retrying every 3 s. Defense-in-depth for a rolling deploy: even with the
+# 100/200 deploy policy, an operator-issued force-new-deployment can briefly
+# leave ECS in a state where the new task is PENDING and list-tasks returns
+# nothing. Without retries a transient empty response would abort the query.
+# Mirrors the polling pattern in scripts/wait-for-rollout.sh.
 
-task_arn=$(aws ecs list-tasks \
-    --cluster "$CLUSTER" \
-    --service-name "$SERVICE" \
-    --desired-status RUNNING \
-    --region "$REGION" \
-    --query 'taskArns[0]' \
-    --output text)
+LIST_TASKS_POLL_TIMEOUT_SECS="${LIST_TASKS_POLL_TIMEOUT_SECS:-60}"
+_list_tasks_start=$(date +%s)
+_list_tasks_deadline=$((_list_tasks_start + LIST_TASKS_POLL_TIMEOUT_SECS))
 
-if [[ -z "$task_arn" || "$task_arn" == "None" ]]; then
-    echo "Error: no running task found for service $SERVICE in cluster $CLUSTER" >&2
-    echo "Check that the ingestion worker is running:" >&2
-    echo "  aws ecs describe-services --cluster $CLUSTER --services $SERVICE --region $REGION --query 'services[0].runningCount'" >&2
-    exit 1
-fi
+task_arn=""
+while true; do
+    task_arn=$(aws ecs list-tasks \
+        --cluster "$CLUSTER" \
+        --service-name "$SERVICE" \
+        --desired-status RUNNING \
+        --region "$REGION" \
+        --query 'taskArns[0]' \
+        --output text)
+
+    if [[ -n "$task_arn" && "$task_arn" != "None" ]]; then
+        break
+    fi
+
+    _now=$(date +%s)
+    if [[ "$_now" -ge "$_list_tasks_deadline" ]]; then
+        echo "Error: no running task found for service $SERVICE in cluster $CLUSTER" >&2
+        echo "Check that the ingestion worker is running:" >&2
+        echo "  aws ecs describe-services --cluster $CLUSTER --services $SERVICE --region $REGION --query 'services[0].runningCount'" >&2
+        exit 1
+    fi
+
+    _elapsed=$((_now - _list_tasks_start))
+    echo "No running task yet (${_elapsed}s elapsed), retrying in 3 s..." >&2
+    sleep 3
+done
 
 # ─── Build the command ───────────────────────────────────────────────────────
 

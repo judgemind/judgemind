@@ -517,9 +517,14 @@ resource "aws_ecs_service" "ingestion_worker" {
   # running container without a VPN or bastion host.
   enable_execute_command = true
 
-  # Restart the task if it exits unexpectedly.
-  deployment_minimum_healthy_percent = 0
-  deployment_maximum_percent         = 100
+  # Rolling-no-gap deploy policy: bring up the new task first, wait for it to
+  # reach RUNNING, then drain the old one. With desired_count=1 the 0/100
+  # policy guaranteed a 30–120 s window with runningCount=0 on every deploy
+  # (#3556). 100/200 eliminates that gap. wait_for_steady_state=true ensures
+  # terraform-apply blocks until the service settles.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+  wait_for_steady_state              = true
 
   network_configuration {
     subnets          = var.private_subnet_ids
