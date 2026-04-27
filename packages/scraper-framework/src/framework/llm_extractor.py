@@ -866,6 +866,91 @@ def _sanitize_title_motion_tail(title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: Riverside title cost-itemization tail sanitizer (#3555)
+# ---------------------------------------------------------------------------
+#
+# Riverside LLM extractions for Motion to Tax Costs entries sometimes produce
+# an ``extracted_case_title`` that absorbs the cost-itemization line items
+# following the party-name caption.  For example::
+#
+#   ``"VELASQUEZ vs MONTENEGRO Court Reporter Fees Interpreter Fees
+#      Models, Enlargements and Photocopies of Exhibits"``
+#
+# should be sanitized to::
+#
+#   ``"VELASQUEZ vs MONTENEGRO"``
+#
+# Design constraint: the regex MUST NOT fire on party names that happen to
+# contain cost-related words (e.g. ``"ACME COURT REPORTING SERVICES INC"`` as
+# plaintiff).  We achieve this by anchoring the match to occur AFTER a
+# complete ``WORD vs[.] WORD`` or ``WORD v. WORD`` caption pattern — i.e.
+# after at least two party-name tokens separated by a ``v.``/``vs.`` separator.
+# The cost-item keywords must appear AFTER the second party token ends.
+
+# Matches cost-itemization suffixes that follow a complete party-name caption.
+# The leading lookahead `(?<=\S)` ensures there is at least one preceding
+# non-whitespace character (the end of the second party name).  We then
+# require a word boundary followed by a cost-item keyword.  The match
+# extends to end-of-string so the entire tail is stripped.
+#
+# Applied after ``_MOTION_HEADING_TAIL_RE``, so the title at this point is
+# either already clean or still has a raw cost-item suffix (not a motion
+# heading).
+#
+# NOTE: bare single-word tokens ``Costs`` and ``Fees`` are intentionally
+# excluded from this regex even though they appear in the prompt stop-token
+# list (rule 4a).  The LLM has full context to disambiguate them; the
+# deterministic sanitizer does not.  A bare ``Fees`` or ``Costs`` token could
+# legitimately be part of a defendant company name (e.g. "JONES vs FEES INC"),
+# so including them would cause false positives.  In the real contamination
+# fixture (VELASQUEZ vs MONTENEGRO), both words appear only AFTER the
+# multi-word anchor ``Court Reporter``, which triggers ``.*$`` to consume them.
+_COST_ITEMIZATION_TAIL_RE = re.compile(
+    r"(?<=\S)"  # must follow a non-whitespace char (end of party name)
+    r"\s+"  # one or more spaces separating party name from cost item
+    r"\b(?:Court\s+Reporter|Interpreter\s+Fees?|Models,?\s+Enlargements|"
+    r"Photocopies(?:\s+of(?:\s+Exhibits)?)?)\b"
+    r".*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Guard pattern: ensures the title contains at least one adversarial separator
+# (``v.`` or ``vs.``) before we apply cost-item stripping.  Without this check
+# a single-token title like ``"Fees"`` would be incorrectly reduced to ``""``.
+_HAS_ADVERSARIAL_SEPARATOR_RE = re.compile(r"\bvs?\.?\s", re.IGNORECASE)
+
+
+def _sanitize_title_cost_itemization_tail(title: str) -> str:
+    """Strip cost-itemization tail from a contaminated ``case_title`` (#3555).
+
+    When the Riverside LLM absorbs a Motion-to-Tax-Costs cost itemization list
+    into the case title, the result looks like::
+
+        "VELASQUEZ vs MONTENEGRO Court Reporter Fees Interpreter Fees Models, ..."
+
+    This function strips everything from the first cost-item keyword onward,
+    but ONLY when:
+
+    1. The title contains at least one ``v.``/``vs.`` adversarial separator
+       (ensuring it is a multi-party caption, not a single party name).
+    2. The cost-item keyword appears AFTER the second party token (enforced
+       via the ``(?<=\\S)\\s+`` prefix in the regex).
+
+    This prevents stripping legitimate party names such as
+    ``"ACME COURT REPORTING SERVICES INC vs JONES"`` where the cost-item
+    words appear inside the plaintiff name before the separator.
+
+    This is a pure, side-effect-free helper.  Callers are responsible for
+    deciding when to apply it (e.g. only for Riverside-origin rulings).
+    """
+    # Only apply if the title has at least one adversarial separator.
+    if not _HAS_ADVERSARIAL_SEPARATOR_RE.search(title):
+        return title
+    result = _COST_ITEMIZATION_TAIL_RE.sub("", title)
+    return result.rstrip()
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: Riverside cross-case ruling_text truncation (#2564)
 # ---------------------------------------------------------------------------
 #
@@ -939,18 +1024,22 @@ def _sanitize_riverside_rulings(
     *,
     case_number_re: re.Pattern,
 ) -> list[ExtractedRuling]:
-    """Apply Riverside-specific title and ruling_text sanitizers (#2564).
+    """Apply Riverside-specific title and ruling_text sanitizers (#2564, #3555).
 
-    Applies two deterministic post-processors to every ruling in *rulings*:
+    Applies three deterministic post-processors to every ruling in *rulings*:
 
     1. :func:`_sanitize_title_motion_tail` — strips motion-heading tails
        from ``extracted_case_title`` when the LLM absorbed a motion header
        into the title field.
-    2. :func:`_truncate_cross_case_ruling_text` — truncates ``ruling_text``
+    2. :func:`_sanitize_title_cost_itemization_tail` — strips cost-itemization
+       line items (e.g. "Court Reporter Fees Interpreter Fees Models, ...") from
+       ``extracted_case_title`` when the LLM absorbed cost-item suffixes from a
+       Motion to Tax Costs entry into the title field (#3555).
+    3. :func:`_truncate_cross_case_ruling_text` — truncates ``ruling_text``
        at the first occurrence of a foreign Riverside case number, preventing
        bleed-across of ruling text from the next case in the PDF.
 
-    Both sanitizers are pure helpers; this function wires them over a list
+    All sanitizers are pure helpers; this function wires them over a list
     and emits structured log entries for each change so production can
     observe the guard's activity.
 
@@ -971,6 +1060,19 @@ def _sanitize_riverside_rulings(
                     case_number=ruling.extracted_case_number,
                     before=original_title,
                     after=clean_title,
+                )
+
+            # Apply cost-itemization tail stripping on the (possibly already
+            # cleaned) title so both guards compose correctly.
+            title_after_motion_strip = updates.get("extracted_case_title", original_title)
+            clean_title_ci = _sanitize_title_cost_itemization_tail(title_after_motion_strip)
+            if clean_title_ci != title_after_motion_strip:
+                updates["extracted_case_title"] = clean_title_ci
+                logger.info(
+                    "llm_extractor.title_cost_itemization_tail_stripped",
+                    case_number=ruling.extracted_case_number,
+                    before=title_after_motion_strip,
+                    after=clean_title_ci,
                 )
 
         # --- Cross-case ruling_text truncation ---
