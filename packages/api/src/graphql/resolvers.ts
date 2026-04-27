@@ -251,9 +251,9 @@ export const resolvers = {
     compareJudges: async (
       _: unknown,
       { judgeIds }: { judgeIds: string[] },
-      { pool }: Context,
+      { pool, loaders }: Context,
     ) => {
-      const results = await getMultipleJudgeAnalytics(pool, judgeIds);
+      const results = await getMultipleJudgeAnalytics(pool, loaders, judgeIds);
       // Filter out null entries (non-existent judges)
       return results.filter((r): r is NonNullable<typeof r> => r !== null);
     },
