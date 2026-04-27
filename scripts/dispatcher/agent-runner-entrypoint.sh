@@ -2967,9 +2967,12 @@ handle_fix_conflict() {
 #
 # Log event names (``fix_ci_patch_pushed``, ``fix_ci_missing_commit_
 # message``, ``fix_ci_git_commit_failed``, ``fix_ci_git_push_failed``,
-# ``fix_ci_patch_empty``, ``fix_ci_flaky``, ``fix_ci_blocked``,
-# ``fix_ci_unrecognized_verdict``) mirror the daemon's names so
-# CloudWatch log-insights queries work across both paths.
+# ``fix_ci_patch_empty_already_applied`` (#3580 — was ``fix_ci_patch_empty``
+# pre-#3580; renamed to split it out from real failure classes since this
+# is now an advance-to-awaiting_ci event, not a terminal),
+# ``fix_ci_flaky``, ``fix_ci_blocked``, ``fix_ci_unrecognized_verdict``)
+# mirror the daemon's names so CloudWatch log-insights queries work across
+# both paths.
 #
 # Prints the phase-output JSON on stdout (the same JSON that
 # ``run_claude_phase`` emitted, possibly re-wrapped) for
@@ -3050,26 +3053,42 @@ handle_fix_ci() {
             return 0
         fi
 
-        # Empty-diff check (#3245): if the skill said PATCHED but
-        # wrote no changes to the working tree, ``git diff --cached
-        # --quiet`` exits 0 (nothing staged). Treat as BLOCKED — the
-        # skill's self-report was wrong and a plain ``git commit``
-        # would also fail non-zero downstream, but this explicit
-        # check gives a dedicated log event for CloudWatch.
+        # Empty-diff check (#3245, refined #3580): ``git diff --cached
+        # --quiet`` exits 0 when nothing is staged. After a PATCHED
+        # verdict that's the "fix is already in the baseline" case —
+        # not a failure. It happens routinely when:
+        #   1. The pre-fix_ci rebase pulled in a sibling PR that landed
+        #      the same fix on main first.
+        #   2. The skill's edit was idempotent (re-writing the existing
+        #      content); git diff is empty even though the skill thinks
+        #      it edited a file.
+        #   3. A prior fix_ci attempt on the same branch already
+        #      committed the fix and this is a retry.
+        # In all three cases the correct action is to advance to
+        # awaiting_ci so the next supervisor tick observes the now-green
+        # CI rollup. The skill's PATCHED self-report was correct in
+        # concluding "the fix is in"; there's just nothing for THIS
+        # invocation to commit.
+        #
+        # Pre-#3580 we treated this as terminal fix_ci_failed/patch_empty,
+        # which left the issue stuck in a daemon-cooldown loop forever
+        # (re-claim → rebase pulls in the same fix → empty diff → fail
+        # → cooldown → repeat).
+        #
+        # Log event renamed fix_ci_patch_empty → fix_ci_patch_empty_already_applied
+        # so dashboards / alerts split on the new name and don't treat
+        # this as a failure class.
         set +e
         git -C "$REPO_ROOT" diff --cached --quiet \
             > /dev/null 2>&1
         _diff_rc=$?
         set -e
         if [[ "$_diff_rc" -eq 0 ]]; then
-            # Exit 0 from ``diff --quiet`` = no staged changes.
-            log "fix_ci_patch_empty" \
+            log "fix_ci_patch_empty_already_applied" \
                 "verdict=$_verdict" \
                 "commit_message=$_commit_msg"
-            agent_runner_reaped_failure \
-                "fix_ci_failed" \
-                "patch_empty" \
-                "fix_ci PATCHED but no changes staged after git add -A"
+            advance_phase "awaiting_ci"
+            printf '%s' "$_output"
             return 0
         fi
 
