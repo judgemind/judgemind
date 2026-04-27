@@ -314,6 +314,53 @@ def test_all_sites_have_on_conflict_do_update() -> None:
         )
 
 
+def test_agent_runner_reaped_failure_no_bash_interpolation() -> None:
+    """agent_runner_reaped_failure must use psql -v + jsonb_build_object, not
+    bash interpolation via _escaped_reason (#3488).
+
+    The old implementation did:
+        _escaped_reason=$(printf '%s' "$_reason" | sed "s/'/''/g")
+        ... '{"category": "$_category", "reason": "$_escaped_reason"}' ...
+
+    This still allowed $() / backticks / $VAR inside $_reason to be expanded
+    by bash before psql saw the SQL.  The fix lifts $_category and $_reason
+    into psql -v vars and builds the JSON via jsonb_build_object so no bash
+    string interpolation occurs.
+
+    This test is purely structural (regex on source text) and always runs —
+    no DB required.
+    """
+    text = _ENTRYPOINT_SH.read_text(encoding="utf-8")
+    arf_block = _extract_function_block(text, "agent_runner_reaped_failure")
+
+    # Must NOT contain the old escape helper.
+    assert "_escaped_reason" not in arf_block, (
+        "agent_runner_reaped_failure still references '_escaped_reason'. "
+        "The bash-interpolation fix (#3488) should have removed it — "
+        "lift $_reason into a psql -v var instead."
+    )
+
+    # Must use psql -v to pass the reason.
+    assert re.search(r"-v\s+reason=", arf_block), (
+        "agent_runner_reaped_failure does not pass reason via psql -v. "
+        "Expected '-v reason=' to lift $_reason out of bash interpolation (#3488)."
+    )
+
+    # Must build JSON via jsonb_build_object (no bare string interpolation).
+    assert re.search(r"jsonb_build_object", arf_block), (
+        "agent_runner_reaped_failure does not use jsonb_build_object to build "
+        "the output_json. Expected jsonb_build_object(:'category'::text, "
+        ":'reason'::text) instead of bash string interpolation (#3488)."
+    )
+
+    # Must reference the psql-quoted variable :'reason' (not $-prefixed bash var).
+    assert re.search(r":'reason'", arf_block), (
+        "agent_runner_reaped_failure does not reference :'reason' as a psql "
+        "variable. The fix must use psql variable substitution so that the "
+        "reason value never passes through bash expansion (#3488)."
+    )
+
+
 def test_on_conflict_targets_match() -> None:
     """Every ON CONFLICT target must be exactly (agent_id, phase, attempt).
 
