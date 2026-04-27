@@ -312,6 +312,17 @@ read_agent_kind() {
                    LIMIT 1;"
 }
 
+read_agent_status() {
+    # Issue #3166. Read ``dispatcher.agents.status`` so the phase loop
+    # can detect an externally-written terminal status (diagnoser, supervisor,
+    # killswitch) and exit 0 before running the next phase handler.
+    # Returns the empty string when the row is missing.
+    db_query_one "SELECT status
+                    FROM dispatcher.agents
+                   WHERE agent_id = '$AGENT_ID'
+                   LIMIT 1;"
+}
+
 # ── Python helper: phase_transitions bridge --------------------------------
 #
 # The shell script can't import Python, so we expose the pure
@@ -4584,6 +4595,37 @@ is_terminal() {
     [[ "$_result" == "yes" ]]
 }
 
+# Issue #3166: sibling shim for agent STATUS terminal check.
+# Mirrors TERMINAL_SHIM / is_terminal() above but queries TERMINAL_STATUSES
+# (agent-level) via is_terminal_status() instead of TERMINAL_PHASES.
+STATUS_TERMINAL_SHIM="${AGENT_RUNNER_STATUS_TERMINAL_SHIM:-$AGENT_WORKSPACE/phase_status_terminal_shim.py}"
+if [[ "$STATUS_TERMINAL_SHIM" == "$AGENT_WORKSPACE/phase_status_terminal_shim.py" ]]; then
+    cat <<'STERMEOF' > "$STATUS_TERMINAL_SHIM"
+"""Print 'yes' or 'no' for whether the agent status on stdin is terminal."""
+import os
+import sys
+
+_dir = os.environ.get("PHASE_TRANSITIONS_DIR", "/app/scripts/dispatcher")
+_parent = os.environ.get("PHASE_TRANSITIONS_PARENT", "/app")
+sys.path.insert(0, _dir)
+sys.path.insert(0, _parent)
+
+try:
+    from scripts.dispatcher import phase_transitions as pt
+except ImportError:
+    import phase_transitions as pt  # type: ignore
+
+status = sys.stdin.read().strip()
+sys.stdout.write("yes" if pt.is_terminal_status(status) else "no")
+STERMEOF
+fi
+
+is_terminal_status() {
+    _status="$1"
+    _result=$(printf '%s' "$_status" | python3 "$STATUS_TERMINAL_SHIM" 2>/dev/null || printf 'unknown')
+    [[ "$_result" == "yes" ]]
+}
+
 # ── Test hook: run the ralph HEAD-watcher standalone (#3144) ---------------
 #
 # The HEAD-watcher tests need to drive start_ralph_head_watcher +
@@ -4663,6 +4705,17 @@ while true; do
     if [[ -z "$_current" ]]; then
         log "agent_row_missing"
         exit 4
+    fi
+
+    # Issue #3166: observe external-terminal status written by a diagnoser,
+    # supervisor, or killswitch before running the next phase handler.
+    # If terminal, exit 0 immediately — do NOT call mark_ended, because the
+    # external writer already owns the row's ended_at/status and we must not
+    # race it.  Same semantics as _check_killswitch_and_abort.
+    _current_status=$(read_agent_status)
+    if is_terminal_status "$_current_status"; then
+        log "external_terminal_observed" "status=$_current_status" "after_phase=$_current"
+        exit 0
     fi
 
     log "phase_loop_tick" "iteration=$_iter" "current_phase=$_current"

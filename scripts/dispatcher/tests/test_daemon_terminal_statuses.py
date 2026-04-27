@@ -31,6 +31,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from dispatcher import daemon  # noqa: E402  — sys.path mutation above
+from dispatcher import phase_transitions  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -167,3 +168,12 @@ def test_correct_outcome_terminal_statuses_constant_contents() -> None:
 def test_correct_outcome_is_subset_of_terminal() -> None:
     """CORRECT_OUTCOME_TERMINAL_STATUSES must be a subset of TERMINAL_AGENT_STATUSES."""
     assert daemon.CORRECT_OUTCOME_TERMINAL_STATUSES <= daemon.TERMINAL_AGENT_STATUSES
+
+
+def test_phase_transitions_terminal_statuses_matches_daemon() -> None:
+    """phase_transitions.TERMINAL_STATUSES must equal daemon.TERMINAL_AGENT_STATUSES.
+
+    AC #2: two locations define the terminal-status list; this CI-enforced assertion
+    keeps them in sync without restructuring either module (circular-import risk).
+    """
+    assert phase_transitions.TERMINAL_STATUSES == daemon.TERMINAL_AGENT_STATUSES
