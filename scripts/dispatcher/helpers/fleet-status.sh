@@ -19,8 +19,9 @@
 #   scripts/dispatcher/helpers/fleet-status.sh --since 2h     # time-window for terminals / greens / diagnoses
 #   scripts/dispatcher/helpers/fleet-status.sh --terminals 20 # cap on recent terminals
 #   scripts/dispatcher/helpers/fleet-status.sh --greens 10    # cap on daemon-shipped greens
+#   scripts/dispatcher/helpers/fleet-status.sh --no-cooldown  # skip cooldown / stuck-loop watch section
 #
-# Defaults: --since 1h, --terminals 10, --greens 5.
+# Defaults: --since 1h, --terminals 10, --greens 5, cooldown section enabled.
 #
 # Exit codes:
 #   0  — printed successfully.
@@ -63,6 +64,7 @@ query() {
 since="1h"
 terminals_cap="10"
 greens_cap="5"
+cooldown_enabled=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             shift 2
+            ;;
+        --no-cooldown)
+            cooldown_enabled=0
+            shift
             ;;
         -h|--help)
             usage
@@ -230,6 +236,69 @@ SELECT
        WHERE started_at > now() - ${since_interval}) AS total_diagnoses_in_window
 "
 
+# Cooldown / stuck-loop watch — surfaces issues currently on cooldown so the
+# operator can spot retry storms at a glance. Hard-codes 3600 s matching
+# daemon.py:885 FAILED_AGENT_COOLDOWN_SECONDS. Orders latest-agent-per-issue
+# by started_at DESC (not ended_at DESC) so zombie rows (ended_at IS NULL)
+# surface as the representative row per memory feedback_zombie_rows_started_at_not_ended_at.md.
+# Phase group mirrors daemon.py:8699: split('-',1)[0].
+q_cooldown="
+WITH cooldown_issues AS (
+    SELECT DISTINCT issue_number
+    FROM dispatcher.agents
+    WHERE dispatcher.issue_cooldown_remaining_seconds(issue_number, 3600) > 0
+),
+latest_agent AS (
+    SELECT DISTINCT ON (a.issue_number)
+        a.issue_number,
+        a.priority,
+        a.phase,
+        a.status,
+        a.started_at,
+        a.ended_at,
+        (a.ended_at IS NULL) AS is_zombie
+    FROM dispatcher.agents a
+    JOIN cooldown_issues ci ON ci.issue_number = a.issue_number
+    ORDER BY a.issue_number, a.started_at DESC
+),
+attempt_counts AS (
+    SELECT
+        a.issue_number,
+        split_part(a.phase, '-', 1) AS phase_group,
+        COUNT(*) AS attempts_24h
+    FROM dispatcher.agents a
+    JOIN cooldown_issues ci ON ci.issue_number = a.issue_number
+    WHERE a.started_at > now() - make_interval(hours => 24)
+    GROUP BY a.issue_number, split_part(a.phase, '-', 1)
+),
+phase_group_for_latest AS (
+    SELECT
+        la.issue_number,
+        split_part(la.phase, '-', 1) AS phase_group
+    FROM latest_agent la
+),
+counts_for_latest AS (
+    SELECT
+        pg.issue_number,
+        COALESCE(ac.attempts_24h, 0) AS attempts_24h
+    FROM phase_group_for_latest pg
+    LEFT JOIN attempt_counts ac
+        ON ac.issue_number = pg.issue_number
+        AND ac.phase_group = pg.phase_group
+)
+SELECT
+    la.issue_number,
+    la.priority,
+    dispatcher.issue_cooldown_remaining_seconds(la.issue_number, 3600) AS cooldown_left_seconds,
+    la.phase AS last_phase,
+    la.status AS last_status,
+    la.is_zombie,
+    COALESCE(cfl.attempts_24h, 0) AS attempts_24h
+FROM latest_agent la
+LEFT JOIN counts_for_latest cfl ON cfl.issue_number = la.issue_number
+ORDER BY cooldown_left_seconds ASC
+"
+
 if [[ "${FLEET_STATUS_DEBUG:-0}" == "1" ]]; then
     echo "===== active =====" >&2
     echo "$q_active" >&2
@@ -247,6 +316,17 @@ greens_json=$(query "$q_greens")
 pending_json=$(query "$q_pending")
 totals_json=$(query "$q_totals")
 
+# Cooldown section is optional — failures emit a WARNING and fall back to
+# an empty array so the rest of the snapshot still renders.
+cooldown_json="[]"
+if [[ "$cooldown_enabled" == "1" ]]; then
+    cooldown_json=$(query "$q_cooldown" || true)
+    if ! printf '%s' "$cooldown_json" | jq -e . >/dev/null 2>&1; then
+        echo "WARNING: fleet-status: cooldown query failed or returned malformed JSON — skipping section" >&2
+        cooldown_json="[]"
+    fi
+fi
+
 # Assemble the snapshot shape the formatter expects. Defensive defaults:
 # empty arrays for missing collections and empty objects for missing
 # singletons, so a transient DB hiccup on one sub-query doesn't crash the
@@ -260,7 +340,9 @@ snapshot=$(jq -n \
     --argjson greens "$greens_json" \
     --argjson pending "$pending_json" \
     --argjson totals "$totals_json" \
+    --argjson cooldown "$cooldown_json" \
     --arg since "$since" \
+    --argjson cooldown_enabled "$cooldown_enabled" \
     '{
         since: $since,
         active: $active,
@@ -269,12 +351,25 @@ snapshot=$(jq -n \
         diagnoses_recent: $diagnoses,
         greens: $greens,
         pending_commands: $pending,
-        totals: ($totals[0] // {})
+        totals: ($totals[0] // {}),
+        cooldown: $cooldown,
+        cooldown_enabled: $cooldown_enabled
     }')
 
 # ─── Format ─────────────────────────────────────────────────────────────
 
 echo "$snapshot" | jq -r '
+  # Cooldown classifier — mirrors daemon.py:8699 phase_group split.
+  # Returns a classifier string for one cooldown row.
+  def classify_cooldown:
+    if (.attempts_24h >= 3) and (.last_status == "failed")
+      then "🔁 stuck-in-loop (\(.attempts_24h)x \(.last_phase | split("-")[0]))"
+    elif (.attempts_24h >= 2)
+      then "⚠ retry pattern"
+    elif (.attempts_24h == 1) and (.last_status == "succeeded" or .last_status == "needs_review")
+      then "✓ recently terminal"
+    else "? unclassified"
+    end;
   . as $s
   | $s.config as $cfg
   | $s.totals as $t
@@ -298,6 +393,32 @@ echo "$snapshot" | jq -r '
            + (if .pr_number then "  PR #\(.pr_number)" else "" end)
            + (if .failure_summary then "\n    summary: \(.failure_summary)" else "" end)
          ))
+       end)
+    + [""]
+    + (if $s.cooldown_enabled == 1
+         then
+           ["── cooldown / stuck-loop watch ──"]
+           + (if ($s.cooldown | length) == 0
+                then ["  ✓ no cooldown / stuck loops"]
+                else
+                  ($s.cooldown | map(
+                    "  \(classify_cooldown)  #\(.issue_number)  cooldown=\((.cooldown_left_seconds / 60 | floor | tostring) + "m")  last=\(.last_phase)/\(.last_status)\(if .is_zombie then " (zombie)" else "" end)"
+                    + (if .priority then "  \(.priority)" else "" end)
+                  ))
+                  + (
+                    # Summary line
+                    [
+                      "  Total: \($s.cooldown | length) cooldown, \($s.cooldown | map(select(.is_zombie)) | length) zombie rows, \($s.cooldown | map(select(.last_status == "running" or .last_status == "claiming")) | length) running, \($s.cooldown | map(select(.last_status == "succeeded")) | length) succeeded"
+                    ]
+                    + (if ($s.cooldown | map(select((.attempts_24h >= 3) and (.last_status == "failed"))) | length) > 0
+                         then [
+                           "  Stuck-in-loop: \($s.cooldown | map(select((.attempts_24h >= 3) and (.last_status == "failed"))) | map("#\(.issue_number) (\(.attempts_24h)x \(.last_phase | split("-")[0]))") | join(", "))"
+                         ]
+                         else []
+                       end)
+                  )
+              end)
+         else []
        end)
     + ["",
        "── daemon-shipped greens (\($s.since)) — showing \($s.greens | length) of \($t.total_greens_in_window) ──"]
