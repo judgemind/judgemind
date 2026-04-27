@@ -142,3 +142,58 @@ class TestRalphNotShipLocalHandlerExists:
             "route_to_diagnoser case arm should dispatch `ralph_not_ship` to "
             "handle_ralph_not_ship_local (not route_stub)"
         )
+
+
+class TestReapedFailureExitsUnconditionally:
+    """Issue #3494 — static lint: ``agent_runner_reaped_failure`` must
+    terminate the script via ``exit 0`` as its last non-comment,
+    non-blank line.
+
+    PR #3458 replaced ``advance_phase agent_runner_route_stub`` with
+    ``agent_runner_reaped_failure`` calls that emit descriptive phase
+    strings. None of those strings were in ``TERMINAL_PHASES``, so the
+    dispatch loop re-read the phase, found no matching case arm, fell to
+    ``*)``, and re-emitted ``phase_unknown`` for up to 40 iterations
+    before the safety cap fired. The fix adds ``exit 0`` as the final
+    statement of the function body; this test ensures it stays there.
+    """
+
+    def _function_body_lines(self) -> list[str]:
+        """Extract the body lines of ``agent_runner_reaped_failure()``."""
+        text = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
+        # Match the function definition opening.
+        m = re.search(
+            r"^agent_runner_reaped_failure\s*\(\s*\)\s*\{",
+            text,
+            re.MULTILINE,
+        )
+        assert m is not None, "agent_runner_reaped_failure function not found"
+        # Walk forward from the opening brace to the matching closing brace.
+        # We count brace depth; the function is closed when depth returns to 0.
+        start = m.end()
+        body_chars: list[str] = []
+        depth = 1
+        for ch in text[start:]:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            body_chars.append(ch)
+        return "".join(body_chars).splitlines()
+
+    def test_agent_runner_reaped_failure_last_line_is_exit_0(self) -> None:
+        """The last non-comment, non-blank line of ``agent_runner_reaped_failure``
+        must be ``exit 0`` (#3494)."""
+        lines = self._function_body_lines()
+        # Collect non-comment, non-blank lines.
+        executable = [
+            line for line in lines if line.strip() and not line.lstrip().startswith("#")
+        ]
+        assert executable, "agent_runner_reaped_failure body has no executable lines"
+        last = executable[-1].strip()
+        assert last == "exit 0", (
+            f"Last executable line of agent_runner_reaped_failure must be "
+            f"'exit 0' (#3494) to close the dispatch loop. Got: {last!r}"
+        )

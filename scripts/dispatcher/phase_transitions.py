@@ -345,6 +345,21 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# #3494 — loop-closure terminals emitted by agent_runner_reaped_failure
+# when the dispatch loop sees an unrecognized phase or a route-to-diagnoser
+# verdict that is handled locally. These strings were introduced in PR #3458
+# but were never added to TERMINAL_PHASES, causing the dispatch loop to re-read
+# the phase each iteration, find no matching case arm, fall to `*)`, and
+# re-emit phase_unknown for up to 40 iterations before the safety cap fired.
+# The primary fix is exit 0 in agent_runner_reaped_failure (see
+# agent-runner-entrypoint.sh); adding them here is defense-in-depth so
+# is_terminal() also returns True if the loop somehow re-enters.
+PHASE_PHASE_UNKNOWN = "phase_unknown"
+PHASE_RALPH_NOT_SHIP = "ralph_not_ship"
+PHASE_RALPH_BASELINE_TRANSITION_UNRECOGNIZED = "ralph_baseline_transition_unrecognized"
+PHASE_POST_CLAUDE_TRANSITION_UNRECOGNIZED = "post_claude_transition_unrecognized"
+PHASE_PUSH_AND_PR_TRANSITION_UNRECOGNIZED = "push_and_pr_transition_unrecognized"
+
 # ---------------------------------------------------------------------------
 # Terminal phases — the agent's phase loop exits when the next phase is one
 # of these. The daemon's supervisor tick uses this set to decide whether an
@@ -378,6 +393,13 @@ TERMINAL_PHASES: frozenset[str] = frozenset(
         PHASE_AGENT_RUNNER_ROUTE_STUB,
         # #3374 — synthetic scheduled-skill failure terminal.
         PHASE_SCHEDULED_SKILL_FAILED,
+        # #3494 — loop-closure terminals (defense-in-depth; primary fix
+        # is exit 0 in agent_runner_reaped_failure).
+        PHASE_PHASE_UNKNOWN,
+        PHASE_RALPH_NOT_SHIP,
+        PHASE_RALPH_BASELINE_TRANSITION_UNRECOGNIZED,
+        PHASE_POST_CLAUDE_TRANSITION_UNRECOGNIZED,
+        PHASE_PUSH_AND_PR_TRANSITION_UNRECOGNIZED,
     }
 )
 
@@ -1281,6 +1303,12 @@ __all__ = [
     "PHASE_FIX_CI_FAILED",
     "PHASE_AGENT_RUNNER_ROUTE_STUB",
     "PHASE_SCHEDULED_SKILL_FAILED",
+    # #3494 — loop-closure terminals
+    "PHASE_PHASE_UNKNOWN",
+    "PHASE_RALPH_NOT_SHIP",
+    "PHASE_RALPH_BASELINE_TRANSITION_UNRECOGNIZED",
+    "PHASE_POST_CLAUDE_TRANSITION_UNRECOGNIZED",
+    "PHASE_PUSH_AND_PR_TRANSITION_UNRECOGNIZED",
     # Verdict constants
     "VERDICT_SHIP",
     "VERDICT_AC_INFEASIBLE",

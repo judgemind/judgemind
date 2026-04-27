@@ -1019,6 +1019,28 @@ class TestTerminalPhaseAndStatus:
         """#3137 — agent-runner route stub terminal (Stage 1b)."""
         assert pt.is_terminal_phase(pt.PHASE_AGENT_RUNNER_ROUTE_STUB) is True
 
+    def test_is_terminal_phase_true_for_loop_closure_terminals(self) -> None:
+        """#3494 — loop-closure terminals set by agent_runner_reaped_failure.
+
+        PR #3458 introduced descriptive phase strings (phase_unknown,
+        ralph_not_ship, *_transition_unrecognized) but did not add them to
+        TERMINAL_PHASES, causing the dispatch loop to spin for up to 40
+        iterations before the safety cap fired. These must be terminal so
+        is_terminal() returns True as defense-in-depth.
+        """
+        assert pt.is_terminal_phase(pt.PHASE_PHASE_UNKNOWN) is True
+        assert pt.is_terminal_phase(pt.PHASE_RALPH_NOT_SHIP) is True
+        assert (
+            pt.is_terminal_phase(pt.PHASE_RALPH_BASELINE_TRANSITION_UNRECOGNIZED)
+            is True
+        )
+        assert (
+            pt.is_terminal_phase(pt.PHASE_POST_CLAUDE_TRANSITION_UNRECOGNIZED) is True
+        )
+        assert (
+            pt.is_terminal_phase(pt.PHASE_PUSH_AND_PR_TRANSITION_UNRECOGNIZED) is True
+        )
+
     def test_fix_conflict_is_intermediate_not_terminal(self) -> None:
         """#3225 — fix_conflict is active, not terminal (it advances)."""
         assert pt.is_terminal_phase(pt.PHASE_FIX_CONFLICT) is False
