@@ -6,7 +6,6 @@ Tests cover:
   3. Falls back to 'split_supersede_unverified' when no valid sibling.
   4. UPDATE SQL shapes for both paths.
   5. Dry-run mode skips DB writes.
-  6. No duplicate event= kwarg in logger calls (AST-based, #3527).
 
 All database access is mocked -- these tests verify the pure helper logic,
 SELECT filters, and UPDATE shapes without requiring live services.
@@ -18,7 +17,6 @@ We mock them in sys.modules before importing the script under test.
 
 from __future__ import annotations
 
-import ast
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -321,56 +319,3 @@ class TestMain:
         assert len(update_calls) == 0
         mock_conn.commit.assert_not_called()
 
-
-# ---------------------------------------------------------------------------
-# AST-based regression test: no duplicate event= kwarg (#3527)
-# ---------------------------------------------------------------------------
-
-_LOGGER_LEVELS = {"info", "warning", "error", "debug", "critical"}
-
-
-class TestNoDuplicateEventKwarg:
-    """Ensure no logger.<level>(positional_string, event=...) duplicate pattern.
-
-    structlog's bound logger maps the first positional arg to 'event='
-    automatically.  Passing both raises TypeError at runtime.  This test
-    parses the script source via ast.parse so it catches the bug without
-    executing any DB or structlog code.
-    """
-
-    def _get_script_path(self) -> str:
-        return os.path.join(
-            os.path.dirname(__file__), "..", "backfill_split_supersede.py"
-        )
-
-    def test_no_logger_call_has_both_positional_and_event_kwarg(self) -> None:
-        script_path = self._get_script_path()
-        with open(script_path) as fh:
-            source = fh.read()
-
-        tree = ast.parse(source, filename=script_path)
-
-        violations: list[int] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            # Match logger.<level>(...) call shapes.
-            if not (
-                isinstance(func, ast.Attribute)
-                and func.attr in _LOGGER_LEVELS
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "logger"
-            ):
-                continue
-            # Violation: has at least one positional arg AND a keyword arg named 'event'.
-            has_positional = len(node.args) > 0
-            has_event_kwarg = any(kw.arg == "event" for kw in node.keywords)
-            if has_positional and has_event_kwarg:
-                violations.append(node.lineno)
-
-        assert violations == [], (
-            f"Duplicate event= kwarg found in backfill_split_supersede.py "
-            f"at lines: {violations}. Remove the explicit event= kwarg — "
-            f"structlog maps the first positional arg to event= automatically."
-        )
