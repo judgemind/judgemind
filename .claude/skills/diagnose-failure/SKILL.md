@@ -223,6 +223,33 @@ Routed here on the bypass-fix from #3366. Read `context.details.conflict_files` 
 
 If the conflict is structural (semantic collision — function rewritten on main, feature reverted), recommend `escalate` (or the inline-#3455 `terminal` shape) or `reissue` with a clarified `new_scope`, and write `next_directive=terminal`.
 
+### Per-category guidance — `push_and_pr_no_unmerged_files` (#3558)
+
+Routed here when `transition_from_push_and_pr` emitted `route_to_diagnoser` with `hint=push_and_pr_no_unmerged_files`: the push_and_pr phase detected that the pre-push rebase left no unmerged files to push — i.e. the agent's branch produced no diff against `origin/main` by the time it reached push_and_pr.
+
+**Gather evidence first:**
+
+```
+# Check if a PR for this issue already landed on main
+git -C {worktree} log origin/main --oneline --grep '#<issue_number>' | head -10
+
+# Check for any open PRs referencing this issue
+gh pr list --repo judgemind/judgemind --search '#<issue_number> is:open'
+
+# Read the ralph verdict for this agent cycle
+cat {worktree}/tmp/ralph/ralph-done.txt 2>/dev/null || echo '(missing)'
+```
+
+**Three known dispositions:**
+
+1. **`already_fixed`** — a prior PR merged the change; the agent's worktree rebased on top and has nothing left to push. Action: close the issue inline (`gh issue close <N> --comment "Closed: already resolved in <PR/commit URL>"`), remove `agent/ready` / `status/in-progress`, emit `action="terminal"` with `action_taken="close"` and `next_directive=terminal`.
+
+2. **`stale_issue`** — the issue describes a change that is no longer needed (premise invalidated by other work, spec changed, etc.). Action: post a `## Diagnosis` comment explaining the staleness, close (`gh issue close <N>`), emit `action="terminal"` with `action_taken="close"` and `next_directive=terminal`.
+
+3. **`ralph_silent_failure`** — ralph returned SHIP but made no commits (bug in the worker: passed checks, wrote no files, committed nothing). The branch has no diff. Action: clear any sentinel files that would make ralph think it already ran (`rm -f {worktree}/tmp/ralph/ralph-done.txt`), emit `action="terminal"` with `action_taken="retry_with_hint"`, `next_directive=respawn_at=ralph`, and include a `hint` field with `"ralph_produced_no_diff"` so the next worker knows to investigate the zero-diff condition.
+
+**When uncertain:** post a `## Diagnosis (3D escalation)` comment on the issue, add `status/needs-human`, emit `action="terminal"` with `action_taken="escalate"` and `next_directive=terminal`.
+
 ### Per-category guidance — `agent_runner_route_stub` (#3366) — historical
 
 Pre-#3455 the agent-runner entrypoint hit a transition shape it didn't know how to route (often `ralph_not_ship` — ralph terminated with a non-SHIP verdict) and emitted `agent_runner_route_stub`. Post-#3455 those fall-throughs are eliminated — the entrypoint emits descriptive terminal phases (`ralph_baseline_transition_unrecognized`, `push_and_pr_transition_unrecognized`, `phase_unknown_<phase>`, etc.) via `agent_runner_reaped_failure`, and `ralph_not_ship` is handled locally (post comment + add `status/blocked`) without bouncing to the diagnoser. If you do see an `agent_runner_route_stub` row in the wild, that's a pre-#3455 agent or a regression — read `context.details.route_hint`, the agent's commits (`git log --oneline origin/main..HEAD`), and the latest reviewer feedback (`{worktree}/tmp/ralph/*-feedback.md` if present), and route to `retry_with_hint` (write a hint, set `next_directive=respawn_at=ralph` if you reset the agent's commits, otherwise `terminal`) or to the inline-#3455 `terminal` shape with `action_taken="block_and_comment"`.

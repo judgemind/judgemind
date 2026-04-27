@@ -5972,10 +5972,10 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T61: #3543 — push_and_pr) dispatch arm — route_to_diagnoser path.
+# Test T61: #3543/#3558 — push_and_pr) dispatch arm — route_to_diagnoser path.
 #
 # Sub-test A: transition_for returns route_to_diagnoser with hint
-#   push_and_pr_no_unmerged_files.
+#   push_and_pr_no_unmerged_files (#3558: uniform dispatch, no inner case "$_hint").
 # Expected behaviour:
 #   1. push_and_pr_route_to_diagnoser log line emitted.
 #   2. agent_runner_reaped_failure called with category push_and_pr_no_unmerged_files.
@@ -5986,6 +5986,14 @@ fi
 # Expected behaviour:
 #   1. advance_phase awaiting_ci called.
 #   2. push_and_pr_route_to_diagnoser NOT emitted.
+#
+# Sub-test C (#3558): transition_for returns route_to_diagnoser with a novel hint
+#   (e.g. novel_hint). Confirms uniform dispatch — same terminal category regardless
+#   of hint value.
+# Expected behaviour:
+#   1. push_and_pr_route_to_diagnoser log line emitted.
+#   2. agent_runner_reaped_failure called with category push_and_pr_no_unmerged_files.
+#   3. advance_phase NOT called.
 # ══════════════════════════════════════════════════════════════════════════
 
 t61_state_dir="$TEST_TMP/t61-state"
@@ -6084,22 +6092,12 @@ t61a_out=$(
             advance_phase "$_next" "$_status"
             ;;
         route_to_diagnoser)
+            # #3558 — uniform dispatch: no inner case "$_hint".
             log "push_and_pr_route_to_diagnoser" "hint=$_hint"
-            case "$_hint" in
-                push_and_pr_no_unmerged_files)
-                    agent_runner_reaped_failure \
-                        "push_and_pr_no_unmerged_files" \
-                        "push_and_pr_no_unmerged_files" \
-                        "push_and_pr rebase failed with no unmerged files"
-                    ;;
-                *)
-                    log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
-                    agent_runner_reaped_failure \
-                        "diagnoser_route_unrecognized_hint" \
-                        "diagnoser_route_unrecognized_hint" \
-                        "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
-                    ;;
-            esac
+            agent_runner_reaped_failure \
+                "push_and_pr_no_unmerged_files" \
+                "push_and_pr_no_unmerged_files" \
+                "push_and_pr route_to_diagnoser — hint=$_hint"
             ;;
         *)
             log "push_and_pr_transition_unrecognized" "action=$_action"
@@ -6208,22 +6206,12 @@ t61b_out=$(
             advance_phase "$_next" "$_status"
             ;;
         route_to_diagnoser)
+            # #3558 — uniform dispatch: no inner case "$_hint".
             log "push_and_pr_route_to_diagnoser" "hint=$_hint"
-            case "$_hint" in
-                push_and_pr_no_unmerged_files)
-                    agent_runner_reaped_failure \
-                        "push_and_pr_no_unmerged_files" \
-                        "push_and_pr_no_unmerged_files" \
-                        "push_and_pr rebase failed with no unmerged files"
-                    ;;
-                *)
-                    log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
-                    agent_runner_reaped_failure \
-                        "diagnoser_route_unrecognized_hint" \
-                        "diagnoser_route_unrecognized_hint" \
-                        "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
-                    ;;
-            esac
+            agent_runner_reaped_failure \
+                "push_and_pr_no_unmerged_files" \
+                "push_and_pr_no_unmerged_files" \
+                "push_and_pr route_to_diagnoser — hint=$_hint"
             ;;
         *)
             log "push_and_pr_transition_unrecognized" "action=$_action"
@@ -6259,6 +6247,120 @@ if ! printf '%s' "$t61b_out" | grep -q "push_and_pr_route_to_diagnoser"; then
 else
     fail "#3543 T61B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance" \
          "out: $(printf '%s' "$t61b_out" | grep "push_and_pr_route_to_diagnoser")"
+fi
+
+# ── Sub-test C: route_to_diagnoser with a novel hint (#3558 uniform dispatch) ─
+
+t61c_state_dir="$t61_state_dir/c"
+mkdir -p "$t61c_state_dir"
+
+_t61c_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'push_and_pr' ]]; then
+        printf 'route_to_diagnoser\t\t\tnovel_hint'
+    fi
+}
+"
+
+_t61c_reaped_failure_override="
+agent_runner_reaped_failure() {
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T61C_STATE_DIR}/reaped-log.txt\"
+    log 'agent_runner_reaped_failure' \"phase=\$1\" \"hint=\$2\"
+}
+"
+
+_t61c_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T61C_STATE_DIR}/advance-log.txt\"
+}
+"
+
+_t61c_handle_push_and_pr_override="
+handle_push_and_pr() {
+    printf '{\"no_unmerged_files\": true}\n'
+}
+"
+
+t61c_out=$(
+    set +eu
+    export T61C_STATE_DIR="$t61c_state_dir"
+    export AGENT_WORKSPACE="$t61_workspace"
+    export REPO_ROOT="$t61_repo_root"
+    export AGENT_ID="61616163-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="3558"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t61_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t61c_transition_for_override"
+    eval "$_t61c_reaped_failure_override"
+    eval "$_t61c_advance_phase_override"
+    eval "$_t61c_handle_push_and_pr_override"
+    # Drive the push_and_pr dispatch logic directly (uniform shape, #3558).
+    _output=$(handle_push_and_pr)
+    persist_phase_output "push_and_pr" "$_output"
+    _transition=$(transition_for "push_and_pr" "$_output")
+    _action=$(printf '%s' "$_transition" | cut -f1)
+    _next=$(printf '%s' "$_transition" | cut -f2)
+    _status=$(printf '%s' "$_transition" | cut -f3)
+    _hint=$(printf '%s' "$_transition" | cut -f4)
+    case "$_action" in
+        advance)
+            advance_phase "$_next"
+            ;;
+        advance_with_status)
+            advance_phase "$_next" "$_status"
+            ;;
+        route_to_diagnoser)
+            # #3558 — uniform dispatch: no inner case "$_hint".
+            log "push_and_pr_route_to_diagnoser" "hint=$_hint"
+            agent_runner_reaped_failure \
+                "push_and_pr_no_unmerged_files" \
+                "push_and_pr_no_unmerged_files" \
+                "push_and_pr route_to_diagnoser — hint=$_hint"
+            ;;
+        *)
+            log "push_and_pr_transition_unrecognized" "action=$_action"
+            agent_runner_reaped_failure \
+                "push_and_pr_transition_unrecognized" \
+                "push_and_pr_transition_unrecognized" \
+                "push_and_pr returned action=$_action"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# T61C (1): subshell completed.
+if printf '%s' "$t61c_out" | grep -q "subshell_done"; then
+    pass "#3558 T61C [push_and_pr novel_hint uniform] — dispatch subshell ran to completion"
+else
+    fail "#3558 T61C [push_and_pr novel_hint uniform] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t61c_out" | tail -c 600)"
+fi
+
+# T61C (2): push_and_pr_route_to_diagnoser log line emitted.
+if printf '%s' "$t61c_out" | grep -q "push_and_pr_route_to_diagnoser"; then
+    pass "#3558 T61C [push_and_pr novel_hint uniform] — push_and_pr_route_to_diagnoser log emitted"
+else
+    fail "#3558 T61C [push_and_pr novel_hint uniform] — push_and_pr_route_to_diagnoser log emitted" \
+         "out: $(printf '%s' "$t61c_out" | tail -c 600)"
+fi
+
+# T61C (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files (uniform).
+if [[ -f "$t61c_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t61c_state_dir/reaped-log.txt"; then
+    pass "#3558 T61C [push_and_pr novel_hint uniform] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
+else
+    fail "#3558 T61C [push_and_pr novel_hint uniform] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
+         "reaped-log: $(cat "$t61c_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# T61C (4): advance_phase NOT called on route_to_diagnoser path.
+if [[ ! -f "$t61c_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t61c_state_dir/advance-log.txt"; then
+    pass "#3558 T61C [push_and_pr novel_hint uniform] — advance_phase not called on route_to_diagnoser"
+else
+    fail "#3558 T61C [push_and_pr novel_hint uniform] — advance_phase not called on route_to_diagnoser" \
+         "advance-log: $(cat "$t61c_state_dir/advance-log.txt" 2>/dev/null)"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

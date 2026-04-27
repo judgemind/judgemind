@@ -112,7 +112,8 @@ class TestRouteToDignoserListsPushAndPrNoUnmergedFiles:
 
 class TestPushAndPrCaseArmHasRouteToDiagnoser:
     """The push_and_pr) case-arm must contain a ``route_to_diagnoser)``
-    arm and a ``push_and_pr_no_unmerged_files)`` hint sub-case (#3543)."""
+    arm and must NOT special-case ``push_and_pr_no_unmerged_files`` as a
+    hint sub-case (#3558 — uniform dispatch, no inner case "$_hint")."""
 
     @staticmethod
     def _push_and_pr_block(text: str) -> str:
@@ -131,10 +132,13 @@ class TestPushAndPrCaseArmHasRouteToDiagnoser:
             "push_and_pr) case-arm must contain a route_to_diagnoser) arm (#3543)"
         )
 
-    def test_push_and_pr_arm_has_no_unmerged_files_hint(self) -> None:
+    def test_push_and_pr_arm_has_no_inner_hint_case(self) -> None:
+        """After #3558 the route_to_diagnoser arm must NOT contain an
+        inner ``case "$_hint"`` sub-dispatch — all hints route uniformly
+        to the same agent_runner_reaped_failure call."""
         text = _script_text()
         block = self._push_and_pr_block(text)
-        assert re.search(r"push_and_pr_no_unmerged_files\)", block), (
-            "push_and_pr) case-arm must contain a push_and_pr_no_unmerged_files) "
-            "hint sub-case (#3543)"
+        assert not re.search(r'case "\$_hint"', block), (
+            'push_and_pr) route_to_diagnoser arm must not contain an inner '
+            'case "$_hint" sub-case after #3558 (uniform dispatch)'
         )

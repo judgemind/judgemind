@@ -1695,6 +1695,13 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         # here so the empowered diagnoser can apply broader judgment
         # than the entrypoint's local routing table.
         FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
+        # #3558: push_and_pr phase routed to diagnoser because transition
+        # detected no unmerged files (i.e. the agent produced no diff).
+        # Tier-3 fits: this is a judgment-call failure (already_fixed /
+        # stale_issue / ralph_silent_failure) that requires the diagnoser
+        # to inspect the issue + branch state rather than a mechanical
+        # retry.
+        FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
     }
 )
 

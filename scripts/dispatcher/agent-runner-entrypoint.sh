@@ -4967,28 +4967,20 @@ while true; do
                     advance_phase "$_next" "$_status"
                     ;;
                 route_to_diagnoser)
-                    # Issue #3543 — push_and_pr rebase failure with no
-                    # unmerged files. transition_from_push_and_pr emits
-                    # ROUTE_TO_DIAGNOSER with hint=push_and_pr_no_unmerged_files
-                    # (#3465). Route to the descriptive terminal so the
-                    # daemon's BYPASSED_TERMINAL_PHASES_TO_ROUTE picks it
-                    # up for the diagnoser sweep.
+                    # Issue #3558 — collapse the inner hint sub-case.
+                    # All hints from transition_from_push_and_pr route to
+                    # the same descriptive terminal so the daemon's
+                    # BYPASSED_TERMINAL_PHASES_TO_ROUTE + TIER_3_CATEGORIES
+                    # picks the failure up for the diagnoser sweep.
+                    # Model: fix_conflict and operational arms (lines
+                    # 5035–5046, 5108–5116) — one fixed category, no hint
+                    # sub-case. The hint string is embedded in the reason
+                    # field for diagnoser context.
                     log "push_and_pr_route_to_diagnoser" "hint=$_hint"
-                    case "$_hint" in
-                        push_and_pr_no_unmerged_files)
-                            agent_runner_reaped_failure \
-                                "push_and_pr_no_unmerged_files" \
-                                "push_and_pr_no_unmerged_files" \
-                                "push_and_pr rebase failed with no unmerged files"
-                            ;;
-                        *)
-                            log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
-                            agent_runner_reaped_failure \
-                                "diagnoser_route_unrecognized_hint" \
-                                "diagnoser_route_unrecognized_hint" \
-                                "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
-                            ;;
-                    esac
+                    agent_runner_reaped_failure \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr route_to_diagnoser — hint=$_hint"
                     ;;
                 *)
                     # Issue #3455 — descriptive terminal instead of
