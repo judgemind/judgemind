@@ -418,16 +418,18 @@ def _available_memory_mb() -> tuple[int, str]:
     """Return the memory available to this process in MB plus a detection source label.
 
     Reads the Linux cgroup memory limit (Fargate sets this) when available,
-    then falls back to ``psutil.virtual_memory()`` or the host total.  Returns
+    then falls back to the ECS container metadata endpoint, then to
+    ``psutil.virtual_memory()`` or the host total.  Returns
     ``(0, "unresolved")`` when no reliable value can be resolved — the caller
     treats 0 as "skip autoscaling."  Never raises — failure returns
-    ``(0, "unresolved")``.  See #2495, #2635.
+    ``(0, "unresolved")``.  See #2495, #2635, #2723.
 
     Source labels:
-    - ``"cgroup_v2"``    — read from ``/sys/fs/cgroup/memory.max``
-    - ``"cgroup_v1"``    — read from ``/sys/fs/cgroup/memory/memory.limit_in_bytes``
-    - ``"psutil_host"``  — read from ``psutil.virtual_memory()`` (host total, not container)
-    - ``"unresolved"``   — could not determine any value
+    - ``"cgroup_v2"``     — read from ``/sys/fs/cgroup/memory.max``
+    - ``"cgroup_v1"``     — read from ``/sys/fs/cgroup/memory/memory.limit_in_bytes``
+    - ``"ecs_metadata"``  — read from the ECS container metadata endpoint (Fargate v4)
+    - ``"psutil_host"``   — read from ``psutil.virtual_memory()`` (host total, not container)
+    - ``"unresolved"``    — could not determine any value
     """
     # Prefer cgroup v2, then v1, then psutil.  Fargate containers expose
     # their memory limit via the memory cgroup — the host's psutil value
@@ -449,6 +451,25 @@ def _available_memory_mb() -> tuple[int, str]:
             return limit_bytes // (1024 * 1024), source
         except (OSError, ValueError):
             continue
+
+    # ECS container metadata endpoint (Fargate v4): authoritative container
+    # memory limit unaffected by cgroup-mount surprises.  Available when
+    # ECS_CONTAINER_METADATA_URI_V4 is set; fetch with a short timeout so we
+    # never block the process on a network hiccup.
+    try:
+        import json
+        import urllib.request
+
+        metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4", "")
+        if metadata_uri:
+            task_url = metadata_uri.rstrip("/") + "/task"
+            with urllib.request.urlopen(task_url, timeout=2) as resp:  # noqa: S310
+                payload = json.loads(resp.read())
+            limit_mib = int(payload["Limits"]["Memory"])
+            if limit_mib > 0:
+                return limit_mib, "ecs_metadata"
+    except Exception:
+        pass
 
     try:
         import psutil
@@ -1897,11 +1918,11 @@ def main() -> None:
         )
         concurrency = decision.effective
         logger.info(
-            "Autoscale decision",
-            cgroup_memory_limit_mb=decision.available_mb,
+            "Autoscaled concurrency to fit memory budget",
+            available_memory_mb=decision.available_mb,
             max_worker_memory_mb=args.max_worker_memory_mb,
             requested_concurrency=concurrency_requested,
-            effective_concurrency=concurrency,
+            effective=concurrency,
             source=decision.source,
             reason=decision.reason,
         )

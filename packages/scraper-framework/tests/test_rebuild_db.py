@@ -11,7 +11,7 @@ import importlib
 import os
 import sys
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 _SCRIPTS_DIR = os.path.join(
     os.path.dirname(__file__),
@@ -1642,6 +1642,21 @@ class TestAutoscaleConcurrency:
         assert decision.effective == 4
         assert decision.reason == "memory_budget"
 
+    def test_ecs_metadata_source_uses_memory_budget(self) -> None:
+        """source="ecs_metadata", 16 GB container, 1 GB per worker, 64 requested → 16 effective.
+
+        Confirms that "ecs_metadata" is treated as a trusted source (not fargate_fallback).
+        Satisfies AC#2.
+        """
+        decision = rebuild_db._autoscale_concurrency(
+            requested=64,
+            max_worker_memory_mb=1024,
+            available_memory_mb=16384,
+            source="ecs_metadata",
+        )
+        assert decision.effective == 16
+        assert decision.reason == "memory_budget"
+
 
 class TestAvailableMemoryMb:
     """Tests for _available_memory_mb().
@@ -1665,14 +1680,51 @@ class TestAvailableMemoryMb:
         value, source = result
         assert isinstance(value, int)
         assert value >= 0
-        assert source in {"cgroup_v2", "cgroup_v1", "psutil_host", "unresolved"}
+        assert source in {"cgroup_v2", "cgroup_v1", "ecs_metadata", "psutil_host", "unresolved"}
+
+    def test_cgroup_v2_reads_known_value(self) -> None:
+        """Stub /sys/fs/cgroup/memory.max to return a known value; assert correct MiB conversion.
+
+        16 GiB == 17179869184 bytes == 16384 MiB.  Satisfies AC#4.
+        """
+        with patch("builtins.open", mock_open(read_data="17179869184\n")):
+            value, source = rebuild_db._available_memory_mb()
+        assert (value, source) == (16384, "cgroup_v2")
+
+    def test_ecs_metadata_returns_container_limit(self) -> None:
+        """ECS container metadata endpoint returns the container's memory limit in MiB.
+
+        Stubs builtins.open to raise OSError (simulating cgroup paths unavailable),
+        then patches ECS_CONTAINER_METADATA_URI_V4 and urllib.request.urlopen to return
+        a fake response with Limits.Memory == 16384.  Asserts (16384, "ecs_metadata").
+        Satisfies AC#1.
+        """
+        import json
+
+        fake_payload = json.dumps({"Limits": {"Memory": 16384}}).encode()
+        fake_response = MagicMock()
+        fake_response.read.return_value = fake_payload
+        fake_response.__enter__ = MagicMock(return_value=fake_response)
+        fake_response.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch("builtins.open", side_effect=OSError("no cgroup")),
+            patch.dict(
+                os.environ,
+                {"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/abc"},
+                clear=False,
+            ),
+            patch("urllib.request.urlopen", return_value=fake_response),
+        ):
+            value, source = rebuild_db._available_memory_mb()
+        assert (value, source) == (16384, "ecs_metadata")
 
 
 class TestAutoscaleLogging:
     """Integration tests: autoscale decision logging in main().
 
-    Verify that main() always emits an INFO "Autoscale decision" log with the
-    four required fields, and that a WARNING fires when the Fargate fallback
+    Verify that main() always emits an INFO "Autoscaled concurrency to fit memory budget" log
+    with the four required fields, and that a WARNING fires when the Fargate fallback
     path is triggered.
     """
 
@@ -1742,7 +1794,7 @@ class TestAutoscaleLogging:
         return mock_logger
 
     def test_info_log_carries_required_fields(self, tmp_path: Any) -> None:
-        """INFO "Autoscale decision" log must include the four required fields.
+        """INFO "Autoscaled concurrency to fit memory budget" must include the four required fields.
 
         These fields are consumed by log-based alerting and the ops dashboard.
         """
@@ -1752,16 +1804,19 @@ class TestAutoscaleLogging:
 
         info_calls = mock_logger.info.call_args_list
         autoscale_calls = [
-            call for call in info_calls if call.args and call.args[0] == "Autoscale decision"
+            call
+            for call in info_calls
+            if call.args and call.args[0] == "Autoscaled concurrency to fit memory budget"
         ]
         assert len(autoscale_calls) == 1, (
-            f"Expected exactly 1 'Autoscale decision' INFO log; got {autoscale_calls!r}"
+            "Expected exactly 1 'Autoscaled concurrency to fit memory budget' INFO log; "
+            f"got {autoscale_calls!r}"
         )
         kwargs = autoscale_calls[0].kwargs
-        assert "cgroup_memory_limit_mb" in kwargs, f"Missing cgroup_memory_limit_mb in {kwargs!r}"
+        assert "available_memory_mb" in kwargs, f"Missing available_memory_mb in {kwargs!r}"
         assert "max_worker_memory_mb" in kwargs, f"Missing max_worker_memory_mb in {kwargs!r}"
         assert "requested_concurrency" in kwargs, f"Missing requested_concurrency in {kwargs!r}"
-        assert "effective_concurrency" in kwargs, f"Missing effective_concurrency in {kwargs!r}"
+        assert "effective" in kwargs, f"Missing effective in {kwargs!r}"
 
     def test_fargate_fallback_emits_warning(self, tmp_path: Any) -> None:
         """When cgroup detection fails (psutil_host + large value), a WARNING fires.
@@ -1788,16 +1843,18 @@ class TestAutoscaleLogging:
         # The INFO log must also carry the four required fields
         info_calls = mock_logger.info.call_args_list
         autoscale_calls = [
-            call for call in info_calls if call.args and call.args[0] == "Autoscale decision"
+            call
+            for call in info_calls
+            if call.args and call.args[0] == "Autoscaled concurrency to fit memory budget"
         ]
         assert len(autoscale_calls) == 1
         kwargs = autoscale_calls[0].kwargs
-        assert "cgroup_memory_limit_mb" in kwargs
+        assert "available_memory_mb" in kwargs
         assert "max_worker_memory_mb" in kwargs
         assert "requested_concurrency" in kwargs
-        assert "effective_concurrency" in kwargs
+        assert "effective" in kwargs
         # Effective concurrency must be capped at 4
-        assert kwargs["effective_concurrency"] == 4
+        assert kwargs["effective"] == 4
 
 
 class TestRetryCrashedKeysSerially:
