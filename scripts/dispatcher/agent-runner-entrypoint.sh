@@ -4850,24 +4850,57 @@ while true; do
                         _bt=$(transition_for "ralph" "$_ralph_baseline_output")
                         _ba=$(printf '%s' "$_bt" | cut -f1)
                         _bn=$(printf '%s' "$_bt" | cut -f2)
-                        if [[ "$_ba" == "advance" ]]; then
-                            advance_phase "$_bn"
-                        else
-                            # Issue #3455 — replace the route_stub
-                            # fall-through with a descriptive terminal
-                            # so the daemon row reads
-                            # ``ralph_baseline_transition_unrecognized``
-                            # instead of ``agent_runner_route_stub``.
-                            # No diagnoser routing — this is a code
-                            # bug surface (transition_for returned a
-                            # shape we don't handle), not a semantic
-                            # failure the diagnoser can fix.
-                            log "ralph_baseline_transition_unrecognized" "action=$_ba"
-                            agent_runner_reaped_failure \
-                                "ralph_baseline_transition_unrecognized" \
-                                "ralph_baseline_transition_unrecognized" \
-                                "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
-                        fi
+                        _bs=$(printf '%s' "$_bt" | cut -f3)
+                        _bh=$(printf '%s' "$_bt" | cut -f4)
+                        case "$_ba" in
+                            advance)
+                                advance_phase "$_bn"
+                                ;;
+                            advance_with_status)
+                                advance_phase "$_bn" "$_bs"
+                                ;;
+                            route_to_diagnoser)
+                                # Issue #3573 — ralph baseline rebase failure
+                                # with no unmerged files. transition_from_ralph
+                                # emits ROUTE_TO_DIAGNOSER with hint=
+                                # push_and_pr_no_unmerged_files (#3465). Route
+                                # to the descriptive terminal so the daemon's
+                                # BYPASSED_TERMINAL_PHASES_TO_ROUTE picks it
+                                # up for the diagnoser sweep.
+                                log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
+                                case "$_bh" in
+                                    push_and_pr_no_unmerged_files)
+                                        agent_runner_reaped_failure \
+                                            "push_and_pr_no_unmerged_files" \
+                                            "push_and_pr_no_unmerged_files" \
+                                            "ralph baseline rebase failed with no unmerged files (#3573)"
+                                        ;;
+                                    *)
+                                        log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
+                                        agent_runner_reaped_failure \
+                                            "diagnoser_route_unrecognized_hint" \
+                                            "diagnoser_route_unrecognized_hint" \
+                                            "ralph_baseline route_to_diagnoser received unrecognized hint=${_bh:-(empty)}"
+                                        ;;
+                                esac
+                                ;;
+                            *)
+                                # Issue #3455 — replace the route_stub
+                                # fall-through with a descriptive terminal
+                                # so the daemon row reads
+                                # ``ralph_baseline_transition_unrecognized``
+                                # instead of ``agent_runner_route_stub``.
+                                # No diagnoser routing — this is a code
+                                # bug surface (transition_for returned a
+                                # shape we don't handle), not a semantic
+                                # failure the diagnoser can fix.
+                                log "ralph_baseline_transition_unrecognized" "action=$_ba"
+                                agent_runner_reaped_failure \
+                                    "ralph_baseline_transition_unrecognized" \
+                                    "ralph_baseline_transition_unrecognized" \
+                                    "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
+                                ;;
+                        esac
                         continue
                     fi
                 else

@@ -6438,6 +6438,282 @@ else
          "out: $(printf '%s' "$t62b_out" | grep "external_terminal_observed")"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T63: #3573 — ralph_baseline rebase dispatch — route_to_diagnoser path.
+#
+# Sub-test A: transition_for returns route_to_diagnoser with hint
+#   push_and_pr_no_unmerged_files.
+# Expected behaviour:
+#   1. ralph_baseline_route_to_diagnoser log line emitted.
+#   2. agent_runner_reaped_failure called with category push_and_pr_no_unmerged_files.
+#   3. advance_phase NOT called.
+#   4. ralph_baseline_transition_unrecognized NOT emitted.
+#
+# Sub-test B (regression): transition_for returns advance\tfix_conflict\t\t.
+# Expected behaviour:
+#   1. advance_phase fix_conflict called.
+#   2. ralph_baseline_route_to_diagnoser NOT emitted.
+# ══════════════════════════════════════════════════════════════════════════
+
+t63_state_dir="$TEST_TMP/t63-state"
+t63_stub_bin="$TEST_TMP/t63-bin"
+t63_workspace="$TEST_TMP/t63-workspace"
+t63_repo_root="$TEST_TMP/t63-repo"
+mkdir -p "$t63_state_dir" "$t63_stub_bin" "$t63_workspace" "$t63_repo_root"
+mkdir -p "$t63_repo_root/tmp/dispatcher-input"
+mkdir -p "$t63_repo_root/tmp/dispatcher-output"
+
+# psql stub — responds to phase SELECT with ralph.
+cat > "$t63_stub_bin/psql" <<'T63PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+if [[ "$query" == *"SELECT phase"* ]]; then printf 'ralph\n'; fi
+exit 0
+T63PSQLEOF
+chmod +x "$t63_stub_bin/psql"
+
+cat > "$t63_stub_bin/git" <<'T63GITEOF'
+#!/usr/bin/env bash
+exit 0
+T63GITEOF
+chmod +x "$t63_stub_bin/git"
+
+cat > "$t63_stub_bin/gh" <<'T63GHEOF'
+#!/usr/bin/env bash
+exit 0
+T63GHEOF
+chmod +x "$t63_stub_bin/gh"
+
+# ── Sub-test A: route_to_diagnoser with push_and_pr_no_unmerged_files ──────
+
+t63a_state_dir="$t63_state_dir/a"
+mkdir -p "$t63a_state_dir"
+
+_t63a_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'ralph' ]]; then
+        printf 'route_to_diagnoser\t\t\tpush_and_pr_no_unmerged_files'
+    fi
+}
+"
+
+_t63a_reaped_failure_override="
+agent_runner_reaped_failure() {
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T63A_STATE_DIR}/reaped-log.txt\"
+    log 'agent_runner_reaped_failure' \"phase=\$1\" \"hint=\$2\"
+}
+"
+
+_t63a_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T63A_STATE_DIR}/advance-log.txt\"
+}
+"
+
+t63a_out=$(
+    set +eu
+    export T63A_STATE_DIR="$t63a_state_dir"
+    export AGENT_WORKSPACE="$t63_workspace"
+    export REPO_ROOT="$t63_repo_root"
+    export AGENT_ID="63636363-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="3573"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t63_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t63a_transition_for_override"
+    eval "$_t63a_reaped_failure_override"
+    eval "$_t63a_advance_phase_override"
+    # Drive the ralph_baseline rebase dispatch logic directly (mirrors the entrypoint).
+    _ralph_baseline_output='{"rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": "", "source_phase": "ralph"}'
+    persist_phase_output "ralph" "$_ralph_baseline_output"
+    _bt=$(transition_for "ralph" "$_ralph_baseline_output")
+    _ba=$(printf '%s' "$_bt" | cut -f1)
+    _bn=$(printf '%s' "$_bt" | cut -f2)
+    _bs=$(printf '%s' "$_bt" | cut -f3)
+    _bh=$(printf '%s' "$_bt" | cut -f4)
+    case "$_ba" in
+        advance)
+            advance_phase "$_bn"
+            ;;
+        advance_with_status)
+            advance_phase "$_bn" "$_bs"
+            ;;
+        route_to_diagnoser)
+            log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
+            case "$_bh" in
+                push_and_pr_no_unmerged_files)
+                    agent_runner_reaped_failure \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr_no_unmerged_files" \
+                        "ralph baseline rebase failed with no unmerged files (#3573)"
+                    ;;
+                *)
+                    log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
+                    agent_runner_reaped_failure \
+                        "diagnoser_route_unrecognized_hint" \
+                        "diagnoser_route_unrecognized_hint" \
+                        "ralph_baseline route_to_diagnoser received unrecognized hint=${_bh:-(empty)}"
+                    ;;
+            esac
+            ;;
+        *)
+            log "ralph_baseline_transition_unrecognized" "action=$_ba"
+            agent_runner_reaped_failure \
+                "ralph_baseline_transition_unrecognized" \
+                "ralph_baseline_transition_unrecognized" \
+                "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# T63A (1): subshell completed.
+if printf '%s' "$t63a_out" | grep -q "subshell_done"; then
+    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — dispatch subshell ran to completion"
+else
+    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t63a_out" | tail -c 600)"
+fi
+
+# T63A (2): ralph_baseline_route_to_diagnoser log line emitted.
+if printf '%s' "$t63a_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
+    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_route_to_diagnoser log emitted"
+else
+    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_route_to_diagnoser log emitted" \
+         "out: $(printf '%s' "$t63a_out" | tail -c 600)"
+fi
+
+# T63A (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files.
+if [[ -f "$t63a_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t63a_state_dir/reaped-log.txt"; then
+    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
+else
+    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
+         "reaped-log: $(cat "$t63a_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# T63A (4): advance_phase NOT called on route_to_diagnoser path.
+if [[ ! -f "$t63a_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t63a_state_dir/advance-log.txt"; then
+    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — advance_phase not called on route_to_diagnoser"
+else
+    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — advance_phase not called on route_to_diagnoser" \
+         "advance-log: $(cat "$t63a_state_dir/advance-log.txt" 2>/dev/null)"
+fi
+
+# T63A (5): ralph_baseline_transition_unrecognized NOT emitted.
+if ! printf '%s' "$t63a_out" | grep -q "ralph_baseline_transition_unrecognized"; then
+    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_transition_unrecognized not emitted"
+else
+    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_transition_unrecognized not emitted" \
+         "out: $(printf '%s' "$t63a_out" | grep "ralph_baseline_transition_unrecognized")"
+fi
+
+# ── Sub-test B: advance happy-path regression ──────────────────────────────
+
+t63b_state_dir="$t63_state_dir/b"
+mkdir -p "$t63b_state_dir"
+
+_t63b_transition_for_override="
+transition_for() {
+    if [[ \"\${1:-}\" == 'ralph' ]]; then
+        printf 'advance\tfix_conflict\t\t'
+    fi
+}
+"
+
+_t63b_advance_phase_override="
+advance_phase() {
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T63B_STATE_DIR}/advance-log.txt\"
+}
+"
+
+t63b_out=$(
+    set +eu
+    export T63B_STATE_DIR="$t63b_state_dir"
+    export AGENT_WORKSPACE="$t63_workspace"
+    export REPO_ROOT="$t63_repo_root"
+    export AGENT_ID="63636364-dead-beef-cafe-000000000001"
+    export ISSUE_NUMBER="3573"
+    export DATABASE_URL="postgresql://stub"
+    export AGENT_RUNNER_DRY_RUN="0"
+    export PATH="$t63_stub_bin:$PATH"
+    source "$t58_funcs"
+    eval "$_t63b_transition_for_override"
+    eval "$_t63b_advance_phase_override"
+    # Drive the ralph_baseline rebase dispatch logic directly.
+    _ralph_baseline_output='{"rebase_failed": true, "conflict_files": ["foo.py"], "rebase_stderr_tail": "", "source_phase": "ralph"}'
+    persist_phase_output "ralph" "$_ralph_baseline_output"
+    _bt=$(transition_for "ralph" "$_ralph_baseline_output")
+    _ba=$(printf '%s' "$_bt" | cut -f1)
+    _bn=$(printf '%s' "$_bt" | cut -f2)
+    _bs=$(printf '%s' "$_bt" | cut -f3)
+    _bh=$(printf '%s' "$_bt" | cut -f4)
+    case "$_ba" in
+        advance)
+            advance_phase "$_bn"
+            ;;
+        advance_with_status)
+            advance_phase "$_bn" "$_bs"
+            ;;
+        route_to_diagnoser)
+            log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
+            case "$_bh" in
+                push_and_pr_no_unmerged_files)
+                    agent_runner_reaped_failure \
+                        "push_and_pr_no_unmerged_files" \
+                        "push_and_pr_no_unmerged_files" \
+                        "ralph baseline rebase failed with no unmerged files (#3573)"
+                    ;;
+                *)
+                    log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
+                    agent_runner_reaped_failure \
+                        "diagnoser_route_unrecognized_hint" \
+                        "diagnoser_route_unrecognized_hint" \
+                        "ralph_baseline route_to_diagnoser received unrecognized hint=${_bh:-(empty)}"
+                    ;;
+            esac
+            ;;
+        *)
+            log "ralph_baseline_transition_unrecognized" "action=$_ba"
+            agent_runner_reaped_failure \
+                "ralph_baseline_transition_unrecognized" \
+                "ralph_baseline_transition_unrecognized" \
+                "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
+            ;;
+    esac
+    echo "subshell_done"
+    2>&1
+) 2>&1
+
+# T63B (1): subshell completed.
+if printf '%s' "$t63b_out" | grep -q "subshell_done"; then
+    pass "#3573 T63B [ralph_baseline advance] — dispatch subshell ran to completion"
+else
+    fail "#3573 T63B [ralph_baseline advance] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t63b_out" | tail -c 600)"
+fi
+
+# T63B (2): advance_phase fix_conflict called.
+if [[ -f "$t63b_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE fix_conflict" "$t63b_state_dir/advance-log.txt"; then
+    pass "#3573 T63B [ralph_baseline advance] — advance_phase fix_conflict called"
+else
+    fail "#3573 T63B [ralph_baseline advance] — advance_phase fix_conflict called" \
+         "advance-log: $(cat "$t63b_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+fi
+
+# T63B (3): ralph_baseline_route_to_diagnoser NOT emitted on advance path.
+if ! printf '%s' "$t63b_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
+    pass "#3573 T63B [ralph_baseline advance] — ralph_baseline_route_to_diagnoser not emitted on advance"
+else
+    fail "#3573 T63B [ralph_baseline advance] — ralph_baseline_route_to_diagnoser not emitted on advance" \
+         "out: $(printf '%s' "$t63b_out" | grep "ralph_baseline_route_to_diagnoser")"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
