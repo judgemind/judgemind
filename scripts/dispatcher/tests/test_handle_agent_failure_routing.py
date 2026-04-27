@@ -128,6 +128,7 @@ class TestBypassedTerminalConstants:
         # ``ralph_not_ship`` is intentionally NOT here — it's handled
         # locally by the entrypoint.
         from dispatcher.daemon import (
+            FAILURE_CATEGORY_DEPLOY_FAILED,
             FAILURE_CATEGORY_FIX_CI_BLOCKED,
             FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
@@ -144,6 +145,7 @@ class TestBypassedTerminalConstants:
             "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
             "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
+            "awaiting_deploy_failed": FAILURE_CATEGORY_DEPLOY_FAILED,
         }
 
 
