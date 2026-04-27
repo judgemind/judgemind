@@ -25,7 +25,7 @@ MIGRATION_PATH = (
     / "packages"
     / "api"
     / "migrations"
-    / "56_dispatcher-backfill-ended-at.sql"
+    / "57_dispatcher-backfill-ended-at.sql"
 )
 
 # Expected terminal statuses that the UP migration must filter on.
@@ -56,7 +56,7 @@ def _down_section(text: str) -> str:
 def test_migration_file_exists() -> None:
     assert MIGRATION_PATH.is_file(), (
         f"Migration file missing: {MIGRATION_PATH}\n"
-        "Create packages/api/migrations/56_dispatcher-backfill-ended-at.sql (#3574)"
+        "Create packages/api/migrations/57_dispatcher-backfill-ended-at.sql (#3574)"
     )
 
 
