@@ -102,6 +102,27 @@ describe('DiagnoserEffectivenessPanel', () => {
     expect(rows[0]).toHaveTextContent('3');
   });
 
+  it('renders (unknown) sentinel for null-outcome rows (#3653)', () => {
+    // Regression test: outcome JSONB present but lacking retry_outcome key →
+    // API maps observed_outcome to '(unknown)'.  The panel must render the
+    // '(unknown)' badge without crashing or showing empty state.
+    mockQueryResult = {
+      data: {
+        weeklyDiagnoserReport: [
+          makeRow({ recommendedAction: 'escalate', observedOutcome: '(unknown)', count: 2 }),
+        ],
+      },
+      loading: false,
+      error: undefined,
+    };
+    render(<DiagnoserEffectivenessPanel />);
+    const rows = screen.getAllByTestId('diagnoser-effectiveness-row');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent('escalate');
+    expect(rows[0]).toHaveTextContent('(unknown)');
+    expect(rows[0]).toHaveTextContent('2');
+  });
+
   it('renders skeleton placeholders while loading with no data yet', () => {
     mockQueryResult = {
       data: undefined,
