@@ -1,7 +1,7 @@
 """Issue #3392 — schema-level assertions for ``dispatcher.diagnoses.status``
 column comment.
 
-Migration 56 adds COMMENT ON COLUMN for the status column, documenting all
+Migration 60 adds COMMENT ON COLUMN for the status column, documenting all
 four lifecycle values: pending | completed | failed | orphaned.
 
 The orphaned value was introduced in PR #3388 (issue #3383) so that
@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MIGRATION_56 = (
     REPO_ROOT
-    / "packages/api/migrations/56_dispatcher-diagnoses-orphaned-status-doc.sql"
+    / "packages/api/migrations/60_dispatcher-diagnoses-orphaned-status-doc.sql"
 )
 SCHEMA_SQL = REPO_ROOT / "packages/api/src/data-access/schema.sql"
 
