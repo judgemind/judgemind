@@ -58,8 +58,8 @@ for issue in issues:
     title = issue['title']
     body = issue.get('body') or ''
 
-    # Look for 'Blocked by #N' lines in the body
-    blockers = re.findall(r'Blocked by #(\d+)', body)
+    # Look for 'Blocked by #N' or 'Blocked by: #N' lines in the body
+    blockers = re.findall(r'Blocked by:?\s+#(\d+)', body)
 
     if not blockers:
         mismatches.append((n, title))

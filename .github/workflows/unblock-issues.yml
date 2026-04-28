@@ -1,13 +1,18 @@
-name: Unblock dependent issues on PR merge
+name: Unblock dependent issues on PR merge or issue close
 
 on:
   pull_request:
     types: [closed]
     branches: [main]
+  issues:
+    types: [closed]
 
 jobs:
   unblock:
-    if: github.event.pull_request.merged == true
+    # Run when a PR is merged OR when an issue is directly closed.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      github.event_name == 'issues'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -18,12 +23,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT_NAME: ${{ github.event_name }}
+          CLOSED_ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           python3 - << 'PYEOF'
           import subprocess, json, re, os, sys
 
           repo = os.environ['GITHUB_REPOSITORY']
           pr_body = os.environ.get('PR_BODY', '')
+          event_name = os.environ.get('EVENT_NAME', '')
+          closed_issue_env = os.environ.get('CLOSED_ISSUE_NUMBER', '')
 
           def gh(*args):
               r = subprocess.run(['gh', *args], capture_output=True, text=True)
@@ -36,22 +45,45 @@ jobs:
               out = gh(*args)
               return json.loads(out) if out else None
 
-          # Extract issue numbers closed by this PR
-          closed = re.findall(r'(?:closes|fixes|resolves)\s+#(\d+)', pr_body, re.IGNORECASE)
-          if not closed:
-              print('No issue references found in PR body.')
-              sys.exit(0)
+          # Determine which issues were closed triggering this workflow run.
+          # - pull_request event: parse "Closes #N" from the PR body.
+          # - issues event: the closed issue number comes from the event payload directly.
+          if event_name == 'issues' and closed_issue_env:
+              closed = [closed_issue_env]
+              print(f'Triggered by issue close: #{closed_issue_env}')
+          else:
+              # Extract issue numbers closed by this PR
+              closed = re.findall(r'(?:closes|fixes|resolves)\s+#(\d+)', pr_body, re.IGNORECASE)
+              if not closed:
+                  print('No issue references found in PR body.')
+                  sys.exit(0)
 
           for issue_n in closed:
               print(f'Checking for issues blocked by #{issue_n}...')
 
-              blocked = gh_json(
+              # Run two searches to catch both "Blocked by #N" and "Blocked by: #N"
+              blocked_no_colon = gh_json(
                   'issue', 'list', '--repo', repo,
                   '--state', 'open',
                   '--search', f'"Blocked by #{issue_n}"',
                   '--json', 'number,body,labels',
                   '--limit', '50',
-              )
+              ) or []
+              blocked_with_colon = gh_json(
+                  'issue', 'list', '--repo', repo,
+                  '--state', 'open',
+                  '--search', f'"Blocked by: #{issue_n}"',
+                  '--json', 'number,body,labels',
+                  '--limit', '50',
+              ) or []
+              # Deduplicate by issue number
+              seen = set()
+              blocked = []
+              for item in blocked_no_colon + blocked_with_colon:
+                  if item['number'] not in seen:
+                      seen.add(item['number'])
+                      blocked.append(item)
+
               if not blocked:
                   print(f'No open issues blocked by #{issue_n}.')
                   continue
@@ -59,7 +91,8 @@ jobs:
               for issue in blocked:
                   n = issue['number']
                   body = issue.get('body') or ''
-                  blockers = re.findall(r'Blocked by #(\d+)', body)
+                  # Accept both "Blocked by #N" and "Blocked by: #N"
+                  blockers = re.findall(r'Blocked by:?\s+#(\d+)', body)
                   if not blockers:
                       continue
 
@@ -94,9 +127,9 @@ jobs:
 
                   print(f'Author verified — unblocking #{n}...')
 
-                  # Strip resolved "Blocked by #X" lines
+                  # Strip resolved "Blocked by #X" / "Blocked by: #X" lines
                   lines = body.splitlines()
-                  lines = [l for l in lines if not re.match(r'\s*Blocked by #\d+', l)]
+                  lines = [l for l in lines if not re.match(r'\s*Blocked by:?\s+#\d+', l)]
 
                   # Remove empty "## Dependencies" section
                   result = []
@@ -121,3 +154,42 @@ jobs:
                      '--remove-label', 'status/blocked', '--add-label', 'agent/ready')
                   print(f'Issue #{n} unblocked and marked agent/ready.')
           PYEOF
+
+      - name: Post-run audit — check for remaining blocked issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CLOSED_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          event_name="${EVENT_NAME}"
+          pr_body="${PR_BODY}"
+          closed_issue_env="${CLOSED_ISSUE_NUMBER}"
+
+          if [ "$event_name" = "issues" ] && [ -n "$closed_issue_env" ]; then
+            closed_issues="$closed_issue_env"
+          else
+            closed_issues=$(echo "$pr_body" | grep -oiP '(?:closes|fixes|resolves)\s+#\K\d+' || true)
+          fi
+
+          if [ -z "$closed_issues" ]; then
+            echo "No closed issues to audit."
+            exit 0
+          fi
+
+          for issue_n in $closed_issues; do
+            echo "Audit: checking for remaining blocked issues that reference #${issue_n}..."
+            survivors=$(gh issue list --repo judgemind/judgemind \
+              --label "status/blocked" \
+              --search "\"Blocked by #${issue_n}\"" \
+              --json number,title \
+              --limit 20 2>/dev/null || echo "[]")
+            count=$(echo "$survivors" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+            if [ "$count" -gt 0 ]; then
+              echo "WARNING: ${count} issue(s) still have status/blocked and reference #${issue_n} — possible misfires:"
+              echo "$survivors" | python3 -c "import json,sys; [print(f'  #{i[\"number\"]}: {i[\"title\"]}') for i in json.load(sys.stdin)]" 2>/dev/null || true
+            else
+              echo "OK: No remaining blocked issues referencing #${issue_n}."
+            fi
+          done

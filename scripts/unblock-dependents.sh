@@ -77,19 +77,54 @@ if [ "$DRY_RUN" = true ]; then
     echo ""
 fi
 
-# Search for open issues containing "Blocked by #N"
+# Search for open issues containing "Blocked by #N" or "Blocked by: #N".
+# GitHub search only supports substring matching, so we run two queries and merge
+# the results to catch both the canonical and colon-variant forms.
 echo "Searching for open issues blocked by #$CLOSED_ISSUE..."
-BLOCKED_ISSUES=$(gh issue list --repo "$REPO" \
+BLOCKED_NO_COLON=$(gh issue list --repo "$REPO" \
     --state open \
     --search "\"Blocked by #$CLOSED_ISSUE\"" \
     --json number,body,labels \
-    --limit 50 2>/dev/null) || {
-    echo "Error: Could not search for blocked issues." >&2
+    --limit 50 2>/dev/null) || BLOCKED_NO_COLON="[]"
+
+BLOCKED_WITH_COLON=$(gh issue list --repo "$REPO" \
+    --state open \
+    --search "\"Blocked by: #$CLOSED_ISSUE\"" \
+    --json number,body,labels \
+    --limit 50 2>/dev/null) || BLOCKED_WITH_COLON="[]"
+
+# Merge and deduplicate the two result sets by issue number.
+# Use temp files to avoid quoting issues when issue bodies contain special characters.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORK_TMPDIR="${SCRIPT_DIR}/../tmp"
+mkdir -p "$WORK_TMPDIR"
+MERGE_A="$WORK_TMPDIR/_merge_no_colon_$CLOSED_ISSUE.json"
+MERGE_B="$WORK_TMPDIR/_merge_with_colon_$CLOSED_ISSUE.json"
+printf '%s' "$BLOCKED_NO_COLON" > "$MERGE_A"
+printf '%s' "$BLOCKED_WITH_COLON" > "$MERGE_B"
+BLOCKED_ISSUES=$(python3 - "$MERGE_A" "$MERGE_B" << 'PYEOF'
+import json, sys
+with open(sys.argv[1]) as fa:
+    a = json.load(fa)
+with open(sys.argv[2]) as fb:
+    b = json.load(fb)
+seen = set()
+merged = []
+for item in a + b:
+    if item['number'] not in seen:
+        seen.add(item['number'])
+        merged.append(item)
+print(json.dumps(merged))
+PYEOF
+) || {
+    rm -f "$MERGE_A" "$MERGE_B"
+    echo "Error: Could not merge blocked issue search results." >&2
     exit 1
 }
+rm -f "$MERGE_A" "$MERGE_B"
 
 # Check if any results
-COUNT=$(echo "$BLOCKED_ISSUES" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+COUNT=$(printf '%s' "$BLOCKED_ISSUES" | python3 -c "import json, sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
 if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
     echo "No open issues found with 'Blocked by #$CLOSED_ISSUE' in the body."
     exit 0
@@ -97,11 +132,6 @@ fi
 
 echo "Found $COUNT candidate issue(s). Checking blockers..."
 echo ""
-
-# Resolve the directory for temp files
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORK_TMPDIR="${SCRIPT_DIR}/../tmp"
-mkdir -p "$WORK_TMPDIR"
 
 # Delegate to Python helper for JSON parsing and body manipulation
 REPO="$REPO" \
