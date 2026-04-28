@@ -1344,21 +1344,15 @@ class TestLooksLikeValidJudgeNameTruncation:
         """'John K' — single character, not a suffix — rejected."""
         assert _looks_like_valid_judge_name("John K") is False
 
-    def test_accepts_asian_surname_vu(self) -> None:
-        """'Nathan Nhan Vu' — AC2: 2-char surname 'Vu' is a valid Vietnamese name."""
-        assert _looks_like_valid_judge_name("Nathan Nhan Vu") is True
+    @pytest.mark.parametrize("surname", ["Vu", "Lo", "Li", "Wu", "Xu", "Hu", "Lu", "Fu", "Ng"])
+    @pytest.mark.parametrize("trailing", ["", "."])
+    def test_accepts_asian_surname_all_forms(self, surname: str, trailing: str) -> None:
+        """All 9 Asian surnames are valid in both plain and trailing-period forms."""
+        assert _looks_like_valid_judge_name(f"Nathan {surname}{trailing}") is True
 
-    def test_accepts_asian_surname_lo(self) -> None:
-        """'Thomas J. Lo' — AC3: 2-char surname 'Lo' is a valid Asian name."""
-        assert _looks_like_valid_judge_name("Thomas J. Lo") is True
-
-    def test_accepts_asian_surname_wu(self) -> None:
-        """'Jane Wu' — 2-char surname 'Wu' is a valid Chinese name."""
-        assert _looks_like_valid_judge_name("Jane Wu") is True
-
-    def test_accepts_asian_surname_ng(self) -> None:
-        """'David Ng' — 2-char consonant-only surname 'Ng' is a valid Cantonese name."""
-        assert _looks_like_valid_judge_name("David Ng") is True
+    def test_accepts_trailing_period_after_asian_surname(self) -> None:
+        # AC1: trailing period from court-supplied directory should not reject
+        assert _looks_like_valid_judge_name("Hon. Nathan Vu.") is True
 
 
 # ---------------------------------------------------------------------------
