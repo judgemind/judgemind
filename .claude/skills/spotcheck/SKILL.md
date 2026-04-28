@@ -153,7 +153,7 @@ Once you've worked through the sample, you usually still have time. Use it. The 
 Possible directions (pick what feels productive — don't try to do them all):
 
 - **Scraper drift.** Check `telemetry.scraper_runs` for counties with declining capture rates or unusual error patterns. `scripts/dev-db-query.sh` for the SELECT.
-- **Dispatcher behavior.** Skim the last 24h of `dispatcher.agents` rows — failure-class concentration, repeated stuck_timeouts on the same issue, `final_phase` distribution. Anything anomalous?
+- **Dispatcher behavior.** Skim the last 24h of `dispatcher.agents` rows — failure-class concentration, repeated stuck_timeouts on the same issue, terminal `phase` distribution (the column is `phase`, not `final_phase` — `final_phase` is the status-file / structured-log field name). Anything anomalous?
 - **Dead or abandoned columns.** Check whether columns marked deprecated in migrations are still being written or read by application code. A column with stale data is worse than a missing one.
 - **Stale documentation.** Source-file docstrings or `README.md` files in `packages/` that contradict the current code (a frequent spotcheck finding — investigations land but the docstrings stay stale; see #2434 and B.1.5 in `.claude/skills/task/SKILL.md`).
 - **Field completeness regressions.** `derived.rulings` null-rate per field over recent days — sudden cliff = regression. Compare against the field-completeness loop notes (`MEMORY.md` → `field-completeness-loop.md`) if you have access.
