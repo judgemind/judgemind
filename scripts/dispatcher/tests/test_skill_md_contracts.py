@@ -584,3 +584,48 @@ class TestTaskV2FixCiSkillContracts:
             "task-v2-fix-ci/SKILL.md must document the FIX_CI_REBASE_OUTCOME "
             "heartbeat echo line (issue #2966 AC6)"
         )
+
+
+# ------------------------------------------------------------------
+# Issue #3725 — duplicate-PR consolidation example contract coverage.
+# ------------------------------------------------------------------
+
+
+class TestDuplicatePrConsolidationContract:
+    """diagnose-failure/SKILL.md must document the duplicate-PR
+    consolidation pattern (Example 8) as a regression guard (issue #3725)."""
+
+    def test_duplicate_pr_example_present(self) -> None:
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "duplicate-PR consolidation" in content, (
+            "diagnose-failure/SKILL.md must contain 'duplicate-PR consolidation' "
+            "example (issue #3725)"
+        )
+
+    def test_duplicate_pr_detection_command_present(self) -> None:
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "in:body Closes" in content, (
+            "diagnose-failure/SKILL.md must document the gh search pattern "
+            "'in:body Closes' for duplicate-PR detection (issue #3725)"
+        )
+
+    def test_duplicate_pr_close_template_present(self) -> None:
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "Closing as duplicate of" in content, (
+            "diagnose-failure/SKILL.md must document the close-comment template "
+            "'Closing as duplicate of' (issue #3725)"
+        )
+
+    def test_duplicate_pr_action_taken_present(self) -> None:
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "consolidate_duplicate_prs" in content, (
+            "diagnose-failure/SKILL.md must document 'consolidate_duplicate_prs' "
+            "as the action_taken value (issue #3725)"
+        )
+
+    def test_duplicate_pr_3725_issue_reference(self) -> None:
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "#3725" in content, (
+            "diagnose-failure/SKILL.md must reference '#3725' for traceability "
+            "(issue #3725)"
+        )
