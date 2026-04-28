@@ -4751,16 +4751,33 @@ class DispatcherDaemon:
         return bool(row[0]) if row and row[0] is not None else False
 
     def _issue_already_attempted(self, issue_number: int) -> bool:
-        """True if ``dispatcher.agents`` has any active/succeeded row for this issue.
+        """True if ``dispatcher.agents`` has any active row for this issue.
 
         Delegates to ``dispatcher.issue_has_active_agent`` (SQL function,
-        migration 37).  The function mirrors :data:`ACTIVE_AGENT_STATUSES`
-        (``running``, ``retrying``, ``succeeded``, ``needs_review``).
+        migration 56, superseding migration 37).  The function returns TRUE for:
+
+        - ``status IN ('running', 'retrying', 'needs_review')`` — agent is
+          actively working the issue.
+        - ``status = 'succeeded' AND merged_at IS NULL`` — agent succeeded but
+          the PR merge has not yet been detected; re-claiming before detection
+          would double-process the issue.
+
+        A ``succeeded`` row whose ``merged_at IS NOT NULL`` (PR already merged)
+        no longer blocks re-claim.  The housekeeping tick drains these stale
+        rows via :meth:`_cleanup_stale_succeeded_rows` and closes the originating
+        issue; after that the issue is eligible to be re-queued if an operator
+        adds ``agent/ready`` again.
+
+        Note: :data:`ACTIVE_AGENT_STATUSES` (the Python constant) still lists
+        ``succeeded`` — that constant enumerates *all* statuses that were ever
+        considered active, for documentation and terminal-consistency guards.
+        The SQL function is now intentionally stricter (it conditionally excludes
+        merged-succeeded rows). The asymmetry is deliberate; see #3738.
 
         The partial UNIQUE INDEX (migration 25) enforces uniqueness on
-        ``running`` and ``retrying``. The extra ``succeeded`` / ``needs_review``
-        check is so a successful prior run (not yet cleaned up) doesn't
-        get double-processed before the PR merges.
+        ``running`` and ``retrying``. The extra ``needs_review`` /
+        ``succeeded`` (null-merged) check prevents double-processing before
+        the PR merge is detected.
         """
         assert self._conn is not None, "connect() must run before reading"
         try:
@@ -25082,6 +25099,91 @@ class DispatcherDaemon:
             return default_days
         return configured
 
+    def _cleanup_stale_succeeded_rows(self) -> dict[str, int]:
+        """Close GitHub issues for succeeded rows whose PR has already merged.
+
+        Issue #3738. Complements the SQL-function change in migration 56.
+        After a PR merges the ``merged_at`` column is stamped by
+        :meth:`_write_merged_at`, but the originating issue is sometimes not
+        auto-closed by GitHub (missing ``Closes #N`` keyword). This leaves
+        ``dispatcher.agents`` with ``status='succeeded'`` and
+        ``merged_at IS NOT NULL`` rows that previously blocked the queue via
+        ``_issue_already_attempted``. Migration 56 removes the block at the
+        SQL level; this method runs during housekeeping to drain the backlog
+        by closing those open issues.
+
+        Behaviour:
+
+        - Fetches at most 25 rows (``LIMIT 25``) per tick to bound the
+          number of GitHub API calls. Rows are returned in insertion order
+          so the oldest stale items are cleared first.
+        - For each row, :meth:`_gh_issue_is_open` checks current issue state.
+          If OPEN: calls :meth:`_close_issue_post_merge` to post a comment and
+          strip ``agent/ready``.  Already-closed issues are a no-op (the
+          :meth:`_close_issue_post_merge` call handles that gracefully).
+        - Per-row exceptions are caught and logged; they do not crash the
+          tick or prevent processing of the remaining rows.
+
+        Returns a dict with ``rows_scanned``, ``issues_closed``, and ``errors``
+        counts.  The return value is surfaced to tests and logged by the caller
+        as a ``housekeeping_succeeded_cleanup`` event.
+        """
+        assert self._conn is not None, "connect() must run before ticks"
+
+        rows_scanned = 0
+        issues_closed = 0
+        errors = 0
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT issue_number, pr_number "
+                    "FROM dispatcher.agents "
+                    "WHERE status = 'succeeded' AND merged_at IS NOT NULL "
+                    "ORDER BY id "
+                    "LIMIT 25"
+                )
+                stale_rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.cleanup_stale_succeeded_scan_failed",
+                extra={
+                    "event": "cleanup_stale_succeeded_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return {"rows_scanned": 0, "issues_closed": 0, "errors": 1}
+
+        for row in stale_rows:
+            rows_scanned += 1
+            issue_number = int(row[0])
+            pr_number = row[1]
+            try:
+                self._close_issue_post_merge(issue_number, pr_number)
+                issues_closed += 1
+            except Exception:
+                errors += 1
+                self._log.exception(
+                    "daemon.cleanup_stale_succeeded_row_failed",
+                    extra={
+                        "event": "cleanup_stale_succeeded_row_failed",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                    },
+                )
+
+        return {
+            "rows_scanned": rows_scanned,
+            "issues_closed": issues_closed,
+            "errors": errors,
+        }
+
     def _housekeeping_tick(self) -> dict[str, int]:
         """Run one housekeeping tick. Prunes stale rows from dispatcher tables.
 
@@ -25147,6 +25249,22 @@ class DispatcherDaemon:
                     "cutoff_days": cutoff_days,
                 },
             )
+
+        # Drain stale succeeded rows whose PR has already merged but whose
+        # GitHub issue was never auto-closed (missing ``Closes #N`` keyword).
+        # Migration 56 removed the SQL-level block; this sweep closes any
+        # lingering open issues so they can be re-queued if needed. Issue #3738.
+        cleanup_stats = self._cleanup_stale_succeeded_rows()
+        self._log.info(
+            "daemon.housekeeping_succeeded_cleanup",
+            extra={
+                "event": "housekeeping_succeeded_cleanup",
+                "run_id": self._run_id,
+                "rows_scanned": cleanup_stats["rows_scanned"],
+                "issues_closed": cleanup_stats["issues_closed"],
+                "errors": cleanup_stats["errors"],
+            },
+        )
 
         self._housekeeping_ticks += 1
         return per_table

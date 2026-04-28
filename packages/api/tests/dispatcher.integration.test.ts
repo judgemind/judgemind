@@ -812,6 +812,46 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
     );
     expect(rowsA[0].result).toBe(false);
   });
+
+  it('issue_has_active_agent: succeeded + merged_at IS NULL → true; succeeded + merged_at IS NOT NULL → false (#3738)', async () => {
+    // This test pins the new semantic introduced by migration 56: a succeeded
+    // row with a non-null merged_at must NOT block re-claim.  If migration 56
+    // is ever reverted the old function body reinstates itself (via the Down
+    // migration), which would make the IS NOT NULL assertion below fail CI.
+    const ISSUE_SUCCEEDED = 99_000_001;
+
+    // Seed a succeeded row with merged_at IS NULL — issue still has active agent.
+    await pool.query(
+      `INSERT INTO dispatcher.agents
+         (issue_number, status, started_at, merged_at)
+       VALUES ($1, 'succeeded', now() - interval '1 hour', NULL)`,
+      [ISSUE_SUCCEEDED],
+    );
+
+    const { rows: rowsNull } = await pool.query<{ result: boolean }>(
+      `SELECT dispatcher.issue_has_active_agent($1) AS result`,
+      [ISSUE_SUCCEEDED],
+    );
+    expect(rowsNull[0].result).toBe(true);
+
+    // Stamp merged_at — the row is now stale-succeeded; function must return false.
+    await pool.query(
+      `UPDATE dispatcher.agents SET merged_at = now() WHERE issue_number = $1`,
+      [ISSUE_SUCCEEDED],
+    );
+
+    const { rows: rowsMerged } = await pool.query<{ result: boolean }>(
+      `SELECT dispatcher.issue_has_active_agent($1) AS result`,
+      [ISSUE_SUCCEEDED],
+    );
+    expect(rowsMerged[0].result).toBe(false);
+
+    // Cleanup.
+    await pool.query(
+      `DELETE FROM dispatcher.agents WHERE issue_number = $1`,
+      [ISSUE_SUCCEEDED],
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
