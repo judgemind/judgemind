@@ -213,17 +213,22 @@ class TestCheckStuckAgentsExecutionModeFilter:
     def test_subprocess_agent_still_flagged_on_timeout(self, tmp_path: Path) -> None:
         """A subprocess-mode agent stuck past its threshold still flips crashed."""
         d, conn, handler = _make_daemon(tmp_path)
-        # Override the config read so the per-phase overrides lookup
-        # returns an empty dict and we fall back to module defaults
-        # (``ralph`` = 54000s).
+        # Override both config reads so we fall back to module defaults
+        # (ralph stuck=54000s, ralph silent_hang=5400s).
         d._read_stuck_timeout_overrides = lambda: {}  # type: ignore[assignment]
-        # One subprocess agent stuck 60000s in ralph (exceeds 54000s).
+        d._read_silent_hang_timeout_overrides = lambda: {}  # type: ignore[assignment]
+        # Post-#3731 row shape: (agent_id, issue_number, phase,
+        # silent_seconds, total_runtime_seconds, execution_mode,
+        # agent_task_arn). Set silent=1800 (under 5400 silent
+        # threshold) and total=60000 (over 54000 stuck threshold) so
+        # ONLY total-runtime trips → stuck_timeout category preserved.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-sub", 2807, "ralph", 60000.0)],
+            [("agent-sub", 2807, "ralph", 1800.0, 60000.0, "subprocess", None)],
         ]
         # Per _flag_stuck_agents path: failure_id RETURNING from
         # _write_failure, prior stuck check (no prior), retry marker
-        # COUNT, backoff config.
+        # COUNT, backoff config. Override reads are stubbed via the
+        # method replacements above so no fetchone for those.
         conn.cursor_instance.fetch_queue = [
             (42,),  # failure_id RETURNING from _write_failure
             None,  # _has_prior_stuck_timeout_in_window — no prior

@@ -140,23 +140,27 @@ class TestOperationalPhaseStuckTimeout:
         """
         d, conn, handler = _make_daemon(tmp_path)
 
-        # Seeded row: one stale operational agent. Elapsed 3700s > 3600s
-        # (operational threshold added in #3524). The SELECT returns
-        # (agent_id, issue_number, phase, elapsed_seconds) and the
-        # Python-side comparison applies the per-phase threshold.
+        # Seeded row: stale operational agent. Post-#3731 row shape:
+        # (agent_id, issue_number, phase, silent_seconds,
+        #  total_runtime_seconds, execution_mode, agent_task_arn).
+        # silent=1800 under operational silent-hang (3600s); total=3700
+        # over operational total-runtime (3600s). Total-runtime path
+        # fires → stuck_timeout category preserved (not silent_hang).
         conn.cursor_instance.fetchall_queue = [
-            [("agent-op-1", 3524, "operational", 3700.0)],
+            [("agent-op-1", 3524, "operational", 1800.0, 3700.0, "subprocess", None)],
         ]
         # Order inside _check_stuck_agents + _create_retry_marker:
         # (1) stuck_timeout_s_by_phase override read (returns None → fall
         #     through to module defaults — where "operational": 3600 now lives),
-        # (2) RETURNING failure_id from _write_failure INSERT,
-        # (3) _has_prior_stuck_timeout_in_window SELECT (returns None →
+        # (2) silent_hang_timeout_s_by_phase override read (None) [#3731],
+        # (3) RETURNING failure_id from _write_failure INSERT,
+        # (4) _has_prior_stuck_timeout_in_window SELECT (returns None →
         #     first occurrence, no repeated event),
-        # (4) COUNT prior markers in _create_retry_marker,
-        # (5) read backoff_seconds config.
+        # (5) COUNT prior markers in _create_retry_marker,
+        # (6) read backoff_seconds config.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (100,),  # failure_id from _write_failure RETURNING
             None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior retry marker count
@@ -215,15 +219,18 @@ class TestOperationalPhaseStuckTimeout:
         """
         d, conn, handler = _make_daemon(tmp_path)
 
-        # Seeded row: operational agent at 3500s — below the 3600s threshold.
+        # Seeded row: operational agent at 3500s — below both 3600s
+        # thresholds (silent-hang and total-runtime are equal for
+        # operational by design). Post-#3731 7-tuple shape.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-op-2", 3524, "operational", 3500.0)],
+            [("agent-op-2", 3524, "operational", 3500.0, 3500.0, "subprocess", None)],
         ]
-        # Only the per-sweep override read fires (fetchone for the config row).
-        # The agent is filtered by elapsed < threshold, so no failure/marker
-        # DB calls are made.
+        # Only the per-sweep override reads fire (fetchone for both
+        # config rows). The agent is filtered by elapsed < threshold,
+        # so no failure/marker DB calls are made.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
         ]
 
         flagged = d._check_stuck_agents()

@@ -1032,14 +1032,83 @@ STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     # `claude -p /<skill>` and only persist `phase_transitions` at end, so the
     # reaper only sees `now() - started_at`. Set ceilings well above documented
     # runtimes; the diagnoser will still pick up a truly hung row eventually.
-    "spotcheck": 5400,                  # 90 min — SKILL.md says "one-hour spot-check"
-    "audit": 5400,                      # 90 min — every-N-merges audit, similar shape
-    "dispatcher-audit": 5400,           # 90 min — 6-hourly health probes (#2865)
-    "dispatcher-daily-report": 1800,    # 30 min — short summary skill (#3375)
+    "spotcheck": 5400,  # 90 min — SKILL.md says "one-hour spot-check"
+    "audit": 5400,  # 90 min — every-N-merges audit, similar shape
+    "dispatcher-audit": 5400,  # 90 min — 6-hourly health probes (#2865)
+    "dispatcher-daily-report": 1800,  # 30 min — short summary skill (#3375)
     "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
     "force_stopped": 60,  # 1 min — #2884 operator force_stop terminal phase
     "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
     "agent_runner_route_stub": 60,  # 1 min — terminal phase from unrecognized route/transition
+}
+
+#: Global fallback for the silent-hang threshold — used when a phase
+#: is not present in :data:`SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE` and
+#: no live override is set. 30 minutes covers the longest legitimate
+#: "no phase_transitions" gap across all known phases (issue #3731).
+SILENT_HANG_DEFAULT_SECONDS: int = 1800  # 30 min
+
+#: Per-phase silent-hang threshold (seconds) — issue #3731. **Distinct
+#: from :data:`STUCK_TIMEOUT_SECONDS_BY_PHASE`**: this is the
+#: "no-progress" window, measured against ``now - max(phase_transitions.ts)``.
+#: ``STUCK_TIMEOUT_SECONDS_BY_PHASE`` is the absolute total-runtime cap,
+#: measured against ``now - started_at``. Pre-#3731 the reaper conflated
+#: the two and used the (much larger) total-runtime values for both
+#: decisions, so a hung ralph waited up to 15h before getting reaped
+#: even though it had emitted zero phase_transitions for hours.
+#:
+#: Concrete instance the bug burned (#3731): agent ``9943a31e`` on
+#: #3663 emitted its last ``phase_transitions`` event at 04:33:54Z then
+#: went silent for 12h while still showing ``status=running,
+#: phase=ralph``. The cap slot was wasted for the full 12h. Reap was
+#: only triggered by an operator force_stop at 16:21:46Z.
+#:
+#: The thresholds below are tight enough to detect a genuinely-hung
+#: subprocess in <2h while loose enough not to false-positive on
+#: legitimate slow-iteration phases:
+#:
+#: * ``ralph`` — 90 min. A healthy ralph emits ``ralph_iteration_*``
+#:   phase_transitions every few minutes (worker work + reviewer
+#:   review). 90 min covers the longest observed legitimate iteration
+#:   (worst-case Claude Sonnet 4.5 + three reviewers on a hard issue
+#:   ~30-40 min) with a 2× safety margin. Anything silent for >90 min
+#:   is a hung subprocess (Claude OOM, network hang, container freeze).
+#: * ``plan`` / ``planning`` / ``summary`` / ``verify`` / ``retro`` —
+#:   30 min each. These are single-pass LLM phases: one
+#:   ``phase_transitions`` row at start, one at end. 30 min covers any
+#:   legitimate single-pass runtime with a wide margin.
+#: * ``push_and_pr`` — 15 min. Git-only phase (no LLM). Anything
+#:   silent for >15 min is a TCP retry storm or a hung ``git push``.
+#: * ``operational`` — 60 min, matching the total-runtime cap. The
+#:   operational phase emits one ``phase_transitions`` row at end (no
+#:   sub-events), so the silent-hang and total-runtime windows are
+#:   functionally the same. Listing it here keeps the lookup uniform
+#:   without changing semantics.
+#: * Phases not listed fall back to :data:`SILENT_HANG_DEFAULT_SECONDS`
+#:   (30 min).
+#:
+#: Operators can override via ``dispatcher.config.silent_hang_timeout_s_by_phase``
+#: (JSONB object merged into this default at read time — see
+#: :meth:`_silent_hang_timeout_for_phase`).
+SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
+    "ralph": 5400,  # 90 min — see module-level rationale
+    "plan": 1800,  # 30 min — single-pass LLM
+    "planning": 1800,  # 30 min — alias for plan (same as STUCK table)
+    "summary": 1800,  # 30 min — single-pass LLM
+    "verify": 1800,  # 30 min — single-pass LLM
+    "retro": 1800,  # 30 min — single-pass LLM
+    "push_and_pr": 900,  # 15 min — git-only, no LLM
+    "operational": 3600,  # 60 min — matches total-runtime cap
+    "fix_ci": 1800,  # 30 min — single-pass LLM (similar shape to summary/verify)
+    "claiming": 60,  # 1 min — single gh + psycopg call
+    "awaiting_ci": 1800,  # 30 min — sleeps then polls; long gap = stuck poller
+    "awaiting_deploy": 1800,  # 30 min — sleeps then polls; long gap = stuck poller
+    # Scheduled-skill phase names — emit phase_transitions only at end,
+    # so silent-hang threshold matches total-runtime cap.
+    "spotcheck": 5400,
+    "audit": 5400,
+    "dispatcher-audit": 5400,
+    "dispatcher-daily-report": 1800,
 }
 
 #: Terminal statuses on ``dispatcher.agents.status`` — the worker thread
@@ -17260,6 +17329,88 @@ class DispatcherDaemon:
                 continue
         return out
 
+    def _silent_hang_timeout_for_phase(
+        self, phase: str | None, *, overrides: dict[str, int] | None = None
+    ) -> int:
+        """Return the silent-hang threshold in seconds for a given phase.
+
+        **Distinct from :meth:`_stuck_timeout_for_phase`** — that method
+        returns the absolute total-runtime cap (compared against
+        ``now - started_at``). This method returns the silent-hang
+        window (compared against ``now - max(phase_transitions.ts)``).
+        Pre-#3731 the two were conflated and the reaper used the larger
+        total-runtime value for both decisions, leaving hung ralph
+        agents pinned for up to 15h.
+
+        Resolution order (first hit wins):
+
+        1. ``overrides`` argument (a pre-read JSONB object from
+           ``dispatcher.config.silent_hang_timeout_s_by_phase`` — the
+           supervisor tick reads this once per sweep and passes it in).
+           Operators can live-edit any phase's silent-hang threshold
+           via this config row without a redeploy.
+        2. :data:`SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE` — module-level
+           defaults from the per-phase rationale block in this file.
+        3. :data:`SILENT_HANG_DEFAULT_SECONDS` — 30-minute fallback for
+           any phase not covered above.
+
+        A ``None`` or unknown phase falls back to the global default.
+        Issue #3731.
+        """
+        key = (phase or "").strip()
+        if overrides and key and key in overrides:
+            try:
+                value = int(overrides[key])
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        if key and key in SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE:
+            return SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE[key]
+        return SILENT_HANG_DEFAULT_SECONDS
+
+    def _read_silent_hang_timeout_overrides(self) -> dict[str, int]:
+        """Read the live ``silent_hang_timeout_s_by_phase`` config override.
+
+        Parallel to :meth:`_read_stuck_timeout_overrides`. Returns an
+        empty dict on missing row, malformed JSON, or any read error —
+        the caller's fallback chain
+        (:meth:`_silent_hang_timeout_for_phase`) picks up the module
+        defaults cleanly in that case. Issue #3731.
+        """
+        assert self._conn is not None, "connect() must run before config read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("silent_hang_timeout_s_by_phase",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return {}
+        if row is None or row[0] is None:
+            return {}
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def _max_turns_for_phase(
         self, phase: str, *, overrides: dict[str, int] | None = None
     ) -> int:
@@ -17331,13 +17482,41 @@ class DispatcherDaemon:
     def _check_stuck_agents(self) -> int:
         """Find running agents whose current phase has been stuck too long.
 
-        Per-phase thresholds (issue #2872 Bug B) replace the old single
-        30-minute global threshold. Each running agent's elapsed time
-        since the most-recent ``phase_transitions.ts`` (or
-        ``started_at`` if no transitions yet) is compared against the
-        threshold for its current ``phase`` —
-        :meth:`_stuck_timeout_for_phase` handles the lookup with live
-        config overrides.
+        Two independent reap conditions are evaluated per running agent
+        (issue #3731 — split prior single-threshold conflation):
+
+        1. **Silent-hang** — ``now - max(phase_transitions.ts)``
+           compared against
+           :data:`SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE` (90 min for
+           ralph, 30 min for short LLM phases, 15 min for
+           ``push_and_pr``). Catches agents whose subprocess crashed /
+           hung / OOM'd without writing any phase_transitions row.
+        2. **Total-runtime** — ``now - started_at`` compared against
+           :data:`STUCK_TIMEOUT_SECONDS_BY_PHASE` (15 hr for ralph,
+           etc.). Catches genuinely runaway agents that ARE still
+           emitting phase_transitions but for too long.
+
+        :meth:`_silent_hang_timeout_for_phase` and
+        :meth:`_stuck_timeout_for_phase` perform the lookups with
+        live config overrides
+        (``dispatcher.config.silent_hang_timeout_s_by_phase`` and
+        ``dispatcher.config.stuck_timeout_s_by_phase`` respectively).
+
+        **Decision precedence.** When both conditions trip, silent-hang
+        wins — it is the more diagnostic signal (no events at all
+        means subprocess hang) and routes through the diagnoser for
+        log-tail inspection. When only total-runtime trips (agent IS
+        emitting events but for too long), the existing stuck_timeout
+        path takes over (mechanical retry first occurrence, diagnoser
+        on recurrence).
+
+        Pre-#3731 the reaper used the (much larger) total-runtime
+        threshold for the silent-hang decision — a hung ralph waited
+        up to 15 hours before getting reaped despite emitting zero
+        phase_transitions for that whole time. Concrete instance
+        2026-04-28: agent ``9943a31e`` on issue #3663 emitted last
+        phase_transitions at 04:33:54Z, then stayed silent for 12h
+        while occupying a cap slot. Manual force_stop at 16:21:46Z.
 
         **Subprocess-mode flagged agents** get a ``dispatcher.failures``
         row with ``category='stuck_timeout'``, are flipped to
@@ -17380,21 +17559,38 @@ class DispatcherDaemon:
         """
         assert self._conn is not None, "connect() must run before stuck check"
 
-        # Candidate rows: every running agent (subprocess or ECS) whose
-        # last phase_transition is older than its phase's threshold.
-        # The per-phase threshold comparison happens in Python so we
-        # can consult both the live config override and the module-
-        # level defaults without expressing them as SQL.
+        # Candidate rows: every running agent (subprocess or ECS).
+        # We compute TWO independent elapsed values per row:
+        #
+        # * ``silent_seconds`` — ``now - max(phase_transitions.ts)``,
+        #   the no-progress window. Compared against
+        #   :data:`SILENT_HANG_TIMEOUT_SECONDS_BY_PHASE` (#3731). When
+        #   ``phase_transitions`` has no rows yet (e.g. brand-new agent
+        #   in claiming) this falls back to ``now - started_at`` so the
+        #   reaper still has SOMETHING to compare against.
+        # * ``total_runtime_seconds`` — ``now - started_at``, the
+        #   absolute runtime cap. Compared against
+        #   :data:`STUCK_TIMEOUT_SECONDS_BY_PHASE`. Catches genuinely
+        #   runaway agents that ARE making progress (phase_transitions
+        #   updating) but for too long.
+        #
+        # Pre-#3731 the SELECT returned a single ``elapsed_seconds``
+        # value computed as ``now - COALESCE(pt.last_ts, started_at)``
+        # — i.e. silent-hang semantics — and the reaper compared it
+        # against the (much larger) total-runtime threshold. That meant
+        # a hung ralph agent (no phase_transitions for hours) had to
+        # wait the full 15h cap before getting reaped. The split fixes
+        # that: each agent is reaped if EITHER threshold is exceeded.
         #
         # #3656: the SELECT no longer excludes ``execution_mode='ecs'``
         # (the previous #3158 filter). The Python loop below branches
         # on mode to deliver the right signal — SIGKILL/retry-marker
         # for subprocess, ``ecs:StopTask`` + diagnoser for ECS.
         #
-        # Fields: agent_id, issue_number, phase, elapsed_seconds,
-        #         execution_mode, agent_task_arn.
+        # Fields: agent_id, issue_number, phase, silent_seconds,
+        #         total_runtime_seconds, execution_mode, agent_task_arn.
         candidates: list[
-            tuple[str, int | None, str | None, float, str, str | None]
+            tuple[str, int | None, str | None, float, float, str, str | None]
         ] = []
         try:
             with self._conn.cursor() as cur:
@@ -17402,7 +17598,10 @@ class DispatcherDaemon:
                     "SELECT a.agent_id, a.issue_number, a.phase, "
                     "       EXTRACT(EPOCH FROM ("
                     "           now() - COALESCE(pt.last_ts, a.started_at)"
-                    "       )) AS elapsed_seconds, "
+                    "       )) AS silent_seconds, "
+                    "       EXTRACT(EPOCH FROM ("
+                    "           now() - a.started_at"
+                    "       )) AS total_runtime_seconds, "
                     "       COALESCE(a.execution_mode, 'subprocess') "
                     "         AS execution_mode, "
                     "       a.agent_task_arn "
@@ -17416,11 +17615,11 @@ class DispatcherDaemon:
                 )
                 rows = cur.fetchall()
                 for row in rows:
-                    raw_mode = row[4] if len(row) > 4 else None
+                    raw_mode = row[5] if len(row) > 5 else None
                     mode = (
                         str(raw_mode).lower() if raw_mode is not None else "subprocess"
                     )
-                    raw_arn = row[5] if len(row) > 5 else None
+                    raw_arn = row[6] if len(row) > 6 else None
                     task_arn = str(raw_arn) if raw_arn is not None else None
                     candidates.append(
                         (
@@ -17428,6 +17627,7 @@ class DispatcherDaemon:
                             int(row[1]) if row[1] is not None else None,
                             str(row[2]) if row[2] is not None else None,
                             float(row[3]) if row[3] is not None else 0.0,
+                            float(row[4]) if row[4] is not None else 0.0,
                             mode,
                             task_arn,
                         )
@@ -17447,33 +17647,50 @@ class DispatcherDaemon:
                 pass
             return 0
 
-        # Read the per-phase override map once per sweep. Empty on
-        # missing row / malformed JSON — ``_stuck_timeout_for_phase``
-        # falls back to module defaults cleanly.
-        overrides = self._read_stuck_timeout_overrides()
+        # Read both per-phase override maps once per sweep. Empty on
+        # missing row / malformed JSON — the helpers fall back to
+        # module defaults cleanly.
+        stuck_overrides = self._read_stuck_timeout_overrides()
+        silent_hang_overrides = self._read_silent_hang_timeout_overrides()
 
         flagged = 0
         for (
             agent_id,
             issue_number,
             phase,
-            elapsed_seconds,
+            silent_seconds,
+            total_runtime_seconds,
             execution_mode,
             agent_task_arn,
         ) in candidates:
-            threshold = self._stuck_timeout_for_phase(phase, overrides=overrides)
-            if elapsed_seconds < threshold:
+            stuck_threshold = self._stuck_timeout_for_phase(
+                phase, overrides=stuck_overrides
+            )
+            silent_threshold = self._silent_hang_timeout_for_phase(
+                phase, overrides=silent_hang_overrides
+            )
+            silent_hang_tripped = silent_seconds >= silent_threshold
+            total_runtime_tripped = total_runtime_seconds >= stuck_threshold
+            if not silent_hang_tripped and not total_runtime_tripped:
                 continue
+            # Decision precedence (#3731): silent-hang takes precedence
+            # when both trip. Silent-hang is the tighter, more
+            # diagnostic signal — the agent stopped emitting events
+            # entirely, so route through the diagnoser for log-tail
+            # inspection. If only total-runtime trips, the agent IS
+            # still emitting events; the existing stuck_timeout path
+            # (mechanical retry first occurrence, diagnoser on
+            # recurrence) is the right call.
             try:
-                if execution_mode == "ecs":
-                    # #3656: ECS-mode silent-hang reaper. Issue
-                    # ``ecs:StopTask`` (best-effort — the
-                    # ``_handle_agent_failure`` row is the source of
-                    # truth even if the StopTask call itself fails),
-                    # then route through the unified failure path so
-                    # the diagnoser inspects last known phase + log
-                    # tail before deciding retry vs. escalate.
-                    self._force_stop_ecs_task(agent_id, agent_task_arn)
+                if silent_hang_tripped:
+                    # Silent-hang: agent has emitted no phase_transitions
+                    # for ``silent_seconds`` ≥ phase's silent-hang
+                    # threshold. ECS rows get an additional StopTask
+                    # call (best-effort); subprocess rows skip the
+                    # StopTask but still route through the unified
+                    # failure path with the silent_hang category.
+                    if execution_mode == "ecs":
+                        self._force_stop_ecs_task(agent_id, agent_task_arn)
                     self._log.warning(
                         "daemon.agent_silent_hang_reaped",
                         extra={
@@ -17482,8 +17699,10 @@ class DispatcherDaemon:
                             "agent_id": agent_id,
                             "issue_number": issue_number,
                             "phase": phase,
-                            "stuck_seconds": int(elapsed_seconds),
-                            "threshold_seconds": threshold,
+                            "stuck_seconds": int(silent_seconds),
+                            "threshold_seconds": silent_threshold,
+                            "total_runtime_seconds": int(total_runtime_seconds),
+                            "total_runtime_threshold_seconds": stuck_threshold,
                             "agent_task_arn": agent_task_arn,
                         },
                     )
@@ -17494,8 +17713,10 @@ class DispatcherDaemon:
                         stderr_tail="",
                         exit_code=None,
                         details={
-                            "stuck_seconds": int(elapsed_seconds),
-                            "threshold_seconds": threshold,
+                            "stuck_seconds": int(silent_seconds),
+                            "threshold_seconds": silent_threshold,
+                            "total_runtime_seconds": int(total_runtime_seconds),
+                            "total_runtime_threshold_seconds": stuck_threshold,
                             "last_known_phase": phase,
                             "execution_mode": execution_mode,
                             "agent_task_arn": agent_task_arn,
@@ -17505,13 +17726,15 @@ class DispatcherDaemon:
                     flagged += 1
                     continue
 
+                # total-runtime-only path: mechanical first-occurrence
+                # retry, diagnoser on recurrence (existing behavior).
                 failure_id = self._write_failure(
                     agent_id=agent_id,
                     category=FAILURE_CATEGORY_STUCK_TIMEOUT,
                     detected_by="supervisor",
                     details={
-                        "stuck_seconds": int(elapsed_seconds),
-                        "threshold_seconds": threshold,
+                        "stuck_seconds": int(total_runtime_seconds),
+                        "threshold_seconds": stuck_threshold,
                         "last_known_phase": phase,
                         "issue_number": issue_number,
                     },
@@ -17538,8 +17761,8 @@ class DispatcherDaemon:
                         "issue_number": issue_number,
                         "category": FAILURE_CATEGORY_STUCK_TIMEOUT,
                         "phase": phase,
-                        "stuck_seconds": int(elapsed_seconds),
-                        "threshold_seconds": threshold,
+                        "stuck_seconds": int(total_runtime_seconds),
+                        "threshold_seconds": stuck_threshold,
                     },
                 )
                 # Emit alert signal for CloudWatch alarm (#2878): if this
