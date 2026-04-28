@@ -85,6 +85,12 @@ from framework.la_parser_utils import (
 from framework.la_parser_utils import (
     SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
 )
+from framework.llm_extractor import (
+    _ROLE_LITERAL_TITLE_RE as _ROLE_LITERAL_TITLE_RE,
+)
+from framework.llm_extractor import (
+    _rebuild_title_from_parties as _rebuild_title_from_parties,
+)
 from framework.llm_utils import parse_llm_json
 from framework.party_utils import (
     is_name_fragment as _is_name_fragment,  # noqa: F401 — re-exported for tests
@@ -370,9 +376,13 @@ LA_SYSTEM_PROMPT = (
     "has 3 'Case Number:' entries, return 3 rulings.\n"
     "2. Extract the case number EXACTLY as it appears (including any "
     "leading digits).\n"
-    "3. For case_title, use 'Plaintiff v. Defendant' format. Strip "
-    "legal entity descriptors like 'an individual', 'a corporation', "
-    "etc. Use title case.\n"
+    "3. For extracted_case_title, name the parties explicitly: "
+    "'<plaintiff_name> v. <defendant_name>' (e.g. 'Aasi v. American Honda Motor Co.'). "
+    "Strip legal entity descriptors like 'an individual', 'a corporation', etc. "
+    "Use title case. "
+    "If the caption does not name both parties, return null for extracted_case_title — "
+    "do NOT use the literal words 'Plaintiff', 'Defendant', 'Petitioner', or 'Respondent' "
+    "as party names in the title.\n"
     "4. For ruling_text, include the COMPLETE ruling text verbatim. "
     "Include all legal analysis, citations, and reasoning. Do NOT "
     "truncate or summarize.\n"
@@ -492,12 +502,29 @@ def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
                         continue
                     parties.append({"name": name, "role": str(p["role"])})
 
+        case_title = entry.get("extracted_case_title")
+        if case_title and _ROLE_LITERAL_TITLE_RE.match(case_title):
+            rebuilt = _rebuild_title_from_parties(case_title, parties)
+            if rebuilt is not None:
+                logger.info(
+                    "la.llm_role_literal_title_rebuilt",
+                    before=case_title,
+                    after=rebuilt,
+                )
+                case_title = rebuilt
+            else:
+                logger.info(
+                    "la.llm_role_literal_title_dropped",
+                    before=case_title,
+                )
+                case_title = None
+
         rulings.append(
             LASplitRuling(
                 ruling_index=idx + 1,
                 case_number=entry.get("extracted_case_number"),
                 ruling_text=entry.get("ruling_text") or "",
-                case_title=entry.get("extracted_case_title"),
+                case_title=case_title,
                 motion_type=entry.get("motion_type"),
                 outcome=outcome,
                 parties=parties,

@@ -1373,8 +1373,12 @@ def _rebuild_title_from_parties(
     plaintiff_name: str | None = None
     defendant_name: str | None = None
     for party in parties:
-        role = getattr(party, "role", None) or ""
-        name = getattr(party, "name", None) or ""
+        if isinstance(party, dict):
+            role = party.get("role") or ""
+            name = party.get("name") or ""
+        else:
+            role = getattr(party, "role", None) or ""
+            name = getattr(party, "name", None) or ""
         if not name:
             continue
         if role.lower() in plaintiff_roles and plaintiff_name is None:

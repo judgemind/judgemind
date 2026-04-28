@@ -3942,3 +3942,88 @@ def test_extract_ruling_fields_landaverde_fixture_end_to_end() -> None:
         assert "07-03-25" not in doc.case_title
         assert "Landaverde" in doc.case_title
         assert "Meller" in doc.case_title
+
+
+# ---------------------------------------------------------------------------
+# TestLlmExtractRulingsRoleLiteralTitle — role-literal case_title suppression
+# (#3749)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmExtractRulingsRoleLiteralTitle:
+    """Tests for role-literal case_title sanitization in _llm_extract_rulings().
+
+    The LA LLM occasionally emits placeholders like "Plaintiff v. General Motors, LLC"
+    instead of real party names.  The post-processor should either rebuild the title
+    from extracted parties or drop it to None — never let a role-literal placeholder
+    reach the DB.  See #3749.
+    """
+
+    def test_role_literal_title_rebuilt_from_parties(self) -> None:
+        """LLM emits 'Plaintiff v. General Motors, LLC' + real parties → rebuilt title."""
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV35786",
+                "extracted_case_title": "Plaintiff v. General Motors, LLC",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [
+                    {"name": "Sumayya Aasi", "role": "plaintiff"},
+                    {"name": "General Motors, LLC", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV35786</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Sumayya Aasi v. General Motors, LLC"
+
+    def test_role_literal_title_dropped_when_parties_insufficient(self) -> None:
+        """LLM emits 'Plaintiff v. Defendant' with no parties → case_title is None."""
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV99999",
+                "extracted_case_title": "Plaintiff v. Defendant",
+                "outcome": "granted",
+                "ruling_text": "The motion is GRANTED.",
+                "parties": [],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV99999</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title is None
+
+    def test_clean_title_passes_through(self) -> None:
+        """A real party-name title is not affected by the role-literal sanitizer."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24NNCV02551",
+                "extracted_case_title": "Aasi v. American Honda",
+                "outcome": "granted",
+                "ruling_text": "The motion is GRANTED.",
+                "parties": [
+                    {"name": "Sumayya Aasi", "role": "plaintiff"},
+                    {"name": "American Honda Motor Co., Inc.", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 24NNCV02551</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Aasi v. American Honda"
