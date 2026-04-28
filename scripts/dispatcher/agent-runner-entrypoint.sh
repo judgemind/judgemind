@@ -2303,6 +2303,8 @@ VALUES (:'agent_id', :'phase', :'output_json'::jsonb)
 ON CONFLICT (agent_id, phase, attempt) DO UPDATE
   SET output_json = EXCLUDED.output_json,
       ts = now();
+INSERT INTO dispatcher.phase_transitions (agent_id, phase)
+VALUES (:'agent_id', :'phase');
 EOF
     _persist_rc=$?
     set -e
