@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 49 migrations.
+-- Generated from 56 migrations.
 
 
 
@@ -153,8 +153,7 @@ CREATE TABLE derived.case_attorneys (
     attorney_id uuid NOT NULL,
     role text NOT NULL,
     party_id uuid,
-    appeared_at date,
-    withdrew_at date
+    appeared_at date
 );
 
 
@@ -180,7 +179,6 @@ CREATE TABLE derived.cases (
     case_number_normalized text,
     court_id uuid NOT NULL,
     case_type text,
-    case_subtype text,
     case_status text,
     case_title text,
     filed_at date,
@@ -281,7 +279,6 @@ CREATE TABLE derived.judges (
     is_active boolean DEFAULT true NOT NULL,
     appointed_at date,
     biographical_notes text,
-    bio_reviewed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -863,6 +860,9 @@ CREATE TABLE public.users (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     google_id text
 );
+
+
+COMMENT ON COLUMN public.users.ai_budget_daily IS 'Forward-specced for AI feature cost caps per docs/specs/architecture-spec-v1.md §3.4.4. Currently 0%-populated and unused; remove this comment when the AI budget feature ships.';
 
 
 CREATE TABLE staging.captures (
