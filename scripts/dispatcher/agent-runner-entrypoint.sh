@@ -1944,7 +1944,12 @@ run_claude_phase() {
     (
         cd "$REPO_ROOT" || exit 127
         log "claude_phase_begin" "phase=$_phase" "skill=$_skill" "cwd=$(pwd)"
-        claude -p "/task-v2-$_skill $AGENT_ID" \
+        # #3683: wrap ``claude -p`` in ``timeout`` so a hung or wedged
+        # claude process surfaces as a distinct ``claude_phase_timeout``
+        # event (exit 124) rather than silently pinning the cap slot for
+        # up to 30 minutes until the heartbeat reaper fires.
+        timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS" \
+            claude -p "/task-v2-$_skill $AGENT_ID" \
             --output-format json \
             --dangerously-skip-permissions \
             > "$_out_file" \
@@ -1953,6 +1958,16 @@ run_claude_phase() {
     _rc=$?
     set -e
     log "claude_phase_done" "phase=$_phase" "exit_code=$_rc"
+    # #3683: emit a distinct event when the timeout fires so CloudWatch
+    # Logs Insights queries can grep for ``claude_phase_timeout`` to
+    # count incidents. This branch runs BEFORE the non-object-result
+    # branch so the failure surfaces with a real exit code rather than
+    # silently re-routing through the json-parse path.
+    if [[ "$_rc" -eq 124 ]]; then
+        log "claude_phase_timeout" \
+            "phase=$_phase" \
+            "elapsed_seconds=$CLAUDE_PHASE_TIMEOUT_SECONDS"
+    fi
 
     # Output resolution order (#3133):
     #   1. ``{repo_root}/tmp/dispatcher-output/<skill_suffix>.json`` —
@@ -2300,6 +2315,32 @@ EOF
     log "phase_output_persisted" "phase=$_phase"
 }
 
+assert_phase_deadline_not_exceeded() {
+    # #3683: belt-and-suspenders wall-clock guard for ``handle_push_and_pr``.
+    # Called before each major step; if the elapsed time since _phase_start
+    # (captured at function entry) exceeds PUSH_AND_PR_PHASE_DEADLINE_SECONDS,
+    # emit the ``push_and_pr_phase_wall_clock_exceeded`` log event + a
+    # structured envelope and return 1 so the caller can ``return 0`` from
+    # handle_push_and_pr.
+    #
+    # Usage (inside handle_push_and_pr):
+    #   assert_phase_deadline_not_exceeded || return 0
+    #
+    # Callers are expected to have already ``printf``d the envelope
+    # via the subshell before this function returns; this helper only
+    # emits the log event and signals the caller to bail out.
+    _elapsed=$(( SECONDS - _phase_start ))
+    if [[ "$_elapsed" -ge "$PUSH_AND_PR_PHASE_DEADLINE_SECONDS" ]]; then
+        log "push_and_pr_phase_wall_clock_exceeded" \
+            "elapsed_seconds=$_elapsed" \
+            "deadline_seconds=$PUSH_AND_PR_PHASE_DEADLINE_SECONDS"
+        printf '{"no_op": false, "phase_wall_clock_exceeded": true, "elapsed_seconds": %d}' \
+            "$_elapsed"
+        return 1
+    fi
+    return 0
+}
+
 handle_push_and_pr() {
     # Mechanical implementation of the push_and_pr phase (#3117, #3176).
     #
@@ -2350,6 +2391,10 @@ handle_push_and_pr() {
         return 0
     fi
 
+    # #3683: capture the function entry time so assert_phase_deadline_not_exceeded
+    # can compute elapsed wall-clock seconds at each major step below.
+    _phase_start=$SECONDS
+
     # Detect the #3039 no-op-SHIP guardrail: ralph's SHIP with a clean
     # working tree means ``origin/main..HEAD`` is empty — there's
     # nothing to push and no PR to open. Terminate as no_op so the
@@ -2382,17 +2427,32 @@ handle_push_and_pr() {
     # conventional-commits message. Mirrors the daemon's
     # ``git commit --amend -F <file>`` — see daemon.py ~L10914.
     if [[ -n "$_commit_message" ]]; then
+        # #3683: wall-clock guard — bail before touching git if we're
+        # already over budget. Unlikely here (we're at the top of the
+        # function) but protects against slow jq / DB calls above.
+        assert_phase_deadline_not_exceeded || return 0
         _commit_msg_path="$AGENT_WORKSPACE/commit_msg.txt"
         printf '%s' "$_commit_message" > "$_commit_msg_path"
         log "push_and_pr_commit_amend_begin"
         set +e
-        git -C "$REPO_ROOT" commit --amend -F "$_commit_msg_path" \
+        # #3683: wrap in LOCAL_GIT_TIMEOUT_SECONDS — a wedged git index
+        # or stale lock file can make ``commit --amend`` block forever.
+        timeout "$LOCAL_GIT_TIMEOUT_SECONDS" \
+            git -C "$REPO_ROOT" commit --amend -F "$_commit_msg_path" \
             > "$AGENT_WORKSPACE/git-commit-amend.stdout.log" \
             2> "$AGENT_WORKSPACE/git-commit-amend.stderr.log"
         _amend_rc=$?
         set -e
         log "push_and_pr_commit_amend_done" "exit_code=$_amend_rc"
-        if [[ "$_amend_rc" -ne 0 ]]; then
+        if [[ "$_amend_rc" -eq 124 ]]; then
+            # #3683: timeout fired — emit a distinct event and a
+            # structured envelope so the diagnoser can differentiate
+            # a hung amend from a non-zero exit. Non-fatal: log +
+            # continue with ralph's original commit (mirrors the
+            # existing non-zero branch below).
+            log "push_and_pr_commit_amend_timeout" \
+                "elapsed_seconds=$LOCAL_GIT_TIMEOUT_SECONDS"
+        elif [[ "$_amend_rc" -ne 0 ]]; then
             # Non-fatal: log + continue with ralph's original commit.
             # A pre-push hook rejection is the common real-world
             # failure here; proceeding with the unamended commit is
@@ -2406,6 +2466,8 @@ handle_push_and_pr() {
     # ``git rebase origin/main``). On rebase conflict, abort and fail
     # cleanly — the transition shim routes to the unrecognized branch
     # and the agent terminates without opening an orphan PR.
+    # #3683: wall-clock guard before the fetch+rebase block.
+    assert_phase_deadline_not_exceeded || return 0
     log "push_and_pr_fetch_main_begin"
     set +e
     # #3656: bound network IO at NETWORK_TIMEOUT_SECONDS — a hung
@@ -2427,7 +2489,11 @@ handle_push_and_pr() {
     if [[ "$_fetch_rc" -eq 0 ]]; then
         log "push_and_pr_rebase_begin"
         set +e
-        git -C "$REPO_ROOT" rebase origin/main \
+        # #3683: wrap in LOCAL_GIT_TIMEOUT_SECONDS — a wedged rebase
+        # (e.g. stale .git/rebase-merge directory from a previous run)
+        # can block forever without a timeout.
+        timeout "$LOCAL_GIT_TIMEOUT_SECONDS" \
+            git -C "$REPO_ROOT" rebase origin/main \
             > "$AGENT_WORKSPACE/git-rebase.stdout.log" \
             2> "$AGENT_WORKSPACE/git-rebase.stderr.log"
         _rebase_rc=$?
@@ -2460,6 +2526,17 @@ handle_push_and_pr() {
         # path, see #3465). Mirrors the rename in #3580 which split
         # ``fix_ci_patch_empty`` into the new
         # ``fix_ci_patch_empty_already_applied`` advance event.
+        # #3683: emit a distinct event when the LOCAL_GIT_TIMEOUT_SECONDS
+        # ceiling fires on ``git rebase origin/main`` so operators can
+        # grep for ``push_and_pr_rebase_timeout`` vs. the generic
+        # ``push_and_pr_rebase_conflict`` event. Fall through to the
+        # existing non-zero branch which aborts + emits the structured
+        # failure envelope — same outcome as a real conflict, just with
+        # a clearer root-cause event in the log.
+        if [[ "$_rebase_rc" -eq 124 ]]; then
+            log "push_and_pr_rebase_timeout" \
+                "elapsed_seconds=$LOCAL_GIT_TIMEOUT_SECONDS"
+        fi
         if [[ "$_rebase_rc" -eq 0 ]]; then
             _post_rebase_ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
             if [[ "$_post_rebase_ahead" == "0" ]]; then
@@ -2543,10 +2620,23 @@ handle_push_and_pr() {
             # to its pre-rebase state, log the failure, and emit the
             # structured envelope.
             set +e
-            git -C "$REPO_ROOT" rebase --abort \
+            # #3683: wrap rebase --abort in LOCAL_GIT_TIMEOUT_SECONDS —
+            # a stuck abort (e.g. index lock) would otherwise block here
+            # indefinitely. A non-zero or 124 exit from --abort is
+            # best-effort; we log it and proceed to emit the envelope
+            # regardless so the agent always terminates cleanly.
+            timeout "$LOCAL_GIT_TIMEOUT_SECONDS" \
+                git -C "$REPO_ROOT" rebase --abort \
                 > "$AGENT_WORKSPACE/git-rebase-abort.stdout.log" \
                 2> "$AGENT_WORKSPACE/git-rebase-abort.stderr.log"
+            _abort_rc=$?
             set -e
+            if [[ "$_abort_rc" -eq 124 ]]; then
+                log "push_and_pr_rebase_abort_timeout" \
+                    "elapsed_seconds=$LOCAL_GIT_TIMEOUT_SECONDS"
+            elif [[ "$_abort_rc" -ne 0 ]]; then
+                log "push_and_pr_rebase_abort_failed" "exit_code=$_abort_rc"
+            fi
             log "push_and_pr_rebase_conflict" "exit_code=$_rebase_rc" \
                 "conflict_files_json=$_conflict_files_json"
             # #3465: if the conflict-files list is empty the entrypoint
@@ -2639,6 +2729,9 @@ handle_push_and_pr() {
         log "push_and_pr_fetch_main_failed" "exit_code=$_fetch_rc"
     fi
 
+    # #3683: wall-clock guard before push — e.g. a slow db_exec or jq
+    # above could eat into the budget before we reach the network step.
+    assert_phase_deadline_not_exceeded || return 0
     log "push_and_pr_push_begin" "branch=$BRANCH_NAME"
     set +e
     # #3656: bound ``git push`` network IO at NETWORK_TIMEOUT_SECONDS.
@@ -2710,6 +2803,8 @@ Closes #${ISSUE_NUMBER}
     # ── #3176: open the PR with summary's pr_title + pr_body_md when
     # available. Fall back to ``--fill`` so a missing summary still
     # produces a PR (degraded but not abandoned).
+    # #3683: wall-clock guard before PR create.
+    assert_phase_deadline_not_exceeded || return 0
     log "push_and_pr_pr_create_begin"
     _pr_body_path="$AGENT_WORKSPACE/pr_body.md"
     set +e
@@ -3929,6 +4024,38 @@ STALE_ROLLUP_MARKER="base branch policy prohibits the merge"
 # Tests override to 1 (or use a stub ``timeout`` shim) to drive the
 # 124-exit branch deterministically.
 NETWORK_TIMEOUT_SECONDS="${AGENT_RUNNER_NETWORK_TIMEOUT_SECONDS:-300}"
+
+# #3683: hard timeout (seconds) on the ``claude -p`` subprocess inside
+# ``run_claude_phase``. Without this, a hung or wedged claude process
+# silently pins the cap slot until the 30-minute heartbeat reaper fires
+# — confirmed by five reaped tasks (agent cadf0773 / failure #216 and
+# siblings) where the last CW log line before reaping was inside a
+# claude_phase_begin with no matching claude_phase_done. 1800s matches
+# the ``push_and_pr`` stuck-timeout fallback and the daemon's
+# ``GIT_PUSH_TIMEOUT_SECONDS``. Tests override to 1 via
+# ``AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS=1``.
+CLAUDE_PHASE_TIMEOUT_SECONDS="${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-1800}"
+
+# #3683: hard timeout (seconds) on local git operations that don't
+# touch the network — ``git commit --amend``, ``git rebase
+# origin/main``, ``git rebase --abort`` — inside
+# ``handle_push_and_pr``. These have been observed to wedge on a
+# corrupt index or a broken lock file, pinning the cap slot indefinitely
+# with no network activity to trip NETWORK_TIMEOUT_SECONDS. 120s is
+# generous for any healthy local-only git op; tests override to 1 via
+# ``AGENT_RUNNER_LOCAL_GIT_TIMEOUT_SECONDS=1``.
+LOCAL_GIT_TIMEOUT_SECONDS="${AGENT_RUNNER_LOCAL_GIT_TIMEOUT_SECONDS:-120}"
+
+# #3683: wall-clock deadline (seconds) for the entire ``handle_push_and_pr``
+# function. Belt-and-suspenders backstop for code paths the per-step
+# timeouts above don't cover (e.g. db_exec UPDATE, jq, or any future
+# shell statement added without a timeout). The deadline is checked
+# before each major step via ``assert_phase_deadline_not_exceeded``.
+# Default 600s ≤ STUCK_TIMEOUT_S_BY_PHASE["push_and_pr"] so the
+# function always returns a structured envelope before the heartbeat
+# reaper fires. Tests override to 1 via
+# ``AGENT_RUNNER_PUSH_AND_PR_DEADLINE_SECONDS=1``.
+PUSH_AND_PR_PHASE_DEADLINE_SECONDS="${AGENT_RUNNER_PUSH_AND_PR_DEADLINE_SECONDS:-600}"
 
 # Deploy workflow display names we watch on the merge SHA. Must match
 # the ``name:`` field in each ``.github/workflows/`` file. Mirrors the

@@ -3649,6 +3649,11 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t41_funcs"
 done
 
+# #3683: run_claude_phase wraps ``claude -p`` in
+# ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"``. Include the constant so
+# the sourced fixture doesn't fail under ``set -u``.
+grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
+
 # Sanity: handle_fix_conflict was extracted.
 if grep -q "^handle_fix_conflict()" "$t41_funcs"; then
     pass "#3225 T41 — extracted handle_fix_conflict from entrypoint"
@@ -5634,6 +5639,11 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t58_funcs"
 done
 
+# #3683: run_claude_phase wraps ``claude -p`` in
+# ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"``. Include the constant so
+# the sourced fixture doesn't fail under ``set -u``.
+grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
+
 # Sanity: phase_to_skill maps operational.
 if grep -q "operational)" "$t58_funcs"; then
     pass "#3507 T58 setup — operational) arm exists in extracted functions"
@@ -6918,6 +6928,7 @@ t3614_funcs="$TEST_TMP/t3614-funcs.sh"
 printf 'exec 3>&1\n' > "$t3614_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
+          assert_phase_deadline_not_exceeded \
           handle_push_and_pr; do
     awk -v FN="^${fn}\\\\(\\\\)" '
         $0 ~ FN { in_fn=1 }
@@ -6926,11 +6937,14 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t3614_funcs"
 done
 
-# #3656: handle_push_and_pr now references NETWORK_TIMEOUT_SECONDS
-# (the ``timeout`` wrapper around git fetch / git push / gh pr create).
-# T3614 doesn't drive the 124-exit branch — it just needs the constant
+# #3656: handle_push_and_pr references NETWORK_TIMEOUT_SECONDS.
+# #3683: handle_push_and_pr references LOCAL_GIT_TIMEOUT_SECONDS and
+# PUSH_AND_PR_PHASE_DEADLINE_SECONDS (via assert_phase_deadline_not_exceeded).
+# T3614 doesn't drive the 124-exit branch — it just needs the constants
 # defined so the wrapped commands run normally under ``set -u``.
 grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3614_funcs"
+grep '^LOCAL_GIT_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3614_funcs"
+grep '^PUSH_AND_PR_PHASE_DEADLINE_SECONDS=' "$ENTRYPOINT" >> "$t3614_funcs"
 
 if grep -q "^handle_push_and_pr()" "$t3614_funcs"; then
     pass "#3614 T3614 setup — extracted handle_push_and_pr from entrypoint"
@@ -8230,6 +8244,7 @@ t3656_funcs="$TEST_TMP/t3656-funcs.sh"
 printf 'exec 3>&1\n' > "$t3656_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
+          assert_phase_deadline_not_exceeded \
           handle_push_and_pr; do
     awk -v FN="^${fn}\\\\(\\\\)" '
         $0 ~ FN { in_fn=1 }
@@ -8238,9 +8253,12 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t3656_funcs"
 done
 
-# Append the NETWORK_TIMEOUT_SECONDS constant declaration so
-# ``handle_push_and_pr`` finds it when sourced standalone.
+# Append constants that handle_push_and_pr references when sourced standalone.
+# #3656: NETWORK_TIMEOUT_SECONDS; #3683: LOCAL_GIT_TIMEOUT_SECONDS and
+# PUSH_AND_PR_PHASE_DEADLINE_SECONDS (via assert_phase_deadline_not_exceeded).
 grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3656_funcs"
+grep '^LOCAL_GIT_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3656_funcs"
+grep '^PUSH_AND_PR_PHASE_DEADLINE_SECONDS=' "$ENTRYPOINT" >> "$t3656_funcs"
 
 if grep -q "^NETWORK_TIMEOUT_SECONDS=" "$t3656_funcs"; then
     pass "#3656 T3656 setup — extracted NETWORK_TIMEOUT_SECONDS constant"
@@ -8691,6 +8709,7 @@ t3675_funcs="$TEST_TMP/t3675-funcs.sh"
 printf 'exec 3>&1\n' > "$t3675_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
+          assert_phase_deadline_not_exceeded \
           handle_push_and_pr; do
     awk -v FN="^${fn}\\\\(\\\\)" '
         $0 ~ FN { in_fn=1 }
@@ -8699,8 +8718,11 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t3675_funcs"
 done
 
-# ``handle_push_and_pr`` references NETWORK_TIMEOUT_SECONDS (#3656).
+# ``handle_push_and_pr`` references NETWORK_TIMEOUT_SECONDS (#3656) and
+# LOCAL_GIT_TIMEOUT_SECONDS + PUSH_AND_PR_PHASE_DEADLINE_SECONDS (#3683).
 grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3675_funcs"
+grep '^LOCAL_GIT_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3675_funcs"
+grep '^PUSH_AND_PR_PHASE_DEADLINE_SECONDS=' "$ENTRYPOINT" >> "$t3675_funcs"
 
 if grep -q "^handle_push_and_pr()" "$t3675_funcs"; then
     pass "#3675 T3675 setup — extracted handle_push_and_pr from entrypoint"
