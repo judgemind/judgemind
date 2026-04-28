@@ -159,6 +159,21 @@ Each test block in `scripts/tests/test_agent_runner_entrypoint.sh` carries a uni
 
 **Why issue numbers?** GitHub issue numbers are globally unique within the repository. Two agents working on different issues N1 ≠ N2 always produce non-overlapping `T_issue<N1>` and `T_issue<N2>` markers, so parallel PRs that both add tests can never collide on a marker name.
 
+#### Silent-drop guard
+
+Even with unique issue-number markers, a 3-way git merge can silently discard one side's appended test block if both branches add lines at the same end-of-file region and the merge heuristics pick only one side. The **silent-drop guard** (`scripts/check-rebase-no-silent-drop.sh`) detects this at pre-push and in CI before a PR is merged.
+
+**How it works:** the script calls `git merge-tree --write-tree origin/main HEAD` to compute an in-memory 3-way merge without touching the working tree. For each watched file, it collects all `MARKER_PATTERN` lines present in HEAD or `origin/main` and verifies that each one survives into the merged tree. If any marker is absent from the merged result **and** the merged file contains no `<<<<<<<` conflict markers (which would make the conflict user-visible), the script exits 1 with a diagnostic naming the dropped marker(s).
+
+**Configuration:**
+
+- `WATCH_FILES` — hardcoded list of 'appended-list' files to check. Initial entry: `scripts/tests/test_agent_runner_entrypoint.sh`. Add new files here when a new appended-list file is identified.
+- `MARKER_PATTERN` — ERE passed to `grep -E`. Default: `^# Test T(_issue)?[0-9]+`. Override via environment variable if a different file uses a different marker scheme.
+
+**Wiring:** the guard runs in the pre-push hook whenever `scripts/tests/test_agent_runner_entrypoint.sh` is in the pushed diff. It also runs as an explicit CI step (`Check rebase does not silently drop appended-list markers`) in the `scripts-tests` job (python shard). The CI checkout uses `fetch-depth: 0` so `origin/main` is always reachable. On shallow clones (or repos with no `origin/main`), the guard exits 0 gracefully.
+
+**Fix when the guard fires:** rebase interactively (`git rebase -i origin/main`) and ensure both sides' marker blocks appear in the final result. If the merge heuristics keep collapsing them, add a unique sentinel comment line (e.g. `# --- T_issue<N> end ---`) after each block to give git distinct context to anchor the merge hunks.
+
 ### Coverage gates (enforced in CI)
 
 - **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).

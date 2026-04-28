@@ -606,6 +606,8 @@ jobs:
       PYTHONPATH: scripts
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -646,6 +648,15 @@ jobs:
       - name: Check test files do not redefine the same stub binary
         if: matrix.shard == 'python'
         run: scripts/check-no-duplicate-stubs.sh
+      # Issue #3670: detect markers in appended-list files (e.g.
+      # test_agent_runner_entrypoint.sh) that would be silently dropped
+      # by git merge-tree when rebasing onto origin/main — i.e. a merge
+      # that produces no conflict markers but loses a test block.
+      # fetch-depth: 0 (set on this job's checkout) ensures origin/main
+      # is reachable. The check exits 0 gracefully on shallow clones.
+      - name: Check rebase does not silently drop appended-list markers
+        if: matrix.shard == 'python'
+        run: scripts/check-rebase-no-silent-drop.sh
       # Cross-checks every non-stdlib import under scripts/dispatcher/ against
       # the pip install step in Dockerfile.dispatcher. Motivated by the #2773
       # boto3 scope miss (#2776): PR #2771 added `import boto3` but did not
