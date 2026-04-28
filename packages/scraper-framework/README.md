@@ -19,7 +19,7 @@ Court data scraping framework and ingestion pipeline for Judgemind. This is the 
 ## What It Produces (Outputs)
 
 - **Redis Streams events** -- `document.captured` (scraper output) and `scraper.health` (operational metrics).
-- **S3 objects** -- Archived raw documents (immutable, path: `/{state}/{county}/{court}/{case_id}/...`).
+- **S3 objects** -- Archived raw documents (immutable, content-addressed key: `{state}/{county}/{court}/raw/{content_hash}.{ext}`).
 - **PostgreSQL rows** -- Courts, judges, cases, documents, rulings, and parties via the ingestion worker's three-tier extraction pipeline (scraper fields -> LLM extraction -> regex fallback).
 - **OpenSearch index** -- `tentative_rulings` index for full-text search, populated by the ingestion worker.
 
