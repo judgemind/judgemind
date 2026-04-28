@@ -823,9 +823,9 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
     // Seed a succeeded row with merged_at IS NULL — issue still has active agent.
     await pool.query(
       `INSERT INTO dispatcher.agents
-         (issue_number, status, started_at, merged_at)
-       VALUES ($1, 'succeeded', now() - interval '1 hour', NULL)`,
-      [ISSUE_SUCCEEDED],
+         (issue_number, worktree_path, status, started_at, merged_at)
+       VALUES ($1, $2, 'succeeded', now() - interval '1 hour', NULL)`,
+      [ISSUE_SUCCEEDED, `/tmp/${MARKER}/agent-test-3738`],
     );
 
     const { rows: rowsNull } = await pool.query<{ result: boolean }>(
