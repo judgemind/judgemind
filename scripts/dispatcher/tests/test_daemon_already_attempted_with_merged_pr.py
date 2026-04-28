@@ -5,7 +5,7 @@ Covers three acceptance-criterion behaviors:
 
 1. ``_issue_already_attempted`` returns FALSE when the SQL function returns
    False (i.e. the agent row has status='succeeded' AND merged_at IS NOT NULL).
-   This proves that migration 56's new SQL gate flows through to the Python
+   This proves that migration 57's new SQL gate flows through to the Python
    wrapper correctly — if the gate ever reverts the SQL function would return
    True and this test would fail.
 
@@ -146,14 +146,14 @@ def _make_daemon_with_capture() -> tuple[
 class TestReturnsWhenSucceededRowHasMergedAt:
     """AC2: a row with status=succeeded AND merged_at IS NOT NULL must not block.
 
-    The SQL function (migration 56) returns False for this state.  The Python
+    The SQL function (migration 57) returns False for this state.  The Python
     wrapper ``_issue_already_attempted`` must pass that value straight through.
     """
 
     def test_returns_false_when_succeeded_row_has_merged_at(self) -> None:
         """Stub the SQL function to return False (merged succeeded row).
 
-        If migration 56 is reverted and the old body reinstated, the SQL
+        If migration 57 is reverted and the old body reinstated, the SQL
         function would return True for the same row, causing the Python
         wrapper to return True and this assertion to fail CI.
         """

@@ -4754,7 +4754,7 @@ class DispatcherDaemon:
         """True if ``dispatcher.agents`` has any active row for this issue.
 
         Delegates to ``dispatcher.issue_has_active_agent`` (SQL function,
-        migration 56, superseding migration 37).  The function returns TRUE for:
+        migration 57, superseding migration 37).  The function returns TRUE for:
 
         - ``status IN ('running', 'retrying', 'needs_review')`` — agent is
           actively working the issue.
@@ -25102,7 +25102,7 @@ class DispatcherDaemon:
     def _cleanup_stale_succeeded_rows(self) -> dict[str, int]:
         """Close GitHub issues for succeeded rows whose PR has already merged.
 
-        Issue #3738. Complements the SQL-function change in migration 56.
+        Issue #3738. Complements the SQL-function change in migration 57.
         After a PR merges the ``merged_at`` column is stamped by
         :meth:`_write_merged_at`, but the originating issue is sometimes not
         auto-closed by GitHub (missing ``Closes #N`` keyword). This leaves
@@ -25137,6 +25137,9 @@ class DispatcherDaemon:
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
+                    # exec-mode-agnostic (#3738): drains stale succeeded rows for
+                    # both ecs and subprocess modes — all agents that have merged
+                    # need their open issues closed regardless of how they ran.
                     "SELECT issue_number, pr_number "
                     "FROM dispatcher.agents "
                     "WHERE status = 'succeeded' AND merged_at IS NOT NULL "
