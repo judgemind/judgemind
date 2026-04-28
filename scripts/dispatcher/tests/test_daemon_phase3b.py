@@ -904,16 +904,8 @@ class TestAwaitingCiRedPatched:
                     }
                 )
             )
-            # Register inflight so _finalize_fix_ci can read ctx.
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_fix_ci(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_fix_ci(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -1013,15 +1005,8 @@ class TestAwaitingCiRedBlocked:
                     }
                 )
             )
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_fix_ci(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_fix_ci(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -1106,15 +1091,8 @@ class TestAwaitingCiRedFlaky:
                     }
                 )
             )
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_fix_ci(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_fix_ci(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -1500,15 +1478,8 @@ class TestAwaitingDeploySuccess:
                     }
                 )
             )
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_verify(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_verify(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -1638,15 +1609,8 @@ class TestAwaitingDeployNoDeployRun:
                     }
                 )
             )
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_verify(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_verify(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -2105,21 +2069,18 @@ class TestVerifyRecoveryShortCircuit:
 
         d._handle_agent_failure = forbid_handle_failure  # type: ignore[method-assign]
 
-        # Populate inflight ctx with merged_at_set=True (PR already merged).
-        d._phase_subprocess_inflight[agent["agent_id"]] = {
-            "phase": "verify",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
+        # Pass ctx explicitly to finalizer (#3698); merged_at_set=True (PR already merged).
+        d._finalize_verify(
+            agent["agent_id"],
+            worktree,
+            0,
+            ctx={
                 "pr_number": agent["pr_number"],
                 "issue_number": agent["issue_number"],
                 "merge_sha": "merge-sha",
                 "merged_at_set": True,
             },
-        }
-        d._finalize_verify(agent["agent_id"], worktree, 0)
+        )
 
         assert not handle_failure_calls, (
             "Must NOT flip status=failed on a phase_output_missing "
@@ -2164,21 +2125,18 @@ class TestVerifyRecoveryShortCircuit:
 
         d._handle_agent_failure = record_handle_failure  # type: ignore[method-assign]
 
-        # Populate inflight ctx with merged_at_set=False (not yet merged).
-        d._phase_subprocess_inflight[agent["agent_id"]] = {
-            "phase": "verify",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
+        # Pass ctx explicitly to finalizer (#3698); merged_at_set=False (not yet merged).
+        d._finalize_verify(
+            agent["agent_id"],
+            worktree,
+            0,
+            ctx={
                 "pr_number": agent["pr_number"],
                 "issue_number": agent["issue_number"],
                 "merge_sha": "merge-sha",
                 "merged_at_set": False,
             },
-        }
-        d._finalize_verify(agent["agent_id"], worktree, 0)
+        )
 
         assert handle_failure_calls, (
             "Legacy (unmerged) phase_output_missing path must still "

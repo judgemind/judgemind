@@ -759,3 +759,173 @@ class TestAdvanceRunningAgentsSkipsInflight:
         # Event emitted for the skip.
         skip_events = handler.events("advance_skipped_async_inflight")
         assert len(skip_events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: ctx must survive the inflight delete (#3698)
+# ---------------------------------------------------------------------------
+
+
+class TestReapPassesCtxToFinalizers:
+    """_reap_phase_subprocesses must pass spawn-time ctx to finalizers (#3698).
+
+    Bug: the reaper called ``del self._phase_subprocess_inflight[agent_id]``
+    BEFORE calling ``_finalize_phase_subprocess``.  The finalizers then did
+    ``self._phase_subprocess_inflight.get(agent_id, {})`` and got ``{}``,
+    losing every spawn-time field.
+
+    Fix: snapshot ctx before the delete and thread it through as an explicit
+    parameter so finalizers never re-read from the (now-deleted) inflight dict.
+
+    These tests FAIL against pre-fix code and PASS after the fix.
+    """
+
+    def test_reap_then_finalize_passes_ctx_from_spawn_verify(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """verify finalizer receives spawn-time ctx, not {}."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        agent_id = "agent-ctx-verify"
+
+        spawn_ctx = {
+            "pr_number": 42,
+            "issue_number": 99,
+            "merge_sha": "deadbeef",
+            "merged_at_set": True,
+            "agent": {"agent_id": agent_id},
+            "retries_used": 2,
+        }
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "verify",
+            "pid": 11111,
+            "worktree_path": str(tmp_path),
+            "started_at": datetime.now(UTC) - timedelta(seconds=10),
+            "deadline_at": datetime.now(UTC) + timedelta(seconds=3000),
+            "ctx": spawn_ctx,
+        }
+
+        monkeypatch.setattr(
+            daemon.DispatcherDaemon, "_process_alive", staticmethod(lambda pid: False)
+        )
+
+        captured_ctx: list[dict] = []
+
+        def fake_finalize_verify(
+            *, agent_id: str, worktree: Path, exit_code: int | None, ctx: dict
+        ) -> None:
+            captured_ctx.append(ctx)
+
+        monkeypatch.setattr(d, "_finalize_verify", fake_finalize_verify)
+
+        d._reap_phase_subprocesses()
+
+        assert len(captured_ctx) == 1, "_finalize_verify must be called exactly once"
+        received = captured_ctx[0]
+        assert received.get("pr_number") == 42, (
+            f"Expected pr_number=42 in ctx, got: {received}"
+        )
+        assert received.get("issue_number") == 99, (
+            f"Expected issue_number=99 in ctx, got: {received}"
+        )
+        assert received.get("merge_sha") == "deadbeef", (
+            f"Expected merge_sha='deadbeef' in ctx, got: {received}"
+        )
+
+    def test_reap_then_finalize_passes_ctx_from_spawn_fix_ci(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """fix-ci finalizer receives spawn-time ctx, not {}."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        agent_id = "agent-ctx-fix-ci"
+
+        spawn_ctx = {
+            "pr_number": 42,
+            "issue_number": 99,
+            "merge_sha": "deadbeef",
+            "merged_at_set": True,
+            "agent": {"agent_id": agent_id},
+            "retries_used": 2,
+        }
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "fix-ci",
+            "pid": 22222,
+            "worktree_path": str(tmp_path),
+            "started_at": datetime.now(UTC) - timedelta(seconds=10),
+            "deadline_at": datetime.now(UTC) + timedelta(seconds=3000),
+            "ctx": spawn_ctx,
+        }
+
+        monkeypatch.setattr(
+            daemon.DispatcherDaemon, "_process_alive", staticmethod(lambda pid: False)
+        )
+
+        captured_ctx: list[dict] = []
+
+        def fake_finalize_fix_ci(
+            *, agent_id: str, worktree: Path, exit_code: int | None, ctx: dict
+        ) -> None:
+            captured_ctx.append(ctx)
+
+        monkeypatch.setattr(d, "_finalize_fix_ci", fake_finalize_fix_ci)
+
+        d._reap_phase_subprocesses()
+
+        assert len(captured_ctx) == 1, "_finalize_fix_ci must be called exactly once"
+        received = captured_ctx[0]
+        assert received.get("pr_number") == 42, (
+            f"Expected pr_number=42 in ctx, got: {received}"
+        )
+        assert received.get("issue_number") == 99, (
+            f"Expected issue_number=99 in ctx, got: {received}"
+        )
+        assert received.get("retries_used") == 2, (
+            f"Expected retries_used=2 in ctx, got: {received}"
+        )
+
+    def test_reap_then_finalize_passes_ctx_from_spawn_retro(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """retro finalizer receives spawn-time ctx, not {}."""
+        d, _conn, _handler = _make_daemon(tmp_path)
+        agent_id = "agent-ctx-retro"
+
+        spawn_ctx = {
+            "pr_number": 42,
+            "issue_number": 99,
+            "merge_sha": "deadbeef",
+            "merged_at_set": True,
+            "agent": {"agent_id": agent_id},
+            "retries_used": 2,
+        }
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "retro",
+            "pid": 33333,
+            "worktree_path": str(tmp_path),
+            "started_at": datetime.now(UTC) - timedelta(seconds=10),
+            "deadline_at": datetime.now(UTC) + timedelta(seconds=3000),
+            "ctx": spawn_ctx,
+        }
+
+        monkeypatch.setattr(
+            daemon.DispatcherDaemon, "_process_alive", staticmethod(lambda pid: False)
+        )
+
+        captured_ctx: list[dict] = []
+
+        def fake_finalize_retro(
+            *, agent_id: str, worktree: Path, exit_code: int | None, ctx: dict
+        ) -> None:
+            captured_ctx.append(ctx)
+
+        monkeypatch.setattr(d, "_finalize_retro", fake_finalize_retro)
+
+        d._reap_phase_subprocesses()
+
+        assert len(captured_ctx) == 1, "_finalize_retro must be called exactly once"
+        received = captured_ctx[0]
+        assert received.get("pr_number") == 42, (
+            f"Expected pr_number=42 in ctx, got: {received}"
+        )
+        assert received.get("issue_number") == 99, (
+            f"Expected issue_number=99 in ctx, got: {received}"
+        )

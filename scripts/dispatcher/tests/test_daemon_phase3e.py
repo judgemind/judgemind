@@ -344,15 +344,8 @@ class TestRunRetroPhaseZeroFindings:
                     }
                 )
             )
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -437,15 +430,8 @@ class TestRunRetroPhaseMultipleIssues:
             output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -521,15 +507,8 @@ class TestRunRetroPhaseMultipleIssues:
             output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -574,15 +553,8 @@ class TestRunRetroPhaseFailures:
             deadline_seconds: float,
             ctx: dict | None = None,
         ) -> None:
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 1)  # non-zero exit
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 1, ctx=ctx or {})  # non-zero exit
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
         d._run_retro_phase(agent)
@@ -625,15 +597,10 @@ class TestRunRetroPhaseFailures:
             deadline_seconds: float,
             ctx: dict | None = None,
         ) -> None:
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, None)  # killed = timeout
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(
+                agent_id, worktree, None, ctx=ctx or {}
+            )  # killed = timeout
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
         d._run_retro_phase(agent)
@@ -662,15 +629,10 @@ class TestRunRetroPhaseFailures:
             deadline_seconds: float,
             ctx: dict | None = None,
         ) -> None:
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)  # exit 0, no output file
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(
+                agent_id, worktree, 0, ctx=ctx or {}
+            )  # exit 0, no output file
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
         d._run_retro_phase(agent)
@@ -709,15 +671,8 @@ class TestRunRetroPhaseFailures:
             output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
@@ -811,15 +766,8 @@ class TestRunRetroPhaseFailures:
             output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 0, ctx=ctx or {})
 
         monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
