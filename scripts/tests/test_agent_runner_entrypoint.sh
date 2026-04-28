@@ -7211,10 +7211,17 @@ else
          "block (head 800): $(head -c 800 "$t3651_block")"
 fi
 
-if grep -qE 'rev-list[[:space:]]+--count[[:space:]]+origin/main\.\.HEAD' "$t3651_block"; then
-    pass "#3651 T3651 setup — extracted envelope block contains the post-abort rev-list check"
+# #3675: the post-abort check is now ``git diff --quiet origin/main HEAD``
+# (replaced the pre-#3675 ``rev-list --count`` check). Both shapes are
+# valid evidence the envelope block contains the post-abort short-
+# circuit logic — accept either to keep this setup assertion compatible
+# with both pre- and post-#3675 code (defence against accidental
+# regression of the fix).
+if grep -qE 'rev-list[[:space:]]+--count[[:space:]]+origin/main\.\.HEAD' "$t3651_block" \
+   || grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3651_block"; then
+    pass "#3651 T3651 setup — extracted envelope block contains the post-abort already-applied check"
 else
-    fail "#3651 T3651 setup — extracted envelope block contains the post-abort rev-list check" \
+    fail "#3651 T3651 setup — extracted envelope block contains the post-abort already-applied check" \
          "block (head 800): $(head -c 800 "$t3651_block")"
 fi
 
@@ -7235,7 +7242,13 @@ run_t3651_envelope_test() {
     _tbin="$TEST_TMP/${_test_id}-bin"
     mkdir -p "$_twork" "$_trepo" "$_tstate" "$_tbin"
 
-    # git stub — only rev-list matters here. Logs every call.
+    # git stub — rev-list and diff --quiet matter here. Logs every call.
+    # #3675 replaced the post-abort ``rev-list --count`` check with
+    # ``git diff --quiet origin/main HEAD``. T3651 is updated in the
+    # same PR as #3675 so the stub now handles both invocations:
+    # the pre-#3675 ``rev-list`` path (kept for backwards-compatibility
+    # if any future code path re-introduces it) and the post-#3675
+    # ``diff --quiet`` path that the new code actually exercises.
     cat > "$_tbin/git" <<'T3651GITEOF'
 #!/usr/bin/env bash
 set -u
@@ -7247,6 +7260,16 @@ done
 
 case "${1:-}" in
     rev-list) printf '%s\n' "${T3651_REV_LIST_AHEAD:-0}"; exit 0 ;;
+    diff)
+        # ``git diff --quiet origin/main HEAD`` (post-#3675).
+        # Disambiguate by inspecting flags.
+        for _a in "$@"; do
+            if [[ "$_a" == "--quiet" ]]; then
+                exit "${T3651_DIFF_QUIET_RC:-0}"
+            fi
+        done
+        exit 0
+        ;;
     *) exit 0 ;;
 esac
 T3651GITEOF
@@ -7329,15 +7352,25 @@ else
          "output: $T3651_TEST_OUT"
 fi
 
-# CRITICAL — git rev-list must have been invoked exactly once
-# (the new post-abort ahead-count check). Pre-#3651 the rev-list call
-# didn't exist on this code path at all; this assertion is the
-# behavioural fingerprint of the fix.
-if grep -cE "CALL .*\\brev-list\\b" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null | grep -q "^1$"; then
-    pass "#3651 T3651A — git rev-list invoked exactly once (post-abort check)"
+# CRITICAL — #3675 replaced the post-abort ``rev-list --count`` check
+# with ``git diff --quiet origin/main HEAD``. The new behavioural
+# fingerprint is the diff invocation (rev-list is no longer called on
+# this code path). Pre-#3651 neither existed; pre-#3675 only rev-list
+# existed; post-#3675 only diff exists. Assert the new fingerprint.
+if grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3651 T3651A — git diff --quiet origin/main HEAD invoked (#3675 replacement for rev-list)"
+else
+    fail "#3651 T3651A — git diff --quiet origin/main HEAD invoked (#3675 replacement for rev-list)" \
+         "git-log: $(cat "$T3651_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# #3675 — assert the rev-list call from the pre-#3675 logic is GONE
+# from this code path. The diff-quiet check replaces it.
+if ! grep -qE "CALL .*\\brev-list\\b" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3651 T3651A — git rev-list NOT invoked on post-abort path (#3675 replaced with diff --quiet)"
 else
     _t3651a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null || printf '0')
-    fail "#3651 T3651A — git rev-list invoked exactly once (post-abort check)" \
+    fail "#3651 T3651A — git rev-list NOT invoked on post-abort path (#3675 replaced with diff --quiet)" \
          "found $_t3651a_rev_list_calls call(s); git-log: $(cat "$T3651_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
@@ -7393,7 +7426,7 @@ fi
 # #3465 route_to_diagnoser path — only ahead=0 triggers the new no_op
 # terminal.
 
-run_t3651_envelope_test "t3651c" T3651_CONFLICT_FILES_JSON="[]" T3651_REV_LIST_AHEAD=1
+run_t3651_envelope_test "t3651c" T3651_CONFLICT_FILES_JSON="[]" T3651_REV_LIST_AHEAD=1 T3651_DIFF_QUIET_RC=1
 
 if [[ "$T3651_TEST_RC" -eq 0 ]]; then
     pass "#3651 T3651C — envelope block exits 0 on empty-conflicts + still-ahead path"
@@ -7721,12 +7754,23 @@ case "$sub" in
         ;;
     diff)
         # ``git diff --name-only --diff-filter=U`` for conflict files.
+        # ``git diff --quiet origin/main HEAD`` for the post-#3675 check.
+        # Disambiguate via flag inspection.
+        _is_diff_filter_U=0
+        _is_diff_quiet=0
         for _a in "$@"; do
-            if [[ "$_a" == "--diff-filter=U" ]]; then
-                cat "${T_STATE_DIR}/diff-files-output.txt"
-                exit 0
-            fi
+            case "$_a" in
+                --diff-filter=U) _is_diff_filter_U=1 ;;
+                --quiet)         _is_diff_quiet=1 ;;
+            esac
         done
+        if [[ "$_is_diff_filter_U" == "1" ]]; then
+            cat "${T_STATE_DIR}/diff-files-output.txt"
+            exit 0
+        fi
+        if [[ "$_is_diff_quiet" == "1" ]]; then
+            exit "${T3662_DIFF_QUIET_RC:-0}"
+        fi
         # ``git diff <merge-base>..ORIG_HEAD`` for original-patch capture.
         exit 0
         ;;
@@ -7746,6 +7790,19 @@ case "$sub" in
 esac
 T3662GITEOF
     chmod +x "$_tbin/git"
+
+    # #3656/#3675: ``handle_push_and_pr`` wraps git fetch / git push / gh
+    # pr create in ``timeout NETWORK_TIMEOUT_SECONDS``. macOS does not
+    # ship coreutils' ``timeout(1)``, so a real ``timeout`` lookup
+    # would exit 127. T3662 doesn't exercise the 124-exit branch — this
+    # stub passes through to the inner command transparently.
+    cat > "$_tbin/timeout" <<'T3662TIMEOUTEOF'
+#!/usr/bin/env bash
+# argv: <seconds> <inner-cmd> <inner-args...>
+shift  # discard the seconds arg
+exec "$@"
+T3662TIMEOUTEOF
+    chmod +x "$_tbin/timeout"
 
     cat > "$_tbin/gh" <<'T3662GHEOF'
 #!/usr/bin/env bash
@@ -7874,18 +7931,28 @@ else
          "gh-log: $(cat "$T3662_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
-# Two rev-list calls: pre-rebase #3039 guardrail + new #3662 post-abort
-# ahead-count check. Pre-#3662 there was only one rev-list call on this
-# code path (the pre-rebase guardrail) — the second call is the
-# behavioural fingerprint of the fix.
+# Pre-#3675: two rev-list calls (pre-rebase #3039 guardrail + new #3662
+# post-abort ahead-count check).
+# Post-#3675: one rev-list call (only the pre-rebase guardrail) PLUS
+# one ``git diff --quiet origin/main HEAD`` call (the new post-#3675
+# replacement for the post-abort rev-list). Assert the new fingerprints.
 if [[ -f "$T3662_TEST_STATE/git-log.txt" ]]; then
     _t3662a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3662_TEST_STATE/git-log.txt" || printf '0')
-    if [[ "$_t3662a_rev_list_calls" == "2" ]]; then
-        pass "#3662 T3662A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
+    if [[ "$_t3662a_rev_list_calls" == "1" ]]; then
+        pass "#3662 T3662A — git rev-list invoked once (pre-rebase guardrail; #3675 replaced post-abort check)"
     else
-        fail "#3662 T3662A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
+        fail "#3662 T3662A — git rev-list invoked once (pre-rebase guardrail; #3675 replaced post-abort check)" \
              "found $_t3662a_rev_list_calls call(s); git-log: $(cat "$T3662_TEST_STATE/git-log.txt")"
     fi
+fi
+
+# #3675 — git diff --quiet origin/main HEAD must have been invoked
+# (the new post-abort check that replaced the old rev-list path).
+if grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3662_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3662 T3662A — git diff --quiet origin/main HEAD invoked (#3675 replacement)"
+else
+    fail "#3662 T3662A — git diff --quiet origin/main HEAD invoked (#3675 replacement)" \
+         "git-log: $(cat "$T3662_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # ── Sub-test B: rebase rc=128 + non-empty conflict files (real conflict) ──
@@ -7956,6 +8023,7 @@ fi
 
 run_t3662_push_pr_test "t3662c" \
     T3662_REV_LIST_PRE=1 T3662_REV_LIST_POST=1 \
+    T3662_DIFF_QUIET_RC=1 \
     T3662_DIFF_FILES="" \
     GIT_REBASE_EXIT=128
 
@@ -8014,17 +8082,25 @@ else
          "gh-log: $(cat "$T3662_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
-# Still-ahead path runs the new post-abort rev-list check (the fix
-# unconditionally probes ahead-count when conflict_files_json is empty).
-# Behavioural fingerprint that the new code path is exercised.
+# Still-ahead path: post-#3675 the unconditional probe is now
+# ``git diff --quiet origin/main HEAD`` (replaced the post-abort
+# rev-list call). Assert the diff probe was invoked AND rev-list
+# was called only once (the pre-rebase #3039 guardrail).
 if [[ -f "$T3662_TEST_STATE/git-log.txt" ]]; then
     _t3662c_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3662_TEST_STATE/git-log.txt" || printf '0')
-    if [[ "$_t3662c_rev_list_calls" == "2" ]]; then
-        pass "#3662 T3662C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
+    if [[ "$_t3662c_rev_list_calls" == "1" ]]; then
+        pass "#3662 T3662C — git rev-list invoked once (pre-rebase guardrail; #3675 replaced post-abort check)"
     else
-        fail "#3662 T3662C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
+        fail "#3662 T3662C — git rev-list invoked once (pre-rebase guardrail; #3675 replaced post-abort check)" \
              "found $_t3662c_rev_list_calls call(s); git-log: $(cat "$T3662_TEST_STATE/git-log.txt")"
     fi
+fi
+
+if grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3662_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3662 T3662C — git diff --quiet origin/main HEAD invoked on still-ahead path (#3675)"
+else
+    fail "#3662 T3662C — git diff --quiet origin/main HEAD invoked on still-ahead path (#3675)" \
+         "git-log: $(cat "$T3662_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # Test T_issue3656: #3656 — network-blocking ops in handle_push_and_pr are wrapped
@@ -8469,6 +8545,710 @@ if grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T3656_TEST_STATE/gh-log.txt" 2>/de
 else
     fail "#3656 T3656D — gh pr create ran on happy path" \
          "gh-log: $(cat "$T3656_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T3675: #3675 — replace ``rev-list --count`` with ``git diff --quiet``
+# at both empty-conflicts post-rebase-failure check sites.
+#
+# Fourth sibling in the bug class fixed by T3614/T3651/T3662 (#3614/#3651/
+# #3662):
+#
+#   T3614 (#3614) → handle_push_and_pr rebase rc=0 + ahead-count 0 path.
+#   T3651 (#3651) → handle_ralph_baseline_rebase rc=128 + empty conflicts
+#                   + ahead-count 0 path.
+#   T3662 (#3662) → handle_push_and_pr rc=128 + empty conflicts + ahead-
+#                   count 0 path.
+#   T3675 (#3675) → BOTH sites — rc=128 + empty conflicts + ahead-count
+#                   NON-zero (rev-list says "agent has commits") BUT
+#                   ``git diff --quiet origin/main HEAD`` exits 0 (no
+#                   semantic diff to ship). The pre-#3675 ``rev-list
+#                   --count`` check missed this case because it counts
+#                   commit *objects* (which still exist after abort
+#                   restores ORIG_HEAD), not the diff that would actually
+#                   ship. After ``rebase --abort`` the agent's ralph +
+#                   fix_conflict commits are still distinct objects, but
+#                   if rebase produced empty commits (which is why it
+#                   exited 128) those commits are semantically redundant
+#                   with main — diff would be empty and the agent should
+#                   advance to no_op terminal succeeded.
+#
+# The fix: replace ``git rev-list --count origin/main..HEAD`` (returns N
+# > 0 in the failure-mode-under-test) with ``git diff --quiet origin/main
+# HEAD`` (returns 0 in the failure-mode-under-test). Apply at both
+# ``handle_push_and_pr`` (lines ~2592) and ``handle_ralph_baseline_rebase``
+# (lines ~4938) sites.
+#
+# Bug fingerprint: agent ``3cfda874-d979-4374-863b-768ddec608f4`` on
+# #3581, terminated 2026-04-28T00:09:50Z post-deploy of #3666 + #3667.
+# Real fix_conflict commits, post-abort ahead-count > 0, diff to main
+# was empty (semantically redundant) — fell through #3666's check to
+# the terminal-fail envelope. 7th ``push_and_pr_no_unmerged_files``
+# failure on #3581 specifically.
+#
+# Self-contained: own ``T3675_*`` env namespace, own ``run_t3675_*``
+# drivers. No shared fixture state with T3614/T3651/T3662/T3656.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── Site 1: handle_push_and_pr ────────────────────────────────────────────
+#
+# Reuse the same extraction approach as T3614/T3662 (function fixture).
+# T3675 owns its own copy because T3662 piggybacks on T3614's $t3614_funcs
+# and we want T3675 to remain self-contained per the issue body's
+# "T3675_* env namespace" rule.
+
+t3675_funcs="$TEST_TMP/t3675-funcs.sh"
+printf 'exec 3>&1\n' > "$t3675_funcs"
+
+for fn in db_exec db_query_one log persist_phase_output \
+          handle_push_and_pr; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$ENTRYPOINT" >> "$t3675_funcs"
+done
+
+# ``handle_push_and_pr`` references NETWORK_TIMEOUT_SECONDS (#3656).
+grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3675_funcs"
+
+if grep -q "^handle_push_and_pr()" "$t3675_funcs"; then
+    pass "#3675 T3675 setup — extracted handle_push_and_pr from entrypoint"
+else
+    fail "#3675 T3675 setup — extracted handle_push_and_pr from entrypoint" \
+         "fixture head: $(head -c 400 "$t3675_funcs")"
+fi
+
+# Behavioural fingerprint: the new fix MUST contain a ``git diff --quiet
+# origin/main HEAD`` invocation in handle_push_and_pr. If this is absent
+# the fix wasn't applied at this site.
+if grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3675_funcs"; then
+    pass "#3675 T3675 setup — handle_push_and_pr contains diff --quiet origin/main HEAD"
+else
+    fail "#3675 T3675 setup — handle_push_and_pr contains diff --quiet origin/main HEAD" \
+         "fixture: $(grep -nE '(rev-list|diff)' "$t3675_funcs" | head -20)"
+fi
+
+# Per-test runner. Drives handle_push_and_pr into the rebase-rc=128
+# empty-conflicts path with stub control over:
+#
+#   T3675_REV_LIST_PRE   — count for the FIRST rev-list call (pre-rebase
+#                          #3039 guardrail). Default 1.
+#   T3675_DIFF_QUIET_RC  — exit code for ``git diff --quiet origin/main
+#                          HEAD`` (the new #3675 check). Default 0
+#                          (no diff = already in main = no_op).
+#   T3675_DIFF_FILES     — content for ``git diff --name-only --diff-
+#                          filter=U`` stdout. Default empty (no conflict
+#                          files). Set to file paths to simulate a real
+#                          conflict.
+#   GIT_REBASE_EXIT      — exit code for ``git rebase origin/main``.
+#                          Default 128 (the failure case under test).
+#
+# CRITICAL: T3675 deliberately DOES NOT control rev-list-post (the second
+# rev-list call exists only in pre-#3675 code). The git stub returns
+# ``T3675_REV_LIST_PRE`` for ALL rev-list calls — if the new code path
+# ever calls rev-list a second time, that's a regression to the old
+# logic. The stub is parameterised on the diff exit code, which is the
+# new check.
+run_t3675_push_pr_test() {
+    _test_id="$1"
+    shift
+
+    _tworkspace="$TEST_TMP/${_test_id}-workspace"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_tworkspace" "$_trepo" "$_tstate" "$_tbin"
+    mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
+
+    # Stage the diff-files stdout (for ``git diff --name-only
+    # --diff-filter=U`` — the conflict-files capture step).
+    _t3675_diff_files=""
+    for _a in "$@"; do
+        case "$_a" in
+            T3675_DIFF_FILES=*) _t3675_diff_files="${_a#T3675_DIFF_FILES=}" ;;
+        esac
+    done
+    printf '%s' "$_t3675_diff_files" > "$_tstate/diff-files-output.txt"
+
+    cat > "$_tbin/git" <<'T3675GITEOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+# Skip ``-C <dir>`` prefix.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -C) shift 2 || true; continue ;;
+        *) break ;;
+    esac
+done
+
+sub="${1:-}"
+case "$sub" in
+    rev-list)
+        # Pre-rebase #3039 guardrail. Pre-#3675 code also calls this
+        # post-abort. T3675 returns the same value for every call (the
+        # post-abort path should NOT re-invoke rev-list — that would
+        # mean the pre-#3675 logic is still present).
+        printf '%s\n' "${T3675_REV_LIST_PRE:-1}"
+        exit 0
+        ;;
+    fetch)
+        exit "${GIT_FETCH_EXIT:-0}"
+        ;;
+    rebase)
+        for _arg in "$@"; do
+            if [[ "$_arg" == "--abort" ]]; then exit 0; fi
+        done
+        exit "${GIT_REBASE_EXIT:-128}"
+        ;;
+    diff)
+        # Two distinct diff invocations the entrypoint makes:
+        #
+        # (1) ``git diff --name-only --diff-filter=U`` — the conflict-
+        #     files capture step that runs BEFORE the new #3675 check.
+        # (2) ``git diff --quiet origin/main HEAD`` — the new #3675
+        #     check itself.
+        #
+        # Disambiguate via flag inspection.
+        _is_diff_filter_U=0
+        _is_diff_quiet=0
+        for _a in "$@"; do
+            case "$_a" in
+                --diff-filter=U) _is_diff_filter_U=1 ;;
+                --quiet)         _is_diff_quiet=1 ;;
+            esac
+        done
+        if [[ "$_is_diff_filter_U" == "1" ]]; then
+            cat "${T_STATE_DIR}/diff-files-output.txt"
+            exit 0
+        fi
+        if [[ "$_is_diff_quiet" == "1" ]]; then
+            exit "${T3675_DIFF_QUIET_RC:-0}"
+        fi
+        # Other diff invocations (merge-base captures etc.) succeed.
+        exit 0
+        ;;
+    push)
+        exit "${GIT_PUSH_EXIT:-0}"
+        ;;
+    commit)
+        exit "${GIT_COMMIT_EXIT:-0}"
+        ;;
+    rev-parse|merge-base)
+        printf 'deadbeefcafe\n'
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+T3675GITEOF
+    chmod +x "$_tbin/git"
+
+    # #3656/#3675: ``handle_push_and_pr`` wraps git fetch / git push / gh
+    # pr create in ``timeout NETWORK_TIMEOUT_SECONDS``. macOS does not
+    # ship coreutils' ``timeout(1)``, so a real ``timeout`` lookup
+    # would exit 127. T3675 doesn't exercise the 124-exit branch —
+    # this stub passes through to the inner command transparently.
+    cat > "$_tbin/timeout" <<'T3675TIMEOUTEOF'
+#!/usr/bin/env bash
+# argv: <seconds> <inner-cmd> <inner-args...>
+shift  # discard the seconds arg
+exec "$@"
+T3675TIMEOUTEOF
+    chmod +x "$_tbin/timeout"
+
+    cat > "$_tbin/gh" <<'T3675GHEOF'
+#!/usr/bin/env bash
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
+if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+    printf 'https://github.com/judgemind/judgemind/pull/9999\n'
+fi
+exit "${GH_EXIT:-0}"
+T3675GHEOF
+    chmod +x "$_tbin/gh"
+
+    cat > "$_tbin/psql" <<'T3675PSQLEOF'
+#!/usr/bin/env bash
+query=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -c) shift; query="$1" ;; esac
+    shift || true
+done
+printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
+exit 0
+T3675PSQLEOF
+    chmod +x "$_tbin/psql"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_tbin/jq"
+    fi
+
+    set +e
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        PATH="$_tbin:$PATH" \
+        AGENT_ID="${_test_id}-dead-beef-cafe-000000000099" \
+        ISSUE_NUMBER="3675" \
+        AGENT_WORKSPACE="$_tworkspace" \
+        REPO_ROOT="$_trepo" \
+        BRANCH_NAME="agent/${_test_id}abcd" \
+        DATABASE_URL="postgres://test" \
+        AGENT_RUNNER_DRY_RUN="0" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            # shellcheck disable=SC1090
+            . "'"$t3675_funcs"'"
+            handle_push_and_pr
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    T3675_TEST_RC="$_trc"
+    T3675_TEST_OUT="$_tout"
+    T3675_TEST_STATE="$_tstate"
+}
+
+# ── Sub-test A: rebase rc=128 + empty conflicts + ahead>0 + diff=0 ────────
+#   THE BUG CASE. Agent has commits (rev-list says "ahead by 2") but
+#   diff to main is empty (commits are semantically redundant — rebase
+#   produced empty commits). Pre-#3675 the rev-list-only check fell
+#   through to terminal-fail. Post-#3675 the diff-quiet check catches
+#   it and emits no_op.
+#   MUST FAIL on unfixed code.
+
+run_t3675_push_pr_test "t3675a" \
+    T3675_REV_LIST_PRE=2 \
+    T3675_DIFF_QUIET_RC=0 \
+    T3675_DIFF_FILES="" \
+    GIT_REBASE_EXIT=128
+
+if [[ "$T3675_TEST_RC" -eq 0 ]]; then
+    pass "#3675 T3675A — handle_push_and_pr exits 0 on empty-conflicts + ahead>0 + empty-diff"
+else
+    fail "#3675 T3675A — handle_push_and_pr exits 0 on empty-conflicts + ahead>0 + empty-diff" \
+         "rc=$T3675_TEST_RC, output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — already-applied log event must be emitted (the behavioural
+# fingerprint of the fix). Distinguishes this advance from
+# ``push_and_pr_no_unmerged_files`` (the terminal-fail event we're
+# specifically NOT taking on this path).
+if printf '%s' "$T3675_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3675 T3675A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted"
+else
+    fail "#3675 T3675A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — envelope must be {"no_op": true, ...}. Routes to PHASE_NO_OP
+# terminal succeeded via transition_from_push_and_pr (#3645).
+if printf '%s' "$T3675_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3675 T3675A — envelope is {\"no_op\": true, ...} on already-applied path"
+else
+    fail "#3675 T3675A — envelope is {\"no_op\": true, ...} on already-applied path" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — envelope must carry diff_to_main_empty discriminator (the
+# new #3675 fingerprint, distinct from #3662's ``post_abort_ahead: 0``).
+if printf '%s' "$T3675_TEST_OUT" | grep -qE '"diff_to_main_empty": true'; then
+    pass "#3675 T3675A — envelope carries diff_to_main_empty=true (new #3675 discriminator)"
+else
+    fail "#3675 T3675A — envelope carries diff_to_main_empty=true (new #3675 discriminator)" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — envelope must NOT carry rebase_failed=true (the pre-#3675
+# terminal-fail envelope shape).
+if ! printf '%s' "$T3675_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3675 T3675A — envelope does NOT carry rebase_failed=true on already-applied path"
+else
+    fail "#3675 T3675A — envelope does NOT carry rebase_failed=true on already-applied path" \
+         "output: $T3675_TEST_OUT"
+fi
+
+if ! printf '%s' "$T3675_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
+    pass "#3675 T3675A — envelope does NOT carry no_unmerged_files=true on already-applied path"
+else
+    fail "#3675 T3675A — envelope does NOT carry no_unmerged_files=true on already-applied path" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — function must NOT have invoked ``git push`` (no diff to
+# push).
+if ! grep -qE "CALL .*\\bpush\\b" "$T3675_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3675 T3675A — git push NOT invoked on already-applied post-rebase-failure"
+else
+    fail "#3675 T3675A — git push NOT invoked on already-applied post-rebase-failure" \
+         "git-log: $(cat "$T3675_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T3675_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3675 T3675A — gh pr create NOT invoked on already-applied post-rebase-failure"
+else
+    fail "#3675 T3675A — gh pr create NOT invoked on already-applied post-rebase-failure" \
+         "gh-log: $(cat "$T3675_TEST_STATE/gh-log.txt" 2>/dev/null)"
+fi
+
+# CRITICAL — git diff --quiet origin/main HEAD must have been invoked
+# (the new fix's behavioural fingerprint). Pre-#3675 this call did
+# NOT exist on the empty-conflicts post-rebase-failure code path.
+if grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3675_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3675 T3675A — git diff --quiet origin/main HEAD invoked (new #3675 check fingerprint)"
+else
+    fail "#3675 T3675A — git diff --quiet origin/main HEAD invoked (new #3675 check fingerprint)" \
+         "git-log: $(cat "$T3675_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# Behavioural fingerprint that the OLD pre-#3675 logic isn't lurking: the
+# post-abort code path must call rev-list AT MOST ONCE (the pre-rebase
+# #3039 guardrail). The pre-#3675 code called it twice. If two calls
+# appear, the #3675 fix isn't replacing the rev-list check — it's
+# adding the diff-quiet check on top of it, which would mean stale
+# logic.
+if [[ -f "$T3675_TEST_STATE/git-log.txt" ]]; then
+    _t3675a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3675_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t3675a_rev_list_calls" -le 1 ]]; then
+        pass "#3675 T3675A — git rev-list called at most once (rev-list check replaced, not augmented)"
+    else
+        fail "#3675 T3675A — git rev-list called at most once (rev-list check replaced, not augmented)" \
+             "found $_t3675a_rev_list_calls call(s); git-log: $(cat "$T3675_TEST_STATE/git-log.txt")"
+    fi
+fi
+
+# ── Sub-test B: rebase rc=128 + empty conflicts + ahead>0 + diff=1 ────────
+#   GENUINE FAILURE PATH (regression). Agent has commits AND diff is
+#   non-empty — the rebase actually failed for a non-already-applied
+#   reason. Must preserve the existing #3465 route_to_diagnoser path.
+
+run_t3675_push_pr_test "t3675b" \
+    T3675_REV_LIST_PRE=2 \
+    T3675_DIFF_QUIET_RC=1 \
+    T3675_DIFF_FILES="" \
+    GIT_REBASE_EXIT=128
+
+if [[ "$T3675_TEST_RC" -eq 0 ]]; then
+    pass "#3675 T3675B — handle_push_and_pr exits 0 on empty-conflicts + non-empty-diff path"
+else
+    fail "#3675 T3675B — handle_push_and_pr exits 0 on empty-conflicts + non-empty-diff path" \
+         "rc=$T3675_TEST_RC, output: $T3675_TEST_OUT"
+fi
+
+# Genuine-failure envelope must carry rebase_failed=true (#3465 path).
+if printf '%s' "$T3675_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3675 T3675B — non-empty-diff envelope carries rebase_failed=true (#3465 path preserved)"
+else
+    fail "#3675 T3675B — non-empty-diff envelope carries rebase_failed=true (#3465 path preserved)" \
+         "output: $T3675_TEST_OUT"
+fi
+
+if printf '%s' "$T3675_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
+    pass "#3675 T3675B — non-empty-diff envelope carries no_unmerged_files=true"
+else
+    fail "#3675 T3675B — non-empty-diff envelope carries no_unmerged_files=true" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# Genuine-failure path must NOT emit the already-applied log event.
+if ! printf '%s' "$T3675_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3675 T3675B — already-applied log NOT emitted on non-empty-diff path"
+else
+    fail "#3675 T3675B — already-applied log NOT emitted on non-empty-diff path" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# Genuine-failure envelope must NOT be no_op.
+if ! printf '%s' "$T3675_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3675 T3675B — non-empty-diff envelope is NOT {\"no_op\": true}"
+else
+    fail "#3675 T3675B — non-empty-diff envelope is NOT {\"no_op\": true}" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# T3675B also exercises the diff --quiet call (it's unconditional on the
+# empty-conflicts path now).
+if grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3675_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3675 T3675B — git diff --quiet origin/main HEAD invoked on non-empty-diff path"
+else
+    fail "#3675 T3675B — git diff --quiet origin/main HEAD invoked on non-empty-diff path" \
+         "git-log: $(cat "$T3675_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# ── Sub-test C: rebase rc=128 + non-empty conflicts (real conflict) ───────
+#   REAL CONFLICT REGRESSION. The #3225 path must continue to route to
+#   fix_conflict with the file bundle. The diff-quiet check is only
+#   reached when conflict_files_json is empty.
+
+run_t3675_push_pr_test "t3675c" \
+    T3675_REV_LIST_PRE=1 \
+    T3675_DIFF_QUIET_RC=0 \
+    T3675_DIFF_FILES="packages/api/foo.py
+packages/scraper-framework/bar.py" \
+    GIT_REBASE_EXIT=128
+
+if [[ "$T3675_TEST_RC" -eq 0 ]]; then
+    pass "#3675 T3675C — handle_push_and_pr exits 0 on real-conflict path"
+else
+    fail "#3675 T3675C — handle_push_and_pr exits 0 on real-conflict path" \
+         "rc=$T3675_TEST_RC, output: $T3675_TEST_OUT"
+fi
+
+# Real conflict envelope must carry conflict_files (route to fix_conflict).
+if printf '%s' "$T3675_TEST_OUT" | grep -qE '"conflict_files":[[:space:]]*\[.*"packages/api/foo\.py".*\]'; then
+    pass "#3675 T3675C — real-conflict envelope carries conflict_files (routes to fix_conflict)"
+else
+    fail "#3675 T3675C — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
+         "output: $T3675_TEST_OUT"
+fi
+
+if printf '%s' "$T3675_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3675 T3675C — real-conflict envelope carries rebase_failed=true"
+else
+    fail "#3675 T3675C — real-conflict envelope carries rebase_failed=true" \
+         "output: $T3675_TEST_OUT"
+fi
+
+if ! printf '%s' "$T3675_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3675 T3675C — real-conflict envelope is NOT {\"no_op\": true}"
+else
+    fail "#3675 T3675C — real-conflict envelope is NOT {\"no_op\": true}" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# Real conflict path must NOT call ``git diff --quiet`` (the new check
+# is gated on conflict_files_json == "[]"; with files present we skip
+# straight to the rebase_failed/conflict_files envelope).
+if ! grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3675_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3675 T3675C — git diff --quiet origin/main HEAD NOT invoked on real-conflict path"
+else
+    fail "#3675 T3675C — git diff --quiet origin/main HEAD NOT invoked on real-conflict path" \
+         "git-log: $(cat "$T3675_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# ── Site 2: handle_ralph_baseline_rebase ──────────────────────────────────
+#
+# The ralph baseline rebase logic isn't a function — it's an inline block
+# inside the main loop's ``case "$_current"`` arm. Reuse T3651's awk-based
+# extraction approach: extract the ``_ralph_baseline_output=""`` ... outer
+# ``fi`` block and source it standalone with the inputs the entrypoint
+# would have computed (``_baseline_conflict_files_json``,
+# ``_baseline_rebase_stderr_tail``).
+
+t3675_block="$TEST_TMP/t3675-envelope-block.sh"
+awk '
+  /_ralph_baseline_output=""/ { in_block=1; depth=0 }
+  in_block {
+    print
+    if ($0 ~ /^[[:space:]]*if[[:space:]]+\[\[/) depth++
+    if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
+      depth--
+      if (depth == 0) exit
+    }
+  }
+' "$ENTRYPOINT" > "$t3675_block"
+
+if grep -q "ralph_baseline_no_unmerged_files_already_applied" "$t3675_block"; then
+    pass "#3675 T3675 setup — extracted ralph_baseline envelope block contains the log event marker"
+else
+    fail "#3675 T3675 setup — extracted ralph_baseline envelope block contains the log event marker" \
+         "block (head 800): $(head -c 800 "$t3675_block")"
+fi
+
+# Behavioural fingerprint at site 2: the new fix MUST contain a ``git
+# diff --quiet origin/main HEAD`` invocation in the ralph_baseline
+# envelope block. If this is absent the fix wasn't applied at this site.
+if grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3675_block"; then
+    pass "#3675 T3675 setup — ralph_baseline block contains diff --quiet origin/main HEAD"
+else
+    fail "#3675 T3675 setup — ralph_baseline block contains diff --quiet origin/main HEAD" \
+         "block (head 1200): $(head -c 1200 "$t3675_block")"
+fi
+
+# Per-test runner for the ralph_baseline envelope block. Stubs ``git``
+# (only ``rev-list`` and ``diff --quiet`` matter — abort already
+# happened upstream of this block) and ``log`` (captured into a state
+# file). Parameters control:
+#   T3675_BASELINE_CONFLICT_FILES_JSON — value of
+#     ``_baseline_conflict_files_json`` ("[]" for empty, or a JSON array
+#     for real).
+#   T3675_BASELINE_DIFF_QUIET_RC       — exit code for ``git diff --quiet
+#     origin/main HEAD`` (the new #3675 check). Default 0 (no diff).
+run_t3675_baseline_test() {
+    _test_id="$1"
+    shift
+
+    _twork="$TEST_TMP/${_test_id}-work"
+    _trepo="$TEST_TMP/${_test_id}-repo"
+    _tstate="$TEST_TMP/${_test_id}-state"
+    _tbin="$TEST_TMP/${_test_id}-bin"
+    mkdir -p "$_twork" "$_trepo" "$_tstate" "$_tbin"
+
+    cat > "$_tbin/git" <<'T3675BASELINEGITEOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in -C) shift 2 || true; continue ;; *) break ;; esac
+done
+
+case "${1:-}" in
+    rev-list)
+        printf '%s\n' "${T3675_BASELINE_REV_LIST:-1}"
+        exit 0
+        ;;
+    diff)
+        for _a in "$@"; do
+            if [[ "$_a" == "--quiet" ]]; then
+                exit "${T3675_BASELINE_DIFF_QUIET_RC:-0}"
+            fi
+        done
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+T3675BASELINEGITEOF
+    chmod +x "$_tbin/git"
+
+    if command -v jq >/dev/null 2>&1; then
+        ln -sf "$(command -v jq)" "$_tbin/jq"
+    fi
+
+    set +e
+    _tout=$(env \
+        T_STATE_DIR="$_tstate" \
+        PATH="$_tbin:$PATH" \
+        AGENT_WORKSPACE="$_twork" \
+        REPO_ROOT="$_trepo" \
+        AGENT_ID="t3675-baseline-dead-beef-cafe-99" \
+        ISSUE_NUMBER="3675" \
+        "$@" \
+        bash -c '
+            set -uo pipefail
+            log() { printf "%s\n" "LOG $*"; }
+            _baseline_conflict_files_json="${T3675_BASELINE_CONFLICT_FILES_JSON:-[]}"
+            _baseline_rebase_stderr_tail='\''""'\''
+            # shellcheck disable=SC1090
+            . "'"$t3675_block"'"
+            printf "ENVELOPE %s\n" "$_ralph_baseline_output"
+        ' 2>&1)
+    _trc=$?
+    set -e
+
+    T3675_TEST_RC="$_trc"
+    T3675_TEST_OUT="$_tout"
+    T3675_TEST_STATE="$_tstate"
+}
+
+# ── Sub-test D: ralph_baseline empty conflicts + diff=0 → no_op ───────────
+#   THE BUG CASE at site 2. Pre-#3675 the rev-list-only check missed
+#   the case where commits are semantically redundant (rebase produced
+#   empty commits). MUST FAIL on unfixed code.
+
+run_t3675_baseline_test "t3675d" \
+    T3675_BASELINE_CONFLICT_FILES_JSON="[]" \
+    T3675_BASELINE_DIFF_QUIET_RC=0 \
+    T3675_BASELINE_REV_LIST=2
+
+if [[ "$T3675_TEST_RC" -eq 0 ]]; then
+    pass "#3675 T3675D — ralph_baseline envelope block exits 0 on empty conflicts + empty diff"
+else
+    fail "#3675 T3675D — ralph_baseline envelope block exits 0 on empty conflicts + empty diff" \
+         "rc=$T3675_TEST_RC, output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — already-applied log event must be emitted.
+if printf '%s' "$T3675_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3675 T3675D — ralph_baseline_no_unmerged_files_already_applied log event emitted"
+else
+    fail "#3675 T3675D — ralph_baseline_no_unmerged_files_already_applied log event emitted" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — envelope must be {"no_op": true, ...}.
+if printf '%s' "$T3675_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3675 T3675D — ralph_baseline envelope is {\"no_op\": true, ...} on already-applied path"
+else
+    fail "#3675 T3675D — ralph_baseline envelope is {\"no_op\": true, ...} on already-applied path" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — envelope must carry the new diff_to_main_empty discriminator.
+if printf '%s' "$T3675_TEST_OUT" | grep -qE 'ENVELOPE .*"diff_to_main_empty": true'; then
+    pass "#3675 T3675D — ralph_baseline envelope carries diff_to_main_empty=true (new #3675 discriminator)"
+else
+    fail "#3675 T3675D — ralph_baseline envelope carries diff_to_main_empty=true (new #3675 discriminator)" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# CRITICAL — envelope must NOT carry rebase_failed=true (the pre-#3675
+# terminal-fail envelope shape).
+if ! printf '%s' "$T3675_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
+    pass "#3675 T3675D — ralph_baseline envelope does NOT carry rebase_failed=true"
+else
+    fail "#3675 T3675D — ralph_baseline envelope does NOT carry rebase_failed=true" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# git diff --quiet must have been invoked (new check fingerprint).
+if grep -qE "CALL .*\\bdiff\\b.*--quiet.*origin/main.*HEAD" "$T3675_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3675 T3675D — ralph_baseline git diff --quiet origin/main HEAD invoked"
+else
+    fail "#3675 T3675D — ralph_baseline git diff --quiet origin/main HEAD invoked" \
+         "git-log: $(cat "$T3675_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+
+# ── Sub-test E: ralph_baseline empty conflicts + diff=1 → diagnoser ───────
+#   GENUINE FAILURE PATH (regression). Agent has real diff to ship —
+#   rebase actually failed for a non-already-applied reason. Must
+#   preserve the existing #3465 route_to_diagnoser path.
+
+run_t3675_baseline_test "t3675e" \
+    T3675_BASELINE_CONFLICT_FILES_JSON="[]" \
+    T3675_BASELINE_DIFF_QUIET_RC=1 \
+    T3675_BASELINE_REV_LIST=2
+
+if [[ "$T3675_TEST_RC" -eq 0 ]]; then
+    pass "#3675 T3675E — ralph_baseline envelope block exits 0 on empty conflicts + non-empty diff"
+else
+    fail "#3675 T3675E — ralph_baseline envelope block exits 0 on empty conflicts + non-empty diff" \
+         "rc=$T3675_TEST_RC, output: $T3675_TEST_OUT"
+fi
+
+# Genuine-failure envelope must carry rebase_failed=true (#3465 path).
+if printf '%s' "$T3675_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
+    pass "#3675 T3675E — non-empty-diff ralph_baseline envelope carries rebase_failed=true (#3465 path preserved)"
+else
+    fail "#3675 T3675E — non-empty-diff ralph_baseline envelope carries rebase_failed=true (#3465 path preserved)" \
+         "output: $T3675_TEST_OUT"
+fi
+
+if printf '%s' "$T3675_TEST_OUT" | grep -qE 'ENVELOPE .*"no_unmerged_files": true'; then
+    pass "#3675 T3675E — non-empty-diff ralph_baseline envelope carries no_unmerged_files=true"
+else
+    fail "#3675 T3675E — non-empty-diff ralph_baseline envelope carries no_unmerged_files=true" \
+         "output: $T3675_TEST_OUT"
+fi
+
+# Genuine-failure path must NOT emit the already-applied log event.
+if ! printf '%s' "$T3675_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3675 T3675E — already-applied log NOT emitted on non-empty-diff ralph_baseline path"
+else
+    fail "#3675 T3675E — already-applied log NOT emitted on non-empty-diff ralph_baseline path" \
+         "output: $T3675_TEST_OUT"
+fi
+
+if ! printf '%s' "$T3675_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3675 T3675E — non-empty-diff ralph_baseline envelope is NOT {\"no_op\": true}"
+else
+    fail "#3675 T3675E — non-empty-diff ralph_baseline envelope is NOT {\"no_op\": true}" \
+         "output: $T3675_TEST_OUT"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
