@@ -570,7 +570,7 @@ ln -sf "$(command -v python3)" "$STUB_BIN/python3"
 
 # #3656: handle_push_and_pr now wraps git fetch / git push / gh pr create
 # in ``timeout NETWORK_TIMEOUT_SECONDS`` to bound silent-hang risk.
-# Most pre-#3656 tests (T50, T51, T52, T64, the integration paths) do
+# Most pre-#3656 tests (T50, T51, T52, T3614, the integration paths) do
 # NOT exercise the 124-exit branch — they need a passthrough ``timeout``
 # binary so the wrapped commands run identically to the pre-#3656 path.
 # macOS does not ship coreutils' ``timeout(1)`` so ``command -v timeout``
@@ -578,7 +578,7 @@ ln -sf "$(command -v python3)" "$STUB_BIN/python3"
 # tests on operator laptops. This stub matches GNU ``timeout(1)``
 # semantics for the no-timer-fired path: drop the seconds arg, exec
 # the inner command transparently. Tests that DO exercise the 124
-# branch (T66, #3656) override this stub in their own per-test ``$_tbin``
+# branch (T3656, #3656) override this stub in their own per-test ``$_tbin``
 # directory. See #3656 for the full layered defense rationale.
 cat > "$STUB_BIN/timeout" <<'TIMEOUTEOF'
 #!/usr/bin/env bash
@@ -6046,7 +6046,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T61: #3543 — push_and_pr) dispatch arm — route_to_diagnoser path.
+# Test T_issue3543: #3543 — push_and_pr) dispatch arm — route_to_diagnoser path.
 #
 # Sub-test A: transition_for returns route_to_diagnoser with hint
 #   push_and_pr_no_unmerged_files.
@@ -6062,16 +6062,16 @@ fi
 #   2. push_and_pr_route_to_diagnoser NOT emitted.
 # ══════════════════════════════════════════════════════════════════════════
 
-t61_state_dir="$TEST_TMP/t61-state"
-t61_stub_bin="$TEST_TMP/t61-bin"
-t61_workspace="$TEST_TMP/t61-workspace"
-t61_repo_root="$TEST_TMP/t61-repo"
-mkdir -p "$t61_state_dir" "$t61_stub_bin" "$t61_workspace" "$t61_repo_root"
-mkdir -p "$t61_repo_root/tmp/dispatcher-input"
-mkdir -p "$t61_repo_root/tmp/dispatcher-output"
+t3543_state_dir="$TEST_TMP/t3543-state"
+t3543_stub_bin="$TEST_TMP/t3543-bin"
+t3543_workspace="$TEST_TMP/t3543-workspace"
+t3543_repo_root="$TEST_TMP/t3543-repo"
+mkdir -p "$t3543_state_dir" "$t3543_stub_bin" "$t3543_workspace" "$t3543_repo_root"
+mkdir -p "$t3543_repo_root/tmp/dispatcher-input"
+mkdir -p "$t3543_repo_root/tmp/dispatcher-output"
 
 # psql stub — responds to phase SELECT with push_and_pr.
-cat > "$t61_stub_bin/psql" <<'T61PSQLEOF'
+cat > "$t3543_stub_bin/psql" <<'T3543PSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -6080,27 +6080,27 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ "$query" == *"SELECT phase"* ]]; then printf 'push_and_pr\n'; fi
 exit 0
-T61PSQLEOF
-chmod +x "$t61_stub_bin/psql"
+T3543PSQLEOF
+chmod +x "$t3543_stub_bin/psql"
 
-cat > "$t61_stub_bin/git" <<'T61GITEOF'
+cat > "$t3543_stub_bin/git" <<'T3543GITEOF'
 #!/usr/bin/env bash
 exit 0
-T61GITEOF
-chmod +x "$t61_stub_bin/git"
+T3543GITEOF
+chmod +x "$t3543_stub_bin/git"
 
-cat > "$t61_stub_bin/gh" <<'T61GHEOF'
+cat > "$t3543_stub_bin/gh" <<'T3543GHEOF'
 #!/usr/bin/env bash
 exit 0
-T61GHEOF
-chmod +x "$t61_stub_bin/gh"
+T3543GHEOF
+chmod +x "$t3543_stub_bin/gh"
 
 # ── Sub-test A: route_to_diagnoser with push_and_pr_no_unmerged_files ──────
 
-t61a_state_dir="$t61_state_dir/a"
-mkdir -p "$t61a_state_dir"
+t3543a_state_dir="$t3543_state_dir/a"
+mkdir -p "$t3543a_state_dir"
 
-_t61a_transition_for_override="
+_t3543a_transition_for_override="
 transition_for() {
     if [[ \"\${1:-}\" == 'push_and_pr' ]]; then
         printf 'route_to_diagnoser\t\t\tpush_and_pr_no_unmerged_files'
@@ -6108,40 +6108,40 @@ transition_for() {
 }
 "
 
-_t61a_reaped_failure_override="
+_t3543a_reaped_failure_override="
 agent_runner_reaped_failure() {
-    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T61A_STATE_DIR}/reaped-log.txt\"
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T3543A_STATE_DIR}/reaped-log.txt\"
     log 'agent_runner_reaped_failure' \"phase=\$1\" \"hint=\$2\"
 }
 "
 
-_t61a_advance_phase_override="
+_t3543a_advance_phase_override="
 advance_phase() {
-    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T61A_STATE_DIR}/advance-log.txt\"
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T3543A_STATE_DIR}/advance-log.txt\"
 }
 "
 
-_t61a_handle_push_and_pr_override="
+_t3543a_handle_push_and_pr_override="
 handle_push_and_pr() {
     printf '{\"no_unmerged_files\": true}\n'
 }
 "
 
-t61a_out=$(
+t3543a_out=$(
     set +eu
-    export T61A_STATE_DIR="$t61a_state_dir"
-    export AGENT_WORKSPACE="$t61_workspace"
-    export REPO_ROOT="$t61_repo_root"
+    export T3543A_STATE_DIR="$t3543a_state_dir"
+    export AGENT_WORKSPACE="$t3543_workspace"
+    export REPO_ROOT="$t3543_repo_root"
     export AGENT_ID="61616161-dead-beef-cafe-000000000001"
     export ISSUE_NUMBER="3543"
     export DATABASE_URL="postgresql://stub"
     export AGENT_RUNNER_DRY_RUN="0"
-    export PATH="$t61_stub_bin:$PATH"
+    export PATH="$t3543_stub_bin:$PATH"
     source "$t58_funcs"
-    eval "$_t61a_transition_for_override"
-    eval "$_t61a_reaped_failure_override"
-    eval "$_t61a_advance_phase_override"
-    eval "$_t61a_handle_push_and_pr_override"
+    eval "$_t3543a_transition_for_override"
+    eval "$_t3543a_reaped_failure_override"
+    eval "$_t3543a_advance_phase_override"
+    eval "$_t3543a_handle_push_and_pr_override"
     # Drive the push_and_pr dispatch logic directly (mirrors the entrypoint).
     _output=$(handle_push_and_pr)
     persist_phase_output "push_and_pr" "$_output"
@@ -6187,52 +6187,52 @@ t61a_out=$(
     2>&1
 ) 2>&1
 
-# T61A (1): subshell completed.
-if printf '%s' "$t61a_out" | grep -q "subshell_done"; then
-    pass "#3543 T61A [push_and_pr route_to_diagnoser] — dispatch subshell ran to completion"
+# T3543A (1): subshell completed.
+if printf '%s' "$t3543a_out" | grep -q "subshell_done"; then
+    pass "#3543 T3543A [push_and_pr route_to_diagnoser] — dispatch subshell ran to completion"
 else
-    fail "#3543 T61A [push_and_pr route_to_diagnoser] — dispatch subshell ran to completion" \
-         "out tail: $(printf '%s' "$t61a_out" | tail -c 600)"
+    fail "#3543 T3543A [push_and_pr route_to_diagnoser] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t3543a_out" | tail -c 600)"
 fi
 
-# T61A (2): push_and_pr_route_to_diagnoser log line emitted.
-if printf '%s' "$t61a_out" | grep -q "push_and_pr_route_to_diagnoser"; then
-    pass "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_route_to_diagnoser log emitted"
+# T3543A (2): push_and_pr_route_to_diagnoser log line emitted.
+if printf '%s' "$t3543a_out" | grep -q "push_and_pr_route_to_diagnoser"; then
+    pass "#3543 T3543A [push_and_pr route_to_diagnoser] — push_and_pr_route_to_diagnoser log emitted"
 else
-    fail "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_route_to_diagnoser log emitted" \
-         "out: $(printf '%s' "$t61a_out" | tail -c 600)"
+    fail "#3543 T3543A [push_and_pr route_to_diagnoser] — push_and_pr_route_to_diagnoser log emitted" \
+         "out: $(printf '%s' "$t3543a_out" | tail -c 600)"
 fi
 
-# T61A (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files.
-if [[ -f "$t61a_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t61a_state_dir/reaped-log.txt"; then
-    pass "#3543 T61A [push_and_pr route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
+# T3543A (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files.
+if [[ -f "$t3543a_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t3543a_state_dir/reaped-log.txt"; then
+    pass "#3543 T3543A [push_and_pr route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
 else
-    fail "#3543 T61A [push_and_pr route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
-         "reaped-log: $(cat "$t61a_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
+    fail "#3543 T3543A [push_and_pr route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
+         "reaped-log: $(cat "$t3543a_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
 fi
 
-# T61A (4): advance_phase NOT called on route_to_diagnoser path.
-if [[ ! -f "$t61a_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t61a_state_dir/advance-log.txt"; then
-    pass "#3543 T61A [push_and_pr route_to_diagnoser] — advance_phase not called on route_to_diagnoser"
+# T3543A (4): advance_phase NOT called on route_to_diagnoser path.
+if [[ ! -f "$t3543a_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t3543a_state_dir/advance-log.txt"; then
+    pass "#3543 T3543A [push_and_pr route_to_diagnoser] — advance_phase not called on route_to_diagnoser"
 else
-    fail "#3543 T61A [push_and_pr route_to_diagnoser] — advance_phase not called on route_to_diagnoser" \
-         "advance-log: $(cat "$t61a_state_dir/advance-log.txt" 2>/dev/null)"
+    fail "#3543 T3543A [push_and_pr route_to_diagnoser] — advance_phase not called on route_to_diagnoser" \
+         "advance-log: $(cat "$t3543a_state_dir/advance-log.txt" 2>/dev/null)"
 fi
 
-# T61A (5): push_and_pr_transition_unrecognized NOT emitted.
-if ! printf '%s' "$t61a_out" | grep -q "push_and_pr_transition_unrecognized"; then
-    pass "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_transition_unrecognized not emitted"
+# T3543A (5): push_and_pr_transition_unrecognized NOT emitted.
+if ! printf '%s' "$t3543a_out" | grep -q "push_and_pr_transition_unrecognized"; then
+    pass "#3543 T3543A [push_and_pr route_to_diagnoser] — push_and_pr_transition_unrecognized not emitted"
 else
-    fail "#3543 T61A [push_and_pr route_to_diagnoser] — push_and_pr_transition_unrecognized not emitted" \
-         "out: $(printf '%s' "$t61a_out" | grep "push_and_pr_transition_unrecognized")"
+    fail "#3543 T3543A [push_and_pr route_to_diagnoser] — push_and_pr_transition_unrecognized not emitted" \
+         "out: $(printf '%s' "$t3543a_out" | grep "push_and_pr_transition_unrecognized")"
 fi
 
 # ── Sub-test B: advance happy-path regression ──────────────────────────────
 
-t61b_state_dir="$t61_state_dir/b"
-mkdir -p "$t61b_state_dir"
+t3543b_state_dir="$t3543_state_dir/b"
+mkdir -p "$t3543b_state_dir"
 
-_t61b_transition_for_override="
+_t3543b_transition_for_override="
 transition_for() {
     if [[ \"\${1:-}\" == 'push_and_pr' ]]; then
         printf 'advance\tawaiting_ci\t\t'
@@ -6240,32 +6240,32 @@ transition_for() {
 }
 "
 
-_t61b_advance_phase_override="
+_t3543b_advance_phase_override="
 advance_phase() {
-    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T61B_STATE_DIR}/advance-log.txt\"
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T3543B_STATE_DIR}/advance-log.txt\"
 }
 "
 
-_t61b_handle_push_and_pr_override="
+_t3543b_handle_push_and_pr_override="
 handle_push_and_pr() {
     printf '{\"pr_number\": 9999}\n'
 }
 "
 
-t61b_out=$(
+t3543b_out=$(
     set +eu
-    export T61B_STATE_DIR="$t61b_state_dir"
-    export AGENT_WORKSPACE="$t61_workspace"
-    export REPO_ROOT="$t61_repo_root"
+    export T3543B_STATE_DIR="$t3543b_state_dir"
+    export AGENT_WORKSPACE="$t3543_workspace"
+    export REPO_ROOT="$t3543_repo_root"
     export AGENT_ID="61616162-dead-beef-cafe-000000000001"
     export ISSUE_NUMBER="3543"
     export DATABASE_URL="postgresql://stub"
     export AGENT_RUNNER_DRY_RUN="0"
-    export PATH="$t61_stub_bin:$PATH"
+    export PATH="$t3543_stub_bin:$PATH"
     source "$t58_funcs"
-    eval "$_t61b_transition_for_override"
-    eval "$_t61b_advance_phase_override"
-    eval "$_t61b_handle_push_and_pr_override"
+    eval "$_t3543b_transition_for_override"
+    eval "$_t3543b_advance_phase_override"
+    eval "$_t3543b_handle_push_and_pr_override"
     # Drive the push_and_pr dispatch logic directly.
     _output=$(handle_push_and_pr)
     persist_phase_output "push_and_pr" "$_output"
@@ -6311,32 +6311,32 @@ t61b_out=$(
     2>&1
 ) 2>&1
 
-# T61B (1): subshell completed.
-if printf '%s' "$t61b_out" | grep -q "subshell_done"; then
-    pass "#3543 T61B [push_and_pr advance] — dispatch subshell ran to completion"
+# T3543B (1): subshell completed.
+if printf '%s' "$t3543b_out" | grep -q "subshell_done"; then
+    pass "#3543 T3543B [push_and_pr advance] — dispatch subshell ran to completion"
 else
-    fail "#3543 T61B [push_and_pr advance] — dispatch subshell ran to completion" \
-         "out tail: $(printf '%s' "$t61b_out" | tail -c 600)"
+    fail "#3543 T3543B [push_and_pr advance] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t3543b_out" | tail -c 600)"
 fi
 
-# T61B (2): advance_phase awaiting_ci called.
-if [[ -f "$t61b_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE awaiting_ci" "$t61b_state_dir/advance-log.txt"; then
-    pass "#3543 T61B [push_and_pr advance] — advance_phase awaiting_ci called"
+# T3543B (2): advance_phase awaiting_ci called.
+if [[ -f "$t3543b_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE awaiting_ci" "$t3543b_state_dir/advance-log.txt"; then
+    pass "#3543 T3543B [push_and_pr advance] — advance_phase awaiting_ci called"
 else
-    fail "#3543 T61B [push_and_pr advance] — advance_phase awaiting_ci called" \
-         "advance-log: $(cat "$t61b_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+    fail "#3543 T3543B [push_and_pr advance] — advance_phase awaiting_ci called" \
+         "advance-log: $(cat "$t3543b_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
 fi
 
-# T61B (3): push_and_pr_route_to_diagnoser NOT emitted on advance path.
-if ! printf '%s' "$t61b_out" | grep -q "push_and_pr_route_to_diagnoser"; then
-    pass "#3543 T61B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance"
+# T3543B (3): push_and_pr_route_to_diagnoser NOT emitted on advance path.
+if ! printf '%s' "$t3543b_out" | grep -q "push_and_pr_route_to_diagnoser"; then
+    pass "#3543 T3543B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance"
 else
-    fail "#3543 T61B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance" \
-         "out: $(printf '%s' "$t61b_out" | grep "push_and_pr_route_to_diagnoser")"
+    fail "#3543 T3543B [push_and_pr advance] — push_and_pr_route_to_diagnoser not emitted on advance" \
+         "out: $(printf '%s' "$t3543b_out" | grep "push_and_pr_route_to_diagnoser")"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T62: #3166 — external-terminal observation at phase boundary.
+# Test T_issue3166: #3166 — external-terminal observation at phase boundary.
 #
 # Sub-test A (positive): db_query_one returns status=failed → block exits 0
 # and emits external_terminal_observed log line.
@@ -6345,38 +6345,38 @@ fi
 # NOT exit; loop continues (subshell reaches echo "loop_continued").
 # ══════════════════════════════════════════════════════════════════════════
 
-t62_state_dir="$TEST_TMP/t62-state"
-t62_stub_bin="$TEST_TMP/t62-bin"
-t62_workspace="$TEST_TMP/t62-workspace"
-mkdir -p "$t62_state_dir" "$t62_stub_bin" "$t62_workspace"
+t3166_state_dir="$TEST_TMP/t3166-state"
+t3166_stub_bin="$TEST_TMP/t3166-bin"
+t3166_workspace="$TEST_TMP/t3166-workspace"
+mkdir -p "$t3166_state_dir" "$t3166_stub_bin" "$t3166_workspace"
 
 # Extract helper functions from the real entrypoint.
-t62_funcs="$TEST_TMP/t62-funcs.sh"
-printf 'exec 3>&1\n' > "$t62_funcs"
+t3166_funcs="$TEST_TMP/t3166-funcs.sh"
+printf 'exec 3>&1\n' > "$t3166_funcs"
 
 for fn in db_query_one log read_agent_status; do
     awk -v FN="^${fn}\\(\\)" '
         $0 ~ FN { in_fn=1 }
         in_fn { print }
         in_fn && /^}$/ { exit }
-    ' "$ENTRYPOINT" >> "$t62_funcs"
+    ' "$ENTRYPOINT" >> "$t3166_funcs"
 done
 
 # Sanity: read_agent_status exists in extracted functions.
-if grep -q "read_agent_status" "$t62_funcs"; then
-    pass "#3166 T62 setup — read_agent_status exists in extracted functions"
+if grep -q "read_agent_status" "$t3166_funcs"; then
+    pass "#3166 T3166 setup — read_agent_status exists in extracted functions"
 else
-    fail "#3166 T62 setup — read_agent_status exists in extracted functions" \
-         "grep target: 'read_agent_status' in funcs (head 200): $(head -c 200 "$t62_funcs")"
+    fail "#3166 T3166 setup — read_agent_status exists in extracted functions" \
+         "grep target: 'read_agent_status' in funcs (head 200): $(head -c 200 "$t3166_funcs")"
 fi
 
 # ── Sub-test A: terminal status → exits 0, emits log line ─────────────────
 
-t62a_state_dir="$t62_state_dir/a"
-mkdir -p "$t62a_state_dir"
+t3166a_state_dir="$t3166_state_dir/a"
+mkdir -p "$t3166a_state_dir"
 
 # psql stub — returns 'failed' for status SELECT, 'planning' for phase SELECT.
-cat > "$t62_stub_bin/psql" <<'T62PSQLEOF'
+cat > "$t3166_stub_bin/psql" <<'T3166PSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -6389,24 +6389,24 @@ elif [[ "$query" == *"SELECT phase"* ]]; then
     printf 'planning\n'
 fi
 exit 0
-T62PSQLEOF
-chmod +x "$t62_stub_bin/psql"
+T3166PSQLEOF
+chmod +x "$t3166_stub_bin/psql"
 
 # is_terminal_status override: returns 0 (terminal) for 'failed'.
-_t62a_is_terminal_status_override="
+_t3166a_is_terminal_status_override="
 is_terminal_status() {
     [[ \"\${1:-}\" == 'failed' ]]
 }
 "
 
-t62a_out=$(
+t3166a_out=$(
     set +eu
-    export AGENT_WORKSPACE="$t62_workspace"
+    export AGENT_WORKSPACE="$t3166_workspace"
     export AGENT_ID="62626262-dead-beef-cafe-000000000001"
     export DATABASE_URL="postgresql://stub"
-    export PATH="$t62_stub_bin:$PATH"
-    source "$t62_funcs"
-    eval "$_t62a_is_terminal_status_override"
+    export PATH="$t3166_stub_bin:$PATH"
+    source "$t3166_funcs"
+    eval "$_t3166a_is_terminal_status_override"
     # Inline the external-terminal observation block from the phase loop.
     _current="planning"
     _current_status=$(read_agent_status)
@@ -6417,43 +6417,43 @@ t62a_out=$(
     echo "loop_continued"
     2>&1
 ) 2>&1
-t62a_rc=$?
+t3166a_rc=$?
 
-# T62A (1): subshell exited 0.
-if [[ $t62a_rc -eq 0 ]]; then
-    pass "#3166 T62A [external_terminal_observed] — subshell exited 0 on terminal status"
+# T3166A (1): subshell exited 0.
+if [[ $t3166a_rc -eq 0 ]]; then
+    pass "#3166 T3166A [external_terminal_observed] — subshell exited 0 on terminal status"
 else
-    fail "#3166 T62A [external_terminal_observed] — subshell exited 0 on terminal status" \
-         "exit_code=$t62a_rc out: $(printf '%s' "$t62a_out" | tail -c 400)"
+    fail "#3166 T3166A [external_terminal_observed] — subshell exited 0 on terminal status" \
+         "exit_code=$t3166a_rc out: $(printf '%s' "$t3166a_out" | tail -c 400)"
 fi
 
-# T62A (2): external_terminal_observed emitted with status=failed.
-if printf '%s' "$t62a_out" | grep -q "external_terminal_observed"; then
-    pass "#3166 T62A [external_terminal_observed] — log line emitted"
+# T3166A (2): external_terminal_observed emitted with status=failed.
+if printf '%s' "$t3166a_out" | grep -q "external_terminal_observed"; then
+    pass "#3166 T3166A [external_terminal_observed] — log line emitted"
 else
-    fail "#3166 T62A [external_terminal_observed] — log line emitted" \
-         "out: $(printf '%s' "$t62a_out" | tail -c 400)"
+    fail "#3166 T3166A [external_terminal_observed] — log line emitted" \
+         "out: $(printf '%s' "$t3166a_out" | tail -c 400)"
 fi
 
-if printf '%s' "$t62a_out" | grep "external_terminal_observed" | grep -q "failed"; then
-    pass "#3166 T62A [external_terminal_observed] — status=failed in log line"
+if printf '%s' "$t3166a_out" | grep "external_terminal_observed" | grep -q "failed"; then
+    pass "#3166 T3166A [external_terminal_observed] — status=failed in log line"
 else
-    fail "#3166 T62A [external_terminal_observed] — status=failed in log line" \
-         "out: $(printf '%s' "$t62a_out" | grep "external_terminal_observed")"
+    fail "#3166 T3166A [external_terminal_observed] — status=failed in log line" \
+         "out: $(printf '%s' "$t3166a_out" | grep "external_terminal_observed")"
 fi
 
-# T62A (3): loop_continued NOT printed (block exited before reaching it).
-if ! printf '%s' "$t62a_out" | grep -q "loop_continued"; then
-    pass "#3166 T62A [external_terminal_observed] — loop_continued not reached"
+# T3166A (3): loop_continued NOT printed (block exited before reaching it).
+if ! printf '%s' "$t3166a_out" | grep -q "loop_continued"; then
+    pass "#3166 T3166A [external_terminal_observed] — loop_continued not reached"
 else
-    fail "#3166 T62A [external_terminal_observed] — loop_continued not reached" \
-         "out: $(printf '%s' "$t62a_out" | tail -c 400)"
+    fail "#3166 T3166A [external_terminal_observed] — loop_continued not reached" \
+         "out: $(printf '%s' "$t3166a_out" | tail -c 400)"
 fi
 
 # ── Sub-test B (negative): non-terminal status → loop continues ────────────
 
 # psql stub — returns 'running' for status SELECT.
-cat > "$t62_stub_bin/psql" <<'T62BPSQLEOF'
+cat > "$t3166_stub_bin/psql" <<'T3166BPSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -6466,24 +6466,24 @@ elif [[ "$query" == *"SELECT phase"* ]]; then
     printf 'planning\n'
 fi
 exit 0
-T62BPSQLEOF
-chmod +x "$t62_stub_bin/psql"
+T3166BPSQLEOF
+chmod +x "$t3166_stub_bin/psql"
 
 # is_terminal_status override: returns 1 (not terminal) for 'running'.
-_t62b_is_terminal_status_override="
+_t3166b_is_terminal_status_override="
 is_terminal_status() {
     [[ \"\${1:-}\" == 'failed' || \"\${1:-}\" == 'crashed' || \"\${1:-}\" == 'succeeded' || \"\${1:-}\" == 'plan_blocked' || \"\${1:-}\" == 'needs_review' ]]
 }
 "
 
-t62b_out=$(
+t3166b_out=$(
     set +eu
-    export AGENT_WORKSPACE="$t62_workspace"
+    export AGENT_WORKSPACE="$t3166_workspace"
     export AGENT_ID="62626262-dead-beef-cafe-000000000001"
     export DATABASE_URL="postgresql://stub"
-    export PATH="$t62_stub_bin:$PATH"
-    source "$t62_funcs"
-    eval "$_t62b_is_terminal_status_override"
+    export PATH="$t3166_stub_bin:$PATH"
+    source "$t3166_funcs"
+    eval "$_t3166b_is_terminal_status_override"
     # Inline the external-terminal observation block from the phase loop.
     _current="planning"
     _current_status=$(read_agent_status)
@@ -6494,26 +6494,26 @@ t62b_out=$(
     echo "loop_continued"
     2>&1
 ) 2>&1
-t62b_rc=$?
+t3166b_rc=$?
 
-# T62B (1): subshell reached loop_continued (did NOT exit early).
-if printf '%s' "$t62b_out" | grep -q "loop_continued"; then
-    pass "#3166 T62B [non-terminal running] — loop_continued reached"
+# T3166B (1): subshell reached loop_continued (did NOT exit early).
+if printf '%s' "$t3166b_out" | grep -q "loop_continued"; then
+    pass "#3166 T3166B [non-terminal running] — loop_continued reached"
 else
-    fail "#3166 T62B [non-terminal running] — loop_continued reached" \
-         "exit_code=$t62b_rc out: $(printf '%s' "$t62b_out" | tail -c 400)"
+    fail "#3166 T3166B [non-terminal running] — loop_continued reached" \
+         "exit_code=$t3166b_rc out: $(printf '%s' "$t3166b_out" | tail -c 400)"
 fi
 
-# T62B (2): external_terminal_observed NOT emitted.
-if ! printf '%s' "$t62b_out" | grep -q "external_terminal_observed"; then
-    pass "#3166 T62B [non-terminal running] — external_terminal_observed not emitted"
+# T3166B (2): external_terminal_observed NOT emitted.
+if ! printf '%s' "$t3166b_out" | grep -q "external_terminal_observed"; then
+    pass "#3166 T3166B [non-terminal running] — external_terminal_observed not emitted"
 else
-    fail "#3166 T62B [non-terminal running] — external_terminal_observed not emitted" \
-         "out: $(printf '%s' "$t62b_out" | grep "external_terminal_observed")"
+    fail "#3166 T3166B [non-terminal running] — external_terminal_observed not emitted" \
+         "out: $(printf '%s' "$t3166b_out" | grep "external_terminal_observed")"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T63: #3573 — ralph_baseline rebase dispatch — route_to_diagnoser path.
+# Test T_issue3573: #3573 — ralph_baseline rebase dispatch — route_to_diagnoser path.
 #
 # Sub-test A: transition_for returns route_to_diagnoser with hint
 #   push_and_pr_no_unmerged_files.
@@ -6529,16 +6529,16 @@ fi
 #   2. ralph_baseline_route_to_diagnoser NOT emitted.
 # ══════════════════════════════════════════════════════════════════════════
 
-t63_state_dir="$TEST_TMP/t63-state"
-t63_stub_bin="$TEST_TMP/t63-bin"
-t63_workspace="$TEST_TMP/t63-workspace"
-t63_repo_root="$TEST_TMP/t63-repo"
-mkdir -p "$t63_state_dir" "$t63_stub_bin" "$t63_workspace" "$t63_repo_root"
-mkdir -p "$t63_repo_root/tmp/dispatcher-input"
-mkdir -p "$t63_repo_root/tmp/dispatcher-output"
+t3573_state_dir="$TEST_TMP/t3573-state"
+t3573_stub_bin="$TEST_TMP/t3573-bin"
+t3573_workspace="$TEST_TMP/t3573-workspace"
+t3573_repo_root="$TEST_TMP/t3573-repo"
+mkdir -p "$t3573_state_dir" "$t3573_stub_bin" "$t3573_workspace" "$t3573_repo_root"
+mkdir -p "$t3573_repo_root/tmp/dispatcher-input"
+mkdir -p "$t3573_repo_root/tmp/dispatcher-output"
 
 # psql stub — responds to phase SELECT with ralph.
-cat > "$t63_stub_bin/psql" <<'T63PSQLEOF'
+cat > "$t3573_stub_bin/psql" <<'T3573PSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -6547,27 +6547,27 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ "$query" == *"SELECT phase"* ]]; then printf 'ralph\n'; fi
 exit 0
-T63PSQLEOF
-chmod +x "$t63_stub_bin/psql"
+T3573PSQLEOF
+chmod +x "$t3573_stub_bin/psql"
 
-cat > "$t63_stub_bin/git" <<'T63GITEOF'
+cat > "$t3573_stub_bin/git" <<'T3573GITEOF'
 #!/usr/bin/env bash
 exit 0
-T63GITEOF
-chmod +x "$t63_stub_bin/git"
+T3573GITEOF
+chmod +x "$t3573_stub_bin/git"
 
-cat > "$t63_stub_bin/gh" <<'T63GHEOF'
+cat > "$t3573_stub_bin/gh" <<'T3573GHEOF'
 #!/usr/bin/env bash
 exit 0
-T63GHEOF
-chmod +x "$t63_stub_bin/gh"
+T3573GHEOF
+chmod +x "$t3573_stub_bin/gh"
 
 # ── Sub-test A: route_to_diagnoser with push_and_pr_no_unmerged_files ──────
 
-t63a_state_dir="$t63_state_dir/a"
-mkdir -p "$t63a_state_dir"
+t3573a_state_dir="$t3573_state_dir/a"
+mkdir -p "$t3573a_state_dir"
 
-_t63a_transition_for_override="
+_t3573a_transition_for_override="
 transition_for() {
     if [[ \"\${1:-}\" == 'ralph' ]]; then
         printf 'route_to_diagnoser\t\t\tpush_and_pr_no_unmerged_files'
@@ -6575,33 +6575,33 @@ transition_for() {
 }
 "
 
-_t63a_reaped_failure_override="
+_t3573a_reaped_failure_override="
 agent_runner_reaped_failure() {
-    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T63A_STATE_DIR}/reaped-log.txt\"
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T3573A_STATE_DIR}/reaped-log.txt\"
     log 'agent_runner_reaped_failure' \"phase=\$1\" \"hint=\$2\"
 }
 "
 
-_t63a_advance_phase_override="
+_t3573a_advance_phase_override="
 advance_phase() {
-    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T63A_STATE_DIR}/advance-log.txt\"
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T3573A_STATE_DIR}/advance-log.txt\"
 }
 "
 
-t63a_out=$(
+t3573a_out=$(
     set +eu
-    export T63A_STATE_DIR="$t63a_state_dir"
-    export AGENT_WORKSPACE="$t63_workspace"
-    export REPO_ROOT="$t63_repo_root"
+    export T3573A_STATE_DIR="$t3573a_state_dir"
+    export AGENT_WORKSPACE="$t3573_workspace"
+    export REPO_ROOT="$t3573_repo_root"
     export AGENT_ID="63636363-dead-beef-cafe-000000000001"
     export ISSUE_NUMBER="3573"
     export DATABASE_URL="postgresql://stub"
     export AGENT_RUNNER_DRY_RUN="0"
-    export PATH="$t63_stub_bin:$PATH"
+    export PATH="$t3573_stub_bin:$PATH"
     source "$t58_funcs"
-    eval "$_t63a_transition_for_override"
-    eval "$_t63a_reaped_failure_override"
-    eval "$_t63a_advance_phase_override"
+    eval "$_t3573a_transition_for_override"
+    eval "$_t3573a_reaped_failure_override"
+    eval "$_t3573a_advance_phase_override"
     # Drive the ralph_baseline rebase dispatch logic directly (mirrors the entrypoint).
     _ralph_baseline_output='{"rebase_failed": true, "no_unmerged_files": true, "rebase_stderr_tail": "", "source_phase": "ralph"}'
     persist_phase_output "ralph" "$_ralph_baseline_output"
@@ -6647,52 +6647,52 @@ t63a_out=$(
     2>&1
 ) 2>&1
 
-# T63A (1): subshell completed.
-if printf '%s' "$t63a_out" | grep -q "subshell_done"; then
-    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — dispatch subshell ran to completion"
+# T3573A (1): subshell completed.
+if printf '%s' "$t3573a_out" | grep -q "subshell_done"; then
+    pass "#3573 T3573A [ralph_baseline route_to_diagnoser] — dispatch subshell ran to completion"
 else
-    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — dispatch subshell ran to completion" \
-         "out tail: $(printf '%s' "$t63a_out" | tail -c 600)"
+    fail "#3573 T3573A [ralph_baseline route_to_diagnoser] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t3573a_out" | tail -c 600)"
 fi
 
-# T63A (2): ralph_baseline_route_to_diagnoser log line emitted.
-if printf '%s' "$t63a_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
-    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_route_to_diagnoser log emitted"
+# T3573A (2): ralph_baseline_route_to_diagnoser log line emitted.
+if printf '%s' "$t3573a_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
+    pass "#3573 T3573A [ralph_baseline route_to_diagnoser] — ralph_baseline_route_to_diagnoser log emitted"
 else
-    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_route_to_diagnoser log emitted" \
-         "out: $(printf '%s' "$t63a_out" | tail -c 600)"
+    fail "#3573 T3573A [ralph_baseline route_to_diagnoser] — ralph_baseline_route_to_diagnoser log emitted" \
+         "out: $(printf '%s' "$t3573a_out" | tail -c 600)"
 fi
 
-# T63A (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files.
-if [[ -f "$t63a_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t63a_state_dir/reaped-log.txt"; then
-    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
+# T3573A (3): agent_runner_reaped_failure called with push_and_pr_no_unmerged_files.
+if [[ -f "$t3573a_state_dir/reaped-log.txt" ]] && grep -q "REAPED_FAILURE push_and_pr_no_unmerged_files" "$t3573a_state_dir/reaped-log.txt"; then
+    pass "#3573 T3573A [ralph_baseline route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files"
 else
-    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
-         "reaped-log: $(cat "$t63a_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
+    fail "#3573 T3573A [ralph_baseline route_to_diagnoser] — agent_runner_reaped_failure called with push_and_pr_no_unmerged_files" \
+         "reaped-log: $(cat "$t3573a_state_dir/reaped-log.txt" 2>/dev/null || echo '(missing)')"
 fi
 
-# T63A (4): advance_phase NOT called on route_to_diagnoser path.
-if [[ ! -f "$t63a_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t63a_state_dir/advance-log.txt"; then
-    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — advance_phase not called on route_to_diagnoser"
+# T3573A (4): advance_phase NOT called on route_to_diagnoser path.
+if [[ ! -f "$t3573a_state_dir/advance-log.txt" ]] || ! grep -q "ADVANCE_PHASE" "$t3573a_state_dir/advance-log.txt"; then
+    pass "#3573 T3573A [ralph_baseline route_to_diagnoser] — advance_phase not called on route_to_diagnoser"
 else
-    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — advance_phase not called on route_to_diagnoser" \
-         "advance-log: $(cat "$t63a_state_dir/advance-log.txt" 2>/dev/null)"
+    fail "#3573 T3573A [ralph_baseline route_to_diagnoser] — advance_phase not called on route_to_diagnoser" \
+         "advance-log: $(cat "$t3573a_state_dir/advance-log.txt" 2>/dev/null)"
 fi
 
-# T63A (5): ralph_baseline_transition_unrecognized NOT emitted.
-if ! printf '%s' "$t63a_out" | grep -q "ralph_baseline_transition_unrecognized"; then
-    pass "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_transition_unrecognized not emitted"
+# T3573A (5): ralph_baseline_transition_unrecognized NOT emitted.
+if ! printf '%s' "$t3573a_out" | grep -q "ralph_baseline_transition_unrecognized"; then
+    pass "#3573 T3573A [ralph_baseline route_to_diagnoser] — ralph_baseline_transition_unrecognized not emitted"
 else
-    fail "#3573 T63A [ralph_baseline route_to_diagnoser] — ralph_baseline_transition_unrecognized not emitted" \
-         "out: $(printf '%s' "$t63a_out" | grep "ralph_baseline_transition_unrecognized")"
+    fail "#3573 T3573A [ralph_baseline route_to_diagnoser] — ralph_baseline_transition_unrecognized not emitted" \
+         "out: $(printf '%s' "$t3573a_out" | grep "ralph_baseline_transition_unrecognized")"
 fi
 
 # ── Sub-test B: advance happy-path regression ──────────────────────────────
 
-t63b_state_dir="$t63_state_dir/b"
-mkdir -p "$t63b_state_dir"
+t3573b_state_dir="$t3573_state_dir/b"
+mkdir -p "$t3573b_state_dir"
 
-_t63b_transition_for_override="
+_t3573b_transition_for_override="
 transition_for() {
     if [[ \"\${1:-}\" == 'ralph' ]]; then
         printf 'advance\tfix_conflict\t\t'
@@ -6700,25 +6700,25 @@ transition_for() {
 }
 "
 
-_t63b_advance_phase_override="
+_t3573b_advance_phase_override="
 advance_phase() {
-    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T63B_STATE_DIR}/advance-log.txt\"
+    printf 'ADVANCE_PHASE %s\n' \"\${1:-}\" >> \"\${T3573B_STATE_DIR}/advance-log.txt\"
 }
 "
 
-t63b_out=$(
+t3573b_out=$(
     set +eu
-    export T63B_STATE_DIR="$t63b_state_dir"
-    export AGENT_WORKSPACE="$t63_workspace"
-    export REPO_ROOT="$t63_repo_root"
+    export T3573B_STATE_DIR="$t3573b_state_dir"
+    export AGENT_WORKSPACE="$t3573_workspace"
+    export REPO_ROOT="$t3573_repo_root"
     export AGENT_ID="63636364-dead-beef-cafe-000000000001"
     export ISSUE_NUMBER="3573"
     export DATABASE_URL="postgresql://stub"
     export AGENT_RUNNER_DRY_RUN="0"
-    export PATH="$t63_stub_bin:$PATH"
+    export PATH="$t3573_stub_bin:$PATH"
     source "$t58_funcs"
-    eval "$_t63b_transition_for_override"
-    eval "$_t63b_advance_phase_override"
+    eval "$_t3573b_transition_for_override"
+    eval "$_t3573b_advance_phase_override"
     # Drive the ralph_baseline rebase dispatch logic directly.
     _ralph_baseline_output='{"rebase_failed": true, "conflict_files": ["foo.py"], "rebase_stderr_tail": "", "source_phase": "ralph"}'
     persist_phase_output "ralph" "$_ralph_baseline_output"
@@ -6764,32 +6764,32 @@ t63b_out=$(
     2>&1
 ) 2>&1
 
-# T63B (1): subshell completed.
-if printf '%s' "$t63b_out" | grep -q "subshell_done"; then
-    pass "#3573 T63B [ralph_baseline advance] — dispatch subshell ran to completion"
+# T3573B (1): subshell completed.
+if printf '%s' "$t3573b_out" | grep -q "subshell_done"; then
+    pass "#3573 T3573B [ralph_baseline advance] — dispatch subshell ran to completion"
 else
-    fail "#3573 T63B [ralph_baseline advance] — dispatch subshell ran to completion" \
-         "out tail: $(printf '%s' "$t63b_out" | tail -c 600)"
+    fail "#3573 T3573B [ralph_baseline advance] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t3573b_out" | tail -c 600)"
 fi
 
-# T63B (2): advance_phase fix_conflict called.
-if [[ -f "$t63b_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE fix_conflict" "$t63b_state_dir/advance-log.txt"; then
-    pass "#3573 T63B [ralph_baseline advance] — advance_phase fix_conflict called"
+# T3573B (2): advance_phase fix_conflict called.
+if [[ -f "$t3573b_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE fix_conflict" "$t3573b_state_dir/advance-log.txt"; then
+    pass "#3573 T3573B [ralph_baseline advance] — advance_phase fix_conflict called"
 else
-    fail "#3573 T63B [ralph_baseline advance] — advance_phase fix_conflict called" \
-         "advance-log: $(cat "$t63b_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+    fail "#3573 T3573B [ralph_baseline advance] — advance_phase fix_conflict called" \
+         "advance-log: $(cat "$t3573b_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
 fi
 
-# T63B (3): ralph_baseline_route_to_diagnoser NOT emitted on advance path.
-if ! printf '%s' "$t63b_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
-    pass "#3573 T63B [ralph_baseline advance] — ralph_baseline_route_to_diagnoser not emitted on advance"
+# T3573B (3): ralph_baseline_route_to_diagnoser NOT emitted on advance path.
+if ! printf '%s' "$t3573b_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
+    pass "#3573 T3573B [ralph_baseline advance] — ralph_baseline_route_to_diagnoser not emitted on advance"
 else
-    fail "#3573 T63B [ralph_baseline advance] — ralph_baseline_route_to_diagnoser not emitted on advance" \
-         "out: $(printf '%s' "$t63b_out" | grep "ralph_baseline_route_to_diagnoser")"
+    fail "#3573 T3573B [ralph_baseline advance] — ralph_baseline_route_to_diagnoser not emitted on advance" \
+         "out: $(printf '%s' "$t3573b_out" | grep "ralph_baseline_route_to_diagnoser")"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T64: #3614 — handle_push_and_pr empty-diff after successful rebase.
+# Test T_issue3614: #3614 — handle_push_and_pr empty-diff after successful rebase.
 #
 # The bug: when an agent claims an issue whose fix has ALREADY shipped via
 # a sibling PR, the pre-push ``git rebase origin/main`` succeeds AND drops
@@ -6824,8 +6824,8 @@ fi
 # Extract handle_push_and_pr + minimal dependencies. handle_push_and_pr
 # depends on log, db_exec, persist_phase_output (none of which it actually
 # calls in the empty-diff path, but the function body uses ``log`` heavily).
-t64_funcs="$TEST_TMP/t64-funcs.sh"
-printf 'exec 3>&1\n' > "$t64_funcs"
+t3614_funcs="$TEST_TMP/t3614-funcs.sh"
+printf 'exec 3>&1\n' > "$t3614_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
           handle_push_and_pr; do
@@ -6833,20 +6833,20 @@ for fn in db_exec db_query_one log persist_phase_output \
         $0 ~ FN { in_fn=1 }
         in_fn { print }
         in_fn && /^}$/ { exit }
-    ' "$ENTRYPOINT" >> "$t64_funcs"
+    ' "$ENTRYPOINT" >> "$t3614_funcs"
 done
 
 # #3656: handle_push_and_pr now references NETWORK_TIMEOUT_SECONDS
 # (the ``timeout`` wrapper around git fetch / git push / gh pr create).
-# T64 doesn't drive the 124-exit branch — it just needs the constant
+# T3614 doesn't drive the 124-exit branch — it just needs the constant
 # defined so the wrapped commands run normally under ``set -u``.
-grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t64_funcs"
+grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3614_funcs"
 
-if grep -q "^handle_push_and_pr()" "$t64_funcs"; then
-    pass "#3614 T64 setup — extracted handle_push_and_pr from entrypoint"
+if grep -q "^handle_push_and_pr()" "$t3614_funcs"; then
+    pass "#3614 T3614 setup — extracted handle_push_and_pr from entrypoint"
 else
-    fail "#3614 T64 setup — extracted handle_push_and_pr from entrypoint" \
-         "fixture head: $(head -c 400 "$t64_funcs")"
+    fail "#3614 T3614 setup — extracted handle_push_and_pr from entrypoint" \
+         "fixture head: $(head -c 400 "$t3614_funcs")"
 fi
 
 # Per-test runner. The git stub is parameterised by a counter file so
@@ -6856,9 +6856,9 @@ fi
 # PR) post-rebase empty-diff check.
 #
 # Stub control via env vars:
-#   T64_REV_LIST_PRE   — count returned for the FIRST rev-list call
+#   T3614_REV_LIST_PRE   — count returned for the FIRST rev-list call
 #                        (pre-rebase). Default 1 (something to push).
-#   T64_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
+#   T3614_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
 #                        Default 1 (rebase preserved the agent's commits).
 #                        Set to 0 to simulate "rebase pulled in the fix".
 #   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
@@ -6881,7 +6881,7 @@ run_push_pr_test() {
     # git stub — log every call, parameterise rev-list / push / rebase /
     # fetch by env. ``git -C <dir> <subcmd>`` is normalised by stripping
     # the -C arg.
-    cat > "$_tbin/git" <<'T64GITEOF'
+    cat > "$_tbin/git" <<'T3614GITEOF'
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
@@ -6896,15 +6896,15 @@ done
 sub="${1:-}"
 case "$sub" in
     rev-list)
-        # Returns T64_REV_LIST_PRE on first call, T64_REV_LIST_POST after.
+        # Returns T3614_REV_LIST_PRE on first call, T3614_REV_LIST_POST after.
         _counter_file="${T_STATE_DIR}/rev-list-call-count.txt"
         _n=$(cat "$_counter_file" 2>/dev/null || printf '0')
         _next=$((_n + 1))
         printf '%s\n' "$_next" > "$_counter_file"
         if [[ "$_n" == "0" ]]; then
-            printf '%s\n' "${T64_REV_LIST_PRE:-1}"
+            printf '%s\n' "${T3614_REV_LIST_PRE:-1}"
         else
-            printf '%s\n' "${T64_REV_LIST_POST:-1}"
+            printf '%s\n' "${T3614_REV_LIST_POST:-1}"
         fi
         exit 0
         ;;
@@ -6919,7 +6919,7 @@ case "$sub" in
         ;;
     diff)
         # ``git diff --name-only --diff-filter=U`` for conflict files.
-        # T64 doesn't drive the conflict path, but this keeps the stub
+        # T3614 doesn't drive the conflict path, but this keeps the stub
         # robust if future tests do.
         exit 0
         ;;
@@ -6937,27 +6937,27 @@ case "$sub" in
         exit 0
         ;;
 esac
-T64GITEOF
+T3614GITEOF
     chmod +x "$_tbin/git"
 
     # #3656: passthrough ``timeout`` stub. handle_push_and_pr now wraps
     # git fetch / git push / gh pr create in ``timeout NETWORK_TIMEOUT_SECONDS``.
-    # T64 does NOT exercise the 124-exit branch — it just needs a
+    # T3614 does NOT exercise the 124-exit branch — it just needs a
     # ``timeout`` binary on PATH that execs the inner command transparently
     # so the test runs identically pre- and post-#3656. macOS does not
     # ship coreutils' ``timeout(1)``, so a real ``timeout`` lookup would
     # exit 127 and break the test on operator laptops. This stub matches
     # GNU ``timeout`` semantics for the no-timer-fired path.
-    cat > "$_tbin/timeout" <<'T64TIMEOUTEOF'
+    cat > "$_tbin/timeout" <<'T3614TIMEOUTEOF'
 #!/usr/bin/env bash
 # argv: <seconds> <inner-cmd> <inner-args...>
 shift  # discard the seconds arg
 exec "$@"
-T64TIMEOUTEOF
+T3614TIMEOUTEOF
     chmod +x "$_tbin/timeout"
 
     # gh stub — log invocations, default exit 0.
-    cat > "$_tbin/gh" <<'T64GHEOF'
+    cat > "$_tbin/gh" <<'T3614GHEOF'
 #!/usr/bin/env bash
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
 # gh pr create prints a PR URL on stdout (the entrypoint parses it).
@@ -6965,11 +6965,11 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
     printf 'https://github.com/judgemind/judgemind/pull/9999\n'
 fi
 exit "${GH_EXIT:-0}"
-T64GHEOF
+T3614GHEOF
     chmod +x "$_tbin/gh"
 
     # psql stub — log invocations.
-    cat > "$_tbin/psql" <<'T64PSQLEOF'
+    cat > "$_tbin/psql" <<'T3614PSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -6978,7 +6978,7 @@ while [[ $# -gt 0 ]]; do
 done
 printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
 exit 0
-T64PSQLEOF
+T3614PSQLEOF
     chmod +x "$_tbin/psql"
 
     if command -v jq >/dev/null 2>&1; then
@@ -7000,7 +7000,7 @@ T64PSQLEOF
         bash -c '
             set -uo pipefail
             # shellcheck disable=SC1090
-            . "'"$t64_funcs"'"
+            . "'"$t3614_funcs"'"
             handle_push_and_pr
         ' 2>&1)
     _trc=$?
@@ -7013,20 +7013,20 @@ T64PSQLEOF
 
 # ── Sub-test A: post-rebase empty diff → no_op envelope, no push, no PR ───
 
-run_push_pr_test "t64a" T64_REV_LIST_PRE=1 T64_REV_LIST_POST=0 GIT_REBASE_EXIT=0
+run_push_pr_test "t3614a" T3614_REV_LIST_PRE=1 T3614_REV_LIST_POST=0 GIT_REBASE_EXIT=0
 
 if [[ "$PUSHPR_TEST_RC" -eq 0 ]]; then
-    pass "#3614 T64A — handle_push_and_pr exits 0 on post-rebase empty-diff"
+    pass "#3614 T3614A — handle_push_and_pr exits 0 on post-rebase empty-diff"
 else
-    fail "#3614 T64A — handle_push_and_pr exits 0 on post-rebase empty-diff" \
+    fail "#3614 T3614A — handle_push_and_pr exits 0 on post-rebase empty-diff" \
          "rc=$PUSHPR_TEST_RC, output: $PUSHPR_TEST_OUT"
 fi
 
 # CRITICAL — new log event for the post-rebase already-applied case.
 if printf '%s' "$PUSHPR_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied"; then
-    pass "#3614 T64A — push_and_pr_no_unmerged_files_already_applied log event emitted"
+    pass "#3614 T3614A — push_and_pr_no_unmerged_files_already_applied log event emitted"
 else
-    fail "#3614 T64A — push_and_pr_no_unmerged_files_already_applied log event emitted" \
+    fail "#3614 T3614A — push_and_pr_no_unmerged_files_already_applied log event emitted" \
          "output: $PUSHPR_TEST_OUT"
 fi
 
@@ -7035,9 +7035,9 @@ fi
 # no-op (Everything up-to-date) or attempt a push that gh pr create
 # would then fail on for an empty-diff PR.
 if ! grep -qE "CALL .*\\bpush\\b" "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3614 T64A — git push NOT invoked on post-rebase empty-diff"
+    pass "#3614 T3614A — git push NOT invoked on post-rebase empty-diff"
 else
-    fail "#3614 T64A — git push NOT invoked on post-rebase empty-diff" \
+    fail "#3614 T3614A — git push NOT invoked on post-rebase empty-diff" \
          "git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
@@ -7045,9 +7045,9 @@ fi
 # diff there's no PR to open; gh pr create would fail and the agent
 # would terminal as push_and_pr_pr_create_failed.
 if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null; then
-    pass "#3614 T64A — gh pr create NOT invoked on post-rebase empty-diff"
+    pass "#3614 T3614A — gh pr create NOT invoked on post-rebase empty-diff"
 else
-    fail "#3614 T64A — gh pr create NOT invoked on post-rebase empty-diff" \
+    fail "#3614 T3614A — gh pr create NOT invoked on post-rebase empty-diff" \
          "gh-log: $(cat "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
@@ -7055,9 +7055,9 @@ fi
 # transition_from_push_and_pr routes ``no_op=true`` to PHASE_NO_OP terminal
 # succeeded — exactly the right outcome for "fix already in baseline".
 if printf '%s' "$PUSHPR_TEST_OUT" | grep -q '"no_op": true\|"no_op":true'; then
-    pass "#3614 T64A — handler emits {\"no_op\": true} envelope on post-rebase empty-diff"
+    pass "#3614 T3614A — handler emits {\"no_op\": true} envelope on post-rebase empty-diff"
 else
-    fail "#3614 T64A — handler emits {\"no_op\": true} envelope on post-rebase empty-diff" \
+    fail "#3614 T3614A — handler emits {\"no_op\": true} envelope on post-rebase empty-diff" \
          "output: $PUSHPR_TEST_OUT"
 fi
 
@@ -7066,9 +7066,9 @@ fi
 # handled by #3465). Here the rebase SUCCEEDED; the diff is empty
 # because the patches were already in main, not because rebase failed.
 if ! printf '%s' "$PUSHPR_TEST_OUT" | grep -q '"rebase_failed": true\|"rebase_failed":true'; then
-    pass "#3614 T64A — does NOT emit rebase_failed envelope on post-rebase empty-diff"
+    pass "#3614 T3614A — does NOT emit rebase_failed envelope on post-rebase empty-diff"
 else
-    fail "#3614 T64A — does NOT emit rebase_failed envelope on post-rebase empty-diff" \
+    fail "#3614 T3614A — does NOT emit rebase_failed envelope on post-rebase empty-diff" \
          "output: $PUSHPR_TEST_OUT"
 fi
 
@@ -7081,45 +7081,45 @@ fi
 if [[ -f "$PUSHPR_TEST_STATE/git-log.txt" ]]; then
     _rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$PUSHPR_TEST_STATE/git-log.txt" || printf '0')
     if [[ "$_rev_list_calls" == "2" ]]; then
-        pass "#3614 T64A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)"
+        pass "#3614 T3614A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)"
     else
-        fail "#3614 T64A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)" \
+        fail "#3614 T3614A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)" \
              "found $_rev_list_calls call(s); git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt")"
     fi
 fi
 
 # ── Sub-test B: happy path regression — rebase preserves agent's commits ──
 
-run_push_pr_test "t64b" T64_REV_LIST_PRE=1 T64_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+run_push_pr_test "t3614b" T3614_REV_LIST_PRE=1 T3614_REV_LIST_POST=1 GIT_REBASE_EXIT=0
 
 if [[ "$PUSHPR_TEST_RC" -eq 0 ]]; then
-    pass "#3614 T64B — handle_push_and_pr exits 0 on happy path"
+    pass "#3614 T3614B — handle_push_and_pr exits 0 on happy path"
 else
-    fail "#3614 T64B — handle_push_and_pr exits 0 on happy path" \
+    fail "#3614 T3614B — handle_push_and_pr exits 0 on happy path" \
          "rc=$PUSHPR_TEST_RC, output: $PUSHPR_TEST_OUT"
 fi
 
 # Happy path MUST invoke git push.
 if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3614 T64B — git push -u origin invoked on happy path"
+    pass "#3614 T3614B — git push -u origin invoked on happy path"
 else
-    fail "#3614 T64B — git push -u origin invoked on happy path" \
+    fail "#3614 T3614B — git push -u origin invoked on happy path" \
          "git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # Happy path MUST invoke gh pr create.
 if grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null; then
-    pass "#3614 T64B — gh pr create invoked on happy path"
+    pass "#3614 T3614B — gh pr create invoked on happy path"
 else
-    fail "#3614 T64B — gh pr create invoked on happy path" \
+    fail "#3614 T3614B — gh pr create invoked on happy path" \
          "gh-log: $(cat "$PUSHPR_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
 # Happy path MUST NOT emit the new already-applied event.
 if ! printf '%s' "$PUSHPR_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied"; then
-    pass "#3614 T64B — push_and_pr_no_unmerged_files_already_applied NOT emitted on happy path"
+    pass "#3614 T3614B — push_and_pr_no_unmerged_files_already_applied NOT emitted on happy path"
 else
-    fail "#3614 T64B — push_and_pr_no_unmerged_files_already_applied NOT emitted on happy path" \
+    fail "#3614 T3614B — push_and_pr_no_unmerged_files_already_applied NOT emitted on happy path" \
          "output: $PUSHPR_TEST_OUT"
 fi
 
@@ -7127,16 +7127,16 @@ fi
 # real changes; transition_from_push_and_pr should advance to awaiting_ci,
 # not terminal as no_op succeeded.
 if ! printf '%s' "$PUSHPR_TEST_OUT" | grep -q '"no_op": true\|"no_op":true'; then
-    pass "#3614 T64B — happy-path envelope is NOT {\"no_op\": true}"
+    pass "#3614 T3614B — happy-path envelope is NOT {\"no_op\": true}"
 else
-    fail "#3614 T64B — happy-path envelope is NOT {\"no_op\": true}" \
+    fail "#3614 T3614B — happy-path envelope is NOT {\"no_op\": true}" \
          "output: $PUSHPR_TEST_OUT"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T65: #3651 — handle_ralph_baseline_rebase empty-rebase after abort.
+# Test T_issue3651: #3651 — handle_ralph_baseline_rebase empty-rebase after abort.
 #
-# Direct sibling of #3614/PR #3645 (T64), which fixed the same bug class
+# Direct sibling of #3614/PR #3645 (T3614), which fixed the same bug class
 # for ``handle_push_and_pr``. Same fix shape, different code site:
 #
 # The bug: when the start-of-ralph baseline rebase fails AND the conflict-
@@ -7179,7 +7179,7 @@ fi
 # new ``{"no_op": true, ...}`` envelope, mocking transition_for to
 # return ``advance_with_status\tno_op\tsucceeded\t``. Assert
 # advance_phase is called with ("no_op", "succeeded") AND
-# agent_runner_reaped_failure is NOT called. Mirrors T63A's dispatch-
+# agent_runner_reaped_failure is NOT called. Mirrors T3573A's dispatch-
 # path test for the route_to_diagnoser case but exercises the new
 # advance_with_status branch.
 # ══════════════════════════════════════════════════════════════════════════
@@ -7187,11 +7187,11 @@ fi
 # Extract the #3651 envelope-construction block from the entrypoint via
 # awk. Boundary: from ``_ralph_baseline_output=""`` (a marker line added
 # in #3651) to the matching outer ``fi``. Walks ``if [[`` openings and
-# ``fi`` closings to get the nesting right. This matches T64's "extract
+# ``fi`` closings to get the nesting right. This matches T3614's "extract
 # the actual production code path" approach, adapted for an inline block
 # (not a function — handle_ralph_baseline_rebase doesn't exist as a
 # function in the entrypoint, see issue body).
-t65_block="$TEST_TMP/t65-envelope-block.sh"
+t3651_block="$TEST_TMP/t3651-envelope-block.sh"
 awk '
   /_ralph_baseline_output=""/ { in_block=1; depth=0 }
   in_block {
@@ -7202,30 +7202,30 @@ awk '
       if (depth == 0) exit
     }
   }
-' "$ENTRYPOINT" > "$t65_block"
+' "$ENTRYPOINT" > "$t3651_block"
 
-if grep -q "ralph_baseline_no_unmerged_files_already_applied" "$t65_block"; then
-    pass "#3651 T65 setup — extracted envelope block contains the new log event marker"
+if grep -q "ralph_baseline_no_unmerged_files_already_applied" "$t3651_block"; then
+    pass "#3651 T3651 setup — extracted envelope block contains the new log event marker"
 else
-    fail "#3651 T65 setup — extracted envelope block contains the new log event marker" \
-         "block (head 800): $(head -c 800 "$t65_block")"
+    fail "#3651 T3651 setup — extracted envelope block contains the new log event marker" \
+         "block (head 800): $(head -c 800 "$t3651_block")"
 fi
 
-if grep -qE 'rev-list[[:space:]]+--count[[:space:]]+origin/main\.\.HEAD' "$t65_block"; then
-    pass "#3651 T65 setup — extracted envelope block contains the post-abort rev-list check"
+if grep -qE 'rev-list[[:space:]]+--count[[:space:]]+origin/main\.\.HEAD' "$t3651_block"; then
+    pass "#3651 T3651 setup — extracted envelope block contains the post-abort rev-list check"
 else
-    fail "#3651 T65 setup — extracted envelope block contains the post-abort rev-list check" \
-         "block (head 800): $(head -c 800 "$t65_block")"
+    fail "#3651 T3651 setup — extracted envelope block contains the post-abort rev-list check" \
+         "block (head 800): $(head -c 800 "$t3651_block")"
 fi
 
 # Per-test runner. Stubs ``git`` (only ``rev-list`` matters — the abort
 # already happened upstream of this block) and ``log`` (captured into a
 # state file). Parameters control:
-#   T65_CONFLICT_FILES_JSON  — value of ``_baseline_conflict_files_json``
+#   T3651_CONFLICT_FILES_JSON  — value of ``_baseline_conflict_files_json``
 #                              ("[]" for empty, or a JSON array for real).
-#   T65_REV_LIST_AHEAD       — count returned by ``git rev-list``
+#   T3651_REV_LIST_AHEAD       — count returned by ``git rev-list``
 #                              (default 0 = collapsed to baseline).
-run_t65_envelope_test() {
+run_t3651_envelope_test() {
     _test_id="$1"
     shift
 
@@ -7236,7 +7236,7 @@ run_t65_envelope_test() {
     mkdir -p "$_twork" "$_trepo" "$_tstate" "$_tbin"
 
     # git stub — only rev-list matters here. Logs every call.
-    cat > "$_tbin/git" <<'T65GITEOF'
+    cat > "$_tbin/git" <<'T3651GITEOF'
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
@@ -7246,10 +7246,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${1:-}" in
-    rev-list) printf '%s\n' "${T65_REV_LIST_AHEAD:-0}"; exit 0 ;;
+    rev-list) printf '%s\n' "${T3651_REV_LIST_AHEAD:-0}"; exit 0 ;;
     *) exit 0 ;;
 esac
-T65GITEOF
+T3651GITEOF
     chmod +x "$_tbin/git"
 
     if command -v jq >/dev/null 2>&1; then
@@ -7263,7 +7263,7 @@ T65GITEOF
         PATH="$_tbin:$PATH" \
         AGENT_WORKSPACE="$_twork" \
         REPO_ROOT="$_trepo" \
-        AGENT_ID="t65-dead-beef-cafe-000000000099" \
+        AGENT_ID="t3651-dead-beef-cafe-000000000099" \
         ISSUE_NUMBER="3651" \
         "$@" \
         bash -c '
@@ -7272,12 +7272,12 @@ T65GITEOF
             # a test-shim that mirrors to stdout so assertions can
             # grep the captured output.
             log() { printf "%s\n" "LOG $*"; }
-            _baseline_conflict_files_json="${T65_CONFLICT_FILES_JSON:-[]}"
+            _baseline_conflict_files_json="${T3651_CONFLICT_FILES_JSON:-[]}"
             _baseline_rebase_stderr_tail='\''""'\''
             # Now source the extracted envelope block. It assigns
             # ``_ralph_baseline_output`` based on the inputs above.
             # shellcheck disable=SC1090
-            . "'"$t65_block"'"
+            . "'"$t3651_block"'"
             # Echo the resulting envelope so the test harness can
             # inspect it.
             printf "ENVELOPE %s\n" "$_ralph_baseline_output"
@@ -7285,36 +7285,36 @@ T65GITEOF
     _trc=$?
     set -e
 
-    T65_TEST_RC="$_trc"
-    T65_TEST_OUT="$_tout"
-    T65_TEST_STATE="$_tstate"
+    T3651_TEST_RC="$_trc"
+    T3651_TEST_OUT="$_tout"
+    T3651_TEST_STATE="$_tstate"
 }
 
 # ── Sub-test A: empty conflict files + post-abort ahead=0 → no_op ─────────
 
-run_t65_envelope_test "t65a" T65_CONFLICT_FILES_JSON="[]" T65_REV_LIST_AHEAD=0
+run_t3651_envelope_test "t3651a" T3651_CONFLICT_FILES_JSON="[]" T3651_REV_LIST_AHEAD=0
 
-if [[ "$T65_TEST_RC" -eq 0 ]]; then
-    pass "#3651 T65A — envelope block exits 0 on empty conflict files + ahead=0"
+if [[ "$T3651_TEST_RC" -eq 0 ]]; then
+    pass "#3651 T3651A — envelope block exits 0 on empty conflict files + ahead=0"
 else
-    fail "#3651 T65A — envelope block exits 0 on empty conflict files + ahead=0" \
-         "rc=$T65_TEST_RC, output: $T65_TEST_OUT"
+    fail "#3651 T3651A — envelope block exits 0 on empty conflict files + ahead=0" \
+         "rc=$T3651_TEST_RC, output: $T3651_TEST_OUT"
 fi
 
 # CRITICAL — new log event must be emitted.
-if printf '%s' "$T65_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
-    pass "#3651 T65A — ralph_baseline_no_unmerged_files_already_applied log event emitted"
+if printf '%s' "$T3651_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3651 T3651A — ralph_baseline_no_unmerged_files_already_applied log event emitted"
 else
-    fail "#3651 T65A — ralph_baseline_no_unmerged_files_already_applied log event emitted" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651A — ralph_baseline_no_unmerged_files_already_applied log event emitted" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # CRITICAL — envelope must be {"no_op": true, ...}.
-if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
-    pass "#3651 T65A — envelope is {\"no_op\": true, ...} on already-applied path"
+if printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3651 T3651A — envelope is {\"no_op\": true, ...} on already-applied path"
 else
-    fail "#3651 T65A — envelope is {\"no_op\": true, ...} on already-applied path" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651A — envelope is {\"no_op\": true, ...} on already-applied path" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # CRITICAL — envelope must NOT carry rebase_failed=true. The pre-#3651
@@ -7322,67 +7322,67 @@ fi
 # which transition_from_ralph routed to the diagnoser as a terminal-
 # failure. The new path emits ``{"no_op": true, ...}`` which routes to
 # PHASE_NO_OP terminal succeeded. These envelopes are mutually exclusive.
-if ! printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
-    pass "#3651 T65A — envelope does NOT carry rebase_failed=true on already-applied path"
+if ! printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
+    pass "#3651 T3651A — envelope does NOT carry rebase_failed=true on already-applied path"
 else
-    fail "#3651 T65A — envelope does NOT carry rebase_failed=true on already-applied path" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651A — envelope does NOT carry rebase_failed=true on already-applied path" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # CRITICAL — git rev-list must have been invoked exactly once
 # (the new post-abort ahead-count check). Pre-#3651 the rev-list call
 # didn't exist on this code path at all; this assertion is the
 # behavioural fingerprint of the fix.
-if grep -cE "CALL .*\\brev-list\\b" "$T65_TEST_STATE/git-log.txt" 2>/dev/null | grep -q "^1$"; then
-    pass "#3651 T65A — git rev-list invoked exactly once (post-abort check)"
+if grep -cE "CALL .*\\brev-list\\b" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null | grep -q "^1$"; then
+    pass "#3651 T3651A — git rev-list invoked exactly once (post-abort check)"
 else
-    _t65a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T65_TEST_STATE/git-log.txt" 2>/dev/null || printf '0')
-    fail "#3651 T65A — git rev-list invoked exactly once (post-abort check)" \
-         "found $_t65a_rev_list_calls call(s); git-log: $(cat "$T65_TEST_STATE/git-log.txt" 2>/dev/null)"
+    _t3651a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null || printf '0')
+    fail "#3651 T3651A — git rev-list invoked exactly once (post-abort check)" \
+         "found $_t3651a_rev_list_calls call(s); git-log: $(cat "$T3651_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # ── Sub-test B: non-empty conflict files → fix_conflict envelope (regression) ──
 
-run_t65_envelope_test "t65b" T65_CONFLICT_FILES_JSON='["packages/api/foo.py"]' T65_REV_LIST_AHEAD=1
+run_t3651_envelope_test "t3651b" T3651_CONFLICT_FILES_JSON='["packages/api/foo.py"]' T3651_REV_LIST_AHEAD=1
 
-if [[ "$T65_TEST_RC" -eq 0 ]]; then
-    pass "#3651 T65B — envelope block exits 0 on real-conflict path"
+if [[ "$T3651_TEST_RC" -eq 0 ]]; then
+    pass "#3651 T3651B — envelope block exits 0 on real-conflict path"
 else
-    fail "#3651 T65B — envelope block exits 0 on real-conflict path" \
-         "rc=$T65_TEST_RC, output: $T65_TEST_OUT"
+    fail "#3651 T3651B — envelope block exits 0 on real-conflict path" \
+         "rc=$T3651_TEST_RC, output: $T3651_TEST_OUT"
 fi
 
 # Real conflict envelope must carry conflict_files (route to fix_conflict).
-if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"conflict_files": \[.*"packages/api/foo\.py".*\]'; then
-    pass "#3651 T65B — real-conflict envelope carries conflict_files (routes to fix_conflict)"
+if printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"conflict_files": \[.*"packages/api/foo\.py".*\]'; then
+    pass "#3651 T3651B — real-conflict envelope carries conflict_files (routes to fix_conflict)"
 else
-    fail "#3651 T65B — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651B — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # Real conflict envelope must NOT be no_op.
-if ! printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
-    pass "#3651 T65B — real-conflict envelope is NOT {\"no_op\": true}"
+if ! printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3651 T3651B — real-conflict envelope is NOT {\"no_op\": true}"
 else
-    fail "#3651 T65B — real-conflict envelope is NOT {\"no_op\": true}" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651B — real-conflict envelope is NOT {\"no_op\": true}" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # Real conflict path must NOT emit the new already-applied log event.
-if ! printf '%s' "$T65_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
-    pass "#3651 T65B — already-applied log NOT emitted on real-conflict path"
+if ! printf '%s' "$T3651_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3651 T3651B — already-applied log NOT emitted on real-conflict path"
 else
-    fail "#3651 T65B — already-applied log NOT emitted on real-conflict path" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651B — already-applied log NOT emitted on real-conflict path" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # Real conflict path must NOT call rev-list (the post-abort check is
 # only reached when conflict_files_json is empty).
-if ! grep -qE "CALL .*\\brev-list\\b" "$T65_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3651 T65B — git rev-list NOT invoked on real-conflict path"
+if ! grep -qE "CALL .*\\brev-list\\b" "$T3651_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3651 T3651B — git rev-list NOT invoked on real-conflict path"
 else
-    fail "#3651 T65B — git rev-list NOT invoked on real-conflict path" \
-         "git-log: $(cat "$T65_TEST_STATE/git-log.txt" 2>/dev/null)"
+    fail "#3651 T3651B — git rev-list NOT invoked on real-conflict path" \
+         "git-log: $(cat "$T3651_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # ── Sub-test C: empty conflict files but post-abort ahead=1 → diagnoser (regression) ──
@@ -7393,60 +7393,60 @@ fi
 # #3465 route_to_diagnoser path — only ahead=0 triggers the new no_op
 # terminal.
 
-run_t65_envelope_test "t65c" T65_CONFLICT_FILES_JSON="[]" T65_REV_LIST_AHEAD=1
+run_t3651_envelope_test "t3651c" T3651_CONFLICT_FILES_JSON="[]" T3651_REV_LIST_AHEAD=1
 
-if [[ "$T65_TEST_RC" -eq 0 ]]; then
-    pass "#3651 T65C — envelope block exits 0 on empty-conflicts + still-ahead path"
+if [[ "$T3651_TEST_RC" -eq 0 ]]; then
+    pass "#3651 T3651C — envelope block exits 0 on empty-conflicts + still-ahead path"
 else
-    fail "#3651 T65C — envelope block exits 0 on empty-conflicts + still-ahead path" \
-         "rc=$T65_TEST_RC, output: $T65_TEST_OUT"
+    fail "#3651 T3651C — envelope block exits 0 on empty-conflicts + still-ahead path" \
+         "rc=$T3651_TEST_RC, output: $T3651_TEST_OUT"
 fi
 
 # Still-ahead path must emit the OLD rebase_failed/no_unmerged_files
 # envelope (route_to_diagnoser via #3465).
-if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
-    pass "#3651 T65C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)"
+if printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"rebase_failed": true'; then
+    pass "#3651 T3651C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)"
 else
-    fail "#3651 T65C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)" \
+         "output: $T3651_TEST_OUT"
 fi
 
-if printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_unmerged_files": true'; then
-    pass "#3651 T65C — still-ahead envelope carries no_unmerged_files=true"
+if printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"no_unmerged_files": true'; then
+    pass "#3651 T3651C — still-ahead envelope carries no_unmerged_files=true"
 else
-    fail "#3651 T65C — still-ahead envelope carries no_unmerged_files=true" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651C — still-ahead envelope carries no_unmerged_files=true" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # Still-ahead path must NOT emit the new already-applied event.
-if ! printf '%s' "$T65_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
-    pass "#3651 T65C — already-applied log NOT emitted on still-ahead path"
+if ! printf '%s' "$T3651_TEST_OUT" | grep -q "ralph_baseline_no_unmerged_files_already_applied"; then
+    pass "#3651 T3651C — already-applied log NOT emitted on still-ahead path"
 else
-    fail "#3651 T65C — already-applied log NOT emitted on still-ahead path" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651C — already-applied log NOT emitted on still-ahead path" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # Still-ahead path must NOT be a no_op envelope.
-if ! printf '%s' "$T65_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
-    pass "#3651 T65C — still-ahead envelope is NOT {\"no_op\": true}"
+if ! printf '%s' "$T3651_TEST_OUT" | grep -qE 'ENVELOPE .*"no_op": true'; then
+    pass "#3651 T3651C — still-ahead envelope is NOT {\"no_op\": true}"
 else
-    fail "#3651 T65C — still-ahead envelope is NOT {\"no_op\": true}" \
-         "output: $T65_TEST_OUT"
+    fail "#3651 T3651C — still-ahead envelope is NOT {\"no_op\": true}" \
+         "output: $T3651_TEST_OUT"
 fi
 
 # ── Sub-test D: dispatch with no_op envelope → advance_phase no_op succeeded ──
 #
 # The envelope-construction tests above (A/B/C) cover the entrypoint
 # side of the fix. This sub-test covers the dispatch case statement
-# (mirrors T63A's structure) for the new path: when transition_for
+# (mirrors T3573A's structure) for the new path: when transition_for
 # returns advance_with_status\tno_op\tsucceeded\t, the dispatch must
 # call advance_phase("no_op", "succeeded") and NOT call
 # agent_runner_reaped_failure.
 
-t65d_state_dir="$TEST_TMP/t65d-state"
-mkdir -p "$t65d_state_dir"
+t3651d_state_dir="$TEST_TMP/t3651d-state"
+mkdir -p "$t3651d_state_dir"
 
-_t65d_transition_for_override="
+_t3651d_transition_for_override="
 transition_for() {
     if [[ \"\${1:-}\" == 'ralph' ]]; then
         printf 'advance_with_status\tno_op\tsucceeded\t'
@@ -7454,39 +7454,39 @@ transition_for() {
 }
 "
 
-_t65d_advance_phase_override="
+_t3651d_advance_phase_override="
 advance_phase() {
-    printf 'ADVANCE_PHASE %s status=%s\n' \"\${1:-}\" \"\${2:-}\" >> \"\${T65D_STATE_DIR}/advance-log.txt\"
+    printf 'ADVANCE_PHASE %s status=%s\n' \"\${1:-}\" \"\${2:-}\" >> \"\${T3651D_STATE_DIR}/advance-log.txt\"
 }
 "
 
-_t65d_reaped_failure_override="
+_t3651d_reaped_failure_override="
 agent_runner_reaped_failure() {
-    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T65D_STATE_DIR}/reaped-log.txt\"
+    printf 'REAPED_FAILURE %s\n' \"\${1:-}\" >> \"\${T3651D_STATE_DIR}/reaped-log.txt\"
 }
 "
 
-# Reuse the t63 stub_bin (psql / git / gh stubs are sufficient for
+# Reuse the t3573 stub_bin (psql / git / gh stubs are sufficient for
 # advance_phase + log; we override transition_for / advance_phase /
 # agent_runner_reaped_failure inline).
-t65d_workspace="$TEST_TMP/t65d-workspace"
-t65d_repo_root="$TEST_TMP/t65d-repo"
-mkdir -p "$t65d_workspace" "$t65d_repo_root/tmp/dispatcher-input" "$t65d_repo_root/tmp/dispatcher-output"
+t3651d_workspace="$TEST_TMP/t3651d-workspace"
+t3651d_repo_root="$TEST_TMP/t3651d-repo"
+mkdir -p "$t3651d_workspace" "$t3651d_repo_root/tmp/dispatcher-input" "$t3651d_repo_root/tmp/dispatcher-output"
 
-t65d_out=$(
+t3651d_out=$(
     set +eu
-    export T65D_STATE_DIR="$t65d_state_dir"
-    export AGENT_WORKSPACE="$t65d_workspace"
-    export REPO_ROOT="$t65d_repo_root"
+    export T3651D_STATE_DIR="$t3651d_state_dir"
+    export AGENT_WORKSPACE="$t3651d_workspace"
+    export REPO_ROOT="$t3651d_repo_root"
     export AGENT_ID="65656565-dead-beef-cafe-000000000001"
     export ISSUE_NUMBER="3651"
     export DATABASE_URL="postgresql://stub"
     export AGENT_RUNNER_DRY_RUN="0"
-    export PATH="$t63_stub_bin:$PATH"
+    export PATH="$t3573_stub_bin:$PATH"
     source "$t58_funcs"
-    eval "$_t65d_transition_for_override"
-    eval "$_t65d_advance_phase_override"
-    eval "$_t65d_reaped_failure_override"
+    eval "$_t3651d_transition_for_override"
+    eval "$_t3651d_advance_phase_override"
+    eval "$_t3651d_reaped_failure_override"
     # Drive the ralph_baseline rebase dispatch logic directly with the
     # new no_op envelope (matches the entrypoint dispatch case statement).
     _ralph_baseline_output='{"no_op": true, "rebase_dropped_all_commits": true, "post_abort_ahead": 0, "rebase_stderr_tail": "", "source_phase": "ralph"}'
@@ -7533,63 +7533,63 @@ t65d_out=$(
     2>&1
 ) 2>&1
 
-# T65D (1): subshell completed.
-if printf '%s' "$t65d_out" | grep -q "subshell_done"; then
-    pass "#3651 T65D [ralph_baseline no_op dispatch] — dispatch subshell ran to completion"
+# T3651D (1): subshell completed.
+if printf '%s' "$t3651d_out" | grep -q "subshell_done"; then
+    pass "#3651 T3651D [ralph_baseline no_op dispatch] — dispatch subshell ran to completion"
 else
-    fail "#3651 T65D [ralph_baseline no_op dispatch] — dispatch subshell ran to completion" \
-         "out tail: $(printf '%s' "$t65d_out" | tail -c 600)"
+    fail "#3651 T3651D [ralph_baseline no_op dispatch] — dispatch subshell ran to completion" \
+         "out tail: $(printf '%s' "$t3651d_out" | tail -c 600)"
 fi
 
-# T65D (2): advance_phase called with ("no_op", "succeeded").
-if [[ -f "$t65d_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE no_op status=succeeded" "$t65d_state_dir/advance-log.txt"; then
-    pass "#3651 T65D [ralph_baseline no_op dispatch] — advance_phase called with (no_op, succeeded)"
+# T3651D (2): advance_phase called with ("no_op", "succeeded").
+if [[ -f "$t3651d_state_dir/advance-log.txt" ]] && grep -q "ADVANCE_PHASE no_op status=succeeded" "$t3651d_state_dir/advance-log.txt"; then
+    pass "#3651 T3651D [ralph_baseline no_op dispatch] — advance_phase called with (no_op, succeeded)"
 else
-    fail "#3651 T65D [ralph_baseline no_op dispatch] — advance_phase called with (no_op, succeeded)" \
-         "advance-log: $(cat "$t65d_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
+    fail "#3651 T3651D [ralph_baseline no_op dispatch] — advance_phase called with (no_op, succeeded)" \
+         "advance-log: $(cat "$t3651d_state_dir/advance-log.txt" 2>/dev/null || echo '(missing)')"
 fi
 
-# T65D (3): agent_runner_reaped_failure NOT called (this is the key
+# T3651D (3): agent_runner_reaped_failure NOT called (this is the key
 # behavioural distinction from the unfixed code, which terminal-failed
 # the agent as push_and_pr_no_unmerged_files).
-if [[ ! -f "$t65d_state_dir/reaped-log.txt" ]] || ! grep -q "REAPED_FAILURE" "$t65d_state_dir/reaped-log.txt"; then
-    pass "#3651 T65D [ralph_baseline no_op dispatch] — agent_runner_reaped_failure NOT called"
+if [[ ! -f "$t3651d_state_dir/reaped-log.txt" ]] || ! grep -q "REAPED_FAILURE" "$t3651d_state_dir/reaped-log.txt"; then
+    pass "#3651 T3651D [ralph_baseline no_op dispatch] — agent_runner_reaped_failure NOT called"
 else
-    fail "#3651 T65D [ralph_baseline no_op dispatch] — agent_runner_reaped_failure NOT called" \
-         "reaped-log: $(cat "$t65d_state_dir/reaped-log.txt" 2>/dev/null)"
+    fail "#3651 T3651D [ralph_baseline no_op dispatch] — agent_runner_reaped_failure NOT called" \
+         "reaped-log: $(cat "$t3651d_state_dir/reaped-log.txt" 2>/dev/null)"
 fi
 
-# T65D (4): ralph_baseline_route_to_diagnoser NOT emitted (the old
+# T3651D (4): ralph_baseline_route_to_diagnoser NOT emitted (the old
 # terminal-fail log line — this is the bug signature from the issue
 # trace, agent d511b0e8 at 20:59:33Z).
-if ! printf '%s' "$t65d_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
-    pass "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_route_to_diagnoser NOT emitted"
+if ! printf '%s' "$t3651d_out" | grep -q "ralph_baseline_route_to_diagnoser"; then
+    pass "#3651 T3651D [ralph_baseline no_op dispatch] — ralph_baseline_route_to_diagnoser NOT emitted"
 else
-    fail "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_route_to_diagnoser NOT emitted" \
-         "out: $(printf '%s' "$t65d_out" | grep "ralph_baseline_route_to_diagnoser")"
+    fail "#3651 T3651D [ralph_baseline no_op dispatch] — ralph_baseline_route_to_diagnoser NOT emitted" \
+         "out: $(printf '%s' "$t3651d_out" | grep "ralph_baseline_route_to_diagnoser")"
 fi
 
-# T65D (5): ralph_baseline_transition_unrecognized NOT emitted (the
+# T3651D (5): ralph_baseline_transition_unrecognized NOT emitted (the
 # default-case fallthrough — must NOT fire on advance_with_status).
-if ! printf '%s' "$t65d_out" | grep -q "ralph_baseline_transition_unrecognized"; then
-    pass "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_transition_unrecognized NOT emitted"
+if ! printf '%s' "$t3651d_out" | grep -q "ralph_baseline_transition_unrecognized"; then
+    pass "#3651 T3651D [ralph_baseline no_op dispatch] — ralph_baseline_transition_unrecognized NOT emitted"
 else
-    fail "#3651 T65D [ralph_baseline no_op dispatch] — ralph_baseline_transition_unrecognized NOT emitted" \
-         "out: $(printf '%s' "$t65d_out" | grep "ralph_baseline_transition_unrecognized")"
+    fail "#3651 T3651D [ralph_baseline no_op dispatch] — ralph_baseline_transition_unrecognized NOT emitted" \
+         "out: $(printf '%s' "$t3651d_out" | grep "ralph_baseline_transition_unrecognized")"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# Test T66: #3662 — handle_push_and_pr post-fix_conflict re-rebase exit 128
+# Test T_issue3662: #3662 — handle_push_and_pr post-fix_conflict re-rebase exit 128
 # with empty conflict files AND post-abort ahead-count 0.
 #
-# Direct sibling of #3651/PR #3657 (T65) and #3614/PR #3645 (T64). Same bug
+# Direct sibling of #3651/PR #3657 (T3651) and #3614/PR #3645 (T3614). Same bug
 # class, third sibling code site:
 #
-# T64 (#3614) fixed: handle_push_and_pr rebase exits 0 + drops all commits
+# T3614 (#3614) fixed: handle_push_and_pr rebase exits 0 + drops all commits
 #                    (post-rebase ahead-count 0).
-# T65 (#3651) fixed: handle_ralph_baseline_rebase rebase exits non-zero +
+# T3651 (#3651) fixed: handle_ralph_baseline_rebase rebase exits non-zero +
 #                    empty conflict files + post-abort ahead-count 0.
-# T66 (#3662) fixes: handle_push_and_pr rebase exits non-zero + empty
+# T3662 (#3662) fixes: handle_push_and_pr rebase exits non-zero + empty
 #                    conflict files + post-abort ahead-count 0.
 #
 # This third sibling fires when a fix_conflict skill resolves real conflicts
@@ -7633,31 +7633,31 @@ fi
 # path). Don't regress the non-already-applied diagnoser route.
 # ══════════════════════════════════════════════════════════════════════════
 
-# Reuse T64's extracted handle_push_and_pr fixture ($t64_funcs) — same
-# function under test, different code path within it. The T64 test
+# Reuse T3614's extracted handle_push_and_pr fixture ($t3614_funcs) — same
+# function under test, different code path within it. The T3614 test
 # established that the extraction works; this test exercises a different
 # branch of the same function.
-if [[ -s "$t64_funcs" ]] && grep -q "^handle_push_and_pr()" "$t64_funcs"; then
-    pass "#3662 T66 setup — handle_push_and_pr fixture (from T64) is available"
+if [[ -s "$t3614_funcs" ]] && grep -q "^handle_push_and_pr()" "$t3614_funcs"; then
+    pass "#3662 T3662 setup — handle_push_and_pr fixture (from T3614) is available"
 else
-    fail "#3662 T66 setup — handle_push_and_pr fixture (from T64) is available" \
-         "fixture missing or empty: $t64_funcs"
+    fail "#3662 T3662 setup — handle_push_and_pr fixture (from T3614) is available" \
+         "fixture missing or empty: $t3614_funcs"
 fi
 
 # Per-test runner. Drives handle_push_and_pr into the rebase-rc=128
 # empty-conflicts path. Stub control via env vars:
-#   T66_REV_LIST_PRE   — count returned for the FIRST rev-list call
+#   T3662_REV_LIST_PRE   — count returned for the FIRST rev-list call
 #                        (pre-rebase #3039 guardrail). Default 1.
-#   T66_REV_LIST_POST  — count for the SECOND rev-list call (the new
+#   T3662_REV_LIST_POST  — count for the SECOND rev-list call (the new
 #                        #3662 post-abort ahead check). Default 0
 #                        (commits already in baseline).
-#   T66_DIFF_FILES     — content for ``git diff --name-only --diff-
+#   T3662_DIFF_FILES     — content for ``git diff --name-only --diff-
 #                        filter=U`` stdout. Default empty (no conflict
 #                        files). Set to file paths to simulate a real
 #                        conflict.
 #   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
 #                        Default 128 (the failure case under test).
-run_t66_push_pr_test() {
+run_t3662_push_pr_test() {
     _test_id="$1"
     shift
 
@@ -7672,19 +7672,19 @@ run_t66_push_pr_test() {
     printf '0\n' > "$_tstate/rev-list-call-count.txt"
 
     # Stage the diff-files stdout for the conflict-files capture step.
-    # T66_DIFF_FILES is passed as a KEY=VAL ``env`` arg in "$@" (mirrors
-    # T64's parameterisation pattern) so it isn't set as a regular bash
+    # T3662_DIFF_FILES is passed as a KEY=VAL ``env`` arg in "$@" (mirrors
+    # T3614's parameterisation pattern) so it isn't set as a regular bash
     # var here. Parse it out of the args explicitly so the file content
     # matches the env value the entrypoint will see.
-    _t66_diff_files=""
+    _t3662_diff_files=""
     for _a in "$@"; do
         case "$_a" in
-            T66_DIFF_FILES=*) _t66_diff_files="${_a#T66_DIFF_FILES=}" ;;
+            T3662_DIFF_FILES=*) _t3662_diff_files="${_a#T3662_DIFF_FILES=}" ;;
         esac
     done
-    printf '%s' "$_t66_diff_files" > "$_tstate/diff-files-output.txt"
+    printf '%s' "$_t3662_diff_files" > "$_tstate/diff-files-output.txt"
 
-    cat > "$_tbin/git" <<'T66GITEOF'
+    cat > "$_tbin/git" <<'T3662GITEOF'
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
@@ -7704,9 +7704,9 @@ case "$sub" in
         _next=$((_n + 1))
         printf '%s\n' "$_next" > "$_counter_file"
         if [[ "$_n" == "0" ]]; then
-            printf '%s\n' "${T66_REV_LIST_PRE:-1}"
+            printf '%s\n' "${T3662_REV_LIST_PRE:-1}"
         else
-            printf '%s\n' "${T66_REV_LIST_POST:-0}"
+            printf '%s\n' "${T3662_REV_LIST_POST:-0}"
         fi
         exit 0
         ;;
@@ -7744,20 +7744,20 @@ case "$sub" in
         exit 0
         ;;
 esac
-T66GITEOF
+T3662GITEOF
     chmod +x "$_tbin/git"
 
-    cat > "$_tbin/gh" <<'T66GHEOF'
+    cat > "$_tbin/gh" <<'T3662GHEOF'
 #!/usr/bin/env bash
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
 if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
     printf 'https://github.com/judgemind/judgemind/pull/9999\n'
 fi
 exit "${GH_EXIT:-0}"
-T66GHEOF
+T3662GHEOF
     chmod +x "$_tbin/gh"
 
-    cat > "$_tbin/psql" <<'T66PSQLEOF'
+    cat > "$_tbin/psql" <<'T3662PSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -7766,7 +7766,7 @@ while [[ $# -gt 0 ]]; do
 done
 printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
 exit 0
-T66PSQLEOF
+T3662PSQLEOF
     chmod +x "$_tbin/psql"
 
     if command -v jq >/dev/null 2>&1; then
@@ -7788,30 +7788,30 @@ T66PSQLEOF
         bash -c '
             set -uo pipefail
             # shellcheck disable=SC1090
-            . "'"$t64_funcs"'"
+            . "'"$t3614_funcs"'"
             handle_push_and_pr
         ' 2>&1)
     _trc=$?
     set -e
 
-    T66_TEST_RC="$_trc"
-    T66_TEST_OUT="$_tout"
-    T66_TEST_STATE="$_tstate"
+    T3662_TEST_RC="$_trc"
+    T3662_TEST_OUT="$_tout"
+    T3662_TEST_STATE="$_tstate"
 }
 
 # ── Sub-test A: rebase rc=128 + empty conflict files + post-abort ahead=0 ──
 #   Expect: no_op envelope, new log event, NO push, NO PR create.
 
-run_t66_push_pr_test "t66a" \
-    T66_REV_LIST_PRE=1 T66_REV_LIST_POST=0 \
-    T66_DIFF_FILES="" \
+run_t3662_push_pr_test "t3662a" \
+    T3662_REV_LIST_PRE=1 T3662_REV_LIST_POST=0 \
+    T3662_DIFF_FILES="" \
     GIT_REBASE_EXIT=128
 
-if [[ "$T66_TEST_RC" -eq 0 ]]; then
-    pass "#3662 T66A — handle_push_and_pr exits 0 on empty-conflicts post-rebase-failure already-applied"
+if [[ "$T3662_TEST_RC" -eq 0 ]]; then
+    pass "#3662 T3662A — handle_push_and_pr exits 0 on empty-conflicts post-rebase-failure already-applied"
 else
-    fail "#3662 T66A — handle_push_and_pr exits 0 on empty-conflicts post-rebase-failure already-applied" \
-         "rc=$T66_TEST_RC, output: $T66_TEST_OUT"
+    fail "#3662 T3662A — handle_push_and_pr exits 0 on empty-conflicts post-rebase-failure already-applied" \
+         "rc=$T3662_TEST_RC, output: $T3662_TEST_OUT"
 fi
 
 # CRITICAL — new log event must be emitted (the behavioural fingerprint
@@ -7819,19 +7819,19 @@ fi
 # (which is the rebase-rc=0 path from #3614) and from the terminal-fail
 # event push_and_pr_no_unmerged_files (the existing #3465 diagnoser path
 # that we explicitly do NOT take here).
-if printf '%s' "$T66_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
-    pass "#3662 T66A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted"
+if printf '%s' "$T3662_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3662 T3662A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted"
 else
-    fail "#3662 T66A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662A — push_and_pr_no_unmerged_files_already_applied_post_rebase_failure log emitted" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # CRITICAL — envelope must be {"no_op": true, ...}.
-if printf '%s' "$T66_TEST_OUT" | grep -qE '"no_op": true'; then
-    pass "#3662 T66A — envelope is {\"no_op\": true, ...} on already-applied path"
+if printf '%s' "$T3662_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3662 T3662A — envelope is {\"no_op\": true, ...} on already-applied path"
 else
-    fail "#3662 T66A — envelope is {\"no_op\": true, ...} on already-applied path" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662A — envelope is {\"no_op\": true, ...} on already-applied path" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # CRITICAL — envelope must NOT carry rebase_failed=true. Pre-#3662 the
@@ -7839,114 +7839,114 @@ fi
 # which transition_from_push_and_pr routed to the diagnoser as a
 # terminal-failure. The new path emits ``{"no_op": true, ...}`` which
 # routes to PHASE_NO_OP terminal succeeded. Mutually exclusive.
-if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"rebase_failed": true'; then
-    pass "#3662 T66A — envelope does NOT carry rebase_failed=true on already-applied path"
+if ! printf '%s' "$T3662_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3662 T3662A — envelope does NOT carry rebase_failed=true on already-applied path"
 else
-    fail "#3662 T66A — envelope does NOT carry rebase_failed=true on already-applied path" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662A — envelope does NOT carry rebase_failed=true on already-applied path" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # CRITICAL — envelope must NOT carry no_unmerged_files=true. Same
 # mutually-exclusive reason as above.
-if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
-    pass "#3662 T66A — envelope does NOT carry no_unmerged_files=true on already-applied path"
+if ! printf '%s' "$T3662_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
+    pass "#3662 T3662A — envelope does NOT carry no_unmerged_files=true on already-applied path"
 else
-    fail "#3662 T66A — envelope does NOT carry no_unmerged_files=true on already-applied path" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662A — envelope does NOT carry no_unmerged_files=true on already-applied path" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # CRITICAL — function must NOT have invoked ``git push``. The empty diff
 # means there's nothing to push; falling through to push would attempt
 # a push the daemon would then reap as push_and_pr_no_unmerged_files.
-if ! grep -qE "CALL .*\\bpush\\b" "$T66_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3662 T66A — git push NOT invoked on already-applied post-rebase-failure"
+if ! grep -qE "CALL .*\\bpush\\b" "$T3662_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3662 T3662A — git push NOT invoked on already-applied post-rebase-failure"
 else
-    fail "#3662 T66A — git push NOT invoked on already-applied post-rebase-failure" \
-         "git-log: $(cat "$T66_TEST_STATE/git-log.txt" 2>/dev/null)"
+    fail "#3662 T3662A — git push NOT invoked on already-applied post-rebase-failure" \
+         "git-log: $(cat "$T3662_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # CRITICAL — function must NOT have invoked ``gh pr create``. With no
 # diff there's no PR to open.
-if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T66_TEST_STATE/gh-log.txt" 2>/dev/null; then
-    pass "#3662 T66A — gh pr create NOT invoked on already-applied post-rebase-failure"
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T3662_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3662 T3662A — gh pr create NOT invoked on already-applied post-rebase-failure"
 else
-    fail "#3662 T66A — gh pr create NOT invoked on already-applied post-rebase-failure" \
-         "gh-log: $(cat "$T66_TEST_STATE/gh-log.txt" 2>/dev/null)"
+    fail "#3662 T3662A — gh pr create NOT invoked on already-applied post-rebase-failure" \
+         "gh-log: $(cat "$T3662_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
 # Two rev-list calls: pre-rebase #3039 guardrail + new #3662 post-abort
 # ahead-count check. Pre-#3662 there was only one rev-list call on this
 # code path (the pre-rebase guardrail) — the second call is the
 # behavioural fingerprint of the fix.
-if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
-    _t66a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T66_TEST_STATE/git-log.txt" || printf '0')
-    if [[ "$_t66a_rev_list_calls" == "2" ]]; then
-        pass "#3662 T66A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
+if [[ -f "$T3662_TEST_STATE/git-log.txt" ]]; then
+    _t3662a_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3662_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t3662a_rev_list_calls" == "2" ]]; then
+        pass "#3662 T3662A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
     else
-        fail "#3662 T66A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
-             "found $_t66a_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
+        fail "#3662 T3662A — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
+             "found $_t3662a_rev_list_calls call(s); git-log: $(cat "$T3662_TEST_STATE/git-log.txt")"
     fi
 fi
 
 # ── Sub-test B: rebase rc=128 + non-empty conflict files (real conflict) ──
 #   Expect: rebase_failed/conflict_files envelope (route to fix_conflict).
 
-run_t66_push_pr_test "t66b" \
-    T66_REV_LIST_PRE=1 T66_REV_LIST_POST=1 \
-    T66_DIFF_FILES="packages/api/foo.py
+run_t3662_push_pr_test "t3662b" \
+    T3662_REV_LIST_PRE=1 T3662_REV_LIST_POST=1 \
+    T3662_DIFF_FILES="packages/api/foo.py
 packages/scraper-framework/bar.py" \
     GIT_REBASE_EXIT=128
 
-if [[ "$T66_TEST_RC" -eq 0 ]]; then
-    pass "#3662 T66B — handle_push_and_pr exits 0 on real-conflict path"
+if [[ "$T3662_TEST_RC" -eq 0 ]]; then
+    pass "#3662 T3662B — handle_push_and_pr exits 0 on real-conflict path"
 else
-    fail "#3662 T66B — handle_push_and_pr exits 0 on real-conflict path" \
-         "rc=$T66_TEST_RC, output: $T66_TEST_OUT"
+    fail "#3662 T3662B — handle_push_and_pr exits 0 on real-conflict path" \
+         "rc=$T3662_TEST_RC, output: $T3662_TEST_OUT"
 fi
 
 # Real conflict envelope must carry conflict_files (routes to fix_conflict).
-if printf '%s' "$T66_TEST_OUT" | grep -qE '"conflict_files":[[:space:]]*\[.*"packages/api/foo\.py".*\]'; then
-    pass "#3662 T66B — real-conflict envelope carries conflict_files (routes to fix_conflict)"
+if printf '%s' "$T3662_TEST_OUT" | grep -qE '"conflict_files":[[:space:]]*\[.*"packages/api/foo\.py".*\]'; then
+    pass "#3662 T3662B — real-conflict envelope carries conflict_files (routes to fix_conflict)"
 else
-    fail "#3662 T66B — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662B — real-conflict envelope carries conflict_files (routes to fix_conflict)" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Real conflict envelope must carry rebase_failed=true (this is the
 # #3225 path — fix_conflict skill consumes the envelope).
-if printf '%s' "$T66_TEST_OUT" | grep -qE '"rebase_failed": true'; then
-    pass "#3662 T66B — real-conflict envelope carries rebase_failed=true"
+if printf '%s' "$T3662_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3662 T3662B — real-conflict envelope carries rebase_failed=true"
 else
-    fail "#3662 T66B — real-conflict envelope carries rebase_failed=true" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662B — real-conflict envelope carries rebase_failed=true" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Real conflict envelope must NOT be no_op.
-if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"no_op": true'; then
-    pass "#3662 T66B — real-conflict envelope is NOT {\"no_op\": true}"
+if ! printf '%s' "$T3662_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3662 T3662B — real-conflict envelope is NOT {\"no_op\": true}"
 else
-    fail "#3662 T66B — real-conflict envelope is NOT {\"no_op\": true}" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662B — real-conflict envelope is NOT {\"no_op\": true}" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Real conflict path must NOT emit the new already-applied log event.
-if ! printf '%s' "$T66_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
-    pass "#3662 T66B — already-applied-post-rebase-failure log NOT emitted on real-conflict path"
+if ! printf '%s' "$T3662_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3662 T3662B — already-applied-post-rebase-failure log NOT emitted on real-conflict path"
 else
-    fail "#3662 T66B — already-applied-post-rebase-failure log NOT emitted on real-conflict path" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662B — already-applied-post-rebase-failure log NOT emitted on real-conflict path" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Real conflict path must NOT call rev-list a second time (the post-abort
 # check is only reached when conflict_files_json is empty). Exactly one
 # call (the pre-rebase #3039 guardrail).
-if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
-    _t66b_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T66_TEST_STATE/git-log.txt" || printf '0')
-    if [[ "$_t66b_rev_list_calls" == "1" ]]; then
-        pass "#3662 T66B — git rev-list invoked exactly once (post-abort check skipped on real conflict)"
+if [[ -f "$T3662_TEST_STATE/git-log.txt" ]]; then
+    _t3662b_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3662_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t3662b_rev_list_calls" == "1" ]]; then
+        pass "#3662 T3662B — git rev-list invoked exactly once (post-abort check skipped on real conflict)"
     else
-        fail "#3662 T66B — git rev-list invoked exactly once (post-abort check skipped on real conflict)" \
-             "found $_t66b_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
+        fail "#3662 T3662B — git rev-list invoked exactly once (post-abort check skipped on real conflict)" \
+             "found $_t3662b_rev_list_calls call(s); git-log: $(cat "$T3662_TEST_STATE/git-log.txt")"
     fi
 fi
 
@@ -7954,80 +7954,80 @@ fi
 #   The rebase actually failed for a non-already-applied reason — must
 #   preserve the existing #3465 route_to_diagnoser path. Don't regress.
 
-run_t66_push_pr_test "t66c" \
-    T66_REV_LIST_PRE=1 T66_REV_LIST_POST=1 \
-    T66_DIFF_FILES="" \
+run_t3662_push_pr_test "t3662c" \
+    T3662_REV_LIST_PRE=1 T3662_REV_LIST_POST=1 \
+    T3662_DIFF_FILES="" \
     GIT_REBASE_EXIT=128
 
-if [[ "$T66_TEST_RC" -eq 0 ]]; then
-    pass "#3662 T66C — handle_push_and_pr exits 0 on empty-conflicts + still-ahead path"
+if [[ "$T3662_TEST_RC" -eq 0 ]]; then
+    pass "#3662 T3662C — handle_push_and_pr exits 0 on empty-conflicts + still-ahead path"
 else
-    fail "#3662 T66C — handle_push_and_pr exits 0 on empty-conflicts + still-ahead path" \
-         "rc=$T66_TEST_RC, output: $T66_TEST_OUT"
+    fail "#3662 T3662C — handle_push_and_pr exits 0 on empty-conflicts + still-ahead path" \
+         "rc=$T3662_TEST_RC, output: $T3662_TEST_OUT"
 fi
 
 # Still-ahead path must emit the OLD rebase_failed/no_unmerged_files
 # envelope (the existing #3465 route_to_diagnoser path).
-if printf '%s' "$T66_TEST_OUT" | grep -qE '"rebase_failed": true'; then
-    pass "#3662 T66C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)"
+if printf '%s' "$T3662_TEST_OUT" | grep -qE '"rebase_failed": true'; then
+    pass "#3662 T3662C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)"
 else
-    fail "#3662 T66C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662C — still-ahead envelope carries rebase_failed=true (#3465 path preserved)" \
+         "output: $T3662_TEST_OUT"
 fi
 
-if printf '%s' "$T66_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
-    pass "#3662 T66C — still-ahead envelope carries no_unmerged_files=true"
+if printf '%s' "$T3662_TEST_OUT" | grep -qE '"no_unmerged_files": true'; then
+    pass "#3662 T3662C — still-ahead envelope carries no_unmerged_files=true"
 else
-    fail "#3662 T66C — still-ahead envelope carries no_unmerged_files=true" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662C — still-ahead envelope carries no_unmerged_files=true" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Still-ahead path must NOT emit the new already-applied event.
-if ! printf '%s' "$T66_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
-    pass "#3662 T66C — already-applied-post-rebase-failure log NOT emitted on still-ahead path"
+if ! printf '%s' "$T3662_TEST_OUT" | grep -q "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure"; then
+    pass "#3662 T3662C — already-applied-post-rebase-failure log NOT emitted on still-ahead path"
 else
-    fail "#3662 T66C — already-applied-post-rebase-failure log NOT emitted on still-ahead path" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662C — already-applied-post-rebase-failure log NOT emitted on still-ahead path" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Still-ahead path must NOT be a no_op envelope.
-if ! printf '%s' "$T66_TEST_OUT" | grep -qE '"no_op": true'; then
-    pass "#3662 T66C — still-ahead envelope is NOT {\"no_op\": true}"
+if ! printf '%s' "$T3662_TEST_OUT" | grep -qE '"no_op": true'; then
+    pass "#3662 T3662C — still-ahead envelope is NOT {\"no_op\": true}"
 else
-    fail "#3662 T66C — still-ahead envelope is NOT {\"no_op\": true}" \
-         "output: $T66_TEST_OUT"
+    fail "#3662 T3662C — still-ahead envelope is NOT {\"no_op\": true}" \
+         "output: $T3662_TEST_OUT"
 fi
 
 # Still-ahead path must NOT invoke git push or gh pr create — the
 # entrypoint returns early after emitting the diagnoser-route envelope.
-if ! grep -qE "CALL .*\\bpush\\b" "$T66_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3662 T66C — git push NOT invoked on still-ahead diagnoser-route path"
+if ! grep -qE "CALL .*\\bpush\\b" "$T3662_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3662 T3662C — git push NOT invoked on still-ahead diagnoser-route path"
 else
-    fail "#3662 T66C — git push NOT invoked on still-ahead diagnoser-route path" \
-         "git-log: $(cat "$T66_TEST_STATE/git-log.txt" 2>/dev/null)"
+    fail "#3662 T3662C — git push NOT invoked on still-ahead diagnoser-route path" \
+         "git-log: $(cat "$T3662_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
-if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T66_TEST_STATE/gh-log.txt" 2>/dev/null; then
-    pass "#3662 T66C — gh pr create NOT invoked on still-ahead diagnoser-route path"
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T3662_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3662 T3662C — gh pr create NOT invoked on still-ahead diagnoser-route path"
 else
-    fail "#3662 T66C — gh pr create NOT invoked on still-ahead diagnoser-route path" \
-         "gh-log: $(cat "$T66_TEST_STATE/gh-log.txt" 2>/dev/null)"
+    fail "#3662 T3662C — gh pr create NOT invoked on still-ahead diagnoser-route path" \
+         "gh-log: $(cat "$T3662_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
 # Still-ahead path runs the new post-abort rev-list check (the fix
 # unconditionally probes ahead-count when conflict_files_json is empty).
 # Behavioural fingerprint that the new code path is exercised.
-if [[ -f "$T66_TEST_STATE/git-log.txt" ]]; then
-    _t66c_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T66_TEST_STATE/git-log.txt" || printf '0')
-    if [[ "$_t66c_rev_list_calls" == "2" ]]; then
-        pass "#3662 T66C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
+if [[ -f "$T3662_TEST_STATE/git-log.txt" ]]; then
+    _t3662c_rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$T3662_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_t3662c_rev_list_calls" == "2" ]]; then
+        pass "#3662 T3662C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)"
     else
-        fail "#3662 T66C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
-             "found $_t66c_rev_list_calls call(s); git-log: $(cat "$T66_TEST_STATE/git-log.txt")"
+        fail "#3662 T3662C — git rev-list invoked twice (pre-rebase guardrail + post-abort check)" \
+             "found $_t3662c_rev_list_calls call(s); git-log: $(cat "$T3662_TEST_STATE/git-log.txt")"
     fi
 fi
 
-# Test T67: #3656 — network-blocking ops in handle_push_and_pr are wrapped
+# Test T_issue3656: #3656 — network-blocking ops in handle_push_and_pr are wrapped
 # in ``timeout NETWORK_TIMEOUT_SECONDS``, and a 124 exit emits a
 # distinct ``*_timeout`` log + structured failure envelope.
 #
@@ -8045,24 +8045,23 @@ fi
 # seconds.
 #
 # Self-contained per the issue's "don't share fixture stubs across
-# test markers" rule. Marker churn for this fix:
-#   * Original PR #3661 used T65 — collided with the (merged-first)
-#     #3657 T65 for #3651's ralph_baseline empty-rebase test.
-#   * Re-dispatch initially used T66 with a ``T66_*`` env namespace —
-#     collided with the (merged-during-CI) #3666 T66 for #3662's
-#     post-fix_conflict re-rebase test.
-#   * Final marker T67 with a self-contained ``T67_*`` env namespace
-#     and its own ``run_t67_test`` driver. No shared fixture state
-#     with T64/T65/T66 — each test block owns its $_tbin per-test
-#     stub directory and env vars.
+# test markers" rule. Historical note on marker churn during development:
+# When this test was first written (pre-issue-numbered convention), two
+# sequential-numbered markers (T65 and T66) collided with concurrently
+# merged PRs (#3657 and #3666) — the root cause that motivated migrating
+# to the T_issue<N> naming scheme. Under the new convention each marker
+# is uniquely keyed by its issue number (T_issue3656 / T3656_* env
+# namespace / run_t3656_test driver), so similar collisions cannot occur.
+# Each test block owns its $_tbin per-test stub directory and env vars,
+# with no shared fixture state across T_issue3614/T_issue3651/T_issue3662.
 # ══════════════════════════════════════════════════════════════════════════
 
-# Extract handle_push_and_pr + minimal dependencies (mirrors T64's
+# Extract handle_push_and_pr + minimal dependencies (mirrors T3614's
 # extraction). We need ``log``, ``db_exec``, ``persist_phase_output``,
 # and ``handle_push_and_pr`` itself plus the ``NETWORK_TIMEOUT_SECONDS``
 # constant from the post-function config block.
-t67_funcs="$TEST_TMP/t67-funcs.sh"
-printf 'exec 3>&1\n' > "$t67_funcs"
+t3656_funcs="$TEST_TMP/t3656-funcs.sh"
+printf 'exec 3>&1\n' > "$t3656_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
           handle_push_and_pr; do
@@ -8070,25 +8069,25 @@ for fn in db_exec db_query_one log persist_phase_output \
         $0 ~ FN { in_fn=1 }
         in_fn { print }
         in_fn && /^}$/ { exit }
-    ' "$ENTRYPOINT" >> "$t67_funcs"
+    ' "$ENTRYPOINT" >> "$t3656_funcs"
 done
 
 # Append the NETWORK_TIMEOUT_SECONDS constant declaration so
 # ``handle_push_and_pr`` finds it when sourced standalone.
-grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t67_funcs"
+grep '^NETWORK_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t3656_funcs"
 
-if grep -q "^NETWORK_TIMEOUT_SECONDS=" "$t67_funcs"; then
-    pass "#3656 T67 setup — extracted NETWORK_TIMEOUT_SECONDS constant"
+if grep -q "^NETWORK_TIMEOUT_SECONDS=" "$t3656_funcs"; then
+    pass "#3656 T3656 setup — extracted NETWORK_TIMEOUT_SECONDS constant"
 else
-    fail "#3656 T67 setup — extracted NETWORK_TIMEOUT_SECONDS constant" \
-         "fixture tail: $(tail -c 400 "$t67_funcs")"
+    fail "#3656 T3656 setup — extracted NETWORK_TIMEOUT_SECONDS constant" \
+         "fixture tail: $(tail -c 400 "$t3656_funcs")"
 fi
 
-if grep -q "^handle_push_and_pr()" "$t67_funcs"; then
-    pass "#3656 T67 setup — extracted handle_push_and_pr from entrypoint"
+if grep -q "^handle_push_and_pr()" "$t3656_funcs"; then
+    pass "#3656 T3656 setup — extracted handle_push_and_pr from entrypoint"
 else
-    fail "#3656 T67 setup — extracted handle_push_and_pr from entrypoint" \
-         "fixture head: $(head -c 400 "$t67_funcs")"
+    fail "#3656 T3656 setup — extracted handle_push_and_pr from entrypoint" \
+         "fixture head: $(head -c 400 "$t3656_funcs")"
 fi
 
 # Per-test runner with a stub ``timeout`` binary that can be
@@ -8099,18 +8098,18 @@ fi
 # the OTHERS run normally.
 #
 # Stub control via env vars:
-#   T67_TIMEOUT_TARGET — substring to match in the timeout's argv.
+#   T3656_TIMEOUT_TARGET — substring to match in the timeout's argv.
 #                        When the substring matches, ``timeout`` exits
 #                        124 without invoking the inner command.
 #                        Otherwise it execs the inner command directly.
 #                        Examples: "fetch", "push", "pr create".
-#   T67_REV_LIST_PRE   — count returned for the FIRST rev-list call
+#   T3656_REV_LIST_PRE   — count returned for the FIRST rev-list call
 #                        (pre-rebase). Default 1 (something to push).
-#   T67_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
+#   T3656_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
 #                        Default 1 (rebase preserved the agent's commits).
 #   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
 #                        Default 0 (clean rebase).
-run_t67_test() {
+run_t3656_test() {
     _test_id="$1"
     shift
 
@@ -8122,15 +8121,15 @@ run_t67_test() {
     mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
 
     # rev-list counter file — written/read by the git stub to alternate
-    # responses across calls (mirrors T64's pattern).
+    # responses across calls (mirrors T3614's pattern).
     printf '0\n' > "$_tstate/rev-list-call-count.txt"
 
-    # ``timeout`` stub — the heart of T67. Logs every call. When the
-    # T67_TIMEOUT_TARGET substring appears in the inner command argv,
+    # ``timeout`` stub — the heart of T3656. Logs every call. When the
+    # T3656_TIMEOUT_TARGET substring appears in the inner command argv,
     # exits 124 (mirroring real ``timeout`` behaviour after SIGTERM
     # on timer expiry). Otherwise execs the inner command directly so
     # other ``timeout``-wrapped calls in the same test run normally.
-    cat > "$_tbin/timeout" <<'T67TIMEOUTEOF'
+    cat > "$_tbin/timeout" <<'T3656TIMEOUTEOF'
 #!/usr/bin/env bash
 set -u
 # argv: <seconds> <inner-cmd> <inner-args...>
@@ -8139,19 +8138,19 @@ shift || true
 _inner_argv="$*"
 printf 'CALL secs=%s argv=%s\n' "$_secs" "$_inner_argv" \
     >> "${T_STATE_DIR}/timeout-log.txt"
-# T67_TIMEOUT_TARGET — substring match against the inner argv.
-if [[ -n "${T67_TIMEOUT_TARGET:-}" && "$_inner_argv" == *"${T67_TIMEOUT_TARGET}"* ]]; then
+# T3656_TIMEOUT_TARGET — substring match against the inner argv.
+if [[ -n "${T3656_TIMEOUT_TARGET:-}" && "$_inner_argv" == *"${T3656_TIMEOUT_TARGET}"* ]]; then
     # Emulate real ``timeout(1)`` after SIGTERM-on-timer-expiry.
     exit 124
 fi
 # No match — exec the inner command transparently.
 exec "$@"
-T67TIMEOUTEOF
+T3656TIMEOUTEOF
     chmod +x "$_tbin/timeout"
 
-    # git stub — reused pattern from T64. Records every invocation;
+    # git stub — reused pattern from T3614. Records every invocation;
     # returns parameterised exit codes for fetch/push/rebase.
-    cat > "$_tbin/git" <<'T67GITEOF'
+    cat > "$_tbin/git" <<'T3656GITEOF'
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/git-log.txt"
@@ -8171,9 +8170,9 @@ case "$sub" in
         _next=$((_n + 1))
         printf '%s\n' "$_next" > "$_counter_file"
         if [[ "$_n" == "0" ]]; then
-            printf '%s\n' "${T67_REV_LIST_PRE:-1}"
+            printf '%s\n' "${T3656_REV_LIST_PRE:-1}"
         else
-            printf '%s\n' "${T67_REV_LIST_POST:-1}"
+            printf '%s\n' "${T3656_REV_LIST_POST:-1}"
         fi
         exit 0
         ;;
@@ -8203,22 +8202,22 @@ case "$sub" in
         exit 0
         ;;
 esac
-T67GITEOF
+T3656GITEOF
     chmod +x "$_tbin/git"
 
     # gh stub — log + return PR URL on ``pr create``, exit 0 by default.
-    cat > "$_tbin/gh" <<'T67GHEOF'
+    cat > "$_tbin/gh" <<'T3656GHEOF'
 #!/usr/bin/env bash
 printf '%s\n' "CALL $*" >> "${T_STATE_DIR}/gh-log.txt"
 if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
     printf 'https://github.com/judgemind/judgemind/pull/9999\n'
 fi
 exit "${GH_EXIT:-0}"
-T67GHEOF
+T3656GHEOF
     chmod +x "$_tbin/gh"
 
     # psql stub — log only.
-    cat > "$_tbin/psql" <<'T67PSQLEOF'
+    cat > "$_tbin/psql" <<'T3656PSQLEOF'
 #!/usr/bin/env bash
 query=""
 while [[ $# -gt 0 ]]; do
@@ -8227,7 +8226,7 @@ while [[ $# -gt 0 ]]; do
 done
 printf 'CALL %s\n' "$query" >> "${T_STATE_DIR}/psql-log.txt"
 exit 0
-T67PSQLEOF
+T3656PSQLEOF
     chmod +x "$_tbin/psql"
 
     if command -v jq >/dev/null 2>&1; then
@@ -8249,139 +8248,139 @@ T67PSQLEOF
         bash -c '
             set -uo pipefail
             # shellcheck disable=SC1090
-            . "'"$t67_funcs"'"
+            . "'"$t3656_funcs"'"
             handle_push_and_pr
         ' 2>&1)
     _trc=$?
     set -e
 
-    T67_TEST_RC="$_trc"
-    T67_TEST_OUT="$_tout"
-    T67_TEST_STATE="$_tstate"
+    T3656_TEST_RC="$_trc"
+    T3656_TEST_OUT="$_tout"
+    T3656_TEST_STATE="$_tstate"
 }
 
 # ── Sub-test A: ``git push`` timeout → push_timeout envelope ────────────────
 #
-# T67_TIMEOUT_TARGET="push -u" matches only the ``git push -u origin``
+# T3656_TIMEOUT_TARGET="push -u" matches only the ``git push -u origin``
 # call site (not ``git fetch`` or ``gh pr create``). Asserts:
 #   * ``push_and_pr_push_timeout`` log emitted with elapsed_seconds.
 #   * Envelope is ``{"no_op": false, "push_failed": true, "reason": "push_timeout"}``.
 #   * ``gh pr create`` is NOT invoked (function returns at the timeout).
 # Test would fail against unfixed code (no timeout wrapper, no
 # ``*_timeout`` log, push hang-forever).
-run_t67_test "t67a" T67_TIMEOUT_TARGET="push -u" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+run_t3656_test "t3656a" T3656_TIMEOUT_TARGET="push -u" T3656_REV_LIST_PRE=1 T3656_REV_LIST_POST=1 GIT_REBASE_EXIT=0
 
-if [[ "$T67_TEST_RC" -eq 0 ]]; then
-    pass "#3656 T67A — handle_push_and_pr exits 0 on git push timeout"
+if [[ "$T3656_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T3656A — handle_push_and_pr exits 0 on git push timeout"
 else
-    fail "#3656 T67A — handle_push_and_pr exits 0 on git push timeout" \
-         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+    fail "#3656 T3656A — handle_push_and_pr exits 0 on git push timeout" \
+         "rc=$T3656_TEST_RC, output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — push_timeout log event emitted.
-if printf '%s' "$T67_TEST_OUT" | grep -q "push_and_pr_push_timeout"; then
-    pass "#3656 T67A — push_and_pr_push_timeout log event emitted"
+if printf '%s' "$T3656_TEST_OUT" | grep -q "push_and_pr_push_timeout"; then
+    pass "#3656 T3656A — push_and_pr_push_timeout log event emitted"
 else
-    fail "#3656 T67A — push_and_pr_push_timeout log event emitted" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656A — push_and_pr_push_timeout log event emitted" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — log includes elapsed_seconds field (not bare event).
 # The ``log`` helper emits structured JSON, so the field appears as
 # ``"elapsed_seconds": "300"`` — match either JSON-quoted or
 # key=value forms to keep the assertion implementation-agnostic.
-if printf '%s' "$T67_TEST_OUT" \
+if printf '%s' "$T3656_TEST_OUT" \
     | grep "push_and_pr_push_timeout" \
     | grep -qE '("?elapsed_seconds"?[[:space:]]*[:=][[:space:]]*"?[0-9]+)'; then
-    pass "#3656 T67A — push timeout log includes elapsed_seconds"
+    pass "#3656 T3656A — push timeout log includes elapsed_seconds"
 else
-    fail "#3656 T67A — push timeout log includes elapsed_seconds" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656A — push timeout log includes elapsed_seconds" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — envelope has the reason=push_timeout discriminator.
-if printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"push_timeout"'; then
-    pass "#3656 T67A — envelope contains reason=push_timeout"
+if printf '%s' "$T3656_TEST_OUT" | grep -qE '"reason":[[:space:]]*"push_timeout"'; then
+    pass "#3656 T3656A — envelope contains reason=push_timeout"
 else
-    fail "#3656 T67A — envelope contains reason=push_timeout" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656A — envelope contains reason=push_timeout" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — push_failed=true so the transition shim still routes
 # through the existing failure path.
-if printf '%s' "$T67_TEST_OUT" | grep -qE '"push_failed":[[:space:]]*true'; then
-    pass "#3656 T67A — envelope contains push_failed=true"
+if printf '%s' "$T3656_TEST_OUT" | grep -qE '"push_failed":[[:space:]]*true'; then
+    pass "#3656 T3656A — envelope contains push_failed=true"
 else
-    fail "#3656 T67A — envelope contains push_failed=true" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656A — envelope contains push_failed=true" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — gh pr create NOT invoked (function returned early).
-if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T67_TEST_STATE/gh-log.txt" 2>/dev/null; then
-    pass "#3656 T67A — gh pr create NOT invoked after push timeout"
+if ! grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T3656_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3656 T3656A — gh pr create NOT invoked after push timeout"
 else
-    fail "#3656 T67A — gh pr create NOT invoked after push timeout" \
-         "gh-log: $(cat "$T67_TEST_STATE/gh-log.txt" 2>/dev/null)"
+    fail "#3656 T3656A — gh pr create NOT invoked after push timeout" \
+         "gh-log: $(cat "$T3656_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
 # Sanity — the timeout stub WAS invoked at least once (proves the
 # ``timeout`` wrapper is on the call path, not silently absent).
-if grep -q "argv=git" "$T67_TEST_STATE/timeout-log.txt" 2>/dev/null; then
-    pass "#3656 T67A — timeout wrapper invoked on git command"
+if grep -q "argv=git" "$T3656_TEST_STATE/timeout-log.txt" 2>/dev/null; then
+    pass "#3656 T3656A — timeout wrapper invoked on git command"
 else
-    fail "#3656 T67A — timeout wrapper invoked on git command" \
-         "timeout-log: $(cat "$T67_TEST_STATE/timeout-log.txt" 2>/dev/null)"
+    fail "#3656 T3656A — timeout wrapper invoked on git command" \
+         "timeout-log: $(cat "$T3656_TEST_STATE/timeout-log.txt" 2>/dev/null)"
 fi
 
 # ── Sub-test B: ``gh pr create`` timeout → pr_create_timeout envelope ──────
 #
-# T67_TIMEOUT_TARGET="pr create" matches only the ``gh pr create`` call.
+# T3656_TIMEOUT_TARGET="pr create" matches only the ``gh pr create`` call.
 # git push runs normally (so we exercise the path past the push site).
-run_t67_test "t67b" T67_TIMEOUT_TARGET="pr create" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+run_t3656_test "t3656b" T3656_TIMEOUT_TARGET="pr create" T3656_REV_LIST_PRE=1 T3656_REV_LIST_POST=1 GIT_REBASE_EXIT=0
 
-if [[ "$T67_TEST_RC" -eq 0 ]]; then
-    pass "#3656 T67B — handle_push_and_pr exits 0 on gh pr create timeout"
+if [[ "$T3656_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T3656B — handle_push_and_pr exits 0 on gh pr create timeout"
 else
-    fail "#3656 T67B — handle_push_and_pr exits 0 on gh pr create timeout" \
-         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+    fail "#3656 T3656B — handle_push_and_pr exits 0 on gh pr create timeout" \
+         "rc=$T3656_TEST_RC, output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — pr_create_timeout log event emitted.
-if printf '%s' "$T67_TEST_OUT" | grep -q "push_and_pr_pr_create_timeout"; then
-    pass "#3656 T67B — push_and_pr_pr_create_timeout log event emitted"
+if printf '%s' "$T3656_TEST_OUT" | grep -q "push_and_pr_pr_create_timeout"; then
+    pass "#3656 T3656B — push_and_pr_pr_create_timeout log event emitted"
 else
-    fail "#3656 T67B — push_and_pr_pr_create_timeout log event emitted" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656B — push_and_pr_pr_create_timeout log event emitted" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — envelope has the pr_create_timeout reason discriminator.
-if printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"pr_create_timeout"'; then
-    pass "#3656 T67B — envelope contains reason=pr_create_timeout"
+if printf '%s' "$T3656_TEST_OUT" | grep -qE '"reason":[[:space:]]*"pr_create_timeout"'; then
+    pass "#3656 T3656B — envelope contains reason=pr_create_timeout"
 else
-    fail "#3656 T67B — envelope contains reason=pr_create_timeout" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656B — envelope contains reason=pr_create_timeout" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — pr_create_failed=true (preserves existing failure routing).
-if printf '%s' "$T67_TEST_OUT" | grep -qE '"pr_create_failed":[[:space:]]*true'; then
-    pass "#3656 T67B — envelope contains pr_create_failed=true"
+if printf '%s' "$T3656_TEST_OUT" | grep -qE '"pr_create_failed":[[:space:]]*true'; then
+    pass "#3656 T3656B — envelope contains pr_create_failed=true"
 else
-    fail "#3656 T67B — envelope contains pr_create_failed=true" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656B — envelope contains pr_create_failed=true" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — git push DID run (path got past the push call site,
 # proving the timeout target was scoped to ``gh pr create`` only).
-if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T67_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3656 T67B — git push DID run (timeout was scoped to gh pr create)"
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T3656_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3656 T3656B — git push DID run (timeout was scoped to gh pr create)"
 else
-    fail "#3656 T67B — git push DID run (timeout was scoped to gh pr create)" \
-         "git-log: $(cat "$T67_TEST_STATE/git-log.txt" 2>/dev/null)"
+    fail "#3656 T3656B — git push DID run (timeout was scoped to gh pr create)" \
+         "git-log: $(cat "$T3656_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # ── Sub-test C: ``git fetch`` timeout → fetch_main_timeout log only ─────────
 #
-# T67_TIMEOUT_TARGET="fetch origin" matches only the pre-push
+# T3656_TIMEOUT_TARGET="fetch origin" matches only the pre-push
 # ``git fetch origin main``. The fetch is best-effort by design — a
 # 124 should emit the timeout log but fall through to the push (which
 # we then let succeed). Asserts:
@@ -8391,85 +8390,85 @@ fi
 #     preserves that).
 #   * Final envelope is NOT the push_timeout shape (fetch timeout
 #     should not look like a push timeout to the diagnoser).
-run_t67_test "t67c" T67_TIMEOUT_TARGET="fetch origin" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+run_t3656_test "t3656c" T3656_TIMEOUT_TARGET="fetch origin" T3656_REV_LIST_PRE=1 T3656_REV_LIST_POST=1 GIT_REBASE_EXIT=0
 
-if [[ "$T67_TEST_RC" -eq 0 ]]; then
-    pass "#3656 T67C — handle_push_and_pr exits 0 on git fetch timeout (best-effort)"
+if [[ "$T3656_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T3656C — handle_push_and_pr exits 0 on git fetch timeout (best-effort)"
 else
-    fail "#3656 T67C — handle_push_and_pr exits 0 on git fetch timeout (best-effort)" \
-         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+    fail "#3656 T3656C — handle_push_and_pr exits 0 on git fetch timeout (best-effort)" \
+         "rc=$T3656_TEST_RC, output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — fetch_main_timeout log event emitted.
-if printf '%s' "$T67_TEST_OUT" | grep -q "push_and_pr_fetch_main_timeout"; then
-    pass "#3656 T67C — push_and_pr_fetch_main_timeout log event emitted"
+if printf '%s' "$T3656_TEST_OUT" | grep -q "push_and_pr_fetch_main_timeout"; then
+    pass "#3656 T3656C — push_and_pr_fetch_main_timeout log event emitted"
 else
-    fail "#3656 T67C — push_and_pr_fetch_main_timeout log event emitted" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656C — push_and_pr_fetch_main_timeout log event emitted" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # CRITICAL — git push DID run (best-effort fetch failure falls through).
-if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T67_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3656 T67C — git push DID run after fetch timeout (best-effort fall-through)"
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T3656_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3656 T3656C — git push DID run after fetch timeout (best-effort fall-through)"
 else
-    fail "#3656 T67C — git push DID run after fetch timeout (best-effort fall-through)" \
-         "git-log: $(cat "$T67_TEST_STATE/git-log.txt" 2>/dev/null)"
+    fail "#3656 T3656C — git push DID run after fetch timeout (best-effort fall-through)" \
+         "git-log: $(cat "$T3656_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # Final envelope must NOT be the push_timeout shape (the fetch
 # timeout fell through to a successful push + PR create).
-if ! printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"push_timeout"'; then
-    pass "#3656 T67C — final envelope is NOT push_timeout (fetch fell through)"
+if ! printf '%s' "$T3656_TEST_OUT" | grep -qE '"reason":[[:space:]]*"push_timeout"'; then
+    pass "#3656 T3656C — final envelope is NOT push_timeout (fetch fell through)"
 else
-    fail "#3656 T67C — final envelope is NOT push_timeout (fetch fell through)" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656C — final envelope is NOT push_timeout (fetch fell through)" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # ── Sub-test D: happy-path regression — no timeout target → all run ─────────
 #
-# T67_TIMEOUT_TARGET unset (empty). The ``timeout`` stub falls through
+# T3656_TIMEOUT_TARGET unset (empty). The ``timeout`` stub falls through
 # to exec the inner command, so every wrapped site behaves exactly as
 # pre-#3656. Asserts no ``*_timeout`` log fires and the happy-path
 # envelope is unchanged.
-run_t67_test "t67d" T67_REV_LIST_PRE=1 T67_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+run_t3656_test "t3656d" T3656_REV_LIST_PRE=1 T3656_REV_LIST_POST=1 GIT_REBASE_EXIT=0
 
-if [[ "$T67_TEST_RC" -eq 0 ]]; then
-    pass "#3656 T67D — handle_push_and_pr exits 0 on happy path (no timeouts)"
+if [[ "$T3656_TEST_RC" -eq 0 ]]; then
+    pass "#3656 T3656D — handle_push_and_pr exits 0 on happy path (no timeouts)"
 else
-    fail "#3656 T67D — handle_push_and_pr exits 0 on happy path (no timeouts)" \
-         "rc=$T67_TEST_RC, output: $T67_TEST_OUT"
+    fail "#3656 T3656D — handle_push_and_pr exits 0 on happy path (no timeouts)" \
+         "rc=$T3656_TEST_RC, output: $T3656_TEST_OUT"
 fi
 
 # Happy path emits NO ``*_timeout`` log lines.
-if ! printf '%s' "$T67_TEST_OUT" | grep -qE "(push|pr_create|fetch_main)_timeout"; then
-    pass "#3656 T67D — no *_timeout log events on happy path"
+if ! printf '%s' "$T3656_TEST_OUT" | grep -qE "(push|pr_create|fetch_main)_timeout"; then
+    pass "#3656 T3656D — no *_timeout log events on happy path"
 else
-    fail "#3656 T67D — no *_timeout log events on happy path" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656D — no *_timeout log events on happy path" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # Happy path envelope does NOT carry a reason field (push_timeout /
 # pr_create_timeout discriminators are absent).
-if ! printf '%s' "$T67_TEST_OUT" | grep -qE '"reason":[[:space:]]*"(push_timeout|pr_create_timeout)"'; then
-    pass "#3656 T67D — happy-path envelope has no timeout reason field"
+if ! printf '%s' "$T3656_TEST_OUT" | grep -qE '"reason":[[:space:]]*"(push_timeout|pr_create_timeout)"'; then
+    pass "#3656 T3656D — happy-path envelope has no timeout reason field"
 else
-    fail "#3656 T67D — happy-path envelope has no timeout reason field" \
-         "output: $T67_TEST_OUT"
+    fail "#3656 T3656D — happy-path envelope has no timeout reason field" \
+         "output: $T3656_TEST_OUT"
 fi
 
 # Both push and pr create DID run.
-if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T67_TEST_STATE/git-log.txt" 2>/dev/null; then
-    pass "#3656 T67D — git push ran on happy path"
+if grep -qE "CALL .*\\bpush\\b.*-u\\b.*\\borigin\\b" "$T3656_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3656 T3656D — git push ran on happy path"
 else
-    fail "#3656 T67D — git push ran on happy path" \
-         "git-log: $(cat "$T67_TEST_STATE/git-log.txt" 2>/dev/null)"
+    fail "#3656 T3656D — git push ran on happy path" \
+         "git-log: $(cat "$T3656_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
-if grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T67_TEST_STATE/gh-log.txt" 2>/dev/null; then
-    pass "#3656 T67D — gh pr create ran on happy path"
+if grep -qE "CALL .*\\bpr\\b.*\\bcreate\\b" "$T3656_TEST_STATE/gh-log.txt" 2>/dev/null; then
+    pass "#3656 T3656D — gh pr create ran on happy path"
 else
-    fail "#3656 T67D — gh pr create ran on happy path" \
-         "gh-log: $(cat "$T67_TEST_STATE/gh-log.txt" 2>/dev/null)"
+    fail "#3656 T3656D — gh pr create ran on happy path" \
+         "gh-log: $(cat "$T3656_TEST_STATE/gh-log.txt" 2>/dev/null)"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

@@ -142,6 +142,23 @@ except Exception:  # noqa: BLE001
 
 Prefer narrowing the handler (`except FileNotFoundError:`) or logging the exception over the escape hatch — the goal is to keep blind swallows out of assertion paths.
 
+### Test marker convention (`scripts/tests/test_agent_runner_entrypoint.sh`)
+
+Each test block in `scripts/tests/test_agent_runner_entrypoint.sh` carries a unique marker tied to the GitHub issue that introduced the test. This avoids the sequential-numbering collision that occurred when two parallel agents (PRs #3661 and #3666) both claimed marker T65, causing a merge conflict.
+
+**Naming scheme:**
+
+- **Header comment:** `# Test T_issue<N>: #<N> — short description`
+- **Per-test env namespace:** `T<N>_*` — drop `_issue` for compactness (e.g. `T3656_TIMEOUT_TARGET`, `T3656A_STATE_DIR`)
+- **Per-test runner function:** `run_t<N>_test()` (e.g. `run_t3656_test()`)
+- **Sub-test labels / state dirs:** `t<N>a`, `t<N>b`, ... and `t<N>_state_dir`, `t<N>_stub_bin`, etc.
+
+**Same-issue disambiguation:** when a single issue requires multiple distinct test blocks, append a letter to the issue number — `T_issue3507a` / `T_issue3507b` — with corresponding `T3507a_*` / `T3507b_*` env namespaces.
+
+**Grandfathered tests:** T44–T59 predate this convention and are left as-is until they are naturally edited. New tests always use `T_issue<N>`.
+
+**Why issue numbers?** GitHub issue numbers are globally unique within the repository. Two agents working on different issues N1 ≠ N2 always produce non-overlapping `T_issue<N1>` and `T_issue<N2>` markers, so parallel PRs that both add tests can never collide on a marker name.
+
 ### Coverage gates (enforced in CI)
 
 - **Diff coverage:** new/changed lines must have >= 90% test coverage. CI runs `diff-cover` against `coverage.xml` (Python) or `lcov.info` (TypeScript).
