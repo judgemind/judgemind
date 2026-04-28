@@ -10,6 +10,8 @@
 #
 # Object lock is intentionally disabled for dev so test objects can be deleted.
 
+data "aws_caller_identity" "current" {}
+
 # Look up API key secrets so we can pass their ARNs to the compute module
 # without hardcoding the random Secrets Manager suffix.
 data "aws_secretsmanager_secret" "anthropic_api_key" {
@@ -150,6 +152,15 @@ module "search" {
   instance_type   = "t3.small.search"
   instance_count  = 1
   ebs_volume_size = 20
+
+  principal_arns = [
+    # API ECS task role -- name is deterministic from modules/api-service/main.tf.
+    # Built as a string (not module.api_service.task_role_arn) to avoid a
+    # Terraform dependency cycle: api_service already consumes
+    # module.search.master_credentials_secret_arn / domain_endpoint.
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/judgemind-api-task-dev",
+    module.iam_scraper.role_arn, # ingestion-worker + ECS-oneshot tasks
+  ]
 }
 
 module "api_service" {

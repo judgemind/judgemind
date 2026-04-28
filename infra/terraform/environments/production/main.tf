@@ -93,6 +93,11 @@ module "search" {
   instance_type   = "t3.medium.search"
   instance_count  = 1
   ebs_volume_size = 50
+
+  # Add the api-task role here when production grows an api_service module.
+  principal_arns = [
+    module.iam_scraper.role_arn, # ingestion-worker + ECS-oneshot tasks
+  ]
 }
 
 module "ses" {

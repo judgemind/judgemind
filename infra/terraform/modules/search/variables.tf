@@ -47,3 +47,13 @@ variable "master_user_name" {
   type        = string
   default     = "admin"
 }
+
+variable "principal_arns" {
+  description = "IAM role/user ARNs allowed to call es:* on this OpenSearch domain (#3704). An empty list would deny all IAM access, so at least one ARN is required."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.principal_arns) > 0
+    error_message = "principal_arns must contain at least one ARN; an empty list would deny all IAM access to OpenSearch."
+  }
+}

@@ -107,12 +107,15 @@ resource "aws_opensearch_domain" "main" {
     }
   }
 
+  # Defence-in-depth (#3704): the security group is the network gate (HTTPS
+  # from VPC CIDR only); this IAM policy is the second layer, restricting
+  # es:* to enumerated role ARNs instead of the prior AWS="*" wildcard.
   access_policies = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Effect    = "Allow"
-        Principal = { AWS = "*" }
+        Principal = { AWS = var.principal_arns }
         Action    = "es:*"
         Resource  = "arn:aws:es:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:domain/judgemind-${var.environment}/*"
       }
