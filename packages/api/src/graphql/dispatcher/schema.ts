@@ -377,10 +377,12 @@ export const dispatcherTypeDefs = `#graphql
     activeAgents: [DispatcherAgent!]!
     """Failures from \`dispatcher.failures\` in the last \`sinceHours\` (default 24)."""
     recentFailures(sinceHours: Int = 24): [DispatcherFailure!]!
-    """Count of open \`agent/ready\` issues. Sourced from the most recent row in
-    \`dispatcher.queue_snapshots\`, written by the daemon on each 30s scheduler
-    tick (Phase 2+). Returns 0 before the daemon has booted or when every
-    recent scan has failed — the admin page treats that as "queue unknown / 0"."""
+    """Count of pickup-eligible \`agent/ready\` issues in the latest snapshot.
+    Applies the same \`dispatcher.issue_has_active_agent\` filter as \`queueReady\`
+    (issues already being worked on are excluded) but without the 10-item cap,
+    so the cockpit panel header \`{queueReady.length}/{queueDepth}\` always agrees —
+    in particular, both show 0 when the filtered set is empty (bug #3743). Returns
+    0 before the daemon has booted or when every recent scan has failed."""
     queueDepth: Int!
     """Count of open \`status/blocked\` issues. Sourced from the most recent row
     in \`dispatcher.blocked_snapshots\`, written by the daemon on a slower

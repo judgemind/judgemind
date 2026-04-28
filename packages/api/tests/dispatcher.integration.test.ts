@@ -343,16 +343,35 @@ describe('dispatcherState — admin', () => {
     // Seed two snapshots: an older one with depth 3, a newer one with
     // depth 7. The resolver should return 7 (latest by observed_at DESC).
     // We seed via the run we'll insert so cleanup cascades correctly.
+    //
+    // Both rows now include issues_json so the refactored resolver (which
+    // reads issues_json and re-applies the active-agent filter — bug #3743)
+    // can compute the depth correctly. None of these issue numbers have
+    // active agents, so queueDepth == jsonb_array_length(issues_json).
     const runId = await insertRun();
+    const olderIssuesJson = JSON.stringify([
+      { number: 11, title: 'A', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 22, title: 'B', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 33, title: 'C', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+    ]);
+    const newerIssuesJson = JSON.stringify([
+      { number: 40, title: 'D', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 41, title: 'E', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 42, title: 'F', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 43, title: 'G', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 44, title: 'H', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 45, title: 'I', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+      { number: 46, title: 'J', labels: ['agent/ready'], createdAt: new Date().toISOString() },
+    ]);
     await pool.query(
-      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, run_id)
-       VALUES (now() - interval '2 minutes', 3, ARRAY[11,22,33]::int[], $1)`,
-      [runId],
+      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, issues_json, run_id)
+       VALUES (now() - interval '2 minutes', 3, ARRAY[11,22,33]::int[], $1::jsonb, $2)`,
+      [olderIssuesJson, runId],
     );
     await pool.query(
-      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, run_id)
-       VALUES (now() - interval '10 seconds', 7, ARRAY[40,41,42,43,44,45,46]::int[], $1)`,
-      [runId],
+      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, issues_json, run_id)
+       VALUES (now() - interval '10 seconds', 7, ARRAY[40,41,42,43,44,45,46]::int[], $1::jsonb, $2)`,
+      [newerIssuesJson, runId],
     );
 
     const body = await gql(
@@ -811,6 +830,86 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
       [ISSUE_A],
     );
     expect(rowsA[0].result).toBe(false);
+  });
+
+  it('queueDepth equals queueReady.length when active-agent filter applies (#3743)', async () => {
+    // Same fixture: A=1001, B=1002 (running agent), C=1003.
+    // queueDepth must exclude B (active) just as queueReady does.
+    // Expected: queueDepth === 2 (A + C) AND queueDepth === queueReady.length.
+    const body = await gql(
+      `{
+        dispatcherState {
+          queueDepth
+          queueReady {
+            issueNumber
+          }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    const queueReady = state.queueReady as Array<{ issueNumber: number }>;
+    const queueDepth = state.queueDepth as number;
+
+    // B has a running agent — must be excluded from both queueReady AND depth.
+    expect(queueDepth).toBe(2);
+    expect(queueDepth).toBe(queueReady.length);
+  });
+
+  it('queueDepth === 0 and queueReady is empty when all issues have active agents (#3743 AC2)', async () => {
+    // Seed a fresh snapshot where every issue has a running agent.
+    // This is the exact scenario the issue body describes: cockpit was
+    // showing "0 / N" instead of "0 / 0".
+    const runId2 = await insertRun();
+    const ISSUE_X = 9901;
+    const ISSUE_Y = 9902;
+    const allActiveJson = JSON.stringify([
+      { number: ISSUE_X, title: 'X', labels: ['priority/p2', 'agent/ready'], createdAt: new Date().toISOString() },
+      { number: ISSUE_Y, title: 'Y', labels: ['priority/p2', 'agent/ready'], createdAt: new Date().toISOString() },
+    ]);
+    await pool.query(
+      `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, issues_json, run_id)
+       VALUES (now() + interval '1 second', 2, ARRAY[$1, $2]::int[], $3::jsonb, $4)`,
+      [ISSUE_X, ISSUE_Y, allActiveJson, runId2],
+    );
+    // Insert running agents for both X and Y.
+    const { rows: xRows } = await pool.query<{ agent_id: string }>(
+      `INSERT INTO dispatcher.agents (issue_number, worktree_path, phase, status, started_at)
+       VALUES ($1, $2, 'ralph', 'running', now() - interval '1 minute')
+       RETURNING agent_id`,
+      [ISSUE_X, `/tmp/${MARKER}/agent-3743-x`],
+    );
+    insertedAgentIds.push(xRows[0].agent_id);
+    const { rows: yRows } = await pool.query<{ agent_id: string }>(
+      `INSERT INTO dispatcher.agents (issue_number, worktree_path, phase, status, started_at)
+       VALUES ($1, $2, 'ralph', 'running', now() - interval '1 minute')
+       RETURNING agent_id`,
+      [ISSUE_Y, `/tmp/${MARKER}/agent-3743-y`],
+    );
+    insertedAgentIds.push(yRows[0].agent_id);
+
+    const body = await gql(
+      `{
+        dispatcherState {
+          queueDepth
+          queueReady {
+            issueNumber
+          }
+        }
+      }`,
+      undefined,
+      adminToken,
+    );
+    expect(body.errors).toBeUndefined();
+    const state = body.data?.dispatcherState as Record<string, unknown>;
+    const queueReady = state.queueReady as Array<{ issueNumber: number }>;
+    const queueDepth = state.queueDepth as number;
+
+    // Both issues have running agents — cockpit must display 0 / 0.
+    expect(queueDepth).toBe(0);
+    expect(queueReady).toHaveLength(0);
   });
 });
 
