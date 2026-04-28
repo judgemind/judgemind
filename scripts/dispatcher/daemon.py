@@ -2291,7 +2291,7 @@ def _normalize_issue_enrichment(
             body_str = body if isinstance(body, str) else ""
             blocker_numbers = [
                 int(m)
-                for m in re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body_str)
+                for m in re.findall(r"(?im)^\s*blocked by:?\s+#(\d+)\s*$", body_str)
             ]
             record["blockedBy"] = [
                 {"number": n, "title": blocker_title_lookup.get(n)}
@@ -6352,11 +6352,13 @@ class DispatcherDaemon:
 
         Matches the same convention ``scripts/unblock-dependents.sh``
         uses: one or more ``Blocked by #N`` lines, case-insensitive,
-        anywhere in the body.
+        anywhere in the body.  Accepts the optional colon variant
+        ``Blocked by: #N`` as well as the canonical ``Blocked by #N``
+        form so that both styles are recognised.
         """
         import re  # noqa: PLC0415 — lazy import
 
-        matches = re.findall(r"(?im)^\s*blocked by\s+#(\d+)\s*$", body)
+        matches = re.findall(r"(?im)^\s*blocked by:?\s+#(\d+)\s*$", body)
         return [int(m) for m in matches]
 
     def _fetch_issue_titles_for_blockers(

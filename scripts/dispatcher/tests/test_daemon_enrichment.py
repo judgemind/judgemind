@@ -1045,3 +1045,37 @@ class TestFetchIssuesTitleCap:
         # All fetched numbers have a title.
         assert len(result) == MAX_BLOCKER_TITLE_FETCH
         assert all(v is not None for v in result.values())
+
+
+class TestParseBlockedByColonVariant:
+    """Regression tests for _parse_blocked_by accepting the colon variant.
+
+    AC3 requires at least one test that FAILS against the old pattern
+    (``blocked by`` + whitespace + ``#(\\d+)`` — no ``:?``) and passes after the fix.
+    """
+
+    @pytest.mark.parametrize(
+        "body,expected",
+        [
+            # Canonical form — must work before and after the change.
+            ("Blocked by #42\n", [42]),
+            # Colon variant — this is the AC3 regression case.
+            # The OLD pattern (blocked by + whitespace + #N) does NOT match this line,
+            # so this test fails against pre-fix code.
+            ("Blocked by: #42\n", [42]),
+            # Mixed: both forms in the same body.
+            ("Blocked by #10\nBlocked by: #20\n", [10, 20]),
+            # Unrelated text must not match.
+            ("This issue is blocked.\n", []),
+            ("Blocked: see above\n", []),
+        ],
+    )
+    def test_parse_blocked_by_variants(self, body: str, expected: list[int]) -> None:
+        """_parse_blocked_by must return the expected blocker numbers for each body form."""
+        from dispatcher.daemon import DispatcherDaemon
+
+        result = DispatcherDaemon._parse_blocked_by(body)
+        assert result == expected, (
+            f"_parse_blocked_by({body!r}) returned {result!r}, expected {expected!r}. "
+            "This test fails on the old pattern that does not allow an optional colon."
+        )

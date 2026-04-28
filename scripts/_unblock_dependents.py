@@ -33,11 +33,15 @@ def gh_json(*args: str) -> dict | list | None:
 
 
 def strip_blocked_lines(body: str) -> str:
-    """Remove 'Blocked by #N' lines and empty '## Dependencies' sections."""
+    """Remove 'Blocked by #N' lines and empty '## Dependencies' sections.
+
+    Accepts both the canonical ``Blocked by #N`` form and the colon variant
+    ``Blocked by: #N`` so that issues written in either style are cleaned up.
+    """
     lines = body.splitlines()
 
-    # Remove all "Blocked by #N" lines
-    lines = [line for line in lines if not re.match(r"\s*Blocked by #\d+", line)]
+    # Remove all "Blocked by #N" / "Blocked by: #N" lines (colon is optional)
+    lines = [line for line in lines if not re.match(r"\s*Blocked by:?\s+#\d+", line)]
 
     # Remove empty "## Dependencies" section
     result: list[str] = []
@@ -79,14 +83,14 @@ def main() -> None:
         n = issue["number"]
         body = issue.get("body") or ""
 
-        # Verify this issue actually has "Blocked by #N" for our closed issue
-        if not re.search(rf"Blocked by #{closed_issue}\b", body):
+        # Verify this issue actually has "Blocked by #N" (or "Blocked by: #N") for our closed issue
+        if not re.search(rf"Blocked by:?\s+#{closed_issue}\b", body):
             continue
 
         print(f"Issue #{n}:")
 
-        # Find ALL blockers in the body
-        blockers = re.findall(r"Blocked by #(\d+)", body)
+        # Find ALL blockers in the body (accept optional colon: "Blocked by: #N")
+        blockers = re.findall(r"Blocked by:?\s+#(\d+)", body)
         if not blockers:
             print("  No 'Blocked by' lines found (unexpected). Skipping.")
             skipped_count += 1

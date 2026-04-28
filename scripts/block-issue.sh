@@ -13,6 +13,12 @@
 # issues as blocked — sometimes adding only the label or only a comment, which
 # broke the unblock-issues CI workflow. This script ensures both pieces are
 # always present.
+#
+# Note: This writer always emits the canonical `Blocked by #N` form (no colon).
+# The unblock side (`unblock-dependents.sh`, `unblock-issues.yml`,
+# `_unblock_dependents.py`, and the daemon's `_parse_blocked_by`) tolerates
+# the colon variant (`Blocked by: #N`) as well, for issues written manually or
+# by tools that included the colon.
 
 set -euo pipefail
 
