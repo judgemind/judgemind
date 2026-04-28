@@ -216,7 +216,7 @@ See **`docs/agent/code-standards.md`** for the full reference. Highlights:
 See **`docs/agent/task-dependencies.md`** and **`docs/agent/issue-authoring.md`** for the full mechanics. Core rules:
 
 - **Blocking:** use `scripts/block-issue.sh <issue> <blocker>`. Both the `status/blocked` label AND a `Blocked by #N` line in the issue body are required. Label-only blocks never auto-unblock. `Parent: #N` is hierarchy, not a dependency.
-- **Unblocking:** PR merges auto-unblock via `Closes #N`. For non-PR completions, run `scripts/unblock-dependents.sh <your-issue>`.
+- **Unblocking:** PR merges auto-unblock via `Closes #N`. For non-PR completions, run `scripts/unblock-dependents.sh <your-issue>`. For manual unblock of a single issue (rather than auto-unblock of all dependents of a closed issue), use `scripts/unblock-issue.sh <N>` — never bare `gh issue edit --remove-label status/blocked`.
 - **Sub-tasks:** reference the parent as `Parent: #N`; each sub-task should be independently pickup-able.
 - **Acceptance criteria:** concrete and machine-checkable. Each criterion has at least one `Verify:` line. **Data cleanup on `derived.*` defaults to `rebuild_db.py --county <name>`** — surgical scripts are a last resort.
 - **Investigation tasks:** produce documentation and file follow-up issues for every actionable finding, then close.
