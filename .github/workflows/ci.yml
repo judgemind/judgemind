@@ -645,6 +645,9 @@ jobs:
       - name: Check docs describe the actual rebuild_db.py CLI
         if: matrix.shard == 'python'
         run: scripts/check-no-rebuild-db-skip-reset.sh
+      - name: Check tests use POSIX sed instead of GNU head negative count
+        if: matrix.shard == 'python'
+        run: scripts/check-no-gnu-head.sh
       - name: Check test files do not redefine the same stub binary
         if: matrix.shard == 'python'
         run: scripts/check-no-duplicate-stubs.sh
