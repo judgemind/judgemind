@@ -426,11 +426,7 @@ class TestReapRoutesBypassedTerminals:
 
         # 1. Initial SELECT for active agent rows.
         cur.fetchall_queue = [
-            [
-                self._agent_row(
-                    agent_id, issue_number, arn, "ralph_not_ship", "failed"
-                )
-            ],
+            [self._agent_row(agent_id, issue_number, arn, "ralph_not_ship", "failed")],
         ]
         # 2. _read_agent_status_phase + _build_bypassed_terminal_details
         #    fetches: terminal phase_outputs row, then ralph phase_outputs row.
@@ -473,9 +469,9 @@ class TestReapRoutesBypassedTerminals:
         assert kwargs["phase"] == "ralph_not_ship"
         assert kwargs["issue_number"] == issue_number
         # block_reason carried through as stderr_tail for diagnoser §Step 1.
-        assert (
-            "prerequisite #2840" in kwargs["details"]["stderr_tail"]
-        ), f"block_reason not in stderr_tail: {kwargs['details'].get('stderr_tail')!r}"
+        assert "prerequisite #2840" in kwargs["details"]["stderr_tail"], (
+            f"block_reason not in stderr_tail: {kwargs['details'].get('stderr_tail')!r}"
+        )
         assert kwargs["details"]["terminal_phase"] == "ralph_not_ship"
 
         # ARN clear ran so the next reap tick excludes the row.

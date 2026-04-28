@@ -108,9 +108,7 @@ class TestRalphNotShipDescriptiveTerminal:
             r"^handle_ralph_not_ship_local\s*\(\s*\)\s*\{",
             text,
             re.MULTILINE,
-        ), (
-            "handle_ralph_not_ship_local function must not be defined (#3586 removed it)"
-        )
+        ), "handle_ralph_not_ship_local function must not be defined (#3586 removed it)"
 
     def test_route_to_diagnoser_dispatches_ralph_not_ship_as_descriptive_terminal(
         self,

@@ -317,9 +317,7 @@ class TestOrphanPrRecoveryPendingProceedPaths:
 
         result = d._orphan_pr_recovery_pending(42)
 
-        assert result is False, (
-            "transient gh failure must not block the claim path"
-        )
+        assert result is False, "transient gh failure must not block the claim path"
 
     def test_pick_candidate_proceeds_when_budget_exhausted(
         self, tmp_path: Path

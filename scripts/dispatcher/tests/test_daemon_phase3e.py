@@ -322,10 +322,16 @@ class TestRunRetroPhaseZeroFindings:
         d, conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
 
-        # Stub the retro spawn to write a no-findings output.
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
+        # #3658: stub _spawn_phase_subprocess_async to call finalizer immediately.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
             assert phase == "retro"
-            output_dir = wt / "tmp" / "dispatcher-output"
+            output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(
                 json.dumps(
@@ -338,9 +344,17 @@ class TestRunRetroPhaseZeroFindings:
                     }
                 )
             )
-            return 0, 1.5
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         # Monkeypatch subprocess.run so that any unexpected gh call
         # would surface clearly. With zero retro issues, no gh call
@@ -413,13 +427,27 @@ class TestRunRetroPhaseMultipleIssues:
             ],
         }
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            output_dir = wt / "tmp" / "dispatcher-output"
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            return 0, 5.0
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         gh_calls: list[list[str]] = []
 
@@ -483,13 +511,27 @@ class TestRunRetroPhaseMultipleIssues:
             ],
         }
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            output_dir = wt / "tmp" / "dispatcher-output"
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            return 0, 1.0
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         gh_calls: list[list[str]] = []
 
@@ -523,10 +565,26 @@ class TestRunRetroPhaseFailures:
         d, conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            return 1, 2.0  # non-zero exit, no output written
+        # #3658: stub _spawn_phase_subprocess_async; nonzero exit → call
+        # _finalize_retro with exit_code=1, no output file written.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 1)  # non-zero exit
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
         d._run_retro_phase(agent)
 
         # Phase flipped to retro_failed.
@@ -559,10 +617,25 @@ class TestRunRetroPhaseFailures:
         d, conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            raise subprocess.TimeoutExpired(cmd="claude", timeout=300)
+        # #3658: timeout is now signaled by _finalize_retro with exit_code=None.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, None)  # killed = timeout
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
         d._run_retro_phase(agent)
 
         retro_failed_updates = [
@@ -581,11 +654,25 @@ class TestRunRetroPhaseFailures:
         d, conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            # Exit 0 but no output file.
-            return 0, 1.0
+        # #3658: exit 0 but no output file.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)  # exit 0, no output file
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
         d._run_retro_phase(agent)
 
         retro_failed_updates = [
@@ -612,13 +699,27 @@ class TestRunRetroPhaseFailures:
             ],
         }
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            output_dir = wt / "tmp" / "dispatcher-output"
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            return 0, 1.0
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         # Issue #3089: ``_file_retro_issue`` now routes through the
         # shared 3-attempt 1s+2s retry helper (``_subprocess_with_retry``).
@@ -700,13 +801,27 @@ class TestRunRetroPhaseFailures:
         ]
         retro_payload = {"no_findings": False, "retro_issues": many_issues}
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            output_dir = wt / "tmp" / "dispatcher-output"
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            output_dir = worktree / "tmp" / "dispatcher-output"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_dir.joinpath("retro.json").write_text(json.dumps(retro_payload))
-            return 0, 1.0
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         n = {"i": 0}
 

@@ -876,9 +876,17 @@ class TestAwaitingCiRedPatched:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        # fix-ci subprocess writes the PATCHED output.
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            out_dir = wt / "tmp" / "dispatcher-output"
+        # #3658: _start_fix_ci fires async. Stub _spawn_phase_subprocess_async
+        # to write the output file and call _finalize_fix_ci immediately so
+        # the test exercises the full flow synchronously.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            out_dir = worktree / "tmp" / "dispatcher-output"
             out_dir.mkdir(parents=True, exist_ok=True)
             assert phase == "fix-ci"
             (out_dir / "fix-ci.json").write_text(
@@ -896,9 +904,18 @@ class TestAwaitingCiRedPatched:
                     }
                 )
             )
-            return 0, 0.1
+            # Register inflight so _finalize_fix_ci can read ctx.
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_fix_ci(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         agent = {
             "agent_id": "aabbccdd-eeff-0011-2233-445566778899",
@@ -910,8 +927,8 @@ class TestAwaitingCiRedPatched:
         }
         d._advance_awaiting_ci(agent)
 
-        # fix_ci_started event.
-        assert handler.events("fix_ci_started")
+        # fix_ci_started_async event (#3658: event renamed from fix_ci_started).
+        assert handler.events("fix_ci_started_async")
         # fix_ci_patched event (successful apply).
         patched = handler.events("fix_ci_patched")
         assert patched
@@ -971,8 +988,15 @@ class TestAwaitingCiRedBlocked:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            out_dir = wt / "tmp" / "dispatcher-output"
+        # #3658: stub _spawn_phase_subprocess_async to call finalizer immediately.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            out_dir = worktree / "tmp" / "dispatcher-output"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "fix-ci.json").write_text(
                 json.dumps(
@@ -989,9 +1013,17 @@ class TestAwaitingCiRedBlocked:
                     }
                 )
             )
-            return 0, 0.1
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_fix_ci(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         agent = {
             "agent_id": "aabbccdd-eeff-0011-2233-445566778899",
@@ -1049,8 +1081,15 @@ class TestAwaitingCiRedFlaky:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            out_dir = wt / "tmp" / "dispatcher-output"
+        # #3658: stub _spawn_phase_subprocess_async to call finalizer immediately.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            out_dir = worktree / "tmp" / "dispatcher-output"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "fix-ci.json").write_text(
                 json.dumps(
@@ -1067,9 +1106,17 @@ class TestAwaitingCiRedFlaky:
                     }
                 )
             )
-            return 0, 0.1
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_fix_ci(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         agent = {
             "agent_id": "a1",
@@ -1423,8 +1470,15 @@ class TestAwaitingDeploySuccess:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            out_dir = wt / "tmp" / "dispatcher-output"
+        # #3658: stub _spawn_phase_subprocess_async to call finalizer immediately.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            out_dir = worktree / "tmp" / "dispatcher-output"
             out_dir.mkdir(parents=True, exist_ok=True)
             assert phase == "verify"
             (out_dir / "verify.json").write_text(
@@ -1446,9 +1500,17 @@ class TestAwaitingDeploySuccess:
                     }
                 )
             )
-            return 0, 0.1
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_verify(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         agent = {
             "agent_id": "a1",
@@ -1460,8 +1522,8 @@ class TestAwaitingDeploySuccess:
         }
         d._advance_awaiting_deploy(agent)
 
-        # verify_started event.
-        assert handler.events("verify_started")
+        # verify_started_async event (#3658: event renamed from verify_started).
+        assert handler.events("verify_started_async")
         # Evidence comment was posted.
         assert handler.events("evidence_comment_posted")
         comment_cmds = [c for c in call_log if c[:3] == ["gh", "issue", "comment"]]
@@ -1551,8 +1613,15 @@ class TestAwaitingDeployNoDeployRun:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            out_dir = wt / "tmp" / "dispatcher-output"
+        # #3658: stub _spawn_phase_subprocess_async to call finalizer immediately.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            out_dir = worktree / "tmp" / "dispatcher-output"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "verify.json").write_text(
                 json.dumps(
@@ -1569,9 +1638,17 @@ class TestAwaitingDeployNoDeployRun:
                     }
                 )
             )
-            return 0, 0.1
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_verify(agent_id, worktree, 0)
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(d, "_spawn_phase_subprocess_async", fake_spawn_async)
 
         agent = {
             "agent_id": "a1",
@@ -2000,7 +2077,7 @@ class TestVerifyRecoveryShortCircuit:
         )
 
     def test_phase_output_missing_on_merged_agent_preserves_succeeded(
-        self, monkeypatch: Any, tmp_path: Path
+        self, tmp_path: Path
     ) -> None:
         """When the verify subprocess returns exit 0 but fails to write
         ``verify.json`` (the #3055 recovery-path failure mode — claude
@@ -2009,38 +2086,14 @@ class TestVerifyRecoveryShortCircuit:
         :meth:`_handle_agent_failure` which flipped the row to
         ``status='failed'`` and handed it to the Opus diagnoser. On a
         merged PR that's wrong — restore ``status='succeeded'`` and
-        advance phase → ``done`` instead."""
+        advance phase → ``done`` instead.
+
+        #3658: test updated to call _finalize_verify directly; the
+        merged_at_set flag comes from the inflight ctx."""
         d, conn, handler = _make_daemon(tmp_path)
         agent = self._agent(tmp_path)
-        pr_status: dict[str, Any] = {}
-        deploy_runs: list[dict[str, Any]] = []
+        worktree = Path(agent["worktree_path"])
 
-        # First: _read_verify_skip_reason returns None.
-        # Second: _read_merged_at_and_verified_at returns (True, False) —
-        # PR merged but verify has never run.
-        conn.cursor_instance.fetch_queue = [
-            (None,),
-            (True, False),
-        ]
-
-        # Short-circuit the input-assembly helpers so we land directly
-        # on the phase_output_missing branch.
-        d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
-            return_value={
-                "issue_number": agent["issue_number"],
-                "issue_title": "t",
-                "issue_body": "- [ ] criterion",
-                "issue_comments": [],
-                "issue_labels": [],
-                "blocked_by": [],
-                "parent_issue": None,
-            }
-        )
-        d._select_deploy_status = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._infer_change_type = MagicMock(return_value="dx")  # type: ignore[method-assign]
-        d._touched_services_from_runs = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
         # The output file is not written — simulate the #3055 failure.
         d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
         # Guard rail: the failure handler must NOT be called on the
@@ -2052,7 +2105,21 @@ class TestVerifyRecoveryShortCircuit:
 
         d._handle_agent_failure = forbid_handle_failure  # type: ignore[method-assign]
 
-        d._run_verify_and_complete(agent, pr_status, "merge-sha", deploy_runs)
+        # Populate inflight ctx with merged_at_set=True (PR already merged).
+        d._phase_subprocess_inflight[agent["agent_id"]] = {
+            "phase": "verify",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "pr_number": agent["pr_number"],
+                "issue_number": agent["issue_number"],
+                "merge_sha": "merge-sha",
+                "merged_at_set": True,
+            },
+        }
+        d._finalize_verify(agent["agent_id"], worktree, 0)
 
         assert not handle_failure_calls, (
             "Must NOT flip status=failed on a phase_output_missing "
@@ -2074,39 +2141,20 @@ class TestVerifyRecoveryShortCircuit:
         )
 
     def test_phase_output_missing_on_unmerged_agent_still_flips_failed(
-        self, monkeypatch: Any, tmp_path: Path
+        self, tmp_path: Path
     ) -> None:
         """Regression guard: on the rare ``merged_at IS NULL`` code path
         (pre-#2953 agents, or a state inconsistency), the original
         failure routing via :meth:`_handle_agent_failure` must still
         fire. Otherwise we'd silently hide genuine verify regressions
-        for agents whose merge-time columns somehow never got stamped."""
-        d, conn, _handler = _make_daemon(tmp_path)
+        for agents whose merge-time columns somehow never got stamped.
+
+        #3658: test updated to call _finalize_verify directly; the
+        merged_at_set flag comes from the inflight ctx (set to False)."""
+        d, _conn, _handler = _make_daemon(tmp_path)
         agent = self._agent(tmp_path)
-        pr_status: dict[str, Any] = {}
-        deploy_runs: list[dict[str, Any]] = []
+        worktree = Path(agent["worktree_path"])
 
-        conn.cursor_instance.fetch_queue = [
-            (None,),
-            (False, False),  # not merged, not verified
-        ]
-
-        d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
-            return_value={
-                "issue_number": agent["issue_number"],
-                "issue_title": "t",
-                "issue_body": "- [ ] criterion",
-                "issue_comments": [],
-                "issue_labels": [],
-                "blocked_by": [],
-                "parent_issue": None,
-            }
-        )
-        d._select_deploy_status = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._infer_change_type = MagicMock(return_value="dx")  # type: ignore[method-assign]
-        d._touched_services_from_runs = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
         d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
 
         handle_failure_calls: list[Any] = []
@@ -2116,7 +2164,21 @@ class TestVerifyRecoveryShortCircuit:
 
         d._handle_agent_failure = record_handle_failure  # type: ignore[method-assign]
 
-        d._run_verify_and_complete(agent, pr_status, "merge-sha", deploy_runs)
+        # Populate inflight ctx with merged_at_set=False (not yet merged).
+        d._phase_subprocess_inflight[agent["agent_id"]] = {
+            "phase": "verify",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "pr_number": agent["pr_number"],
+                "issue_number": agent["issue_number"],
+                "merge_sha": "merge-sha",
+                "merged_at_set": False,
+            },
+        }
+        d._finalize_verify(agent["agent_id"], worktree, 0)
 
         assert handle_failure_calls, (
             "Legacy (unmerged) phase_output_missing path must still "
