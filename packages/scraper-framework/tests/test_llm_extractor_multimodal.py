@@ -1484,6 +1484,68 @@ class TestIsCalendarListingOnly:
         text = "Motion to Strike Grantham's Answer"
         assert _is_calendar_listing_only(text) is True
 
+    # --- Probate calendar-listing pointer patterns (#3609) ---
+
+    def test_drop_calendar_listing_probate_hearing_in_re(self) -> None:
+        """CC probate calendar-pointer rows (HEARING IN RE) are detected (#3609).
+
+        These strings are 110-180 chars — above the 100-char threshold — so
+        they previously bypassed the length gate and were kept as rulings.
+        The new pointer regex must catch them regardless of length.
+        """
+        # Three representative CC strings from the issue
+        # (shape: <time> HEARING IN RE ... --see also alternate sheet)
+        assert (
+            _is_calendar_listing_only(
+                "9:00 AM HEARING IN RE: PETITION FOR APPOINTMENT OF GUARDIAN "
+                "--see also alternate sheet"
+            )
+            is True
+        )
+        assert (
+            _is_calendar_listing_only(
+                "10:30 AM HEARING IN RE: CONSERVATORSHIP OF MARGARET ROSE JOHNSON "
+                "--see also alternate sheet for full details"
+            )
+            is True
+        )
+        assert (
+            _is_calendar_listing_only(
+                "1:30 PM HEARING IN RE: TRUST PETITION FOR DISTRIBUTION OF ASSETS "
+                "--see also alternate sheet"
+            )
+            is True
+        )
+
+    def test_drop_calendar_listing_probate_see_alt_sheet_variant(self) -> None:
+        """Strings with 'see also alternate sheet' are calendar listings (#3609)."""
+        # No time prefix — just the pointer phrase alone.
+        assert (
+            _is_calendar_listing_only(
+                "HEARING IN RE: ESTATE OF ROBERT A. HARRIS --see also alternate sheet"
+            )
+            is True
+        )
+        # Variant: 'see alt sheet' abbreviation.
+        assert (
+            _is_calendar_listing_only("9:00 AM HEARING IN RE: PETITION FOR PROBATE --see alt sheet")
+            is True
+        )
+
+    def test_real_probate_ruling_with_hearing_phrase_preserved(self) -> None:
+        """A long body containing 'hearing in re' PLUS a disposition is preserved (#3609).
+
+        The disposition-verb guard must prevent a real ruling that incidentally
+        mentions the phrase from being dropped.
+        """
+        text = (
+            "The court has reviewed the petition in this matter.  The hearing in re "
+            "the petition for appointment of guardian came on regularly for hearing.  "
+            "After reviewing all submitted papers, the petition is GRANTED.  "
+            "Letters of guardianship shall issue forthwith."
+        )
+        assert _is_calendar_listing_only(text) is False
+
 
 class TestIsCalendarListingOnlyWidened2489:
     """Additional widened-filter cases for #2489.
@@ -1866,6 +1928,36 @@ class TestDropCalendarListingRulings:
         result = _drop_calendar_listing_rulings(rulings)
         assert len(result) == 1
         assert result[0].extracted_case_number == "30-2024-00007"
+
+    def test_drop_calendar_listing_probate_hearing_in_re(self) -> None:
+        """CC probate calendar-pointer rows (HEARING IN RE) are dropped (#3609).
+
+        The verbatim strings below match the shape observed in the issue:
+        ``<HH:MM> AM HEARING IN RE: <NAME> --see also alternate sheet``.
+        These are calendar-pointer rows, not real rulings.  A sibling real
+        ruling (with GRANTED) must be preserved.
+        """
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="P25-01001",
+                extracted_case_title="In the Matter of: John Doe",
+                ruling_text=(
+                    "9:00 AM HEARING IN RE: PETITION FOR APPOINTMENT OF GUARDIAN "
+                    "--see also alternate sheet"
+                ),
+            ),
+            ExtractedRuling(
+                extracted_case_number="P25-01002",
+                extracted_case_title="Conservatorship of: Jane Smith",
+                ruling_text=(
+                    "Demurrer is SUSTAINED with leave to amend.  Plaintiff shall "
+                    "file an amended complaint within 20 days of this order."
+                ),
+            ),
+        ]
+        result = _drop_calendar_listing_rulings(rulings)
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "P25-01002"
 
 
 class TestIsShortUnsubstantiveRuling:
