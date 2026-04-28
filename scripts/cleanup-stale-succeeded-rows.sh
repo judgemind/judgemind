@@ -11,7 +11,7 @@
 # PR body lacks a ``Closes #N`` keyword). This leaves stale succeeded rows
 # that previously blocked the ready queue indefinitely via
 # ``_issue_already_attempted``. Migration 56 removed the block at the SQL
-# level; this script drains the backlog that accumulated before migration 60.
+# level; this script drains the backlog that accumulated before migration 56.
 #
 # Usage:
 #   scripts/cleanup-stale-succeeded-rows.sh
