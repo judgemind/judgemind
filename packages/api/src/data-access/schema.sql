@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 49 migrations.
+-- Generated from 56 migrations.
 
 
 
@@ -485,6 +485,9 @@ CREATE TABLE dispatcher.diagnoses (
     next_directive text,
     subprocess_pid integer
 );
+
+
+COMMENT ON COLUMN dispatcher.diagnoses.status IS '4-state lifecycle (issue #3392). "pending" — row created, awaiting dispatch (initial DEFAULT). "completed" — diagnoser ran to completion, recommendation/outcome written. "failed" — diagnoser ran but errored; counts toward 24h fallback-rate circuit breaker (issue #3383). "orphaned" — row abandoned by a previous daemon (boot-reap, watchdog kill, restart cascade); distinct from failed because no diagnoser run completed, so the breaker excludes these rows (issue #3383, daemon.py::_mark_diagnosis_orphaned).';
 
 
 COMMENT ON COLUMN dispatcher.diagnoses.actions_taken IS 'Structured action log written by the empowered diagnoser (issue #3366). One entry per side-effect: git_commit, git_push, gh_issue_create, gh_issue_edit, gh_issue_comment, skill_invoke, bash_run (non-trivial). Operator audit trail; daemon never reads.';
