@@ -692,6 +692,28 @@ if [ -n "$changed_scripts_py" ]; then
 fi
 
 # -------------------------------------------------------------------
+# Rebase silent-drop guard — run whenever an appended-list file changes
+# -------------------------------------------------------------------
+# Detects markers in WATCH_FILES that would be silently dropped by
+# git merge-tree (i.e. a rebase onto origin/main would lose test
+# blocks without producing a conflict). See issue #3670.
+changed_watch_files=$(echo "$changed_files" | grep -F 'scripts/tests/test_agent_runner_entrypoint.sh' || true)
+if [ -n "$changed_watch_files" ]; then
+    echo "pre-push: checking for silent marker drops in appended-list files..." >&2
+    if [ -x scripts/check-rebase-no-silent-drop.sh ]; then
+        if ! run_check "_" "scripts/check-rebase-no-silent-drop.sh" scripts/check-rebase-no-silent-drop.sh; then
+            echo "  A rebase onto origin/main would silently drop a test marker." >&2
+            echo "  Rebase interactively and ensure all markers survive, or add" >&2
+            echo "  a sentinel line between blocks so git can distinguish them." >&2
+            echo "  See docs/agent/code-standards.md §Silent-drop guard." >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "  WARNING: scripts/check-rebase-no-silent-drop.sh not found or not executable — skipping" >&2
+    fi
+fi
+
+# -------------------------------------------------------------------
 # PR existence check (advisory — runs before push completes)
 # -------------------------------------------------------------------
 # Git has no native post-push hook. We check here as the closest
