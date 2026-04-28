@@ -23,7 +23,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -413,6 +415,122 @@ def get_scraper_ids() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Runner helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_one_scraper(
+    entry: tuple[str, type, Any],
+    *,
+    bucket: str,
+    archiver: Any,
+    event_bus: Any,
+    court_id_cache: dict[tuple[str, str], str | None],
+    court_id_cache_lock: threading.Lock,
+    dept_judge_maps: dict[str, dict[str, str]],
+    db_conn_factory: Any,
+    owns_conn: bool,
+) -> tuple[str, bool]:
+    """Run a single scraper entry and return ``(scraper_id, had_failure)``.
+
+    *db_conn_factory* is a callable that returns a DB connection (or None).
+    In sequential mode it returns the shared top-level connection and
+    *owns_conn* is False (the caller manages the connection lifecycle).
+    In parallel mode it calls ``_connect_db`` and *owns_conn* is True,
+    so this function closes the connection in a ``finally`` block.
+    """
+    scraper_id, scraper_cls, config_factory = entry
+    log = logger.bind(scraper_id=scraper_id)
+    log.info("Running scraper")
+
+    config: ScraperConfig = config_factory(s3_bucket=bucket)
+
+    extra_kwargs: dict[str, object] = {}
+    if scraper_id in dept_judge_maps and dept_judge_maps[scraper_id]:
+        extra_kwargs["dept_judge_map"] = dept_judge_maps[scraper_id]
+
+    db_conn = db_conn_factory()
+
+    run_started_at = datetime.now(UTC)
+    run_start = time.monotonic()
+    try:
+        try:
+            scraper = scraper_cls(
+                config=config,
+                archiver=archiver,
+                event_bus=event_bus,
+                db_conn=db_conn,
+                **extra_kwargs,
+            )
+        except Exception as exc:
+            log.error("Scraper construction failed", error=str(exc))
+            if db_conn:
+                with court_id_cache_lock:
+                    cache_snapshot = dict(court_id_cache)
+                record_scraper_exception(
+                    db_conn,
+                    scraper_id,
+                    config,
+                    run_started_at,
+                    str(exc),
+                    time.monotonic() - run_start,
+                    cache_snapshot,
+                )
+                with court_id_cache_lock:
+                    court_id_cache.update(cache_snapshot)
+            return scraper_id, True
+
+        try:
+            health = scraper.run()
+        except Exception as exc:
+            log.error("Unhandled exception in scraper", error=str(exc))
+            elapsed = time.monotonic() - run_start
+            if db_conn:
+                with court_id_cache_lock:
+                    cache_snapshot = dict(court_id_cache)
+                record_scraper_exception(
+                    db_conn,
+                    scraper_id,
+                    config,
+                    run_started_at,
+                    str(exc),
+                    elapsed,
+                    cache_snapshot,
+                )
+                with court_id_cache_lock:
+                    court_id_cache.update(cache_snapshot)
+            return scraper_id, True
+
+        if db_conn:
+            with court_id_cache_lock:
+                cache_snapshot = dict(court_id_cache)
+            record_scraper_run(db_conn, health, config, cache_snapshot)
+            with court_id_cache_lock:
+                court_id_cache.update(cache_snapshot)
+
+        if health.success:
+            log.info(
+                "Scraper completed",
+                records=health.records_captured,
+                time_seconds=round(health.response_time_seconds, 2),
+            )
+            return scraper_id, False
+        else:
+            log.error(
+                "Scraper reported failure",
+                error=health.error_message,
+                records=health.records_captured,
+            )
+            return scraper_id, True
+    finally:
+        if owns_conn and db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -567,83 +685,69 @@ def run_scrapers(scraper_ids: list[str] | None = None) -> int:
                     error=str(exc),
                 )
 
-        for scraper_id, scraper_cls, config_factory in entries:
-            log = logger.bind(scraper_id=scraper_id)
-            log.info("Running scraper")
+        # Build a per-scraper-id dept-judge map dict for _run_one_scraper.
+        dept_judge_maps: dict[str, dict[str, str]] = {}
+        for sid in la_scraper_ids:
+            dept_judge_maps[sid] = la_dept_judge_map
+        for sid in riv_scraper_ids:
+            dept_judge_maps[sid] = riv_dept_judge_map
+        for sid in ventura_scraper_ids:
+            dept_judge_maps[sid] = ventura_dept_judge_map
+        for sid in sf_civil_scraper_ids:
+            dept_judge_maps[sid] = sf_dept_judge_map
 
-            config: ScraperConfig = config_factory(s3_bucket=bucket)
+        court_id_cache_lock = threading.Lock()
 
-            # Pass dept-judge mapping to LA, Riverside, Ventura, and SF scrapers
-            extra_kwargs: dict[str, object] = {}
-            if scraper_id in la_scraper_ids and la_dept_judge_map:
-                extra_kwargs["dept_judge_map"] = la_dept_judge_map
-            if scraper_id in riv_scraper_ids and riv_dept_judge_map:
-                extra_kwargs["dept_judge_map"] = riv_dept_judge_map
-            if scraper_id in ventura_scraper_ids and ventura_dept_judge_map:
-                extra_kwargs["dept_judge_map"] = ventura_dept_judge_map
-            if scraper_id in sf_civil_scraper_ids and sf_dept_judge_map:
-                extra_kwargs["dept_judge_map"] = sf_dept_judge_map
+        # Determine parallelism level from env var (default 1 = sequential).
+        max_workers = int(os.environ.get("SCRAPER_RUNNER_PARALLEL", "1"))
 
-            run_started_at = datetime.now(UTC)
-            run_start = time.monotonic()
-
-            try:
-                scraper = scraper_cls(
-                    config=config,
+        if max_workers <= 1:
+            # Sequential path — preserves existing behaviour exactly.
+            for entry in entries:
+                _, entry_had_failure = _run_one_scraper(
+                    entry,
+                    bucket=bucket,
                     archiver=archiver,
                     event_bus=event_bus,
-                    db_conn=db_conn,
-                    **extra_kwargs,
+                    court_id_cache=court_id_cache,
+                    court_id_cache_lock=court_id_cache_lock,
+                    dept_judge_maps=dept_judge_maps,
+                    db_conn_factory=lambda: db_conn,
+                    owns_conn=False,
                 )
-            except Exception as exc:
-                log.error("Scraper construction failed", error=str(exc))
-                if db_conn:
-                    record_scraper_exception(
-                        db_conn,
-                        scraper_id,
-                        config,
-                        run_started_at,
-                        str(exc),
-                        time.monotonic() - run_start,
-                        court_id_cache,
-                    )
-                had_failure = True
-                continue
-
-            try:
-                health = scraper.run()
-            except Exception as exc:
-                log.error("Unhandled exception in scraper", error=str(exc))
-                elapsed = time.monotonic() - run_start
-                if db_conn:
-                    record_scraper_exception(
-                        db_conn,
-                        scraper_id,
-                        config,
-                        run_started_at,
-                        str(exc),
-                        elapsed,
-                        court_id_cache,
-                    )
-                had_failure = True
-                continue
-
-            if db_conn:
-                record_scraper_run(db_conn, health, config, court_id_cache)
-
-            if health.success:
-                log.info(
-                    "Scraper completed",
-                    records=health.records_captured,
-                    time_seconds=round(health.response_time_seconds, 2),
-                )
-            else:
-                log.error(
-                    "Scraper reported failure",
-                    error=health.error_message,
-                    records=health.records_captured,
-                )
-                had_failure = True
+                if entry_had_failure:
+                    had_failure = True
+        else:
+            # Parallel path — each thread opens and closes its own DB connection.
+            effective_workers = min(max_workers, len(entries)) if entries else 1
+            with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _run_one_scraper,
+                        entry,
+                        bucket=bucket,
+                        archiver=archiver,
+                        event_bus=event_bus,
+                        court_id_cache=court_id_cache,
+                        court_id_cache_lock=court_id_cache_lock,
+                        dept_judge_maps=dept_judge_maps,
+                        db_conn_factory=_connect_db,
+                        owns_conn=True,
+                    ): entry[0]
+                    for entry in entries
+                }
+                for future in as_completed(futures):
+                    try:
+                        _, entry_had_failure = future.result()
+                    except Exception as exc:
+                        logger.error(
+                            "Unexpected error in parallel scraper task",
+                            scraper_id=futures[future],
+                            error=str(exc),
+                        )
+                        entry_had_failure = True
+                    if entry_had_failure:
+                        had_failure = True
     finally:
         if db_conn:
             try:
