@@ -239,6 +239,7 @@ jobs:
           - shard: 1
             test-paths: >-
               tests/courts/test_cc_tentatives.py
+              tests/courts/test_cc_dept_judges.py
               tests/courts/test_fresno_tentatives.py
               tests/courts/test_oc_tentatives.py
               tests/courts/test_oc_family_law_tentatives.py

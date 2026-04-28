@@ -1595,6 +1595,7 @@ def _fetch_rosters(
     import importlib
 
     DIRECTORIES = [
+        ("courts.ca.cc_dept_judges", "ContraCostaCourtDirectory", "ca_contra_costa"),
         ("courts.ca.oc_dept_judges", "OCCourtDirectory", "ca_orange"),
         ("courts.ca.la_dept_judges", "LACourtDirectory", "ca_los_angeles"),
         ("courts.ca.fresno_dept_judges", "FresnoCourtDirectory", "ca_fresno"),
