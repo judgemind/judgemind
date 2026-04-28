@@ -20212,7 +20212,7 @@ class DispatcherDaemon:
                 text=True,
                 cwd=str(repo_root),
                 env=diagnoser_env,
-                # noqa: timeout-required: issue-3376-fire-and-forget-reaper-enforces-90min-budget
+                # timeout-required: issue-3376-fire-and-forget-reaper-enforces-90min-budget
                 # Detach into its own process group so the reaper's
                 # SIGTERM/SIGKILL targets only the diagnoser tree.
                 # Cross-platform safe: ``start_new_session`` is a
@@ -20360,7 +20360,7 @@ class DispatcherDaemon:
                 stderr=stderr_file,
                 text=True,
                 cwd=str(popen_cwd),
-                # noqa: timeout-required: issue-3658-fire-and-forget-reaper-enforces-deadline
+                # timeout-required: issue-3658-fire-and-forget-reaper-enforces-deadline
                 start_new_session=True,
             )
         except FileNotFoundError:

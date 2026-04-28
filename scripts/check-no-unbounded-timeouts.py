@@ -47,10 +47,12 @@ For every ``ast.Call`` node under ``scripts/dispatcher/**/*.py`` (excluding
 
 Allowlist
 ---------
-A call may be exempted by adding ``# noqa: timeout-required: <reason>``
+A call may be exempted by adding ``# timeout-required: <reason>``
 to the same source line as the call (or any line covered by the call's
-multi-line span). A bare ``# noqa`` does NOT exempt -- the rule name
-``timeout-required`` AND a non-empty reason are required.
+multi-line span). A bare ``# noqa`` does NOT exempt -- the marker name
+``timeout-required`` AND a non-empty reason are required. The old form
+``# noqa: timeout-required: <reason>`` is retired (it emits ruff
+``Invalid # noqa directive`` warnings).
 
 Output
 ------
@@ -90,7 +92,7 @@ REQUESTS_METHODS = frozenset(
 # Allowlist marker -- see module docstring for the exact spelling. We
 # require the rule name AND a non-empty reason. Bare markers (no rule
 # name, or empty reason) are rejected -- see _line_is_allowlisted.
-_ALLOWLIST_RE = re.compile(r"#\s*noqa\s*:\s*timeout-required\s*:\s*\S+")
+_ALLOWLIST_RE = re.compile(r"#\s*timeout-required\s*:\s*\S+")
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +397,7 @@ def _node_contains(parent: ast.AST, child: ast.AST) -> bool:
 
 def _line_is_allowlisted(call: ast.Call, source_lines: list[str]) -> bool:
     """Return True if any source line covered by ``call`` carries a
-    ``# noqa: timeout-required: <reason>`` comment."""
+    ``# timeout-required: <reason>`` comment."""
     start = call.lineno
     end = getattr(call, "end_lineno", None) or start
     for lineno in range(start, end + 1):
@@ -566,7 +568,7 @@ def main(argv: list[str]) -> int:
             sys.stderr.write(f"    {line}\n")
         sys.stderr.write(
             "\nFix: add the missing kwarg, or annotate the call with\n"
-            "    # noqa: timeout-required: <reason>\n"
+            "    # timeout-required: <reason>\n"
             "on the same line. See scripts/check-no-unbounded-timeouts.py\n"
             "for the full rule table. Tracking: issue #3356.\n"
         )

@@ -350,7 +350,7 @@ class TestAllowlist:
     def test_allowlist_with_reason_exempts(self, tmp_path: Path) -> None:
         source = (
             "import requests\n"
-            "requests.get('https://example.com')  # noqa: timeout-required: test fixture\n"
+            "requests.get('https://example.com')  # timeout-required: test fixture\n"
         )
         assert _scan(tmp_path, source) == []
 
@@ -361,31 +361,40 @@ class TestAllowlist:
         assert len(violations) == 1
 
     def test_noqa_rule_only_does_not_exempt(self, tmp_path: Path) -> None:
-        """``# noqa: timeout-required`` without a colon-reason must NOT
+        """``# timeout-required`` without a colon-reason must NOT
         exempt — the rule requires a non-empty justification."""
         source = (
-            "import requests\n"
-            "requests.get('https://example.com')  # noqa: timeout-required\n"
+            "import requests\nrequests.get('https://example.com')  # timeout-required\n"
         )
         violations = _scan(tmp_path, source)
         assert len(violations) == 1
 
     def test_noqa_empty_reason_does_not_exempt(self, tmp_path: Path) -> None:
-        """``# noqa: timeout-required:`` (colon present, reason empty)
+        """``# timeout-required:`` (colon present, reason empty)
         must NOT exempt."""
         source = (
             "import requests\n"
-            "requests.get('https://example.com')  # noqa: timeout-required: \n"
+            "requests.get('https://example.com')  # timeout-required: \n"
+        )
+        violations = _scan(tmp_path, source)
+        assert len(violations) == 1
+
+    def test_noqa_prefix_form_does_not_exempt(self, tmp_path: Path) -> None:
+        """The legacy ``# noqa: timeout-required: reason`` form is retired
+        and must NOT exempt — use ``# timeout-required: reason`` instead."""
+        source = (
+            "import requests\n"
+            "requests.get('https://example.com')  # noqa: timeout-required: legacy-form\n"
         )
         violations = _scan(tmp_path, source)
         assert len(violations) == 1
 
     def test_allowlist_inside_multiline_call_exempts(self, tmp_path: Path) -> None:
-        """A noqa marker on any line covered by the call's span exempts."""
+        """A timeout-required marker on any line covered by the call's span exempts."""
         source = (
             "import requests\n"
             "requests.get(\n"
-            "    'https://example.com',  # noqa: timeout-required: legacy\n"
+            "    'https://example.com',  # timeout-required: legacy\n"
             ")\n"
         )
         assert _scan(tmp_path, source) == []
