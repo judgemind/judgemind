@@ -2170,6 +2170,134 @@ class TestCleanCaseTitle:
         if result is not None:
             assert "CVPS" not in result
 
+    # --- Trailing connector stripping after 120-char truncation (#3730) ---
+
+    def test_truncation_strips_trailing_and(self) -> None:
+        """SB example: trailing 'and' is stripped after 120-char truncation."""
+        # "Friends of Fawnskin..." is 134 chars — long enough to trigger truncation.
+        raw = (
+            "Friends of Fawnskin Mountain Communities Foundation"
+            " v. County of San Bernardino and Board of Supervisors"
+            " for the County of San Bernardino"
+        )
+        result = clean_case_title(raw)
+        assert result is not None
+        assert len(result) <= 120
+        last_word = result.rstrip().split()[-1].lower()
+        assert last_word not in {
+            "and",
+            "for",
+            "the",
+            "of",
+            "to",
+            "by",
+            "in",
+            "on",
+            "with",
+            "or",
+            "a",
+            "an",
+            "as",
+        }
+
+    def test_truncation_strips_trailing_for_the(self) -> None:
+        """LA example: trailing connector phrase is stripped after 120-char truncation."""
+        # Pad the plaintiff name to ensure the truncation path runs (>120 chars total).
+        plaintiff = "A" * 45 + " Long Plaintiff Name Inc"
+        raw = plaintiff + " v. City of Los Angeles, a public entity; and Does 1 to 50"
+        # Verify input is long enough to trigger the truncation path
+        assert len(raw) > 120
+        result = clean_case_title(raw)
+        assert result is not None
+        assert len(result) <= 120
+        last_word = result.rstrip().split()[-1].lower()
+        assert last_word not in {
+            "and",
+            "for",
+            "the",
+            "of",
+            "to",
+            "by",
+            "in",
+            "on",
+            "with",
+            "or",
+            "a",
+            "an",
+            "as",
+        }
+
+    def test_truncation_strips_trailing_of(self) -> None:
+        """Orange/UCLA example: trailing 'of' is stripped after 120-char truncation."""
+        # Pad the plaintiff name so the title exceeds 120 chars and truncation
+        # lands on a connector word.
+        plaintiff = "A" * 60 + " Plaintiff"
+        raw = plaintiff + " v. The Regents of the University of California, Los Angeles"
+        assert len(raw) > 120
+        result = clean_case_title(raw)
+        assert result is not None
+        assert len(result) <= 120
+        last_word = result.rstrip().split()[-1].lower()
+        assert last_word not in {
+            "and",
+            "for",
+            "the",
+            "of",
+            "to",
+            "by",
+            "in",
+            "on",
+            "with",
+            "or",
+            "a",
+            "an",
+            "as",
+        }
+
+    def test_truncation_no_op_when_under_limit(self) -> None:
+        """Titles <=120 chars ending in a connector are returned unchanged (no truncation path)."""
+        # This title is short; the 120-char truncation block is never entered.
+        raw = "Smith v. Jones and Partners"
+        result = clean_case_title(raw)
+        # The truncation path must NOT have fired — result is well within limit.
+        assert result is not None
+        assert len(result) <= 120
+        # The connector-stripping regex must NOT have been applied outside the
+        # truncation block; "Partners" should still be present.
+        assert "Partners" in result
+
+    def test_truncation_strips_chained_connectors(self) -> None:
+        """Synthetic: trailing ', and the' chain after truncation is stripped in one pass."""
+        # Build a title where the word-boundary truncation lands on ', and the'
+        # e.g. plaintiff (50 chars) + " v. " + defendant that ends in ", and the XYZ"
+        plaintiff = "A" * 50 + " Plaintiff Corp"
+        # Craft the defendant so the 120-char word-boundary cut leaves ', and the'
+        # parts[0] = plaintiff (65 chars), " v. " = 4, so max_def_len = 120-65-4=51
+        # We want space_idx to land right after ", and the" — fill up 51 chars exactly
+        # so last word before the boundary IS a connector word.
+        defendant = "Defendant Entity, and the " + "X" * 25 + " More Stuff"
+        raw = plaintiff + " v. " + defendant
+        assert len(raw) > 120
+        result = clean_case_title(raw)
+        if result is not None:
+            assert len(result) <= 120
+            last_word = result.rstrip().split()[-1].lower()
+            assert last_word not in {
+                "and",
+                "for",
+                "the",
+                "of",
+                "to",
+                "by",
+                "in",
+                "on",
+                "with",
+                "or",
+                "a",
+                "an",
+                "as",
+            }
+
 
 # ---------------------------------------------------------------------------
 # Ventura-specific fixes (#2370)
