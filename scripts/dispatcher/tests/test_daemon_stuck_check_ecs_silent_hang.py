@@ -189,13 +189,20 @@ class TestEcsSilentHangReaper:
             "arn:aws:ecs:us-west-2:155326049300:task/"
             "judgemind-dispatcher/9d333e50bb3c4653b4ba8eb6506f9d13"
         )
+        # Post-#3731 row shape: (agent_id, issue_number, phase,
+        # silent_seconds, total_runtime_seconds, execution_mode,
+        # agent_task_arn). silent=2000 over the push_and_pr silent-hang
+        # threshold (900s) → silent-hang fires. total=2000 also over
+        # push_and_pr stuck threshold (default 1800s), but silent-hang
+        # takes precedence per #3731 decision rule.
         conn.cursor_instance.fetchall_queue = [
             [
                 (
                     "2ff6e282-a431-493c-bc3e-b899d4c92ca1",
                     3608,
                     "push_and_pr",
-                    2000.0,  # 2000s > 1800s default threshold
+                    2000.0,  # silent_seconds — over 900s silent threshold
+                    2000.0,  # total_runtime — also over 1800s stuck (silent wins)
                     "ecs",
                     task_arn,
                 ),
@@ -204,9 +211,11 @@ class TestEcsSilentHangReaper:
         # Order of fetchone calls inside _check_stuck_agents (ECS branch
         # via _handle_agent_failure → _write_failure → _mark_agent_terminal):
         # (1) stuck_timeout_s_by_phase override read — returns None.
-        # (2) failure_id from _write_failure RETURNING.
+        # (2) silent_hang_timeout_s_by_phase override read — None [#3731].
+        # (3) failure_id from _write_failure RETURNING.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override unset
+            None,  # silent_hang_timeout_s_by_phase override unset
             (200,),  # failure_id from _write_failure RETURNING
         ]
 
@@ -275,19 +284,23 @@ class TestEcsSilentHangReaper:
         """
         d, conn, handler = _make_daemon(tmp_path)
 
+        # Post-#3731 row shape with silent + total. Both 600s — well
+        # below silent (900s) and stuck (1800s default) thresholds.
         conn.cursor_instance.fetchall_queue = [
             [
                 (
                     "agent-ecs-fast",
                     3656,
                     "push_and_pr",
-                    600.0,  # well below 1800s default threshold
+                    600.0,  # silent_seconds — under 900s
+                    600.0,  # total_runtime — under 1800s
                     "ecs",
                     "arn:aws:ecs:us-west-2:155326049300:task/cluster/abc",
                 ),
             ],
         ]
-        conn.cursor_instance.fetch_queue = [None]
+        # Both override reads fire even when no agent fires.
+        conn.cursor_instance.fetch_queue = [None, None]
 
         flagged = d._check_stuck_agents()
         assert flagged == 0
@@ -319,20 +332,25 @@ class TestEcsSilentHangReaper:
         """
         d, conn, handler = _make_daemon(tmp_path)
 
+        # Post-#3731 7-tuple: silent=2000 over 900s silent threshold →
+        # silent-hang fires. NULL agent_task_arn — _force_stop_ecs_task
+        # short-circuits cleanly.
         conn.cursor_instance.fetchall_queue = [
             [
                 (
                     "agent-ecs-no-arn",
                     3656,
                     "push_and_pr",
-                    2000.0,  # > 1800s default threshold
+                    2000.0,  # silent_seconds — over 900s
+                    2000.0,  # total_runtime — also over but silent wins
                     "ecs",
                     None,  # missing ARN
                 ),
             ],
         ]
         conn.cursor_instance.fetch_queue = [
-            None,
+            None,  # stuck override
+            None,  # silent_hang override [#3731]
             (201,),  # failure_id RETURNING
         ]
 
@@ -368,26 +386,31 @@ class TestEcsSilentHangReaper:
         """
         d, conn, handler = _make_daemon(tmp_path)
 
+        # Post-#3731: silent=600 under 900s silent threshold so silent-
+        # hang does NOT fire; total=2000 over 1800s stuck threshold so
+        # the existing stuck_timeout path fires (preserves test intent).
         conn.cursor_instance.fetchall_queue = [
             [
                 (
                     "agent-subproc",
                     3656,
                     "push_and_pr",
-                    2000.0,  # > 1800s default threshold
+                    600.0,  # silent_seconds — under 900s
+                    2000.0,  # total_runtime — over 1800s default stuck
                     "subprocess",
                     None,
                 ),
             ],
         ]
-        # Subprocess path's fetch sequence (unchanged from the
-        # pre-#3656 test fixtures):
+        # Subprocess path's fetch sequence:
         # (1) stuck_timeout_s_by_phase override — None.
-        # (2) failure_id RETURNING.
-        # (3) _has_prior_stuck_timeout_in_window — None (first occurrence).
-        # (4) prior retry-marker count.
-        # (5) backoff schedule.
+        # (2) silent_hang_timeout_s_by_phase override — None [#3731].
+        # (3) failure_id RETURNING.
+        # (4) _has_prior_stuck_timeout_in_window — None (first occurrence).
+        # (5) prior retry-marker count.
+        # (6) backoff schedule.
         conn.cursor_instance.fetch_queue = [
+            None,
             None,
             (300,),
             None,
@@ -433,21 +456,27 @@ class TestEcsSilentHangReaper:
         d, conn, handler = _make_daemon(tmp_path)
 
         ecs_arn = "arn:aws:ecs:us-west-2:155326049300:task/cluster/ecs1"
+        # Post-#3731: 7-tuple shape. ECS row trips silent-hang
+        # (silent=2000 > 900 push_and_pr silent threshold). Subprocess
+        # row trips total-runtime only (silent=900 < 1800 summary
+        # silent threshold; total=7000 > 6000 summary stuck threshold).
         conn.cursor_instance.fetchall_queue = [
             [
                 (
                     "agent-mixed-ecs",
                     3656,
                     "push_and_pr",
-                    2000.0,  # > 1800s default
+                    2000.0,  # silent_seconds — over 900 silent threshold
+                    2000.0,  # total_runtime — silent-hang takes precedence
                     "ecs",
                     ecs_arn,
                 ),
                 (
                     "agent-mixed-sub",
                     3656,
-                    "summary",  # 6000s threshold (#2885)
-                    7000.0,  # > 6000s
+                    "summary",  # silent=1800, stuck=6000 (#2885)
+                    900.0,  # silent_seconds — under 1800 silent
+                    7000.0,  # total_runtime — over 6000 stuck
                     "subprocess",
                     None,
                 ),
@@ -455,6 +484,7 @@ class TestEcsSilentHangReaper:
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override
+            None,  # silent_hang_timeout_s_by_phase override [#3731]
             # ECS agent failure write (first):
             (400,),
             # subprocess agent failure write:

@@ -139,15 +139,22 @@ class TestStuckTimeoutRepeated:
         """
         d, conn, handler = _make_daemon(tmp_path)
 
+        # Post-#3731 row tuple: silent_seconds under 5400 (ralph silent
+        # threshold) so total-runtime path fires (stuck_timeout
+        # category, not silent_hang). Tuple shape: (agent_id,
+        # issue_number, phase, silent_seconds, total_runtime_seconds,
+        # execution_mode, agent_task_arn).
         conn.cursor_instance.fetchall_queue = [
-            [("agent-first", 101, "ralph", 57600.0)],  # 16 hr > 54000s threshold
+            [("agent-first", 101, "ralph", 1800.0, 57600.0, "subprocess", None)],
         ]
         # Fetch order with _mark_agent_terminal / _create_retry_marker stubbed:
         # (1) stuck_timeout_s_by_phase config override (unset → None),
-        # (2) RETURNING failure_id from _write_failure INSERT = 10,
-        # (3) _has_prior_stuck_timeout_in_window → None (no prior row).
+        # (2) silent_hang_timeout_s_by_phase override (None) [#3731],
+        # (3) RETURNING failure_id from _write_failure INSERT = 10,
+        # (4) _has_prior_stuck_timeout_in_window → None (no prior row).
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (10,),  # failure_id RETURNING from _write_failure
             None,  # _has_prior_stuck_timeout_in_window — no prior
         ]
@@ -177,14 +184,16 @@ class TestStuckTimeoutRepeated:
         d, conn, handler = _make_daemon(tmp_path)
 
         conn.cursor_instance.fetchall_queue = [
-            [("agent-repeat", 202, "ralph", 57600.0)],
+            [("agent-repeat", 202, "ralph", 1800.0, 57600.0, "subprocess", None)],
         ]
         # Fetch order with _mark_agent_terminal / _create_retry_marker stubbed:
         # (1) stuck_timeout_s_by_phase override — unset,
-        # (2) RETURNING failure_id = 10 (current failure),
-        # (3) _has_prior_stuck_timeout_in_window → (9,) (prior row exists).
+        # (2) silent_hang_timeout_s_by_phase override — unset [#3731],
+        # (3) RETURNING failure_id = 10 (current failure),
+        # (4) _has_prior_stuck_timeout_in_window → (9,) (prior row exists).
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (10,),  # failure_id RETURNING (current failure)
             (9,),  # prior failure_id within window
         ]

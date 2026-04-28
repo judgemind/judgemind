@@ -682,15 +682,20 @@ class TestPerPhaseStuckTimeout:
     """
 
     def test_ralph_below_threshold_not_flagged(self, tmp_path: Path) -> None:
-        """A 2.5-minute ralph is not stuck (threshold is 90 min)."""
+        """A 2.5-minute ralph is not stuck (threshold is 15 hr).
+
+        Row tuple shape (#3731): (agent_id, issue_number, phase,
+        silent_seconds, total_runtime_seconds, execution_mode,
+        agent_task_arn). Both silent and total are 150s — under both
+        thresholds. The reaper does not fire.
+        """
         d, conn, _handler = _make_daemon(tmp_path)
-        # SELECT returns (agent_id, issue_number, phase, elapsed).
-        # Post-#2927 the #2903 ``kind`` column was dropped.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 150.0)],  # 2.5 min elapsed
+            [("agent-1", 42, "ralph", 150.0, 150.0, "subprocess", None)],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
         ]
         assert d._check_stuck_agents() == 0
 
@@ -698,21 +703,30 @@ class TestPerPhaseStuckTimeout:
         """A 90-second plan is not stuck (threshold is 2.5 hr, #2885)."""
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "plan", 90.0)],
+            [("agent-1", 42, "plan", 90.0, 90.0, "subprocess", None)],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
         ]
         assert d._check_stuck_agents() == 0
 
     def test_ralph_over_threshold_flagged(self, tmp_path: Path) -> None:
-        """A 16-hour ralph IS stuck (threshold is 15 hr / 54000s, #2885)."""
+        """A 16-hour ralph IS stuck (total-runtime threshold 15 hr exceeded).
+
+        Post-#3731: silent_seconds set under the 5400s ralph silent-hang
+        threshold so only the total-runtime path fires (preserves
+        original test intent — stuck_timeout category, not silent-hang).
+        """
         d, conn, handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 57600.0)],  # 16 hr
+            # silent=1800 (under 5400 silent threshold), total=57600
+            # (over 54000 stuck threshold) → stuck_timeout fires.
+            [("agent-1", 42, "ralph", 1800.0, 57600.0, "subprocess", None)],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (42,),  # failure_id RETURNING from _write_failure
             None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior retry marker count
@@ -727,13 +741,15 @@ class TestPerPhaseStuckTimeout:
     def test_config_override_wins_over_default(self, tmp_path: Path) -> None:
         """Operator override in ``stuck_timeout_s_by_phase`` takes precedence."""
         d, conn, _handler = _make_daemon(tmp_path)
-        # Elapsed 400s — under the default 5min claiming threshold, but
-        # operator set claiming override to 300s. Should fire.
+        # silent=30 (under 60s claiming silent threshold), total=400s.
+        # Operator override sets claiming stuck threshold to 300s, so
+        # total (400) > stuck (300) → stuck_timeout fires.
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "claiming", 400.0)],
+            [("agent-1", 42, "claiming", 30.0, 400.0, "subprocess", None)],
         ]
         conn.cursor_instance.fetch_queue = [
             ('{"claiming": 300}',),  # operator override
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (42,),  # failure_id RETURNING from _write_failure
             None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior marker count
@@ -744,12 +760,14 @@ class TestPerPhaseStuckTimeout:
     def test_unknown_phase_falls_back_to_global(self, tmp_path: Path) -> None:
         """Phase not in the table falls back to STUCK_TIMEOUT_SECONDS (30 min)."""
         d, conn, _handler = _make_daemon(tmp_path)
-        # Novel phase, elapsed 31 min — over the 30 min default fallback.
+        # silent=600 (under SILENT_HANG_DEFAULT 1800s), total=31min
+        # (over STUCK_TIMEOUT_SECONDS 30min default).
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "novel_phase", 31 * 60.0)],
+            [("agent-1", 42, "novel_phase", 600.0, 31 * 60.0, "subprocess", None)],
         ]
         conn.cursor_instance.fetch_queue = [
-            None,  # no override
+            None,  # stuck override — no
+            None,  # silent_hang override — no
             (42,),  # failure_id RETURNING from _write_failure
             None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior marker count
@@ -865,13 +883,22 @@ class TestIssue2885TenTimesBump:
         though the subprocess was 15s from clean exit. The new 54000s
         threshold gives ~15 hr of headroom — enough that a
         normally-progressing ralph can NEVER race against the timer.
+
+        Post-#3731 the silent-hang and total-runtime thresholds are
+        evaluated independently. A normally-progressing ralph emits
+        ``phase_transitions`` every few minutes, so silent_seconds
+        stays well under the 5400s silent-hang threshold even when
+        total_runtime is 5419s.
         """
         d, conn, _handler = _make_daemon(tmp_path)
         conn.cursor_instance.fetchall_queue = [
-            [("agent-821e96ee", 2565, "ralph", 5419.0, "task")],
+            # silent=300 (5min — healthy ralph iteration cadence),
+            # total=5419 (under 54000 ralph stuck threshold).
+            [("agent-821e96ee", 2565, "ralph", 300.0, 5419.0, "subprocess", None)],
         ]
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
         ]
         # Pre-fix: 1. Post-fix: 0.
         assert d._check_stuck_agents() == 0

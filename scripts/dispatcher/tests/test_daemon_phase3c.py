@@ -212,27 +212,30 @@ class TestCheckStuckAgents:
     ) -> None:
         d, conn, handler = _make_daemon(tmp_path)
 
-        # Seeded row: one stale ralph agent. Elapsed 55000s > 54000s
-        # (ralph default threshold bumped 10× in #2885). #2872 — the
-        # SELECT returns (agent_id, issue_number, phase, elapsed_seconds)
-        # and the Python-side comparison applies the per-phase
-        # threshold. The kind column was removed from the SELECT
-        # post-#2927 — every row is daemon-owned by construction.
+        # Seeded row: one stale ralph agent. The post-#3731 reaper
+        # evaluates two thresholds independently:
+        #   * silent_seconds=1800 — under ralph silent-hang (5400s),
+        #   * total_runtime_seconds=55000 — over ralph total-runtime
+        #     (54000s, bumped 10× in #2885).
+        # Total-runtime trips alone → stuck_timeout category (existing
+        # behavior preserved). Row tuple shape (#3656/#3731):
+        # (agent_id, issue_number, phase, silent_seconds,
+        #  total_runtime_seconds, execution_mode, agent_task_arn).
         conn.cursor_instance.fetchall_queue = [
-            [("agent-1", 42, "ralph", 55000.0)],
+            [("agent-1", 42, "ralph", 1800.0, 55000.0, "subprocess", None)],
         ]
         # Order inside _check_stuck_agents + _create_retry_marker:
         # (1) stuck_timeout_s_by_phase override read (returns None → fall
         # through to module defaults),
-        # (2) RETURNING failure_id from _write_failure INSERT,
-        # (3) _has_prior_stuck_timeout_in_window SELECT (returns None →
+        # (2) silent_hang_timeout_s_by_phase override read (None) [#3731],
+        # (3) RETURNING failure_id from _write_failure INSERT,
+        # (4) _has_prior_stuck_timeout_in_window SELECT (returns None →
         #     first occurrence, no repeated event),
-        # (4) COUNT prior markers in _create_retry_marker,
-        # (5) read backoff_seconds config.
-        # Post-#2927 the #2903 _lookup_agent_kind defensive fetch is
-        # gone — no task-skill rows exist to guard against.
+        # (5) COUNT prior markers in _create_retry_marker,
+        # (6) read backoff_seconds config.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (42,),  # failure_id from _write_failure RETURNING
             None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior retry marker count
@@ -299,22 +302,28 @@ class TestCheckStuckAgents:
 
     def test_multiple_stuck_agents_all_flagged(self, tmp_path: Path) -> None:
         d, conn, handler = _make_daemon(tmp_path)
-        # Two stuck agents: ralph exceeds 54000s threshold at 55000s,
-        # claiming exceeds 5min threshold at 600s. (#2872 per-phase
-        # thresholds replace the single 30min global; #2885 bumped
-        # ralph 10× from 90min to 15hr.)
+        # Two stuck agents — both want stuck_timeout (total-runtime
+        # only, no silent-hang) routing under #3731 split.
+        # ralph: silent=1800 (under 5400 silent threshold), total=55000
+        #        (over 54000 stuck threshold) → stuck_timeout fires.
+        # claiming: silent=30 (under 60 silent threshold), total=600
+        #           (over 300s stuck threshold) → stuck_timeout fires.
+        # Row tuple shape (#3731): (agent_id, issue_number, phase,
+        #   silent_seconds, total_runtime_seconds, execution_mode,
+        #   agent_task_arn).
         conn.cursor_instance.fetchall_queue = [
             [
-                ("agent-1", 1, "ralph", 55000.0),
-                ("agent-2", 2, "claiming", 600.0),
+                ("agent-1", 1, "ralph", 1800.0, 55000.0, "subprocess", None),
+                ("agent-2", 2, "claiming", 30.0, 600.0, "subprocess", None),
             ],
         ]
         # Queue: (1) stuck_timeout_s_by_phase override (unset),
+        # (2) silent_hang_timeout_s_by_phase override (unset) [#3731],
         # then for each agent: failure_id RETURNING, prior_stuck check,
         # prior marker count, backoff config.
-        # Post-#2927 the #2903 _lookup_agent_kind fetch is gone.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase — unset
+            None,  # silent_hang_timeout_s_by_phase — unset
             (42,),  # failure_id RETURNING for agent-1
             None,  # _has_prior_stuck_timeout_in_window for agent-1 — no prior
             (0,),  # prior marker count for agent-1

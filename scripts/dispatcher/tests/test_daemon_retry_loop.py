@@ -141,19 +141,27 @@ class TestRetryLoopEndToEnd:
         d, conn, handler = _make_daemon(tmp_path)
 
         # ── Step 1: _check_stuck_agents ────────────────────────────────
-        # Seed one stuck ralph agent.  Elapsed 55000s > 54000s (ralph
-        # per-phase threshold, bumped 10× by #2885).
+        # Seed one stuck ralph agent. Post-#3731 the reaper evaluates
+        # silent-hang (5400s for ralph) and total-runtime (54000s) as
+        # independent thresholds. To preserve this test's intent
+        # (stuck_timeout fires, not silent_hang), set silent_seconds
+        # under 5400 and total_runtime over 54000.
+        # Row tuple shape (#3656/#3731): (agent_id, issue_number,
+        # phase, silent_seconds, total_runtime_seconds, execution_mode,
+        # agent_task_arn).
         conn.cursor_instance.fetchall_queue = [
-            [("retry-agent-1", 2794, "ralph", 55000.0)],
+            [("retry-agent-1", 2794, "ralph", 1800.0, 55000.0, "subprocess", None)],
         ]
         # Per _check_stuck_agents + _create_retry_marker call order:
         # (1) stuck_timeout_s_by_phase config override (unset → None),
-        # (2) RETURNING failure_id from _write_failure INSERT,
-        # (3) _has_prior_stuck_timeout_in_window (no prior → None),
-        # (4) COUNT prior retry markers (0 → first attempt),
-        # (5) backoff schedule.
+        # (2) silent_hang_timeout_s_by_phase override (None) [#3731],
+        # (3) RETURNING failure_id from _write_failure INSERT,
+        # (4) _has_prior_stuck_timeout_in_window (no prior → None),
+        # (5) COUNT prior retry markers (0 → first attempt),
+        # (6) backoff schedule.
         conn.cursor_instance.fetch_queue = [
             None,  # stuck_timeout_s_by_phase override — unset
+            None,  # silent_hang_timeout_s_by_phase override — unset
             (42,),  # failure_id RETURNING from _write_failure
             None,  # _has_prior_stuck_timeout_in_window — no prior
             (0,),  # prior retry marker count
