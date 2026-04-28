@@ -23,7 +23,6 @@ Covers:
 from __future__ import annotations
 
 import logging
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -324,27 +323,23 @@ class TestPhaseOutputMissingPreview:
         worktree.mkdir()
         _write_phase_log(worktree, "fix-ci", "fix-ci subprocess returned wrong shape")
 
-        agent = {
-            "agent_id": "agent-123",
-            "issue_number": 1,
-            "phase": "awaiting_ci",
-            "pr_number": 77,
-            "worktree_path": str(worktree),
-            "retries_used": 0,
-            "status": "running",
-        }
-        pr_status = {"statusCheckRollup": []}
+        agent_id = "agent-123"
 
         # Short-circuit helpers that require richer state.
-        d._fetch_pr_diff = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._branch_for_agent = MagicMock(return_value="agent/x")  # type: ignore[method-assign]
-        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
         d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
 
-        d._run_fix_ci(agent, pr_status)
+        # #3658: call _finalize_fix_ci directly (async path).
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "fix-ci",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {"pr_number": 77, "issue_number": 1, "retries_used": 0, "agent": {}},
+        }
+        d._finalize_fix_ci(agent_id, worktree, 0)
 
         events = handler.events("phase_output_missing")
         assert events
@@ -358,42 +353,31 @@ class TestPhaseOutputMissingPreview:
         worktree.mkdir()
         _write_phase_log(worktree, "verify", "Verify skill crashed on AC #3")
 
-        agent = {
-            "agent_id": "agent-123",
-            "issue_number": 1,
-            "phase": "awaiting_deploy",
-            "pr_number": 77,
-            "worktree_path": str(worktree),
-            "retries_used": 0,
-            "status": "running",
-        }
-        pr_status = {"statusCheckRollup": []}
-        merge_sha = "deadbeef"
-        deploy_runs: list[dict[str, Any]] = []
+        agent_id = "agent-123"
 
         # Short-circuit helpers — verify's input-assembly is long and we
         # only want the missing-output branch.
-        d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
-            return_value={
-                "issue_number": 1,
-                "issue_title": "t",
-                "issue_body": "- [ ] do thing",
-                "issue_comments": [],
-                "issue_labels": [],
-                "blocked_by": [],
-                "parent_issue": None,
-            }
-        )
-        d._select_deploy_status = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._infer_change_type = MagicMock(return_value="dx")  # type: ignore[method-assign]
-        d._touched_services_from_runs = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
         d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
 
-        d._run_verify_and_complete(agent, pr_status, merge_sha, deploy_runs)
+        # #3658: call _finalize_verify directly; merged_at_set=False routes
+        # through handle_agent_failure (the desired "phase_output_missing" path).
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "verify",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "pr_number": 77,
+                "issue_number": 1,
+                "merge_sha": "deadbeef",
+                "merged_at_set": False,
+            },
+        }
+        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
+        d._finalize_verify(agent_id, worktree, 0)
 
         events = handler.events("phase_output_missing")
         assert events
@@ -442,6 +426,30 @@ class TestRetroFailurePreviews:
         )
         d._write_phase_input = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
+        d._read_phase_output = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+    def _run_retro_finalize(
+        self,
+        d: daemon.DispatcherDaemon,
+        agent: dict[str, Any],
+        worktree: Path,
+        exit_code: int | None,
+    ) -> None:
+        """#3658: populate inflight registry and call _finalize_retro directly
+        (mirrors the reaper pattern used in test_daemon_phase3e.py)."""
+        agent_id = agent["agent_id"]
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "retro",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "issue_number": agent.get("issue_number"),
+                "pr_number": agent.get("pr_number"),
+            },
+        }
+        d._finalize_retro(agent_id, worktree, exit_code)
 
     def test_nonzero_exit_logs_preview(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, _conn, handler = _make_daemon(tmp_path)
@@ -450,11 +458,8 @@ class TestRetroFailurePreviews:
         _write_phase_log(worktree, "retro", "retro exit 1: bad haiku")
         self._prep(d, agent)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            return 1, 2.0
-
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
-        d._run_retro_phase(agent)
+        # #3658: async path — call _finalize_retro directly with nonzero exit.
+        self._run_retro_finalize(d, agent, worktree, exit_code=1)
 
         events = handler.events("retro_nonzero_exit")
         assert events
@@ -468,14 +473,12 @@ class TestRetroFailurePreviews:
     ) -> None:
         d, _conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
+        worktree = Path(agent["worktree_path"])
         # No phase log written.
         self._prep(d, agent)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            return 1, 2.0
-
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
-        d._run_retro_phase(agent)
+        # #3658: async path — nonzero exit, no log file.
+        self._run_retro_finalize(d, agent, worktree, exit_code=1)
 
         events = handler.events("retro_nonzero_exit")
         assert events
@@ -491,11 +494,9 @@ class TestRetroFailurePreviews:
         )
         self._prep(d, agent)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            raise subprocess.TimeoutExpired(cmd="claude", timeout=300)
-
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
-        d._run_retro_phase(agent)
+        # #3658: async path — exit_code=None means reaper killed the process
+        # (deadline exceeded), which maps to the retro_timeout event.
+        self._run_retro_finalize(d, agent, worktree, exit_code=None)
 
         events = handler.events("retro_timeout")
         assert events
@@ -507,24 +508,43 @@ class TestRetroFailurePreviews:
     def test_subprocess_error_logs_preview(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
+        """#3658: retro_subprocess_error is replaced by phase_async_spawn_failed.
+
+        Pre-#3658, a FileNotFoundError during Popen was caught synchronously
+        inside _spawn_phase_subprocess and logged as ``retro_subprocess_error``.
+        Post-#3658, the same OS error is caught inside
+        _spawn_phase_subprocess_async and logged as ``phase_async_spawn_failed``
+        (phase="retro").  No stderr_preview is attached because the subprocess
+        never ran — there is no log to read.
+        """
         d, _conn, handler = _make_daemon(tmp_path)
         agent = _succeeded_agent(tmp_path)
         worktree = Path(agent["worktree_path"])
         _write_phase_log(worktree, "retro", "pre-spawn OS error log content")
         self._prep(d, agent)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
+        # Patch subprocess.Popen so the actual _spawn_phase_subprocess_async
+        # raises FileNotFoundError (simulating "claude" binary missing).
+        import subprocess as _subprocess
+
+        _orig_popen = _subprocess.Popen
+
+        def _fake_popen(*args: Any, **kwargs: Any) -> None:
             raise FileNotFoundError("claude binary missing")
 
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
+        monkeypatch.setattr(_subprocess, "Popen", _fake_popen)
+
+        # Call _start_retro (fires async spawn) via _run_retro_phase.
         d._run_retro_phase(agent)
 
-        events = handler.events("retro_subprocess_error")
+        # The event is now phase_async_spawn_failed, not retro_subprocess_error.
+        events = handler.events("phase_async_spawn_failed")
         assert events
         record = events[0]
-        preview = getattr(record, "stderr_preview", None)
-        assert preview is not None
-        assert "pre-spawn" in preview
+        assert getattr(record, "phase", None) == "retro"
+        assert getattr(record, "reason", None) == "claude_binary_not_found"
+
+        monkeypatch.setattr(_subprocess, "Popen", _orig_popen)
 
     def test_output_missing_logs_preview(
         self, monkeypatch: Any, tmp_path: Path
@@ -535,12 +555,8 @@ class TestRetroFailurePreviews:
         _write_phase_log(worktree, "retro", "retro JSON write failed silently")
         self._prep(d, agent)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            # Exit 0 but no output file written.
-            return 0, 1.0
-
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
-        d._run_retro_phase(agent)
+        # #3658: async path — exit 0 but no output file (read returns None via mock).
+        self._run_retro_finalize(d, agent, worktree, exit_code=0)
 
         events = handler.events("retro_output_missing")
         assert events
@@ -567,11 +583,8 @@ class TestRetroFailurePreviews:
         _write_phase_log(worktree, "retro", "Z" * 3000)
         self._prep(d, agent)
 
-        def fake_spawn(phase: str, wt: Path, agent_id: str) -> tuple[int, float]:
-            return 1, 1.0
-
-        monkeypatch.setattr(d, "_spawn_phase_subprocess", fake_spawn)
-        d._run_retro_phase(agent)
+        # #3658: async path — nonzero exit, log truncated to 2000 chars.
+        self._run_retro_finalize(d, agent, worktree, exit_code=1)
 
         events = handler.events("retro_nonzero_exit")
         assert events

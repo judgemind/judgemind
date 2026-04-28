@@ -383,7 +383,6 @@ class TestFixCiBlockedRouting:
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
         d._materialize_prior_attempts = MagicMock(return_value=0)  # type: ignore[method-assign]
         d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
         d._read_phase_output = MagicMock(return_value=fix_ci_output)  # type: ignore[method-assign]
         d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
         d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
@@ -393,6 +392,30 @@ class TestFixCiBlockedRouting:
         d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._apply_fix_ci_patch = MagicMock()  # type: ignore[method-assign]
+
+    def _run_fix_ci_finalize(
+        self,
+        d: daemon.DispatcherDaemon,
+        agent: dict[str, Any],
+        worktree: Path,
+        exit_code: int = 0,
+    ) -> None:
+        """Populate inflight ctx and call _finalize_fix_ci directly (#3658)."""
+        agent_id = agent["agent_id"]
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "fix-ci",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "agent": dict(agent),
+                "pr_number": agent.get("pr_number"),
+                "issue_number": agent.get("issue_number"),
+                "retries_used": agent.get("retries_used", 0),
+            },
+        }
+        d._finalize_fix_ci(agent_id, worktree, exit_code)
 
     def test_blocked_verdict_routes(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path, scope="fix_ci_blocked")
@@ -414,9 +437,8 @@ class TestFixCiBlockedRouting:
             "worktree_path": str(worktree),
             "retries_used": 1,
         }
-        pr_status: dict[str, Any] = {"statusCheckRollup": []}
 
-        d._run_fix_ci(agent, pr_status)
+        self._run_fix_ci_finalize(d, agent, worktree)
 
         d._handle_agent_failure.assert_called_once()  # type: ignore[union-attr]
         kwargs = d._handle_agent_failure.call_args.kwargs  # type: ignore[union-attr]
@@ -451,7 +473,7 @@ class TestFixCiBlockedRouting:
             "retries_used": 0,
         }
 
-        d._run_fix_ci(agent, {"statusCheckRollup": []})
+        self._run_fix_ci_finalize(d, agent, worktree)
 
         d._handle_agent_failure.assert_called_once()  # type: ignore[union-attr]
         kwargs = d._handle_agent_failure.call_args.kwargs  # type: ignore[union-attr]
@@ -483,7 +505,7 @@ class TestFixCiBlockedRouting:
             "retries_used": 0,
         }
 
-        d._run_fix_ci(agent, {"statusCheckRollup": []})
+        self._run_fix_ci_finalize(d, agent, worktree)
 
         d._handle_agent_failure.assert_not_called()  # type: ignore[union-attr]
         d._apply_fix_ci_patch.assert_called_once()  # type: ignore[union-attr]
@@ -850,37 +872,59 @@ class TestVerifyFailedPostMergeSkillContract:
 
 
 class TestVerifyFailedPostMergeRouting:
+    def _patch_verify(
+        self, d: daemon.DispatcherDaemon, *, verify_output: dict[str, Any]
+    ) -> None:
+        d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
+        d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
+        d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
+        d._read_phase_output = MagicMock(return_value=verify_output)  # type: ignore[method-assign]
+        d._write_merged_at = MagicMock()  # type: ignore[method-assign]
+        d._post_evidence_comment = MagicMock()  # type: ignore[method-assign]
+        d._write_verified_at = MagicMock()  # type: ignore[method-assign]
+        d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
+        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
+        d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
+        d._restore_succeeded_and_advance_done = MagicMock()  # type: ignore[method-assign]
+
+    def _run_verify_finalize(
+        self,
+        d: daemon.DispatcherDaemon,
+        agent: dict[str, Any],
+        worktree: Path,
+        merge_sha: str,
+        exit_code: int = 0,
+    ) -> None:
+        """Populate inflight ctx and call _finalize_verify directly (#3658)."""
+        agent_id = agent["agent_id"]
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "verify",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "pr_number": agent.get("pr_number"),
+                "issue_number": agent.get("issue_number"),
+                "merge_sha": merge_sha,
+                "merged_at_set": agent.get("merged_at") is not None,
+            },
+        }
+        d._finalize_verify(agent_id, worktree, exit_code)
+
     def test_failed_verdict_routes(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path, scope="verify_failed_pm")
         worktree = tmp_path / "wt"
         worktree.mkdir()
 
-        d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
-        d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._read_phase_output = MagicMock(  # type: ignore[method-assign]
-            return_value={
+        self._patch_verify(
+            d,
+            verify_output={
                 "verdict": "FAILED",
                 "failure_reason": "search endpoint returned 500 on sample ruling",
                 "evidence_md": "## Verify\n\n- FAIL: AC#1 — got 500",
-            }
+            },
         )
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
-        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._write_merged_at = MagicMock()  # type: ignore[method-assign]
-        d._read_verify_skip_reason = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._post_evidence_comment = MagicMock()  # type: ignore[method-assign]
-        d._write_verified_at = MagicMock()  # type: ignore[method-assign]
-        d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
-        d._materialize_prior_attempts = MagicMock(return_value=0)  # type: ignore[method-assign]
-        d._extract_acceptance_criteria = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._fetch_issue_body = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._fetch_pr_diff = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._list_committed_files_at_head = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._detect_verify_skip_reason = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
-        d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
-        d._restore_succeeded_and_advance_done = MagicMock()  # type: ignore[method-assign]
 
         agent = {
             "agent_id": "agent-verify-fail",
@@ -889,9 +933,8 @@ class TestVerifyFailedPostMergeRouting:
             "worktree_path": str(worktree),
             "merged_at": datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC),
         }
-        pr_status = {"mergeCommit": {"oid": "f00dbabe"}}
 
-        d._run_verify_and_complete(agent, pr_status, "f00dbabe", [])
+        self._run_verify_finalize(d, agent, worktree, "f00dbabe")
 
         d._handle_agent_failure.assert_called_once()  # type: ignore[union-attr]
         kwargs = d._handle_agent_failure.call_args.kwargs  # type: ignore[union-attr]
@@ -917,30 +960,13 @@ class TestVerifyFailedPostMergeRouting:
         worktree = tmp_path / "wt"
         worktree.mkdir()
 
-        d._persist_phase_output = MagicMock()  # type: ignore[method-assign]
-        d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._read_phase_output = MagicMock(  # type: ignore[method-assign]
-            return_value={
+        self._patch_verify(
+            d,
+            verify_output={
                 "verdict": "VERIFIED",
                 "evidence_md": "## Verify\n\n- PASS: AC#1",
-            }
+            },
         )
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
-        d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._write_merged_at = MagicMock()  # type: ignore[method-assign]
-        d._read_verify_skip_reason = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._post_evidence_comment = MagicMock()  # type: ignore[method-assign]
-        d._write_verified_at = MagicMock()  # type: ignore[method-assign]
-        d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
-        d._materialize_prior_attempts = MagicMock(return_value=0)  # type: ignore[method-assign]
-        d._extract_acceptance_criteria = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._fetch_issue_body = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._fetch_pr_diff = MagicMock(return_value="")  # type: ignore[method-assign]
-        d._list_committed_files_at_head = MagicMock(return_value=[])  # type: ignore[method-assign]
-        d._detect_verify_skip_reason = MagicMock(return_value=None)  # type: ignore[method-assign]
-        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
-        d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
 
         agent = {
             "agent_id": "agent-verified",
@@ -949,9 +975,8 @@ class TestVerifyFailedPostMergeRouting:
             "worktree_path": str(worktree),
             "merged_at": datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC),
         }
-        pr_status = {"mergeCommit": {"oid": "f00dbabe"}}
 
-        d._run_verify_and_complete(agent, pr_status, "f00dbabe", [])
+        self._run_verify_finalize(d, agent, worktree, "f00dbabe")
 
         d._handle_agent_failure.assert_not_called()  # type: ignore[union-attr]
         d._write_verified_at.assert_called_once()  # type: ignore[union-attr]
@@ -1067,9 +1092,9 @@ class TestFixCiForceWithLease:
 
 
 class TestFixCiRebaseOutcomeLogEvent:
-    """Verify ``_run_fix_ci`` emits a ``daemon.fix_ci_rebase_outcome`` log
-    event unconditionally after parsing the fix-ci output JSON (AC6, issue
-    #2966).
+    """Verify ``_finalize_fix_ci`` emits a ``daemon.fix_ci_rebase_outcome``
+    log event unconditionally after parsing the fix-ci output JSON (AC6,
+    issue #2966).
 
     Three parametrized cases: clean / resolved / conflict_unresolvable.
     Also covers the None case (old skill payload without rebase_outcome).
@@ -1085,7 +1110,6 @@ class TestFixCiRebaseOutcomeLogEvent:
         d._read_full_phase_log = MagicMock(return_value="")  # type: ignore[method-assign]
         d._parse_phase_usage = MagicMock(return_value=None)  # type: ignore[method-assign]
         d._read_phase_output = MagicMock(return_value=fix_ci_output)  # type: ignore[method-assign]
-        d._run_subprocess_or_fail = MagicMock(return_value=0)  # type: ignore[method-assign]
         d._write_phase_input = MagicMock()  # type: ignore[method-assign]
         d._extract_failing_jobs = MagicMock(return_value=[])  # type: ignore[method-assign]
         d._fetch_pr_diff = MagicMock(return_value="")  # type: ignore[method-assign]
@@ -1100,14 +1124,27 @@ class TestFixCiRebaseOutcomeLogEvent:
         worktree = tmp_path / "wt"
         worktree.mkdir()
         self._patch(d, fix_ci_output=fix_ci_output)
-        agent = {
-            "agent_id": f"agent-{scope}",
-            "pr_number": 9966,
-            "issue_number": 2966,
-            "worktree_path": str(worktree),
-            "retries_used": 0,
+        agent_id = f"agent-{scope}"
+        # Populate inflight ctx so _finalize_fix_ci has the metadata it needs.
+        d._phase_subprocess_inflight[agent_id] = {
+            "phase": "fix-ci",
+            "pid": 99999,
+            "worktree_path": worktree,
+            "started_at": 0.0,
+            "deadline_at": 99999.0,
+            "ctx": {
+                "agent": {
+                    "agent_id": agent_id,
+                    "pr_number": 9966,
+                    "issue_number": 2966,
+                    "retries_used": 0,
+                },
+                "pr_number": 9966,
+                "issue_number": 2966,
+                "retries_used": 0,
+            },
         }
-        d._run_fix_ci(agent, {"statusCheckRollup": []})
+        d._finalize_fix_ci(agent_id, worktree, 0)
         return handler
 
     def test_rebase_outcome_clean_logged(self, tmp_path: Path) -> None:

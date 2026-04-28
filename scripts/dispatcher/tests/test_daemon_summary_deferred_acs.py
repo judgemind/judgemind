@@ -169,7 +169,11 @@ class TestSummaryDeferredAcsPersisted:
                     "summary": "…",
                     "changed_files": ["scripts/foo.py"],
                 },
-                "plan": {"acceptance_criteria": [], "scope_check": [], "collapsed_comments": []},
+                "plan": {
+                    "acceptance_criteria": [],
+                    "scope_check": [],
+                    "collapsed_comments": [],
+                },
             }.get(phase)
         )
         d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]
@@ -249,7 +253,11 @@ class TestSummaryDeferredAcsPersisted:
         d._fetch_phase_output = MagicMock(  # type: ignore[method-assign]
             side_effect=lambda agent_id, phase: {
                 "ralph": {"verdict": "SHIP", "summary": "", "changed_files": []},
-                "plan": {"acceptance_criteria": [], "scope_check": [], "collapsed_comments": []},
+                "plan": {
+                    "acceptance_criteria": [],
+                    "scope_check": [],
+                    "collapsed_comments": [],
+                },
             }.get(phase)
         )
         d._fetch_issue_bundle = MagicMock(  # type: ignore[method-assign]

@@ -762,7 +762,6 @@ class TestRetroStampsRetroedAt:
 
         d._build_retro_input = MagicMock(return_value={"ralph_iterations": 1})  # type: ignore[method-assign]
         d._write_phase_input = MagicMock()  # type: ignore[method-assign]
-        d._spawn_phase_subprocess = MagicMock(return_value=(0, 1.23))  # type: ignore[method-assign]
         d._read_phase_output = MagicMock(  # type: ignore[method-assign]
             return_value={"retro_issues": [], "no_findings": True}
         )
@@ -777,6 +776,27 @@ class TestRetroStampsRetroedAt:
             "pr_number": 99,
             "worktree_path": str(worktree),
         }
+
+        # #3658: stub _spawn_phase_subprocess_async to call _finalize_retro immediately.
+        def fake_spawn_async(
+            phase: str,
+            worktree: Path,
+            agent_id: str,
+            deadline_seconds: float,
+            ctx: dict | None = None,
+        ) -> None:
+            d._phase_subprocess_inflight[agent_id] = {
+                "phase": phase,
+                "pid": 99999,
+                "worktree_path": worktree,
+                "started_at": 0.0,
+                "deadline_at": 99999.0,
+                "ctx": ctx or {},
+            }
+            d._finalize_retro(agent_id, worktree, 0)
+
+        d._spawn_phase_subprocess_async = fake_spawn_async  # type: ignore[method-assign]
+
         d._run_retro_phase(agent)
 
         # retroed_at stamped.

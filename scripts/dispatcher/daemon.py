@@ -2550,6 +2550,15 @@ class DispatcherDaemon:
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop: threading.Event = threading.Event()
         self._watchdog_warn_emitted_for_gap: bool = False
+        # #3658 — async phase subprocess tracker for verify / fix-ci / retro.
+        # Keyed by ``agent_id``, value is a dict with keys:
+        #   ``phase``, ``pid``, ``stdout_path``, ``stderr_path``,
+        #   ``jsonl_path``, ``worktree_path``, ``started_at``,
+        #   ``deadline_at``.
+        # In-memory only (lost on daemon restart — handled by the
+        # existing ``verify_already_completed`` short-circuit and the
+        # recovery-path code in ``_run_verify_and_complete``).
+        self._phase_subprocess_inflight: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Thread-aware connection accessor (#2847).
@@ -13999,6 +14008,24 @@ class DispatcherDaemon:
                         },
                     )
                 continue
+            # #3658 — if this agent already has an async phase subprocess
+            # in flight (verify / fix-ci / retro), skip re-entering the
+            # phase handler. The reaper pass in supervisor_tick will call
+            # the finalizer once the subprocess exits.
+            if agent_id in self._phase_subprocess_inflight:
+                self._log.debug(
+                    "daemon.advance_skipped_async_inflight",
+                    extra={
+                        "event": "advance_skipped_async_inflight",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "phase": phase,
+                        "inflight_phase": self._phase_subprocess_inflight[agent_id].get(
+                            "phase"
+                        ),
+                    },
+                )
+                continue
             try:
                 if phase == "awaiting_ci":
                     self._advance_awaiting_ci(agent)
@@ -14743,16 +14770,25 @@ class DispatcherDaemon:
         return None
 
     def _run_fix_ci(self, agent: dict[str, Any], pr_status: dict[str, Any]) -> None:
-        """Gather failing-job logs, spawn ``/task-v2-fix-ci``, handle verdict.
+        """Gather failing-job logs, spawn ``/task-v2-fix-ci`` async, handle verdict.
 
-        Escalates to ``status='failed'`` when ``retries_used >=
-        FIX_CI_MAX_RETRIES`` (spec §8 ``ci_red_after_retries``). On
-        ``PATCHED`` verdict, applies the patch via ``git add -A`` +
-        ``git commit`` + ``git push``, increments ``retries_used``, and
-        leaves the agent in ``awaiting_ci`` so the next supervisor
-        tick re-polls. On ``BLOCKED`` — mark failed. On ``FLAKY`` —
-        no-op; let the next tick re-poll (GitHub may re-run flaky jobs
-        automatically, or the operator can nudge).
+        Pre-#3658 this blocked MainThread for the full fix-ci duration.
+        Post-#3658 it delegates to ``_start_fix_ci`` which writes the
+        input bundle and fire-and-forgets the subprocess.
+        """
+        self._start_fix_ci(agent, pr_status)
+
+    def _start_fix_ci(self, agent: dict[str, Any], pr_status: dict[str, Any]) -> None:
+        """Build the fix-ci input bundle and fire-and-forget the subprocess (#3658).
+
+        Escalates to ``status='failed'`` synchronously when
+        ``retries_used >= FIX_CI_MAX_RETRIES`` (no subprocess needed).
+        Otherwise writes ``phase_input.json`` and calls
+        :meth:`_spawn_phase_subprocess_async` — returns immediately.
+
+        The full verdict handling (PATCHED / FLAKY / BLOCKED) is
+        delegated to ``_finalize_fix_ci`` which runs on a later tick
+        via the reaper.
         """
         agent_id = agent["agent_id"]
         pr_number = agent["pr_number"]
@@ -14789,10 +14825,7 @@ class DispatcherDaemon:
                 },
             )
             # ROUTING (#3062): failure row written above with a tier-3
-            # category → diagnoser picks it up. Inline pattern (not
-            # ``_handle_agent_failure``) preserves the existing
-            # ``detected_by="scheduler"`` marker and ``details`` shape
-            # that the diagnoser-context bundler expects.
+            # category → diagnoser picks it up.
             self._mark_agent_terminal(
                 agent_id, status="failed", phase="awaiting_ci", exit_code=None
             )
@@ -14817,9 +14850,9 @@ class DispatcherDaemon:
         self._write_phase_input(worktree, "fix-ci", fix_ci_input)
 
         self._log.info(
-            "daemon.fix_ci_started",
+            "daemon.fix_ci_started_async",
             extra={
-                "event": "fix_ci_started",
+                "event": "fix_ci_started_async",
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "pr_number": pr_number,
@@ -14828,10 +14861,69 @@ class DispatcherDaemon:
             },
         )
 
-        exit_code = self._run_subprocess_or_fail(agent_id, "fix-ci", worktree)
+        # #3658 — async fire-and-forget. Store agent dict in ctx so the
+        # finalizer can call _apply_fix_ci_patch(agent, ...) without
+        # re-querying the DB.
+        deadline = float(STUCK_TIMEOUT_SECONDS_BY_PHASE.get("fix_ci", 18000))
+        self._spawn_phase_subprocess_async(
+            phase="fix-ci",
+            worktree=worktree,
+            agent_id=agent_id,
+            deadline_seconds=deadline,
+            ctx={
+                "agent": dict(agent),
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "retries_used": retries_used,
+            },
+        )
+
+    def _finalize_fix_ci(
+        self,
+        agent_id: str,
+        worktree: Path,
+        exit_code: int | None,
+    ) -> None:
+        """Post-completion handler for an async fix-ci subprocess (#3658).
+
+        Called by :meth:`_reap_phase_subprocesses` once the subprocess
+        exits (or is killed for deadline). Handles the same output
+        parsing / transition logic that ``_run_fix_ci`` previously ran
+        inline after ``_run_subprocess_or_fail`` returned.
+
+        ``exit_code=None`` means the subprocess was killed (timeout).
+        """
+        inflight = self._phase_subprocess_inflight.get(agent_id, {})
+        ctx = inflight.get("ctx", {})
+        agent = ctx.get("agent") or {}
+        pr_number = ctx.get("pr_number")
+        issue_number = ctx.get("issue_number")
+        retries_used = int(ctx.get("retries_used") or 0)
+
         if exit_code is None:
-            # Subprocess infra failure — agent already marked failed
-            # inside _run_subprocess_or_fail. Stop.
+            # Subprocess killed — treat as infra failure; agent already
+            # failed inside _reap_phase_subprocesses timeout path.
+            self._log.warning(
+                "daemon.fix_ci_killed",
+                extra={
+                    "event": "fix_ci_killed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "detail": "subprocess killed (deadline exceeded)",
+                },
+            )
+            self._handle_agent_failure(
+                agent_id=agent_id,
+                phase="awaiting_ci",
+                category=FAILURE_CATEGORY_PHASE_OUTPUT_MISSING,
+                stderr_tail="",
+                exit_code=None,
+                details={
+                    "missing_phase_output": "fix-ci",
+                    "reason": "deadline_exceeded",
+                },
+            )
             return
 
         fix_ci_output = self._read_phase_output(worktree, "fix-ci")
@@ -14877,10 +14969,6 @@ class DispatcherDaemon:
         )
         verdict = str(fix_ci_output.get("verdict") or "").upper()
 
-        # Dispatch through the pure phase-transition catalog (#2976).
-        # All side-effect logic (logging events, apply-patch call,
-        # failure-row writes) is preserved verbatim; only the DECISION
-        # about which path to take is driven by transition_from_fix_ci.
         fix_ci_transition = transition_from_fix_ci(fix_ci_output)
 
         if fix_ci_transition.action == TransitionAction.ADVANCE:
@@ -14903,7 +14991,6 @@ class DispatcherDaemon:
             return
 
         # fix_ci_transition.action == ROUTE_TO_DIAGNOSER
-        # verdict == "BLOCKED" or unrecognized
         block_reason = fix_ci_output.get("block_reason")
         self._log.warning(
             "daemon.fix_ci_blocked",
@@ -14916,13 +15003,6 @@ class DispatcherDaemon:
                 "block_reason": block_reason,
             },
         )
-        # ROUTING (#3062 #3068): ROUTED via ``_handle_agent_failure``
-        # with the tier-3 ``FAILURE_CATEGORY_FIX_CI_BLOCKED`` category.
-        # Exact analog of the ralph_not_ship fix (#3054): fix-ci
-        # returned BLOCKED with a ``block_reason``, no mechanical retry
-        # will help, and the diagnoser's ``block_on_existing_task`` /
-        # ``file_prerequisite_task`` / ``block_and_comment`` /
-        # ``escalate`` actions are the right responses.
         self._handle_agent_failure(
             agent_id=agent_id,
             phase="awaiting_ci",
@@ -15609,23 +15689,45 @@ class DispatcherDaemon:
         merge_sha: str,
         deploy_runs: list[dict[str, Any]],
     ) -> None:
-        """Spawn ``/task-v2-verify``, post evidence comment, advance to done.
+        """Spawn ``/task-v2-verify`` asynchronously (#3658), post evidence, advance.
+
+        Pre-#3658 this method blocked MainThread for the full verify
+        duration (30–50 min) via ``_run_subprocess_or_fail``. Post-#3658
+        it delegates to ``_start_verify`` which writes the input bundle
+        and fire-and-forgets the subprocess. The reaper pass
+        (:meth:`_reap_phase_subprocesses`) calls ``_finalize_verify``
+        once the subprocess exits on a subsequent tick.
+        """
+        self._start_verify(agent, pr_status, merge_sha, deploy_runs)
+
+    def _start_verify(
+        self,
+        agent: dict[str, Any],
+        pr_status: dict[str, Any],
+        merge_sha: str,
+        deploy_runs: list[dict[str, Any]],
+    ) -> None:
+        """Build the verify input bundle and fire-and-forget the subprocess (#3658).
+
+        Handles the short-circuit cases (skip_reason, already_completed)
+        synchronously on MainThread (they are cheap DB reads). For the
+        normal case, writes ``phase_input.json`` and calls
+        :meth:`_spawn_phase_subprocess_async` — returns immediately
+        without blocking on the subprocess.
 
         Issue #2953: ``status='succeeded'`` was already written at merge
         time by ``_write_merged_at`` — this method no longer flips the
         status. Its remaining responsibilities are (a) short-circuit
         when ``verify_skip_reason`` is set (dispatcher-self-PR case),
-        (b) run the verify subprocess, (c) stamp ``verified_at`` on
-        VERIFIED/SKIPPED verdict, and (d) advance ``phase`` to ``done``
-        so the retro phase picks it up on the next tick.
+        (b) async-spawn the verify subprocess, (c) stamp ``verified_at``
+        on VERIFIED/SKIPPED verdict (delegated to ``_finalize_verify``),
+        and (d) advance ``phase`` to ``done`` (also delegated).
 
         A FAILED verdict flips status back to ``failed`` via
         ``_mark_agent_terminal`` — verify failing post-merge is a real
         problem (the deployed code didn't behave as expected) and the
         admin cockpit should surface it in red even though the PR
-        technically shipped. The row still has ``merged_at`` populated
-        so the milestone breakdown tooltip can show "merged X · verify
-        failed" on operator hover.
+        technically shipped.
         """
         agent_id = agent["agent_id"]
         issue_number = agent["issue_number"]
@@ -15761,9 +15863,9 @@ class DispatcherDaemon:
         self._write_phase_input(worktree, "verify", verify_input)
 
         self._log.info(
-            "daemon.verify_started",
+            "daemon.verify_started_async",
             extra={
-                "event": "verify_started",
+                "event": "verify_started_async",
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "pr_number": pr_number,
@@ -15772,19 +15874,50 @@ class DispatcherDaemon:
             },
         )
 
-        exit_code = self._run_subprocess_or_fail(agent_id, "verify", worktree)
+        # #3658 — async fire-and-forget. Store context the finalizer needs
+        # (pr_number, issue_number, merge_sha, merged_at_set) so it can
+        # log correctly without a second DB round-trip.
+        deadline = float(STUCK_TIMEOUT_SECONDS_BY_PHASE.get("verify", 3000))
+        self._spawn_phase_subprocess_async(
+            phase="verify",
+            worktree=worktree,
+            agent_id=agent_id,
+            deadline_seconds=deadline,
+            ctx={
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "merge_sha": merge_sha,
+                "merged_at_set": merged_at_set,
+            },
+        )
+
+    def _finalize_verify(
+        self,
+        agent_id: str,
+        worktree: Path,
+        exit_code: int | None,
+    ) -> None:
+        """Post-completion handler for an async verify subprocess (#3658).
+
+        Called by :meth:`_reap_phase_subprocesses` once the subprocess
+        exits (or is killed for exceeding its deadline). Handles the same
+        read-output / persist / post-evidence / transition logic that
+        ``_run_verify_and_complete`` previously ran inline after
+        ``_run_subprocess_or_fail`` returned.
+
+        ``exit_code=None`` means the subprocess was killed for timeout —
+        treated the same as a subprocess-infra failure.
+        """
+        # Recover the spawn-time context stored by _spawn_phase_subprocess_async.
+        inflight = self._phase_subprocess_inflight.get(agent_id, {})
+        ctx = inflight.get("ctx", {})
+        pr_number = ctx.get("pr_number")
+        issue_number = ctx.get("issue_number")
+        merge_sha = str(ctx.get("merge_sha") or "")
+        merged_at_set = bool(ctx.get("merged_at_set", True))
+
+        # exit_code is None when the process was killed (timeout / SIGKILL).
         if exit_code is None:
-            # Issue #3055 — ``_run_subprocess_or_fail`` already flipped
-            # the row to ``status='failed'`` via its internal failure
-            # handlers. On an already-merged agent that is wrong: the
-            # PR shipped, ``merged_at`` is stamped, and a verify
-            # subprocess crash shouldn't retroactively invert the audit
-            # trail. Any post-merge verify infra failure is bookkeeping
-            # noise, not a product regression. Restore the row to
-            # ``status='succeeded'`` and advance phase to ``done`` so
-            # retro runs on the next tick. The distinct
-            # ``verify_infra_failure_post_merge`` event gives operators
-            # the grep hook for "verify-was-broken-but-shipped" cases.
             if merged_at_set:
                 self._log.warning(
                     "daemon.verify_infra_failure_post_merge",
@@ -15794,11 +15927,11 @@ class DispatcherDaemon:
                         "agent_id": agent_id,
                         "issue_number": issue_number,
                         "pr_number": pr_number,
-                        "detail": "subprocess failed before output parse",
+                        "detail": "subprocess killed (deadline exceeded)",
                     },
                 )
                 self._restore_succeeded_and_advance_done(agent_id)
-            return  # subprocess failure already marked (or restored) by now
+            return
 
         verify_output = self._read_phase_output(worktree, "verify")
         if verify_output is None:
@@ -15820,10 +15953,7 @@ class DispatcherDaemon:
             # :meth:`_restore_succeeded_and_advance_done` instead of
             # :meth:`_handle_agent_failure` so ``status`` stays
             # ``succeeded`` and the admin cockpit doesn't render an
-            # already-shipped PR red. Pre-#3055 this path flipped the
-            # row to ``failed`` and the Opus diagnoser then escalated
-            # it to ``diagnoser_escalate/failed`` — inverting the
-            # authoritative success signal on an already-shipped PR.
+            # already-shipped PR red.
             if merged_at_set:
                 self._log.warning(
                     "daemon.verify_infra_failure_post_merge",
@@ -15872,15 +16002,10 @@ class DispatcherDaemon:
             )
 
         # Dispatch through the pure phase-transition catalog (#2976).
-        # Side-effect logic (logging events, failure-row writes) is
-        # preserved verbatim; only the DECISION about which path to take
-        # is driven by transition_from_verify.
-        # Keep the verdict string for the daemon.agent_completed log event below.
         verdict = str(verify_output.get("verdict") or "").upper()
         verify_transition = transition_from_verify(verify_output)
 
         if verify_transition.action == TransitionAction.ROUTE_TO_DIAGNOSER:
-            # verify_transition.failure_hint == FAILURE_HINT_VERIFY_FAILED_POST_MERGE
             failure_reason = verify_output.get("failure_reason")
             self._log.warning(
                 "daemon.verify_failed",
@@ -15892,22 +16017,6 @@ class DispatcherDaemon:
                     "failure_reason": failure_reason,
                 },
             )
-            # Issue #2953: verify failed post-merge is a genuine
-            # regression signal — the deployed code didn't behave as
-            # expected. Flip status back to ``failed`` so the admin
-            # cockpit renders red. ``merged_at`` stays populated so the
-            # tooltip can read "merged X · verify failed" instead of
-            # hiding the shipment entirely.
-            #
-            # ROUTING (#3062 #3071): ROUTED via ``_handle_agent_failure``
-            # with the tier-3 ``FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE``
-            # category. Post-merge context differs from pre-merge
-            # failures: the PR is merged, the code is on main.
-            # ``retry`` is a no-op; the diagnoser's primary actions
-            # are ``file_prerequisite_task`` (p1 regression issue),
-            # ``block_and_comment`` (repro steps), or ``escalate``.
-            # See :file:`.claude/skills/diagnose-failure/SKILL.md` for
-            # the dedicated per-category guidance.
             self._handle_agent_failure(
                 agent_id=agent_id,
                 phase="done",
@@ -15927,9 +16036,7 @@ class DispatcherDaemon:
 
         # verify_transition.action == ADVANCE, next_phase == "done"
         # VERIFIED or SKIPPED — stamp ``verified_at`` and advance phase
-        # so the retro phase picks up the row next tick. ``status`` is
-        # already ``succeeded`` from merge-time; no re-flip needed
-        # (issue #2953).
+        # so the retro phase picks up the row next tick.
         self._write_verified_at(agent_id)
         self._update_agent_phase(agent_id, verify_transition.next_phase or "done")
         self._log.info(
@@ -16122,17 +16229,24 @@ class DispatcherDaemon:
     # succeeded; only the post-success bookkeeping varies.
 
     def _run_retro_phase(self, agent: dict[str, Any]) -> None:
-        """Spawn ``/task-v2-retro`` and file any retro issues it produces.
+        """Spawn ``/task-v2-retro`` asynchronously (#3658) and file issues.
 
-        Reads ``dispatcher.phase_transitions`` + ``dispatcher.failures``
-        for this agent, writes the retro input bundle, runs the
-        subprocess, parses the output, and calls ``gh issue create``
-        once per entry in ``retro_issues``. Transitions the agent's
-        phase to :data:`PHASE_RETRO_DONE` on success or
-        :data:`PHASE_RETRO_FAILED` on subprocess / parse failure.
+        Pre-#3658 this blocked MainThread via ``_spawn_phase_subprocess``.
+        Post-#3658 it delegates to ``_start_retro`` which writes the input
+        bundle and fire-and-forgets the subprocess.
+        """
+        self._start_retro(agent)
 
-        ``status='succeeded'`` is preserved across this advance — the
-        retro is bookkeeping for an already-successful run.
+    def _start_retro(self, agent: dict[str, Any]) -> None:
+        """Build the retro input bundle and fire-and-forget the subprocess (#3658).
+
+        Handles the worktree-missing short-circuit synchronously (cheap
+        filesystem check). Otherwise writes ``phase_input.json`` and
+        calls :meth:`_spawn_phase_subprocess_async` — returns immediately.
+
+        The full output-parsing / issue-filing / phase-advance logic is
+        delegated to ``_finalize_retro`` which runs on a later tick via
+        the reaper.
         """
         agent_id = agent["agent_id"]
         issue_number = agent["issue_number"]
@@ -16155,16 +16269,14 @@ class DispatcherDaemon:
             self._update_agent_phase(agent_id, PHASE_CLEANUP_DONE)
             return
 
-        # Build the retro input bundle. The retro skill's SKILL.md
-        # documents the contract — we satisfy the required fields and
-        # the optional ones we can derive cheaply from DB state.
+        # Build the retro input bundle.
         retro_input = self._build_retro_input(agent)
         self._write_phase_input(worktree, "retro", retro_input)
 
         self._log.info(
-            "daemon.retro_started",
+            "daemon.retro_started_async",
             extra={
-                "event": "retro_started",
+                "event": "retro_started_async",
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "issue_number": issue_number,
@@ -16174,13 +16286,41 @@ class DispatcherDaemon:
             },
         )
 
-        # Spawn the retro subprocess. Failure here flips to retro_failed
-        # but does NOT touch the agent's succeeded status.
-        try:
-            exit_code, duration_s = self._spawn_phase_subprocess(
-                "retro", worktree, agent_id
-            )
-        except subprocess.TimeoutExpired:
+        deadline = float(STUCK_TIMEOUT_SECONDS_BY_PHASE.get("retro", 3000))
+        self._spawn_phase_subprocess_async(
+            phase="retro",
+            worktree=worktree,
+            agent_id=agent_id,
+            deadline_seconds=deadline,
+            ctx={
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+            },
+        )
+
+    def _finalize_retro(
+        self,
+        agent_id: str,
+        worktree: Path,
+        exit_code: int | None,
+    ) -> None:
+        """Post-completion handler for an async retro subprocess (#3658).
+
+        Called by :meth:`_reap_phase_subprocesses` once the subprocess
+        exits (or is killed for deadline). Handles the same output
+        parsing / issue filing / phase advance logic that ``_run_retro_phase``
+        previously ran inline after ``_spawn_phase_subprocess`` returned.
+
+        ``exit_code=None`` means the subprocess was killed (timeout).
+        """
+        inflight = self._phase_subprocess_inflight.get(agent_id, {})
+        ctx = inflight.get("ctx", {})
+        issue_number = ctx.get("issue_number")
+        pr_number = ctx.get("pr_number")
+
+        retro_failed_transition = transition_from_retro(False)
+
+        if exit_code is None:
             extra: dict[str, Any] = {
                 "event": "retro_timeout",
                 "run_id": self._run_id,
@@ -16190,24 +16330,6 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_timeout", extra=extra)
-            # transition_from_retro(False) → next_phase == PHASE_RETRO_FAILED
-            retro_failed_transition = transition_from_retro(False)
-            self._update_agent_phase(
-                agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
-            )
-            return
-        except (FileNotFoundError, OSError) as exc:
-            extra = {
-                "event": "retro_subprocess_error",
-                "run_id": self._run_id,
-                "agent_id": agent_id,
-                "detail": str(exc),
-            }
-            preview = self._extract_log_preview(worktree, "retro")
-            if preview:
-                extra["stderr_preview"] = preview
-            self._log.warning("daemon.retro_subprocess_error", extra=extra)
-            retro_failed_transition = transition_from_retro(False)
             self._update_agent_phase(
                 agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
             )
@@ -16219,13 +16341,11 @@ class DispatcherDaemon:
                 "run_id": self._run_id,
                 "agent_id": agent_id,
                 "exit_code": exit_code,
-                "duration_s": duration_s,
             }
             preview = self._extract_log_preview(worktree, "retro")
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_nonzero_exit", extra=extra)
-            retro_failed_transition = transition_from_retro(False)
             self._update_agent_phase(
                 agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
             )
@@ -16242,7 +16362,6 @@ class DispatcherDaemon:
             if preview:
                 extra["stderr_preview"] = preview
             self._log.warning("daemon.retro_output_missing", extra=extra)
-            retro_failed_transition = transition_from_retro(False)
             self._update_agent_phase(
                 agent_id, retro_failed_transition.next_phase or PHASE_RETRO_FAILED
             )
@@ -16258,9 +16377,7 @@ class DispatcherDaemon:
             usage=self._parse_phase_usage(worktree, "retro"),
         )
 
-        # File the retro issues. Each entry becomes a separate
-        # ``gh issue create``. Honour the per-agent cap defensively —
-        # the skill is supposed to produce only high-signal findings.
+        # File the retro issues.
         retro_issues = retro_output.get("retro_issues") or []
         if not isinstance(retro_issues, list):
             retro_issues = []
@@ -16285,15 +16402,7 @@ class DispatcherDaemon:
             if new_issue is not None:
                 filed += 1
 
-        # Issue #2953: stamp ``retroed_at`` BEFORE advancing phase so a
-        # crash between the two writes leaves the milestone column set
-        # — the admin cockpit can render the "retro completed" signal
-        # even if the phase advance failed. Paired reads of
-        # ``phase=retro_done`` and ``retroed_at IS NOT NULL`` are both
-        # authoritative (post this fix).
-        # Dispatch through the pure phase-transition catalog (#2976).
         retro_done_transition = transition_from_retro(True)
-        # retro_done_transition.next_phase == PHASE_RETRO_DONE
         self._write_retroed_at(agent_id)
         self._update_agent_phase(
             agent_id, retro_done_transition.next_phase or PHASE_RETRO_DONE
@@ -16309,7 +16418,6 @@ class DispatcherDaemon:
                 "no_findings": bool(retro_output.get("no_findings")),
                 "issues_filed": filed,
                 "issues_attempted": len(retro_issues),
-                "duration_s": duration_s,
             },
         )
 
@@ -19898,6 +20006,316 @@ class DispatcherDaemon:
 
         return int(proc.pid)
 
+    # ------------------------------------------------------------------
+    # #3658 — async fire-and-forget spawn for verify / fix-ci / retro.
+    # Models the same pattern as ``_spawn_diagnoser_subprocess`` so a
+    # slow verify / fix-ci / retro no longer blocks MainThread and cannot
+    # trip the 120s ``scheduler_tick_stalled_exiting`` watchdog.
+    # ------------------------------------------------------------------
+
+    def _spawn_phase_subprocess_async(
+        self,
+        phase: str,
+        worktree: Path,
+        agent_id: str,
+        deadline_seconds: float,
+        ctx: dict[str, Any] | None = None,
+    ) -> int | None:
+        """Spawn ``claude -p /task-v2-<phase> <agent_id>`` fire-and-forget (#3658).
+
+        Mirrors :meth:`_spawn_diagnoser_subprocess` (fire-and-forget
+        ``Popen`` + immediate FD close). The reaper pass
+        (:meth:`_reap_phase_subprocesses`) reads results on a later tick.
+
+        ``ctx`` is an optional dict of additional per-phase data that the
+        corresponding finalizer (``_finalize_verify``, etc.) needs but that
+        is not trivially re-read from the DB — e.g. ``merge_sha``,
+        ``pr_number``, ``issue_number``. It is stored verbatim in the
+        ``_phase_subprocess_inflight`` entry under the key ``"ctx"``.
+
+        Returns the subprocess PID on success, or ``None`` if the launch
+        failed. The entry in ``_phase_subprocess_inflight`` is registered
+        before this method returns so the very next tick can check it.
+        """
+        overrides = self._read_max_turns_overrides()
+        max_turns = self._max_turns_for_phase(phase, overrides=overrides)
+        model = self._model_for_phase(phase, agent_id)
+
+        stdout_path = worktree / "tmp" / f"claude-p-{phase}.stdout.json"
+        stderr_path = worktree / "tmp" / f"claude-p-{phase}.stderr.log"
+        jsonl_path = worktree / ".dispatcher" / f"{phase}-{agent_id}.jsonl"
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Post-merge phases (verify, retro) use the baseline repo cwd so the
+        # skill is discoverable even when the per-agent worktree has been wiped.
+        popen_cwd: Path = worktree
+        if (
+            phase in POST_MERGE_PHASES_USING_BASELINE_CWD
+            and self._cfg.baseline_repo_root is not None
+        ):
+            popen_cwd = self._cfg.baseline_repo_root
+
+        cmd = [
+            "claude",
+            "-p",
+            f"/task-v2-{phase} {agent_id}",
+            "--max-turns",
+            str(max_turns),
+            "--model",
+            model,
+            "--output-format",
+            "json",
+            "--dangerously-skip-permissions",
+        ]
+
+        try:
+            stdout_file = stdout_path.open("w", encoding="utf-8")
+        except OSError:
+            self._log.exception(
+                "daemon.phase_async_spawn_stdout_open_failed",
+                extra={
+                    "event": "phase_async_spawn_stdout_open_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": phase,
+                    "stdout_path": str(stdout_path),
+                },
+            )
+            return None
+        try:
+            stderr_file = stderr_path.open("w", encoding="utf-8")
+        except OSError:
+            stdout_file.close()
+            self._log.exception(
+                "daemon.phase_async_spawn_stderr_open_failed",
+                extra={
+                    "event": "phase_async_spawn_stderr_open_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": phase,
+                    "stderr_path": str(stderr_path),
+                },
+            )
+            return None
+
+        try:
+            proc: subprocess.Popen[str] = subprocess.Popen(  # noqa: S603 — literal trusted cmd
+                cmd,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                cwd=str(popen_cwd),
+                # noqa: timeout-required: issue-3658-fire-and-forget-reaper-enforces-deadline
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            stdout_file.close()
+            stderr_file.close()
+            self._log.error(
+                "daemon.phase_async_spawn_failed",
+                extra={
+                    "event": "phase_async_spawn_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": phase,
+                    "reason": "claude_binary_not_found",
+                },
+            )
+            return None
+        except OSError:
+            stdout_file.close()
+            stderr_file.close()
+            self._log.exception(
+                "daemon.phase_async_spawn_failed",
+                extra={
+                    "event": "phase_async_spawn_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": phase,
+                    "reason": "popen_oserror",
+                },
+            )
+            return None
+
+        # Close the parent's FD copies; the child holds its own dup.
+        try:
+            stdout_file.close()
+        except Exception:  # pragma: no cover — defensive
+            pass
+        try:
+            stderr_file.close()
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        pid = int(proc.pid)
+        now = datetime.now(UTC)
+        self._phase_subprocess_inflight[agent_id] = {
+            "phase": phase,
+            "pid": pid,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "jsonl_path": str(jsonl_path),
+            "worktree_path": str(worktree),
+            "started_at": now,
+            "deadline_at": now + timedelta(seconds=deadline_seconds),
+            "ctx": ctx or {},
+        }
+        self._log.info(
+            "daemon.phase_async_spawned",
+            extra={
+                "event": "phase_async_spawned",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "phase": phase,
+                "pid": pid,
+                "deadline_seconds": deadline_seconds,
+            },
+        )
+        return pid
+
+    def _reap_phase_subprocesses(self) -> int:
+        """Reap completed/timed-out async verify/fix-ci/retro subprocesses (#3658).
+
+        Called from :meth:`supervisor_tick` before the advance pass so
+        that completed subprocesses finalize in the same tick they exit.
+        Mirrors :meth:`_reap_diagnoser_subprocesses`.
+
+          * **Process gone** — subprocess exited; dispatch to the
+            per-phase finalizer (``_finalize_verify``,
+            ``_finalize_fix_ci``, ``_finalize_retro``).
+          * **Alive past deadline** — SIGKILL the process group; route
+            the finalizer with ``exit_code=None`` (timeout).
+          * **Alive within deadline** — leave; check next tick.
+
+        Returns the number of reaped entries for log/test correlation.
+        """
+        if not self._phase_subprocess_inflight:
+            return 0
+
+        reaped = 0
+        now = datetime.now(UTC)
+        agent_ids = list(self._phase_subprocess_inflight.keys())
+
+        for agent_id in agent_ids:
+            entry = self._phase_subprocess_inflight.get(agent_id)
+            if entry is None:
+                continue
+            phase = entry["phase"]
+            pid = entry["pid"]
+            deadline_at = entry["deadline_at"]
+            worktree = Path(entry["worktree_path"])
+
+            try:
+                if self._process_alive(pid):
+                    if now >= deadline_at:
+                        elapsed = (now - entry["started_at"]).total_seconds()
+                        self._log.warning(
+                            "daemon.phase_async_deadline_exceeded",
+                            extra={
+                                "event": "phase_async_deadline_exceeded",
+                                "run_id": self._run_id,
+                                "agent_id": agent_id,
+                                "phase": phase,
+                                "subprocess_pid": pid,
+                                "elapsed_seconds": elapsed,
+                            },
+                        )
+                        self._kill_phase_subprocess(pid)
+                        del self._phase_subprocess_inflight[agent_id]
+                        self._finalize_phase_subprocess(
+                            agent_id=agent_id,
+                            phase=phase,
+                            worktree=worktree,
+                            exit_code=None,
+                        )
+                        reaped += 1
+                    # else: still within deadline — check next tick.
+                    continue
+
+                # Process gone — finalize.
+                del self._phase_subprocess_inflight[agent_id]
+                self._finalize_phase_subprocess(
+                    agent_id=agent_id,
+                    phase=phase,
+                    worktree=worktree,
+                    exit_code=0,
+                )
+                reaped += 1
+            except Exception:
+                self._log.exception(
+                    "daemon.phase_async_reap_iteration_failed",
+                    extra={
+                        "event": "phase_async_reap_iteration_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "phase": phase,
+                        "subprocess_pid": pid,
+                    },
+                )
+                # Best-effort fallback so one bad reap doesn't stall later ones.
+                self._phase_subprocess_inflight.pop(agent_id, None)
+                reaped += 1
+
+        return reaped
+
+    def _kill_phase_subprocess(self, pid: int) -> None:
+        """SIGKILL the process group of a timed-out phase subprocess (#3658).
+
+        Uses SIGKILL directly (unlike the diagnoser which gives a
+        SIGTERM grace period) because the 3s grace in
+        ``_kill_diagnoser_process`` is too long for the supervisor-tick
+        path when multiple processes might time out simultaneously.
+        """
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            return  # already gone
+        except Exception:  # pragma: no cover — defensive
+            self._log.exception(
+                "daemon.phase_async_kill_failed",
+                extra={
+                    "event": "phase_async_kill_failed",
+                    "run_id": self._run_id,
+                    "subprocess_pid": pid,
+                },
+            )
+
+    def _finalize_phase_subprocess(
+        self,
+        agent_id: str,
+        phase: str,
+        worktree: Path,
+        exit_code: int | None,
+    ) -> None:
+        """Dispatch to the per-phase post-completion handler (#3658).
+
+        Routes completed (or deadline-exceeded) subprocess entries to
+        the appropriate finalizer. ``exit_code=None`` means the
+        subprocess was killed for exceeding its deadline.
+        """
+        if phase == "verify":
+            self._finalize_verify(
+                agent_id=agent_id, worktree=worktree, exit_code=exit_code
+            )
+        elif phase == "fix-ci":
+            self._finalize_fix_ci(
+                agent_id=agent_id, worktree=worktree, exit_code=exit_code
+            )
+        elif phase == "retro":
+            self._finalize_retro(
+                agent_id=agent_id, worktree=worktree, exit_code=exit_code
+            )
+        else:
+            self._log.warning(
+                "daemon.phase_async_unknown_phase",
+                extra={
+                    "event": "phase_async_unknown_phase",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "phase": phase,
+                },
+            )
+
     def _read_recommendation(self, diagnosis_id: int) -> dict[str, Any] | None:
         """Read ``dispatcher.diagnoses.recommendation`` for the given row.
 
@@ -22844,6 +23262,24 @@ class DispatcherDaemon:
 
         rate_skip_active = self._gh_rate_skip_active()
 
+        # #3658 — reap completed/timed-out async verify/fix-ci/retro
+        # subprocesses. Runs BEFORE the advance pass so completed
+        # subprocesses finalize in the same tick they exit and their
+        # agent_ids are removed from ``_phase_subprocess_inflight``
+        # before ``_advance_running_agents`` checks the dict.
+        phase_subprocs_reaped = 0
+        try:
+            phase_subprocs_reaped = self._reap_phase_subprocesses()
+        except Exception:
+            self._log.exception(
+                "daemon.phase_async_reap_pass_failed",
+                extra={
+                    "event": "phase_async_reap_pass_failed",
+                    "run_id": self._run_id,
+                },
+            )
+        t_step = self._record_supervisor_step("phase_async_reap", t_step)
+
         # Issue #3399: orphan-PR resurrection sweep. Runs BEFORE the
         # advance pass so any agent flipped from status='failed' back
         # to status='running' AND phase='awaiting_ci' is picked up by
@@ -23021,6 +23457,8 @@ class DispatcherDaemon:
                 "rate_skip_active": rate_skip_active,
                 "diagnoses_ran": diagnoses_ran,
                 "diagnoses_reaped": diagnoses_reaped,
+                # #3658 — async phase subprocess reaper observability.
+                "phase_subprocs_reaped": phase_subprocs_reaped,
                 # #3374 — generalized scheduled-skills tick observability.
                 "scheduled_skills_rows_scanned": scheduled_skills_summary[
                     "rows_scanned"
@@ -23049,6 +23487,8 @@ class DispatcherDaemon:
             "rate_skip_active": 1 if rate_skip_active else 0,
             "diagnoses_ran": diagnoses_ran,
             "diagnoses_reaped": diagnoses_reaped,
+            # #3658 — async phase subprocess reaper observability.
+            "phase_subprocs_reaped": phase_subprocs_reaped,
             # #3374 — generalized scheduled-skills tick observability.
             "scheduled_skills_rows_scanned": scheduled_skills_summary["rows_scanned"],
             "scheduled_skills_fires_succeeded": scheduled_skills_summary[
