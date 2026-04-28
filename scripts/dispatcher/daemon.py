@@ -14883,6 +14883,7 @@ class DispatcherDaemon:
         agent_id: str,
         worktree: Path,
         exit_code: int | None,
+        ctx: dict[str, Any] | None = None,
     ) -> None:
         """Post-completion handler for an async fix-ci subprocess (#3658).
 
@@ -14892,13 +14893,19 @@ class DispatcherDaemon:
         inline after ``_run_subprocess_or_fail`` returned.
 
         ``exit_code=None`` means the subprocess was killed (timeout).
+
+        ``ctx`` is the spawn-time context snapshot passed from
+        :meth:`_finalize_phase_subprocess` (#3698).  It is never
+        re-read from ``_phase_subprocess_inflight`` here because that
+        entry has already been deleted by the time this method is called.
         """
-        inflight = self._phase_subprocess_inflight.get(agent_id, {})
-        ctx = inflight.get("ctx", {})
-        agent = ctx.get("agent") or {}
-        pr_number = ctx.get("pr_number")
-        issue_number = ctx.get("issue_number")
-        retries_used = int(ctx.get("retries_used") or 0)
+        # Use the spawn-time context passed explicitly (not re-read from inflight,
+        # which has already been deleted — see #3698).
+        _ctx = ctx or {}
+        agent = _ctx.get("agent") or {}
+        pr_number = _ctx.get("pr_number")
+        issue_number = _ctx.get("issue_number")
+        retries_used = int(_ctx.get("retries_used") or 0)
 
         if exit_code is None:
             # Subprocess killed — treat as infra failure; agent already
@@ -15896,6 +15903,7 @@ class DispatcherDaemon:
         agent_id: str,
         worktree: Path,
         exit_code: int | None,
+        ctx: dict[str, Any] | None = None,
     ) -> None:
         """Post-completion handler for an async verify subprocess (#3658).
 
@@ -15907,14 +15915,19 @@ class DispatcherDaemon:
 
         ``exit_code=None`` means the subprocess was killed for timeout —
         treated the same as a subprocess-infra failure.
+
+        ``ctx`` is the spawn-time context snapshot passed from
+        :meth:`_finalize_phase_subprocess` (#3698).  It is never
+        re-read from ``_phase_subprocess_inflight`` here because that
+        entry has already been deleted by the time this method is called.
         """
-        # Recover the spawn-time context stored by _spawn_phase_subprocess_async.
-        inflight = self._phase_subprocess_inflight.get(agent_id, {})
-        ctx = inflight.get("ctx", {})
-        pr_number = ctx.get("pr_number")
-        issue_number = ctx.get("issue_number")
-        merge_sha = str(ctx.get("merge_sha") or "")
-        merged_at_set = bool(ctx.get("merged_at_set", True))
+        # Use the spawn-time context passed explicitly (not re-read from inflight,
+        # which has already been deleted — see #3698).
+        _ctx = ctx or {}
+        pr_number = _ctx.get("pr_number")
+        issue_number = _ctx.get("issue_number")
+        merge_sha = str(_ctx.get("merge_sha") or "")
+        merged_at_set = bool(_ctx.get("merged_at_set", True))
 
         # exit_code is None when the process was killed (timeout / SIGKILL).
         if exit_code is None:
@@ -16303,6 +16316,7 @@ class DispatcherDaemon:
         agent_id: str,
         worktree: Path,
         exit_code: int | None,
+        ctx: dict[str, Any] | None = None,
     ) -> None:
         """Post-completion handler for an async retro subprocess (#3658).
 
@@ -16312,11 +16326,17 @@ class DispatcherDaemon:
         previously ran inline after ``_spawn_phase_subprocess`` returned.
 
         ``exit_code=None`` means the subprocess was killed (timeout).
+
+        ``ctx`` is the spawn-time context snapshot passed from
+        :meth:`_finalize_phase_subprocess` (#3698).  It is never
+        re-read from ``_phase_subprocess_inflight`` here because that
+        entry has already been deleted by the time this method is called.
         """
-        inflight = self._phase_subprocess_inflight.get(agent_id, {})
-        ctx = inflight.get("ctx", {})
-        issue_number = ctx.get("issue_number")
-        pr_number = ctx.get("pr_number")
+        # Use the spawn-time context passed explicitly (not re-read from inflight,
+        # which has already been deleted — see #3698).
+        _ctx = ctx or {}
+        issue_number = _ctx.get("issue_number")
+        pr_number = _ctx.get("pr_number")
 
         retro_failed_transition = transition_from_retro(False)
 
@@ -20220,6 +20240,7 @@ class DispatcherDaemon:
                                 "elapsed_seconds": elapsed,
                             },
                         )
+                        ctx_snapshot = entry.get("ctx", {}) or {}
                         self._kill_phase_subprocess(pid)
                         del self._phase_subprocess_inflight[agent_id]
                         self._finalize_phase_subprocess(
@@ -20227,18 +20248,21 @@ class DispatcherDaemon:
                             phase=phase,
                             worktree=worktree,
                             exit_code=None,
+                            ctx=ctx_snapshot,
                         )
                         reaped += 1
                     # else: still within deadline — check next tick.
                     continue
 
                 # Process gone — finalize.
+                ctx_snapshot = entry.get("ctx", {}) or {}
                 del self._phase_subprocess_inflight[agent_id]
                 self._finalize_phase_subprocess(
                     agent_id=agent_id,
                     phase=phase,
                     worktree=worktree,
                     exit_code=0,
+                    ctx=ctx_snapshot,
                 )
                 reaped += 1
             except Exception:
@@ -20286,24 +20310,32 @@ class DispatcherDaemon:
         phase: str,
         worktree: Path,
         exit_code: int | None,
+        ctx: dict[str, Any] | None = None,
     ) -> None:
         """Dispatch to the per-phase post-completion handler (#3658).
 
         Routes completed (or deadline-exceeded) subprocess entries to
         the appropriate finalizer. ``exit_code=None`` means the
         subprocess was killed for exceeding its deadline.
+
+        ``ctx`` carries the spawn-time context snapshot captured by
+        :meth:`_reap_phase_subprocesses` before the inflight entry is
+        deleted.  Finalizers receive it as an explicit parameter so they
+        never re-read from ``_phase_subprocess_inflight`` after deletion
+        (#3698).
         """
+        _ctx = ctx or {}
         if phase == "verify":
             self._finalize_verify(
-                agent_id=agent_id, worktree=worktree, exit_code=exit_code
+                agent_id=agent_id, worktree=worktree, exit_code=exit_code, ctx=_ctx
             )
         elif phase == "fix-ci":
             self._finalize_fix_ci(
-                agent_id=agent_id, worktree=worktree, exit_code=exit_code
+                agent_id=agent_id, worktree=worktree, exit_code=exit_code, ctx=_ctx
             )
         elif phase == "retro":
             self._finalize_retro(
-                agent_id=agent_id, worktree=worktree, exit_code=exit_code
+                agent_id=agent_id, worktree=worktree, exit_code=exit_code, ctx=_ctx
             )
         else:
             self._log.warning(

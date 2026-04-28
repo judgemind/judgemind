@@ -330,16 +330,13 @@ class TestPhaseOutputMissingPreview:
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
 
-        # #3658: call _finalize_fix_ci directly (async path).
-        d._phase_subprocess_inflight[agent_id] = {
-            "phase": "fix-ci",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {"pr_number": 77, "issue_number": 1, "retries_used": 0, "agent": {}},
-        }
-        d._finalize_fix_ci(agent_id, worktree, 0)
+        # #3658/#3698: call _finalize_fix_ci directly with explicit ctx.
+        d._finalize_fix_ci(
+            agent_id,
+            worktree,
+            0,
+            ctx={"pr_number": 77, "issue_number": 1, "retries_used": 0, "agent": {}},
+        )
 
         events = handler.events("phase_output_missing")
         assert events
@@ -361,23 +358,21 @@ class TestPhaseOutputMissingPreview:
         d._mark_agent_terminal = MagicMock()  # type: ignore[method-assign]
         d._update_agent_phase = MagicMock()  # type: ignore[method-assign]
 
-        # #3658: call _finalize_verify directly; merged_at_set=False routes
-        # through handle_agent_failure (the desired "phase_output_missing" path).
-        d._phase_subprocess_inflight[agent_id] = {
-            "phase": "verify",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
+        # #3658/#3698: call _finalize_verify directly with explicit ctx.
+        # merged_at_set=False routes through handle_agent_failure (the desired
+        # "phase_output_missing" path).
+        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
+        d._finalize_verify(
+            agent_id,
+            worktree,
+            0,
+            ctx={
                 "pr_number": 77,
                 "issue_number": 1,
                 "merge_sha": "deadbeef",
                 "merged_at_set": False,
             },
-        }
-        d._handle_agent_failure = MagicMock()  # type: ignore[method-assign]
-        d._finalize_verify(agent_id, worktree, 0)
+        )
 
         events = handler.events("phase_output_missing")
         assert events
@@ -435,21 +430,13 @@ class TestRetroFailurePreviews:
         worktree: Path,
         exit_code: int | None,
     ) -> None:
-        """#3658: populate inflight registry and call _finalize_retro directly
-        (mirrors the reaper pattern used in test_daemon_phase3e.py)."""
+        """#3658/#3698: call _finalize_retro directly with explicit ctx."""
         agent_id = agent["agent_id"]
-        d._phase_subprocess_inflight[agent_id] = {
-            "phase": "retro",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
-                "issue_number": agent.get("issue_number"),
-                "pr_number": agent.get("pr_number"),
-            },
+        ctx = {
+            "issue_number": agent.get("issue_number"),
+            "pr_number": agent.get("pr_number"),
         }
-        d._finalize_retro(agent_id, worktree, exit_code)
+        d._finalize_retro(agent_id, worktree, exit_code, ctx=ctx)
 
     def test_nonzero_exit_logs_preview(self, monkeypatch: Any, tmp_path: Path) -> None:
         d, _conn, handler = _make_daemon(tmp_path)

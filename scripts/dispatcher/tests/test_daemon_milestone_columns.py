@@ -777,7 +777,7 @@ class TestRetroStampsRetroedAt:
             "worktree_path": str(worktree),
         }
 
-        # #3658: stub _spawn_phase_subprocess_async to call _finalize_retro immediately.
+        # #3658/#3698: stub _spawn_phase_subprocess_async to call _finalize_retro immediately.
         def fake_spawn_async(
             phase: str,
             worktree: Path,
@@ -785,15 +785,8 @@ class TestRetroStampsRetroedAt:
             deadline_seconds: float,
             ctx: dict | None = None,
         ) -> None:
-            d._phase_subprocess_inflight[agent_id] = {
-                "phase": phase,
-                "pid": 99999,
-                "worktree_path": worktree,
-                "started_at": 0.0,
-                "deadline_at": 99999.0,
-                "ctx": ctx or {},
-            }
-            d._finalize_retro(agent_id, worktree, 0)
+            # Pass ctx explicitly to finalizer (#3698).
+            d._finalize_retro(agent_id, worktree, 0, ctx=ctx or {})
 
         d._spawn_phase_subprocess_async = fake_spawn_async  # type: ignore[method-assign]
 

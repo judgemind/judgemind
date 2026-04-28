@@ -400,22 +400,15 @@ class TestFixCiBlockedRouting:
         worktree: Path,
         exit_code: int = 0,
     ) -> None:
-        """Populate inflight ctx and call _finalize_fix_ci directly (#3658)."""
+        """Call _finalize_fix_ci directly with explicit ctx (#3698)."""
         agent_id = agent["agent_id"]
-        d._phase_subprocess_inflight[agent_id] = {
-            "phase": "fix-ci",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
-                "agent": dict(agent),
-                "pr_number": agent.get("pr_number"),
-                "issue_number": agent.get("issue_number"),
-                "retries_used": agent.get("retries_used", 0),
-            },
+        ctx = {
+            "agent": dict(agent),
+            "pr_number": agent.get("pr_number"),
+            "issue_number": agent.get("issue_number"),
+            "retries_used": agent.get("retries_used", 0),
         }
-        d._finalize_fix_ci(agent_id, worktree, exit_code)
+        d._finalize_fix_ci(agent_id, worktree, exit_code, ctx=ctx)
 
     def test_blocked_verdict_routes(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path, scope="fix_ci_blocked")
@@ -895,22 +888,15 @@ class TestVerifyFailedPostMergeRouting:
         merge_sha: str,
         exit_code: int = 0,
     ) -> None:
-        """Populate inflight ctx and call _finalize_verify directly (#3658)."""
+        """Call _finalize_verify directly with explicit ctx (#3698)."""
         agent_id = agent["agent_id"]
-        d._phase_subprocess_inflight[agent_id] = {
-            "phase": "verify",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
-                "pr_number": agent.get("pr_number"),
-                "issue_number": agent.get("issue_number"),
-                "merge_sha": merge_sha,
-                "merged_at_set": agent.get("merged_at") is not None,
-            },
+        ctx = {
+            "pr_number": agent.get("pr_number"),
+            "issue_number": agent.get("issue_number"),
+            "merge_sha": merge_sha,
+            "merged_at_set": agent.get("merged_at") is not None,
         }
-        d._finalize_verify(agent_id, worktree, exit_code)
+        d._finalize_verify(agent_id, worktree, exit_code, ctx=ctx)
 
     def test_failed_verdict_routes(self, tmp_path: Path) -> None:
         d, _conn, _handler = _make_daemon(tmp_path, scope="verify_failed_pm")
@@ -1125,26 +1111,19 @@ class TestFixCiRebaseOutcomeLogEvent:
         worktree.mkdir()
         self._patch(d, fix_ci_output=fix_ci_output)
         agent_id = f"agent-{scope}"
-        # Populate inflight ctx so _finalize_fix_ci has the metadata it needs.
-        d._phase_subprocess_inflight[agent_id] = {
-            "phase": "fix-ci",
-            "pid": 99999,
-            "worktree_path": worktree,
-            "started_at": 0.0,
-            "deadline_at": 99999.0,
-            "ctx": {
-                "agent": {
-                    "agent_id": agent_id,
-                    "pr_number": 9966,
-                    "issue_number": 2966,
-                    "retries_used": 0,
-                },
+        # Pass ctx explicitly (#3698 — no longer read from inflight after delete).
+        ctx = {
+            "agent": {
+                "agent_id": agent_id,
                 "pr_number": 9966,
                 "issue_number": 2966,
                 "retries_used": 0,
             },
+            "pr_number": 9966,
+            "issue_number": 2966,
+            "retries_used": 0,
         }
-        d._finalize_fix_ci(agent_id, worktree, 0)
+        d._finalize_fix_ci(agent_id, worktree, 0, ctx=ctx)
         return handler
 
     def test_rebase_outcome_clean_logged(self, tmp_path: Path) -> None:
