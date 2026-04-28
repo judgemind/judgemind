@@ -871,7 +871,7 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
     ]);
     await pool.query(
       `INSERT INTO dispatcher.queue_snapshots (observed_at, queue_depth, issue_numbers, issues_json, run_id)
-       VALUES (now() + interval '1 second', 2, ARRAY[$1, $2]::int[], $3::jsonb, $4)`,
+       VALUES (now(), 2, ARRAY[$1, $2]::int[], $3::jsonb, $4)`,
       [ISSUE_X, ISSUE_Y, allActiveJson, runId2],
     );
     // Insert running agents for both X and Y.
