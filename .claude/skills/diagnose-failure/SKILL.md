@@ -198,7 +198,7 @@ The first eight are the legacy decision tree (still supported for backward compa
 8. **Tracking issue already exists** → either:
    - **Preferred (#3455 inline):** validate the blocker is open via `gh issue view`, append `Blocked by #<N>` yourself, add `status/blocked`, remove `agent/ready`, post the comment, then emit `action="terminal"` with `action_taken="block_on_existing_task"`.
    - Legacy fallback: `action="block_on_existing_task"` with `blocker_issue_number`.
-9. **Inline-action terminal (#3455)** → `action="terminal"`. Preferred whenever you've performed gh side-effects yourself. Required fields: `action_taken` (descriptive string — e.g. `"close"`, `"escalate"`, `"block_and_comment"`, `"file_prerequisite_task"`, `"block_on_existing_task"`, or any other string that names what you did) and `summary` (one paragraph, ≤500 chars, what you did and why). Optional: `evidence` (longer prose with log lines, gh output, etc.).
+9. **Inline-action terminal (#3455)** → `action="terminal"`. Preferred whenever you've performed gh side-effects yourself. Required fields: `action_taken` (descriptive string — e.g. `"close"`, `"escalate"`, `"block_and_comment"`, `"file_prerequisite_task"`, `"block_on_existing_task"`, or any other string that names what you did) and `summary` (one paragraph, ≤500 chars, what you did and why). Optional: `evidence` (longer prose with log lines, gh output, etc.). For the duplicate-PR pattern (N>1 open PRs Closes-keyword'd to the same issue), see Example 8 — `action_taken="consolidate_duplicate_prs"`.
 
 **When uncertain, prefer `escalate` over a wrong guess.** A human re-classification is cheap; a wrong `close` or `reissue` can destroy context.
 
@@ -555,6 +555,47 @@ next_directive: "terminal"
 actions_taken: [
   {"type": "gh_issue_edit", "labels_added": ["status/invalid"]},
   {"type": "gh_issue_close", "issue_number": 3297, "reason": "not planned"}
+]
+```
+### Example 8 — duplicate-PR consolidation, close inline (#3725)
+
+```text
+Trigger: diagnoser invoked on any failure_category when N>1 open PRs all carry
+"Closes #<issue>" in their body. The operator invariant "one PR per issue" is
+violated. Detected during any diagnosis run, regardless of the triggering
+failure_category.
+
+Detection:
+  gh pr list --repo judgemind/judgemind --state open \
+    --search "in:body Closes #<issue>" \
+    --json number,headRefName,updatedAt,statusCheckRollup
+  returns rows for PR #3628 and PR #3650 (N=2).
+
+Selection (pick the canonical PR to keep):
+  1. Most recent push: compare updatedAt across rows -- pick max.
+  2. Tie-break: fewest CI failures (count statusCheckRollup entries with
+     status=FAILURE across each PR).
+  3. Tie-break: largest diff:
+       gh pr diff <N> --patch | wc -l   (higher line count wins)
+  chosen = #3650, duplicates = [#3628].
+
+Action (inline, one Bash call per duplicate):
+  gh pr close 3628 --repo judgemind/judgemind \
+    --comment "Closing as duplicate of #3650" --delete-branch
+
+Issue label state: leave status/in-progress in place.
+The daemon's existing CI-watch / merge logic on #3650 takes over from here.
+No agent/ready toggling needed.
+
+Recommendation: {
+  "action": "terminal",
+  "action_taken": "consolidate_duplicate_prs",
+  "summary": "detected N=2 open PRs with Closes #3601 -- #3628, #3650. Closed #3628 as duplicate of #3650 (most recent push). Daemon CI-watch proceeds on #3650.",
+  "reasoning": "..."
+}
+next_directive: "terminal"
+actions_taken: [
+  {"type": "gh_pr_close", "pr_number": 3628, "comment": "Closing as duplicate of #3650", "delete_branch": true}
 ]
 ```
 
