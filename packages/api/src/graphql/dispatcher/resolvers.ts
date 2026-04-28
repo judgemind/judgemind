@@ -328,29 +328,49 @@ async function queryCapFlippedBy(pool: Pool): Promise<string | null> {
   return normalizeJsonbString(raw);
 }
 
+/**
+ * Count of pickup-eligible `agent/ready` issues in the latest snapshot,
+ * applying the same `dispatcher.issue_has_active_agent` filter as
+ * `queryQueueReady` so the cockpit's `{shown}/{total}` header always agrees.
+ *
+ * Previously returned `queue_depth` directly from the snapshot row, which
+ * caused the cockpit to show `0 / N` instead of `0 / 0` when all N issues
+ * in the snapshot already had active agents (bug #3743). The daemon writer is
+ * consistent — `queue_depth == jsonb_array_length(issues_json)` — but the
+ * GraphQL layer must re-apply the filter to align the denominator with what
+ * `queueReady` shows.
+ *
+ * Fall back to 0 when:
+ *   - The daemon has never booted (no snapshots yet).
+ *   - The table exists but is empty (initial deploy before the first
+ *     successful scan).
+ *   - The daemon's GitHub API calls have failed for the full recent
+ *     history (transient — the next successful scan writes a row).
+ *
+ * Returning 0 keeps the GraphQL contract (`queueDepth: Int!`) honored.
+ */
 async function queryQueueDepth(pool: Pool): Promise<number> {
-  // Phase 2: return the most recent row's `queue_depth` from
-  // `dispatcher.queue_snapshots` (written by the daemon on each 30s
-  // scheduler tick — see `scripts/dispatcher/daemon.py` and migration
-  // `24_dispatcher-queue-snapshots.sql`).
-  //
-  // Fall back to 0 when:
-  //   - The daemon has never booted (no snapshots yet).
-  //   - The table exists but is empty (initial deploy before the first
-  //     successful scan).
-  //   - The daemon's GitHub API calls have failed for the full recent
-  //     history (transient — the next successful scan writes a row).
-  //
-  // Returning 0 keeps the GraphQL contract (`queueDepth: Int!`) honored.
-  const { rows } = await pool.query<{ queue_depth: number | string }>(
-    `SELECT queue_depth
-       FROM dispatcher.queue_snapshots
-       ORDER BY observed_at DESC
-       LIMIT 1`,
+  const issues = await queryLatestQueueSnapshotIssuesJson(pool);
+  if (issues.length === 0) return 0;
+
+  const issueNumbers = issues.map((i) => i.number);
+  const { rows: predicateRows } = await pool.query<{
+    issue_number: number;
+    active: boolean;
+  }>(
+    `SELECT
+       issue_number,
+       dispatcher.issue_has_active_agent(issue_number) AS active
+     FROM unnest($1::int[]) AS issue_number`,
+    [issueNumbers],
   );
-  if (rows.length === 0) return 0;
-  const raw = rows[0].queue_depth;
-  return typeof raw === 'number' ? raw : Number(raw);
+
+  const activeSet = new Set<number>();
+  for (const row of predicateRows) {
+    if (row.active) activeSet.add(row.issue_number);
+  }
+
+  return issues.filter((i) => !activeSet.has(i.number)).length;
 }
 
 /**
