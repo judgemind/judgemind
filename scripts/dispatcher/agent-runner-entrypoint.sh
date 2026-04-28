@@ -3182,10 +3182,15 @@ handle_fix_ci() {
             return 0
         fi
 
-        # Empty-diff check (#3245, refined #3580): ``git diff --cached
-        # --quiet`` exits 0 when nothing is staged. After a PATCHED
-        # verdict that's the "fix is already in the baseline" case —
-        # not a failure. It happens routinely when:
+        # Empty-diff check (#3245, refined #3580, bifurcated #3635):
+        # ``git diff --cached --quiet`` exits 0 when nothing is staged.
+        # After a PATCHED verdict that's an ambiguous signal — it could
+        # mean:
+        #
+        #   Benign (ahead > 0): the fix is already in the rebased
+        #   baseline and there is nothing new to commit, BUT prior
+        #   commits on this branch mean CI will still observe the
+        #   patched state. It happens routinely when:
         #   1. The pre-fix_ci rebase pulled in a sibling PR that landed
         #      the same fix on main first.
         #   2. The skill's edit was idempotent (re-writing the existing
@@ -3193,28 +3198,50 @@ handle_fix_ci() {
         #      it edited a file.
         #   3. A prior fix_ci attempt on the same branch already
         #      committed the fix and this is a retry.
-        # In all three cases the correct action is to advance to
-        # awaiting_ci so the next supervisor tick observes the now-green
-        # CI rollup. The skill's PATCHED self-report was correct in
-        # concluding "the fix is in"; there's just nothing for THIS
-        # invocation to commit.
+        #   Correct action: advance to awaiting_ci so the next
+        #   supervisor tick observes the now-green CI rollup.
         #
-        # Pre-#3580 we treated this as terminal fix_ci_failed/patch_empty,
-        # which left the issue stuck in a daemon-cooldown loop forever
-        # (re-claim → rebase pulls in the same fix → empty diff → fail
-        # → cooldown → repeat).
+        #   Malign (ahead == 0): the branch has NO commits ahead of
+        #   origin/main — the LLM hallucinated a PATCHED verdict without
+        #   actually committing anything (lost commit, missing ``git
+        #   add``, skill bug). Advancing to awaiting_ci here would poll
+        #   CI forever on a branch indistinguishable from main. Correct
+        #   action: terminal-fail as fix_ci_failed/fix_ci_patched_without_commit.
         #
-        # Log event renamed fix_ci_patch_empty → fix_ci_patch_empty_already_applied
-        # so dashboards / alerts split on the new name and don't treat
-        # this as a failure class.
+        # Pre-#3580 the empty-diff branch always terminal-failed
+        # (fix_ci_failed/patch_empty), which left issues stuck in a
+        # daemon-cooldown loop (re-claim → rebase pulls in same fix →
+        # empty diff → fail → cooldown → repeat). #3580 fixed the
+        # benign case by advancing unconditionally. #3635 restores a
+        # terminal path for the malign case so LLM-hallucination / lost-
+        # commit failures surface as failures instead of being silently
+        # swallowed by an infinite awaiting_ci loop.
+        #
+        # Log events:
+        #   fix_ci_patch_empty_already_applied — benign (ahead > 0)
+        #   fix_ci_patch_empty_no_commits      — malign (ahead == 0)
         set +e
         git -C "$REPO_ROOT" diff --cached --quiet \
             > /dev/null 2>&1
         _diff_rc=$?
         set -e
         if [[ "$_diff_rc" -eq 0 ]]; then
+            _ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
+            if [[ "$_ahead" == "0" ]]; then
+                _head_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')
+                log "fix_ci_patch_empty_no_commits" \
+                    "verdict=$_verdict" \
+                    "ahead=$_ahead" \
+                    "head_sha=$_head_sha"
+                agent_runner_reaped_failure \
+                    "fix_ci_failed" \
+                    "fix_ci_patched_without_commit" \
+                    "fix-ci returned PATCHED but worktree has no commits ahead of origin/main"
+                return 0
+            fi
             log "fix_ci_patch_empty_already_applied" \
                 "verdict=$_verdict" \
+                "ahead=$_ahead" \
                 "commit_message=$_commit_msg"
             advance_phase "awaiting_ci"
             printf '%s' "$_output"

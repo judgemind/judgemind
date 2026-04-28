@@ -4193,11 +4193,23 @@ case "$sub" in
         # GIT_DIFF_CACHED_EXIT=0. Default is 1 (there ARE staged changes).
         exit "${GIT_DIFF_CACHED_EXIT:-1}"
         ;;
+    rev-list)
+        # ``git rev-list --count origin/main..HEAD`` — prints how many
+        # commits the branch is ahead of origin/main. Default 1 means
+        # existing tests that don't set GIT_REV_LIST_COUNT keep their
+        # current benign (already-applied) semantics.
+        printf '%s\n' "${GIT_REV_LIST_COUNT:-1}"
+        exit 0
+        ;;
     commit)
         exit "${GIT_COMMIT_EXIT:-0}"
         ;;
     push)
         exit "${GIT_PUSH_EXIT:-0}"
+        ;;
+    rev-parse)
+        printf 'deadbeefcafe000000000000000000000000cafe\n'
+        exit 0
         ;;
     *)
         exit 0
@@ -4637,6 +4649,84 @@ if ! grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/n
 else
     fail "#3245 T49 — does NOT advance to fix_ci_failed on FLAKY" \
          "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Test T_issue3635: #3635 — PATCHED + empty staged diff + NO commits ahead
+# → terminal-fail (fix_ci_failed / fix_ci_patched_without_commit), NOT
+# advance to awaiting_ci.
+#
+# Scenario: the fix-ci skill returns PATCHED, git add succeeds, but
+# git diff --cached is empty (nothing actually staged) AND git rev-list
+# reports 0 commits ahead of origin/main. This is the LLM-hallucination /
+# lost-commit / missing-git-add case: advancing to awaiting_ci would poll
+# CI forever on a branch indistinguishable from main.
+#
+# Assertions:
+#   (a) fix_ci_patch_empty_no_commits log event emitted.
+#   (b) fix_ci_patch_empty_already_applied log event NOT emitted.
+#   (c) psql-log shows phase = 'fix_ci_failed' and status = 'failed'
+#       (terminal-fail path via agent_runner_reaped_failure).
+#   (d) stdout contains category=fix_ci_patched_without_commit
+#       (from the agent_runner_reaped_failure log line).
+#   (e) no git commit or push attempted (nothing to commit / push).
+# ══════════════════════════════════════════════════════════════════════════
+
+T3635_json='{"verdict": "PATCHED", "commit_message": "fix(area): thing — CI (#9999)", "changed_files": []}'
+run_fix_ci_test "t3635" "$T3635_json" GIT_DIFF_CACHED_EXIT=0 GIT_REV_LIST_COUNT=0
+
+# (a) fix_ci_patch_empty_no_commits log event emitted.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patch_empty_no_commits"; then
+    pass "#3635 T_issue3635 — fix_ci_patch_empty_no_commits log event emitted"
+else
+    fail "#3635 T_issue3635 — fix_ci_patch_empty_no_commits log event emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# (b) fix_ci_patch_empty_already_applied log event NOT emitted.
+if ! printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patch_empty_already_applied"; then
+    pass "#3635 T_issue3635 — fix_ci_patch_empty_already_applied NOT emitted"
+else
+    fail "#3635 T_issue3635 — fix_ci_patch_empty_already_applied NOT emitted" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# (c) psql-log shows phase = 'fix_ci_failed' (terminal-fail).
+if grep -q "phase = 'fix_ci_failed'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3635 T_issue3635 — advances to fix_ci_failed terminal (malign empty-diff)"
+else
+    fail "#3635 T_issue3635 — advances to fix_ci_failed terminal (malign empty-diff)" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# (c) Negative: must NOT have advanced to awaiting_ci.
+if ! grep -q "SET phase = 'awaiting_ci'" "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null; then
+    pass "#3635 T_issue3635 — does NOT advance to awaiting_ci on malign empty-diff"
+else
+    fail "#3635 T_issue3635 — does NOT advance to awaiting_ci on malign empty-diff" \
+         "psql-log: $(cat "$FIXCI_TEST_STATE/psql-log.txt" 2>/dev/null)"
+fi
+
+# (d) category=fix_ci_patched_without_commit carried in the failure log line.
+if printf '%s' "$FIXCI_TEST_OUT" | grep -q "fix_ci_patched_without_commit"; then
+    pass "#3635 T_issue3635 — category=fix_ci_patched_without_commit in output"
+else
+    fail "#3635 T_issue3635 — category=fix_ci_patched_without_commit in output" \
+         "output: $FIXCI_TEST_OUT"
+fi
+
+# (e) No git commit or push attempted.
+if ! grep -qE "CALL .*\\bcommit\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3635 T_issue3635 — no git commit attempted on malign empty-diff"
+else
+    fail "#3635 T_issue3635 — no git commit attempted on malign empty-diff" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
+fi
+if ! grep -qE "CALL .*\\bpush\\b" "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null; then
+    pass "#3635 T_issue3635 — no git push attempted on malign empty-diff"
+else
+    fail "#3635 T_issue3635 — no git push attempted on malign empty-diff" \
+         "git-log: $(cat "$FIXCI_TEST_STATE/git-log.txt" 2>/dev/null)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
