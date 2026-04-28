@@ -3,6 +3,8 @@ import { sendEmail } from '../email/send';
 import { renderDigestEmail } from '../email/templates/digest';
 import type { DigestAlertItem } from '../email/templates/digest';
 
+const CONCURRENCY = 10;
+
 type Row = Record<string, unknown>;
 
 interface UserDigest {
@@ -88,31 +90,50 @@ export async function sendAlertDigests(pool: Pool): Promise<number> {
   }
 
   const today = new Date().toISOString().slice(0, 10);
+  const digests = Array.from(userDigests.values());
+  const sentEventIds: string[] = [];
   let emailsSent = 0;
 
-  for (const digest of userDigests.values()) {
-    const { subject, html, text } = renderDigestEmail({
-      displayName: digest.displayName ?? undefined,
-      alerts: digest.alerts,
-      digestDate: today,
-    });
+  // Process digests in bounded-concurrency slices to avoid overwhelming SES
+  for (let i = 0; i < digests.length; i += CONCURRENCY) {
+    const slice = digests.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(
+      slice.map(async (digest) => {
+        const { subject, html, text } = renderDigestEmail({
+          displayName: digest.displayName ?? undefined,
+          alerts: digest.alerts,
+          digestDate: today,
+        });
 
-    await sendEmail({
-      to: digest.email,
-      subject,
-      htmlBody: html,
-      textBody: text,
-    });
+        await sendEmail({
+          to: digest.email,
+          subject,
+          htmlBody: html,
+          textBody: text,
+        });
 
-    // Mark all events for this user as sent in a single batch update
+        return digest.eventIds;
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        sentEventIds.push(...result.value);
+        emailsSent++;
+      } else {
+        console.error('Failed to send digest email:', result.reason);
+      }
+    }
+  }
+
+  // Single batched UPDATE covering all successfully-sent events
+  if (sentEventIds.length > 0) {
     await pool.query(
       `UPDATE alert_events
        SET digest_sent = true, included_in_digest_at = NOW()
        WHERE id = ANY($1::uuid[])`,
-      [digest.eventIds],
+      [sentEventIds],
     );
-
-    emailsSent++;
   }
 
   return emailsSent;

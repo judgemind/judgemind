@@ -44,6 +44,7 @@ const pool = new Pool({
 
 let app: FastifyInstance;
 let userId: string;
+let userId2: string;
 let accessToken: string;
 let courtId: string;
 let judgeId: string;
@@ -137,6 +138,13 @@ async function cleanupData(): Promise<void> {
   // Clean up alert data first (FK order)
   await pool.query(`DELETE FROM alert_events WHERE subscription_id IN (SELECT id FROM alert_subscriptions WHERE user_id = $1)`, [userId]);
   await pool.query(`DELETE FROM alert_subscriptions WHERE user_id = $1`, [userId]);
+  // Clean up second test user if created
+  if (userId2) {
+    await pool.query(`DELETE FROM alert_events WHERE subscription_id IN (SELECT id FROM alert_subscriptions WHERE user_id = $1)`, [userId2]);
+    await pool.query(`DELETE FROM alert_subscriptions WHERE user_id = $1`, [userId2]);
+    await pool.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [userId2]);
+    await pool.query(`DELETE FROM users WHERE id = $1`, [userId2]);
+  }
   // Clean up ruling/document/case/judge/court/party/user
   await pool.query(`DELETE FROM rulings WHERE court_id = $1`, [courtId]);
   await pool.query(`DELETE FROM documents WHERE court_id = $1`, [courtId]);
@@ -367,6 +375,60 @@ describe('Alert subscriptions — integration', () => {
     it('returns 0 when no unsent events exist', async () => {
       const emailsSent = await sendAlertDigests(pool);
       expect(emailsSent).toBe(0);
+    });
+
+    it('sends digests to multiple users with bounded concurrency', async () => {
+      const { sendEmail } = await import('../src/email/send');
+      const mockSendEmail = sendEmail as ReturnType<typeof vi.fn>;
+      mockSendEmail.mockClear();
+
+      // Reset user 1's events so they are unsent again
+      await pool.query(
+        `UPDATE alert_events SET digest_sent = false, included_in_digest_at = NULL
+         WHERE subscription_id IN (SELECT id FROM alert_subscriptions WHERE user_id = $1)`,
+        [userId],
+      );
+
+      // Seed a second user with a subscription and a pending alert event
+      const { rows: u2Rows } = await pool.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, email_verified, display_name, role)
+         VALUES ('alert-test-2@example.com', 'not-a-real-hash', true, 'Alert Tester 2', 'user')
+         RETURNING id`,
+      );
+      userId2 = u2Rows[0].id;
+
+      const { rows: sub2Rows } = await pool.query<{ id: string }>(
+        `INSERT INTO alert_subscriptions (user_id, alert_type, filters, is_active)
+         VALUES ($1, 'judge_ruling', '{}', true)
+         RETURNING id`,
+        [userId2],
+      );
+      const subId2 = sub2Rows[0].id;
+
+      await pool.query(
+        `INSERT INTO alert_events (subscription_id, ruling_id, digest_sent, triggered_at)
+         VALUES ($1, $2, false, NOW())`,
+        [subId2, rulingId],
+      );
+
+      // Both user 1 (reset above) and user 2 have unsent events
+      const emailsSent = await sendAlertDigests(pool);
+      expect(emailsSent).toBe(2); // one digest per user
+
+      // sendEmail called once per user
+      expect(mockSendEmail).toHaveBeenCalledTimes(2);
+      expect(mockSendEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'alert-test@example.com' }));
+      expect(mockSendEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'alert-test-2@example.com' }));
+
+      // All alert_events for both users are now marked as sent (single batched UPDATE)
+      const { rows } = await pool.query(
+        `SELECT digest_sent FROM alert_events WHERE subscription_id IN (
+          SELECT id FROM alert_subscriptions WHERE user_id IN ($1, $2)
+        )`,
+        [userId, userId2],
+      );
+      expect(rows.length).toBeGreaterThan(0);
+      rows.forEach((row) => expect(row.digest_sent).toBe(true));
     });
   });
 
