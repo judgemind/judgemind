@@ -1207,4 +1207,120 @@ describe('weeklyDiagnoserReport — admin', () => {
     expect(body.errors![0].extensions?.code).toBe('NOT_FOUND');
     expect(body.data == null || body.data.weeklyDiagnoserReport == null).toBe(true);
   });
+
+  it('multi-day rollup with 5+ buckets returns full result set including null-outcome rows (#3653)', async () => {
+    // Regression test for the production scenario that triggered the empty-panel
+    // bug: multiple buckets spread across different calendar days, with a mix of
+    // null/non-null recommended_action values AND a row whose outcome JSONB has
+    // no retry_outcome key (observed_outcome = null in SQL) — both must be mapped
+    // to '(unknown)' without throwing a non-null GraphQL serialization error.
+    //
+    // Asserts: body.errors === undefined AND rows.length >= 5, mirroring the
+    // 7-bucket production shape the operator confirmed on 2026-04-27.
+
+    const agentId = await insertAgent({ issueNumber: 800005, status: 'failed', phase: 'ralph' });
+    const failureId = await insertFailure({
+      agentId,
+      category: 'subprocess_crash',
+      detectedBy: 'scheduler',
+    });
+
+    // Spread rows across 5 distinct calendar days within the 7-day window.
+    const day = (daysAgo: number): string =>
+      new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+
+    // Bucket 1 — day 5: retry / succeeded
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: { retry_outcome: 'succeeded', final_status: 'succeeded', resolved_at: day(5) },
+      completedAt: day(5),
+    });
+
+    // Bucket 2 — day 4: retry / failed
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: { retry_outcome: 'failed', final_status: 'failed', resolved_at: day(4) },
+      completedAt: day(4),
+    });
+
+    // Bucket 3 — day 3: skip / failed
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'skip' },
+      outcome: { retry_outcome: 'failed', final_status: 'failed', resolved_at: day(3) },
+      completedAt: day(3),
+    });
+
+    // Bucket 4 — day 2: null action (recommendation={}) / succeeded
+    // Tests that null recommended_action → '(unknown)' without a non-null error.
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: {},
+      outcome: { retry_outcome: 'succeeded', final_status: 'succeeded', resolved_at: day(2) },
+      completedAt: day(2),
+    });
+
+    // Bucket 5 — day 1: escalate / null observed_outcome
+    // Tests that outcome present but without retry_outcome key → null observed_outcome
+    // → '(unknown)' without a non-null GraphQL serialization error (#3653).
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'escalate' },
+      outcome: { final_status: 'succeeded', resolved_at: day(1) }, // intentionally no retry_outcome
+      completedAt: day(1),
+    });
+
+    // Bucket 6 — day 1: escalate / succeeded (same day as bucket 5, different outcome)
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'escalate' },
+      outcome: { retry_outcome: 'succeeded', final_status: 'succeeded', resolved_at: day(1) },
+      completedAt: day(1),
+    });
+
+    const body = await gql(QUERY, undefined, adminToken);
+
+    // No GraphQL errors — the null-action and null-outcome rows must NOT cause
+    // a non-null serialization error that would zero out the entire array.
+    expect(body.errors).toBeUndefined();
+
+    const rows = body.data?.weeklyDiagnoserReport as Array<{
+      recommendedAction: string;
+      observedOutcome: string;
+      count: number;
+      day: string;
+    }>;
+    expect(Array.isArray(rows)).toBe(true);
+
+    // At least 5 distinct (action × outcome × day) buckets must be returned —
+    // the production shape had 7.  Other describe blocks may add rows too, so
+    // use >= instead of ==.
+    expect(rows.length).toBeGreaterThanOrEqual(5);
+
+    // Null-action bucket must appear as '(unknown)'.
+    const nullActionBucket = rows.find(
+      (r) => r.recommendedAction === '(unknown)' && r.observedOutcome === 'succeeded',
+    );
+    expect(nullActionBucket).toBeDefined();
+
+    // Null-outcome bucket (bucket 5, no retry_outcome key) must appear as '(unknown)'.
+    const nullOutcomeBucket = rows.find(
+      (r) => r.recommendedAction === 'escalate' && r.observedOutcome === '(unknown)',
+    );
+    expect(nullOutcomeBucket).toBeDefined();
+
+    // day field must be a non-empty string for every row (DateTime scalar).
+    for (const r of rows) {
+      expect(typeof r.day).toBe('string');
+      expect(r.day.length).toBeGreaterThan(0);
+    }
+  });
 });

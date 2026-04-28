@@ -1508,6 +1508,56 @@ describe('diagnoserRowToGraphQL', () => {
     // through so the DateTimeScalar.serialize function handles formatting.
     expect(out.day).toBe(isoDay);
   });
+
+  it('maps null recommended_action to (unknown) sentinel (#3626)', () => {
+    // Reproduces: recommendation={} in the DB → recommendation->>'action' = NULL
+    // in SQL → row.recommended_action = null.  Without the ?? '(unknown)' guard
+    // the GraphQL String! field would receive null, causing a non-null
+    // serialization error that drops the entire weeklyDiagnoserReport array.
+    const row: DiagnoserEffectivenessRow = {
+      recommended_action: null,
+      observed_outcome: 'failed',
+      count: '3',
+      day: '2026-04-22T00:00:00+00:00',
+    };
+    const out = diagnoserRowToGraphQL(row);
+    expect(out.recommendedAction).toBe('(unknown)');
+    expect(out.observedOutcome).toBe('failed');
+    expect(out.count).toBe(3);
+  });
+
+  it('maps null observed_outcome to (unknown) sentinel (#3653)', () => {
+    // Reproduces: outcome present but missing retry_outcome key
+    // (e.g. outcome={"final_status":"succeeded","resolved_at":"..."}) →
+    // outcome->>'retry_outcome' = NULL in SQL → row.observed_outcome = null.
+    // Without the ?? '(unknown)' guard the GraphQL String! field would receive
+    // null, causing a non-null serialization error that drops the entire
+    // weeklyDiagnoserReport array, rendering the panel empty (#3653).
+    const row: DiagnoserEffectivenessRow = {
+      recommended_action: 'retry',
+      observed_outcome: null,
+      count: '2',
+      day: '2026-04-21T00:00:00+00:00',
+    };
+    const out = diagnoserRowToGraphQL(row);
+    expect(out.observedOutcome).toBe('(unknown)');
+    expect(out.recommendedAction).toBe('retry');
+    expect(out.count).toBe(2);
+  });
+
+  it('maps both null recommended_action and null observed_outcome to (unknown) (#3653)', () => {
+    // Worst-case: neither action nor retry_outcome is present in the JSONB fields.
+    const row: DiagnoserEffectivenessRow = {
+      recommended_action: null,
+      observed_outcome: null,
+      count: '1',
+      day: '2026-04-20T00:00:00+00:00',
+    };
+    const out = diagnoserRowToGraphQL(row);
+    expect(out.recommendedAction).toBe('(unknown)');
+    expect(out.observedOutcome).toBe('(unknown)');
+    expect(out.count).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
