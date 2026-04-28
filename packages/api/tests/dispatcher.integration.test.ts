@@ -1194,6 +1194,44 @@ describe('weeklyDiagnoserReport — admin', () => {
     expect(unknownBucket!.count).toBeGreaterThanOrEqual(1);
   });
 
+  it('null observed_outcome (outcome JSONB missing retry_outcome key) surfaces as (unknown) bucket (#3639)', async () => {
+    // Seed: agent + failure + diagnosis with recommendation={action:'retry'} (non-null action)
+    // and outcome={other_key:'foo'} — outcome IS NOT NULL (passes SQL filter) but
+    // outcome->>'retry_outcome' returns SQL NULL, exercising the
+    // `row.observed_outcome ?? '(unknown)'` coalesce in resolvers.ts:276.
+    const agentId = await insertAgent({ issueNumber: 800004, status: 'failed', phase: 'ralph' });
+    const failureId = await insertFailure({
+      agentId,
+      category: 'subprocess_crash',
+      detectedBy: 'scheduler',
+    });
+    const dayTs = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(); // within 7 days
+    await insertDiagnosis({
+      agentId,
+      failureId,
+      recommendation: { action: 'retry' },
+      outcome: { other_key: 'foo' }, // non-null outcome but no retry_outcome key
+      completedAt: dayTs,
+    });
+
+    const body = await gql(QUERY, undefined, adminToken);
+    // The null-observed_outcome row must NOT cause a GraphQL serialisation error.
+    expect(body.errors).toBeUndefined();
+    const rows = body.data?.weeklyDiagnoserReport as Array<{
+      recommendedAction: string;
+      observedOutcome: string;
+      count: number;
+      day: string;
+    }>;
+    expect(Array.isArray(rows)).toBe(true);
+    // A bucket with recommendedAction === 'retry' AND observedOutcome === '(unknown)' must be present.
+    const bucket = rows.find(
+      (r) => r.recommendedAction === 'retry' && r.observedOutcome === '(unknown)',
+    );
+    expect(bucket).toBeDefined();
+    expect(bucket!.count).toBeGreaterThanOrEqual(1);
+  });
+
   it('non-admin returns "not found" error', async () => {
     const body = await gql(QUERY, undefined, userToken);
     expect(body.errors).toBeDefined();
