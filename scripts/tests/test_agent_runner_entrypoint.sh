@@ -4896,7 +4896,7 @@ awk '
     /^        fix_conflict\)$/ { in_arm=1; next }
     in_arm && /^        fix_ci\)/ { exit }
     in_arm { print }
-' "$ENTRYPOINT" | head -n -1 > "$t51_dispatch_body"
+' "$ENTRYPOINT" | sed '$d' > "$t51_dispatch_body"
 
 # Sanity: dispatch block was extracted.
 if grep -q "fix_conflict_handler_done" "$t51_dispatch_body"; then
