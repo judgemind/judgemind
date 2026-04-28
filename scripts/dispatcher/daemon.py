@@ -1026,6 +1026,16 @@ STUCK_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     "verify": 3000,  # 50 min (was unset, fell back to 30 min global) — issue #2885
     "retro": 3000,  # 50 min (was 20 min) — single /task-v2-retro, issue #2885
     "operational": 3600,  # 60 min — most ops finish in ~30 min; 2× headroom, issue #3524
+    # Scheduled-skill phase names (kind='scheduled_skill') — issue #3723.
+    # `dispatcher.agents.phase` is the registered skill name (hyphens preserved
+    # from `dispatcher.scheduled_skills.name`). These skills run a single
+    # `claude -p /<skill>` and only persist `phase_transitions` at end, so the
+    # reaper only sees `now() - started_at`. Set ceilings well above documented
+    # runtimes; the diagnoser will still pick up a truly hung row eventually.
+    "spotcheck": 5400,                  # 90 min — SKILL.md says "one-hour spot-check"
+    "audit": 5400,                      # 90 min — every-N-merges audit, similar shape
+    "dispatcher-audit": 5400,           # 90 min — 6-hourly health probes (#2865)
+    "dispatcher-daily-report": 1800,    # 30 min — short summary skill (#3375)
     "paused_by_killswitch": 60,  # 1 min — terminal phase, should be swept quickly
     "force_stopped": 60,  # 1 min — #2884 operator force_stop terminal phase
     "daemon_restart_abandoned": 60,  # 1 min — terminal phase from restart recovery
