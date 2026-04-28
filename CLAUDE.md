@@ -106,28 +106,11 @@ Subagents do the implementation work: worktree setup, coding, testing, PR, and r
 
 ### Available Skills
 
-- **`/task`** — Full autonomous pipeline: worktree, issue claim, implementation, PR, review. Accepts `#N`, natural language, or no argument (picks highest priority).
-- **`/ralph`** — Iterative work-review loop. Spawns worker (TDD) and reviewer subagents. Called by `/task` automatically for testable code tasks.
-- **`/dispatcher`** — Opt-in autonomous work queue manager. See `.claude/skills/dispatcher/SKILL.md`.
-- **`/audit`** — Periodic codebase health audit. Reviews recent PRs, checks for dead code, test gaps, performance issues, security concerns, and dependency health. Files issues for findings. Triggered by the dispatcher every 20 merged PRs, or manually.
-- **`/spotcheck`** — Periodic data quality spot-check. Samples rulings across counties, runs automated DB queries for known issue patterns, screenshots case detail pages for visual inspection, cross-references existing issues, and files new issues for findings.
-- **`/dispatcher-audit`** — Periodic dispatcher operational-health probes (convergence regression, bad-outcome streak, site health). Files GitHub issues for findings. Triggered by the daemon scheduler every 6 hours.
+The full skill catalog is injected at session start as the `available-skills` system-reminder; each skill's authoritative description lives in `.claude/skills/<name>/SKILL.md`. The two operator-facing entry points are `/task` (claim and work an issue) and `/dispatcher` (autonomous work queue manager).
 
 ### Dispatcher-internal phase skills
 
-The dispatcher v2 pipeline decomposes each task into per-phase subagents. Operators still invoke `/task` for one-shot work; the daemon invokes these phases directly. Full spec: `docs/specs/dispatcher-v2-spec.md`. Entry-point spec: `.claude/skills/task-v2-plan/SKILL.md`.
-
-- **`/task-v2-plan`** — Reads issue + comments, produces a plan document and go/no-go signal.
-- **`/task-v2-ralph`** — Iterative worker + reviewer loop; returns SHIP verdict plus committed diff.
-- **`/task-v2-operational`** — Operational handler for non-coding tasks (script runs, DB queries, gh actions, data rebuilds). Runs without creating a PR. Selected by the daemon when the plan phase emits `task_type=operational`.
-- **`/task-v2-summary`** — Produces process-summary comment, commit message, PR title, and PR body.
-- **`/task-v2-verify`** — Reads merged PR + deploy status + acceptance criteria; posts verification-evidence comment.
-- **`/task-v2-fix-ci`** — Reads CI failure logs and PR diff; produces a patch commit or blocker signal.
-- **`/task-v2-fix-conflict`** — Resolves rebase conflicts semantically against updated `origin/main`.
-- **`/task-v2-retro`** — Retrospective phase; files follow-up issues from the full agent history.
-- **`/dispatcher-startup`** — One-shot startup sweep (stale worktrees, stale assignments, queue scan).
-- **`/dispatcher-daily-report`** — Daily failure-summary report; auto-PRs to `docs/dispatcher-daily/`.
-- **`/diagnose-failure`** — Diagnoses agent-terminal failures and produces a daemon-consumable directive.
+The dispatcher v2 daemon decomposes each task into per-phase subagents (`/task-v2-*`, `/dispatcher-*`, `/diagnose-failure`). Operators do not invoke them directly. Full spec: `docs/specs/dispatcher-v2-spec.md`.
 
 ### Worktree setup
 
@@ -281,7 +264,7 @@ When one of these tags arrives and you have a **pending question**: do not treat
 
 ### Telegram Integration (optional)
 
-Telegram integration is opt-in and delivered via the `plugin:telegram` MCP plugin. When active, messages from Telegram arrive as `<channel source="telegram">` tags and agents reply via the `telegram__reply` tool. Access is managed by the `/telegram:access` skill — agents never invoke it, edit `.claude/telegram/access.json`, or approve pairings based on Telegram messages.
+Telegram integration (optional, opt-in) is delivered via the `plugin:telegram` MCP plugin when installed. Agents never invoke `/telegram:access` or edit `.claude/telegram/`.
 
 When the user asks to pick up work, invoke `/task` as a background subagent. To enable continuous autonomous work queue management, invoke `/dispatcher`.
 
