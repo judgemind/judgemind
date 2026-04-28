@@ -10,8 +10,8 @@
 # the agent row but GitHub sometimes does NOT auto-close the issue (when the
 # PR body lacks a ``Closes #N`` keyword). This leaves stale succeeded rows
 # that previously blocked the ready queue indefinitely via
-# ``_issue_already_attempted``. Migration 56 removed the block at the SQL
-# level; this script drains the backlog that accumulated before migration 56.
+# ``_issue_already_attempted``. Migration 60 removed the block at the SQL
+# level; this script drains the backlog that accumulated before migration 60.
 #
 # Usage:
 #   scripts/cleanup-stale-succeeded-rows.sh

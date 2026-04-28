@@ -814,8 +814,8 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
   });
 
   it('issue_has_active_agent: succeeded + merged_at IS NULL → true; succeeded + merged_at IS NOT NULL → false (#3738)', async () => {
-    // This test pins the new semantic introduced by migration 56: a succeeded
-    // row with a non-null merged_at must NOT block re-claim.  If migration 56
+    // This test pins the new semantic introduced by migration 60: a succeeded
+    // row with a non-null merged_at must NOT block re-claim.  If migration 60
     // is ever reverted the old function body reinstates itself (via the Down
     // migration), which would make the IS NOT NULL assertion below fail CI.
     const ISSUE_SUCCEEDED = 99_000_001;
