@@ -172,7 +172,7 @@ import psycopg  # noqa: E402
 import structlog  # noqa: E402
 
 from framework.extraction_config import get_county_extraction_config  # noqa: E402
-from framework.llm_enrichment import enrich_ruling_with_retry  # noqa: E402
+from framework.llm_enrichment import LlmEnrichmentExhaustedError, enrich_ruling_with_retry  # noqa: E402
 from framework.llm_extractor import LlmExtractor  # noqa: E402
 from framework.llm_schema import ExtractedRuling  # noqa: E402
 from framework.logging import configure_structlog  # noqa: E402
@@ -1853,13 +1853,24 @@ def _reparse_document_multimodal(
             getattr(multimodal_extractor, "_provider", None) or llm_provider
         )
         enrichment_model = getattr(multimodal_extractor, "_model", None) or llm_model
-        _apply_llm_enrichment(
-            extracted,
-            llm_client=enrichment_client,
-            llm_provider=enrichment_provider,
-            llm_model=enrichment_model,
-            document_id=doc_meta["document_id"],
-        )
+        try:
+            _apply_llm_enrichment(
+                extracted,
+                llm_client=enrichment_client,
+                llm_provider=enrichment_provider,
+                llm_model=enrichment_model,
+                document_id=doc_meta["document_id"],
+            )
+        except LlmEnrichmentExhaustedError as _exc:
+            logger.critical(
+                "per-child enrichment exhausted on multimodal reingest — "
+                "ruling will land without LLM enrichment",
+                document_id=doc_meta["document_id"],
+                split_document_id=extracted.get("split_document_id"),
+                ruling_index=extracted.get("ruling_index"),
+                case_number=extracted.get("case_number"),
+                error=str(_exc),
+            )
 
         results.append(extracted)
 
