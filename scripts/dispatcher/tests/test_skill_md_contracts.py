@@ -629,3 +629,51 @@ class TestDuplicatePrConsolidationContract:
             "diagnose-failure/SKILL.md must reference '#3725' for traceability "
             "(issue #3725)"
         )
+
+
+# ------------------------------------------------------------------
+# Issue #3744 — empowered diagnoser: "Default to taking the action"
+# and "Chains, not blockers" rules.
+# ------------------------------------------------------------------
+
+
+class TestEmpoweredDiagnoserContracts:
+    """diagnose-failure/SKILL.md must document the empowered-diagnoser rules
+    introduced by issue #3744: the "Default to taking the action, not filing it"
+    rule, the "Chains, not blockers" rule, and Example 9 (#3694 walk-through)."""
+
+    def test_default_to_action_heading(self) -> None:
+        """The 'Default to taking the action, not filing it' section heading
+        must appear in §Step 2 (issue #3744)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "Default to taking the action, not filing it" in content, (
+            "diagnose-failure/SKILL.md must have a "
+            "'Default to taking the action, not filing it' rule section "
+            "(issue #3744)"
+        )
+
+    def test_chains_not_blockers_heading(self) -> None:
+        """The 'Chains, not blockers' section heading must appear immediately
+        after the default-to-action rule (issue #3744)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "Chains, not blockers" in content, (
+            "diagnose-failure/SKILL.md must have a 'Chains, not blockers' "
+            "rule section (issue #3744)"
+        )
+
+    def test_3694_reference(self) -> None:
+        """Example 9 must reference issue #3694 as the concrete walk-through
+        case (issue #3744)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "#3694" in content, (
+            "diagnose-failure/SKILL.md must reference '#3694' in Example 9 "
+            "(issue #3744)"
+        )
+
+    def test_3744_issue_reference(self) -> None:
+        """SKILL.md must reference issue #3744 for traceability."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "#3744" in content, (
+            "diagnose-failure/SKILL.md must reference '#3744' for traceability "
+            "(issue #3744)"
+        )

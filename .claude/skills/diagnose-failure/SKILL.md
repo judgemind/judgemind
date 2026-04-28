@@ -176,6 +176,36 @@ On 2026-04-23 the Opus diagnoser hallucinated a PAT-scope cascade push-rejection
 
 Walk the decision tree below. For most cases the action shape is clear from the failure category and the verbatim stderr. **Pre-#3366 the diagnoser was constrained to recommendation-only output; post-#3366 you can also do the work directly** — patch the agent's branch, file the issue with `gh issue create`, etc. **Post-#3455 the preferred shape for any case where you've taken gh side-effects yourself is `action="terminal"`** — see "Inline-action terminal" below.
 
+### "Default to taking the action, not filing it" rule
+
+When a failure is **tractable** (the fix is mechanical and bounded — a small patch, a cleanup query, a duplicate deletion, a missing log line), the diagnoser MUST do the work directly rather than filing a task and escalating.
+
+**Examples of tractable actions the diagnoser SHOULD do inline:**
+
+- **Instrumentation patch**: the worker's stdout/stderr was not captured; write the 3-line patch to add the capture, open a PR, watch CI, merge. Return `action="terminal"` with `action_taken` summarizing the patch.
+- **Cleanup query**: a stale or duplicate row is blocking a pipeline step; write and run the targeted `DELETE` or `UPDATE` via `scripts/dev-db-query.sh`, confirm the row is gone, return `action="terminal"`.
+- **Sibling-fix duplication**: the same bug was fixed in a sibling scraper last week; port the fix to the current scraper, open a PR, merge. Return `action="terminal"`.
+- **Missing diagnostic data**: a failure has ambiguous root cause because a key field isn't logged; add the field to the log statement, open a PR, merge, return `action="terminal"`. Do NOT wait to see if the next run fails before acting.
+
+**Reserved for operator-only (the diagnoser must NOT act unilaterally):**
+
+- PAT / secret rotation (auth tokens, API keys, AWS credentials).
+- Product or spec decisions (should this feature exist, should this UI work this way).
+- Infrastructure outside agent reach (Fargate task definition changes requiring human approval, DNS changes, CDN config).
+- Destructive operations without explicit human confirmation (DROP TABLE, mass DELETE without a safe preview, irreversible S3 mutations).
+
+**The closing rule:** A failure pattern that says "instrument this and the answer becomes obvious" is NEVER `needs-human`.
+
+### "Chains, not blockers" rule
+
+When the work is tractable but larger than ~30 minutes (multi-file refactor, non-trivial new feature, data migration), prefer filing a prerequisite task over escalating:
+
+- Use `action="file_prerequisite_task"` so the **original issue auto-unblocks** via the Closes-keyword in the new task's PR.
+- Write the prerequisite task with enough context that an agent can pick it up immediately.
+- Return `action="file_prerequisite_task"` — the daemon will link the tasks and set the original back to `agent/ready` once the prerequisite merges.
+
+**Never** set `status/needs-human` on the original issue just because the fix requires a multi-step chain. `needs-human` is reserved for the four operator-only domains above — it is not a synonym for "complicated" or "uncertain."
+
 ### Action selection — the nine known recommendations
 
 The first eight are the legacy decision tree (still supported for backward compat); the ninth (`terminal`) is the new collapsed shape preferred post-#3455.
@@ -598,6 +628,28 @@ actions_taken: [
   {"type": "gh_pr_close", "pr_number": 3628, "comment": "Closing as duplicate of #3650", "delete_branch": true}
 ]
 ```
+
+### Example 9 — Empowered diagnoser walks #3694 (#3744)
+
+**Failure context:** Agent on issue #3694 has silently failed three times. Each run exits with `verdict=BLOCKED`, `block_reason="worker STUCK"`. The ECS logs show the ECS task completing, but the scraper worker's stdout and stderr were never captured — the dispatcher only sees the exit code.
+
+**WRONG path (pre-#3744 behavior):**
+1. Diagnoser reads the three BLOCKED rows.
+2. Diagnoser concludes: "I can't diagnose without the worker output."
+3. Diagnoser emits `action="escalate"`, adds `status/needs-human`, posts a comment: "Need operator to investigate ECS logging."
+4. Issue sits in needs-human queue for days.
+
+**RIGHT path (post-#3744 empowered behavior):**
+1. Diagnoser reads the three BLOCKED rows.
+2. Diagnoser identifies the gap: worker stdout/stderr not captured in `dispatcher.phases`.
+3. **Diagnoser acts:** Opens a worktree, writes a 3-line patch adding `stdout=result.stdout, stderr=result.stderr` capture to `scripts/dispatcher/worker.py` (or whichever ECS launch wrapper is responsible for subprocess capture + ECS metadata logging).
+4. Opens a PR, watches CI (`gh run watch`), merges.
+5. Returns `action="terminal"` with `action_taken="ship_instrumentation_patch: added stdout/stderr capture to worker subprocess launch in PR #XXXX"`.
+6. The original issue #3694 is now unblocked: the next dispatch will have full diagnostic output.
+
+**Oversize fallback:** If the instrumentation fix is larger than ~30 min (e.g. requires a schema migration to add a `log_text` column to `dispatcher.phases`), use `action="file_prerequisite_task"` with a precise task body so the prerequisite can be picked up immediately and the Closes-keyword auto-unblocks #3694 on merge.
+
+**The invariant:** In neither path does the diagnoser emit `status/needs-human` for issue #3694. That label means "a human must make a judgment call." Deciding where to add a log line is not a judgment call — it is mechanical and bounded.
 
 ---
 
