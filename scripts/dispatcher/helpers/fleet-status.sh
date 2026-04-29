@@ -313,6 +313,27 @@ terminals_json=$(query "$q_terminals")
 config_json=$(query "$q_config")
 diagnoses_json=$(query "$q_diagnoses")
 greens_json=$(query "$q_greens")
+
+# Issue #3752: filter greens to rows where the PR is actually MERGED.
+# Each row may have a pr_number; verify via gh before including in the output.
+# Rows without a pr_number are kept (defensive — they should never appear
+# in the greens window, but we don't want to silently drop them).
+verified_greens="[]"
+green_count=$(printf '%s' "$greens_json" | jq 'length')
+for (( i=0; i<green_count; i++ )); do
+    row=$(printf '%s' "$greens_json" | jq ".[$i]")
+    pr=$(printf '%s' "$row" | jq -r '.pr_number // empty')
+    if [[ -z "$pr" ]]; then
+        verified_greens=$(printf '%s\n%s' "$verified_greens" "$row" | jq -s '.[0] + [.[1]]')
+        continue
+    fi
+    pr_state=$(gh pr view "$pr" --repo judgemind/judgemind --json state -q .state 2>/dev/null || true)
+    if [[ "$pr_state" == "MERGED" ]]; then
+        verified_greens=$(printf '%s\n%s' "$verified_greens" "$row" | jq -s '.[0] + [.[1]]')
+    fi
+done
+greens_json="$verified_greens"
+
 pending_json=$(query "$q_pending")
 totals_json=$(query "$q_totals")
 
