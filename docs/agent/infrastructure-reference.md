@@ -103,6 +103,48 @@ When adding a new module that wraps a resource with a maintenance window, check 
 
 See `docs/terraform-checklist.md` for the full checklist.
 
+### Terraform task-def edits — silent-drop gotcha
+
+**Background.** On 2026-04-19 (PR #2836 / parent issue #2840), `terraform apply` silently produced a `judgemind-dispatcher-dev` task-definition revision **without** the `ANTHROPIC_API_KEY` entry in its `secrets` array, despite:
+
+- The HCL wiring being correct (`anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn` in `environments/dev/main.tf`).
+- `terraform state show data.aws_secretsmanager_secret.anthropic_api_key` returning the populated ARN.
+- A `-replace='module.dispatcher_daemon.aws_ecs_task_definition.dispatcher'` apply running cleanly with `Apply complete! Resources: 2 added, 0 changed, 1 destroyed`.
+- A subsequent `terraform plan` reporting "No changes."
+
+The conditional `concat()` block in `modules/dispatcher-daemon/main.tf` (lines 737-775) appends each secret entry only when its ARN variable is non-empty:
+
+```hcl
+secrets = concat(
+  var.anthropic_api_key_secret_arn != "" ? [
+    { name = "ANTHROPIC_API_KEY", valueFrom = var.anthropic_api_key_secret_arn }
+  ] : [],
+  ...
+)
+```
+
+That pattern is correct in principle, but it has a silent-failure mode: if the variable evaluates to `""` for *any reason* (stale data-source evaluation, provider content-hash dedup against a previous revision, refresh quirk), the conditional drops the entry and the rendered JSON is missing the secret. The variable-level `precondition` block (#2838 / PR #3233) catches the case where the ARN is empty *at the variable level* — but it does NOT catch the case where the ARN is non-empty yet the rendered JSON ends up without the secret entry.
+
+**Prevention mechanism (#3764).** The `aws_ecs_task_definition.dispatcher` resource carries `lifecycle.postcondition` blocks that check the rendered `container_definitions` JSON against `self.container_definitions` for each required secret name:
+
+```hcl
+postcondition {
+  condition = (
+    var.anthropic_api_key_secret_arn == "" ||
+    strcontains(self.container_definitions, "ANTHROPIC_API_KEY")
+  )
+  error_message = "dispatcher-daemon: rendered container_definitions is missing ANTHROPIC_API_KEY despite anthropic_api_key_secret_arn being set."
+}
+```
+
+These postconditions evaluate at plan time (when the rendered JSON is statically knowable) or at apply time (otherwise). Either way, an apply that would produce a task-def revision without a required secret fails loudly instead of silently registering a broken revision. Coverage: ANTHROPIC_API_KEY, DATABASE_URL, GITHUB_TOKEN, TELEGRAM_BOT_TOKEN, GEMINI_API_KEY.
+
+A regression test fixture lives in `infra/terraform/modules/dispatcher-daemon/tests/postconditions/` and is wired into the `Terraform / Validate and Plan` CI job.
+
+**Operator gotcha.** When editing `modules/dispatcher-daemon/main.tf` to add a new secret, mirror the pattern: add the conditional `concat()` branch, the variable-level `precondition` (if `desired_count > 0` requires it), AND the content-level `postcondition` that asserts the secret name appears in the rendered JSON. Without the postcondition, a future regression that drops the `concat()` branch (or any other path that produces empty rendered JSON despite a non-empty ARN var) will silently ship a broken task-def revision.
+
+**Workaround for past silent drops.** If you encounter a deployed task-def revision that's missing a secret despite the HCL being correct: register a corrected revision out-of-band via `aws ecs register-task-definition` with the missing entry injected, then `aws ecs update-service --task-definition <family>:<rev> --force-new-deployment`. The next terraform apply will reconcile to a clean state once the postcondition catches any remaining drift.
+
 ## Dispatcher v2 Cutover
 
 The dispatcher v2 daemon is an opt-in production replacement for the laptop-dispatcher's `/dispatcher` skill. It runs on Fargate, claims `agent/ready` issues from GitHub, and drives each one end-to-end through `claude -p '/task-v2-*'` subprocesses (plan → ralph → summary → push → CI watch → merge → deploy watch → verify → retro → cleanup). Phase 3 (#2782) shipped all the orchestration code; Phase 3E (#2798) was the final code piece. **The cutover from `concurrency_cap=0` (cold) to `concurrency_cap=1` (one in-flight agent) is an explicit operator action — not part of any PR.**
