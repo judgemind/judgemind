@@ -323,6 +323,96 @@ read_agent_status() {
                    LIMIT 1;"
 }
 
+# ── ECS task-ARN capture (#3694) ───────────────────────────────────────────
+#
+# Set ``dispatcher.agents.agent_task_arn`` from the ECS metadata endpoint
+# early in the entrypoint so a future diagnoser can pull the task's
+# CloudWatch logs without hunting through ECS describe-tasks state.
+# Mirrors the same column the daemon-side ``_launch_agent_ecs_task``
+# already populates on the launch-result path; this fills it in for the
+# in-task launch ordering that #3694 caught producing
+# ``agent_task_arn=NULL`` rows on every silent ralph_not_ship failure.
+#
+# Failure modes (all best-effort, must never abort the runner):
+#
+#   * ``$ECS_CONTAINER_METADATA_URI_V4`` unset (subprocess-mode, local
+#     test, non-ECS container) → log + skip, no DB write.
+#   * ``curl`` not on PATH (slim image variant) → log + skip.
+#   * Metadata endpoint returns non-zero / non-JSON / missing
+#     ``.TaskARN`` field → log + skip with the response head for
+#     triage.
+#   * DB UPDATE fails (DATABASE_URL transient outage) → log + skip;
+#     the agent row keeps ``agent_task_arn=NULL`` and the daemon's
+#     existing periodic ARN-backfill (#3158) can fill it later.
+#
+# Tests can stub this by setting ``AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1``
+# OR by leaving ``ECS_CONTAINER_METADATA_URI_V4`` unset (the natural
+# state for non-ECS runs).
+set_agent_task_arn_from_metadata() {
+    if [[ "${AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE:-0}" == "1" ]]; then
+        log "agent_task_arn_capture_skipped" "reason=env_skip"
+        return 0
+    fi
+    _meta_url="${ECS_CONTAINER_METADATA_URI_V4:-}"
+    if [[ -z "$_meta_url" ]]; then
+        log "agent_task_arn_capture_skipped" "reason=no_metadata_uri"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        log "agent_task_arn_capture_skipped" "reason=curl_missing"
+        return 0
+    fi
+    _meta_body_file="$AGENT_WORKSPACE/ecs-metadata.json"
+    set +e
+    curl --fail --silent --show-error --max-time 5 \
+        "$_meta_url/task" \
+        > "$_meta_body_file" \
+        2> "$AGENT_WORKSPACE/ecs-metadata.stderr.log"
+    _meta_rc=$?
+    set -e
+    if [[ "$_meta_rc" -ne 0 ]]; then
+        _meta_err_tail=$(head -c 200 "$AGENT_WORKSPACE/ecs-metadata.stderr.log" 2>/dev/null \
+            | tr '\n\r\t' '   ')
+        log "agent_task_arn_capture_failed" \
+            "reason=curl_exit_${_meta_rc}" \
+            "stderr_tail=$_meta_err_tail"
+        return 0
+    fi
+    _task_arn=$(jq -r '.TaskARN // empty' "$_meta_body_file" 2>/dev/null || printf '')
+    if [[ -z "$_task_arn" ]]; then
+        _meta_head=$(head -c 200 "$_meta_body_file" 2>/dev/null | tr '\n\r\t' '   ')
+        log "agent_task_arn_capture_failed" \
+            "reason=task_arn_missing" \
+            "body_head=$_meta_head"
+        return 0
+    fi
+    # UPDATE the agent row. Best-effort — if DATABASE_URL is transiently
+    # unreachable we don't want to block the runner. The daemon's periodic
+    # backfill sweep already handles late-arriving ARNs for legacy rows.
+    set +e
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+        -v agent_id="$AGENT_ID" \
+        -v task_arn="$_task_arn" <<'EOF' >/dev/null 2>&1
+UPDATE dispatcher.agents
+   SET agent_task_arn = :'task_arn'
+ WHERE agent_id = :'agent_id';
+EOF
+    _arn_rc=$?
+    set -e
+    if [[ "$_arn_rc" -ne 0 ]]; then
+        log "agent_task_arn_capture_failed" \
+            "reason=db_update_exit_${_arn_rc}" \
+            "task_arn=$_task_arn"
+        return 0
+    fi
+    log "agent_task_arn_captured" "task_arn=$_task_arn"
+}
+
+# Run the capture as early as possible — right after the DB helpers are
+# defined. Skipped automatically when ``ECS_CONTAINER_METADATA_URI_V4``
+# is unset (subprocess mode + tests).
+set_agent_task_arn_from_metadata
+
 # ── Python helper: phase_transitions bridge --------------------------------
 #
 # The shell script can't import Python, so we expose the pure
@@ -2188,14 +2278,26 @@ handle_scheduled_skill() {
 }
 
 persist_phase_output() {
-    # $1 = phase, $2 = output JSON.
+    # $1 = phase, $2 = output JSON, $3 = optional path to a log-text
+    #     file (worker stdout/stderr tail merged) to persist into
+    #     ``dispatcher.phase_outputs.log_text``. Empty / missing → log_text
+    #     stays NULL (the legacy two-arg behaviour).
     # Stage 1b writes a minimal row shape matching the daemon's
     # phase_outputs schema: (agent_id, phase, output_json) — NOT a
     # `status` column, which does not exist on `dispatcher.phase_outputs`
     # (#3115). The daemon's subprocess-mode persist writes the same
-    # three columns. The `log_text` / `attempt` / token + cost columns
+    # three columns. The `attempt` / token + cost columns
     # stay NULL here; Stage 2 wiring populates them once the daemon-
     # side log-capture path is in place.
+    #
+    # #3694 — log_text capture for the ralph silent-exit case. The
+    # entrypoint now passes the merged stdout/stderr tail of
+    # ``claude-p-ralph.{stdout,stderr}.log`` into this column on every
+    # ralph exit, so a future diagnoser can read the worker's last words
+    # even when ``output_json={}`` (the silent ``ralph_not_ship`` shape
+    # documented in the issue body). Other phases continue to call this
+    # with two args and write log_text=NULL — Stage 2 will widen the
+    # capture to all phases once we've validated the ralph variant.
     #
     # #3219 — ON CONFLICT overwrite. The unique index
     # ``idx_dispatcher_phase_outputs_agent_phase_attempt`` on
@@ -2232,6 +2334,7 @@ persist_phase_output() {
     # set, producing malformed JSONB and a postgres syntax error.
     _phase="$1"
     _output_json="$2"
+    _log_text_path="${3:-}"
     if [[ -z "$_output_json" ]]; then
         _output_json="{}"
     fi
@@ -2292,11 +2395,39 @@ persist_phase_output() {
         set -e
         return 1
     fi
+    # #3694 — when the caller provided a log_text path, INSERT/UPDATE
+    # both ``output_json`` AND ``log_text``. Otherwise keep the legacy
+    # two-column write so untouched phases produce identical SQL. We
+    # branch in the SQL via psql ``\if`` rather than building two
+    # separate heredocs so the bulk of the statement stays one block.
+    _log_text_present=0
+    if [[ -n "$_log_text_path" && -s "$_log_text_path" ]]; then
+        _log_text_present=1
+    fi
     log "db_exec_begin" "fn=persist_phase_output phase=$_phase"
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
-        -v agent_id="$AGENT_ID" \
-        -v phase="$_phase" \
-        -v output_path="$_persist_tmpfile" <<'EOF' >/dev/null
+    if [[ "$_log_text_present" -eq 1 ]]; then
+        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -v agent_id="$AGENT_ID" \
+            -v phase="$_phase" \
+            -v output_path="$_persist_tmpfile" \
+            -v log_text_path="$_log_text_path" <<'EOF' >/dev/null
+\set output_json `cat :'output_path'`
+\set log_text `cat :'log_text_path'`
+INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json, log_text)
+VALUES (:'agent_id', :'phase', :'output_json'::jsonb, :'log_text')
+ON CONFLICT (agent_id, phase, attempt) DO UPDATE
+  SET output_json = EXCLUDED.output_json,
+      log_text = EXCLUDED.log_text,
+      ts = now();
+INSERT INTO dispatcher.phase_transitions (agent_id, phase)
+VALUES (:'agent_id', :'phase');
+EOF
+        _persist_rc=$?
+    else
+        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -v agent_id="$AGENT_ID" \
+            -v phase="$_phase" \
+            -v output_path="$_persist_tmpfile" <<'EOF' >/dev/null
 \set output_json `cat :'output_path'`
 INSERT INTO dispatcher.phase_outputs (agent_id, phase, output_json)
 VALUES (:'agent_id', :'phase', :'output_json'::jsonb)
@@ -2306,7 +2437,8 @@ ON CONFLICT (agent_id, phase, attempt) DO UPDATE
 INSERT INTO dispatcher.phase_transitions (agent_id, phase)
 VALUES (:'agent_id', :'phase');
 EOF
-    _persist_rc=$?
+        _persist_rc=$?
+    fi
     set -e
     rm -f "$_persist_tmpfile"
     log "db_exec_done" "fn=persist_phase_output phase=$_phase rc=$_persist_rc"
@@ -5223,7 +5355,97 @@ while true; do
             if [[ "$_current" == "ralph" ]]; then
                 stop_ralph_head_watcher
             fi
-            persist_phase_output "$_current" "$_output"
+            # #3694 — ralph silent-exit instrumentation. The original
+            # symptom: three consecutive ECS agents on three different
+            # issues exited with ``output_json={}`` and ``stderr_tail=""``,
+            # producing zero diagnostic data. The worker subprocess
+            # terminated cleanly without writing a verdict marker, so the
+            # daemon classified the failure as ``ralph_not_ship`` with no
+            # block_reason.
+            #
+            # Layer 1 (this commit) makes the failure self-diagnosing —
+            # capture the worker's stdout/stderr tails into
+            # ``phase_outputs.log_text``, emit a structured
+            # ``ralph_done_marker_missing`` event, and replace the empty
+            # ``output_json`` with a payload carrying the tails as
+            # ``block_reason``. The daemon's ``_collect_failure_details``
+            # already forwards ``block_reason`` → ``failures.details
+            # .stderr_tail`` (see daemon.py ~12420), so the next
+            # occurrence will surface a populated stderr_tail in the
+            # diagnoser's verbatim-quote pull instead of the current
+            # empty string. Layer 2 (the actual fix to whatever is
+            # making the worker exit silently) lands once the new logs
+            # capture self-diagnosing data.
+            _ralph_log_tail_file=""
+            if [[ "$_current" == "ralph" ]]; then
+                _ralph_stdout_file="$AGENT_WORKSPACE/claude-p-ralph.stdout.json"
+                _ralph_stderr_file="$AGENT_WORKSPACE/claude-p-ralph.stderr.log"
+                # Build a merged tail file (last 2000 bytes of stdout +
+                # last 2000 bytes of stderr) for log_text persistence.
+                # Unconditional capture — even SHIP-path runs benefit
+                # from having the worker narrative in the DB for
+                # post-mortem when CI / verify later reveals a problem.
+                _ralph_log_tail_file="$AGENT_WORKSPACE/claude-p-ralph.log_text.txt"
+                {
+                    printf '=== claude-p-ralph.stdout.json (last 2000 bytes) ===\n'
+                    if [[ -s "$_ralph_stdout_file" ]]; then
+                        tail -c 2000 "$_ralph_stdout_file" 2>/dev/null
+                    fi
+                    printf '\n=== claude-p-ralph.stderr.log (last 2000 bytes) ===\n'
+                    if [[ -s "$_ralph_stderr_file" ]]; then
+                        tail -c 2000 "$_ralph_stderr_file" 2>/dev/null
+                    fi
+                    printf '\n'
+                } > "$_ralph_log_tail_file" 2>/dev/null || true
+                # Detect the silent-exit shape — ralph returned ``{}`` (a
+                # string-equal check is sufficient because run_claude_phase
+                # only emits ``{}`` for the non-object .result fallback;
+                # any legitimate ralph output, even an empty BLOCKED, is at
+                # least ``{"verdict": "..."}``).
+                if [[ "$_output" == "{}" ]]; then
+                    _ralph_stdout_tail=""
+                    _ralph_stderr_tail=""
+                    if [[ -s "$_ralph_stdout_file" ]]; then
+                        _ralph_stdout_tail=$(tail -c 500 "$_ralph_stdout_file" 2>/dev/null \
+                            | tr '\n\r\t' '   ' | sed -e 's/\\/\\\\/g')
+                    fi
+                    if [[ -s "$_ralph_stderr_file" ]]; then
+                        _ralph_stderr_tail=$(tail -c 500 "$_ralph_stderr_file" 2>/dev/null \
+                            | tr '\n\r\t' '   ' | sed -e 's/\\/\\\\/g')
+                    fi
+                    # ``run_claude_phase`` already captured the worker's
+                    # exit code into the ``claude_phase_done`` log line;
+                    # we don't have it in scope here directly, so emit a
+                    # placeholder. The stdout/stderr tails are the
+                    # high-value signal (they contain the actual error
+                    # lines if the worker printed any), and a future
+                    # iteration can plumb the rc through if needed.
+                    log "ralph_done_marker_missing" \
+                        "phase=ralph" \
+                        "worker_exit_code=unknown" \
+                        "worker_stdout_tail=$_ralph_stdout_tail" \
+                        "worker_stderr_tail=$_ralph_stderr_tail"
+                    # Replace the empty ``{}`` with a structured payload
+                    # so the daemon's failures.details.stderr_tail (which
+                    # mirrors block_reason for the ralph_not_ship terminal,
+                    # see daemon.py ~12420) carries the diagnostic tails
+                    # rather than "". jq -n -c builds the JSON safely with
+                    # the tails as typed string variables — no shell
+                    # interpolation into the SQL.
+                    _output=$(jq -n -c \
+                        --arg stdout_tail "$_ralph_stdout_tail" \
+                        --arg stderr_tail "$_ralph_stderr_tail" \
+                        '{verdict: "BLOCKED",
+                          category: "ralph_not_ship",
+                          block_reason: ("ralph_done_marker_missing: worker exited 0 with no done-marker. " +
+                                         "stdout_tail=" + $stdout_tail + " stderr_tail=" + $stderr_tail),
+                          worker_stdout_tail: $stdout_tail,
+                          worker_stderr_tail: $stderr_tail,
+                          ralph_done_marker_missing: true}' 2>/dev/null \
+                        || printf '{"category":"ralph_not_ship","block_reason":"ralph_done_marker_missing: jq build failed","ralph_done_marker_missing":true}')
+                fi
+            fi
+            persist_phase_output "$_current" "$_output" "$_ralph_log_tail_file"
             if [[ "$_current" == "ralph" ]]; then
                 # Mirror the daemon's post-SHIP ralph_patches persist.
                 _verdict=$(printf '%s' "$_output" | jq -r '.verdict // ""')

@@ -9363,6 +9363,248 @@ else
          "output: $T3675_TEST_OUT"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T3694 — silent ralph_not_ship instrumentation (Layer 1).
+#
+# The original symptom (issue #3694): three consecutive ECS agents on
+# three different issues exited the ralph phase with ``output_json={}``
+# and ``stderr_tail=""``, leaving zero diagnostic data. The worker
+# subprocess terminated cleanly without writing a verdict marker, so
+# the daemon classified the failure as ``ralph_not_ship`` with no
+# ``block_reason``.
+#
+# Layer 1 (this regression) instruments the silent-exit path:
+#   1. The merged stdout/stderr tail from
+#      ``$AGENT_WORKSPACE/claude-p-ralph.{stdout,stderr}.log`` is
+#      persisted into ``dispatcher.phase_outputs.log_text``.
+#   2. A structured ``ralph_done_marker_missing`` event is emitted
+#      with ``worker_stdout_tail``, ``worker_stderr_tail``, and
+#      ``worker_exit_code`` fields.
+#   3. The empty ``{}`` output_json is replaced with a
+#      ``{"verdict":"BLOCKED","category":"ralph_not_ship",
+#         "block_reason":"ralph_done_marker_missing: ...","ralph_done_marker_missing":true,
+#         "worker_stdout_tail":"...","worker_stderr_tail":"..."}``
+#      payload so the daemon's ``_collect_failure_details`` forwards
+#      ``block_reason`` → ``failures.details.stderr_tail`` instead of "".
+#
+# The test simulates the silent-exit shape by wiring claude to emit a
+# string ``.result`` for the ralph skill (which run_claude_phase
+# coerces to ``{}`` per the #3131 fallback) AND a non-empty stderr
+# payload (the typical "claude exited with no done-marker" diagnostic
+# output the worker would have written before silently terminating).
+#
+# Pre-fix behaviour:
+#   * ``persist_phase_output ralph "{}"`` is called with no log_text.
+#   * No ``ralph_done_marker_missing`` log event is emitted.
+#   * The ralph terminal-failure ``reason`` is the literal string ""
+#     (passed via ``$_block_reason`` from the empty output).
+#
+# Post-fix behaviour:
+#   * ``ralph_done_marker_missing`` log event is emitted before the
+#     transition runs.
+#   * The persisted output_json carries ``block_reason`` /
+#     ``worker_stdout_tail`` / ``worker_stderr_tail`` keys.
+#   * The merged log_text file path is passed to persist_phase_output.
+#
+# This test must FAIL against the pre-fix entrypoint and PASS against
+# the post-fix entrypoint.
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t3694.txt"
+printf 'ralph\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t3694_workspace="$TEST_TMP/t3694-workspace"
+mkdir -p "$t3694_workspace"
+
+# Distinctive stderr payload so the regression test asserts the actual
+# bytes flow into the new captures. The string contains "T3694" so a
+# grep over both the structured log event AND the persist_phase_output
+# heredoc input proves the wire end-to-end.
+t3694_stderr_payload='T3694 ralph worker silent exit: skill returned plain string and exited 0 without writing tmp/ralph/ralph-done.txt — no verdict marker, no diff'
+
+set +e
+T3694_TEST_OUT=$(AGENT_ID="36943694-3694-3694-3694-369436943694" \
+      ISSUE_NUMBER="3694" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t3694_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "skill exited 0 with no done-marker"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="ralph" \
+      CLAUDE_STDERR_OVERRIDE="$t3694_stderr_payload" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+T3694_TEST_RC=$?
+set -e
+
+# (1) Exit code 0 — the entrypoint reaches a terminal phase cleanly via
+# agent_runner_reaped_failure (ralph_not_ship), same as today's silent
+# path, so the wrapper exit semantics are preserved.
+if [[ "$T3694_TEST_RC" -eq 0 ]]; then
+    pass "#3694 T3694 — entrypoint exits cleanly (rc=0) on silent ralph_not_ship"
+else
+    fail "#3694 T3694 — entrypoint exits cleanly (rc=0) on silent ralph_not_ship" \
+         "rc=$T3694_TEST_RC, output tail: $(printf '%s' "$T3694_TEST_OUT" | tail -c 1200)"
+fi
+
+# (2) AC — the new ralph_done_marker_missing log event must be emitted
+# when ralph exits with an empty output_json. Its absence in the pre-fix
+# entrypoint is the bug; its presence is the fix.
+if printf '%s' "$T3694_TEST_OUT" | grep -q "ralph_done_marker_missing"; then
+    pass "#3694 T3694 — ralph_done_marker_missing log event emitted"
+else
+    fail "#3694 T3694 — ralph_done_marker_missing log event emitted" \
+         "output tail: $(printf '%s' "$T3694_TEST_OUT" | tail -c 1200)"
+fi
+
+# (3) AC — the structured event must carry the worker's stderr tail so
+# operators have a non-empty ``stderr_tail`` to anchor on.
+T3694_DONE_LINE=$(printf '%s' "$T3694_TEST_OUT" | grep "ralph_done_marker_missing" | head -n 1)
+if printf '%s' "$T3694_DONE_LINE" | grep -q "T3694 ralph worker silent exit"; then
+    pass "#3694 T3694 — ralph_done_marker_missing event carries the worker stderr tail"
+else
+    fail "#3694 T3694 — ralph_done_marker_missing event carries the worker stderr tail" \
+         "done line: $T3694_DONE_LINE"
+fi
+
+# (4) AC — the structured event must carry both worker_stdout_tail AND
+# worker_stderr_tail keys (regardless of value). This locks the field
+# names so future #3694 follow-ups don't drift the schema.
+if printf '%s' "$T3694_DONE_LINE" | grep -q "worker_stdout_tail" \
+   && printf '%s' "$T3694_DONE_LINE" | grep -q "worker_stderr_tail"; then
+    pass "#3694 T3694 — ralph_done_marker_missing event carries worker_stdout_tail + worker_stderr_tail keys"
+else
+    fail "#3694 T3694 — ralph_done_marker_missing event carries worker_stdout_tail + worker_stderr_tail keys" \
+         "done line: $T3694_DONE_LINE"
+fi
+
+# (5) AC — persist_phase_output for ralph must carry log_text into the
+# psql -v var list. The shared psql stub records every -v var as part of
+# the CALL line in psql.log; assert the var name is present on the same
+# line as ``phase=ralph``. The pre-fix entrypoint never sets
+# ``log_text_path`` for any phase, so this assertion fails today.
+if grep -E " phase=ralph " "$INVOCATIONS_DIR/psql.log" 2>/dev/null \
+   | grep -q "log_text_path="; then
+    pass "#3694 T3694 — persist_phase_output for ralph passes log_text_path psql var"
+else
+    fail "#3694 T3694 — persist_phase_output for ralph passes log_text_path psql var" \
+         "psql log (ralph rows): $(grep -E ' phase=ralph ' "$INVOCATIONS_DIR/psql.log" 2>/dev/null | head -3)"
+fi
+
+# (6) AC — the rewritten output_json carries the ralph_done_marker_missing
+# field as JSON ``true``. The persist_phase_output write goes through a
+# tmpfile + psql ``\set`` indirection, so the JSON content lands on a
+# STDIN: line in the recorder's psql.log. We grep the full log for the
+# distinctive key — present after the fix, absent before it.
+if grep -q "ralph_done_marker_missing" "$INVOCATIONS_DIR/psql.log" 2>/dev/null; then
+    pass "#3694 T3694 — output_json persisted for ralph carries ralph_done_marker_missing key"
+else
+    fail "#3694 T3694 — output_json persisted for ralph carries ralph_done_marker_missing key" \
+         "psql log tail: $(tail -c 1500 "$INVOCATIONS_DIR/psql.log" 2>/dev/null)"
+fi
+
+# (7) AC — the rewritten output_json carries block_reason text starting
+# with ``ralph_done_marker_missing:`` so the daemon's
+# ``_collect_failure_details`` forwarder pulls a populated stderr_tail
+# into ``dispatcher.failures.details``.
+if grep -q "ralph_done_marker_missing: worker exited 0 with no done-marker" \
+        "$INVOCATIONS_DIR/psql.log" 2>/dev/null; then
+    pass "#3694 T3694 — output_json carries block_reason starting with ralph_done_marker_missing:"
+else
+    fail "#3694 T3694 — output_json carries block_reason starting with ralph_done_marker_missing:" \
+         "psql log tail: $(tail -c 1500 "$INVOCATIONS_DIR/psql.log" 2>/dev/null)"
+fi
+
+# (8) Negative regression — the entrypoint must NOT emit
+# ``ralph_done_marker_missing`` when ralph SHIPs normally. This guards
+# against future drift that would over-emit the event on every ralph
+# completion. Use a fresh fixtures + happy-path verdict.
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t3694b.txt"
+printf 'ralph\n' > "$PHASE_FIXTURE_FILE"
+
+CLAUDE_VERDICT_FIXTURE="$TEST_TMP/verdicts-t3694b.tsv"
+cat > "$CLAUDE_VERDICT_FIXTURE" <<'EOF'
+ralph	SHIP
+EOF
+
+t3694b_workspace="$TEST_TMP/t3694b-workspace"
+mkdir -p "$t3694b_workspace"
+
+set +e
+T3694B_TEST_OUT=$(AGENT_ID="36943694-3694-3694-3694-369436943695" \
+      ISSUE_NUMBER="3694" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t3694b_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="" \
+      CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
+      AGENT_RUNNER_CI_POLL_INTERVAL=0 \
+      AGENT_RUNNER_DEPLOY_POLL_INTERVAL=0 \
+      AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0 \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+T3694B_TEST_RC=$?
+set -e
+
+if ! printf '%s' "$T3694B_TEST_OUT" | grep -q "ralph_done_marker_missing"; then
+    pass "#3694 T3694 negative — ralph SHIP path does NOT emit ralph_done_marker_missing"
+else
+    fail "#3694 T3694 negative — ralph SHIP path does NOT emit ralph_done_marker_missing" \
+         "output tail: $(printf '%s' "$T3694B_TEST_OUT" | tail -c 1200)"
+fi
+
+# (9) AC — set_agent_task_arn_from_metadata function exists. Pure source
+# inspection so the test passes without a curl stub or ECS metadata
+# endpoint. The function name is the load-bearing identifier — if it is
+# renamed, this assertion locks the rename to a deliberate change.
+if grep -q "^set_agent_task_arn_from_metadata()" "$ENTRYPOINT"; then
+    pass "#3694 T3694 — set_agent_task_arn_from_metadata function defined in entrypoint"
+else
+    fail "#3694 T3694 — set_agent_task_arn_from_metadata function defined in entrypoint" \
+         "entrypoint head: $(head -c 400 "$ENTRYPOINT")"
+fi
+
+# (10) AC — the function reads from $ECS_CONTAINER_METADATA_URI_V4
+# (the load-bearing env var documented in the issue body's "Fix shape"
+# section). This guards against a refactor that drops the env var
+# reference (e.g. switching to a hard-coded localhost URL).
+if grep -q "ECS_CONTAINER_METADATA_URI_V4" "$ENTRYPOINT"; then
+    pass "#3694 T3694 — entrypoint references ECS_CONTAINER_METADATA_URI_V4 env var"
+else
+    fail "#3694 T3694 — entrypoint references ECS_CONTAINER_METADATA_URI_V4 env var" \
+         "(env var not found in entrypoint source)"
+fi
+
+# (11) AC — the function targets ``dispatcher.agents.agent_task_arn``
+# in a SET clause. Pure source inspection — locks the SQL column name
+# to migration 41.
+if grep -qE "SET[[:space:]]+agent_task_arn[[:space:]]*=" "$ENTRYPOINT"; then
+    pass "#3694 T3694 — entrypoint UPDATE writes dispatcher.agents.agent_task_arn"
+else
+    fail "#3694 T3694 — entrypoint UPDATE writes dispatcher.agents.agent_task_arn" \
+         "(SET agent_task_arn = clause not found)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 # ── Summary ────────────────────────────────────────────────────────────────
