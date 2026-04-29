@@ -25,6 +25,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Never close a task or remove a worktree without posting a verification evidence comment on the issue. See §A.8 Step 3.
 - Never merge user-visible affordances that haven't been exercised end-to-end. "The page renders" / "the service returns 200" is not evidence. Half-built behind a flag is fine; half-built and reachable by users is the bug.
 - Never use `--force` (or `--force-with-lease`) to bypass a failing CI check or pre-push hook. `--force-with-lease` IS allowed after an intentional rebase of your own branch — see the `/task` skill A.4.
+- `git push --no-verify` is reserved for agent-runner machine pushes inside `scripts/dispatcher/agent-runner-entrypoint.sh` (where ralph already ran the pre-push hook against the WIP commit). Never add `--no-verify` from interactive `/task` work — that path must run the hook to catch lint, format, test, and coverage regressions before CI.
 - Never run `gh auth switch` without an explicit user instruction.
 
 ### ALWAYS — Before Acting

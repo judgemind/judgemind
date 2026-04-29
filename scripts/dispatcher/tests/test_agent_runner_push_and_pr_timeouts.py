@@ -351,3 +351,94 @@ class TestTimeoutWrappersPresent:
                     f'``timeout "$<VAR>_TIMEOUT_SECONDS"`` or ``timeout "$_phase_timeout"`` '
                     f"(#3683, #3766). Line: {line!r}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# --no-verify presence tests (#3800)
+# ---------------------------------------------------------------------------
+
+
+class TestPushNoVerify:
+    """Every machine ``git push`` in agent-runner-entrypoint.sh must pass
+    ``--no-verify`` so the pre-push hook (already run by ralph's worker
+    during iteration) is not redundantly re-executed on the Fargate host,
+    where it consumes ~5+ minutes of wall-clock against the 300s
+    NETWORK_TIMEOUT_SECONDS cap (#3800).
+
+    Three push sites are guarded:
+    - ``handle_push_and_pr`` — the bounded timeout-wrapped primary push.
+    - ``handle_fix_ci`` — the CI-fix commit push.
+    - ``merge_unstick`` — the empty-commit push used to unblock stuck merges.
+    """
+
+    def test_push_and_pr_uses_no_verify(self) -> None:
+        """The ``handle_push_and_pr`` push line must include ``--no-verify``
+        (#3800)."""
+        text = _script_text()
+        _, body = _extract_function_body(text, "handle_push_and_pr")
+        logical = _logical_lines(body)
+        push_lines = [
+            (lineno, line)
+            for lineno, line in logical
+            if re.search(r"\bgit\b.*\bpush\b", line)
+            and "origin" in line
+            and "$BRANCH_NAME" in line
+        ]
+        assert push_lines, (
+            "handle_push_and_pr must contain a ``git ... push ... origin ... $BRANCH_NAME`` "
+            "line (#3800)"
+        )
+        for lineno, line in push_lines:
+            assert "--no-verify" in line, (
+                f"L{lineno}: handle_push_and_pr push line must include ``--no-verify`` "
+                f"so the pre-push hook is not redundantly re-run on the Fargate host "
+                f"(#3800). Line: {line!r}"
+            )
+
+    def test_fix_ci_push_uses_no_verify(self) -> None:
+        """The ``handle_fix_ci`` push line must include ``--no-verify``
+        (#3800)."""
+        text = _script_text()
+        _, body = _extract_function_body(text, "handle_fix_ci")
+        logical = _logical_lines(body)
+        push_lines = [
+            (lineno, line)
+            for lineno, line in logical
+            if re.search(r"\bgit\b.*\bpush\b", line)
+            and "origin" in line
+            and "$BRANCH_NAME" in line
+        ]
+        assert push_lines, (
+            "handle_fix_ci must contain a ``git ... push ... origin ... $BRANCH_NAME`` "
+            "line (#3800)"
+        )
+        for lineno, line in push_lines:
+            assert "--no-verify" in line, (
+                f"L{lineno}: handle_fix_ci push line must include ``--no-verify`` "
+                f"so the pre-push hook is not redundantly re-run on the Fargate host "
+                f"(#3800). Line: {line!r}"
+            )
+
+    def test_merge_unstick_push_uses_no_verify(self) -> None:
+        """The ``try_auto_unstick_merge`` push line must include ``--no-verify``
+        (#3800)."""
+        text = _script_text()
+        _, body = _extract_function_body(text, "try_auto_unstick_merge")
+        logical = _logical_lines(body)
+        push_lines = [
+            (lineno, line)
+            for lineno, line in logical
+            if re.search(r"\bgit\b.*\bpush\b", line)
+            and "origin" in line
+            and "$BRANCH_NAME" in line
+        ]
+        assert push_lines, (
+            "try_auto_unstick_merge must contain a ``git ... push ... origin ... $BRANCH_NAME`` "
+            "line (#3800)"
+        )
+        for lineno, line in push_lines:
+            assert "--no-verify" in line, (
+                f"L{lineno}: try_auto_unstick_merge push line must include ``--no-verify`` "
+                f"so the pre-push hook is not redundantly re-run on the Fargate host "
+                f"(#3800). Line: {line!r}"
+            )

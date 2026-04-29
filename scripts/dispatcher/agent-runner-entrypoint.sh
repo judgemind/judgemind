@@ -2974,8 +2974,14 @@ handle_push_and_pr() {
     # ``timeout`` wrapper guarantees ``handle_push_and_pr`` always
     # returns within NETWORK_TIMEOUT_SECONDS + a few seconds of
     # bookkeeping, freeing the cap slot for a fresh agent.
+    # #3800: --no-verify skips the pre-push hook on this machine push.
+    # ralph's worker already ran .githooks/pre-push end-to-end against the
+    # WIP commit during iteration, so re-running it here adds no safety but
+    # costs ~5+ minutes of wall-clock for scraper-framework-sized diffs —
+    # well above the 300s NETWORK_TIMEOUT_SECONDS cap. Human-laptop pushes
+    # are unaffected; only the agent-runner machine push gains the bypass.
     timeout "$NETWORK_TIMEOUT_SECONDS" \
-        git -C "$REPO_ROOT" push -u origin "$BRANCH_NAME" \
+        git -C "$REPO_ROOT" push -u origin "$BRANCH_NAME" --no-verify \
         > "$AGENT_WORKSPACE/git-push.stdout.log" \
         2> "$AGENT_WORKSPACE/git-push.stderr.log"
     _push_rc=$?
@@ -3624,7 +3630,7 @@ handle_fix_ci() {
         # detached-HEAD state somehow snuck in — matches daemon.py line
         # ~13166's ``push origin <branch>`` pattern.
         set +e
-        git -C "$REPO_ROOT" push origin "$BRANCH_NAME" \
+        git -C "$REPO_ROOT" push origin "$BRANCH_NAME" --no-verify \
             > "$AGENT_WORKSPACE/fix-ci-git-push.stdout.log" \
             2> "$AGENT_WORKSPACE/fix-ci-git-push.stderr.log"
         _push_rc=$?
@@ -4959,7 +4965,7 @@ try_auto_unstick_merge() {
         return 1
     fi
     set +e
-    git -C "$REPO_ROOT" push origin "$BRANCH_NAME" \
+    git -C "$REPO_ROOT" push origin "$BRANCH_NAME" --no-verify \
         > "$AGENT_WORKSPACE/merge-unstick-push.stdout.log" \
         2> "$AGENT_WORKSPACE/merge-unstick-push.stderr.log"
     _push_rc=$?
