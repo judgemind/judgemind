@@ -188,6 +188,29 @@ DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS = 120
 #: change, not a config flip.
 WATCHDOG_POLL_INTERVAL_SECONDS = 30
 
+#: Backup watchdog — EXIT threshold (#3794).  The *primary* watchdog
+#: (``_watchdog_loop``) fires at
+#: :data:`DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS` (120s) but calls
+#: ``self._log.error(...)`` before ``os._exit``, which acquires the
+#: logging-handler RLock.  If the wedged scheduler thread stalled while
+#: holding that RLock (e.g. mid-log-call), the primary watchdog deadlocks
+#: and never calls ``os._exit``.  The backup watchdog runs independently,
+#: uses only ``os.write`` + ``os._exit`` (no stdlib logging, no locks),
+#: and fires after a much longer threshold so it acts purely as a
+#: last-resort kill — the primary watchdog should always fire first under
+#: non-deadlocked conditions.
+#:
+#: 600s = 10 min.  The primary EXIT threshold is 120s; 600s gives the
+#: primary 5× headroom to fire first before the backup has to kick in.
+#: Even at 600s a backup-triggered restart is vastly better than the
+#: production scenario (2026-04-25: 30+ min silent before manual
+#: force-redeploy).
+DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS = 600
+
+#: Backup watchdog poll cadence.  5s — tighter than the primary 30s so
+#: the backup can fire promptly once its 600s threshold is exceeded.
+BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS = 5
+
 #: boto3 ECS client socket timeouts (#3351). Applied to every
 #: :meth:`DispatcherDaemon._make_ecs_client` invocation via a
 #: :class:`botocore.config.Config`. Without these the AWS SDK defaults
@@ -2679,6 +2702,10 @@ class DispatcherDaemon:
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop: threading.Event = threading.Event()
         self._watchdog_warn_emitted_for_gap: bool = False
+        # Backup watchdog (#3794) — fires via os._exit(138) without logging
+        # if the primary watchdog deadlocks on the logging-handler RLock.
+        self._backup_watchdog_thread: threading.Thread | None = None
+        self._backup_watchdog_stop: threading.Event = threading.Event()
         # #3658 — async phase subprocess tracker for verify / fix-ci / retro.
         # Keyed by ``agent_id``, value is a dict with keys:
         #   ``phase``, ``pid``, ``stdout_path``, ``stderr_path``,
@@ -26405,6 +26432,87 @@ class DispatcherDaemon:
             daemon=True,
         )
         self._watchdog_thread.start()
+        self._start_backup_watchdog()
+
+    def _backup_watchdog_loop(self) -> None:
+        """Last-resort kill path (#3794) — fires when the *primary* watchdog
+        deadlocks on the stdlib logging-handler RLock.
+
+        The primary :meth:`_watchdog_loop` calls ``self._log.error(...)``
+        before ``os._exit``, which acquires the logging-handler RLock.  If
+        the wedged scheduler thread stalled mid-log-call and holds that lock,
+        the primary watchdog blocks forever on the lock acquisition and never
+        calls ``os._exit``.
+
+        This backup watchdog is deliberately primitive: it reads
+        ``_last_scheduler_tick_at`` (a plain float — no lock required on
+        CPython), and on stall calls ``os.write(2, ...)`` to write a raw
+        UTF-8 marker to stderr and then ``os._exit(138)`` (138 =
+        :data:`DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS` / 128+10; 138
+        is distinct from the primary's 137 so post-mortem can identify which
+        watchdog fired).  **No stdlib logging is used on the kill path** —
+        that is the whole point.
+
+        Exit code 138 (not 137) deliberately differs from the primary
+        watchdog so CloudWatch / the ECS stop-reason field can distinguish
+        "primary watchdog fired" from "backup watchdog fired — root cause is
+        likely logging-lock deadlock on the primary".
+
+        The threshold is :data:`DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS`
+        (600s) — 5× the primary EXIT threshold so the primary always fires
+        first under non-deadlocked conditions.  600s is still vastly better
+        than the 2026-04-25 production scenario (30+ min silent before manual
+        force-redeploy).
+
+        Exits cleanly when ``_backup_watchdog_stop`` is set, matching the
+        shutdown semantics of :meth:`_watchdog_loop`.
+        """
+        import os as _os  # noqa: PLC0415 — shadow-free reference for the kill path
+
+        exit_threshold = DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS
+        poll_interval = BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS
+        while not self._backup_watchdog_stop.is_set():
+            if self._backup_watchdog_stop.wait(poll_interval):
+                break
+            now = time.monotonic()
+            elapsed = now - self._last_scheduler_tick_at
+            if elapsed >= exit_threshold:
+                # Kill path: bypass ALL stdlib logging so a held logging RLock
+                # cannot prevent the process from dying.  Write a raw UTF-8
+                # marker to stderr so CloudWatch / the ECS task log stream
+                # captures evidence of which watchdog fired.
+                pid = _os.getpid()
+                _os.write(
+                    2,
+                    (
+                        f"dispatcher.backup_watchdog_exit pid={pid} "
+                        f"elapsed_seconds={elapsed:.1f} "
+                        f"threshold_seconds={exit_threshold} "
+                        f"exit_code=138\n"
+                    ).encode(),
+                )
+                _os._exit(138)
+
+    def _start_backup_watchdog(self) -> None:
+        """Spawn the backup watchdog thread (#3794).
+
+        Idempotent — a second call while the thread is alive is a no-op.
+        Called from :meth:`_start_watchdog` immediately after spawning the
+        primary watchdog thread so both are running before the first
+        scheduler tick.
+        """
+        if (
+            self._backup_watchdog_thread is not None
+            and self._backup_watchdog_thread.is_alive()
+        ):
+            return
+        self._backup_watchdog_stop.clear()
+        self._backup_watchdog_thread = threading.Thread(
+            target=self._backup_watchdog_loop,
+            name="dispatcher-backup-watchdog",
+            daemon=True,
+        )
+        self._backup_watchdog_thread.start()
 
     # ── signal handling ────────────────────────────────────────────────
 
