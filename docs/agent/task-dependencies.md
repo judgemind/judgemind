@@ -38,3 +38,27 @@ This atomically:
 **Implementation tasks (PRs):** dependent issues are unblocked automatically by the `unblock-issues` CI workflow when the PR merges. The PR body must include `Closes #N`.
 
 **Non-PR completions:** unblock dependent issues by running `scripts/unblock-dependents.sh <your-issue>`. The script searches for open issues with `Blocked by #<your-issue>`, checks if all blockers are closed, and if so removes `status/blocked`, adds `agent/ready`, and cleans the `Blocked by` lines from the body. Use `--dry-run` to preview changes first.
+
+## Unblocking an issue manually
+
+Use `scripts/unblock-issue.sh <N>` to manually clean up a specific blocked issue — for example, when one of its blockers has been closed out-of-band and the auto-unblock flow did not fire, or when a `Blocked by` line was added by mistake.
+
+```
+scripts/unblock-issue.sh <N>
+scripts/unblock-issue.sh --dry-run <N>   # preview changes first
+```
+
+**Contrast with `unblock-dependents.sh`:**
+
+| Script | Direction | Use when |
+|---|---|---|
+| `unblock-dependents.sh <closed-issue>` | Reverse: given a *closed* issue, finds everything blocked *by* it | You just finished work on issue X and want to unblock its dependents |
+| `unblock-issue.sh <blocked-issue>` | Forward: given a *blocked* issue, prunes its stale blocker lines | You want to clean up a specific issue that may now be unblockable |
+
+**Safety guarantees:**
+
+- Only `Blocked by #N` lines for *closed* blockers are removed; open-blocker lines are never touched.
+- The `status/blocked` → `agent/ready` label flip only fires when **all** blockers are closed (ALL-blockers gate).
+- Use `--dry-run` to preview what would change before committing.
+
+**Never** run `gh issue edit --remove-label status/blocked` directly — it skips the body cleanup and the ALL-blockers gate, leaving stale `Blocked by` lines that will confuse the auto-unblock CI workflow on the next related PR merge.

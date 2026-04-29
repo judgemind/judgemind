@@ -241,6 +241,7 @@ When you decide to take gh side-effects yourself (the preferred path post-#3455)
    - `gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/dispatcher-diagnoser/comment.md`
    - `gh issue edit <N> --repo judgemind/judgemind --add-label status/blocked --remove-label agent/ready`
    - `gh issue create --repo judgemind/judgemind --title "<title>" --body-file <body-file> --label "<labels>"`
+   - For manual unblock of a specific issue (prunes stale closed-blocker lines + ALL-blockers label gate): `scripts/unblock-issue.sh <N>` — prefer this over bare `gh issue edit --remove-label status/blocked`, which skips the body cleanup and the ALL-blockers gate.
 2. **Log each gh write to `actions_taken`** via `log_action.py` — `gh_issue_close`, `gh_issue_comment`, `gh_issue_edit`, `gh_issue_create` types.
 3. **Emit `action="terminal"`** in the recommendation with descriptive `action_taken` + `summary`.
 4. **Set `next_directive=terminal`** — the daemon's `_consume_action_terminal` simply records the diagnosis and marks the agent terminal at phase `diagnoser_terminal`. No additional gh writes from the daemon.
