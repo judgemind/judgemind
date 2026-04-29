@@ -110,9 +110,20 @@ class TestRouteToDignoserListsPushAndPrNoUnmergedFiles:
         )
 
 
-class TestPushAndPrCaseArmHasRouteToDiagnoser:
-    """The push_and_pr) case-arm must contain a ``route_to_diagnoser)``
-    arm and a ``push_and_pr_no_unmerged_files)`` hint sub-case (#3543)."""
+class TestPushAndPrCaseArmRoutesViaCentralizedHelper:
+    """The push_and_pr) case-arm must delegate to the centralized
+    ``dispatch_transition_action`` helper (#3581), AND the helper must
+    handle ``route_to_diagnoser`` + the ``push_and_pr_no_unmerged_files``
+    hint (#3543).
+
+    Originally (pre-#3581) these assertions checked that the per-phase
+    case-statement INSIDE the push_and_pr) arm contained a
+    ``route_to_diagnoser)`` sub-case + a ``push_and_pr_no_unmerged_files)``
+    hint sub-case. After #3581 centralized dispatch, that logic moved
+    into ``dispatch_transition_action`` — but the bug-class invariant
+    is preserved: the action vocabulary AND the hint are handled
+    SOMEWHERE the push_and_pr) arm reaches at runtime.
+    """
 
     @staticmethod
     def _push_and_pr_block(text: str) -> str:
@@ -124,17 +135,59 @@ class TestPushAndPrCaseArmHasRouteToDiagnoser:
         assert end != -1, "fix_conflict) arm not found after push_and_pr) arm"
         return text[start:end]
 
-    def test_push_and_pr_arm_has_route_to_diagnoser(self) -> None:
+    @staticmethod
+    def _dispatch_helper_body(text: str) -> str:
+        """Return the body of the ``dispatch_transition_action`` helper
+        function (the centralized dispatch site, #3581)."""
+        start = text.find("dispatch_transition_action() {\n")
+        assert start != -1, (
+            "dispatch_transition_action helper not found in entrypoint (#3581)"
+        )
+        # The helper ends at the next top-level ``mark_ended() {`` or
+        # ``# ── ...`` block — find the closing ``}`` at column 0 by
+        # looking for the next bare-``}`` line that follows a non-
+        # indented line.
+        end_marker = text.find("\nmark_ended() {", start)
+        assert end_marker != -1, (
+            "Could not locate end of dispatch_transition_action helper"
+        )
+        return text[start:end_marker]
+
+    def test_push_and_pr_arm_calls_dispatch_helper(self) -> None:
         text = _script_text()
         block = self._push_and_pr_block(text)
-        assert re.search(r"route_to_diagnoser\)", block), (
-            "push_and_pr) case-arm must contain a route_to_diagnoser) arm (#3543)"
+        # The centralized helper is the only correct dispatch site for
+        # the push_and_pr arm post-#3581.
+        assert "dispatch_transition_action" in block, (
+            "push_and_pr) case-arm must call dispatch_transition_action "
+            "(#3581 — centralized transition-action dispatch)"
+        )
+        # Helper invocation passes the phase name as the first arg so
+        # log events + unrecognized-action terminals are correctly
+        # tagged with ``push_and_pr``.
+        assert re.search(
+            r'dispatch_transition_action\s+"push_and_pr"',
+            block,
+        ), (
+            "push_and_pr) case-arm must invoke dispatch_transition_action "
+            'with phase="push_and_pr" as the first argument (#3581)'
         )
 
-    def test_push_and_pr_arm_has_no_unmerged_files_hint(self) -> None:
+    def test_dispatch_helper_handles_route_to_diagnoser(self) -> None:
+        """#3543 invariant — preserved post-#3581 in the centralized helper."""
         text = _script_text()
-        block = self._push_and_pr_block(text)
-        assert re.search(r"push_and_pr_no_unmerged_files\)", block), (
-            "push_and_pr) case-arm must contain a push_and_pr_no_unmerged_files) "
-            "hint sub-case (#3543)"
+        body = self._dispatch_helper_body(text)
+        assert re.search(r"route_to_diagnoser\)", body), (
+            "dispatch_transition_action must contain a route_to_diagnoser) "
+            "arm (#3543 invariant, centralized in #3581)"
+        )
+
+    def test_dispatch_helper_handles_no_unmerged_files_hint(self) -> None:
+        """#3543 invariant — preserved post-#3581 in the centralized helper."""
+        text = _script_text()
+        body = self._dispatch_helper_body(text)
+        assert "push_and_pr_no_unmerged_files" in body, (
+            "dispatch_transition_action must handle the "
+            "push_and_pr_no_unmerged_files hint (#3543 invariant, "
+            "centralized in #3581)"
         )
