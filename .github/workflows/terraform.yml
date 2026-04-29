@@ -64,6 +64,16 @@ jobs:
         if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
         run: bash infra/terraform/modules/dispatcher-daemon/tests/preconditions/check.sh
 
+      # Postcondition fixture test (#3764, parent #2840): verifies that the
+      # content-level postcondition pattern fires when the rendered
+      # container_definitions JSON is missing a required secret entry while
+      # its ARN variable is non-empty. Defense-in-depth against the silent-
+      # drop bug class where terraform apply produces a task-def revision
+      # without a required secret despite the HCL conditional being correct.
+      - name: Dispatcher postcondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/dispatcher-daemon/tests/postconditions/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.
