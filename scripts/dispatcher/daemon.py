@@ -24137,6 +24137,21 @@ class DispatcherDaemon:
                 )
                 return False  # stale → refuse launch
 
+        # #3756: emit a success-path event so CloudWatch Logs Insights
+        # queries and runbook Verify lines have a real observable signal
+        # for the healthy case.  The previous contract was silent-on-fresh
+        # (only ``agent_runner_image_stale`` fired on failure), which made
+        # the AC1 Verify line in issue #3756 reference a non-existent event.
+        self._log.debug(
+            "daemon.agent_runner_image_freshness_check_passed",
+            extra={
+                "event": "agent_runner_image_freshness_check_passed",
+                "run_id": self._run_id,
+                "task_definition_family": (
+                    self._cfg.agent_runner_task_definition_family
+                ),
+            },
+        )
         return True  # fresh
 
     def _cb_config_str(self, key: str, default: str) -> str:
