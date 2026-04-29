@@ -4275,6 +4275,24 @@ dispatch_transition_action() {
                         "$_hint" \
                         "phase=${_phase} emitted route_to_diagnoser hint=$_hint"
                     ;;
+                claude_phase_timeout)
+                    # #3766: the ``claude -p`` per-phase timeout fired
+                    # (rc=124). The transition shim returned
+                    # FAILURE_HINT_CLAUDE_PHASE_TIMEOUT so the daemon
+                    # routes to a dedicated diagnoser fix-shape (bump
+                    # the per-phase cap, investigate runaway iteration
+                    # count, etc.) rather than the generic ralph_not_ship
+                    # path. Pull elapsed_seconds + block_reason from the
+                    # phase output JSON for the failures-row reason text.
+                    local _cpt_elapsed
+                    local _cpt_block_reason
+                    _cpt_elapsed=$(printf '%s' "$_output" | jq -r '.elapsed_seconds // "unknown"' 2>/dev/null || printf 'unknown')
+                    _cpt_block_reason=$(printf '%s' "$_output" | jq -r '.block_reason // ""' 2>/dev/null || printf '')
+                    agent_runner_reaped_failure \
+                        "claude_phase_timeout" \
+                        "claude_phase_timeout" \
+                        "phase=${_phase} claude -p timed out (elapsed_seconds=${_cpt_elapsed}); ${_cpt_block_reason}"
+                    ;;
                 *)
                     # Truly novel hint we don't recognize. The CI
                     # guard should have caught this at PR time — if
