@@ -19,6 +19,7 @@ from ingestion.llm_extract import (
     LLMRulingResult,
     TokenTracker,
     _deserialize_result,
+    _extract_case_number_prefix,
     _merge_results,
     _normalize_case_number,
     _normalize_department,
@@ -165,6 +166,33 @@ class TestNormalizeCaseNumber:
 
     def test_strips_whitespace(self) -> None:
         assert _normalize_case_number("  24NNCV02551  ") == "24NNCV02551"
+
+
+# ---------------------------------------------------------------------------
+# _extract_case_number_prefix
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCaseNumberPrefix:
+    """Tests for _extract_case_number_prefix() — extracts the numeric county
+    prefix from OC-style case numbers (#3680)."""
+
+    def test_oc_30_prefix(self) -> None:
+        assert _extract_case_number_prefix("30-2024-01393434") == "30"
+
+    def test_la_format_returns_none(self) -> None:
+        assert _extract_case_number_prefix("22SMCV01940") is None
+
+    def test_oc_37_prefix(self) -> None:
+        """San Diego uses '37' prefix — should be captured."""
+        assert _extract_case_number_prefix("37-2024-01393434") == "37"
+
+    def test_non_oc_format_returns_none(self) -> None:
+        assert _extract_case_number_prefix("24NNCV02551") is None
+
+    def test_already_normalized_returns_none(self) -> None:
+        """After normalization the prefix is stripped; calling on normalized form returns None."""
+        assert _extract_case_number_prefix("2024-01393434") is None
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +423,8 @@ class TestParseResponse:
         result = _parse_response(response_json, None)
         assert result is not None
         assert result.rulings[0].case_number == "2024-01393434"
+        # Prefix should be captured BEFORE normalization strips it (#3680)
+        assert result.rulings[0].case_number_prefix == "30"
 
     def test_malformed_json_returns_none(self) -> None:
         result = _parse_response("not valid json {{{", None)
