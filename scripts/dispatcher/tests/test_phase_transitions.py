@@ -182,6 +182,35 @@ class TestTransitionFromRalph:
         assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
         assert result.failure_hint == pt.FAILURE_HINT_RALPH_NOT_SHIP
 
+    def test_claude_phase_timeout_routes_to_dedicated_failure_hint(self) -> None:
+        # #3766 — when ``run_claude_phase`` times out the ralph claude
+        # subprocess (timeout(1) exits 124), the entrypoint emits a
+        # structured BLOCKED envelope with
+        # ``category="claude_phase_timeout"``.  The routing function must
+        # short-circuit on that category and emit a dedicated
+        # ``claude_phase_timeout`` failure hint so the diagnoser sees a
+        # distinct category rather than conflating it with
+        # ``ralph_not_ship`` (the pre-fix shape, which has empty
+        # stdout/stderr because SIGKILL truncated the buffers).
+        result = pt.transition_from_ralph(
+            {
+                "verdict": "BLOCKED",
+                "category": "claude_phase_timeout",
+                "block_reason": "claude -p timed out after 5400s in phase ralph",
+                "claude_phase_timeout": True,
+                "elapsed_seconds": 5400,
+            }
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_CLAUDE_PHASE_TIMEOUT
+        # The hint must NOT be the generic ralph_not_ship — that's the
+        # pre-fix routing that #3766 explicitly fixes.
+        assert result.failure_hint != pt.FAILURE_HINT_RALPH_NOT_SHIP
+        # Context must carry the elapsed_seconds + block_reason so the
+        # diagnoser surfaces the timeout in its first message.
+        assert result.context["elapsed_seconds"] == 5400
+        assert "5400s" in result.context["block_reason"]
+
 
 # --------------------------------------------------------------------------
 # transition_from_summary
