@@ -225,6 +225,25 @@ cd "$REPO_ROOT"
 git checkout -B "$BRANCH_NAME" origin/main
 log "branch_ready" "branch=$BRANCH_NAME"
 
+# ── Install Fargate-narrowed preflight hook (#3757) -------------------------
+#
+# The repo ships `.claude/hooks/preflight-bash.sh` with the FULL
+# operator-laptop ruleset, which blocks `;`+double-quoted-string Bash
+# patterns the ralph Step 2.5 pre-push command uses. On the daemon
+# (subprocess execution), `daemon.py::_install_fargate_preflight_hook`
+# swaps in the narrowed `scripts/preflight-bash-fargate.sh` after each
+# `git worktree add`. The agent-runner ECS image needs the equivalent
+# in shell because the entrypoint clones into `$REPO_ROOT` directly.
+#
+# Without this swap, ECS-mode ralph workers exit silently at the pre-push
+# gate (root cause of #3757). The Dockerfile stages the narrowed hook at
+# `/app/fargate-hooks/` and exports `DISPATCHER_FARGATE_HOOKS_DIR`; the
+# helper does the rest. Operator-laptop runs (env unset) skip the swap.
+
+# shellcheck source=./agent_runner_install_fargate_hook.sh
+source "$(dirname "${BASH_SOURCE[0]}")/agent_runner_install_fargate_hook.sh"
+install_fargate_preflight_hook
+
 # ── Apply prior ralph patch (if any) ---------------------------------------
 #
 # Mirrors the daemon's `_apply_prior_ralph_patch` semantics: pull the

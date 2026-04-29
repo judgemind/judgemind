@@ -152,6 +152,7 @@ COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cros
 RUN chmod +x /app/scripts/check-issue-author.sh \
     && chmod +x /app/fargate-hooks/preflight-bash.sh \
     && chmod +x /app/scripts/dispatcher/agent-runner-entrypoint.sh \
+    && chmod +x /app/scripts/dispatcher/agent_runner_install_fargate_hook.sh \
     && chown -R dispatcher:dispatcher /app
 ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
 
