@@ -634,12 +634,17 @@ class TestFetchIssueTitlesForBlockers:
             call_log.append(cmd)
             result = MagicMock()
             result.returncode = 0
+            # Issue #3759: union-shape response with both ``i<n>_issue``
+            # and ``i<n>_pr``. Issues resolve on the issue side; PRs on
+            # the PR side.
             result.stdout = json.dumps(
                 {
                     "data": {
                         "repository": {
-                            "i42": {"number": 42, "title": "Title for #42"},
-                            "i100": {"number": 100, "title": "Title for #100"},
+                            "i42_issue": {"number": 42, "title": "Title for #42"},
+                            "i42_pr": None,
+                            "i100_issue": {"number": 100, "title": "Title for #100"},
+                            "i100_pr": None,
                         }
                     }
                 }
@@ -731,12 +736,15 @@ class TestFetchIssueTitlesForBlockers:
             call_log.append(cmd)
             result = MagicMock()
             result.returncode = 0
+            # Issue #3759: union-shape response.
             result.stdout = json.dumps(
                 {
                     "data": {
                         "repository": {
-                            "i42": {"number": 42, "title": "T#42"},
-                            "i100": {"number": 100, "title": "T#100"},
+                            "i42_issue": {"number": 42, "title": "T#42"},
+                            "i42_pr": None,
+                            "i100_issue": {"number": 100, "title": "T#100"},
+                            "i100_pr": None,
                         }
                     }
                 }
@@ -752,8 +760,11 @@ class TestFetchIssueTitlesForBlockers:
         # Exactly one batched GraphQL call for both numbers.
         assert len(call_log) == 1
         query_arg = call_log[0][4]
-        assert "i42:" in query_arg
-        assert "i100:" in query_arg
+        # Union-shape aliases — both issue and PR sides per number.
+        assert "i42_issue:" in query_arg
+        assert "i42_pr:" in query_arg
+        assert "i100_issue:" in query_arg
+        assert "i100_pr:" in query_arg
         assert titles[42] == "T#42"
 
     def test_called_once_with_list_arg_for_multiple_blockers(
@@ -774,10 +785,12 @@ class TestFetchIssueTitlesForBlockers:
             call_log.append(cmd)
             result = MagicMock()
             result.returncode = 0
-            # Build response for all five numbers.
-            repo_data = {
-                f"i{n}": {"number": n, "title": f"T#{n}"} for n in [1, 2, 3, 4, 5]
-            }
+            # Issue #3759: union-shape response. Build entries for both
+            # ``i<n>_issue`` (resolves) and ``i<n>_pr`` (null) per number.
+            repo_data: dict[str, object] = {}
+            for n in [1, 2, 3, 4, 5]:
+                repo_data[f"i{n}_issue"] = {"number": n, "title": f"T#{n}"}
+                repo_data[f"i{n}_pr"] = None
             result.stdout = json.dumps({"data": {"repository": repo_data}})
             return {"ok": True, "result": result, "attempts": 1}
 
@@ -789,10 +802,12 @@ class TestFetchIssueTitlesForBlockers:
         assert len(call_log) == 1
         # cmd is a list (not a string).
         assert isinstance(call_log[0], list)
-        # The single query string contains all five issue aliases.
+        # The single query string contains all five issue aliases (both
+        # the issue-typed and PR-typed sides per number, post-#3759).
         query_arg = call_log[0][4]
         for n in [1, 2, 3, 4, 5]:
-            assert f"i{n}:" in query_arg
+            assert f"i{n}_issue:" in query_arg
+            assert f"i{n}_pr:" in query_arg
         # All five numbers have titles.
         assert len(titles) == 5
         assert all(titles[n] == f"T#{n}" for n in [1, 2, 3, 4, 5])
@@ -1018,9 +1033,14 @@ class TestFetchIssuesTitleCap:
             call_log.append(cmd)
             # Build a GraphQL response for the capped numbers only.
             # Parse alias names from the query to know which numbers to return.
+            # Issue #3759: query now uses ``i<n>_issue`` / ``i<n>_pr`` union
+            # shape, so match the issue side to extract the number list.
             query_arg = cmd[4]  # "query=..."
-            aliases = re.findall(r"i(\d+):", query_arg)
-            repo_data = {f"i{n}": {"number": int(n), "title": f"T{n}"} for n in aliases}
+            aliases = re.findall(r"i(\d+)_issue:", query_arg)
+            repo_data: dict[str, object] = {}
+            for n in aliases:
+                repo_data[f"i{n}_issue"] = {"number": int(n), "title": f"T{n}"}
+                repo_data[f"i{n}_pr"] = None
             return {
                 "ok": True,
                 "result": type(
@@ -1038,10 +1058,14 @@ class TestFetchIssuesTitleCap:
 
         # Exactly ONE batched GraphQL call regardless of how many numbers.
         assert len(call_log) == 1
-        # The query references exactly MAX_BLOCKER_TITLE_FETCH aliases.
+        # The query references exactly MAX_BLOCKER_TITLE_FETCH issue-side
+        # aliases (and the same number of PR-side aliases — union shape,
+        # 2 nodes per number, still well under GitHub's 500-node limit).
         query_arg = call_log[0][4]
-        alias_count = len(re.findall(r"i\d+:", query_arg))
-        assert alias_count == MAX_BLOCKER_TITLE_FETCH
+        issue_alias_count = len(re.findall(r"i\d+_issue:", query_arg))
+        pr_alias_count = len(re.findall(r"i\d+_pr:", query_arg))
+        assert issue_alias_count == MAX_BLOCKER_TITLE_FETCH
+        assert pr_alias_count == MAX_BLOCKER_TITLE_FETCH
         # All fetched numbers have a title.
         assert len(result) == MAX_BLOCKER_TITLE_FETCH
         assert all(v is not None for v in result.values())
