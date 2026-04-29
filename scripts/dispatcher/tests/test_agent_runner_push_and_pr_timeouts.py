@@ -329,13 +329,25 @@ class TestTimeoutWrappersPresent:
     def test_claude_p_has_timeout_wrapper_in_run_claude_phase(self) -> None:
         """Every ``claude -p`` logical line inside ``run_claude_phase`` must
         be wrapped by ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"`` (or
-        similar ``$<VAR>_TIMEOUT_SECONDS``)."""
+        similar ``$<VAR>_TIMEOUT_SECONDS``).
+
+        #3766 — also accept ``timeout "$_phase_timeout"`` (the per-phase
+        lookup result variable populated from
+        ``CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE``). The semantic intent
+        is unchanged — the value is still derived from a TIMEOUT_SECONDS
+        env-driven constant — but the lookup happens via the per-phase
+        table at function-call time.
+        """
         for lineno, line in self._run_claude_phase_lines():
             if line.strip().startswith("#"):
                 continue
             if "claude" in line and "-p" in line and "--output-format" in line:
-                assert re.search(r'timeout\s+"\$\w*TIMEOUT_SECONDS"', line), (
+                # Accept either the legacy ``timeout "$<VAR>_TIMEOUT_SECONDS"``
+                # form OR the #3766 ``timeout "$_phase_timeout"`` form.
+                assert re.search(
+                    r'timeout\s+"\$\w*TIMEOUT_SECONDS"', line
+                ) or re.search(r'timeout\s+"\$_phase_timeout"', line), (
                     f"L{lineno}: ``claude -p`` in run_claude_phase is not wrapped by "
-                    f'``timeout "$<VAR>_TIMEOUT_SECONDS"`` (#3683). '
-                    f"Line: {line!r}"
+                    f'``timeout "$<VAR>_TIMEOUT_SECONDS"`` or ``timeout "$_phase_timeout"`` '
+                    f"(#3683, #3766). Line: {line!r}"
                 )

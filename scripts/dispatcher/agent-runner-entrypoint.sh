@@ -2049,15 +2049,33 @@ run_claude_phase() {
     # what any intervening phase handler may have done, AND it gives
     # the ``cwd=`` field on ``claude_phase_begin`` (logged inside the
     # subshell) as a self-diagnosing artifact for the next incident.
+    # #3766: pick the per-phase timeout via
+    # ``claude_phase_timeout_seconds_by_phase`` (bash 3.2-compatible
+    # case-statement lookup; see the function definition below for the
+    # full layered-fallback contract). The legacy single-value
+    # ``AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS`` env var is still
+    # honoured as an operator-emergency global override, but the
+    # primary lookup is the per-phase table — ralph in particular gets
+    # 5400s (90 min) so the SKILL.md upper bound for the long-tail
+    # phase no longer SIGKILLs mid-iteration. The CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE
+    # name appears in the constants block above as a comment anchor
+    # for the test_per_phase_timeout.py static lints.
+    _phase_timeout=$(claude_phase_timeout_seconds_by_phase "$_phase")
     set +e
     (
         cd "$REPO_ROOT" || exit 127
-        log "claude_phase_begin" "phase=$_phase" "skill=$_skill" "cwd=$(pwd)"
+        log "claude_phase_begin" \
+            "phase=$_phase" \
+            "skill=$_skill" \
+            "cwd=$(pwd)" \
+            "timeout_seconds=$_phase_timeout"
         # #3683: wrap ``claude -p`` in ``timeout`` so a hung or wedged
         # claude process surfaces as a distinct ``claude_phase_timeout``
         # event (exit 124) rather than silently pinning the cap slot for
         # up to 30 minutes until the heartbeat reaper fires.
-        timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS" \
+        # #3766: per-phase timeout — look up at function-call time so a
+        # post-init mutation of the table (test override) takes effect.
+        timeout "$_phase_timeout" \
             claude -p "/task-v2-$_skill $AGENT_ID" \
             --output-format json \
             --dangerously-skip-permissions \
@@ -2075,7 +2093,41 @@ run_claude_phase() {
     if [[ "$_rc" -eq 124 ]]; then
         log "claude_phase_timeout" \
             "phase=$_phase" \
-            "elapsed_seconds=$CLAUDE_PHASE_TIMEOUT_SECONDS"
+            "elapsed_seconds=$_phase_timeout"
+        # #3766: short-circuit the post-claude output resolution. When
+        # ``timeout`` SIGKILLs the claude subprocess, the
+        # ``read_phase_output`` path below returns nothing (the skill
+        # never wrote dispatcher-output) and the ``.result | type==object``
+        # path returns false (claude got SIGKILLed mid-run, leaving the
+        # JSON envelope truncated). Without this short-circuit, the
+        # function falls through to the empty-result branch and the
+        # caller sees ``{}`` → ``ralph_done_marker_missing`` with empty
+        # stdout/stderr buffers (because SIGKILL truncated them) — same
+        # diagnostic shape as the silent-ralph hook-swap bug fixed in
+        # #3757/PR #3761, but a different root cause.
+        #
+        # Replace ``{}`` with a structured BLOCKED envelope that names
+        # the timeout. Both ``transition_from_ralph`` and the daemon's
+        # failure-category mapping table dispatch on the
+        # ``category="claude_phase_timeout"`` field to route the
+        # terminal to a dedicated diagnoser fix shape (bump the cap,
+        # investigate runaway iteration count, etc.) rather than the
+        # generic ``ralph_not_ship`` path.
+        _timeout_output=$(jq -n -c \
+            --arg phase "$_phase" \
+            --arg elapsed "$_phase_timeout" \
+            '{verdict: "BLOCKED",
+              category: "claude_phase_timeout",
+              block_reason: ("claude -p timed out after " + $elapsed + "s in phase " + $phase),
+              claude_phase_timeout: true,
+              elapsed_seconds: ($elapsed | tonumber)}' \
+            2>/dev/null \
+            || printf '{"verdict":"BLOCKED","category":"claude_phase_timeout","block_reason":"claude -p timed out (jq build failed)","claude_phase_timeout":true,"elapsed_seconds":0}')
+        log "claude_phase_timeout_envelope_built" \
+            "phase=$_phase" \
+            "elapsed_seconds=$_phase_timeout"
+        printf '%s' "$_timeout_output"
+        return 0
     fi
 
     # Output resolution order (#3133):
@@ -4187,7 +4239,101 @@ NETWORK_TIMEOUT_SECONDS="${AGENT_RUNNER_NETWORK_TIMEOUT_SECONDS:-300}"
 # the ``push_and_pr`` stuck-timeout fallback and the daemon's
 # ``GIT_PUSH_TIMEOUT_SECONDS``. Tests override to 1 via
 # ``AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS=1``.
+#
+# #3766 — kept for back-compat as a global override. The actual lookup
+# now uses the per-phase table below; ``CLAUDE_PHASE_TIMEOUT_SECONDS``
+# is only consulted via ``AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS=N``
+# as an env-driven knob for tests + emergency operator overrides.
 CLAUDE_PHASE_TIMEOUT_SECONDS="${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-1800}"
+
+# #3766: per-phase ``claude -p`` timeout (seconds). The single global
+# 1800s default was structurally too short for ralph — the
+# ``task-v2-ralph`` SKILL.md describes the phase as "long-tail
+# (~45-90 min internally)", so a 30-min cap silently SIGKILLs ralph
+# mid-iteration. Two terminals on the post-#3761 deploy
+# (#3641, #3638) hit this exact failure: ``timeout`` exited 124 at
+# exactly 30:00, the SIGKILL truncated stdout/stderr, and the wrapper
+# fell through to ``ralph_done_marker_missing`` with empty buffers
+# — same diagnostic shape as the silent-ralph hook-swap bug fixed in
+# #3757/PR #3761, but a different root cause.
+#
+# Per-phase caps are defined as individual ``CLAUDE_PHASE_TIMEOUT_*``
+# constants (bash 3.2 compat — no associative arrays per
+# ``scripts/check-bash-compat.sh``). Lookup happens in
+# ``claude_phase_timeout_seconds_by_phase()`` below, which uses a
+# case statement — same pattern as ``phase_to_skill``. The
+# CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE name is preserved as a comment
+# anchor for ``test_per_phase_timeout.py``'s static lints so future
+# refactors that drop the per-phase table still trip the regression
+# test.
+#
+# Other phases (planning, summary, fix_ci, fix_conflict, verify) all
+# complete well under 10 min in healthy runs — keep them at 1800 or
+# less so a hung claude in those phases still surfaces quickly. Ralph
+# gets 90 min to cover the SKILL.md upper bound. Tests override per-
+# phase via ``AGENT_RUNNER_<PHASE>_TIMEOUT_OVERRIDE_SECONDS`` env vars
+# applied inside the lookup function so the constants themselves stay
+# authoritative for non-test paths.
+#
+# CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE — phase-keyed cap table:
+#   planning      1200s  (20 min — plan reads issue + writes plan.json)
+#   ralph         5400s  (90 min — long-tail, SKILL.md upper bound)
+#   summary        600s  (10 min — pure summary writer)
+#   push_and_pr    600s  (10 min — local git + gh pr create)
+#   fix_ci        1800s  (30 min — claude reads CI logs + writes patch)
+#   fix_conflict  1800s  (30 min — claude resolves merge conflicts)
+#   verify        1200s  (20 min — claude reads deploy + posts evidence)
+#   retro          600s  (10 min — claude writes retro issues)
+CLAUDE_PHASE_TIMEOUT_PLANNING_SECONDS=1200
+CLAUDE_PHASE_TIMEOUT_RALPH_SECONDS=5400
+CLAUDE_PHASE_TIMEOUT_SUMMARY_SECONDS=600
+CLAUDE_PHASE_TIMEOUT_PUSH_AND_PR_SECONDS=600
+CLAUDE_PHASE_TIMEOUT_FIX_CI_SECONDS=1800
+CLAUDE_PHASE_TIMEOUT_FIX_CONFLICT_SECONDS=1800
+CLAUDE_PHASE_TIMEOUT_VERIFY_SECONDS=1200
+CLAUDE_PHASE_TIMEOUT_RETRO_SECONDS=600
+
+# Fallback for any phase not listed above. Keeps the legacy 1800s
+# ceiling for unknown phases so a future drift between the table and
+# the dispatcher's phase vocabulary doesn't silently extend timeouts
+# beyond the previous default.
+DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS="${AGENT_RUNNER_DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS:-1800}"
+
+# Look up the per-phase ``claude -p`` timeout. Bash 3.2-compatible
+# replacement for the associative array suggested in the issue spec.
+# Returns the cap (seconds) on stdout. Test overrides via env var
+# ``AGENT_RUNNER_<PHASE>_TIMEOUT_OVERRIDE_SECONDS`` are honoured here
+# so a test setting ``AGENT_RUNNER_RALPH_TIMEOUT_OVERRIDE_SECONDS=1``
+# drives the rc=124 branch deterministically without mutating any
+# global state.
+#
+# Layered fallback (highest to lowest precedence):
+#   1. Per-phase test override env var (uppercased phase + suffix)
+#   2. The global ``AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS`` env
+#      var (operator emergency override; back-compat with #3683)
+#   3. Per-phase constant from the table above
+#   4. ``DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS`` (legacy 1800s)
+claude_phase_timeout_seconds_by_phase() {
+    # Compact one-liner case arms — same style as ``phase_to_skill``
+    # — keeps the awk regex in
+    # ``scripts/tests/test_agent_runner_entrypoint.sh`` (which matches
+    # ``^        fix_conflict\)$`` exactly) from snagging this function
+    # by mistake. See the dispatch-arm extraction at T51 in that test.
+    case "$1" in
+        planning)     printf '%s' "${AGENT_RUNNER_PLANNING_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_PLANNING_SECONDS}}" ;;
+        ralph)        printf '%s' "${AGENT_RUNNER_RALPH_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_RALPH_SECONDS}}" ;;
+        summary)      printf '%s' "${AGENT_RUNNER_SUMMARY_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_SUMMARY_SECONDS}}" ;;
+        push_and_pr)  printf '%s' "${AGENT_RUNNER_PUSH_AND_PR_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_PUSH_AND_PR_SECONDS}}" ;;
+        fix_ci)       printf '%s' "${AGENT_RUNNER_FIX_CI_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_FIX_CI_SECONDS}}" ;;
+        fix_conflict) printf '%s' "${AGENT_RUNNER_FIX_CONFLICT_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_FIX_CONFLICT_SECONDS}}" ;;
+        verify)       printf '%s' "${AGENT_RUNNER_VERIFY_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_VERIFY_SECONDS}}" ;;
+        retro)        printf '%s' "${AGENT_RUNNER_RETRO_TIMEOUT_OVERRIDE_SECONDS:-${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$CLAUDE_PHASE_TIMEOUT_RETRO_SECONDS}}" ;;
+        # Phase not in the table — fall back to the operator-overridable
+        # global. Catches scheduled-skill phases (audit, spotcheck,
+        # etc.) and any future drift.
+        *)            printf '%s' "${AGENT_RUNNER_CLAUDE_PHASE_TIMEOUT_SECONDS:-$DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS}" ;;
+    esac
+}
 
 # #3683: hard timeout (seconds) on local git operations that don't
 # touch the network — ``git commit --amend``, ``git rebase

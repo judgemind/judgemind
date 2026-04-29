@@ -504,6 +504,21 @@ FAILURE_HINT_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: ``FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES`` in daemon.py.
 FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
 
+#: #3766 — ``run_claude_phase`` in ``agent-runner-entrypoint.sh``
+#: short-circuited the post-claude output resolution because the
+#: ``timeout`` wrapper fired (rc=124) on the ``claude -p`` subprocess.
+#: The structured envelope is
+#: ``{"verdict": "BLOCKED", "category": "claude_phase_timeout", ...}``.
+#: Pre-#3766 these terminals fell through to the empty-result branch
+#: and produced ``ralph_done_marker_missing`` with empty stdout/stderr
+#: (because SIGKILL truncated the buffers), conflating timeout-driven
+#: terminals with the silent-ralph hook-swap bug fixed in #3757/PR #3761.
+#: A dedicated hint lets the diagnoser route the timeout to its own
+#: fix-shape (bump the per-phase cap, investigate runaway iteration
+#: count, etc.) rather than re-running the same ralph that just timed
+#: out as if it were a transient REVISE-exhausted terminal.
+FAILURE_HINT_CLAUDE_PHASE_TIMEOUT = "claude_phase_timeout"
+
 #: #3507 — The operational skill returned ``verdict=failed`` or an
 #: unrecognized verdict. Maps to ``FAILURE_CATEGORY_OPERATIONAL_FAILED``
 #: in daemon.py.
@@ -754,6 +769,31 @@ def transition_from_ralph(output: Mapping[str, Any] | None) -> PhaseTransition:
             reason="ralph baseline rebase conflict — routing to fix_conflict (#3225)",
             context={
                 "conflict_files": output.get("conflict_files") or [],
+                "source_phase": "ralph",
+            },
+        )
+    # #3766: ``run_claude_phase`` emitted a structured BLOCKED envelope
+    # because the ``timeout`` wrapper fired (rc=124) on the ``claude -p``
+    # subprocess. Route to a dedicated diagnoser failure hint so the
+    # timeout shows up as a distinct category instead of conflating
+    # with ``ralph_not_ship`` (the pre-#3766 routing, which has empty
+    # stdout/stderr because SIGKILL truncated the buffers — same
+    # diagnostic shape as the silent-ralph hook-swap bug fixed in
+    # #3757/PR #3761, but a different root cause). MUST come before
+    # the generic verdict check because the envelope's verdict is
+    # ``BLOCKED``, which would otherwise fall through the
+    # non-SHIP/non-AC_INFEASIBLE path and route as ``ralph_not_ship``.
+    if output and output.get("category") == "claude_phase_timeout":
+        return PhaseTransition(
+            action=TransitionAction.ROUTE_TO_DIAGNOSER,
+            failure_hint=FAILURE_HINT_CLAUDE_PHASE_TIMEOUT,
+            reason=(
+                "ralph claude -p timed out — routing to dedicated "
+                "claude_phase_timeout diagnoser (#3766)"
+            ),
+            context={
+                "elapsed_seconds": output.get("elapsed_seconds"),
+                "block_reason": output.get("block_reason"),
                 "source_phase": "ralph",
             },
         )
@@ -1465,6 +1505,7 @@ __all__ = [
     "FAILURE_HINT_CONFLICT_UNRESOLVABLE",
     "FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES",
     "FAILURE_HINT_OPERATIONAL_FAILED",
+    "FAILURE_HINT_CLAUDE_PHASE_TIMEOUT",
     # Transition dataclass + enum
     "PhaseTransition",
     "TransitionAction",

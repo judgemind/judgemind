@@ -3637,6 +3637,7 @@ for fn in db_exec db_query_one log persist_phase_output \
           read_merge_conflict_attempts \
           increment_merge_conflict_attempts \
           apply_resolved_files \
+          claude_phase_timeout_seconds_by_phase \
           run_claude_phase \
           write_phase_input \
           phase_to_skill \
@@ -3653,6 +3654,10 @@ done
 # ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"``. Include the constant so
 # the sourced fixture doesn't fail under ``set -u``.
 grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
+# #3766: per-phase constants + DEFAULT fallback consumed by
+# claude_phase_timeout_seconds_by_phase.
+grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
+grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
 
 # Sanity: handle_fix_conflict was extracted.
 if grep -q "^handle_fix_conflict()" "$t41_funcs"; then
@@ -4146,6 +4151,7 @@ for fn in db_exec db_query_one log persist_phase_output \
           phase_to_skill \
           read_phase_output \
           write_phase_input \
+          claude_phase_timeout_seconds_by_phase \
           run_claude_phase \
           advance_phase \
           agent_runner_reaped_failure \
@@ -4156,6 +4162,14 @@ for fn in db_exec db_query_one log persist_phase_output \
         in_fn && /^}$/ { exit }
     ' "$ENTRYPOINT" >> "$t44_funcs"
 done
+
+# #3683: run_claude_phase wraps ``claude -p`` in ``timeout`` — include
+# the constant so the sourced fixture doesn't fail under ``set -u``.
+grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs"
+# #3766: per-phase constants + DEFAULT fallback consumed by
+# claude_phase_timeout_seconds_by_phase.
+grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs"
+grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs"
 
 # Sanity: handle_fix_ci and its dependencies were extracted.
 if grep -q "^handle_fix_ci()" "$t44_funcs"; then
@@ -5628,6 +5642,7 @@ for fn in db_exec db_query_one log persist_phase_output \
           phase_to_skill \
           read_phase_output \
           write_phase_input \
+          claude_phase_timeout_seconds_by_phase \
           run_claude_phase \
           advance_phase \
           agent_runner_reaped_failure \
@@ -5643,6 +5658,12 @@ done
 # ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"``. Include the constant so
 # the sourced fixture doesn't fail under ``set -u``.
 grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
+# #3766: per-phase timeout constants + DEFAULT fallback consumed by
+# ``claude_phase_timeout_seconds_by_phase``. Include all of them so
+# the sourced fixture doesn't fail under ``set -u`` when the lookup
+# function falls through to one of the per-phase entries.
+grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
+grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
 
 # Sanity: phase_to_skill maps operational.
 if grep -q "operational)" "$t58_funcs"; then
