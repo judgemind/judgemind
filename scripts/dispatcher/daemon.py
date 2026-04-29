@@ -6581,10 +6581,9 @@ class DispatcherDaemon:
         Issues a single batched GitHub GraphQL query that aliases BOTH
         ``issue(number: N)`` and ``pullRequest(number: N)`` per capped
         blocker number. The parser prefers the issue-typed result, falling
-        back to the PR-typed result when the issue side is null. Routed
-        through ``_subprocess_with_retry`` with
-        ``event_name='blocker_title_fetch'``. Returns ``{number: title}``
-        with ``None`` on failure (404, rate-limit, network error).
+        back to the PR-typed result when the issue side is null. Returns
+        ``{number: title}`` with ``None`` on failure (network error,
+        timeout, gh missing, unparseable JSON, or both alias sides null).
 
         Single-tick scope — no cross-tick caching. Issue #2989.
         Issue #3435: batched GraphQL replaces the per-issue loop.
@@ -6595,6 +6594,23 @@ class DispatcherDaemon:
         number of N"``), which surfaced as a non-zero ``gh api graphql``
         exit and failed the whole batch — even when other blockers in the
         batch were valid issues.
+
+        Issue #3808: the union-aliased query *still* exits non-zero
+        whenever a batch mixes issue-only and PR-only blockers — GitHub
+        returns valid ``data.repository`` AND a non-empty ``errors[]``
+        with NOT_FOUND entries for the unresolvable alias side of each
+        number, AND ``gh api graphql`` propagates that as exit 1. Routing
+        through :meth:`_subprocess_with_retry` (which treats non-zero
+        exit as a transient failure) discarded the perfectly-good data
+        and burned three retries on a deterministic outcome — flooding
+        CloudWatch with ``blocker_title_fetch_exhausted`` warnings every
+        ~30s. The fix is surgical: bypass ``_subprocess_with_retry`` for
+        this call and parse ``data.repository`` regardless of exit code.
+        ``errors[]`` is informational; only treat as failure when stdout
+        is empty/unparseable, when ``data.repository`` is missing, or
+        when the subprocess raises ``TimeoutExpired`` / ``FileNotFoundError``.
+        The 3-attempt retry envelope is kept only for those true
+        transient classes.
 
         Caps the number of lookups at ``MAX_BLOCKER_TITLE_FETCH`` to bound
         worst-case query size when GitHub is rate-limited (issue #2989).
@@ -6617,7 +6633,10 @@ class DispatcherDaemon:
         # lookup. GitHub's GraphQL ``issue(number:N)`` only resolves Issue
         # nodes, and ``pullRequest(number:N)`` only resolves PR nodes —
         # so unioning both is the only way to handle a number that could
-        # be either type without triggering a partial GraphQL error.
+        # be either type. When a number is only an Issue, the ``_pr``
+        # alias resolves to null AND the response carries a NOT_FOUND
+        # error for that path; mirror is true for PR-only numbers. The
+        # parser below tolerates these partial errors (#3808).
         alias_fields = " ".join(
             f"i{n}_issue: issue(number: {n}) {{ number title }} "
             f"i{n}_pr: pullRequest(number: {n}) {{ number title }}"
@@ -6629,24 +6648,6 @@ class DispatcherDaemon:
         )
 
         cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
-        outcome = self._subprocess_with_retry(
-            cmd,
-            event_name="blocker_title_fetch",
-            timeout=30,
-            extra_log_fields={"blocker_count": len(capped)},
-        )
-
-        if not outcome["ok"]:
-            self._log.warning(
-                "daemon.blocker_title_fetch_exhausted",
-                extra={
-                    "event": "blocker_title_fetch_exhausted",
-                    "run_id": self._run_id,
-                    "blocker_count": len(capped),
-                    "reason": outcome.get("reason"),
-                },
-            )
-            return {n: None for n in capped}
 
         def _title_from(node: object) -> str | None:
             """Return the ``title`` string from an alias node, or None."""
@@ -6656,19 +6657,122 @@ class DispatcherDaemon:
                     return title
             return None
 
-        try:
-            payload = json.loads(outcome["result"].stdout or "{}")
-            repo_data = payload["data"]["repository"]
-            # Prefer the issue-typed result; fall back to PR-typed.
-            return {
-                n: (
-                    _title_from(repo_data.get(f"i{n}_issue"))
-                    or _title_from(repo_data.get(f"i{n}_pr"))
+        # Retry envelope for *true* transient failures only — timeout,
+        # gh missing, empty stdout, or a payload missing ``data.repository``.
+        # Partial-error responses (errors[] populated, exit 1, but
+        # ``data.repository`` is a dict) are NOT retried — the outcome
+        # is deterministic and the data is already in our hands.
+        #
+        # cold-path (#3089): bypasses ``_subprocess_with_retry`` because
+        # that helper treats *every* non-zero exit as transient (#3808),
+        # which discards perfectly-good ``data.repository`` payloads on
+        # the GraphQL partial-error path. The local retry below preserves
+        # the helper's 1s+2s backoff and ``_flake`` / ``_exhausted`` log
+        # shape for the genuinely-transient classes (timeout, gh missing,
+        # empty stdout, unparseable JSON, missing data) while letting
+        # the deterministic partial-error case return on attempt 1.
+        backoffs_seconds: tuple[float, ...] = (1.0, 2.0)
+        max_attempts = 1 + len(backoffs_seconds)  # 3
+        last_reason: str | None = None
+        last_stderr_tail = ""
+        last_exit_code: int | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
                 )
-                for n in capped
-            }
-        except (json.JSONDecodeError, AttributeError, KeyError, TypeError):
-            return {n: None for n in capped}
+            except FileNotFoundError as exc:
+                last_reason = "gh_missing"
+                last_stderr_tail = str(exc)
+                last_exit_code = None
+            except subprocess.TimeoutExpired:
+                last_reason = "timeout"
+                last_stderr_tail = ""
+                last_exit_code = None
+            else:
+                # Always attempt to parse stdout — partial-error responses
+                # (exit 1 with valid ``data.repository``) are the common
+                # case for mixed issue/PR batches and must be honored.
+                stdout = result.stdout or ""
+                if stdout.strip():
+                    try:
+                        payload = json.loads(stdout)
+                    except json.JSONDecodeError:
+                        last_reason = "unparseable_json"
+                        last_stderr_tail = _stderr_tail(result.stderr)
+                        last_exit_code = result.returncode
+                    else:
+                        repo_data = (
+                            payload.get("data", {}).get("repository")
+                            if isinstance(payload, dict)
+                            else None
+                        )
+                        if isinstance(repo_data, dict):
+                            # Happy path — data is present. ``errors[]``
+                            # in the payload is informational (typically
+                            # NOT_FOUND for the unused alias side of each
+                            # blocker) and is intentionally ignored.
+                            return {
+                                n: (
+                                    _title_from(repo_data.get(f"i{n}_issue"))
+                                    or _title_from(repo_data.get(f"i{n}_pr"))
+                                )
+                                for n in capped
+                            }
+                        # ``data.repository`` is missing/null — treat as
+                        # transient (rate limit, auth scope drop, etc.).
+                        last_reason = "missing_data"
+                        last_stderr_tail = _stderr_tail(result.stderr)
+                        last_exit_code = result.returncode
+                else:
+                    # Empty stdout on either zero or non-zero exit —
+                    # treat as transient flake.
+                    last_reason = "empty_stdout"
+                    last_stderr_tail = _stderr_tail(result.stderr)
+                    last_exit_code = result.returncode
+
+            # Transient failure — emit flake WARNING and (if attempts
+            # remain) back off. Mirrors the
+            # :meth:`_subprocess_with_retry` log shape so operators see
+            # one consistent event in CloudWatch.
+            self._log.warning(
+                "daemon.blocker_title_fetch_flake (attempt %d/%d): %s",
+                attempt,
+                max_attempts,
+                last_reason,
+                extra={
+                    "event": "blocker_title_fetch_flake",
+                    "run_id": self._run_id,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "reason": last_reason,
+                    "stderr_tail": last_stderr_tail,
+                    "blocker_count": len(capped),
+                },
+            )
+            if attempt < max_attempts:
+                time.sleep(backoffs_seconds[attempt - 1])
+
+        # All attempts exhausted on a true transient failure. Emit the
+        # exhausted WARNING and return the all-None map. Existing
+        # behavior is preserved for genuinely flaky outcomes.
+        self._log.warning(
+            "daemon.blocker_title_fetch_exhausted",
+            extra={
+                "event": "blocker_title_fetch_exhausted",
+                "run_id": self._run_id,
+                "blocker_count": len(capped),
+                "reason": last_reason,
+                "stderr_tail": last_stderr_tail,
+                "exit_code": last_exit_code,
+                "attempts": max_attempts,
+            },
+        )
+        return {n: None for n in capped}
 
     @staticmethod
     def _parse_parent_issue(body: str) -> int | None:
