@@ -4091,6 +4091,157 @@ advance_phase() {
     log "phase_advanced" "next_phase=$_next" "status=${_status:-unchanged}"
 }
 
+# ── Centralized transition-action dispatch (#3581) ────────────────────────
+#
+# Single source of truth for translating a ``transition_for`` tuple
+# (action, next, status, hint) into the right downstream call
+# (advance_phase / advance_phase with terminal status / descriptive
+# terminal via agent_runner_reaped_failure). All per-phase case-statements
+# in the main dispatch loop call into this helper instead of reimplementing
+# the action-vocabulary dispatch from scratch.
+#
+# Why this exists (#3581):
+#   Prior to this refactor, every phase (push_and_pr, ralph_baseline,
+#   fix_conflict, operational, the generic post-claude arm) had its own
+#   ``case "$_action" in advance) ... advance_with_status) ...
+#   route_to_diagnoser) ... *) ...`` block, with the route_to_diagnoser
+#   sub-case-statement duplicated almost-identically. When a new action
+#   kind (e.g. ``route_to_diagnoser`` itself, in #3543) or a new failure
+#   hint (e.g. ``push_and_pr_no_unmerged_files``) was added, every phase
+#   needed an independent update. Whichever ones the PR author missed
+#   became latent bugs (#3543, #3558, #3573, #3580).
+#
+#   Centralizing eliminates the entire bug class: new actions / hints
+#   land in ONE place and every phase picks them up uniformly. The CI
+#   guard ``scripts/check-transition-dispatch-vocabulary.sh`` enforces
+#   that the helper's vocabulary stays in sync with phase_transitions.py.
+#
+# Inputs:
+#   $1 = phase name (e.g. "push_and_pr"). Used as a log prefix and
+#        included in unrecognized-action terminal-phase strings so the
+#        operator sees which phase emitted the unhandled shape.
+#   $2 = action ("advance" | "advance_with_status" | "route_to_diagnoser").
+#   $3 = next phase (for advance / advance_with_status). May be empty
+#        for route_to_diagnoser; ignored in that case.
+#   $4 = terminal status (for advance_with_status). May be empty
+#        otherwise; ignored.
+#   $5 = failure hint (for route_to_diagnoser). May be empty if the
+#        transition_for emitted route_to_diagnoser without a hint
+#        (defensive — shouldn't happen, but the unrecognized-hint arm
+#        catches it).
+#   $6 = phase output JSON (optional). Only consulted by the
+#        ``ralph_not_ship`` hint arm to extract ``block_reason``. Pass
+#        the raw output JSON from the phase handler when calling for a
+#        verdict-driven phase (post-claude / push_and_pr / fix_conflict
+#        / operational); pass empty / "{}" otherwise.
+#
+# Side effects:
+#   * advance: calls ``advance_phase $next``.
+#   * advance_with_status: calls ``advance_phase $next $status``.
+#   * route_to_diagnoser: emits a ``${phase}_route_to_diagnoser`` log
+#     event with the hint, then dispatches by hint to a descriptive
+#     terminal via ``agent_runner_reaped_failure``. The known-hint set
+#     mirrors phase_transitions.py's ``FAILURE_HINT_*`` constants;
+#     unknown hints emit a ``diagnoser_route_unrecognized_hint`` terminal.
+#   * unrecognized action: emits a ``${phase}_transition_unrecognized``
+#     terminal so a code-drift bug (transition_for returns a new action
+#     kind that this helper doesn't handle) surfaces as a distinct
+#     failure rather than being swallowed.
+#
+# Returns: 0 always (the underlying advance_phase / agent_runner_reaped_failure
+# calls update the agent row; the loop tick observes the new state on
+# the next iteration).
+dispatch_transition_action() {
+    local _phase="$1"
+    local _action="$2"
+    local _next="$3"
+    local _status="$4"
+    local _hint="$5"
+    local _output="${6:-{}}"
+
+    case "$_action" in
+        advance)
+            advance_phase "$_next"
+            ;;
+        advance_with_status)
+            advance_phase "$_next" "$_status"
+            ;;
+        route_to_diagnoser)
+            log "${_phase}_route_to_diagnoser" "hint=$_hint"
+            # Hint-based descriptive-terminal dispatch. The known-hint
+            # set mirrors FAILURE_HINT_* in phase_transitions.py — the
+            # CI guard ``check-transition-dispatch-vocabulary.sh``
+            # asserts every FAILURE_HINT_* constant is handled here.
+            #
+            # Each terminal phase name matches the daemon's
+            # ``BYPASSED_TERMINAL_PHASES_TO_ROUTE`` mapping so the
+            # supervisor tick's ``_find_diagnoser_candidates`` sweep
+            # picks up the row with the right
+            # ``FAILURE_CATEGORY_*`` for diagnoser routing.
+            case "$_hint" in
+                conflict_unresolvable)
+                    agent_runner_reaped_failure \
+                        "conflict_unresolvable" \
+                        "conflict_unresolvable" \
+                        "fix_conflict skill returned unresolvable or budget exhausted"
+                    ;;
+                ralph_not_ship)
+                    # #3586 — ralph_not_ship routes through diagnoser
+                    # via BYPASSED_TERMINAL_PHASES_TO_ROUTE. Pull
+                    # block_reason from the phase output JSON so the
+                    # failures-row reason carries ralph's structured
+                    # signal for the diagnoser to act on.
+                    local _ralph_block_reason
+                    _ralph_block_reason=$(printf '%s' "$_output" | jq -r '.block_reason // ""' 2>/dev/null || printf '')
+                    agent_runner_reaped_failure \
+                        "ralph_not_ship" \
+                        "ralph_not_ship" \
+                        "$_ralph_block_reason"
+                    ;;
+                ralph_ac_infeasible|summary_ac_infeasible|fix_ci_blocked|verify_failed_post_merge|push_and_pr_no_unmerged_files|operational_failed|plan_blocked)
+                    # Descriptive terminal — the daemon's
+                    # BYPASSED_TERMINAL_PHASES_TO_ROUTE maps these
+                    # phase names to FAILURE_CATEGORY_* so the
+                    # diagnoser sweep picks them up.
+                    agent_runner_reaped_failure \
+                        "$_hint" \
+                        "$_hint" \
+                        "phase=${_phase} emitted route_to_diagnoser hint=$_hint"
+                    ;;
+                *)
+                    # Truly novel hint we don't recognize. The CI
+                    # guard should have caught this at PR time — if
+                    # we land here, a new FAILURE_HINT_* was added to
+                    # phase_transitions.py without updating this
+                    # dispatch helper. Emit a descriptive terminal so
+                    # the operator sees what shape leaked through
+                    # without tripping the route_stub bug.
+                    log "${_phase}_route_unrecognized_hint" "hint=$_hint"
+                    agent_runner_reaped_failure \
+                        "diagnoser_route_unrecognized_hint" \
+                        "diagnoser_route_unrecognized_hint" \
+                        "phase=${_phase} route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
+                    ;;
+            esac
+            ;;
+        unrecognized|*)
+            # Truly unrecognized action — transition_for returned a
+            # shape this dispatcher doesn't know how to handle. The
+            # CI guard should have caught this at PR time (a new
+            # TransitionAction enum value was added to
+            # phase_transitions.py without updating this helper).
+            # Emit a descriptive terminal so the operator sees the
+            # drift instead of advancing to an inconsistent state.
+            log "${_phase}_transition_unrecognized" "action=$_action"
+            agent_runner_reaped_failure \
+                "${_phase}_transition_unrecognized" \
+                "${_phase}_transition_unrecognized" \
+                "phase=${_phase} returned action=$_action (not in dispatch vocabulary)"
+            ;;
+    esac
+    return 0
+}
+
 mark_ended() {
     # Final update when the loop hits a terminal phase.
     db_exec "UPDATE dispatcher.agents
@@ -5305,55 +5456,12 @@ while true; do
                         _bn=$(printf '%s' "$_bt" | cut -f2)
                         _bs=$(printf '%s' "$_bt" | cut -f3)
                         _bh=$(printf '%s' "$_bt" | cut -f4)
-                        case "$_ba" in
-                            advance)
-                                advance_phase "$_bn"
-                                ;;
-                            advance_with_status)
-                                advance_phase "$_bn" "$_bs"
-                                ;;
-                            route_to_diagnoser)
-                                # Issue #3573 — ralph baseline rebase failure
-                                # with no unmerged files. transition_from_ralph
-                                # emits ROUTE_TO_DIAGNOSER with hint=
-                                # push_and_pr_no_unmerged_files (#3465). Route
-                                # to the descriptive terminal so the daemon's
-                                # BYPASSED_TERMINAL_PHASES_TO_ROUTE picks it
-                                # up for the diagnoser sweep.
-                                log "ralph_baseline_route_to_diagnoser" "hint=$_bh"
-                                case "$_bh" in
-                                    push_and_pr_no_unmerged_files)
-                                        agent_runner_reaped_failure \
-                                            "push_and_pr_no_unmerged_files" \
-                                            "push_and_pr_no_unmerged_files" \
-                                            "ralph baseline rebase failed with no unmerged files (#3573)"
-                                        ;;
-                                    *)
-                                        log "ralph_baseline_route_unrecognized_hint" "hint=$_bh"
-                                        agent_runner_reaped_failure \
-                                            "diagnoser_route_unrecognized_hint" \
-                                            "diagnoser_route_unrecognized_hint" \
-                                            "ralph_baseline route_to_diagnoser received unrecognized hint=${_bh:-(empty)}"
-                                        ;;
-                                esac
-                                ;;
-                            *)
-                                # Issue #3455 — replace the route_stub
-                                # fall-through with a descriptive terminal
-                                # so the daemon row reads
-                                # ``ralph_baseline_transition_unrecognized``
-                                # instead of ``agent_runner_route_stub``.
-                                # No diagnoser routing — this is a code
-                                # bug surface (transition_for returned a
-                                # shape we don't handle), not a semantic
-                                # failure the diagnoser can fix.
-                                log "ralph_baseline_transition_unrecognized" "action=$_ba"
-                                agent_runner_reaped_failure \
-                                    "ralph_baseline_transition_unrecognized" \
-                                    "ralph_baseline_transition_unrecognized" \
-                                    "transition_for returned action=$_ba (expected advance after rebase_failed envelope)"
-                                ;;
-                        esac
+                        # #3581 — single-source-of-truth dispatch via
+                        # the helper. See dispatch_transition_action
+                        # above advance_phase. Replaces the per-phase
+                        # case-statement that landed in #3573 (ralph
+                        # baseline route_to_diagnoser arm).
+                        dispatch_transition_action "ralph_baseline" "$_ba" "$_bn" "$_bs" "$_bh" "$_ralph_baseline_output"
                         continue
                     fi
                 else
@@ -5477,101 +5585,14 @@ while true; do
             _next=$(printf '%s' "$_transition" | cut -f2)
             _status=$(printf '%s' "$_transition" | cut -f3)
             _hint=$(printf '%s' "$_transition" | cut -f4)
-
-            case "$_action" in
-                advance)
-                    advance_phase "$_next"
-                    ;;
-                advance_with_status)
-                    advance_phase "$_next" "$_status"
-                    ;;
-                route_to_diagnoser)
-                    # Issue #3455 Path B — replace the
-                    # ``advance_phase agent_runner_route_stub`` fall-
-                    # through with descriptive terminals. Three cases:
-                    #
-                    #   1. ``conflict_unresolvable`` (#3225) — keep
-                    #      the dedicated terminal so the diagnoser
-                    #      supervisor sweep picks it up with the
-                    #      right category. Routed via
-                    #      ``BYPASSED_TERMINAL_PHASES_TO_ROUTE``.
-                    #   2. ``ralph_not_ship`` — handle locally.
-                    #      Ralph already wrote a structured
-                    #      ``block_reason``; we relay it as an issue
-                    #      comment + add ``status/blocked``, then
-                    #      emit the ``ralph_not_ship`` terminal
-                    #      (NOT routed to the diagnoser). 14 agents
-                    #      pre-#3455 died here at ``route_stub``.
-                    #   3. Other hints (e.g. ``ralph_ac_infeasible``,
-                    #      ``summary_ac_infeasible``,
-                    #      ``fix_ci_blocked``,
-                    #      ``verify_failed_post_merge``) — emit a
-                    #      descriptive terminal whose phase name
-                    #      matches the hint. The daemon's
-                    #      ``BYPASSED_TERMINAL_PHASES_TO_ROUTE``
-                    #      maps these to the corresponding
-                    #      ``FAILURE_CATEGORY_*`` so the diagnoser
-                    #      sweep picks them up.
-                    case "$_hint" in
-                        conflict_unresolvable)
-                            log "diagnoser_route_conflict_unresolvable" "hint=$_hint"
-                            agent_runner_reaped_failure \
-                                "conflict_unresolvable" \
-                                "conflict_unresolvable" \
-                                "fix_conflict skill returned unresolvable or budget exhausted"
-                            ;;
-                        ralph_not_ship)
-                            # #3586 — route through diagnoser via
-                            # BYPASSED_TERMINAL_PHASES_TO_ROUTE (reversed
-                            # from the #3455 local-handler path).
-                            # Pass block_reason as the third arg so the
-                            # failures-row reason/stderr_tail carries
-                            # ralph's structured block_reason for the
-                            # diagnoser to act on.
-                            _block_reason=$(printf '%s' "$_output" | jq -r '.block_reason // ""' 2>/dev/null)
-                            log "diagnoser_route_ralph_not_ship" "hint=$_hint" "phase=$_current"
-                            agent_runner_reaped_failure \
-                                "ralph_not_ship" \
-                                "ralph_not_ship" \
-                                "$_block_reason"
-                            ;;
-                        ralph_ac_infeasible|summary_ac_infeasible|fix_ci_blocked|verify_failed_post_merge|push_and_pr_no_unmerged_files)
-                            # Descriptive terminal — the daemon's
-                            # BYPASSED_TERMINAL_PHASES_TO_ROUTE maps
-                            # these phase names to failure categories
-                            # so the diagnoser sweep picks them up.
-                            log "diagnoser_route_descriptive" "hint=$_hint" "phase=$_current"
-                            agent_runner_reaped_failure \
-                                "$_hint" \
-                                "$_hint" \
-                                "post-claude phase=$_current emitted route_to_diagnoser hint=$_hint"
-                            ;;
-                        *)
-                            # Truly novel hint we don't recognize.
-                            # Emit a descriptive terminal so the
-                            # operator sees what shape leaked through
-                            # without tripping the route_stub bug.
-                            log "diagnoser_route_unrecognized_hint" "hint=$_hint" "phase=$_current"
-                            agent_runner_reaped_failure \
-                                "diagnoser_route_unrecognized_hint" \
-                                "diagnoser_route_unrecognized_hint" \
-                                "post-claude phase=$_current emitted route_to_diagnoser hint=${_hint:-(empty)}"
-                            ;;
-                    esac
-                    ;;
-                unrecognized|*)
-                    # Issue #3455 — descriptive terminal instead of
-                    # ``agent_runner_route_stub``. transition_for
-                    # returned a shape this dispatch arm doesn't
-                    # handle — that's a code-drift bug, not a semantic
-                    # failure, so no diagnoser routing.
-                    log "post_claude_transition_unrecognized" "phase=$_current" "action=$_action"
-                    agent_runner_reaped_failure \
-                        "post_claude_transition_unrecognized" \
-                        "post_claude_transition_unrecognized" \
-                        "phase=$_current returned action=$_action (not advance / advance_with_status / route_to_diagnoser)"
-                    ;;
-            esac
+            # #3581 — single-source-of-truth dispatch. The helper
+            # (defined alongside advance_phase) handles every
+            # TransitionAction enum value AND every FAILURE_HINT_*
+            # constant emitted by phase_transitions.py uniformly across
+            # all phases. CI guard scripts/check-transition-dispatch-vocabulary.sh
+            # asserts the helper's vocabulary stays in sync with the
+            # Python module.
+            dispatch_transition_action "$_current" "$_action" "$_next" "$_status" "$_hint" "$_output"
             ;;
         claiming)
             # Mechanical pseudo-phase (#3117): the daemon writes
@@ -5599,47 +5620,12 @@ while true; do
             _next=$(printf '%s' "$_transition" | cut -f2)
             _status=$(printf '%s' "$_transition" | cut -f3)
             _hint=$(printf '%s' "$_transition" | cut -f4)
-            case "$_action" in
-                advance)
-                    advance_phase "$_next"
-                    ;;
-                advance_with_status)
-                    advance_phase "$_next" "$_status"
-                    ;;
-                route_to_diagnoser)
-                    # Issue #3543 — push_and_pr rebase failure with no
-                    # unmerged files. transition_from_push_and_pr emits
-                    # ROUTE_TO_DIAGNOSER with hint=push_and_pr_no_unmerged_files
-                    # (#3465). Route to the descriptive terminal so the
-                    # daemon's BYPASSED_TERMINAL_PHASES_TO_ROUTE picks it
-                    # up for the diagnoser sweep.
-                    log "push_and_pr_route_to_diagnoser" "hint=$_hint"
-                    case "$_hint" in
-                        push_and_pr_no_unmerged_files)
-                            agent_runner_reaped_failure \
-                                "push_and_pr_no_unmerged_files" \
-                                "push_and_pr_no_unmerged_files" \
-                                "push_and_pr rebase failed with no unmerged files"
-                            ;;
-                        *)
-                            log "push_and_pr_route_unrecognized_hint" "hint=$_hint"
-                            agent_runner_reaped_failure \
-                                "diagnoser_route_unrecognized_hint" \
-                                "diagnoser_route_unrecognized_hint" \
-                                "push_and_pr route_to_diagnoser received unrecognized hint=${_hint:-(empty)}"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    # Issue #3455 — descriptive terminal instead of
-                    # ``agent_runner_route_stub``.
-                    log "push_and_pr_transition_unrecognized" "action=$_action"
-                    agent_runner_reaped_failure \
-                        "push_and_pr_transition_unrecognized" \
-                        "push_and_pr_transition_unrecognized" \
-                        "push_and_pr returned action=$_action (not advance / advance_with_status / route_to_diagnoser)"
-                    ;;
-            esac
+            # #3581 — single-source-of-truth dispatch via the helper.
+            # See dispatch_transition_action above advance_phase for
+            # the action-vocabulary handling. Replaces the per-phase
+            # case-statement that landed in #3543 (route_to_diagnoser
+            # arm) and #3558 (push_and_pr_no_unmerged_files hint).
+            dispatch_transition_action "push_and_pr" "$_action" "$_next" "$_status" "$_hint" "$_output"
             ;;
         fix_conflict)
             # #3225: fix_conflict phase. Budget-gated claude-resolution
@@ -5663,37 +5649,10 @@ while true; do
                 "next=$_next" \
                 "status=$_status" \
                 "hint=$_hint"
-            case "$_action" in
-                advance)
-                    log "fix_conflict_dispatched_action" "action=$_action"
-                    advance_phase "$_next"
-                    ;;
-                advance_with_status)
-                    log "fix_conflict_dispatched_action" "action=$_action"
-                    advance_phase "$_next" "$_status"
-                    ;;
-                route_to_diagnoser)
-                    # conflict_unresolvable is the only hint we expect
-                    # here. Route to the dedicated terminal via
-                    # agent_runner_reaped_failure so the row carries
-                    # ``category=conflict_unresolvable`` for the
-                    # diagnoser sweep.
-                    log "fix_conflict_dispatched_action" "action=$_action"
-                    log "fix_conflict_route_to_diagnoser" "hint=$_hint"
-                    agent_runner_reaped_failure \
-                        "conflict_unresolvable" \
-                        "conflict_unresolvable" \
-                        "fix_conflict skill returned unresolvable or budget exhausted"
-                    ;;
-                *)
-                    log "fix_conflict_dispatched_action" "action=$_action"
-                    log "fix_conflict_transition_unrecognized" "action=$_action"
-                    agent_runner_reaped_failure \
-                        "conflict_unresolvable" \
-                        "unrecognized_output" \
-                        "fix_conflict transition shim returned $_action"
-                    ;;
-            esac
+            log "fix_conflict_dispatched_action" "action=$_action"
+            # #3581 — single-source-of-truth dispatch via the helper.
+            # See dispatch_transition_action above advance_phase.
+            dispatch_transition_action "fix_conflict" "$_action" "$_next" "$_status" "$_hint" "$_output"
             ;;
         fix_ci)
             # #3245: fix_ci phase. Split out of the generic Claude-phase
@@ -5738,31 +5697,9 @@ while true; do
                 "next=$_next" \
                 "status=$_status" \
                 "hint=$_hint"
-            case "$_action" in
-                advance)
-                    advance_phase "$_next"
-                    ;;
-                advance_with_status)
-                    advance_phase "$_next" "$_status"
-                    ;;
-                route_to_diagnoser)
-                    # operational_failed is the only hint expected here.
-                    # Route to the descriptive terminal so the diagnoser
-                    # sweep picks it up via BYPASSED_TERMINAL_PHASES_TO_ROUTE.
-                    log "operational_route_to_diagnoser" "hint=$_hint"
-                    agent_runner_reaped_failure \
-                        "operational_failed" \
-                        "operational_failed" \
-                        "operational skill returned non-succeeded verdict — hint=$_hint"
-                    ;;
-                *)
-                    log "operational_transition_unrecognized" "action=$_action"
-                    agent_runner_reaped_failure \
-                        "post_claude_transition_unrecognized" \
-                        "post_claude_transition_unrecognized" \
-                        "operational returned action=$_action (not advance / advance_with_status / route_to_diagnoser)"
-                    ;;
-            esac
+            # #3581 — single-source-of-truth dispatch via the helper.
+            # See dispatch_transition_action above advance_phase.
+            dispatch_transition_action "operational" "$_action" "$_next" "$_status" "$_hint" "$_output"
             ;;
         awaiting_ci)
             # #3176: real implementation — poll ``gh pr view`` rollup,

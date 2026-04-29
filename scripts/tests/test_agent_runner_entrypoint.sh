@@ -4937,6 +4937,29 @@ t51_out=$(bash -c '
     # Stub: advance_phase — no-op.
     advance_phase() { return 0; }
 
+    # Stub: agent_runner_reaped_failure — no-op (used by
+    # dispatch_transition_action route_to_diagnoser arm).
+    agent_runner_reaped_failure() { return 0; }
+
+    # Stub: dispatch_transition_action (#3581) — the centralized helper
+    # the fix_conflict arm now delegates to. Mirrors just enough of the
+    # real helper to pass through to advance_phase / agent_runner_reaped_failure
+    # for the expected actions, so this test can validate the per-step
+    # log events without the full helper logic.
+    dispatch_transition_action() {
+        local _ph="$1"
+        local _act="$2"
+        local _nx="$3"
+        local _st="$4"
+        local _ht="$5"
+        case "$_act" in
+            advance) advance_phase "$_nx" ;;
+            advance_with_status) advance_phase "$_nx" "$_st" ;;
+            route_to_diagnoser) agent_runner_reaped_failure "${_ph}_routed" "$_ht" "stub" ;;
+            *) agent_runner_reaped_failure "${_ph}_unrecognized" "$_act" "stub" ;;
+        esac
+    }
+
     # Stub: jq — minimal verdict extractor.
     jq() {
         if printf "%s" "$*" | grep -q "verdict"; then

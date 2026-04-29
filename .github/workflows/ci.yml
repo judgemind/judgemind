@@ -1107,6 +1107,24 @@ jobs:
         run: scripts/check-dispatcher-terminal-statuses.sh
 
   # ---------------------------------------------------------------
+  # Dispatcher transition-action vocabulary guard (#3581)
+  # Asserts every TransitionAction enum value AND every FAILURE_HINT_*
+  # constant in scripts/dispatcher/phase_transitions.py is handled by
+  # the centralized dispatch_transition_action helper in
+  # scripts/dispatcher/agent-runner-entrypoint.sh. Without this guard,
+  # adding a new action / hint without updating the helper produces the
+  # cluster-bug pattern from #3543/#3558/#3573/#3580.
+  # ---------------------------------------------------------------
+  dispatcher-dispatch-vocabulary-check:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Assert TransitionAction + FAILURE_HINT vocabularies match dispatch helper
+        run: scripts/check-transition-dispatch-vocabulary.sh
+
+  # ---------------------------------------------------------------
   # Schema drift guard: schema.sql must match applied migrations
   # ---------------------------------------------------------------
   schema-drift-check:
