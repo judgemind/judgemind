@@ -16,6 +16,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
 if str(_SCRIPTS) not in sys.path:
@@ -832,6 +834,82 @@ class TestTransitionFromPushAndPrNoUnmergedFiles:
         )
         assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
         assert result.next_phase != pt.PHASE_FIX_CONFLICT
+
+
+# --------------------------------------------------------------------------
+# transition_from_push_and_pr — push_failed branch (#3789)
+# --------------------------------------------------------------------------
+
+
+class TestTransitionFromPushAndPrPushFailed:
+    """#3789: push_and_pr emits ``push_failed=true`` (timeout, PAT scope,
+    pre-push hook, etc.) → route to diagnoser, NOT advance to awaiting_ci.
+
+    Pre-#3789 the catch-all advance arm silently treated push_failed as
+    "PR opened" and the agent reaped as ``awaiting_ci_failed/missing_pr``
+    with ``pr_number=NULL``. See #3663 for the recurring instance pattern.
+    """
+
+    def test_push_failed_with_push_timeout_routes_to_diagnoser(self) -> None:
+        # The exact envelope handle_push_and_pr emits on a 300s timeout.
+        result = pt.transition_from_push_and_pr(
+            {"no_op": False, "push_failed": True, "reason": "push_timeout"}
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_PUSH_FAILED
+        assert result.context["push_reason"] == "push_timeout"
+        assert result.context["source_phase"] == "push_and_pr"
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "push_timeout",
+            "pat_scope",
+            "pre_push_hook",
+            None,  # entrypoint may emit push_failed without a reason
+        ],
+    )
+    def test_push_failed_routes_for_each_reason(self, reason: str | None) -> None:
+        envelope: dict[str, object] = {"no_op": False, "push_failed": True}
+        if reason is not None:
+            envelope["reason"] = reason
+        result = pt.transition_from_push_and_pr(envelope)
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.failure_hint == pt.FAILURE_HINT_PUSH_FAILED
+        assert result.context["push_reason"] == reason
+        assert result.context["source_phase"] == "push_and_pr"
+
+    def test_push_failed_takes_precedence_over_advance(self) -> None:
+        # Catch-all advance arm must NOT win when push_failed is set —
+        # the agent never opened a PR, so awaiting_ci would reap as
+        # missing_pr. (#3789)
+        result = pt.transition_from_push_and_pr(
+            {"push_failed": True, "reason": "push_timeout"}
+        )
+        assert result.action == pt.TransitionAction.ROUTE_TO_DIAGNOSER
+        assert result.next_phase != pt.PHASE_AWAITING_CI
+
+    def test_push_failed_does_not_override_no_op(self) -> None:
+        # If both no_op and push_failed are present (shouldn't happen,
+        # but defensive), no_op SHIP wins because it signals "nothing
+        # to push" — push_failed is moot.
+        result = pt.transition_from_push_and_pr({"no_op": True, "push_failed": True})
+        assert result.action == pt.TransitionAction.ADVANCE_WITH_STATUS
+        assert result.next_phase == pt.PHASE_NO_OP
+
+    def test_push_failed_does_not_override_rebase_failed(self) -> None:
+        # rebase_failed is the more specific signal (the conflict needs
+        # fix_conflict, not the diagnoser). When both are present, the
+        # earlier rebase_failed branch wins.
+        result = pt.transition_from_push_and_pr(
+            {
+                "rebase_failed": True,
+                "conflict_files": ["a.py"],
+                "push_failed": True,
+            }
+        )
+        assert result.action == pt.TransitionAction.ADVANCE
+        assert result.next_phase == pt.PHASE_FIX_CONFLICT
 
 
 # --------------------------------------------------------------------------

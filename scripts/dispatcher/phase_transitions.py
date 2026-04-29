@@ -504,6 +504,26 @@ FAILURE_HINT_CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
 #: ``FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES`` in daemon.py.
 FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES = "push_and_pr_no_unmerged_files"
 
+#: #3789 — ``handle_push_and_pr`` in ``agent-runner-entrypoint.sh``
+#: emits ``{"no_op": false, "push_failed": true, "reason": "..."}`` when
+#: ``git push`` fails (timeout exit 124, or any non-zero exit). Pre-#3789
+#: ``transition_from_push_and_pr`` only checked ``no_op`` and
+#: ``rebase_failed`` — every other shape (including ``push_failed``)
+#: silently fell through the catch-all advance arm, sending the agent to
+#: ``awaiting_ci`` with ``pr_number=NULL`` where the reaper terminal-
+#: failed it as ``awaiting_ci_failed/missing_pr``. The same cluster-bug
+#: family as #3581/PR #3773 (action vocabulary) but for output-field
+#: vocabulary. See #3663 for the recurring instance pattern (4× hits in
+#: a single session).
+#:
+#: Maps to ``FAILURE_CATEGORY_PUSH_FAILED`` in daemon.py — already
+#: defined since the per-PR-create reaper distinguishes push outcomes
+#: from network errors. The diagnoser receives the original
+#: ``reason`` (``push_timeout``, ``pat_scope``, ``pre_push_hook``,
+#: missing) via ``context.push_reason`` so it can pick a fix-shape per
+#: cause (bump push timeout, fix PAT scope, investigate hook).
+FAILURE_HINT_PUSH_FAILED = "push_failed"
+
 #: #3766 — ``run_claude_phase`` in ``agent-runner-entrypoint.sh``
 #: short-circuited the post-claude output resolution because the
 #: ``timeout`` wrapper fired (rc=124) on the ``claude -p`` subprocess.
@@ -879,6 +899,16 @@ def transition_from_push_and_pr(
       ``fix_conflict`` phase, where a claude skill semantically
       resolves the conflict and either re-enters push_and_pr or
       routes to ``conflict_unresolvable``.
+    * ``push_failed=True`` (#3789) — the entrypoint emitted
+      ``{"no_op": false, "push_failed": true, "reason": "..."}``
+      because ``git push`` failed (timeout, PAT scope, pre-push
+      hook reject, etc.). No PR was opened. Pre-#3789 this fell
+      through the catch-all advance arm and the agent reached
+      awaiting_ci with ``pr_number=NULL`` where the reaper
+      terminal-failed it as ``awaiting_ci_failed/missing_pr``
+      (see #3663 for the recurring instance pattern). Route to
+      diagnoser with ``FAILURE_HINT_PUSH_FAILED`` so it can pick
+      a fix-shape per cause.
     * otherwise — PR was opened; advance to ``awaiting_ci``.
     """
     if output and output.get("no_op"):
@@ -916,6 +946,25 @@ def transition_from_push_and_pr(
             reason="push_and_pr rebase conflict — routing to fix_conflict (#3225)",
             context={
                 "conflict_files": output.get("conflict_files") or [],
+                "source_phase": "push_and_pr",
+            },
+        )
+    # #3789: ``git push`` failed (timeout, PAT scope, pre-push hook
+    # reject, etc.). The entrypoint emits
+    # ``{"no_op": false, "push_failed": true, "reason": "..."}``
+    # without an associated PR. MUST come before the catch-all advance
+    # so the agent doesn't enter awaiting_ci with ``pr_number=NULL``
+    # and reap as ``awaiting_ci_failed/missing_pr`` (#3663). This is
+    # the OUTPUT-FIELD vocabulary parallel to the ACTION vocabulary
+    # cluster-bug fix landed in PR #3773 (#3581).
+    if output and output.get("push_failed"):
+        push_reason = output.get("reason")
+        return PhaseTransition(
+            action=TransitionAction.ROUTE_TO_DIAGNOSER,
+            failure_hint=FAILURE_HINT_PUSH_FAILED,
+            reason=f"push_and_pr push failed: {push_reason or 'unknown'}",
+            context={
+                "push_reason": push_reason,
                 "source_phase": "push_and_pr",
             },
         )
@@ -1504,6 +1553,7 @@ __all__ = [
     "FAILURE_HINT_PLAN_BLOCKED",
     "FAILURE_HINT_CONFLICT_UNRESOLVABLE",
     "FAILURE_HINT_PUSH_AND_PR_NO_UNMERGED_FILES",
+    "FAILURE_HINT_PUSH_FAILED",
     "FAILURE_HINT_OPERATIONAL_FAILED",
     "FAILURE_HINT_CLAUDE_PHASE_TIMEOUT",
     # Transition dataclass + enum

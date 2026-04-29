@@ -1498,6 +1498,14 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
     # #3465 — rebase exited non-zero with no unmerged files.
     "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
+    # #3789 — handle_push_and_pr emitted ``push_failed=true`` (timeout,
+    # PAT scope, pre-push hook reject, etc.). Pre-#3789 this advanced
+    # to awaiting_ci with ``pr_number=NULL`` and reaped as
+    # ``awaiting_ci_failed/missing_pr`` (#3663). Now the transition
+    # shim emits ``FAILURE_HINT_PUSH_FAILED`` and the entrypoint
+    # advances to descriptive terminal ``push_failed``; the diagnoser
+    # picks it up via this map and routes per cause.
+    "push_failed": FAILURE_CATEGORY_PUSH_FAILED,
     # #3507 — operational skill returned failed/unrecognized verdict.
     "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
     # #3586 — ralph returned non-SHIP verdict; diagnoser takes over from

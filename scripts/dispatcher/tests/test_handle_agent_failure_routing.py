@@ -135,6 +135,7 @@ class TestBypassedTerminalConstants:
             FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT,
             FAILURE_CATEGORY_FIX_CI_BLOCKED,
             FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
+            FAILURE_CATEGORY_PUSH_FAILED,
             FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
             FAILURE_CATEGORY_RALPH_NOT_SHIP,
             FAILURE_CATEGORY_SUMMARY_AC_INFEASIBLE,
@@ -149,6 +150,11 @@ class TestBypassedTerminalConstants:
             "fix_ci_blocked": FAILURE_CATEGORY_FIX_CI_BLOCKED,
             "verify_failed_post_merge": FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE,
             "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
+            # #3789 — handle_push_and_pr push_failed envelope
+            # routes through the diagnoser (was advancing to
+            # awaiting_ci with pr_number=NULL and reaping as
+            # missing_pr; see #3663).
+            "push_failed": FAILURE_CATEGORY_PUSH_FAILED,
             "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
             "ralph_not_ship": FAILURE_CATEGORY_RALPH_NOT_SHIP,
             # #3777
