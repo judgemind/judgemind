@@ -2703,6 +2703,24 @@ class DispatcherDaemon:
         # existing ``verify_already_completed`` short-circuit and the
         # recovery-path code in ``_run_verify_and_complete``).
         self._phase_subprocess_inflight: dict[str, dict] = {}
+        # #3809 — per-process emission gate for the
+        # ``agent_ecs_retry_not_supported`` operator-visible warning.
+        #
+        # ``_warn_on_ecs_retrying_rows`` runs every supervisor tick
+        # (~10s) and re-reads every ECS-mode ``status='retrying'`` row.
+        # Pre-#3809 every read re-emitted the WARN, flooding
+        # CloudWatch with ~360 lines/hour for a single stuck row. The
+        # signal — "this ECS agent needs operator cleanup" — is
+        # legitimate but only useful ONCE per ``(run_id, agent_id)``
+        # pair; after the first emission, subsequent ticks observe
+        # the same row without re-warning.
+        #
+        # Set is in-memory only; daemon restart resets it (and a
+        # fresh WARN fires on the first tick after boot — also the
+        # right cadence). Bounded by the number of distinct ECS-mode
+        # retrying agent_ids the daemon ever sees in its lifetime,
+        # which is small (operator-cleanup-driven, not autoscaled).
+        self._observed_ecs_retrying: set[str] = set()
 
     # ------------------------------------------------------------------
     # Thread-aware connection accessor (#2847).
@@ -10212,6 +10230,18 @@ class DispatcherDaemon:
         stuck in ``retrying`` is invisible work that will never advance
         without intervention.
 
+        #3809. Emission is gated by the per-process
+        :attr:`_observed_ecs_retrying` set. The supervisor tick
+        cadence (~10s) plus persistently stuck rows (operator action
+        required → may stay for hours/days) pre-#3809 produced ~360
+        WARN lines/hour for a single row. The legitimate signal is
+        "this row needs operator cleanup," which is useful ONCE per
+        ``(run_id, agent_id)`` pair — every subsequent tick on the
+        same row is noise. After the first emission per ``agent_id``
+        the row is observed silently. Daemon restart resets the
+        in-memory set, so a long-stuck row will re-emit one WARN per
+        boot — also the right cadence.
+
         Best-effort: a DB read failure here logs but does not propagate
         — the scheduler tick must not stall on this diagnostic.
         """
@@ -10234,12 +10264,18 @@ class DispatcherDaemon:
                 pass
             return
         for row in rows or []:
+            agent_id = str(row[0])
+            # #3809 — first-detection gate. Skip silently on any
+            # subsequent tick that re-observes the same agent_id.
+            if agent_id in self._observed_ecs_retrying:
+                continue
+            self._observed_ecs_retrying.add(agent_id)
             self._log.warning(
                 "daemon.agent_ecs_retry_not_supported",
                 extra={
                     "event": "agent_ecs_retry_not_supported",
                     "run_id": self._run_id,
-                    "agent_id": str(row[0]),
+                    "agent_id": agent_id,
                     "issue_number": (int(row[1]) if row[1] is not None else None),
                     "detail": (
                         "ECS-mode agent in status='retrying'; the "
@@ -10248,7 +10284,10 @@ class DispatcherDaemon:
                         "not yet wired (audit follow-up #3168). "
                         "Operator action required: either manually "
                         "terminate (force_stop + agent/ready relabel) "
-                        "or wait for #3168."
+                        "or wait for #3168. This warning is emitted "
+                        "once per (run_id, agent_id) pair — daemon "
+                        "restart re-emits one line per stuck row "
+                        "(#3809)."
                     ),
                 },
             )
