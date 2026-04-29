@@ -12,17 +12,29 @@
 #   scripts/dispatcher/helpers/breaker.sh reset
 #   scripts/dispatcher/helpers/breaker.sh pause
 #   scripts/dispatcher/helpers/breaker.sh force-stop <agent-id-or-prefix>
+#   scripts/dispatcher/helpers/breaker.sh set-target <integer>
 #
 # Subcommands:
 #   status            Show cap, flipped_by, recent-outcomes window, bad_count
 #                     vs threshold, and time-until-next-eligible-eval.
-#   reset             Issue `start` command (cap → 1). Auto-closes the
-#                     circuit breaker's `cap_flipped_by` flag on next tick.
-#                     Polls until the command is consumed (up to 90s).
+#   reset             Issue `start` command (cap → target_concurrency_cap;
+#                     defaults to 1 when no target row is configured).
+#                     Auto-closes the circuit breaker's `cap_flipped_by`
+#                     flag inline. Polls until the command is consumed
+#                     (up to 90s).
+#                     #3779 — pre-3779 the start handler hard-coded
+#                     cap → 1 and operators had to manually bump it
+#                     back to their target after every breaker trip.
 #   pause             Issue `stop` command (graceful — cap → 0, in-flight
 #                     agents complete, no new spawns). Polls until consumed.
 #   force-stop PREFIX Issue `force_stop` against one agent matching the
 #                     UUID prefix (min 4 hex chars). Kills mid-flight.
+#   set-target N      Set `target_concurrency_cap` to integer N (>=1).
+#                     The breaker's time-based auto-close (#3779) and
+#                     the `start`/`reset` command both restore cap to
+#                     this value. Does NOT touch the live cap — use
+#                     `reset` after changing the target if you want it
+#                     applied immediately while the breaker is open.
 #
 # Timestamps are UTC with `Z` AND Pacific with PT because the operator
 # defaults to Pacific in conversation (see feedback_timezone_in_communication).
@@ -51,7 +63,7 @@ fi
 . "$script_dir/_query_lib.sh"
 
 usage() {
-    sed -n '6,27p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '6,37p' "$0" | sed 's/^# \{0,1\}//' >&2
 }
 
 # ─── Helpers ────────────────────────────────────────────────────────────
@@ -128,6 +140,7 @@ WITH
   config_row AS (
     SELECT
       (SELECT value::int FROM dispatcher.config WHERE key='concurrency_cap') AS cap,
+      (SELECT value::int FROM dispatcher.config WHERE key='target_concurrency_cap') AS target_cap,
       (SELECT value::text FROM dispatcher.config WHERE key='cap_flipped_by') AS flipped_by,
       (SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM dispatcher.config WHERE key='concurrency_cap') AS cap_updated_utc,
       (SELECT to_char(updated_at AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS\" PT\"') FROM dispatcher.config WHERE key='concurrency_cap') AS cap_updated_pt,
@@ -186,7 +199,7 @@ SELECT jsonb_build_object(
       | ($non_infra | map(select(.status != "succeeded"))) as $bad
       | ($outs | map(select(.latest_category == "daemon_restart_abandoned" or .latest_category == "paused_by_killswitch"))) as $skipped_infra
       | "── concurrency_cap ──",
-        "  cap:        \($c.cap)",
+        "  cap:        \($c.cap)  (target=\($c.target_cap // "(null)"))",
         "  flipped_by: \($c.flipped_by // "(null)")",
         "  cap updated: \($c.cap_updated_utc)  (\($c.cap_updated_pt))",
         "",
@@ -244,6 +257,32 @@ cmd_pause() {
     echo "$result" | jq -r '.[0].state | "  cap:        \(.cap)\n  flipped_by: \(.flipped_by // "(null)")"'
 }
 
+cmd_set_target() {
+    local raw="$1"
+    if ! [[ "$raw" =~ ^[0-9]+$ ]]; then
+        echo "Error: target must be a non-negative integer, got '$raw'" >&2
+        exit 1
+    fi
+    local n=$((10#$raw))
+    if (( n < 1 )); then
+        echo "Error: target must be >=1, got '$raw'" >&2
+        exit 1
+    fi
+    local sql="INSERT INTO dispatcher.config (key, value, updated_by) VALUES ('target_concurrency_cap', '${n}'::jsonb, 'operator-session') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by RETURNING value;"
+    local result
+    result=$(query "$sql")
+    echo "Set target_concurrency_cap to ${n}."
+    echo "Note: live concurrency_cap was NOT touched. Run \`breaker.sh reset\` to apply."
+    echo "Post-set state:"
+    local after_sql="SELECT jsonb_build_object(
+      'cap', (SELECT value::int FROM dispatcher.config WHERE key='concurrency_cap'),
+      'target_cap', (SELECT value::int FROM dispatcher.config WHERE key='target_concurrency_cap'),
+      'flipped_by', (SELECT value FROM dispatcher.config WHERE key='cap_flipped_by')
+    ) AS state;"
+    result=$(query "$after_sql")
+    echo "$result" | jq -r '.[0].state | "  cap:        \(.cap)\n  target_cap: \(.target_cap)\n  flipped_by: \(.flipped_by // "(null)")"'
+}
+
 cmd_force_stop() {
     local prefix="$1"
     local agent_id
@@ -284,6 +323,10 @@ case "$subcommand" in
     force-stop)
         if [[ $# -ne 1 ]]; then usage; exit 1; fi
         cmd_force_stop "$1"
+        ;;
+    set-target)
+        if [[ $# -ne 1 ]]; then usage; exit 1; fi
+        cmd_set_target "$1"
         ;;
     *)
         echo "Error: unknown subcommand '$subcommand'" >&2

@@ -455,7 +455,8 @@ No subscriptions. Admin page uses Apollo `pollInterval: 2000` (2s). Dispatcher e
 **UI sections:**
 
 - **Header:** daemon status pill (running / paused / stopped / unhealthy), uptime, version SHA.
-- **Controls (#2884 simplified):** three buttons — **Start**, **Stop**, **Force Stop**. `start` flips `concurrency_cap` back to 1; `stop` is graceful (blocks new spawns, lets any in-flight agent finish its current phase pipeline); `force_stop` is immediate (sets `_pause_requested` so the in-flight worker aborts at the next phase boundary). Only `force_stop` posts a confirmation modal — the whole point of the simplification is that stopping dev work must not be friction-heavy for the operator. The former Pause / Resume / Stop (drain) / Force-stop cluster and the MFA re-auth gate were removed per #2884.
+- **Controls (#2884 simplified):** three buttons — **Start**, **Stop**, **Force Stop**. `start` flips `concurrency_cap` back to `target_concurrency_cap` (operator-configured target; defaults to 1 when no target row is set — #3779); `stop` is graceful (blocks new spawns, lets any in-flight agent finish its current phase pipeline); `force_stop` is immediate (sets `_pause_requested` so the in-flight worker aborts at the next phase boundary). Only `force_stop` posts a confirmation modal — the whole point of the simplification is that stopping dev work must not be friction-heavy for the operator. The former Pause / Resume / Stop (drain) / Force-stop cluster and the MFA re-auth gate were removed per #2884.
+- **Circuit-breaker auto-close (#2860 + #3779):** when a cluster of bad terminal outcomes opens the breaker (`concurrency_cap=0`, `cap_flipped_by="circuit_breaker"`), two paths converge to close it. **Operator-reflip (#2860):** the operator manually raises cap to ≥1; the daemon clears `cap_flipped_by` and logs `daemon.circuit_breaker_closed`. **Time-based (#3779):** when at least `circuit_breaker_window_minutes` have elapsed since the breaker opened AND the current bad-outcome count over that rolling window is below threshold, the daemon restores cap to `target_concurrency_cap` and clears the flag — without this path the breaker is in a closed-feedback-loop deadlock (cap=0 → no agents → no terminal outcomes → bad_count never refreshes). Either path emits a structured log event for CloudWatch dashboards.
 - **Active agents table:** agent_id (short), issue #, phase, elapsed, worktree (link to CloudWatch logs), actions (retry, kill).
 - **Queue:** upcoming `agent/ready` issues, blocked-by count.
 - **Recent failures (last 24h):** grouped by category, with count and most recent example.
@@ -789,16 +790,23 @@ CREATE INDEX ON dispatcher.notifications (severity, sent_at) WHERE severity = 'h
 
 -- Seed config
 INSERT INTO dispatcher.config (key, value, updated_by) VALUES
-  ('concurrency_cap',      '5',      'init'),
-  ('subprocess_timeout_s', '10800',  'init'),  -- 180 min ceiling; covers known outliers (#2513 107min, #2628 98min)
-  ('backoff_seconds',      '[60,300,900]', 'init'),
-  ('idle_audit_every_n_prs', '20',   'init'),
-  ('idle_spotcheck_cron',  '"0 14 * * *"', 'init'),
+  ('concurrency_cap',         '5',      'init'),  -- runtime cap; circuit breaker writes 0 on overnight-safety trip
+  ('subprocess_timeout_s',    '10800',  'init'),  -- 180 min ceiling; covers known outliers (#2513 107min, #2628 98min)
+  ('backoff_seconds',         '[60,300,900]', 'init'),
+  ('idle_audit_every_n_prs',  '20',     'init'),
+  ('idle_spotcheck_cron',     '"0 14 * * *"', 'init'),
   -- Runner selection: per-phase map. Overridable per-agent via dispatcher.agents.runner_override.
   ('runner_by_phase', '{"plan":"claude","ralph":"claude","summary":"claude","fix_ci":"claude","verify":"claude","retro":"claude","diagnose":"claude"}', 'init'),
   -- Model selection: per-phase map. Values are runner-native model IDs (Claude aliases, OpenCode provider/model strings, etc.).
   ('model_by_phase',  '{"plan":"opus","ralph":"sonnet","summary":"haiku","fix_ci":"sonnet","verify":"haiku","retro":"haiku","diagnose":"opus"}', 'init'),
   ('runner_shadow',    '{}',         'init');  -- e.g. {"summary":"gemini"} runs gemini in parallel, output diff-logged only
+
+-- target_concurrency_cap (#3779) — written by operator via admin cockpit
+-- or `breaker.sh set-target N`. The migration that seeds this row is
+-- deferred to a follow-up PR while migration number 56 is contended
+-- across multiple open PRs (see issue #2916 deadlock pattern). The
+-- daemon falls back to 1 when the row is absent, which matches the
+-- legacy `start` semantics.
 ```
 
 ---

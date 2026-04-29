@@ -1021,6 +1021,20 @@ export function validateConfigValue(key: string, raw: unknown): unknown {
       }
       return n;
     }
+    case 'target_concurrency_cap': {
+      // #3779 — operator-configured target the breaker auto-close path
+      // and the `start` command both restore cap to. Tighter floor
+      // than `concurrency_cap` (>=1, not >=0) so the breaker can't
+      // auto-close back to a paused state.
+      const n = typeof raw === 'number' ? raw : Number.NaN;
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 5) {
+        throw new GraphQLError(
+          'target_concurrency_cap must be an integer in [1, 5]',
+          { extensions: { code: 'BAD_USER_INPUT' } },
+        );
+      }
+      return n;
+    }
     case 'subprocess_timeout_s':
     case 'idle_audit_every_n_prs': {
       const n = typeof raw === 'number' ? raw : Number.NaN;

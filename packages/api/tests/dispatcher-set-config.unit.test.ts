@@ -29,6 +29,35 @@ describe('validateConfigValue — concurrency_cap', () => {
   });
 });
 
+describe('validateConfigValue — target_concurrency_cap (#3779)', () => {
+  it('accepts integers in [1, 5]', () => {
+    expect(validateConfigValue('target_concurrency_cap', 1)).toBe(1);
+    expect(validateConfigValue('target_concurrency_cap', 4)).toBe(4);
+    expect(validateConfigValue('target_concurrency_cap', 5)).toBe(5);
+  });
+
+  it('rejects 0 — target must be >= 1 so the breaker auto-close cannot land on a paused state', () => {
+    expect(() => validateConfigValue('target_concurrency_cap', 0)).toThrow(
+      /integer in \[1, 5\]/,
+    );
+  });
+
+  it('rejects negatives', () => {
+    expect(() => validateConfigValue('target_concurrency_cap', -1)).toThrow();
+  });
+
+  it('rejects values > 5', () => {
+    expect(() => validateConfigValue('target_concurrency_cap', 6)).toThrow();
+    expect(() => validateConfigValue('target_concurrency_cap', 100)).toThrow();
+  });
+
+  it('rejects non-integers', () => {
+    expect(() => validateConfigValue('target_concurrency_cap', 2.5)).toThrow();
+    expect(() => validateConfigValue('target_concurrency_cap', 'four')).toThrow();
+    expect(() => validateConfigValue('target_concurrency_cap', null)).toThrow();
+  });
+});
+
 describe('validateConfigValue — backoff_seconds', () => {
   it('accepts arrays of non-negative integers', () => {
     expect(validateConfigValue('backoff_seconds', [60, 300, 900])).toEqual([60, 300, 900]);
