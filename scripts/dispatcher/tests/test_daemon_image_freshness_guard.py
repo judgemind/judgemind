@@ -528,3 +528,147 @@ class TestLaunchAgentECSTaskFreshnessIntegration:
 
         assert result == _TASK_ARN
         fake_ecs.run_task.assert_called_once()
+
+
+class TestImageFreshnessGuardSuccessPathObservability:
+    """#3756 — success path emits agent_runner_image_freshness_check_passed.
+
+    The original guard was silent on fresh images, which made the AC1
+    Verify line in issue #3756 reference a non-existent log event.  PR
+    that closes #3756 adds a DEBUG-level event on the happy path so
+    CloudWatch Logs Insights queries and runbook Verify lines have a
+    real observable signal.
+    """
+
+    def test_fresh_digest_match_emits_passed_event(self, caplog: Any) -> None:
+        """Matching digests → True AND emits agent_runner_image_freshness_check_passed."""
+        d, _ = _make_daemon()
+        caplog.set_level(logging.DEBUG, logger="test.daemon_image_freshness_guard")
+
+        pinned_image = (
+            "155326049300.dkr.ecr.us-west-2.amazonaws.com/"
+            + _ECR_REPO
+            + "@"
+            + _NEW_DIGEST
+        )
+        fake_ecs = MagicMock()
+        fake_ecs.describe_task_definition.return_value = (
+            _ecs_describe_task_definition_response(image=pinned_image)
+        )
+        fake_ecr = MagicMock()
+        fake_ecr.describe_images.return_value = _ecr_describe_images_response(
+            digest=_NEW_DIGEST,
+            pushed_at=_TASK_DEF_TIME + timedelta(seconds=60),
+        )
+
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_ecs),
+            patch.object(d, "_make_ecr_client", return_value=fake_ecr),
+        ):
+            result = d._check_agent_runner_image_freshness()
+
+        assert result is True
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_image_freshness_check_passed" in events
+        # Stale event must NOT appear.
+        assert "agent_runner_image_stale" not in events
+
+    def test_fresh_timestamp_within_window_emits_passed_event(
+        self, caplog: Any
+    ) -> None:
+        """Timestamp-fresh (ECR push within window) → True AND emits passed event."""
+        d, _ = _make_daemon()
+        caplog.set_level(logging.DEBUG, logger="test.daemon_image_freshness_guard")
+
+        fresh_push = _TASK_DEF_TIME + timedelta(
+            seconds=daemon.AGENT_RUNNER_IMAGE_FRESHNESS_WINDOW_SECONDS - 1
+        )
+        fake_ecs = MagicMock()
+        fake_ecs.describe_task_definition.return_value = (
+            _ecs_describe_task_definition_response(
+                registered_at=_TASK_DEF_TIME,
+                image=(
+                    "155326049300.dkr.ecr.us-west-2.amazonaws.com/"
+                    + _ECR_REPO
+                    + ":latest"
+                ),
+            )
+        )
+        fake_ecr = MagicMock()
+        fake_ecr.describe_images.return_value = _ecr_describe_images_response(
+            pushed_at=fresh_push,
+            digest=_NEW_DIGEST,
+        )
+
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_ecs),
+            patch.object(d, "_make_ecr_client", return_value=fake_ecr),
+        ):
+            result = d._check_agent_runner_image_freshness()
+
+        assert result is True
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_image_freshness_check_passed" in events
+        assert "agent_runner_image_stale" not in events
+
+    def test_passed_event_carries_task_def_family(self, caplog: Any) -> None:
+        """The passed event's structured log carries task_definition_family."""
+        d, _ = _make_daemon()
+        caplog.set_level(logging.DEBUG, logger="test.daemon_image_freshness_guard")
+
+        pinned_image = (
+            "155326049300.dkr.ecr.us-west-2.amazonaws.com/"
+            + _ECR_REPO
+            + "@"
+            + _NEW_DIGEST
+        )
+        fake_ecs = MagicMock()
+        fake_ecs.describe_task_definition.return_value = (
+            _ecs_describe_task_definition_response(image=pinned_image)
+        )
+        fake_ecr = MagicMock()
+        # Use a pushed_at within the freshness window (task_def time + 60s)
+        # so the timestamp check doesn't fire before we reach the passed event.
+        fake_ecr.describe_images.return_value = _ecr_describe_images_response(
+            digest=_NEW_DIGEST,
+            pushed_at=_TASK_DEF_TIME + timedelta(seconds=60),
+        )
+
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_ecs),
+            patch.object(d, "_make_ecr_client", return_value=fake_ecr),
+        ):
+            d._check_agent_runner_image_freshness()
+
+        passed_records = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "agent_runner_image_freshness_check_passed"
+        ]
+        assert len(passed_records) == 1
+        rec = passed_records[0]
+        assert (
+            rec.task_definition_family == _TASK_DEF_FAMILY  # type: ignore[attr-defined]
+        )
+
+    def test_fail_open_does_not_emit_passed_event(self, caplog: Any) -> None:
+        """AWS API error → fail-open → True, but passed event is NOT emitted.
+
+        The passed event signals that the check completed successfully.
+        A fail-open means the check was skipped, not passed — so
+        ``agent_runner_image_freshness_check_passed`` must NOT appear
+        alongside ``agent_runner_image_freshness_check_failed``.
+        """
+        d, _ = _make_daemon()
+        caplog.set_level(logging.DEBUG, logger="test.daemon_image_freshness_guard")
+
+        fake_ecs = MagicMock()
+        fake_ecs.describe_task_definition.side_effect = RuntimeError("Throttle")
+
+        with patch.object(d, "_make_ecs_client", return_value=fake_ecs):
+            result = d._check_agent_runner_image_freshness()
+
+        assert result is True
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_image_freshness_check_failed" in events
+        assert "agent_runner_image_freshness_check_passed" not in events
