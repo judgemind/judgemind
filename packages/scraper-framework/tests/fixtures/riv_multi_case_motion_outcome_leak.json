@@ -1,0 +1,98 @@
+{
+  "readme": "Riverside County motion_type/outcome cross-entry leak fixture (#3638). Synthetic two-entry calendar text. Entry 1 (CVRI2500001) has a substantive motion (Motion for Summary Judgment, GRANTED). Entry 2 (CVRI2500002) is a calendar-only line with no motion description and no ruling content. The contaminated_llm_output shows what a leak-prone LLM produces: entry 2 carries forward motion_type and outcome from entry 1. The expected_clean_output shows the correct behavior: entry 2 has null motion_type and null outcome because its text supports neither.",
+  "raw_input_text": "Tentative Rulings for April 28, 2026\nDepartment RI01\nJudge Jane Smith\n\n1.\nCVRI2500001\nWILLIAMS vs ACME CORP\nMotion for Summary Judgment by Defendant\n\nTentative Ruling: GRANT Defendant's Motion for Summary Judgment.\n\nLegal Standard: A motion for summary judgment shall be granted if all the papers submitted show that there is no triable issue as to any material fact and that the moving party is entitled to judgment as a matter of law. (Code Civ. Proc., \u00a7 437c, subd. (c).)\n\nAnalysis: Defendant has demonstrated that Plaintiff cannot establish the essential element of causation. Plaintiff's expert declaration is conclusory and lacks foundation. The motion is GRANTED.\n\n2.\nCVRI2500002\nJONES vs ADAMS\n\nTentative Ruling: No tentative ruling — a hearing will be conducted.",
+  "contaminated_llm_output": {
+    "extracted_judge_name": "Jane Smith",
+    "hearing_date": "2026-04-28",
+    "department": "RI01",
+    "rulings": [
+      {
+        "extracted_case_number": "CVRI2500001",
+        "extracted_case_title": "Williams v. Acme Corp",
+        "case_type": "civil",
+        "outcome": "granted",
+        "motion_type": "motion for summary judgment",
+        "ruling_text": "GRANT Defendant's Motion for Summary Judgment.\n\nLegal Standard: A motion for summary judgment shall be granted if all the papers submitted show that there is no triable issue as to any material fact and that the moving party is entitled to judgment as a matter of law. (Code Civ. Proc., \u00a7 437c, subd. (c).)\n\nAnalysis: Defendant has demonstrated that Plaintiff cannot establish the essential element of causation. Plaintiff's expert declaration is conclusory and lacks foundation. The motion is GRANTED.",
+        "extracted_parties": [
+          {"name": "Williams", "role": "plaintiff", "confidence": "high"},
+          {"name": "Acme Corp", "role": "defendant", "confidence": "high"}
+        ],
+        "confidence": {
+          "case_number": "high",
+          "case_title": "high",
+          "parties": "high",
+          "judge": "high",
+          "ruling_text": "high",
+          "outcome": "high"
+        }
+      },
+      {
+        "extracted_case_number": "CVRI2500002",
+        "extracted_case_title": "Jones v. Adams",
+        "case_type": "civil",
+        "outcome": "granted",
+        "motion_type": "motion for summary judgment",
+        "ruling_text": "No tentative ruling — a hearing will be conducted.",
+        "extracted_parties": [
+          {"name": "Jones", "role": "plaintiff", "confidence": "high"},
+          {"name": "Adams", "role": "defendant", "confidence": "high"}
+        ],
+        "confidence": {
+          "case_number": "high",
+          "case_title": "high",
+          "parties": "high",
+          "judge": "high",
+          "ruling_text": "high",
+          "outcome": "medium"
+        }
+      }
+    ]
+  },
+  "expected_clean_output": {
+    "extracted_judge_name": "Jane Smith",
+    "hearing_date": "2026-04-28",
+    "department": "RI01",
+    "rulings": [
+      {
+        "extracted_case_number": "CVRI2500001",
+        "extracted_case_title": "Williams v. Acme Corp",
+        "case_type": "civil",
+        "outcome": "granted",
+        "motion_type": "motion for summary judgment",
+        "ruling_text": "GRANT Defendant's Motion for Summary Judgment.\n\nLegal Standard: A motion for summary judgment shall be granted if all the papers submitted show that there is no triable issue as to any material fact and that the moving party is entitled to judgment as a matter of law. (Code Civ. Proc., \u00a7 437c, subd. (c).)\n\nAnalysis: Defendant has demonstrated that Plaintiff cannot establish the essential element of causation. Plaintiff's expert declaration is conclusory and lacks foundation. The motion is GRANTED.",
+        "extracted_parties": [
+          {"name": "Williams", "role": "plaintiff", "confidence": "high"},
+          {"name": "Acme Corp", "role": "defendant", "confidence": "high"}
+        ],
+        "confidence": {
+          "case_number": "high",
+          "case_title": "high",
+          "parties": "high",
+          "judge": "high",
+          "ruling_text": "high",
+          "outcome": "high"
+        }
+      },
+      {
+        "extracted_case_number": "CVRI2500002",
+        "extracted_case_title": "Jones v. Adams",
+        "case_type": "civil",
+        "outcome": null,
+        "motion_type": null,
+        "ruling_text": "No tentative ruling — a hearing will be conducted.",
+        "extracted_parties": [
+          {"name": "Jones", "role": "plaintiff", "confidence": "high"},
+          {"name": "Adams", "role": "defendant", "confidence": "high"}
+        ],
+        "confidence": {
+          "case_number": "high",
+          "case_title": "high",
+          "parties": "high",
+          "judge": "high",
+          "ruling_text": "high",
+          "outcome": "medium"
+        }
+      }
+    ]
+  }
+}
