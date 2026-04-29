@@ -25158,6 +25158,8 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before read"
         try:
             with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): reads pr_number for merge-state
+                # verification; pr_number is set by both ECS and subprocess lanes.
                 cur.execute(
                     "SELECT pr_number FROM dispatcher.agents WHERE agent_id = %s",
                     (agent_id,),
@@ -25458,6 +25460,9 @@ class DispatcherDaemon:
         rows: list[tuple[str, int]] = []
         try:
             with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): merged_at reconcile scans all
+                # agents; pr_number semantics are identical across ECS and
+                # subprocess lanes — both set it after the gh pr merge call.
                 cur.execute(
                     "SELECT agent_id, pr_number FROM dispatcher.agents "
                     "WHERE merged_at IS NOT NULL "
@@ -25490,6 +25495,8 @@ class DispatcherDaemon:
                     continue
                 # PR is OPEN (or CLOSED without merge) — clear the stale stamp.
                 with self._conn.cursor() as cur:
+                    # exec-mode-agnostic (#3158): clears merged_at for any
+                    # agent with a stale stamp; not conditioned on execution mode.
                     cur.execute(
                         "UPDATE dispatcher.agents "
                         "SET merged_at = NULL "
