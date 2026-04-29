@@ -13905,6 +13905,10 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before reading"
 
         rows: list[dict[str, Any]] = []
+        # exec-mode-agnostic (#3158): orphan-PR sweep covers all failed agents
+        # regardless of how they were launched; resurrection merges the PR via
+        # gh and doesn't touch the local filesystem, so execution_mode is
+        # irrelevant here.
         try:
             with self._conn.cursor() as cur:
                 # Inline the lookback as a parameter rather than baking
