@@ -624,16 +624,11 @@ class TestFetchIssueTitlesForBlockers:
 
         call_log: list[list[str]] = []
 
-        def fake_retry(
-            cmd: list[str],
-            *,
-            event_name: str,
-            timeout: float,
-            extra_log_fields: dict | None = None,
-        ) -> dict:
-            call_log.append(cmd)
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            call_log.append(list(cmd))
             result = MagicMock()
             result.returncode = 0
+            result.stderr = ""
             # Issue #3759: union-shape response with both ``i<n>_issue``
             # and ``i<n>_pr``. Issues resolve on the issue side; PRs on
             # the PR side.
@@ -649,9 +644,14 @@ class TestFetchIssueTitlesForBlockers:
                     }
                 }
             )
-            return {"ok": True, "result": result, "attempts": 1}
+            return result
 
-        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+        # Issue #3808: ``_fetch_issue_titles_for_blockers`` no longer
+        # routes through ``_subprocess_with_retry`` (partial-error
+        # responses must not be retried). Stub ``subprocess.run`` to
+        # exercise the real parser end-to-end.
+        monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
         titles = d._fetch_issue_titles_for_blockers({42, 100})
 
@@ -666,33 +666,28 @@ class TestFetchIssueTitlesForBlockers:
     def test_returns_none_on_subprocess_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A genuine transient failure (subprocess timeout) still emits
+        the ``_exhausted`` warning. Issue #3808 only changed the
+        partial-error path — true transient failures retain the
+        3-attempt retry envelope.
+        """
         d, _conn, handler = _make_daemon_with_capture()
 
         call_count = 0
 
-        def fake_retry(
-            cmd: list[str],
-            *,
-            event_name: str,
-            timeout: float,
-            extra_log_fields: dict | None = None,
-        ) -> dict:
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
             nonlocal call_count
             call_count += 1
-            return {
-                "ok": False,
-                "reason": "nonzero_exit",
-                "stderr_tail": "404",
-                "exit_code": 1,
-                "attempts": 3,
-            }
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=30)
 
-        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+        monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
         titles = d._fetch_issue_titles_for_blockers({99})
         assert titles[99] is None
-        # Single batched call, not one per number.
-        assert call_count == 1
+        # 3 attempts on a true transient failure (post-#3808 the
+        # retry envelope is local but unchanged in shape).
+        assert call_count == 3
         # Warning logged at WARNING level.
         warn_events = [
             r
@@ -708,11 +703,16 @@ class TestFetchIssueTitlesForBlockers:
         d, _conn, _handler = _make_daemon_with_capture()
         calls: list = []
 
-        def fake_retry(*_a: object, **_kw: object) -> dict:  # pragma: no cover
+        def fake_run(*_a: object, **_kw: object) -> Any:  # pragma: no cover
             calls.append(1)
-            return {"ok": True, "result": MagicMock(), "attempts": 1}
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "{}"
+            result.stderr = ""
+            return result
 
-        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+        monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
         titles = d._fetch_issue_titles_for_blockers(set())
         assert titles == {}
@@ -726,16 +726,11 @@ class TestFetchIssueTitlesForBlockers:
 
         call_log: list[list[str]] = []
 
-        def fake_retry(
-            cmd: list[str],
-            *,
-            event_name: str,
-            timeout: float,
-            extra_log_fields: dict | None = None,
-        ) -> dict:
-            call_log.append(cmd)
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            call_log.append(list(cmd))
             result = MagicMock()
             result.returncode = 0
+            result.stderr = ""
             # Issue #3759: union-shape response.
             result.stdout = json.dumps(
                 {
@@ -749,9 +744,10 @@ class TestFetchIssueTitlesForBlockers:
                     }
                 }
             )
-            return {"ok": True, "result": result, "attempts": 1}
+            return result
 
-        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+        monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
         # Pass a set — duplicates are already deduplicated by set semantics.
         # This verifies we only make ONE call even when the same number
@@ -775,16 +771,11 @@ class TestFetchIssueTitlesForBlockers:
 
         call_log: list[list[str]] = []
 
-        def fake_retry(
-            cmd: list[str],
-            *,
-            event_name: str,
-            timeout: float,
-            extra_log_fields: dict | None = None,
-        ) -> dict:
-            call_log.append(cmd)
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            call_log.append(list(cmd))
             result = MagicMock()
             result.returncode = 0
+            result.stderr = ""
             # Issue #3759: union-shape response. Build entries for both
             # ``i<n>_issue`` (resolves) and ``i<n>_pr`` (null) per number.
             repo_data: dict[str, object] = {}
@@ -792,9 +783,10 @@ class TestFetchIssueTitlesForBlockers:
                 repo_data[f"i{n}_issue"] = {"number": n, "title": f"T#{n}"}
                 repo_data[f"i{n}_pr"] = None
             result.stdout = json.dumps({"data": {"repository": repo_data}})
-            return {"ok": True, "result": result, "attempts": 1}
+            return result
 
-        monkeypatch.setattr(d, "_subprocess_with_retry", fake_retry)
+        monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
 
         titles = d._fetch_issue_titles_for_blockers({1, 2, 3, 4, 5})
 
@@ -1023,14 +1015,8 @@ class TestFetchIssuesTitleCap:
 
         call_log: list[list[str]] = []
 
-        def fake_subprocess_with_retry(
-            cmd: list[str],
-            *,
-            event_name: str,
-            timeout: int = 30,
-            extra_log_fields: dict | None = None,
-        ) -> dict:
-            call_log.append(cmd)
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            call_log.append(list(cmd))
             # Build a GraphQL response for the capped numbers only.
             # Parse alias names from the query to know which numbers to return.
             # Issue #3759: query now uses ``i<n>_issue`` / ``i<n>_pr`` union
@@ -1041,19 +1027,17 @@ class TestFetchIssuesTitleCap:
             for n in aliases:
                 repo_data[f"i{n}_issue"] = {"number": int(n), "title": f"T{n}"}
                 repo_data[f"i{n}_pr"] = None
-            return {
-                "ok": True,
-                "result": type(
-                    "CP",
-                    (),
-                    {"stdout": json.dumps({"data": {"repository": repo_data}})},
-                )(),
-            }
+            result = MagicMock()
+            result.returncode = 0
+            result.stderr = ""
+            result.stdout = json.dumps({"data": {"repository": repo_data}})
+            return result
 
         # Build a set with MAX_BLOCKER_TITLE_FETCH + 5 unique numbers.
         big_set: set[int] = set(range(1, MAX_BLOCKER_TITLE_FETCH + 6))
 
-        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess_with_retry)
+        monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
         result = d._fetch_issue_titles_for_blockers(big_set)
 
         # Exactly ONE batched GraphQL call regardless of how many numbers.
