@@ -6973,6 +6973,7 @@ printf 'exec 3>&1\n' > "$t3614_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
           assert_phase_deadline_not_exceeded \
+          _post_rebase_no_diff_to_main \
           handle_push_and_pr; do
     awk -v FN="^${fn}\\\\(\\\\)" '
         $0 ~ FN { in_fn=1 }
@@ -6997,18 +6998,18 @@ else
          "fixture head: $(head -c 400 "$t3614_funcs")"
 fi
 
-# Per-test runner. The git stub is parameterised by a counter file so
-# successive ``rev-list --count`` calls can return different values
-# (pre-rebase vs post-rebase). The first call answers the existing #3039
-# no-op-on-clean-tree guardrail; the second call answers the new (this
-# PR) post-rebase empty-diff check.
+# Per-test runner. The git stub is parameterised so the pre-rebase
+# ``rev-list --count`` guardrail (#3039) and the post-rebase
+# ``git diff --quiet`` helper (_post_rebase_no_diff_to_main) can be
+# controlled independently.
 #
 # Stub control via env vars:
-#   T3614_REV_LIST_PRE   — count returned for the FIRST rev-list call
-#                        (pre-rebase). Default 1 (something to push).
-#   T3614_REV_LIST_POST  — count for the SECOND rev-list call (post-rebase).
-#                        Default 1 (rebase preserved the agent's commits).
-#                        Set to 0 to simulate "rebase pulled in the fix".
+#   T3614_REV_LIST_PRE   — count returned for the rev-list call (pre-rebase
+#                        #3039 guardrail). Default 1 (something to push).
+#   T3614_DIFF_QUIET_RC  — exit code for ``git diff --quiet origin/main HEAD``
+#                        (post-rebase _post_rebase_no_diff_to_main helper).
+#                        Default 0 (no diff — already-applied path).
+#                        Set to 1 to simulate "real diff — continue to push".
 #   GIT_REBASE_EXIT    — exit code for ``git rebase origin/main``.
 #                        Default 0 (clean rebase).
 run_push_pr_test() {
@@ -7021,10 +7022,6 @@ run_push_pr_test() {
     _tbin="$TEST_TMP/${_test_id}-bin"
     mkdir -p "$_tworkspace" "$_trepo" "$_tstate" "$_tbin"
     mkdir -p "$_trepo/tmp/dispatcher-output" "$_trepo/tmp/dispatcher-input"
-
-    # rev-list counter file — written/read by the git stub to alternate
-    # responses across calls.
-    printf '0\n' > "$_tstate/rev-list-call-count.txt"
 
     # git stub — log every call, parameterise rev-list / push / rebase /
     # fetch by env. ``git -C <dir> <subcmd>`` is normalised by stripping
@@ -7044,16 +7041,10 @@ done
 sub="${1:-}"
 case "$sub" in
     rev-list)
-        # Returns T3614_REV_LIST_PRE on first call, T3614_REV_LIST_POST after.
-        _counter_file="${T_STATE_DIR}/rev-list-call-count.txt"
-        _n=$(cat "$_counter_file" 2>/dev/null || printf '0')
-        _next=$((_n + 1))
-        printf '%s\n' "$_next" > "$_counter_file"
-        if [[ "$_n" == "0" ]]; then
-            printf '%s\n' "${T3614_REV_LIST_PRE:-1}"
-        else
-            printf '%s\n' "${T3614_REV_LIST_POST:-1}"
-        fi
+        # The only rev-list call in handle_push_and_pr is the pre-rebase
+        # #3039 no-op-on-clean-tree guardrail.  The post-rebase check now
+        # goes through _post_rebase_no_diff_to_main (``git diff --quiet``).
+        printf '%s\n' "${T3614_REV_LIST_PRE:-1}"
         exit 0
         ;;
     fetch)
@@ -7066,9 +7057,16 @@ case "$sub" in
         exit "${GIT_REBASE_EXIT:-0}"
         ;;
     diff)
-        # ``git diff --name-only --diff-filter=U`` for conflict files.
-        # T3614 doesn't drive the conflict path, but this keeps the stub
-        # robust if future tests do.
+        # ``git diff --quiet origin/main HEAD`` is invoked by the
+        # _post_rebase_no_diff_to_main helper.  Honour T3614_DIFF_QUIET_RC
+        # (default 0 = no diff = already-applied) for that call.
+        # ``git diff --name-only --diff-filter=U`` for conflict files still
+        # returns 0; T3614 doesn't drive the conflict path.
+        for _darg in "$@"; do
+            if [[ "$_darg" == "--quiet" ]]; then
+                exit "${T3614_DIFF_QUIET_RC:-0}"
+            fi
+        done
         exit 0
         ;;
     push)
@@ -7161,7 +7159,7 @@ T3614PSQLEOF
 
 # ── Sub-test A: post-rebase empty diff → no_op envelope, no push, no PR ───
 
-run_push_pr_test "t3614a" T3614_REV_LIST_PRE=1 T3614_REV_LIST_POST=0 GIT_REBASE_EXIT=0
+run_push_pr_test "t3614a" T3614_REV_LIST_PRE=1 GIT_REBASE_EXIT=0
 
 if [[ "$PUSHPR_TEST_RC" -eq 0 ]]; then
     pass "#3614 T3614A — handle_push_and_pr exits 0 on post-rebase empty-diff"
@@ -7220,25 +7218,23 @@ else
          "output: $PUSHPR_TEST_OUT"
 fi
 
-# Two rev-list calls: one pre-fetch (the existing #3039 no-op-on-clean-
-# tree guardrail at function entry) + one post-rebase (the new #3614
-# check after a successful rebase). The new check is what distinguishes
-# this from the pre-fix code, where rev-list was called only once and
-# the function fell through to push + gh pr create on empty post-rebase
-# diff.
+# Post-#3682: one rev-list call (pre-rebase #3039 guardrail) + one
+# git diff --quiet call (post-rebase _post_rebase_no_diff_to_main helper).
+# The post-rebase check moved from rev-list to diff --quiet in this PR.
 if [[ -f "$PUSHPR_TEST_STATE/git-log.txt" ]]; then
     _rev_list_calls=$(grep -cE "CALL .*\\brev-list\\b" "$PUSHPR_TEST_STATE/git-log.txt" || printf '0')
-    if [[ "$_rev_list_calls" == "2" ]]; then
-        pass "#3614 T3614A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)"
+    _diff_quiet_calls=$(grep -cE "CALL .*\\bdiff\\b.*--quiet" "$PUSHPR_TEST_STATE/git-log.txt" || printf '0')
+    if [[ "$_rev_list_calls" == "1" ]] && [[ "$_diff_quiet_calls" == "1" ]]; then
+        pass "#3614 T3614A — git rev-list invoked once (pre-fetch guardrail) + git diff --quiet invoked once (post-rebase helper)"
     else
-        fail "#3614 T3614A — git rev-list invoked twice (pre-fetch guardrail + post-rebase check)" \
-             "found $_rev_list_calls call(s); git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt")"
+        fail "#3614 T3614A — git rev-list invoked once (pre-fetch guardrail) + git diff --quiet invoked once (post-rebase helper)" \
+             "rev-list calls=$_rev_list_calls diff-quiet calls=$_diff_quiet_calls; git-log: $(cat "$PUSHPR_TEST_STATE/git-log.txt")"
     fi
 fi
 
 # ── Sub-test B: happy path regression — rebase preserves agent's commits ──
 
-run_push_pr_test "t3614b" T3614_REV_LIST_PRE=1 T3614_REV_LIST_POST=1 GIT_REBASE_EXIT=0
+run_push_pr_test "t3614b" T3614_REV_LIST_PRE=1 T3614_DIFF_QUIET_RC=1 GIT_REBASE_EXIT=0
 
 if [[ "$PUSHPR_TEST_RC" -eq 0 ]]; then
     pass "#3614 T3614B — handle_push_and_pr exits 0 on happy path"
@@ -7344,7 +7340,8 @@ awk '
   /_ralph_baseline_output=""/ { in_block=1; depth=0 }
   in_block {
     print
-    if ($0 ~ /^[[:space:]]*if[[:space:]]+\[\[/) depth++
+    # Count all if-then openings (both "if [[" and "if <identifier>; then").
+    if ($0 ~ /^[[:space:]]*if[[:space:]]/) depth++
     if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
       depth--
       if (depth == 0) exit
@@ -7359,14 +7356,15 @@ else
          "block (head 800): $(head -c 800 "$t3651_block")"
 fi
 
-# #3675: the post-abort check is now ``git diff --quiet origin/main HEAD``
-# (replaced the pre-#3675 ``rev-list --count`` check). Both shapes are
-# valid evidence the envelope block contains the post-abort short-
-# circuit logic — accept either to keep this setup assertion compatible
-# with both pre- and post-#3675 code (defence against accidental
-# regression of the fix).
+# #3682: the post-abort check is now performed by the
+# _post_rebase_no_diff_to_main helper (extracted in #3682 from the inline
+# ``git diff --quiet`` / ``rev-list --count`` blocks). Accept the helper
+# call form as valid evidence the envelope block contains the post-abort
+# short-circuit logic, as well as the older inline forms (defence against
+# accidental regression to either pre-#3675 or pre-#3682 code).
 if grep -qE 'rev-list[[:space:]]+--count[[:space:]]+origin/main\.\.HEAD' "$t3651_block" \
-   || grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3651_block"; then
+   || grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3651_block" \
+   || grep -q '_post_rebase_no_diff_to_main' "$t3651_block"; then
     pass "#3651 T3651 setup — extracted envelope block contains the post-abort already-applied check"
 else
     fail "#3651 T3651 setup — extracted envelope block contains the post-abort already-applied check" \
@@ -7443,6 +7441,18 @@ T3651GITEOF
             # a test-shim that mirrors to stdout so assertions can
             # grep the captured output.
             log() { printf "%s\n" "LOG $*"; }
+            # #3682: the envelope block now calls _post_rebase_no_diff_to_main
+            # (extracted helper). Define a test-shim that delegates to the
+            # git stub on PATH (which honours T3651_DIFF_QUIET_RC via the
+            # --quiet branch) so T3651 assertions remain behavioural.
+            _post_rebase_no_diff_to_main() {
+                local _rc
+                set +e
+                git -C "${REPO_ROOT:-}" diff --quiet origin/main HEAD
+                _rc=$?
+                set -e
+                return "$_rc"
+            }
             _baseline_conflict_files_json="${T3651_CONFLICT_FILES_JSON:-[]}"
             _baseline_rebase_stderr_tail='\''""'\''
             # Now source the extracted envelope block. It assigns
@@ -8754,6 +8764,7 @@ printf 'exec 3>&1\n' > "$t3675_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
           assert_phase_deadline_not_exceeded \
+          _post_rebase_no_diff_to_main \
           handle_push_and_pr; do
     awk -v FN="^${fn}\\\\(\\\\)" '
         $0 ~ FN { in_fn=1 }
@@ -8775,14 +8786,16 @@ else
          "fixture head: $(head -c 400 "$t3675_funcs")"
 fi
 
-# Behavioural fingerprint: the new fix MUST contain a ``git diff --quiet
-# origin/main HEAD`` invocation in handle_push_and_pr. If this is absent
-# the fix wasn't applied at this site.
-if grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3675_funcs"; then
+# Behavioural fingerprint: the post-#3675 fix uses ``git diff --quiet
+# origin/main HEAD`` for the already-applied check, either inline or via
+# the #3682 helper ``_post_rebase_no_diff_to_main`` (which itself contains
+# the diff --quiet invocation). Accept either form.
+if grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3675_funcs" \
+   || grep -q '_post_rebase_no_diff_to_main' "$t3675_funcs"; then
     pass "#3675 T3675 setup — handle_push_and_pr contains diff --quiet origin/main HEAD"
 else
     fail "#3675 T3675 setup — handle_push_and_pr contains diff --quiet origin/main HEAD" \
-         "fixture: $(grep -nE '(rev-list|diff)' "$t3675_funcs" | head -20)"
+         "fixture: $(grep -nE '(rev-list|diff|_post_rebase)' "$t3675_funcs" | head -20)"
 fi
 
 # Per-test runner. Drives handle_push_and_pr into the rebase-rc=128
@@ -9199,7 +9212,8 @@ awk '
   /_ralph_baseline_output=""/ { in_block=1; depth=0 }
   in_block {
     print
-    if ($0 ~ /^[[:space:]]*if[[:space:]]+\[\[/) depth++
+    # Count all if-then openings (both "if [[" and "if <identifier>; then").
+    if ($0 ~ /^[[:space:]]*if[[:space:]]/) depth++
     if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
       depth--
       if (depth == 0) exit
@@ -9214,10 +9228,11 @@ else
          "block (head 800): $(head -c 800 "$t3675_block")"
 fi
 
-# Behavioural fingerprint at site 2: the new fix MUST contain a ``git
-# diff --quiet origin/main HEAD`` invocation in the ralph_baseline
-# envelope block. If this is absent the fix wasn't applied at this site.
-if grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3675_block"; then
+# Behavioural fingerprint at site 2: the post-#3675 fix uses ``git diff
+# --quiet origin/main HEAD``, either inline or via the #3682 helper
+# ``_post_rebase_no_diff_to_main``. Accept either form.
+if grep -qE 'diff[[:space:]]+--quiet[[:space:]]+origin/main[[:space:]]+HEAD' "$t3675_block" \
+   || grep -q '_post_rebase_no_diff_to_main' "$t3675_block"; then
     pass "#3675 T3675 setup — ralph_baseline block contains diff --quiet origin/main HEAD"
 else
     fail "#3675 T3675 setup — ralph_baseline block contains diff --quiet origin/main HEAD" \
@@ -9288,6 +9303,18 @@ T3675BASELINEGITEOF
         bash -c '
             set -uo pipefail
             log() { printf "%s\n" "LOG $*"; }
+            # #3682: the envelope block now calls _post_rebase_no_diff_to_main.
+            # Define a test-shim that delegates to the git stub on PATH
+            # (which honours T3675_BASELINE_DIFF_QUIET_RC via the --quiet
+            # branch) so T3675 assertions remain behavioural.
+            _post_rebase_no_diff_to_main() {
+                local _rc
+                set +e
+                git -C "${REPO_ROOT:-}" diff --quiet origin/main HEAD
+                _rc=$?
+                set -e
+                return "$_rc"
+            }
             _baseline_conflict_files_json="${T3675_BASELINE_CONFLICT_FILES_JSON:-[]}"
             _baseline_rebase_stderr_tail='\''""'\''
             # shellcheck disable=SC1090

@@ -2561,6 +2561,40 @@ assert_phase_deadline_not_exceeded() {
     return 0
 }
 
+# _post_rebase_no_diff_to_main — canonical post-rebase already-applied check.
+#
+# Returns 0 when ``git diff --quiet origin/main HEAD`` exits 0 (no semantic
+# diff between origin/main and HEAD).  The caller SHOULD emit a
+# ``{"no_op": true, ...}`` envelope and return — the agent's commits are
+# already present in main and there is nothing to push or PR.
+#
+# Returns 1 when there IS a real diff — the caller continues its normal
+# push/PR flow.
+#
+# This is the canonical post-rebase already-applied check for all rebase-end
+# sites in this file (``handle_push_and_pr`` sites 1 and 2, and
+# ``handle_ralph_baseline_rebase`` site 3, plus any future siblings).
+# New rebase-end sites MUST use this helper rather than inline
+# ``rev-list --count`` or bare ``git diff --quiet`` blocks.
+#
+# Why ``git diff --quiet`` and not ``rev-list --count origin/main..HEAD``?
+# ``rev-list`` counts commit *objects*, not semantic diff.  After
+# ``rebase --abort`` HEAD equals ORIG_HEAD, which still contains the agent's
+# ralph and fix_conflict commits as distinct git objects — even when those
+# commits became semantically redundant with main during the rebase (which
+# is why rebase produced empty commits and exited 128).  ``rev-list --count``
+# returns N > 0 in that case and the pre-#3675 check fell through to the
+# terminal-fail envelope on what was actually a benign success.  See the
+# history in #3614 / #3651 / #3662 / #3675 for the full progression.
+_post_rebase_no_diff_to_main() {
+    local _rc
+    set +e
+    git -C "$REPO_ROOT" diff --quiet origin/main HEAD
+    _rc=$?
+    set -e
+    return "$_rc"
+}
+
 handle_push_and_pr() {
     # Mechanical implementation of the push_and_pr phase (#3117, #3176).
     #
@@ -2758,10 +2792,8 @@ handle_push_and_pr() {
                 "elapsed_seconds=$LOCAL_GIT_TIMEOUT_SECONDS"
         fi
         if [[ "$_rebase_rc" -eq 0 ]]; then
-            _post_rebase_ahead=$(git -C "$REPO_ROOT" rev-list --count origin/main..HEAD 2>/dev/null || printf '0')
-            if [[ "$_post_rebase_ahead" == "0" ]]; then
+            if _post_rebase_no_diff_to_main; then
                 log "push_and_pr_no_unmerged_files_already_applied" \
-                    "post_rebase_ahead=$_post_rebase_ahead" \
                     "reason=rebase_dropped_all_commits_already_in_baseline"
                 printf '{"no_op": true}'
                 return 0
@@ -2915,13 +2947,8 @@ handle_push_and_pr() {
                 # case (#3662 fixed) AND the rev-list-N-but-no-diff
                 # case (this fix), without hiding real failures
                 # (#3465 path) where the diff is genuinely non-empty.
-                set +e
-                git -C "$REPO_ROOT" diff --quiet origin/main HEAD
-                _post_abort_diff_rc=$?
-                set -e
-                if [[ "$_post_abort_diff_rc" -eq 0 ]]; then
+                if _post_rebase_no_diff_to_main; then
                     log "push_and_pr_no_unmerged_files_already_applied_post_rebase_failure" \
-                        "diff_rc=0" \
                         "reason=rebase_failed_but_diff_to_main_is_empty"
                     printf '{"no_op": true, "rebase_dropped_all_commits": true, "diff_to_main_empty": true, "rebase_stderr_tail": %s}' \
                         "$_rebase_stderr_tail"
@@ -5605,13 +5632,8 @@ while true; do
                             # answers the actual question: "is there
                             # any change to ship?" Exit 0 = no diff =
                             # already in main = emit no_op.
-                            set +e
-                            git -C "$REPO_ROOT" diff --quiet origin/main HEAD
-                            _post_abort_diff_rc=$?
-                            set -e
-                            if [[ "$_post_abort_diff_rc" -eq 0 ]]; then
+                            if _post_rebase_no_diff_to_main; then
                                 log "ralph_baseline_no_unmerged_files_already_applied" \
-                                    "diff_rc=0" \
                                     "reason=rebase_failed_but_diff_to_main_is_empty"
                                 _ralph_baseline_output=$(printf '{"no_op": true, "rebase_dropped_all_commits": true, "diff_to_main_empty": true, "rebase_stderr_tail": %s, "source_phase": "ralph"}' \
                                     "$_baseline_rebase_stderr_tail")

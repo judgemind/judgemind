@@ -343,6 +343,24 @@ fi
 
 **When `|| printf` is fine:** use it only when the caller needs a default value and does NOT make any exit-code-bearing decision afterwards — e.g. `_label=$(git tag --points-at HEAD || printf 'none')` where the caller unconditionally uses `_label` as a display string. If the branch on `_rc` or a `[[ -z "$_var" ]]` guard is anywhere in the same function, prefer the file-redirect shape instead.
 
+#### Post-rebase already-applied check (dispatcher entrypoint)
+
+The canonical "is there anything to ship after a rebase ended?" check in
+`scripts/dispatcher/agent-runner-entrypoint.sh` is the helper
+`_post_rebase_no_diff_to_main`. Any new rebase-end site in that file
+(`handle_push_and_pr`, `handle_ralph_baseline_rebase`, or future siblings)
+MUST use this helper rather than an inline `rev-list --count` or bare
+`git diff --quiet` block.
+
+Why `git diff --quiet` and not `rev-list --count origin/main..HEAD`? `rev-list`
+counts commit *objects*, not semantic diff. After `rebase --abort` HEAD equals
+ORIG_HEAD, which still contains the agent's commits as distinct git objects
+even when those commits became semantically redundant with main during the
+rebase. `rev-list --count` returns N > 0 in that case and the pre-#3675 code
+fell through to a terminal-fail envelope on what was actually a benign success.
+The full progression is documented in issues #3614 / #3651 / #3662 / #3675.
+See the helper's docstring in the entrypoint for a worked example.
+
 ### macOS bash 3.2 compatibility
 
 Operator laptops run macOS, which ships with bash 3.2.57 (Apple has frozen the OS bash at 3.2 since 2007 for GPLv3 licensing reasons). Shell scripts in this repo — especially `scripts/check-*.sh` hygiene guards and `scripts/tests/*.sh` unit tests — are run both from CI (ubuntu-latest, bash 5+) and from operator shells. A script that uses a bash 4+ feature passes CI but fails locally with a cryptic message such as `mapfile: command not found` (exit 127) or `bad substitution`.
