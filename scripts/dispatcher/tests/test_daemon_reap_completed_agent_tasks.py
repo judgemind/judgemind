@@ -1001,3 +1001,247 @@ class TestReapUntrackedArns:
             "still_running": 0,
             "reaped_untracked": 0,
         }
+
+
+# --------------------------------------------------------------------------
+# Issue #3805 — every terminal branch must clear ``agent_task_arn``,
+# including rows where ``issue_number IS NULL`` (audit / dispatcher-
+# daily-report / dispatcher-startup subagents — non-issue subagents are
+# valid).
+#
+# Pre-fix only 2 of the 5 terminal branches cleared the ARN:
+#  - Branch 2 (success_already_terminal) called
+#    ``_reap_finalize_ecs_success`` which early-returned on
+#    ``issue_number is None`` BEFORE the buried ARN clear could fire,
+#    so issue-less rows were re-selected ~10 events/min forever.
+#  - Branch 3 (success_row_gap) called ``_mark_agent_terminal`` which
+#    never touched ``agent_task_arn`` (latent leak).
+#  - Branch 5 (failure_not_terminal) called ``_handle_agent_failure``
+#    which never touched ``agent_task_arn`` (latent leak).
+#
+# Post-fix the ``_clear_agent_task_arn`` helper is invoked at the call
+# site of all 5 terminal branches uniformly. These regression tests
+# pin the new behavior — each FAILS against the pre-#3805 code and
+# PASSES post-fix.
+# --------------------------------------------------------------------------
+
+
+class TestReapArnClearAcrossAllTerminalBranches:
+    """Issue #3805 — ARN clear must be uniform across all 5 terminal branches."""
+
+    def test_success_already_terminal_clears_arn_when_issue_number_is_none(
+        self, caplog: Any
+    ) -> None:
+        """Branch 2: row with ``status='succeeded'``, ``phase='done'``, AND
+        ``issue_number IS NULL`` (e.g. audit / daily-report / startup
+        subagent).
+
+        Pre-fix: ``_reap_finalize_ecs_success`` early-returned on
+        ``issue_number is None`` (line 25568 pre-#3805) and the
+        ARN clear was buried after the early-return — so the row's
+        ``agent_task_arn`` was never nulled and the SELECT
+        re-observed it every tick (~10 events/min, observed
+        2026-04-29 on agent_id ``89ab37bb...``).
+
+        Post-fix: ``_clear_agent_task_arn`` is called at the
+        ``_reap_completed_agent_tasks`` call site, AFTER
+        ``_reap_finalize_ecs_success`` — so the clear fires
+        regardless of whether ``issue_number`` is None.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+        # SELECT returns one row with issue_number=None (audit /
+        # daily-report / startup subagent — agent has no GitHub issue).
+        select_cur = _FakeCursor(
+            rows=[
+                (
+                    "agent-noiss",
+                    None,  # ← the load-bearing field for this regression
+                    "arn:aws:ecs:us-west-2:123:task/jm/audit",
+                    "done",
+                    "succeeded",
+                ),
+            ]
+        )
+        conn.queue_cursor(select_cur)
+        # Re-read post-STOPPED returns terminal status — branch 2.
+        status_cur = _FakeCursor()
+        status_cur.fetchone_queue = [("succeeded", "done")]
+        conn.queue_cursor(status_cur)
+        # ``_reap_finalize_ecs_success`` early-returns on
+        # ``issue_number is None`` so it consumes NO cursors. The next
+        # cursor goes to ``_clear_agent_task_arn``.
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": "arn:aws:ecs:us-west-2:123:task/jm/audit",
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 0}],
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels") as remove_labels_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["reaped_success"] == 1
+        # Branch 2 took the ``success_already_terminal`` path and logged
+        # the success event.
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_reaped_success" in events
+        # No GitHub label strip — issue_number is None.
+        remove_labels_mock.assert_not_called()
+        # CRITICAL: ARN clear MUST have run — this is what the
+        # regression pins. Pre-fix the buried clear inside
+        # ``_reap_finalize_ecs_success`` was unreachable for
+        # issue_number=None rows; post-fix the helper runs at the
+        # call site unconditionally.
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+        assert [params for _, params in arn_clear_cur.executed] == [("agent-noiss",)]
+
+    def test_success_row_gap_clears_arn_when_issue_number_is_none(
+        self, caplog: Any
+    ) -> None:
+        """Branch 3: container exit 0 but DB row not yet terminal, AND
+        ``issue_number IS NULL``.
+
+        Pre-fix: ``_mark_agent_terminal`` writes
+        ``status``/``phase``/``ended_at`` but never touches
+        ``agent_task_arn`` — latent leak: any row of this shape would
+        be re-selected forever.
+
+        Post-fix: ``_clear_agent_task_arn`` runs at the call site
+        immediately after ``_mark_agent_terminal``.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.WARNING, logger="test.daemon_reap")
+        select_cur = _FakeCursor(
+            rows=[
+                (
+                    "agent-gap-noiss",
+                    None,  # ← issue_number IS NULL
+                    "arn:aws:ecs:us-west-2:123:task/gap-noiss",
+                    "verify",
+                    "running",
+                ),
+            ]
+        )
+        conn.queue_cursor(select_cur)
+        # Re-read returns NON-terminal — forces the row_gap branch.
+        status_cur = _FakeCursor()
+        status_cur.fetchone_queue = [("running", "verify")]
+        conn.queue_cursor(status_cur)
+        # ``_mark_agent_terminal`` is mocked below — consumes no
+        # cursor. Next cursor goes to ``_clear_agent_task_arn``.
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": "arn:aws:ecs:us-west-2:123:task/gap-noiss",
+                    "lastStatus": "STOPPED",
+                    "stopCode": "EssentialContainerExited",
+                    "containers": [{"exitCode": 0}],
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_mark_agent_terminal") as mark_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["reaped_success"] == 1
+        # Branch 3 took the row_gap path.
+        mark_mock.assert_called_once()
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_reaped_success_row_gap" in events
+        # CRITICAL: ARN clear MUST have run. Pre-#3805
+        # ``_mark_agent_terminal`` did not touch ``agent_task_arn``
+        # so the row would re-fire on every tick.
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+        assert [params for _, params in arn_clear_cur.executed] == [
+            ("agent-gap-noiss",)
+        ]
+
+    def test_failure_not_terminal_clears_arn_when_issue_number_is_none(
+        self, caplog: Any
+    ) -> None:
+        """Branch 5: container exit non-zero, DB row not yet terminal,
+        AND ``issue_number IS NULL``.
+
+        Pre-fix: ``_handle_agent_failure`` writes a
+        ``dispatcher.failures`` row + invokes the diagnoser path but
+        never touches ``agent_task_arn`` — latent leak: any failure
+        of this shape would be re-selected forever.
+
+        Post-fix: ``_clear_agent_task_arn`` runs at the call site
+        immediately after ``_handle_agent_failure``.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.WARNING, logger="test.daemon_reap")
+        select_cur = _FakeCursor(
+            rows=[
+                (
+                    "agent-fail-noiss",
+                    None,  # ← issue_number IS NULL
+                    "arn:aws:ecs:us-west-2:123:task/fail-noiss",
+                    "ralph",
+                    "running",
+                ),
+            ]
+        )
+        conn.queue_cursor(select_cur)
+        # Re-read returns NON-terminal — forces failure-not-terminal.
+        status_cur = _FakeCursor()
+        status_cur.fetchone_queue = [("running", "ralph")]
+        conn.queue_cursor(status_cur)
+        # ``_handle_agent_failure`` is mocked below. Next cursor
+        # goes to ``_clear_agent_task_arn``.
+        arn_clear_cur = _FakeCursor()
+        conn.queue_cursor(arn_clear_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [
+                {
+                    "taskArn": "arn:aws:ecs:us-west-2:123:task/fail-noiss",
+                    "lastStatus": "STOPPED",
+                    "stopCode": "ContainerRuntimeError",
+                    "containers": [{"exitCode": 137}],
+                }
+            ]
+        }
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_handle_agent_failure") as fail_mock,
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        assert summary["reaped_failure"] == 1
+        # Branch 5 took the failure-not-terminal path.
+        fail_mock.assert_called_once()
+        kw = fail_mock.call_args.kwargs
+        assert kw["category"] == "agent_task_stopped_unexpectedly"
+        assert kw["issue_number"] is None
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert "agent_runner_reaped_failure" in events
+        # CRITICAL: ARN clear MUST have run. Pre-#3805
+        # ``_handle_agent_failure`` did not touch ``agent_task_arn``
+        # so the row would re-fire on every tick.
+        arn_sqls = [sql for sql, _ in arn_clear_cur.executed]
+        assert any("SET agent_task_arn = NULL" in sql for sql in arn_sqls), arn_sqls
+        assert [params for _, params in arn_clear_cur.executed] == [
+            ("agent-fail-noiss",)
+        ]

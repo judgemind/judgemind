@@ -25355,6 +25355,20 @@ class DispatcherDaemon:
                     # idempotent (re-reaps must not bump ``merged_at``
                     # or repeat the label call cost).
                     self._reap_finalize_ecs_success(agent_id, issue_number)
+                    # Issue #3805: clear ``agent_task_arn`` at the
+                    # call site (uniform across all five terminal
+                    # branches). Previously the clear was buried
+                    # inside ``_reap_finalize_ecs_success``, which
+                    # early-returns on ``issue_number is None`` — so
+                    # rows for issue-less subagents (audit, daily
+                    # report, startup) were re-selected every tick
+                    # forever. Hoisting the clear here makes it
+                    # unconditional.
+                    self._clear_agent_task_arn(
+                        agent_id=agent_id,
+                        issue_number=issue_number,
+                        branch="success_already_terminal",
+                    )
                     reaped_success += 1
                 else:
                     # Container exited 0 but agent row wasn't marked
@@ -25385,6 +25399,16 @@ class DispatcherDaemon:
                         phase=current_phase or "done",
                         exit_code=0,
                         issue_number=issue_number,
+                    )
+                    # Issue #3805: clear ``agent_task_arn`` at the
+                    # call site. ``_mark_agent_terminal`` writes
+                    # status/phase/ended_at but does not touch
+                    # ``agent_task_arn``, so without this the row
+                    # would be re-selected every tick.
+                    self._clear_agent_task_arn(
+                        agent_id=agent_id,
+                        issue_number=issue_number,
+                        branch="success_row_gap",
                     )
                     reaped_success += 1
             else:
@@ -25436,30 +25460,15 @@ class DispatcherDaemon:
                     # the success-path clear in
                     # ``_reap_finalize_ecs_success`` — same rationale,
                     # same idempotence story.
-                    try:
-                        with self._conn.cursor() as cur:
-                            cur.execute(
-                                "UPDATE dispatcher.agents "
-                                "SET agent_task_arn = NULL "
-                                "WHERE agent_id = %s",
-                                (agent_id,),
-                            )
-                        self._conn.commit()
-                    except Exception:
-                        self._log.exception(
-                            "daemon.agent_runner_reaped_arn_clear_failed",
-                            extra={
-                                "event": "agent_runner_reaped_arn_clear_failed",
-                                "run_id": self._run_id,
-                                "agent_id": agent_id,
-                                "issue_number": issue_number,
-                                "branch": "failure_already_terminal",
-                            },
-                        )
-                        try:
-                            self._conn.rollback()
-                        except Exception:  # pragma: no cover — defensive
-                            pass
+                    #
+                    # Issue #3805: normalized to use the
+                    # ``_clear_agent_task_arn`` helper so all five
+                    # terminal branches use one consistent shape.
+                    self._clear_agent_task_arn(
+                        agent_id=agent_id,
+                        issue_number=issue_number,
+                        branch="failure_already_terminal",
+                    )
                     reaped_failure += 1
                     continue
                 # Real failure — agent-runner died before it could write
@@ -25496,6 +25505,16 @@ class DispatcherDaemon:
                         "exit_codes": exit_codes,
                     },
                     issue_number=issue_number,
+                )
+                # Issue #3805: clear ``agent_task_arn`` at the call
+                # site. ``_handle_agent_failure`` writes the failures
+                # row + invokes the diagnoser path but does not
+                # touch ``agent_task_arn``, so without this the row
+                # would be re-selected every tick (latent leak).
+                self._clear_agent_task_arn(
+                    agent_id=agent_id,
+                    issue_number=issue_number,
+                    branch="failure_not_terminal",
                 )
                 reaped_failure += 1
 
@@ -25564,6 +25583,15 @@ class DispatcherDaemon:
         Idempotent on the GitHub side because
         :meth:`_gh_issue_remove_labels` is a no-op when the label is
         already absent.
+
+        Issue #3805: the ``agent_task_arn = NULL`` clear used to live
+        in this function but was unreachable on the
+        ``issue_number is None`` early-return below (audit /
+        dispatcher-daily-report / dispatcher-startup agents). The
+        clear is now hoisted to the ``_reap_completed_agent_tasks``
+        call site (one helper call per terminal branch, all five
+        branches uniform), so this function is purely
+        issue-bookkeeping.
         """
         if issue_number is None:
             return
@@ -25634,38 +25662,13 @@ class DispatcherDaemon:
                     self._conn.rollback()
                 except Exception:  # pragma: no cover — defensive
                     pass
-        # Issue #3329: clear ``agent_task_arn`` so the next reaper tick
-        # excludes this row from the SELECT. Without this clear, the
-        # SELECT (now keyed solely on ``agent_task_arn IS NOT NULL``)
-        # would re-observe the same already-finalized row forever and
-        # the daemon would re-call ``ecs:DescribeTasks`` for it on
-        # every tick. Idempotent — if the column is already NULL the
-        # UPDATE is a no-op. Best-effort: a DB hiccup here just defers
-        # the cleanup to the next successful tick.
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE dispatcher.agents "
-                    "SET agent_task_arn = NULL "
-                    "WHERE agent_id = %s",
-                    (agent_id,),
-                )
-            self._conn.commit()
-        except Exception:
-            self._log.exception(
-                "daemon.agent_runner_reaped_arn_clear_failed",
-                extra={
-                    "event": "agent_runner_reaped_arn_clear_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                    "branch": "success_already_terminal",
-                },
-            )
-            try:
-                self._conn.rollback()
-            except Exception:  # pragma: no cover — defensive
-                pass
+        # Issue #3805: the ``agent_task_arn = NULL`` clear used to live
+        # here, but was unreachable on the ``issue_number is None``
+        # early-return above (audit / dispatcher-daily-report /
+        # dispatcher-startup agents). The clear has been hoisted to
+        # the ``_reap_completed_agent_tasks`` call site so all five
+        # terminal branches clear the ARN uniformly via
+        # :meth:`_clear_agent_task_arn`.
 
     def _read_agent_status_phase(self, agent_id: str) -> tuple[str | None, str | None]:
         """Fetch the current (status, phase) for an agent. Best-effort.
