@@ -128,7 +128,11 @@ class TestBypassedTerminalConstants:
         # FAILURE_CATEGORY so the diagnoser sweep picks them up.
         # Issue #3586 adds ``ralph_not_ship`` — reversed from the
         # #3455 local-handler path; the diagnoser now handles it.
+        # Issue #3777 adds ``claude_phase_timeout`` — timeout wrapper
+        # (rc=124) fired inside run_claude_phase; distinct from
+        # ralph_not_ship so operators can triage timeout vs. silent-exit.
         from dispatcher.daemon import (
+            FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT,
             FAILURE_CATEGORY_FIX_CI_BLOCKED,
             FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             FAILURE_CATEGORY_RALPH_AC_INFEASIBLE,
@@ -147,6 +151,8 @@ class TestBypassedTerminalConstants:
             "push_and_pr_no_unmerged_files": FAILURE_CATEGORY_PUSH_AND_PR_NO_UNMERGED_FILES,
             "operational_failed": FAILURE_CATEGORY_OPERATIONAL_FAILED,
             "ralph_not_ship": FAILURE_CATEGORY_RALPH_NOT_SHIP,
+            # #3777
+            "claude_phase_timeout": FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT,
         }
 
 
