@@ -2024,6 +2024,7 @@ phase_to_skill() {
 run_claude_phase() {
     _phase="$1"
     _out_file="$AGENT_WORKSPACE/claude-p-$_phase.stdout.json"
+    _err_file="$AGENT_WORKSPACE/claude-p-$_phase.stderr.log"
 
     if [[ "$AGENT_RUNNER_DRY_RUN" == "1" ]]; then
         log "claude_phase_dry_run" "phase=$_phase"
@@ -2076,6 +2077,7 @@ run_claude_phase() {
     # name appears in the constants block above as a comment anchor
     # for the test_per_phase_timeout.py static lints.
     _phase_timeout=$(claude_phase_timeout_seconds_by_phase "$_phase")
+    _phase_start_ms=$(date -u +%s%3N 2>/dev/null || printf 'unknown')
     set +e
     (
         cd "$REPO_ROOT" || exit 127
@@ -2095,11 +2097,22 @@ run_claude_phase() {
             --output-format json \
             --dangerously-skip-permissions \
             > "$_out_file" \
-            2> "$AGENT_WORKSPACE/claude-p-$_phase.stderr.log"
+            2> "$_err_file"
     )
     _rc=$?
     set -e
-    log "claude_phase_done" "phase=$_phase" "exit_code=$_rc"
+    _phase_end_ms=$(date -u +%s%3N 2>/dev/null || printf 'unknown')
+    if [[ "$_phase_start_ms" == 'unknown' || "$_phase_end_ms" == 'unknown' ]]; then
+        _phase_duration_ms='unknown'
+    else
+        _phase_duration_ms=$((_phase_end_ms - _phase_start_ms))
+    fi
+    _stdout_size=$(wc -c < "$_out_file" 2>/dev/null | tr -d ' ' || printf 'unknown')
+    _stderr_size=$(wc -c < "$_err_file" 2>/dev/null | tr -d ' ' || printf 'unknown')
+    log "claude_phase_done" "phase=$_phase" "exit_code=$_rc" \
+        "stdout_size=$_stdout_size" \
+        "stderr_size=$_stderr_size" \
+        "duration_ms=$_phase_duration_ms"
     # #3683: emit a distinct event when the timeout fires so CloudWatch
     # Logs Insights queries can grep for ``claude_phase_timeout`` to
     # count incidents. This branch runs BEFORE the non-object-result

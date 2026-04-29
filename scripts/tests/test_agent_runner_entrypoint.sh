@@ -9855,7 +9855,171 @@ else
          "output tail: $(printf '%s' "$T3777B_TEST_OUT" | tail -c 1200)"
 fi
 
-# ── Summary ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Test T3778 — claude_phase_done carries stdout_size, stderr_size, duration_ms
+#
+# Root cause (issue #3778): the ``claude_phase_done`` log event only carried
+# ``phase`` and ``exit_code``.  When a ralph worker silently exited (empty
+# stdout + zero-byte stderr), operators had no way to distinguish "files never
+# opened" from "files truncated mid-write" without a second deploy-instrument
+# cycle.  This test verifies that the widened log line carries all three new
+# fields.
+#
+# Positive assertions:
+#   1. ``claude_phase_done`` line carries ``"stdout_size":`` key (JSON format).
+#   2. ``claude_phase_done`` line carries ``"stderr_size":`` key (JSON format).
+#   3. ``claude_phase_done`` line carries ``"duration_ms":`` key (JSON format).
+#   4. ``"phase": "ralph"`` is still present on the same line (no regression).
+#   5. ``"exit_code": "0"`` is still present on the same line (no regression).
+#   6. ``duration_ms`` value is a non-negative integer OR the literal 'unknown'.
+#
+# Negative regression:
+#   7. A synthetic claude that writes 100 bytes to stderr yields stderr_size > 0
+#      on the ``claude_phase_done`` line.
+#
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t3778.txt"
+printf 'ralph\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t3778_workspace="$TEST_TMP/t3778-workspace"
+mkdir -p "$t3778_workspace"
+
+# Use CLAUDE_RESULT_OVERRIDE to make the ralph phase emit a non-object
+# result (same pattern as T3694).  This causes the entrypoint to reach a
+# terminal state (ralph_done_marker_missing / ralph_not_ship) immediately
+# after run_claude_phase returns, so the test does NOT need to stub out
+# all subsequent phases (push_and_pr, ci_watch, merge, etc.).
+# The claude_phase_done log event is emitted BEFORE the result is parsed,
+# so the new stdout_size / stderr_size / duration_ms fields are always
+# present on that event regardless of whether ralph SHIP or fails.
+set +e
+T3778_TEST_OUT=$(AGENT_ID="37783778-3778-3778-3778-377837783778" \
+      ISSUE_NUMBER="3778" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t3778_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "T3778 stub: non-object to force early exit"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="ralph" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+T3778_TEST_RC=$?
+set -e
+
+# Extract the claude_phase_done line for phase=ralph so we can assert on it.
+# log() emits JSON; fields appear as "key": "value" not key=value.
+T3778_DONE_LINE=$(printf '%s' "$T3778_TEST_OUT" | grep 'claude_phase_done' | grep '"phase": "ralph"' | head -1)
+
+# (1) "stdout_size": key present on claude_phase_done line (JSON format).
+if printf '%s' "$T3778_DONE_LINE" | grep -q '"stdout_size":'; then
+    pass "#3778 T3778 — claude_phase_done carries stdout_size"
+else
+    fail "#3778 T3778 — claude_phase_done carries stdout_size" \
+         "done_line: $T3778_DONE_LINE"
+fi
+
+# (2) "stderr_size": key present on claude_phase_done line (JSON format).
+if printf '%s' "$T3778_DONE_LINE" | grep -q '"stderr_size":'; then
+    pass "#3778 T3778 — claude_phase_done carries stderr_size"
+else
+    fail "#3778 T3778 — claude_phase_done carries stderr_size" \
+         "done_line: $T3778_DONE_LINE"
+fi
+
+# (3) "duration_ms": key present on claude_phase_done line (JSON format).
+if printf '%s' "$T3778_DONE_LINE" | grep -q '"duration_ms":'; then
+    pass "#3778 T3778 — claude_phase_done carries duration_ms"
+else
+    fail "#3778 T3778 — claude_phase_done carries duration_ms" \
+         "done_line: $T3778_DONE_LINE"
+fi
+
+# (4) "phase": "ralph" still present (no regression of existing payload).
+if printf '%s' "$T3778_DONE_LINE" | grep -q '"phase": "ralph"'; then
+    pass "#3778 T3778 — claude_phase_done still carries phase=ralph"
+else
+    fail "#3778 T3778 — claude_phase_done still carries phase=ralph" \
+         "done_line: $T3778_DONE_LINE"
+fi
+
+# (5) "exit_code": "0" still present (no regression of existing payload).
+if printf '%s' "$T3778_DONE_LINE" | grep -q '"exit_code": "0"'; then
+    pass "#3778 T3778 — claude_phase_done still carries exit_code=0"
+else
+    fail "#3778 T3778 — claude_phase_done still carries exit_code=0" \
+         "done_line: $T3778_DONE_LINE"
+fi
+
+# (6) duration_ms value is either a non-negative integer or the literal 'unknown'.
+T3778_DURATION_VAL=$(printf '%s' "$T3778_DONE_LINE" | grep -o '"duration_ms": "[^"]*"' | head -1 | sed 's/"duration_ms": "//;s/"//')
+if printf '%s' "$T3778_DURATION_VAL" | grep -qE '^[0-9]+$'; then
+    pass "#3778 T3778 — duration_ms is a non-negative integer ($T3778_DURATION_VAL)"
+elif [[ "$T3778_DURATION_VAL" == 'unknown' ]]; then
+    pass "#3778 T3778 — duration_ms is the BusyBox-friendly fallback 'unknown'"
+else
+    fail "#3778 T3778 — duration_ms is a non-negative integer or 'unknown'" \
+         "got: '$T3778_DURATION_VAL', done_line: $T3778_DONE_LINE"
+fi
+
+# (7) Negative regression — synthetic claude that writes stderr yields stderr_size > 0.
+# The existing claude stub already supports CLAUDE_STDERR_OVERRIDE to emit a
+# payload to stderr before writing the verdict.  Use it to inject a 100-byte
+# string (100 x-chars) and verify the entrypoint's stderr_size capture picks
+# it up on the claude_phase_done log line.
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t3778b.txt"
+printf 'ralph\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t3778b_workspace="$TEST_TMP/t3778b-workspace"
+mkdir -p "$t3778b_workspace"
+
+# 100 x-chars = 100 bytes of stderr payload (plus a newline from printf in stub).
+T3778B_STDERR_PAYLOAD="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+set +e
+T3778B_TEST_OUT=$(AGENT_ID="37783778-3778-3778-3778-377837783779" \
+      ISSUE_NUMBER="3778" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t3778b_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      CLAUDE_RESULT_OVERRIDE='{"result": "T3778b stub: non-object to force early exit"}' \
+      CLAUDE_RESULT_OVERRIDE_SKILL="ralph" \
+      CLAUDE_STDERR_OVERRIDE="$T3778B_STDERR_PAYLOAD" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      bash "$ENTRYPOINT" 2>&1)
+T3778B_TEST_RC=$?
+set -e
+
+T3778B_DONE_LINE=$(printf '%s' "$T3778B_TEST_OUT" | grep 'claude_phase_done' | grep '"phase": "ralph"' | head -1)
+T3778B_STDERR_VAL=$(printf '%s' "$T3778B_DONE_LINE" | grep -o '"stderr_size": "[^"]*"' | head -1 | sed 's/"stderr_size": "//;s/"//')
+
+if printf '%s' "$T3778B_STDERR_VAL" | grep -qE '^[1-9][0-9]*$'; then
+    pass "#3778 T3778 negative — claude stderr payload yields stderr_size > 0 ($T3778B_STDERR_VAL)"
+else
+    fail "#3778 T3778 negative — claude stderr payload yields stderr_size > 0" \
+         "got stderr_size='$T3778B_STDERR_VAL', done_line: $T3778B_DONE_LINE"
+fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
