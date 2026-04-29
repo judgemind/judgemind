@@ -430,6 +430,17 @@ AGENT_RUNNER_RUN_TASK_RETRYABLE_CODES: frozenset[str] = frozenset(
     }
 )
 
+#: Staleness window for the agent-runner image freshness guard (#3754).
+#: When the ECR ``:latest`` image was pushed MORE than this many seconds
+#: after the task-definition was last registered, the guard emits a
+#: ``agent_runner_image_stale`` warning: the task-def is pointing at a
+#: `:latest` tag whose content has changed, which means any long-running
+#: ECS task (e.g., one that spans a deploy window) is running stale code.
+#: Set conservatively large (5 minutes) to absorb normal deploy jitter
+#: (the ``deploy-agent-runner`` workflow takes ~90s) without false-positives
+#: during rolling restarts.
+AGENT_RUNNER_IMAGE_FRESHNESS_WINDOW_SECONDS = 300
+
 #: Killswitch terminal phase name (#2847). When the scheduler observes
 #: ``concurrency_cap=0`` mid-orchestration and the killswitch engages
 #: (not a #2884 graceful ``stop``), the worker thread aborts at the
@@ -23925,6 +23936,209 @@ class DispatcherDaemon:
             config=ecs_cfg,
         )
 
+    def _make_ecr_client(self) -> Any:
+        """Build a boto3 ECR client. Isolated so tests can mock it.
+
+        Mirrors :meth:`_make_ecs_client` — lazy boto3 import so tests
+        that don't exercise the freshness-guard path do not have to
+        install boto3. Same timeout budget as the ECS client: 5s connect
+        + 10s read, 2 attempts. ECR ``DescribeImages`` is a lightweight
+        metadata call so the ECS budget is more than adequate.
+
+        Used by :meth:`_check_agent_runner_image_freshness` (#3754).
+        """
+        import boto3  # noqa: PLC0415 — lazy import
+        import botocore.config  # noqa: PLC0415 — lazy import
+
+        ecr_cfg = botocore.config.Config(
+            connect_timeout=ECS_CLIENT_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=ECS_CLIENT_READ_TIMEOUT_SECONDS,
+            retries={
+                "max_attempts": ECS_CLIENT_MAX_ATTEMPTS,
+                "mode": "standard",
+            },
+        )
+        return boto3.client(
+            "ecr",
+            region_name=self._cfg.aws_region,
+            config=ecr_cfg,
+        )
+
+    def _check_agent_runner_image_freshness(self) -> bool:
+        """Guard: verify the ECR ``:latest`` agent-runner image is not stale.
+
+        Called from :meth:`_launch_agent_ecs_task` before ``ecs:RunTask``
+        to detect the image-lag failure mode documented in issue #3754:
+
+        - PR #3750 merged at 2026-04-29T00:11:12Z, pushing a new
+          ``:latest`` image to ECR.
+        - Agent ``d7041874`` was launched in an ECS task that started
+          BEFORE the deploy completed.  The task's container pulled the
+          pre-#3750 image and ran with stale code for its entire lifetime
+          (one ECS task per agent, all phases in the same container).
+        - None of the Layer-1 instrumentation (``agent_task_arn``,
+          ``log_text``, ``ralph_done_marker_missing``) fired because the
+          entrypoint code predated the instrumentation.
+
+        **What this guard checks:**
+
+        1. Calls ``ecs:DescribeTaskDefinition`` to get the task-def's
+           ``registeredAt`` timestamp and the image URI (with tag).
+        2. Extracts the ECR repository name and image tag from the URI.
+        3. Calls ``ecr:DescribeImages`` to get the ``:latest`` tag's
+           ``imagePushedAt`` timestamp and ``imageDigest``.
+        4. If the task-def image URI contains an explicit digest
+           (``@sha256:...``) AND that digest does not match the current
+           ECR ``:latest`` digest → the task-def is pinned to a stale
+           image → returns ``False`` (caller refuses launch).
+        5. If the ECR ``:latest`` was pushed MORE THAN
+           :data:`AGENT_RUNNER_IMAGE_FRESHNESS_WINDOW_SECONDS` seconds
+           AFTER the task-def was last registered → the ``:latest`` tag
+           has rolled forward since the task-def was created, meaning
+           any long-running ECS task started before the new push would
+           be running stale code → emits ``agent_runner_image_stale``
+           warning and returns ``False`` (caller refuses launch).
+
+        **Fail-open contract:** any AWS API error (AccessDenied,
+        missing repo, throttle, timeout) is caught and logged at WARNING
+        level; the method returns ``True`` so a transient AWS hiccup
+        never blocks agent launches. The guard is a best-effort
+        observability + safety net, not a hard dependency.
+
+        Returns ``True`` (fresh / skip-check) or ``False`` (stale →
+        caller should refuse to launch).
+        """
+        if not self._cfg.agent_runner_task_definition_family:
+            # Wiring not configured — skip (unit-test or local-dev mode).
+            return True
+
+        try:
+            # ── Step 1: task-def metadata ─────────────────────────────────
+            if self._ecs_client is None:
+                self._ecs_client = self._make_ecs_client()
+            td_resp = self._ecs_client.describe_task_definition(
+                taskDefinition=self._cfg.agent_runner_task_definition_family,
+            )
+            td = td_resp.get("taskDefinition") or {}
+            # ``registeredAt`` is a datetime object from boto3.
+            td_registered_at = td.get("registeredAt")
+            containers = td.get("containerDefinitions") or []
+            td_image_uri = containers[0].get("image", "") if containers else ""
+
+            # ── Step 2: extract ECR repo + tag/digest from image URI ──────
+            # URI forms:
+            #   <account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
+            #   <account>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:<digest>
+            td_image_digest: str | None = None
+            ecr_repo_name: str | None = None
+            if td_image_uri:
+                # Split off the registry host (everything before the first /)
+                _slash = td_image_uri.find("/")
+                _rest = td_image_uri[_slash + 1 :] if _slash != -1 else td_image_uri
+                # Digest-pinned form: repo@sha256:...
+                if "@sha256:" in _rest:
+                    _repo_part, _digest_part = _rest.split("@sha256:", 1)
+                    ecr_repo_name = _repo_part
+                    td_image_digest = "sha256:" + _digest_part
+                elif ":" in _rest:
+                    _repo_part, _ = _rest.rsplit(":", 1)
+                    ecr_repo_name = _repo_part
+                else:
+                    ecr_repo_name = _rest
+
+            if not ecr_repo_name:
+                # Cannot parse the image URI → skip check.
+                return True
+
+            # ── Step 3: ECR ``:latest`` metadata ─────────────────────────
+            ecr_client = self._make_ecr_client()
+            ecr_resp = ecr_client.describe_images(
+                repositoryName=ecr_repo_name,
+                imageIds=[{"imageTag": "latest"}],
+            )
+            ecr_images = ecr_resp.get("imageDetails") or []
+            if not ecr_images:
+                # No image found under ``:latest`` — skip check.
+                return True
+            ecr_img = ecr_images[0]
+            ecr_digest = ecr_img.get("imageDigest", "")
+            ecr_pushed_at = ecr_img.get("imagePushedAt")
+
+        except Exception:  # noqa: BLE001 — fail-open
+            self._log.warning(
+                "daemon.agent_runner_image_freshness_check_failed",
+                extra={
+                    "event": "agent_runner_image_freshness_check_failed",
+                    "run_id": self._run_id,
+                    "task_definition_family": (
+                        self._cfg.agent_runner_task_definition_family
+                    ),
+                },
+                exc_info=True,
+            )
+            return True  # fail-open: don't block launches on AWS errors
+
+        # ── Step 4: digest mismatch (pinned task-def vs ECR latest) ──────
+        if td_image_digest and ecr_digest and td_image_digest != ecr_digest:
+            self._log.error(
+                "daemon.agent_runner_image_stale",
+                extra={
+                    "event": "agent_runner_image_stale",
+                    "run_id": self._run_id,
+                    "reason": "digest_mismatch",
+                    "task_def_image_digest": td_image_digest,
+                    "ecr_latest_digest": ecr_digest,
+                    "ecr_latest_pushed_at": (
+                        ecr_pushed_at.isoformat() if ecr_pushed_at else ""
+                    ),
+                    "task_def_registered_at": (
+                        td_registered_at.isoformat() if td_registered_at else ""
+                    ),
+                    "task_definition_family": (
+                        self._cfg.agent_runner_task_definition_family
+                    ),
+                },
+            )
+            return False  # stale → refuse launch
+
+        # ── Step 5: timestamp-based staleness (`:latest` tag task-defs) ──
+        # If ECR `:latest` was pushed more than FRESHNESS_WINDOW seconds
+        # AFTER the task-def was registered, the `:latest` content has
+        # rolled forward since the task-def was created. Any long-running
+        # ECS task launched before the new push would be running stale code.
+        if td_registered_at is not None and ecr_pushed_at is not None:
+            # Normalise both to UTC-aware datetimes. ``UTC`` is the
+            # module-level sentinel (``from datetime import UTC``) —
+            # identical to ``timezone.utc`` but already imported.
+
+            def _to_utc(dt: Any) -> Any:
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=UTC)
+                return dt
+
+            td_ts = _to_utc(td_registered_at)
+            ecr_ts = _to_utc(ecr_pushed_at)
+            staleness_seconds = (ecr_ts - td_ts).total_seconds()
+            if staleness_seconds > AGENT_RUNNER_IMAGE_FRESHNESS_WINDOW_SECONDS:
+                self._log.error(
+                    "daemon.agent_runner_image_stale",
+                    extra={
+                        "event": "agent_runner_image_stale",
+                        "run_id": self._run_id,
+                        "reason": "ecr_pushed_after_task_def_registered",
+                        "staleness_seconds": int(staleness_seconds),
+                        "ecr_latest_digest": ecr_digest,
+                        "ecr_latest_pushed_at": ecr_ts.isoformat(),
+                        "task_def_registered_at": td_ts.isoformat(),
+                        "task_definition_family": (
+                            self._cfg.agent_runner_task_definition_family
+                        ),
+                    },
+                )
+                return False  # stale → refuse launch
+
+        return True  # fresh
+
     def _cb_config_str(self, key: str, default: str) -> str:
         """Read a string key from ``dispatcher.config`` with a fallback.
 
@@ -24059,6 +24273,28 @@ class DispatcherDaemon:
                         "AGENT_RUNNER_TASK_DEFINITION_FAMILY / "
                         "AGENT_RUNNER_SUBNET_IDS / "
                         "AGENT_RUNNER_SECURITY_GROUP_ID not fully wired"
+                    ),
+                },
+            )
+            return None
+
+        # #3754 — image-freshness guard. Verify the ECR ``:latest`` image
+        # is not stale before launching a new ECS task. If the guard detects
+        # that the task-def's image is stale (either pinned to an old digest
+        # or `:latest` has rolled forward since the task-def was registered),
+        # it logs ``agent_runner_image_stale`` and we fail the launch so the
+        # caller can route through ``_handle_agent_failure``. Fail-open on
+        # AWS API errors so transient ECR/ECS hiccups do not block launches.
+        if not self._check_agent_runner_image_freshness():
+            self._log.error(
+                "daemon.agent_runner_launch_refused_stale_image",
+                extra={
+                    "event": "agent_runner_launch_refused_stale_image",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "task_definition_family": (
+                        self._cfg.agent_runner_task_definition_family
                     ),
                 },
             )
