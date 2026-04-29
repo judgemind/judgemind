@@ -1497,16 +1497,16 @@ _PLACEHOLDER_RE = re.compile(
 # They are identified by EITHER:
 #   (a) a time-prefixed "HEARING IN RE" phrase (``9:00 AM HEARING IN RE:``)
 #   (b) the literal pointer phrase ``see also alternate sheet`` / ``see alt sheet``
+# The bare "HEARING IN RE" phrase (without a time prefix or alt-sheet pointer)
+# is intentionally excluded — non-CC courts also use this phrase in real rulings
+# with verbs like ``ruled``, ``ordered``, ``found``, ``held`` that are absent
+# from ``_RULING_VERB_RE`` and would cause false-positive drops (#3699).
 # These rows may be 110-180 chars — well above _CALENDAR_LISTING_MAX_LENGTH —
 # so they MUST be matched by an explicit pointer check that bypasses the
-# length gate.  The disposition-verb guard (_RULING_VERB_RE) is applied
-# *after* this check to preserve any real one-liner ruling that incidentally
-# contains "HEARING IN RE" as part of its text.
+# length gate.
 _PROBATE_CALENDAR_LISTING_RE = re.compile(
     r"(?:"
     r"\d{1,2}:\d{2}\s*(?:AM|PM)\s+HEARING\s+IN\s+RE\b"
-    r"|"
-    r"HEARING\s+IN\s+RE\b"
     r"|"
     r"see\s+also\s+alt(?:ernate)?\s*sheet"
     r")",
@@ -1658,8 +1658,9 @@ def _is_calendar_listing_only(text: str | None) -> bool:
     if not stripped:
         return False
     # Step 0: Explicit CC probate calendar-pointer signals bypass the length
-    # gate.  A real ruling that incidentally mentions "HEARING IN RE" will
-    # still be preserved because the disposition-verb guard fires first.
+    # gate.  Only time-prefixed HEARING IN RE and alt-sheet pointer phrases
+    # match; the bare phrase is excluded to avoid false-positive drops on
+    # non-CC rulings that use verbs absent from _RULING_VERB_RE (#3699).
     if _PROBATE_CALENDAR_LISTING_RE.search(stripped) and not _RULING_VERB_RE.search(stripped):
         return True
     # Too long to be a calendar listing.
