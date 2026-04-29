@@ -1171,3 +1171,44 @@ class TestInfraPreemptionFilter:
         opened = handler.events("circuit_breaker_opened")
         assert len(opened) == 1
         assert opened[0].bad_count == 5  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------
+# Issue #3792 — _check_circuit_breaker_auto_close logs when
+# _read_cap_updated_at() returns None (migration #56 hypothesis probe).
+# --------------------------------------------------------------------------
+
+
+class TestAutoCloseMissingRow:
+    """Auto-close path logs when cap_updated_at row is missing."""
+
+    def test_auto_close_logs_when_target_cap_row_missing(self, tmp_path: Path) -> None:
+        """Simulate _read_cap_updated_at() returning None (no concurrency_cap row).
+
+        The auto-close function must emit
+        ``daemon.circuit_breaker_auto_close_skipped_missing_row`` so
+        CloudWatch can confirm or deny the migration #56 hypothesis.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        # cap_flipped_by = 'circuit_breaker' so we enter the time-based path.
+        conn.cursor_instance.fetch_queue = [
+            ("circuit_breaker",),  # _read_cap_flipped_by
+            (True,),  # _cb_enabled
+            # _read_cap_updated_at: returns None (no row).
+            # The function queries for updated_at; returning None simulates
+            # no concurrency_cap row in dispatcher.config.
+            None,
+        ]
+
+        closed = d._check_circuit_breaker_auto_close(current_cap=0)
+
+        # Must return False (conservative — do nothing).
+        assert closed is False
+        # Must have logged the missing-row event.
+        skipped_events = handler.events(
+            "circuit_breaker_auto_close_skipped_missing_row"
+        )
+        assert len(skipped_events) == 1, (
+            f"expected exactly one circuit_breaker_auto_close_skipped_missing_row "
+            f"event, got {len(skipped_events)}"
+        )

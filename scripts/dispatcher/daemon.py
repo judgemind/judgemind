@@ -721,6 +721,16 @@ DEPLOY_WORKFLOW_NAMES = frozenset(
 #: back to escalate in ``_consume_action_block_on_existing_task``.
 GH_POLL_SUBPROCESS_TIMEOUT_SECONDS = 30
 
+#: Per-batch time budget for the untracked-ARN finalize loop inside
+#: ``_reap_completed_agent_tasks``. When the cumulative elapsed time
+#: across all ``_reap_finalize_ecs_success`` calls for untracked ARNs
+#: exceeds this value the loop breaks early and emits
+#: ``daemon.reap_untracked_budget_exceeded``. Remaining ARNs are picked
+#: up on the next tick (``agent_task_arn IS NOT NULL`` keeps them in the
+#: SELECT), so forward progress is preserved without burning the entire
+#: tick on a stuck batch.
+REAP_UNTRACKED_BATCH_BUDGET_SECONDS = 30
+
 #: Cap on how many ``failing_jobs`` entries we hand the fix-ci skill.
 #: Ten is already an unusually bad CI day and keeps the JSON payload
 #: bounded so the skill's context stays small.
@@ -13693,10 +13703,12 @@ class DispatcherDaemon:
             return 0
 
         resurrected = 0
+        t_sweep_start = time.monotonic()
         for row in candidates:
             agent_id = row["agent_id"]
             pr_number = row["pr_number"]
             issue_number = row["issue_number"]
+            t_candidate_start = time.monotonic()
 
             # Budget check — count past resurrections for this agent_id
             # via the phase_transitions audit log. This avoids needing
@@ -13811,6 +13823,31 @@ class DispatcherDaemon:
             )
             resurrected += 1
 
+            candidate_elapsed = time.monotonic() - t_candidate_start
+            if candidate_elapsed >= 5.0:
+                self._log.warning(
+                    "daemon.orphan_pr_sweep_slow_candidate",
+                    extra={
+                        "event": "orphan_pr_sweep_slow_candidate",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "elapsed_s": round(candidate_elapsed, 3),
+                    },
+                )
+
+        total_elapsed_s = time.monotonic() - t_sweep_start
+        self._log.info(
+            "daemon.orphan_pr_sweep_completed",
+            extra={
+                "event": "orphan_pr_sweep_completed",
+                "run_id": self._run_id,
+                "candidates_seen": len(candidates),
+                "candidates_resurrected": resurrected,
+                "total_elapsed_s": round(total_elapsed_s, 3),
+            },
+        )
         return resurrected
 
     def _list_orphan_pr_failed_agents(self) -> list[dict[str, Any]]:
@@ -19508,6 +19545,15 @@ class DispatcherDaemon:
         cap_updated_at = self._read_cap_updated_at()
         if cap_updated_at is None:
             # No timestamp — be conservative and do nothing this tick.
+            # Log so CloudWatch can confirm the migration #56 hypothesis
+            # (the concurrency_cap config row may not exist yet).
+            self._log.info(
+                "daemon.circuit_breaker_auto_close_skipped_missing_row",
+                extra={
+                    "event": "circuit_breaker_auto_close_skipped_missing_row",
+                    "run_id": self._run_id,
+                },
+            )
             return False
 
         window_minutes = self._cb_config_int(
@@ -25210,6 +25256,8 @@ class DispatcherDaemon:
         untracked_arns = (
             sent_arns - returned_arns_with_status
         ) | returned_arns_empty_status
+        t_loop_start = time.monotonic()
+        budget_breached = False
         for untracked_arn in untracked_arns:
             row = arn_to_row.get(untracked_arn)
             if row is None:
@@ -25230,13 +25278,56 @@ class DispatcherDaemon:
                     ),
                 },
             )
+            # Check per-batch budget before each finalize call so a
+            # stuck batch cannot hold the whole tick hostage. Remaining
+            # ARNs stay in the SELECT and are picked up next tick.
+            loop_elapsed = time.monotonic() - t_loop_start
+            if loop_elapsed >= REAP_UNTRACKED_BATCH_BUDGET_SECONDS:
+                arns_remaining = len(untracked_arns) - reaped_untracked
+                self._log.warning(
+                    "daemon.reap_untracked_budget_exceeded",
+                    extra={
+                        "event": "reap_untracked_budget_exceeded",
+                        "run_id": self._run_id,
+                        "arns_processed": reaped_untracked,
+                        "arns_remaining": arns_remaining,
+                        "elapsed_seconds": round(loop_elapsed, 3),
+                    },
+                )
+                budget_breached = True
+                break
             # Reuse the success-branch finalize: label strip (best-effort),
             # merged_at stamp (idempotent + gated by pr_number IS NOT NULL),
             # agent_task_arn clear. The merged_at WHERE filter handles the
             # no-PR case naturally — the UPDATE is a no-op when there is
             # no PR row.
+            t_arn_start = time.monotonic()
             self._reap_finalize_ecs_success(u_agent_id, u_issue_number)
+            step_elapsed_s = time.monotonic() - t_arn_start
+            if step_elapsed_s >= 1.0:
+                self._log.info(
+                    "daemon.reap_finalize_arn_duration",
+                    extra={
+                        "event": "reap_finalize_arn_duration",
+                        "run_id": self._run_id,
+                        "agent_id": u_agent_id,
+                        "issue_number": u_issue_number,
+                        "task_arn": untracked_arn,
+                        "step_elapsed_s": round(step_elapsed_s, 3),
+                    },
+                )
             reaped_untracked += 1
+        total_elapsed_s = time.monotonic() - t_loop_start
+        self._log.info(
+            "daemon.reap_untracked_loop_completed",
+            extra={
+                "event": "reap_untracked_loop_completed",
+                "run_id": self._run_id,
+                "arns_processed": reaped_untracked,
+                "total_elapsed_s": round(total_elapsed_s, 3),
+                "budget_breached": budget_breached,
+            },
+        )
 
         for task in tasks:
             task_arn = task.get("taskArn", "")
@@ -25585,6 +25676,7 @@ class DispatcherDaemon:
             return
         # Best-effort label strip first — this is the operator-visible
         # leak.
+        _t0 = time.monotonic()
         try:
             self._gh_issue_remove_labels(issue_number, [STATUS_IN_PROGRESS_LABEL])
         except Exception:
@@ -25598,6 +25690,19 @@ class DispatcherDaemon:
                     "branch": "success_already_terminal",
                 },
             )
+        _label_strip_elapsed = time.monotonic() - _t0
+        if _label_strip_elapsed >= 5.0:
+            self._log.warning(
+                "daemon.reap_finalize_step",
+                extra={
+                    "event": "reap_finalize_step",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "step": "label_strip",
+                    "elapsed_s": round(_label_strip_elapsed, 3),
+                },
+            )
         # Best-effort merged_at stamp. Issue #3752: verify the PR is
         # actually MERGED before writing — the agent-runner may have
         # written status='succeeded' before the GitHub merge API
@@ -25607,7 +25712,21 @@ class DispatcherDaemon:
         pr_number_for_verify = self._read_agent_pr_number(agent_id)
         _do_stamp = False
         if pr_number_for_verify is not None:
+            _t1 = time.monotonic()
             verify_status = self._fetch_pr_status(pr_number_for_verify)
+            _pr_status_elapsed = time.monotonic() - _t1
+            if _pr_status_elapsed >= 5.0:
+                self._log.warning(
+                    "daemon.reap_finalize_step",
+                    extra={
+                        "event": "reap_finalize_step",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "step": "pr_status_fetch",
+                        "elapsed_s": round(_pr_status_elapsed, 3),
+                    },
+                )
             if self._pr_observed_as_merged(verify_status):
                 _do_stamp = True
             else:
@@ -25625,6 +25744,7 @@ class DispatcherDaemon:
                     },
                 )
         if _do_stamp:
+            _t2 = time.monotonic()
             try:
                 with self._conn.cursor() as cur:
                     cur.execute(
@@ -25650,6 +25770,19 @@ class DispatcherDaemon:
                     self._conn.rollback()
                 except Exception:  # pragma: no cover — defensive
                     pass
+            _merged_at_elapsed = time.monotonic() - _t2
+            if _merged_at_elapsed >= 5.0:
+                self._log.warning(
+                    "daemon.reap_finalize_step",
+                    extra={
+                        "event": "reap_finalize_step",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                        "step": "merged_at_stamp",
+                        "elapsed_s": round(_merged_at_elapsed, 3),
+                    },
+                )
         # Issue #3329: clear ``agent_task_arn`` so the next reaper tick
         # excludes this row from the SELECT. Without this clear, the
         # SELECT (now keyed solely on ``agent_task_arn IS NOT NULL``)
@@ -25658,6 +25791,7 @@ class DispatcherDaemon:
         # every tick. Idempotent — if the column is already NULL the
         # UPDATE is a no-op. Best-effort: a DB hiccup here just defers
         # the cleanup to the next successful tick.
+        _t3 = time.monotonic()
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -25682,6 +25816,19 @@ class DispatcherDaemon:
                 self._conn.rollback()
             except Exception:  # pragma: no cover — defensive
                 pass
+        _arn_clear_elapsed = time.monotonic() - _t3
+        if _arn_clear_elapsed >= 5.0:
+            self._log.warning(
+                "daemon.reap_finalize_step",
+                extra={
+                    "event": "reap_finalize_step",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "issue_number": issue_number,
+                    "step": "arn_clear",
+                    "elapsed_s": round(_arn_clear_elapsed, 3),
+                },
+            )
 
     def _read_agent_status_phase(self, agent_id: str) -> tuple[str | None, str | None]:
         """Fetch the current (status, phase) for an agent. Best-effort.
