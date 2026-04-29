@@ -14405,7 +14405,7 @@ class DispatcherDaemon:
             "--repo",
             self._cfg.github_repo,
             "--json",
-            "statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit",
+            "statusCheckRollup,mergeable,mergeStateStatus,headRefOid,mergeCommit,state,mergedAt",
         ]
         # Issue #3089: hot-path PR status poll — retry transient flakes
         # so a single GitHub 502 doesn't waste a supervisor tick.
@@ -14461,6 +14461,24 @@ class DispatcherDaemon:
                 },
             )
             return None
+
+    @staticmethod
+    def _pr_observed_as_merged(pr_status: dict[str, Any] | None) -> bool:
+        """Return True only when the PR status payload confirms a real merge.
+
+        Requires ``state == 'MERGED'`` AND ``mergedAt`` non-null/non-empty.
+        A ``None`` payload (gh flake) returns ``False`` — fail-closed so a
+        transient GitHub 502 never lets a false-shipped PR advance.
+
+        Issue #3752: guards both ``_merge_pr_and_advance`` and
+        ``_reap_finalize_ecs_success`` against writing ``merged_at`` for a
+        PR that GitHub did not actually accept.
+        """
+        if pr_status is None:
+            return False
+        state = pr_status.get("state")
+        merged_at = pr_status.get("mergedAt")
+        return state == "MERGED" and bool(merged_at)
 
     def _merge_pr_and_advance(
         self, agent: dict[str, Any], pr_status: dict[str, Any]
@@ -14558,13 +14576,32 @@ class DispatcherDaemon:
             )
             return
 
-        # Extract the merge commit SHA from the PR status if available;
-        # fall back to re-fetching once after the merge.
-        merge_sha = self._extract_merge_sha(pr_status)
-        if not merge_sha:
-            refreshed = self._fetch_pr_status(pr_number)
-            if refreshed is not None:
-                merge_sha = self._extract_merge_sha(refreshed)
+        # Issue #3752: re-fetch and verify PR state before stamping
+        # merged_at. GitHub's merge API occasionally returns exit 0 but
+        # then the PR stays in OPEN state (race during squash, 422 ghost).
+        # Verify state == MERGED + mergedAt non-null before writing; if
+        # unverified skip both the stamp and the phase advance so the
+        # next supervisor tick re-polls. Fail-closed: a gh flake
+        # (None payload) also skips rather than stamping.
+        post_merge_status = self._fetch_pr_status(pr_number)
+        if not self._pr_observed_as_merged(post_merge_status):
+            observed_state = (post_merge_status or {}).get("state")
+            observed_merged_at = (post_merge_status or {}).get("mergedAt")
+            self._log.warning(
+                "daemon.pr_merge_unverified",
+                extra={
+                    "event": "pr_merge_unverified",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "pr_number": pr_number,
+                    "observed_state": observed_state,
+                    "observed_merged_at": observed_merged_at,
+                },
+            )
+            return
+
+        # Extract the merge commit SHA from the verified post-merge status.
+        merge_sha = self._extract_merge_sha(post_merge_status or {})
 
         # Issue #2953: flip ``status='succeeded'`` + stamp ``merged_at``
         # the moment the PR squash-merge lands — not at end of retro.
@@ -25112,6 +25149,33 @@ class DispatcherDaemon:
             "reaped_untracked": reaped_untracked,
         }
 
+    def _read_agent_pr_number(self, agent_id: str) -> int | None:
+        """Fetch the ``pr_number`` for an agent row. Best-effort.
+
+        Returns ``None`` on DB error or when the column is NULL — the
+        caller treats that as "no PR to verify".
+        """
+        assert self._conn is not None, "connect() must run before read"
+        try:
+            with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): reads pr_number for merge-state
+                # verification; pr_number is set by both ECS and subprocess lanes.
+                cur.execute(
+                    "SELECT pr_number FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return None
+        if row is None:
+            return None
+        return row[0]
+
     def _reap_finalize_ecs_success(
         self, agent_id: str, issue_number: int | None
     ) -> None:
@@ -25160,36 +25224,58 @@ class DispatcherDaemon:
                     "branch": "success_already_terminal",
                 },
             )
-        # Best-effort merged_at stamp. Only stamp when the row already
-        # has a pr_number AND merged_at is currently NULL — both
-        # filters live in the WHERE clause so re-reaps and PR-less
-        # rows are no-ops.
+        # Best-effort merged_at stamp. Issue #3752: verify the PR is
+        # actually MERGED before writing — the agent-runner may have
+        # written status='succeeded' before the GitHub merge API
+        # confirmed the PR. Only stamp when the row has a pr_number AND
+        # merged_at is currently NULL AND the PR state is confirmed MERGED.
         assert self._conn is not None, "connect() must run before reap finalize"
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE dispatcher.agents "
-                    "SET merged_at = now() "
-                    "WHERE agent_id = %s "
-                    "  AND merged_at IS NULL "
-                    "  AND pr_number IS NOT NULL",
-                    (agent_id,),
+        pr_number_for_verify = self._read_agent_pr_number(agent_id)
+        _do_stamp = False
+        if pr_number_for_verify is not None:
+            verify_status = self._fetch_pr_status(pr_number_for_verify)
+            if self._pr_observed_as_merged(verify_status):
+                _do_stamp = True
+            else:
+                observed_state = (verify_status or {}).get("state")
+                observed_merged_at = (verify_status or {}).get("mergedAt")
+                self._log.warning(
+                    "daemon.reap_finalize_unverified",
+                    extra={
+                        "event": "reap_finalize_unverified",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "pr_number": pr_number_for_verify,
+                        "observed_state": observed_state,
+                        "observed_merged_at": observed_merged_at,
+                    },
                 )
-            self._conn.commit()
-        except Exception:
-            self._log.exception(
-                "daemon.agent_runner_reaped_merged_at_stamp_failed",
-                extra={
-                    "event": "agent_runner_reaped_merged_at_stamp_failed",
-                    "run_id": self._run_id,
-                    "agent_id": agent_id,
-                    "issue_number": issue_number,
-                },
-            )
+        if _do_stamp:
             try:
-                self._conn.rollback()
-            except Exception:  # pragma: no cover — defensive
-                pass
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE dispatcher.agents "
+                        "SET merged_at = now() "
+                        "WHERE agent_id = %s "
+                        "  AND merged_at IS NULL "
+                        "  AND pr_number IS NOT NULL",
+                        (agent_id,),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._log.exception(
+                    "daemon.agent_runner_reaped_merged_at_stamp_failed",
+                    extra={
+                        "event": "agent_runner_reaped_merged_at_stamp_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "issue_number": issue_number,
+                    },
+                )
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover — defensive
+                    pass
         # Issue #3329: clear ``agent_task_arn`` so the next reaper tick
         # excludes this row from the SELECT. Without this clear, the
         # SELECT (now keyed solely on ``agent_task_arn IS NOT NULL``)
@@ -25356,6 +25442,96 @@ class DispatcherDaemon:
             return default_days
         return configured
 
+    def _reconcile_stale_merged_at(self) -> dict[str, int]:
+        """Hourly guard that clears false-shipped ``merged_at`` stamps (#3752).
+
+        SELECTs agents with ``merged_at IS NOT NULL AND pr_number IS NOT NULL``
+        written within the last 24 hours. For each row, fetches the current
+        PR state via GitHub. If the PR is NOT actually MERGED AND the fetch
+        payload is non-None (distinguishes OPEN from a gh flake — fail-closed
+        on flake), clears ``merged_at = NULL`` and logs
+        ``daemon.merged_at_reconcile_cleared``.
+
+        Per-row try/except + commit/rollback for failure isolation so one
+        DB hiccup doesn't starve siblings. Returns ``{checked, cleared,
+        errors}`` for observability.
+        """
+        assert self._conn is not None, "connect() must run before reconcile"
+        rows: list[tuple[str, int]] = []
+        try:
+            with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): merged_at reconcile scans all
+                # agents; pr_number semantics are identical across ECS and
+                # subprocess lanes — both set it after the gh pr merge call.
+                cur.execute(
+                    "SELECT agent_id, pr_number FROM dispatcher.agents "
+                    "WHERE merged_at IS NOT NULL "
+                    "  AND pr_number IS NOT NULL "
+                    "  AND merged_at > now() - INTERVAL '24 hours'",
+                )
+                rows = list(cur.fetchall())
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return {"checked": 0, "cleared": 0, "errors": 1}
+
+        checked = 0
+        cleared = 0
+        errors = 0
+        for row in rows:
+            agent_id_r: str = row[0]
+            pr_number_r: int = row[1]
+            checked += 1
+            try:
+                verify_status = self._fetch_pr_status(pr_number_r)
+                if verify_status is None:
+                    # gh flake — fail-closed, skip this row.
+                    continue
+                if self._pr_observed_as_merged(verify_status):
+                    # PR is genuinely merged — leave merged_at in place.
+                    continue
+                # PR is OPEN (or CLOSED without merge) — clear the stale stamp.
+                with self._conn.cursor() as cur:
+                    # exec-mode-agnostic (#3158): clears merged_at for any
+                    # agent with a stale stamp; not conditioned on execution mode.
+                    cur.execute(
+                        "UPDATE dispatcher.agents "
+                        "SET merged_at = NULL "
+                        "WHERE agent_id = %s",
+                        (agent_id_r,),
+                    )
+                self._conn.commit()
+                cleared += 1
+                self._log.warning(
+                    "daemon.merged_at_reconcile_cleared",
+                    extra={
+                        "event": "merged_at_reconcile_cleared",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id_r,
+                        "pr_number": pr_number_r,
+                        "observed_state": verify_status.get("state"),
+                    },
+                )
+            except Exception:
+                errors += 1
+                try:
+                    self._conn.rollback()
+                except Exception:  # pragma: no cover — best-effort
+                    pass
+                self._log.exception(
+                    "daemon.merged_at_reconcile_error",
+                    extra={
+                        "event": "merged_at_reconcile_error",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id_r,
+                        "pr_number": pr_number_r,
+                    },
+                )
+        return {"checked": checked, "cleared": cleared, "errors": errors}
+
     def _housekeeping_tick(self) -> dict[str, int]:
         """Run one housekeeping tick. Prunes stale rows from dispatcher tables.
 
@@ -25419,6 +25595,20 @@ class DispatcherDaemon:
                     "table": table,
                     "rows_deleted": rows_deleted,
                     "cutoff_days": cutoff_days,
+                },
+            )
+
+        # Issue #3752: after the prune loop, reconcile any stale
+        # merged_at stamps. Runs in its own try/except so a reconcile
+        # failure does not break the prune results or increment logic.
+        try:
+            self._reconcile_stale_merged_at()
+        except Exception:
+            self._log.exception(
+                "daemon.reconcile_stale_merged_at_failed",
+                extra={
+                    "event": "reconcile_stale_merged_at_failed",
+                    "run_id": self._run_id,
                 },
             )
 

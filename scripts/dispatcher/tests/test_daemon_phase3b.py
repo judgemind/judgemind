@@ -781,6 +781,8 @@ class TestAwaitingCiGreen:
                         "mergeStateStatus": "CLEAN",
                         "headRefOid": "head-sha",
                         "mergeCommit": {"oid": "merge-sha-abc"},
+                        "state": "MERGED",
+                        "mergedAt": "2026-04-29T12:00:00Z",
                     }
                 )
                 return r

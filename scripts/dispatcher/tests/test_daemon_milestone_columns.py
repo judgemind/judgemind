@@ -641,7 +641,13 @@ class TestMergePrAndAdvanceMilestone:
                 r.stdout = ""
                 return r
             if cmd[:3] == ["gh", "pr", "view"]:
-                r.stdout = json.dumps({"mergeCommit": {"oid": "merge-sha"}})
+                r.stdout = json.dumps(
+                    {
+                        "mergeCommit": {"oid": "merge-sha"},
+                        "state": "MERGED",
+                        "mergedAt": "2026-04-29T12:00:00Z",
+                    }
+                )
                 return r
             raise AssertionError(f"unexpected subprocess call: {cmd}")
 

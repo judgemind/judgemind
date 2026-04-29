@@ -111,6 +111,11 @@ class TestReapCompletedAgentTasks:
     def test_stopped_success_terminal_row_logs_only(self, caplog: Any) -> None:
         """STOPPED exit_code=0, row already ``succeeded`` -> reaped_success++."""
         d, conn = _make_daemon()
+        d._read_agent_pr_number = lambda agent_id: 101  # type: ignore[method-assign]
+        d._fetch_pr_status = lambda pr_number: {
+            "state": "MERGED",
+            "mergedAt": "2026-04-29T12:00:00Z",
+        }  # type: ignore[method-assign]
         caplog.set_level(logging.INFO, logger="test.daemon_reap")
         # First cursor: the active-agents SELECT returns one row.
         select_cur = _FakeCursor(
@@ -197,6 +202,11 @@ class TestReapCompletedAgentTasks:
         a future refactor can't silently strip it.
         """
         d, conn = _make_daemon()
+        d._read_agent_pr_number = lambda agent_id: 102  # type: ignore[method-assign]
+        d._fetch_pr_status = lambda pr_number: {
+            "state": "MERGED",
+            "mergedAt": "2026-04-29T12:00:00Z",
+        }  # type: ignore[method-assign]
         caplog.set_level(logging.INFO, logger="test.daemon_reap")
         select_cur = _FakeCursor(
             rows=[
@@ -604,6 +614,11 @@ class TestReapSelectScope:
         clear).
         """
         d, conn = _make_daemon()
+        d._read_agent_pr_number = lambda agent_id: 501  # type: ignore[method-assign]
+        d._fetch_pr_status = lambda pr_number: {
+            "state": "MERGED",
+            "mergedAt": "2026-04-29T12:00:00Z",
+        }  # type: ignore[method-assign]
         caplog.set_level(logging.INFO, logger="test.daemon_reap")
         select_cur = _FakeCursor(
             rows=[
@@ -822,6 +837,11 @@ class TestReapUntrackedArns:
         The 2 returned rows follow the regular STOPPED-success path.
         """
         d, conn = _make_daemon()
+        d._read_agent_pr_number = lambda agent_id: int(agent_id.split("-")[1]) + 1000  # type: ignore[method-assign]
+        d._fetch_pr_status = lambda pr_number: {
+            "state": "MERGED",
+            "mergedAt": "2026-04-29T12:00:00Z",
+        }  # type: ignore[method-assign]
         caplog.set_level(logging.INFO, logger="test.daemon_reap")
 
         all_arns = [f"arn:aws:ecs:us-west-2:123:task/jm/{i}" for i in range(5)]
@@ -933,6 +953,11 @@ class TestReapUntrackedArns:
         ``still_running``.
         """
         d, conn = _make_daemon()
+        d._read_agent_pr_number = lambda agent_id: 4242  # type: ignore[method-assign]
+        d._fetch_pr_status = lambda pr_number: {
+            "state": "MERGED",
+            "mergedAt": "2026-04-29T12:00:00Z",
+        }  # type: ignore[method-assign]
         caplog.set_level(logging.INFO, logger="test.daemon_reap")
 
         arn = "arn:aws:ecs:us-west-2:123:task/jm/empty-status"
