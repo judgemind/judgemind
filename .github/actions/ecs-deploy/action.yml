@@ -1,9 +1,10 @@
 name: "ECS Deploy"
 description: >
-  Shared ECS deployment logic: fetches the current task definition, updates
-  the container image, registers a new revision (preserving execution role,
-  task role, network mode, etc.), and either updates an ECS service or an
-  EventBridge Scheduler target.
+  Shared ECS deployment logic: fetches the desired-state container_definitions
+  (from terraform-managed SSM when configured, otherwise from the current
+  running task definition), substitutes the new image URI, registers a new
+  revision, and either updates an ECS service or an EventBridge Scheduler
+  target.
 
 inputs:
   task-family:
@@ -28,6 +29,16 @@ inputs:
     default: ""
   scheduler-name:
     description: "EventBridge Scheduler name (required for 'scheduler' mode)"
+    required: false
+    default: ""
+  desired-container-definitions-ssm-parameter:
+    description: >
+      Optional SSM Parameter Store name (or ARN) holding the terraform-rendered
+      container_definitions JSON. When set, the action reads desired
+      container_definitions from this parameter instead of from the running
+      task definition — preventing the deploy-* preserve-secrets bug where a
+      revision registered from stale running content silently re-introduces
+      fields terraform has since removed. See #3765 / #2840.
     required: false
     default: ""
 
@@ -57,70 +68,32 @@ runs:
           exit 1
         fi
 
-    - name: Get current task definition
-      id: current-task-def
-      shell: bash
-      run: |
-        aws ecs describe-task-definition \
-          --task-definition "${{ inputs.task-family }}" \
-          --query 'taskDefinition' \
-          --output json > current-task-def.json
-
-        echo "Current task definition:"
-        cat current-task-def.json | jq '.taskDefinitionArn'
-
-    - name: Register new task definition revision
+    - name: Render and register new task definition revision
       id: register
       shell: bash
       env:
         IMAGE_URI: ${{ inputs.image-uri }}
         CONTAINER_NAME: ${{ inputs.container-name }}
         TASK_FAMILY: ${{ inputs.task-family }}
+        SSM_PARAMETER: ${{ inputs.desired-container-definitions-ssm-parameter }}
       run: |
-        # Update the container image in the task definition
-        jq --arg image "$IMAGE_URI" --arg container "$CONTAINER_NAME" \
-          '.containerDefinitions |= map(if .name == $container then .image = $image else . end)' \
-          current-task-def.json > updated-containers.json
-
-        # Build register-task-definition args, always including task role if present.
-        # Self-heal: if the current revision lacks a task role (legacy revisions from
-        # before the IAM role was added), look it up by the Terraform naming convention
-        # so the role is attached on the next deploy.
-        TASK_ROLE=$(jq -r '.taskRoleArn // empty' updated-containers.json)
-
-        if [ -z "$TASK_ROLE" ]; then
-          # Derive role name from task family: judgemind-<svc>-<env> -> judgemind-<svc>-task-<env>
-          ENV_SUFFIX="${TASK_FAMILY##*-}"
-          SVC_PREFIX="${TASK_FAMILY%-*}"
-          ROLE_NAME="${SVC_PREFIX}-task-${ENV_SUFFIX}"
-          echo "Task role ARN missing from current revision — looking up role '$ROLE_NAME'..."
-          TASK_ROLE=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || true)
-          if [ -n "$TASK_ROLE" ] && [ "$TASK_ROLE" != "None" ]; then
-            echo "Resolved task role: $TASK_ROLE"
-          else
-            echo "WARNING: Could not resolve task role '$ROLE_NAME' — proceeding without it."
-            TASK_ROLE=""
-          fi
-        fi
-
-        REGISTER_ARGS=(
-          --family "$TASK_FAMILY"
-          --requires-compatibilities $(jq -r '.requiresCompatibilities[]' updated-containers.json)
-          --network-mode $(jq -r '.networkMode' updated-containers.json)
-          --cpu $(jq -r '.cpu' updated-containers.json)
-          --memory $(jq -r '.memory' updated-containers.json)
-          --execution-role-arn $(jq -r '.executionRoleArn' updated-containers.json)
-          --container-definitions "$(jq -c '.containerDefinitions' updated-containers.json)"
+        # Source the new container_definitions from terraform-managed SSM
+        # (when configured) or from the running task-definition (legacy).
+        # See scripts/ecs-render-task-def.sh and #3765 / #2840 for the
+        # full rationale on why the SSM source path exists.
+        SCRIPT_ARGS=(
+          --task-family "$TASK_FAMILY"
+          --container-name "$CONTAINER_NAME"
+          --image-uri "$IMAGE_URI"
         )
-
-        if [ -n "$TASK_ROLE" ]; then
-          REGISTER_ARGS+=(--task-role-arn "$TASK_ROLE")
+        if [ -n "$SSM_PARAMETER" ]; then
+          SCRIPT_ARGS+=(--desired-container-definitions-ssm-parameter "$SSM_PARAMETER")
+          echo "Using terraform-managed SSM parameter as desired-state source: $SSM_PARAMETER"
+        else
+          echo "Using running task-definition as desired-state source (legacy)."
         fi
 
-        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-          "${REGISTER_ARGS[@]}" \
-          --query 'taskDefinition.taskDefinitionArn' \
-          --output text)
+        NEW_TASK_DEF_ARN=$("${GITHUB_WORKSPACE}/scripts/ecs-render-task-def.sh" "${SCRIPT_ARGS[@]}")
 
         echo "New task definition ARN: $NEW_TASK_DEF_ARN"
         echo "arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"

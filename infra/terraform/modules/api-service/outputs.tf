@@ -52,3 +52,8 @@ output "target_group_arn_suffix" {
   description = "ARN suffix of the API target group (used as CloudWatch dimension)"
   value       = aws_lb_target_group.api.arn_suffix
 }
+
+output "container_definitions_ssm_parameter_name" {
+  description = "SSM parameter holding terraform-rendered container_definitions JSON. Pass to .github/actions/ecs-deploy as `desired-container-definitions-ssm-parameter` to make terraform the source of truth on deploy. See #3765."
+  value       = aws_ssm_parameter.container_definitions.name
+}
