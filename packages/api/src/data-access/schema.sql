@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 56 migrations.
+-- Generated from 55 migrations.
 
 
 
@@ -469,9 +469,6 @@ CREATE TABLE dispatcher.config (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_by text NOT NULL
 );
-
-
-COMMENT ON TABLE dispatcher.config IS 'Live-editable key/value settings for the dispatcher daemon. ``concurrency_cap`` is runtime state (the breaker may rewrite it to 0); ``target_concurrency_cap`` is operator intent (the breaker reads it on auto-close to know what cap to restore). Issue #3779.';
 
 
 CREATE TABLE dispatcher.diagnoses (

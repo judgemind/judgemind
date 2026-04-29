@@ -791,7 +791,6 @@ CREATE INDEX ON dispatcher.notifications (severity, sent_at) WHERE severity = 'h
 -- Seed config
 INSERT INTO dispatcher.config (key, value, updated_by) VALUES
   ('concurrency_cap',         '5',      'init'),  -- runtime cap; circuit breaker writes 0 on overnight-safety trip
-  ('target_concurrency_cap',  '5',      'init'),  -- operator intent (#3779); restored on `start`/auto-close
   ('subprocess_timeout_s',    '10800',  'init'),  -- 180 min ceiling; covers known outliers (#2513 107min, #2628 98min)
   ('backoff_seconds',         '[60,300,900]', 'init'),
   ('idle_audit_every_n_prs',  '20',     'init'),
@@ -801,6 +800,13 @@ INSERT INTO dispatcher.config (key, value, updated_by) VALUES
   -- Model selection: per-phase map. Values are runner-native model IDs (Claude aliases, OpenCode provider/model strings, etc.).
   ('model_by_phase',  '{"plan":"opus","ralph":"sonnet","summary":"haiku","fix_ci":"sonnet","verify":"haiku","retro":"haiku","diagnose":"opus"}', 'init'),
   ('runner_shadow',    '{}',         'init');  -- e.g. {"summary":"gemini"} runs gemini in parallel, output diff-logged only
+
+-- target_concurrency_cap (#3779) — written by operator via admin cockpit
+-- or `breaker.sh set-target N`. The migration that seeds this row is
+-- deferred to a follow-up PR while migration number 56 is contended
+-- across multiple open PRs (see issue #2916 deadlock pattern). The
+-- daemon falls back to 1 when the row is absent, which matches the
+-- legacy `start` semantics.
 ```
 
 ---
