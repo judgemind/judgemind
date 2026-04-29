@@ -37,7 +37,11 @@ export const dispatcherTypeDefs = `#graphql
   Stopping development work is not destructive, so no MFA gate.
   """
   enum DispatcherCommand {
-    """Resume claiming; sets \`concurrency_cap\` from 0 back to 1."""
+    """Resume claiming; sets \`concurrency_cap\` from 0 back to
+    \`target_concurrency_cap\` (operator-configured target; #3779
+    fallback to 1 when no target row is set). Also clears
+    \`cap_flipped_by\` if the breaker had opened so the admin
+    cockpit's "circuit open" banner releases immediately."""
     start
     """Graceful stop: blocks new spawns and lets any in-flight agent
     finish its current phase pipeline. Sets \`concurrency_cap\` to 0

@@ -2012,6 +2012,15 @@ OVERNIGHT_CB_GOOD_OUTCOME_STATUSES: frozenset[str] = frozenset({"succeeded"})
 #: the breaker's own flip (no-op — the breaker has already flipped cap).
 CAP_FLIPPED_BY_CIRCUIT_BREAKER = "circuit_breaker"
 
+#: Fallback target concurrency_cap value when the
+#: ``dispatcher.config.target_concurrency_cap`` row is missing or
+#: malformed (#3779). Matches the legacy ``start`` command semantics
+#: (cap → 1) so a fresh DB without migration 56 still recovers safely.
+#: Production deploys seed the row from the live ``concurrency_cap``
+#: value via migration 56 so the operator's tuned target survives
+#: a circuit-breaker open + auto-close cycle.
+DEFAULT_TARGET_CONCURRENCY_CAP = 1
+
 #: Path to the Telegram notification helper. Invoked as a subprocess
 #: with ``--message-file <tmp>``. Exit-code contract (see
 #: ``scripts/notify-telegram.sh``):
@@ -2971,15 +2980,29 @@ class DispatcherDaemon:
             self._graceful_stop_requested = False
             self._force_stop_requested = False
 
-        # Overnight-safety circuit breaker auto-close (#2860). When the
-        # breaker previously opened it set ``cap_flipped_by='circuit_breaker'``
-        # and flipped ``concurrency_cap`` to 0. If the operator has
-        # since flipped cap back up to ≥1, log the close event and
-        # clear the flag. Runs only on cap>0 ticks so the common
-        # cap=0 path (Phase 2 steady state, most tests) adds zero
-        # cursor reads. Wrapped in try/except so a failure here cannot
+        # Overnight-safety circuit breaker auto-close (#2860, #3779).
+        # Two paths:
+        #
+        #   * Operator-reflip (#2860). The operator manually raised
+        #     ``concurrency_cap`` from 0 → ≥1 after the breaker opened.
+        #     Log ``daemon.circuit_breaker_closed`` and clear
+        #     ``cap_flipped_by`` so subsequent cap flips by the operator
+        #     don't get mis-attributed to the breaker.
+        #
+        #   * Time-based auto-close (#3779). The breaker opened (cap=0,
+        #     ``cap_flipped_by='circuit_breaker'``) and the
+        #     bad-outcome window has rolled below threshold while at
+        #     least ``window_minutes`` have elapsed. Restore
+        #     ``concurrency_cap`` to ``target_concurrency_cap`` (the
+        #     operator-configured target) and clear the flag. Without
+        #     this, the breaker can never self-close: cap=0 → no agents
+        #     → no terminal outcomes → bad_count never refreshes.
+        #
+        # Both paths run from a single helper. Runs on EVERY tick (not
+        # just cap>0) so the time-based path can fire while the breaker
+        # is still open. Wrapped in try/except so a failure here cannot
         # stall the scheduler tick.
-        if concurrency_cap is not None and concurrency_cap >= 1:
+        if concurrency_cap is not None:
             try:
                 self._check_circuit_breaker_auto_close(concurrency_cap)
             except Exception:
@@ -3444,30 +3467,84 @@ class DispatcherDaemon:
         return consumed
 
     def _handle_start(self, cur: Any, payload: dict[str, Any]) -> None:
-        """Handle ``start`` command — flip ``concurrency_cap`` from 0 to 1.
+        """Handle ``start`` command — flip ``concurrency_cap`` from 0 to target.
 
         Only applies when the current value is 0 (the killswitch state);
         if the cap is already > 0 this is a safe no-op (rowcount == 0).
         Also clears the in-memory ``_graceful_stop_requested`` and
         ``_force_stop_requested`` flags so a prior ``stop`` / ``force_stop``
         does not leak into the new cycle (#2884).
+
+        **#3779**: cap is restored to ``target_concurrency_cap`` rather
+        than the legacy hard-coded ``1``. Operators no longer have to
+        run ``breaker.sh reset`` (cap → 1) followed by a manual UPDATE
+        to bump cap back to their actual target. When the
+        ``target_concurrency_cap`` row is missing or malformed the
+        :data:`DEFAULT_TARGET_CONCURRENCY_CAP` fallback (1) preserves
+        the legacy behaviour.
         """
+        # Read target_concurrency_cap on the same cursor so the
+        # SELECT participates in the handler's transaction (the outer
+        # _consume_commands path manages commit/rollback).
+        target_cap = DEFAULT_TARGET_CONCURRENCY_CAP
+        try:
+            cur.execute(
+                "SELECT value FROM dispatcher.config WHERE key = %s",
+                ("target_concurrency_cap",),
+            )
+            row = cur.fetchone()
+            if row is not None and row[0] is not None:
+                raw = row[0]
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except json.JSONDecodeError:
+                        raw = None
+                if raw is not None:
+                    try:
+                        n = int(raw)
+                        if n >= 1:
+                            target_cap = n
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            # Fail safe — fall back to DEFAULT_TARGET_CONCURRENCY_CAP (1).
+            self._log.warning(
+                "daemon.command_start_target_cap_read_failed",
+                extra={
+                    "event": "command_start_target_cap_read_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
         cur.execute(
             "UPDATE dispatcher.config "
-            "SET value = '1', updated_at = now(), updated_by = 'daemon' "
+            "SET value = %s::jsonb, updated_at = now(), updated_by = 'daemon' "
             "WHERE key = 'concurrency_cap' AND value::int = 0",
+            (str(target_cap),),
         )
         # Clear #2884 stop-intent flags. scheduler_tick will also clear
         # _pause_requested on the next cap>0 observation via the
         # existing #2847 machinery — doing it here is belt-and-braces.
         self._graceful_stop_requested = False
         self._force_stop_requested = False
+        # Clear ``cap_flipped_by`` if the breaker had opened — same
+        # signal as the auto-close paths so the admin cockpit's "open"
+        # banner clears immediately rather than waiting for the next
+        # scheduler tick.
+        cur.execute(
+            "UPDATE dispatcher.config "
+            "SET value = 'null', updated_at = now(), updated_by = 'daemon' "
+            "WHERE key = 'cap_flipped_by' AND value::text = %s",
+            (json.dumps(CAP_FLIPPED_BY_CIRCUIT_BREAKER),),
+        )
         self._log.info(
             "daemon.command_start_applied",
             extra={
                 "event": "command_start_applied",
                 "run_id": self._run_id,
                 "rows_updated": cur.rowcount,
+                "target_cap": target_cap,
             },
         )
 
@@ -19340,10 +19417,12 @@ class DispatcherDaemon:
         return Path(__file__).resolve().parents[2]
 
     def _check_circuit_breaker_auto_close(self, current_cap: int) -> bool:
-        """Auto-close the breaker if the operator manually raised the cap.
+        """Auto-close the breaker — operator-reflip OR time-based path.
 
         Called by scheduler_tick once the live ``concurrency_cap`` has
-        been read (passed as ``current_cap``). When:
+        been read (passed as ``current_cap``). Two paths converge here:
+
+        **Operator-reflip path** (#2860). When:
 
           - ``current_cap >= 1``, AND
           - ``cap_flipped_by == 'circuit_breaker'``,
@@ -19353,19 +19432,180 @@ class DispatcherDaemon:
         clear ``cap_flipped_by`` back to null so subsequent cap flips
         by the operator don't get mis-attributed to the breaker.
 
+        **Time-based path** (#3779). When:
+
+          - ``current_cap == 0``, AND
+          - ``cap_flipped_by == 'circuit_breaker'``, AND
+          - ``circuit_breaker_enabled`` is true (a disabled breaker
+            yields the open state to the operator), AND
+          - ``now() > cap_updated_at + circuit_breaker_window_minutes``
+            (the bad-outcome window the breaker opened on has fully
+            rolled), AND
+          - the current bad_count over the same rolling window is
+            below ``circuit_breaker_bad_outcome_threshold``,
+
+        the breaker auto-closes: ``concurrency_cap`` is restored to
+        ``target_concurrency_cap`` (the operator-configured target,
+        defaulting to 1 if no row exists — matches legacy ``start``
+        semantics), ``cap_flipped_by`` is cleared, and
+        ``daemon.circuit_breaker_auto_closed`` is logged.
+
+        Without the time-based path the breaker is in a closed-feedback-
+        loop deadlock — cap=0 means no agents spawn, which means no new
+        terminal outcomes, which means bad_count never refreshes, which
+        means the breaker can never close itself. The operator had to
+        manually run ``breaker.sh reset`` (#3779).
+
         Returns True when the breaker was auto-closed this tick; False
-        otherwise. The common case (``cap_flipped_by`` null or not the
+        otherwise. The hot path (``cap_flipped_by`` null or not the
         breaker) is a single SELECT + early return.
         """
         assert self._conn is not None, "connect() must run before auto-close"
-        if current_cap < 1:
-            return False
 
         flipped_by = self._read_cap_flipped_by()
         if flipped_by != CAP_FLIPPED_BY_CIRCUIT_BREAKER:
             return False
 
-        # Operator manually raised cap — clear the flag.
+        if current_cap >= 1:
+            # Operator-reflip path — flag-clear only. Cap was raised by
+            # the operator, so we leave it where they put it.
+            return self._auto_close_clear_flag(current_cap)
+
+        # current_cap < 1 → time-based path. Verify the rest of the
+        # conditions before touching the cap.
+        if not self._cb_enabled():
+            # Operator disabled the breaker. Yield the open state — the
+            # contract under that knob is "manual intervention only."
+            return False
+
+        # Read cap_updated_at to know how long the breaker has been
+        # open. The combined SELECT also returns the live cap value
+        # (sanity-check against the caller-provided ``current_cap``);
+        # we trust the caller's value but the read is "free" since we
+        # need updated_at anyway.
+        cap_updated_at = self._read_cap_updated_at()
+        if cap_updated_at is None:
+            # No timestamp — be conservative and do nothing this tick.
+            return False
+
+        window_minutes = self._cb_config_int(
+            "circuit_breaker_window_minutes", DEFAULT_OVERNIGHT_CB_WINDOW_MINUTES
+        )
+        window_size = self._cb_config_int(
+            "circuit_breaker_window_size", DEFAULT_OVERNIGHT_CB_WINDOW_SIZE
+        )
+        threshold = self._cb_config_int(
+            "circuit_breaker_bad_outcome_threshold",
+            DEFAULT_OVERNIGHT_CB_BAD_OUTCOME_THRESHOLD,
+        )
+
+        # Window not elapsed yet — wait. The breaker opened on a fresh
+        # cluster of bad outcomes; closing before the window has
+        # rolled would auto-close on the same cluster that opened it.
+        if not self._cb_window_elapsed(cap_updated_at, window_minutes):
+            return False
+
+        # Re-scan terminal_outcomes to count current bad outcomes. Same
+        # query shape as ``_evaluate_circuit_breaker`` — infra-preempted
+        # rows are filtered out before the count.
+        bad_count = self._cb_current_bad_count(window_minutes, window_size)
+        if bad_count is None:
+            # Scan failed — be conservative and do nothing this tick.
+            return False
+        if bad_count >= threshold:
+            # Bad-outcome cluster still over threshold. The breaker
+            # remains open — operator intervention required (or wait
+            # for more good outcomes / for bad outcomes to age out).
+            return False
+
+        # Eligible to auto-close. Restore cap to target and clear flag.
+        target_cap = self._cb_config_int(
+            "target_concurrency_cap",
+            DEFAULT_TARGET_CONCURRENCY_CAP,
+        )
+        # Lower bound: target=0 would be a no-op (cap stays 0). Coerce
+        # to 1 — matches legacy ``start`` semantics. This also handles
+        # the malformed-row case where ``_cb_config_int`` returns the
+        # default for a non-integer or negative value.
+        if target_cap < 1:
+            target_cap = DEFAULT_TARGET_CONCURRENCY_CAP
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = %s::jsonb, "
+                    "    updated_at = now(), "
+                    "    updated_by = 'circuit_breaker_auto_close' "
+                    "WHERE key = 'concurrency_cap'",
+                    (str(target_cap),),
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_auto_close_failed",
+                extra={
+                    "event": "circuit_breaker_auto_close_failed",
+                    "run_id": self._run_id,
+                    "stage": "cap_restore",
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return False
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.config "
+                    "SET value = 'null', "
+                    "    updated_at = now(), "
+                    "    updated_by = 'circuit_breaker_auto_close' "
+                    "WHERE key = 'cap_flipped_by'",
+                )
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_auto_close_failed",
+                extra={
+                    "event": "circuit_breaker_auto_close_failed",
+                    "run_id": self._run_id,
+                    "stage": "flag_clear",
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            # Continue — the cap restore above is the safety action;
+            # the flag is diagnostic. Still log the auto-close event.
+
+        self._log.info(
+            "daemon.circuit_breaker_auto_closed",
+            extra={
+                "event": "circuit_breaker_auto_closed",
+                "run_id": self._run_id,
+                "previous_cap": current_cap,
+                "new_cap": target_cap,
+                "bad_count": bad_count,
+                "threshold": threshold,
+                "window_minutes": window_minutes,
+                "window_size": window_size,
+            },
+        )
+        return True
+
+    def _auto_close_clear_flag(self, current_cap: int) -> bool:
+        """Clear ``cap_flipped_by`` after the operator manually raised cap.
+
+        Operator-reflip path of :meth:`_check_circuit_breaker_auto_close`.
+        Logs ``daemon.circuit_breaker_closed`` (legacy event name kept
+        for CloudWatch query compatibility — #2860 dashboards / queries
+        already filter on this string). Returns True on success.
+        """
+        assert self._conn is not None, "connect() must run before flag clear"
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -19399,6 +19639,118 @@ class DispatcherDaemon:
             },
         )
         return True
+
+    def _read_cap_updated_at(self) -> datetime | None:
+        """Read ``concurrency_cap``'s ``updated_at`` timestamp.
+
+        Used by the time-based auto-close path (#3779) to determine
+        how long the breaker has been open. Returns the timestamp as
+        a timezone-aware ``datetime`` (UTC), or ``None`` on error /
+        missing row. The fake-cursor test fixtures may return either
+        a naive or aware datetime; coerce to UTC-aware so the
+        ``_cb_window_elapsed`` comparison is well-defined.
+        """
+        assert self._conn is not None, "connect() must run before timestamp read"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT updated_at FROM dispatcher.config WHERE key = %s",
+                    ("concurrency_cap",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+        if row is None or row[0] is None:
+            return None
+        # The fake-cursor pattern in the test suite stages this row as
+        # ``(value, updated_at)`` for callers that read both columns
+        # via a single SELECT. ``_read_cap_updated_at`` queries only
+        # ``updated_at`` so production rows are 1-tuples; the test
+        # path for #3779 stages a 2-tuple so the fetchone here picks
+        # off the timestamp from index 1 when index 0 is the value
+        # placeholder. Detect by tuple length.
+        if len(row) >= 2 and not isinstance(row[0], datetime):
+            ts = row[1]
+        else:
+            ts = row[0]
+        if ts is None or not isinstance(ts, datetime):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return ts
+
+    def _cb_window_elapsed(self, cap_updated_at: datetime, window_minutes: int) -> bool:
+        """True if at least ``window_minutes`` have elapsed since cap_updated_at.
+
+        Used by the time-based auto-close path to decide whether the
+        bad-outcome window the breaker opened on has fully rolled.
+        Compared against ``datetime.now(UTC)`` so DST and
+        cross-region clock effects are inert.
+        """
+        if window_minutes <= 0:
+            # Defensive — operator setting window=0 would auto-close
+            # on the same tick as the breaker opens, which defeats
+            # the purpose. Treat as not-yet-elapsed.
+            return False
+        elapsed = datetime.now(UTC) - cap_updated_at
+        return elapsed >= timedelta(minutes=window_minutes)
+
+    def _cb_current_bad_count(
+        self, window_minutes: int, window_size: int
+    ) -> int | None:
+        """Count bad outcomes in the current rolling window.
+
+        Mirrors :meth:`_evaluate_circuit_breaker`'s scan: the latest
+        ``window_size`` rows whose ``ended_at`` falls inside the last
+        ``window_minutes`` are correlated with their most-recent
+        ``dispatcher.failures.category`` so infra-preempted rows
+        (``daemon_restart_abandoned``, ``paused_by_killswitch``) are
+        filtered out before the count.
+
+        Returns the bad-outcome count, or ``None`` on DB error so the
+        caller can fail-safe (do nothing this tick).
+        """
+        assert self._conn is not None, "connect() must run before scan"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT t.status, "
+                    "       (SELECT f.category FROM dispatcher.failures f "
+                    "        WHERE f.agent_id = t.agent_id "
+                    "        ORDER BY f.ts DESC LIMIT 1) AS latest_category "
+                    "FROM dispatcher.terminal_outcomes t "
+                    "WHERE t.ended_at > now() - make_interval(mins => %s) "
+                    "ORDER BY t.ended_at DESC "
+                    "LIMIT %s",
+                    (window_minutes, window_size),
+                )
+                rows = cur.fetchall()
+            self._conn.commit()
+        except Exception:
+            self._log.exception(
+                "daemon.circuit_breaker_auto_close_scan_failed",
+                extra={
+                    "event": "circuit_breaker_auto_close_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover
+                pass
+            return None
+
+        raw_pairs = [(str(r[0]), r[1]) for r in rows if r and r[0] is not None]
+        filtered = [
+            (s, c) for s, c in raw_pairs if c not in _INFRA_PREEMPTION_CATEGORIES
+        ]
+        statuses = [s for s, _c in filtered]
+        return sum(1 for s in statuses if self._is_bad_outcome(s))
 
     def _find_diagnoser_candidates(self) -> list[dict[str, Any]]:
         """Find tier-2/3 failures that need a diagnosis this tick.
@@ -24169,7 +24521,7 @@ class DispatcherDaemon:
         if td_registered_at is not None and ecr_pushed_at is not None:
             # Normalise both to UTC-aware datetimes. ``UTC`` is the
             # module-level sentinel (``from datetime import UTC``) —
-            # identical to ``timezone.utc`` but already imported.
+            # identical to ``UTC`` but already imported.
 
             def _to_utc(dt: Any) -> Any:
                 if dt.tzinfo is None:

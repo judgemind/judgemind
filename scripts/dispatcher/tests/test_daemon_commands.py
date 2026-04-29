@@ -148,11 +148,72 @@ class TestHandleStart:
     """_handle_start flips concurrency_cap from 0 to 1 and clears stop-intent flags."""
 
     def test_start_flips_cap_when_zero(self) -> None:
+        """start flips cap 0→target_concurrency_cap (default 1 when row absent).
+
+        Pre-#3779 the SQL embedded the literal ``value = '1'``. Post-#3779
+        the value is bound as a ``%s::jsonb`` parameter so the operator's
+        ``target_concurrency_cap`` (e.g. 4) is restored on reset rather
+        than the legacy hard-coded 1.
+        """
         d, conn, handler = _make_daemon_with_capture()
         # Stub fetchall to return one 'start' command.
         conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
-        # concurrency_cap UPDATE: rowcount=1 (was 0, now 1).
+        # target_concurrency_cap row absent → fetchone returns None →
+        # default 1. concurrency_cap UPDATE: rowcount=1 (was 0, now 1).
+        conn.cursor_instance.fetch_queue = [None]
         conn.cursor_instance.rowcount = 1
+
+        count = d._consume_commands()
+
+        assert count == 1
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+            and "concurrency_cap" in e[0]
+            and "%s::jsonb" in e[0]
+        ]
+        assert len(cap_updates) == 1
+        # The bound parameter encodes the target cap value as text
+        # (psycopg coerces to JSONB).
+        assert cap_updates[0][1] == ("1",)
+        # consumed_at set after handler.
+        consumed_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "SET consumed_at = now()" in e[0]
+        ]
+        assert len(consumed_updates) == 1
+
+    def test_start_uses_target_concurrency_cap_when_set(self) -> None:
+        """#3779: start restores cap to operator-configured target (e.g. 4)."""
+        d, conn, _handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
+        # target_concurrency_cap = 4 (psycopg3 unwrapped JSONB int).
+        conn.cursor_instance.fetch_queue = [(4,)]
+        conn.cursor_instance.rowcount = 1
+
+        count = d._consume_commands()
+
+        assert count == 1
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+            and "concurrency_cap" in e[0]
+            and "%s::jsonb" in e[0]
+            and "value::int = 0" in e[0]
+        ]
+        assert len(cap_updates) == 1
+        assert cap_updates[0][1] == ("4",)
+
+    def test_start_noop_when_cap_positive(self) -> None:
+        """start when cap > 0 is a safe no-op (rowcount == 0)."""
+        d, conn, _handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
+        # No target_concurrency_cap row → fall through to default 1.
+        conn.cursor_instance.fetch_queue = [None]
+        conn.cursor_instance.rowcount = 0  # already > 0, no rows updated
 
         count = d._consume_commands()
 
@@ -162,30 +223,7 @@ class TestHandleStart:
             for e in conn.cursor_instance.executed
             if "UPDATE dispatcher.config" in e[0]
             and "concurrency_cap" in e[0]
-            and "value = '1'" in e[0]
-        ]
-        assert len(updates) == 1
-        # consumed_at set after handler.
-        consumed_updates = [
-            e
-            for e in conn.cursor_instance.executed
-            if "SET consumed_at = now()" in e[0]
-        ]
-        assert len(consumed_updates) == 1
-
-    def test_start_noop_when_cap_positive(self) -> None:
-        """start when cap > 0 is a safe no-op (rowcount == 0)."""
-        d, conn, _handler = _make_daemon_with_capture()
-        conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
-        conn.cursor_instance.rowcount = 0  # already > 0, no rows updated
-
-        count = d._consume_commands()
-
-        assert count == 1
-        updates = [
-            e
-            for e in conn.cursor_instance.executed
-            if "UPDATE dispatcher.config" in e[0] and "value = '1'" in e[0]
+            and "%s::jsonb" in e[0]
         ]
         assert len(updates) == 1
         # Still consumed — a no-op is a valid success.
@@ -196,12 +234,38 @@ class TestHandleStart:
         ]
         assert len(consumed_updates) == 1
 
+    def test_start_clears_circuit_breaker_flag(self) -> None:
+        """#3779: start also clears ``cap_flipped_by`` if breaker had opened.
+
+        The auto-close paths (#2860 + time-based #3779) clear the flag
+        on the next scheduler tick, but doing it inline here means the
+        admin cockpit's "open" banner clears immediately rather than
+        waiting one tick.
+        """
+        d, conn, _handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
+        conn.cursor_instance.fetch_queue = [None]  # target_cap missing → 1
+        conn.cursor_instance.rowcount = 1
+
+        d._consume_commands()
+
+        flag_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+            and "cap_flipped_by" in e[0]
+            and "value = 'null'" in e[0]
+        ]
+        assert len(flag_updates) == 1
+
     def test_start_clears_graceful_and_force_stop_flags(self) -> None:
         """#2884: start clears any prior stop-intent flags."""
         d, conn, _handler = _make_daemon_with_capture()
         d._graceful_stop_requested = True
         d._force_stop_requested = True
         conn.cursor_instance.fetchall_queue = [[_command_row(1, "start")]]
+        # target_concurrency_cap row absent → default 1 (#3779).
+        conn.cursor_instance.fetch_queue = [None]
 
         d._consume_commands()
 
