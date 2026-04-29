@@ -1,10 +1,9 @@
-"""Real-concurrency stall repro tests for the scheduler-tick watchdog (#3794).
+"""Real-concurrency stall repro tests for the scheduler-tick watchdog.
 
 The existing ``test_daemon_watchdog.py`` exercises WARN/EXIT tiers by
 stubbing ``time.monotonic()`` forward — that proves the *logic* is correct
 but does NOT prove the watchdog can fire when the scheduler thread is
-*genuinely* wedged (real wall-clock seconds, real GIL contention, real
-logging-lock contention).
+*genuinely* wedged (real wall-clock seconds, real GIL contention).
 
 This file exercises real concurrency:
 
@@ -14,21 +13,23 @@ This file exercises real concurrency:
   ``scheduler_tick_stalled_exiting`` log + exit code 137 within a generous
   wall-clock budget.
 
-* ``test_stall_triggers_exit_when_main_holds_logging_handler_lock`` — same
-  wedge, but the "main" thread additionally holds the stdlib
-  logging-handler RLock (the suspected production root cause).  This test
-  is ``xfail(strict=True)`` — it *documents* that the primary watchdog
-  deadlocks on ``self._log.error()`` when the logging RLock is contended
-  (confirmed by #3794 investigation).  The test must keep failing so we do
-  NOT accidentally regress by making the primary watchdog skip logging on
-  the kill path (which would change its semantics under non-deadlocked
-  conditions).  The *fix* for the deadlock is the backup watchdog below.
+* ``test_multi_substep_wedge_triggers_primary_watchdog`` (#3801) —
+  regression for the per-sub-step heartbeat refresh that hid
+  multi-sub-step wedges. Pre-#3801 ``_record_scheduler_step`` /
+  ``_record_supervisor_step`` rewrote ``_last_scheduler_tick_at = now``
+  between every sub-step, so a long-running tick whose individual
+  sub-steps were each below the EXIT threshold could go silent for
+  arbitrary multiples of the threshold without tripping the watchdog.
+  The fix removed the per-sub-step refresh; this test pins the
+  behaviour by simulating a tick that processes 12 sub-steps (each
+  successfully recorded via ``_record_scheduler_step``) and asserting
+  the watchdog still fires on the cumulative elapsed.
 
-* ``test_backup_watchdog_fires_when_logging_blocked`` (AC #2) — same
-  logging-lock wedge as above, but runs ``_backup_watchdog_loop`` (not
-  ``_watchdog_loop``) with a tiny threshold.  Asserts ``os._exit(138)``
-  fires within 5s even while the logging RLock is held by the wedged
-  thread.  Uses ``os.write`` to stderr — no logging, no locks.
+The pre-#3801 tests for ``_backup_watchdog_loop`` were deleted alongside
+that loop — its load-bearing rationale (logging-RLock deadlock during a
+gh-subprocess-storm wedge) is gone now that the storm itself is gone
+(housekeeping bulk-clears stale ARNs; the per-row finalize loop in the
+reaper that produced the storm is deleted). See #3801.
 
 No real ``os._exit`` is ever called — the watchdog is monkeypatched to a
 sentinel-raising stub.  No real Postgres is used — ``psycopg.connect`` is
@@ -259,44 +260,32 @@ def test_stall_triggers_exit(
 
 
 # --------------------------------------------------------------------------
-# AC #1 variant — logging-RLock deadlock documentation (known failure)
+# #3801 — multi-sub-step wedge MUST trip the primary watchdog.
+#
+# Pre-#3801 ``_record_scheduler_step`` rewrote ``_last_scheduler_tick_at =
+# now`` between each sub-step, which meant a long-running tick whose
+# individual sub-steps were each below the EXIT threshold would never
+# trip the watchdog. The fix removed the per-sub-step heartbeat refresh.
+# This test pins the new behaviour: simulate a tick that calls
+# ``_record_scheduler_step`` 12 times, each successfully (sub-second
+# elapsed each), but with an aggregate elapsed exceeding the EXIT
+# threshold. The watchdog must fire.
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#3794: primary watchdog deadlocks on self._log.error() when the "
-        "logging-handler RLock is held by the wedged thread.  This xfail "
-        "documents the known limitation — the fix is the backup watchdog "
-        "(test_backup_watchdog_fires_when_logging_blocked).  Do NOT remove "
-        "this xfail — the primary watchdog SHOULD continue logging before "
-        "os._exit under normal (non-deadlocked) conditions."
-    ),
-)
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_stall_triggers_exit_when_main_holds_logging_handler_lock(
+def test_multi_substep_wedge_triggers_primary_watchdog(
     tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
 ) -> None:
-    """Documents that the *primary* watchdog deadlocks when the logging RLock
-    is held by the wedged thread (#3794).
+    """A scheduler tick that successfully records 12 sub-steps but takes
+    longer than the EXIT threshold in aggregate must trip the primary
+    watchdog (#3801).
 
-    The primary watchdog calls ``self._log.error(...)`` before ``os._exit``.
-    ``self._log.error(...)`` acquires the logging-handler RLock internally
-    (``Handler.emit`` is called under ``Handler.acquire()``).  If the wedged
-    scheduler thread stalled mid-log-call and holds that RLock, the watchdog
-    blocks forever — it never reaches ``os._exit``.
-
-    This test is ``xfail(strict=True)``:
-    - A FAIL (the deadlock manifests — watchdog does not fire within 5s) is the
-      *expected outcome* and confirms the production hypothesis.
-    - An unexpected PASS would mean the primary watchdog has been changed to
-      skip logging on its kill path, which changes semantics and should be
-      reviewed explicitly.
-
-    The AC #2 fix is ``test_backup_watchdog_fires_when_logging_blocked`` below,
-    which exercises ``_backup_watchdog_loop`` — a kill path that uses only
-    ``os.write`` + ``os._exit``, bypassing logging entirely.
+    Pre-#3801 the per-sub-step ``_last_scheduler_tick_at = now`` write
+    in :meth:`_record_scheduler_step` would refresh the heartbeat after
+    each sub-step, hiding the cumulative wedge from the watchdog. This
+    test wedges via the cumulative path, asserts the watchdog still
+    fires, and pins the no-refresh contract.
     """
     d, _conn, handler = _make_daemon(tmp_path)
 
@@ -324,40 +313,49 @@ def test_stall_triggers_exit_when_main_holds_logging_handler_lock(
 
     monkeypatch.setattr(daemon.os, "_exit", fake_exit)
 
-    stall_event = threading.Event()
-    release_event = threading.Event()
-
-    # The logging.Handler base class has an RLock at self.lock.
-    # Handler.emit() is called under Handler.acquire() which takes that lock.
-    # Holding it from a separate thread blocks any concurrent self._log.error().
-    handler_lock = handler.lock
-
-    def wedged_main_thread() -> None:
-        """Simulate a scheduler thread that stalled while holding the logging lock."""
-        with handler_lock:
-            stall_event.set()
-            release_event.wait(timeout=10.0)
-
-    wedger = threading.Thread(
-        target=wedged_main_thread, daemon=True, name="test-wedger"
-    )
-    wedger.start()
-
-    assert stall_event.wait(timeout=2.0), "wedger thread did not acquire lock in time"
-
+    # Wedge: pretend the tick started long ago. Then call
+    # ``_record_scheduler_step`` 12 times in a row — each one is
+    # individually fast but post-#3801 it does not refresh the
+    # heartbeat. Pre-#3801 the watchdog would not fire because each
+    # call would have set ``_last_scheduler_tick_at = now``; post-#3801
+    # the wedge persists.
     d._last_scheduler_tick_at = time.monotonic() - (EXIT_S + 0.5)
+
+    # Simulate 12 successful sub-steps.
+    t_step = time.monotonic()
+    for step_name in (
+        "consume_commands",
+        "concurrency_cap_read",
+        "circuit_breaker_auto_close",
+        "process_retry_markers",
+        "reap_agent_tasks",
+        "scan_queue",
+        "scan_blocked",
+        "active_agent_count",
+        "spawn_orchestration",
+        "step_9",
+        "step_10",
+        "step_11",
+    ):
+        t_step = d._record_scheduler_step(step_name, t_step)
+
+    # The contract: the recorder MUST NOT have refreshed the
+    # ``_last_scheduler_tick_at`` heartbeat — so the watchdog still sees
+    # an elapsed gap > EXIT_S and fires.
+    assert d._last_scheduler_tick_at < t_step - (EXIT_S + 0.4), (
+        "post-#3801 contract violated: _record_scheduler_step refreshed "
+        "_last_scheduler_tick_at, which would hide multi-sub-step wedges "
+        "from the primary watchdog (the load-bearing wedge of 2026-04-29)."
+    )
 
     watchdog_thread = threading.Thread(target=d._watchdog_loop, daemon=True)
     watchdog_thread.start()
 
     try:
-        # This assertion FAILS (xfail) — the watchdog never emits the event
-        # because it deadlocks waiting for the logging-handler RLock.
         rec = _wait_for_event(handler, "scheduler_tick_stalled_exiting", timeout=5.0)
-        release_event.set()
         assert rec is not None, (
-            "DEADLOCK CONFIRMED: primary watchdog blocked on logging-handler RLock "
-            "held by wedged thread — backup watchdog needed (AC #2)."
+            "watchdog did not fire on a multi-sub-step wedge — the per-sub-step "
+            "heartbeat refresh hack from #3205/#3403 must stay deleted (#3801)."
         )
         assert rec.levelno == logging.ERROR
         assert getattr(rec, "exit_code", None) == 137
@@ -365,95 +363,5 @@ def test_stall_triggers_exit_when_main_holds_logging_handler_lock(
             f"os._exit(137) not called within timeout; got {exit_calls!r}"
         )
     finally:
-        release_event.set()
         d._watchdog_stop.set()
         watchdog_thread.join(timeout=3.0)
-        wedger.join(timeout=3.0)
-
-
-# --------------------------------------------------------------------------
-# AC #2 — backup watchdog fires via os._exit(138) when logging is blocked
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_backup_watchdog_fires_when_logging_blocked(
-    tmp_path: Path, monkeypatch: Any, psycopg_stub: Any
-) -> None:
-    """Backup watchdog (#3794) calls ``os._exit(138)`` even when the logging-
-    handler RLock is held by the wedged thread.
-
-    ``_backup_watchdog_loop`` uses only ``os.write`` + ``os._exit`` — no
-    stdlib logging, no RLock acquisition — so a logging-blocked kill path
-    cannot prevent it from firing.
-
-    The test:
-    1. Holds the logging-handler RLock in a wedger thread.
-    2. Sets ``_last_scheduler_tick_at`` far in the past.
-    3. Monkeypatches ``DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS`` to
-       a tiny value (0.1s) and ``BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS`` to 0.
-    4. Runs ``_backup_watchdog_loop`` directly.
-    5. Asserts ``os._exit(138)`` is called within 5s.
-
-    Note: the monkeypatch of the module-level constants propagates into the
-    loop because ``_backup_watchdog_loop`` reads them from the module namespace
-    at call time (not captured in a closure).
-    """
-    d, _conn, handler = _make_daemon(tmp_path)
-
-    # Tiny threshold so the backup watchdog fires in <200ms.
-    BACKUP_EXIT_S = 0.10
-
-    monkeypatch.setattr(
-        daemon, "DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS", BACKUP_EXIT_S
-    )
-    monkeypatch.setattr(daemon, "BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS", 0)
-
-    psycopg_stub.connect = MagicMock(return_value=_FakeConnection())
-
-    exit_calls: list[int] = []
-
-    def fake_exit(code: int) -> None:
-        exit_calls.append(code)
-        raise _ExitCalled(code)
-
-    monkeypatch.setattr(daemon.os, "_exit", fake_exit)
-
-    stall_event = threading.Event()
-    release_event = threading.Event()
-
-    handler_lock = handler.lock
-
-    def wedged_main_thread() -> None:
-        """Hold the logging-handler RLock to block the primary watchdog."""
-        with handler_lock:
-            stall_event.set()
-            release_event.wait(timeout=10.0)
-
-    wedger = threading.Thread(
-        target=wedged_main_thread, daemon=True, name="test-wedger-backup"
-    )
-    wedger.start()
-
-    assert stall_event.wait(timeout=2.0), "wedger thread did not acquire lock in time"
-
-    # Set tick timestamp far enough in the past to exceed BACKUP_EXIT_S.
-    d._last_scheduler_tick_at = time.monotonic() - (BACKUP_EXIT_S + 0.5)
-
-    # Run the backup watchdog loop directly (not _watchdog_loop).
-    backup_thread = threading.Thread(target=d._backup_watchdog_loop, daemon=True)
-    backup_thread.start()
-
-    try:
-        # The backup watchdog must call os._exit(138) even with logging blocked.
-        assert _wait_for_exit_call(exit_calls, 138, timeout=5.0), (
-            "backup watchdog did not call os._exit(138) within 5s even though "
-            "the logging-handler RLock was held — the backup watchdog kill path "
-            "must NOT use stdlib logging.  Check _backup_watchdog_loop."
-        )
-        assert exit_calls == [138], f"expected exactly [138], got {exit_calls!r}"
-    finally:
-        release_event.set()
-        d._backup_watchdog_stop.set()
-        backup_thread.join(timeout=3.0)
-        wedger.join(timeout=3.0)

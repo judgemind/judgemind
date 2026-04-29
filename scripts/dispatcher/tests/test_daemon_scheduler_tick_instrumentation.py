@@ -186,25 +186,42 @@ class TestRecordSchedulerStep:
         threshold = getattr(rec, "threshold_seconds", None)
         assert threshold == daemon.SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS
 
-    def test_record_step_updates_last_scheduler_tick_at(self, tmp_path: Path) -> None:
-        """The watchdog heartbeat must advance per-step so a mid-body
-        wedge produces a ``scheduler_tick_stalled`` within the normal
-        300s WARN window rather than hiding under the prior tick's
-        entry timestamp."""
+    def test_record_step_does_not_refresh_last_scheduler_tick_at(
+        self, tmp_path: Path
+    ) -> None:
+        """#3801: per-sub-step heartbeat refresh is REMOVED.
+
+        Pre-#3801 ``_record_scheduler_step`` wrote ``_last_scheduler_tick_at
+        = now`` between every sub-step. Intent: "give the watchdog
+        forward-progress signal mid-tick." Side effect: a multi-sub-step
+        wedge (12 sub-steps × 60s each = 720s tick) could never trip the
+        watchdog because each fast sub-step reset the timer. That side
+        effect was the load-bearing reason the 2026-04-29 reaper wedge
+        stayed silent for hours despite both watchdogs being alive.
+
+        Post-#3801 the heartbeat is set ONLY at scheduler_tick entry
+        (and at watchdog start). ``_record_scheduler_step`` does NOT
+        touch ``_last_scheduler_tick_at`` — the primary watchdog now
+        observes the whole-tick elapsed and fires correctly when any
+        single tick exceeds the EXIT threshold.
+        """
         d, _conn, _handler = _make_daemon(tmp_path)
-        d._last_scheduler_tick_at = 0.0  # known-stale
-        before = time.monotonic()
-        d._record_scheduler_step("consume_commands", before)
-        after = time.monotonic()
-        assert before <= d._last_scheduler_tick_at <= after
+        d._last_scheduler_tick_at = 0.0  # known-stale sentinel
+        d._record_scheduler_step("consume_commands", time.monotonic())
+        # Heartbeat must NOT be advanced by the per-step recorder.
+        assert d._last_scheduler_tick_at == 0.0
 
     def test_record_step_returns_current_monotonic(self, tmp_path: Path) -> None:
         """Callers chain ``t_step = _record_scheduler_step(...)`` so the
-        return value must be ``time.monotonic()`` after the heartbeat
-        write — matching ``_last_scheduler_tick_at``."""
+        return value must be the ``time.monotonic()`` reading taken at
+        the end of the recorder. ``_last_scheduler_tick_at`` is no
+        longer touched (#3801) so we just bound the return against
+        before/after wall-clock."""
         d, _conn, _handler = _make_daemon(tmp_path)
-        returned = d._record_scheduler_step("consume_commands", time.monotonic())
-        assert returned == d._last_scheduler_tick_at
+        before = time.monotonic()
+        returned = d._record_scheduler_step("consume_commands", before)
+        after = time.monotonic()
+        assert before <= returned <= after
 
 
 # --------------------------------------------------------------------------

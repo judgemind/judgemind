@@ -825,3 +825,244 @@ class TestHousekeepingConfigPlumbing:
         assert entry[2] == "notification_retention_days"
         assert entry[3] == daemon.DEFAULT_NOTIFICATION_RETENTION_DAYS
         assert entry[3] == 30
+
+
+# --------------------------------------------------------------------------
+# #3801 — bulk-clear stale agent_task_arn rows.
+#
+# The pre-#3801 reaper iterated ``_reap_finalize_ecs_success`` over every
+# row whose ARN ECS no longer had metadata for. At observed
+# ``reap_active=75 / reap_untracked=74`` that's 74-148 sequential ``gh``
+# subprocess calls per scheduler tick, which holds the GIL long enough
+# that the watchdog cannot preempt — the load-bearing wedge of
+# 2026-04-29.
+#
+# The fix consolidated stale-ARN cleanup into a single bulk SQL UPDATE
+# in :meth:`_housekeeping_tick`. These tests verify:
+# - the UPDATE clears 100 stale rows in one round-trip,
+# - it does NOT touch fresh rows (started_at within the cutoff),
+# - it uses the configured cutoff (``stale_arn_clear_age_hours`` config
+#   key, default 2h),
+# - it surfaces the cleared count in a structured log event,
+# - it is wired into ``_housekeeping_tick`` (regression test against
+#   accidental decoupling).
+# --------------------------------------------------------------------------
+
+
+class TestClearStaleAgentTaskArns:
+    """Bulk-clear stale ``agent_task_arn`` rows (#3801)."""
+
+    def test_default_cutoff_is_2_hours(self) -> None:
+        """The default ``stale_arn_clear_age_hours`` is 2h (matches the
+        spec — gives the reaper one full Fargate retention window
+        before housekeeping pre-empts it)."""
+        assert daemon.DEFAULT_STALE_ARN_CLEAR_AGE_HOURS == 2
+
+    def test_uses_default_cutoff_when_config_missing(self) -> None:
+        """No ``stale_arn_clear_age_hours`` row in ``dispatcher.config``
+        falls back to :data:`DEFAULT_STALE_ARN_CLEAR_AGE_HOURS`."""
+        d, conn, handler = _make_daemon_with_capture()
+        # Config lookup returns None → default. Then the UPDATE runs.
+        conn.cursor_instance.fetch_queue = [None]
+
+        original_execute = conn.cursor_instance.execute
+
+        def patched_execute(sql: str, params: Any = None) -> None:
+            original_execute(sql, params)
+            if "UPDATE dispatcher.agents" in sql and "agent_task_arn = NULL" in sql:
+                # Pretend 100 stale rows were cleared.
+                conn.cursor_instance.rowcount = 100
+
+        conn.cursor_instance.execute = patched_execute  # type: ignore[method-assign]
+
+        cleared = d._clear_stale_agent_task_arns()
+
+        # The UPDATE was issued with the default cutoff bound via %s.
+        updates = [
+            (sql, params)
+            for sql, params in conn.cursor_instance.executed
+            if sql.startswith("UPDATE dispatcher.agents")
+        ]
+        assert len(updates) == 1
+        sql, params = updates[0]
+        assert "SET agent_task_arn = NULL" in sql
+        assert "agent_task_arn IS NOT NULL" in sql
+        assert "started_at < now() - make_interval(hours => %s)" in sql
+        assert params == (daemon.DEFAULT_STALE_ARN_CLEAR_AGE_HOURS,)
+        # rowcount surfaces.
+        assert cleared == 100
+
+        # Structured log event with rows_cleared + cutoff_hours.
+        events = handler.events("stale_arn_bulk_cleared")
+        assert len(events) == 1
+        rec = events[0]
+        assert rec.rows_cleared == 100
+        assert rec.cutoff_hours == daemon.DEFAULT_STALE_ARN_CLEAR_AGE_HOURS
+        assert rec.run_id == "test-run-id"
+
+    def test_uses_config_override_when_set(self) -> None:
+        """An override row in ``dispatcher.config`` overrides the default."""
+        d, conn, _handler = _make_daemon_with_capture()
+        # Config lookup returns 6 — operator wants a tighter window.
+        conn.cursor_instance.fetch_queue = [(6,)]
+
+        d._clear_stale_agent_task_arns()
+
+        updates = [
+            (sql, params)
+            for sql, params in conn.cursor_instance.executed
+            if sql.startswith("UPDATE dispatcher.agents")
+        ]
+        assert len(updates) == 1
+        assert updates[0][1] == (6,)
+
+    def test_clears_100_stale_rows_in_one_update(self) -> None:
+        """Regression test for the wedge cause: bulk SQL clears the entire
+        backlog in one round-trip — NOT one UPDATE per row."""
+        d, conn, _handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetch_queue = [None]
+
+        original_execute = conn.cursor_instance.execute
+
+        def patched_execute(sql: str, params: Any = None) -> None:
+            original_execute(sql, params)
+            if "UPDATE dispatcher.agents" in sql:
+                conn.cursor_instance.rowcount = 100
+
+        conn.cursor_instance.execute = patched_execute  # type: ignore[method-assign]
+
+        cleared = d._clear_stale_agent_task_arns()
+
+        # ONE UPDATE statement — not 100.
+        updates = [
+            sql
+            for sql, _params in conn.cursor_instance.executed
+            if sql.startswith("UPDATE dispatcher.agents")
+        ]
+        assert len(updates) == 1
+        assert cleared == 100
+
+    def test_does_not_touch_fresh_rows(self) -> None:
+        """The UPDATE filters by ``started_at < now() - interval`` so
+        rows whose ``started_at`` is within the window are unaffected.
+
+        We verify the SQL shape — the actual filter behaviour is tested
+        end-to-end against a real Postgres in the CI integration shard.
+        Here we just pin the WHERE clause so an accidental drop of the
+        ``started_at`` filter would fail the unit test.
+        """
+        d, conn, _handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetch_queue = [None]
+
+        d._clear_stale_agent_task_arns()
+
+        updates = [
+            sql
+            for sql, _params in conn.cursor_instance.executed
+            if sql.startswith("UPDATE dispatcher.agents")
+        ]
+        assert len(updates) == 1
+        # Both filters present — without them the UPDATE would null
+        # every row, including fresh ones.
+        assert "agent_task_arn IS NOT NULL" in updates[0]
+        assert "started_at < now() - make_interval(hours => %s)" in updates[0]
+
+    def test_zero_rows_cleared_emits_zero_event(self) -> None:
+        """Steady-state: after the first sweep catches up, future runs
+        clear zero rows. The event must still emit so operators can see
+        the housekeeping ran."""
+        d, conn, handler = _make_daemon_with_capture()
+        conn.cursor_instance.fetch_queue = [None]
+        # rowcount stays at 0.
+
+        cleared = d._clear_stale_agent_task_arns()
+        assert cleared == 0
+
+        events = handler.events("stale_arn_bulk_cleared")
+        assert len(events) == 1
+        assert events[0].rows_cleared == 0
+
+
+class TestHousekeepingTickWiresInBulkClear:
+    """``_housekeeping_tick`` calls ``_clear_stale_agent_task_arns`` (#3801).
+
+    Regression: an accidental decouple (e.g. removing the call in
+    ``_housekeeping_tick``) would silently break the wedge fix.
+    """
+
+    def test_housekeeping_tick_calls_clear_stale_agent_task_arns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d, _conn, handler = _make_daemon_with_capture()
+
+        called = {"count": 0}
+
+        def fake_clear() -> int:
+            called["count"] += 1
+            return 7
+
+        monkeypatch.setattr(d, "_clear_stale_agent_task_arns", fake_clear, raising=True)
+
+        # Stub out reconcile so the tick doesn't try to talk to GitHub.
+        monkeypatch.setattr(
+            d,
+            "_reconcile_stale_merged_at",
+            lambda: {"checked": 0, "cleared": 0, "errors": 0},
+        )
+
+        d._housekeeping_tick()
+        # Bulk-clear MUST have been called exactly once per tick.
+        assert called["count"] == 1
+        # The tick-level counter still advances.
+        assert d._housekeeping_ticks == 1
+        # Nothing in the prune loop logged a failure.
+        assert handler.events("stale_arn_bulk_clear_failed") == []
+
+    def test_housekeeping_tick_isolates_bulk_clear_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If ``_clear_stale_agent_task_arns`` raises, the tick logs and
+        continues. Per-target prune results are not affected."""
+        d, conn, handler = _make_daemon_with_capture()
+
+        def boom() -> int:
+            raise RuntimeError("connection lost")
+
+        monkeypatch.setattr(d, "_clear_stale_agent_task_arns", boom, raising=True)
+        monkeypatch.setattr(
+            d,
+            "_reconcile_stale_merged_at",
+            lambda: {"checked": 0, "cleared": 0, "errors": 0},
+        )
+
+        # Make the per-target prune trivially succeed.
+        target_count = len(daemon.DispatcherDaemon._HOUSEKEEPING_TARGETS)
+        conn.cursor_instance.fetch_queue = [None] * target_count
+
+        # MUST NOT raise.
+        result = d._housekeeping_tick()
+
+        # Failure event surfaced.
+        failures = handler.events("stale_arn_bulk_clear_failed")
+        assert len(failures) == 1
+        # Per-target sweeps still ran.
+        assert "queue_snapshots" in result
+        # Counter still advances.
+        assert d._housekeeping_ticks == 1
+
+
+class TestStaleArnConfigPlumbing:
+    """Constants + config key shape (#3801)."""
+
+    def test_default_constant_is_module_level(self) -> None:
+        assert hasattr(daemon, "DEFAULT_STALE_ARN_CLEAR_AGE_HOURS")
+        assert isinstance(daemon.DEFAULT_STALE_ARN_CLEAR_AGE_HOURS, int)
+        assert daemon.DEFAULT_STALE_ARN_CLEAR_AGE_HOURS > 0
+
+    def test_backup_watchdog_constants_are_gone(self) -> None:
+        """#3801 deleted the backup watchdog (#3794). Its module-level
+        constants must not be re-introduced — the per-row reaper wedge
+        cause is now gone, so the backup watchdog has no rationale.
+        """
+        assert not hasattr(daemon, "DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS")
+        assert not hasattr(daemon, "BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS")

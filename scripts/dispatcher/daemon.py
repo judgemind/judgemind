@@ -188,29 +188,6 @@ DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS = 120
 #: change, not a config flip.
 WATCHDOG_POLL_INTERVAL_SECONDS = 30
 
-#: Backup watchdog — EXIT threshold (#3794).  The *primary* watchdog
-#: (``_watchdog_loop``) fires at
-#: :data:`DEFAULT_SCHEDULER_TICK_STALL_EXIT_SECONDS` (120s) but calls
-#: ``self._log.error(...)`` before ``os._exit``, which acquires the
-#: logging-handler RLock.  If the wedged scheduler thread stalled while
-#: holding that RLock (e.g. mid-log-call), the primary watchdog deadlocks
-#: and never calls ``os._exit``.  The backup watchdog runs independently,
-#: uses only ``os.write`` + ``os._exit`` (no stdlib logging, no locks),
-#: and fires after a much longer threshold so it acts purely as a
-#: last-resort kill — the primary watchdog should always fire first under
-#: non-deadlocked conditions.
-#:
-#: 600s = 10 min.  The primary EXIT threshold is 120s; 600s gives the
-#: primary 5× headroom to fire first before the backup has to kick in.
-#: Even at 600s a backup-triggered restart is vastly better than the
-#: production scenario (2026-04-25: 30+ min silent before manual
-#: force-redeploy).
-DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS = 600
-
-#: Backup watchdog poll cadence.  5s — tighter than the primary 30s so
-#: the backup can fire promptly once its 600s threshold is exceeded.
-BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS = 5
-
 #: boto3 ECS client socket timeouts (#3351). Applied to every
 #: :meth:`DispatcherDaemon._make_ecs_client` invocation via a
 #: :class:`botocore.config.Config`. Without these the AWS SDK defaults
@@ -353,6 +330,21 @@ DEFAULT_NOTIFICATION_RETENTION_DAYS = 30
 #: ``dispatcher.config`` and thread it through ``_read_retention_days``
 #: the same way the other targets do. Issue #3012.
 DEFAULT_RALPH_PATCH_RETENTION_DAYS = 7
+
+#: Age (in hours) at which a stale ``dispatcher.agents.agent_task_arn``
+#: row gets bulk-cleared by the housekeeping tick (#3801). The Fargate
+#: stopped-task retention window is ~1h, so any row whose
+#: ``agent_task_arn`` is non-NULL AND ``started_at`` is older than this
+#: threshold is, by definition, ECS-untrackable — the per-row reaper
+#: branch that previously called ``_reap_finalize_ecs_success`` for each
+#: such row was a wedge cause (74-148 sequential ``gh`` subprocess calls
+#: per scheduler tick at high backlog) and is deleted. The bulk SQL
+#: ``UPDATE ... SET agent_task_arn = NULL`` clears the entire backlog in
+#: one round-trip instead. Default 2h gives the reaper one full Fargate
+#: retention window of headroom before housekeeping pre-empts it.
+#: Overridable via the ``stale_arn_clear_age_hours`` row in
+#: ``dispatcher.config`` (operator knob — no redeploy needed).
+DEFAULT_STALE_ARN_CLEAR_AGE_HOURS = 2
 
 #: Default repo the daemon watches. Overridden by the ``GITHUB_REPO``
 #: env var, wired in the terraform module.
@@ -2702,10 +2694,6 @@ class DispatcherDaemon:
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop: threading.Event = threading.Event()
         self._watchdog_warn_emitted_for_gap: bool = False
-        # Backup watchdog (#3794) — fires via os._exit(138) without logging
-        # if the primary watchdog deadlocks on the logging-handler RLock.
-        self._backup_watchdog_thread: threading.Thread | None = None
-        self._backup_watchdog_stop: threading.Event = threading.Event()
         # #3658 — async phase subprocess tracker for verify / fix-ci / retro.
         # Keyed by ``agent_id``, value is a dict with keys:
         #   ``phase``, ``pid``, ``stdout_path``, ``stderr_path``,
@@ -25214,64 +25202,23 @@ class DispatcherDaemon:
         reaped_success = 0
         reaped_failure = 0
         still_running = 0
+        # #3801 — the per-row untracked-ARN finalize loop was deleted as
+        # the load-bearing wedge cause: at high stale-row count it ran
+        # 74-148 sequential ``gh`` subprocess calls per scheduler tick
+        # (label strip + PR-state verify per row), holding the GIL long
+        # enough that the watchdog threads could never preempt. The
+        # housekeeping bulk SQL ``UPDATE dispatcher.agents SET
+        # agent_task_arn = NULL WHERE started_at < now() - interval '%s
+        # hours'`` (see :meth:`_clear_stale_agent_task_arns`) drains the
+        # backlog in one round-trip. After that lands the reaper's
+        # SELECT bound (``agent_task_arn IS NOT NULL``) is naturally
+        # bounded by ``started_at >= now() - <stale_arn_clear_age_hours>``,
+        # which is well inside the Fargate stopped-task retention window
+        # (~1h) — every ARN returns with metadata, so the untracked
+        # branch was unreachable anyway. The ``reaped_untracked`` key
+        # stays in the summary dict (returning 0) for a few releases so
+        # the cockpit's ``reap_untracked`` field doesn't break.
         reaped_untracked = 0
-
-        # Issue #3344: any ARN we sent that ECS does NOT return is a
-        # "terminal-untrackable" row — the task left the Fargate stopped-
-        # task retention window (~1h) and DescribeTasks no longer has
-        # metadata for it. Pre-#3344 those rows stayed in the SELECT
-        # forever (zero forward progress every tick) and eventually
-        # wedged the daemon. We treat them as terminal: run the same
-        # finalize sequence (label strip + merged_at stamp + ARN clear)
-        # so the row drops out of the next tick's SELECT. ARNs returned
-        # WITH metadata (any non-empty lastStatus) follow the regular
-        # STOPPED / RUNNING / etc. branches below; ARNs returned with an
-        # EMPTY lastStatus are also treated as untracked because Fargate
-        # occasionally returns a stub entry that conveys no useful state.
-        returned_arns_with_status: set[str] = set()
-        returned_arns_empty_status: set[str] = set()
-        for task in tasks:
-            task_arn = task.get("taskArn", "")
-            if not task_arn:
-                continue
-            if task.get("lastStatus"):
-                returned_arns_with_status.add(task_arn)
-            else:
-                returned_arns_empty_status.add(task_arn)
-
-        sent_arns: set[str] = set(arns)
-        # Untracked = sent but missing from response, OR returned with
-        # no usable lastStatus.
-        untracked_arns = (
-            sent_arns - returned_arns_with_status
-        ) | returned_arns_empty_status
-        for untracked_arn in untracked_arns:
-            row = arn_to_row.get(untracked_arn)
-            if row is None:
-                continue
-            u_agent_id, u_issue_number, _u_arn, _u_phase, _u_status = row
-            self._log.info(
-                "daemon.agent_runner_reaped_arn_untracked",
-                extra={
-                    "event": "agent_runner_reaped_arn_untracked",
-                    "run_id": self._run_id,
-                    "agent_id": u_agent_id,
-                    "issue_number": u_issue_number,
-                    "task_arn": untracked_arn,
-                    "reason": (
-                        "empty_last_status"
-                        if untracked_arn in returned_arns_empty_status
-                        else "not_in_describe_tasks_response"
-                    ),
-                },
-            )
-            # Reuse the success-branch finalize: label strip (best-effort),
-            # merged_at stamp (idempotent + gated by pr_number IS NOT NULL),
-            # agent_task_arn clear. The merged_at WHERE filter handles the
-            # no-PR case naturally — the UPDATE is a no-op when there is
-            # no PR row.
-            self._reap_finalize_ecs_success(u_agent_id, u_issue_number)
-            reaped_untracked += 1
 
         for task in tasks:
             task_arn = task.get("taskArn", "")
@@ -25285,10 +25232,12 @@ class DispatcherDaemon:
             row = arn_to_row.get(task_arn)
             if row is None:
                 continue
-            # Issue #3344: rows with empty lastStatus were already
-            # finalized as untracked above — skip the regular branches
-            # so we don't double-count or fight ourselves on idempotent
-            # SQL.
+            # #3801 — rows with empty ``lastStatus`` no longer get the
+            # per-row untracked-finalize treatment (deleted with the
+            # housekeeping bulk-clear). Skip them so we don't trip the
+            # ``last_status != "STOPPED"`` ``still_running`` increment
+            # below — the housekeeping tick will null the ARN on its
+            # next cadence and the row drops out of the SELECT.
             if not last_status:
                 continue
             agent_id, issue_number, _arn, phase, status = row
@@ -25851,6 +25800,62 @@ class DispatcherDaemon:
             return default_days
         return configured
 
+    def _clear_stale_agent_task_arns(self) -> int:
+        """Bulk-clear ``agent_task_arn`` for agents older than the stale cutoff (#3801).
+
+        Issues a single ``UPDATE dispatcher.agents SET agent_task_arn = NULL
+        WHERE agent_task_arn IS NOT NULL AND started_at < now() - interval
+        '%s hours'`` against the configured stale-ARN age (default 2h via
+        :data:`DEFAULT_STALE_ARN_CLEAR_AGE_HOURS`, overridable via the
+        ``stale_arn_clear_age_hours`` row in ``dispatcher.config``).
+
+        This deletes the wedge-prone per-row finalize loop in
+        :meth:`_reap_completed_agent_tasks`. Pre-#3801 each stale row
+        triggered 1-2 sequential ``gh`` subprocess calls (label strip +
+        PR-state verify) inside the scheduler tick — at observed
+        ``reap_active=75 / reap_untracked=74`` that's 74-148 ``gh``
+        calls per tick, which holds the GIL long enough that the
+        watchdog cannot preempt. The bulk SQL clears the entire backlog
+        in one round-trip (microseconds for thousands of rows) and the
+        reaper's SELECT bound on ``agent_task_arn IS NOT NULL`` is then
+        naturally bounded by ``started_at >= now() - <age>`` — well
+        inside the Fargate stopped-task retention window (~1h), so the
+        per-row untracked branch is unreachable.
+
+        Returns the number of rows cleared (``cur.rowcount``). Logs
+        ``daemon.stale_arn_bulk_cleared`` with the count + cutoff for
+        observability. Failures are caught by the caller
+        (:meth:`_housekeeping_tick`).
+        """
+        assert self._conn is not None, "connect() must run before housekeeping"
+        cutoff_hours = self._read_retention_days(
+            "stale_arn_clear_age_hours", DEFAULT_STALE_ARN_CLEAR_AGE_HOURS
+        )
+        # ``make_interval(hours => %s)`` keeps the cutoff bound via psycopg
+        # parameter substitution rather than f-string interpolation —
+        # mirrors the housekeeping DELETE pattern. ``cutoff_hours`` is
+        # validated positive int by ``_read_retention_days``.
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE dispatcher.agents "
+                "SET agent_task_arn = NULL "
+                "WHERE agent_task_arn IS NOT NULL "
+                "  AND started_at < now() - make_interval(hours => %s)",
+                (cutoff_hours,),
+            )
+            rows_cleared = cur.rowcount or 0
+        self._conn.commit()
+        self._log.info(
+            "daemon.stale_arn_bulk_cleared",
+            extra={
+                "event": "stale_arn_bulk_cleared",
+                "run_id": self._run_id,
+                "rows_cleared": rows_cleared,
+                "cutoff_hours": cutoff_hours,
+            },
+        )
+        return rows_cleared
+
     def _reconcile_stale_merged_at(self) -> dict[str, int]:
         """Hourly guard that clears false-shipped ``merged_at`` stamps (#3752).
 
@@ -26021,6 +26026,31 @@ class DispatcherDaemon:
                 },
             )
 
+        # Issue #3801: bulk-clear stale ``agent_task_arn`` rows so the
+        # reaper's per-tick scope is bounded by the Fargate stopped-task
+        # retention window. Runs in its own try/except so a DB hiccup
+        # here does not break the prune loop or merged_at reconcile.
+        # On failure we fall back to one of:
+        #   * the per-row reaper success-already-terminal branch (still
+        #     in place, load-bearing for #2927/#2953/#3324/#3752 — only
+        #     the untracked branch was deleted),
+        #   * the next housekeeping tick (rerun in 1h),
+        #   * the primary watchdog (#3097) if a wedge persists.
+        try:
+            self._clear_stale_agent_task_arns()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            self._log.exception(
+                "daemon.stale_arn_bulk_clear_failed",
+                extra={
+                    "event": "stale_arn_bulk_clear_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
         self._housekeeping_ticks += 1
         return per_table
 
@@ -26075,38 +26105,37 @@ class DispatcherDaemon:
         return dump
 
     def _record_scheduler_step(self, step: str, t_before: float) -> float:
-        """Refresh the watchdog heartbeat + warn on slow steps (#3205).
+        """Warn on slow scheduler-tick sub-steps (#3205, #3801).
 
         Called from :meth:`scheduler_tick` between each major sub-step
         (``_consume_commands``, concurrency_cap read, ``_process_retry_markers``,
         ``_reap_completed_agent_tasks``, ``_scan_queue_and_snapshot``,
         ``_scan_blocked_and_snapshot``, ``_active_agent_count``,
-        ``_maybe_spawn_orchestration_thread``) so the #3097 watchdog
-        observes forward progress even when the tick body is long AND
-        so we can pinpoint which step owns a wedge BEFORE the 300s
-        watchdog threshold fires.
+        ``_maybe_spawn_orchestration_thread``) to surface a slow sub-step
+        as a ``scheduler_tick_slow_<step>`` WARNING when its elapsed
+        time exceeds :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS`. The
+        log line names the culprit BEFORE the watchdog dump fires so
+        next-occurrence self-diagnosis is cheap.
 
-        The pre-#3205 code updated ``_last_scheduler_tick_at`` only at
-        the start of the tick, which meant a mid-body wedge looked
-        "fresh" for the remainder of the current tick's budget — the
-        watchdog could only see stalls that spanned *between* ticks.
-        Updating after every step both shortens the watchdog's
-        observation window AND produces a ``scheduler_tick_slow_<step>``
-        WARNING naming the culprit step if its elapsed time exceeds
-        :data:`SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS` — so the NEXT
-        wedge self-diagnoses without waiting for the 5 min watchdog
-        dump.
+        **Watchdog heartbeat is NOT refreshed here (#3801).** The pre-#3801
+        code wrote ``self._last_scheduler_tick_at = now`` between every
+        sub-step. Intent: "give the watchdog forward-progress signal
+        mid-tick." Side effect: a multi-sub-step wedge could never trip
+        the watchdog because each fast sub-step reset the timer. Example:
+        12 reaper sub-steps × 60s each = 720s total tick, but the
+        watchdog never observed an elapsed >120s gap. That side effect
+        is the load-bearing reason the 2026-04-29 reaper wedge stayed
+        silent for hours despite both primary (#3097) and backup (#3794)
+        watchdogs being alive. Removing the per-sub-step refresh closes
+        that hole — the primary watchdog now correctly observes the
+        single ``scheduler_tick`` entry timestamp and fires once the
+        whole tick exceeds the EXIT threshold.
 
         Returns ``time.monotonic()`` so the caller can chain by passing
         the return value as the next step's ``t_before``.
         """
         now = time.monotonic()
         elapsed = now - t_before
-        # Advance the watchdog heartbeat. Single-writer (scheduler
-        # thread) / single-reader (watchdog thread) float assignment
-        # is atomic on CPython — same no-lock semantics as the tick-
-        # entry update at the top of scheduler_tick (#3097).
-        self._last_scheduler_tick_at = now
         if elapsed >= SCHEDULER_TICK_SLOW_STEP_WARN_SECONDS:
             self._log.warning(
                 f"daemon.scheduler_tick_slow_{step}",
@@ -26121,36 +26150,26 @@ class DispatcherDaemon:
         return now
 
     def _record_supervisor_step(self, step: str, t_before: float) -> float:
-        """Refresh the watchdog heartbeat + warn on slow supervisor steps (#3403).
+        """Warn on slow supervisor-tick sub-steps (#3403, #3801).
 
         Mirror of :meth:`_record_scheduler_step` for :meth:`supervisor_tick`.
-        Called between each major sub-step so:
+        Emits a ``daemon.supervisor_tick_slow_<step>`` WARNING the moment
+        a sub-step exceeds :data:`SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS`,
+        producing a self-diagnosing log line BEFORE the watchdog has to
+        dump the whole thread set.
 
-        * The :meth:`_watchdog_loop` thread observes forward progress
-          mid-supervisor-tick — pre-#3403 a long supervisor step (e.g. a
-          slow ``_advance_running_agents`` pass, an unresponsive
-          ``cloudwatch:PutMetricData``, a wedged ``gh pr view``) only
-          refreshed ``_last_scheduler_tick_at`` at the end of the
-          supervisor tick, so a wedge mid-supervisor would still trip
-          the watchdog after 60s but the log would name the whole tick
-          rather than the offending sub-step.
-        * A ``daemon.supervisor_tick_slow_<step>`` WARNING fires the moment
-          a sub-step exceeds :data:`SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS`,
-          producing a self-diagnosing log line BEFORE the watchdog has to
-          dump the whole thread set.
+        **Watchdog heartbeat is NOT refreshed here (#3801).** See
+        :meth:`_record_scheduler_step` for the rationale — the
+        per-sub-step refresh hid multi-sub-step wedges from the watchdog
+        and is the load-bearing reason the 2026-04-29 reaper wedge
+        stayed silent.
 
         Returns ``time.monotonic()`` so callers can chain
         ``t_step = _record_supervisor_step("foo", t_step)`` between
         sub-steps without re-reading the clock.
-
-        The single-writer (supervisor thread, which on the daemon is the
-        same as the main run-forever thread) / single-reader (watchdog
-        thread) atomic-float-assignment semantics are identical to
-        :meth:`_record_scheduler_step` — see that method's docstring.
         """
         now = time.monotonic()
         elapsed = now - t_before
-        self._last_scheduler_tick_at = now
         if elapsed >= SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS:
             self._log.warning(
                 f"daemon.supervisor_tick_slow_{step}",
@@ -26406,7 +26425,7 @@ class DispatcherDaemon:
                     pass
 
     def _start_watchdog(self) -> None:
-        """Spawn the supervisor watchdog thread (#3097, #3351, #3386).
+        """Spawn the supervisor watchdog thread (#3097, #3351, #3386, #3801).
 
         Idempotent — a second call while the thread is alive is a no-op.
         Called from :meth:`run_forever` BEFORE the initial scheduler
@@ -26421,6 +26440,13 @@ class DispatcherDaemon:
         construction and :meth:`run_forever`; without this re-seed the
         watchdog would observe a stale baseline and fire a spurious WARN
         before the first tick has had a chance to run.
+
+        #3801 deleted the backup watchdog (#3794). The backup existed
+        because the primary's per-sub-step heartbeat refresh
+        (:meth:`_record_scheduler_step`) hid multi-sub-step wedges from
+        the primary's elapsed-since-last-tick check. With the heartbeat
+        refresh gone (also #3801) the primary observes the whole-tick
+        elapsed and fires correctly.
         """
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             return
@@ -26432,87 +26458,6 @@ class DispatcherDaemon:
             daemon=True,
         )
         self._watchdog_thread.start()
-        self._start_backup_watchdog()
-
-    def _backup_watchdog_loop(self) -> None:
-        """Last-resort kill path (#3794) — fires when the *primary* watchdog
-        deadlocks on the stdlib logging-handler RLock.
-
-        The primary :meth:`_watchdog_loop` calls ``self._log.error(...)``
-        before ``os._exit``, which acquires the logging-handler RLock.  If
-        the wedged scheduler thread stalled mid-log-call and holds that lock,
-        the primary watchdog blocks forever on the lock acquisition and never
-        calls ``os._exit``.
-
-        This backup watchdog is deliberately primitive: it reads
-        ``_last_scheduler_tick_at`` (a plain float — no lock required on
-        CPython), and on stall calls ``os.write(2, ...)`` to write a raw
-        UTF-8 marker to stderr and then ``os._exit(138)`` (138 =
-        :data:`DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS` / 128+10; 138
-        is distinct from the primary's 137 so post-mortem can identify which
-        watchdog fired).  **No stdlib logging is used on the kill path** —
-        that is the whole point.
-
-        Exit code 138 (not 137) deliberately differs from the primary
-        watchdog so CloudWatch / the ECS stop-reason field can distinguish
-        "primary watchdog fired" from "backup watchdog fired — root cause is
-        likely logging-lock deadlock on the primary".
-
-        The threshold is :data:`DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS`
-        (600s) — 5× the primary EXIT threshold so the primary always fires
-        first under non-deadlocked conditions.  600s is still vastly better
-        than the 2026-04-25 production scenario (30+ min silent before manual
-        force-redeploy).
-
-        Exits cleanly when ``_backup_watchdog_stop`` is set, matching the
-        shutdown semantics of :meth:`_watchdog_loop`.
-        """
-        import os as _os  # noqa: PLC0415 — shadow-free reference for the kill path
-
-        exit_threshold = DEFAULT_BACKUP_WATCHDOG_EXIT_THRESHOLD_SECONDS
-        poll_interval = BACKUP_WATCHDOG_POLL_INTERVAL_SECONDS
-        while not self._backup_watchdog_stop.is_set():
-            if self._backup_watchdog_stop.wait(poll_interval):
-                break
-            now = time.monotonic()
-            elapsed = now - self._last_scheduler_tick_at
-            if elapsed >= exit_threshold:
-                # Kill path: bypass ALL stdlib logging so a held logging RLock
-                # cannot prevent the process from dying.  Write a raw UTF-8
-                # marker to stderr so CloudWatch / the ECS task log stream
-                # captures evidence of which watchdog fired.
-                pid = _os.getpid()
-                _os.write(
-                    2,
-                    (
-                        f"dispatcher.backup_watchdog_exit pid={pid} "
-                        f"elapsed_seconds={elapsed:.1f} "
-                        f"threshold_seconds={exit_threshold} "
-                        f"exit_code=138\n"
-                    ).encode(),
-                )
-                _os._exit(138)
-
-    def _start_backup_watchdog(self) -> None:
-        """Spawn the backup watchdog thread (#3794).
-
-        Idempotent — a second call while the thread is alive is a no-op.
-        Called from :meth:`_start_watchdog` immediately after spawning the
-        primary watchdog thread so both are running before the first
-        scheduler tick.
-        """
-        if (
-            self._backup_watchdog_thread is not None
-            and self._backup_watchdog_thread.is_alive()
-        ):
-            return
-        self._backup_watchdog_stop.clear()
-        self._backup_watchdog_thread = threading.Thread(
-            target=self._backup_watchdog_loop,
-            name="dispatcher-backup-watchdog",
-            daemon=True,
-        )
-        self._backup_watchdog_thread.start()
 
     # ── signal handling ────────────────────────────────────────────────
 

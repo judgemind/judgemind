@@ -1,13 +1,13 @@
-"""Unit tests for #3403 supervisor_tick instrumentation + watchdog heartbeat.
+"""Unit tests for #3403 supervisor_tick instrumentation.
 
 Covers the diagnostic-first changes added to :mod:`scripts.dispatcher.daemon`:
 
 * :meth:`DispatcherDaemon._record_supervisor_step` — mirror of the #3205
-  ``_record_scheduler_step`` for supervisor sub-steps. Refreshes
-  ``_last_scheduler_tick_at`` so the watchdog observes forward progress
-  mid-supervisor-tick AND emits a
+  ``_record_scheduler_step`` for supervisor sub-steps. Emits a
   ``daemon.supervisor_tick_slow_<step>`` WARNING when a sub-step exceeds
-  :data:`SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS`.
+  :data:`SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS`. Per-sub-step refresh
+  of ``_last_scheduler_tick_at`` was removed in #3801 — see
+  ``test_record_step_does_not_refresh_last_scheduler_tick_at``.
 * :meth:`DispatcherDaemon.supervisor_tick` actually calls
   ``_record_supervisor_step`` between sub-steps so a slow sub-step
   produces a named WARN event rather than just a generic
@@ -184,25 +184,32 @@ class TestRecordSupervisorStep:
         threshold = getattr(rec, "threshold_seconds", None)
         assert threshold == daemon.SUPERVISOR_TICK_SLOW_STEP_WARN_SECONDS
 
-    def test_record_step_updates_last_scheduler_tick_at(self, tmp_path: Path) -> None:
-        """The watchdog heartbeat must advance per-step so a mid-supervisor
-        wedge produces a ``scheduler_tick_stalled`` within the normal
-        WARN window rather than hiding under the supervisor entry
-        timestamp."""
+    def test_record_step_does_not_refresh_last_scheduler_tick_at(
+        self, tmp_path: Path
+    ) -> None:
+        """#3801: per-sub-step heartbeat refresh is REMOVED.
+
+        See ``test_record_step_does_not_refresh_last_scheduler_tick_at``
+        in ``test_daemon_scheduler_tick_instrumentation.py`` for the
+        full rationale. Same fix here for the supervisor mirror.
+        """
         d, _conn, _handler = _make_daemon(tmp_path)
-        d._last_scheduler_tick_at = 0.0  # known-stale
-        before = time.monotonic()
-        d._record_supervisor_step("stuck_check", before)
-        after = time.monotonic()
-        assert before <= d._last_scheduler_tick_at <= after
+        d._last_scheduler_tick_at = 0.0  # known-stale sentinel
+        d._record_supervisor_step("stuck_check", time.monotonic())
+        # Heartbeat must NOT be advanced by the per-step recorder.
+        assert d._last_scheduler_tick_at == 0.0
 
     def test_record_step_returns_current_monotonic(self, tmp_path: Path) -> None:
         """Callers chain ``t_step = _record_supervisor_step(...)`` so the
-        return value must be ``time.monotonic()`` after the heartbeat
-        write — matching ``_last_scheduler_tick_at``."""
+        return value must be the ``time.monotonic()`` reading taken at
+        the end of the recorder. ``_last_scheduler_tick_at`` is no
+        longer touched (#3801) so we just bound the return against
+        before/after wall-clock."""
         d, _conn, _handler = _make_daemon(tmp_path)
-        returned = d._record_supervisor_step("stuck_check", time.monotonic())
-        assert returned == d._last_scheduler_tick_at
+        before = time.monotonic()
+        returned = d._record_supervisor_step("stuck_check", before)
+        after = time.monotonic()
+        assert before <= returned <= after
 
 
 # --------------------------------------------------------------------------
