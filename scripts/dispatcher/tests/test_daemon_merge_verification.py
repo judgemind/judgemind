@@ -348,9 +348,15 @@ class TestMergeStampsWhenPrStateMerged:
 class TestReapFinalizeSkipsStampWhenPrOpen:
     """AC1 half 2: _reap_finalize_ecs_success fetches PR state before stamp.
 
-    When state==OPEN: merged_at UPDATE skipped, but label-strip and ARN
-    clear still run (independent invariants).
+    When state==OPEN: merged_at UPDATE skipped, but label-strip still
+    runs (independent invariant).
     This test FAILS against pre-#3752 code (no verification in reap path).
+
+    Issue #3805: ARN clear is no longer the responsibility of this
+    helper — it lives at the ``_reap_completed_agent_tasks`` call site
+    via :meth:`_clear_agent_task_arn` so all five terminal branches
+    clear uniformly. Test updated to no longer assert ARN clear from
+    inside ``_reap_finalize_ecs_success``.
     """
 
     def test_reap_finalize_skips_stamp_when_pr_open(self, tmp_path: Path) -> None:
@@ -390,13 +396,21 @@ class TestReapFinalizeSkipsStampWhenPrOpen:
         assert unverified, "expected reap_finalize_unverified event"
         assert unverified[0].pr_number == 303
 
-        # ARN clear must also still run
+        # Issue #3805: ARN clear is no longer this function's job —
+        # it lives at the ``_reap_completed_agent_tasks`` call site.
+        # ``_reap_finalize_ecs_success`` must NOT issue an
+        # ``agent_task_arn = NULL`` UPDATE. The reaper-level uniform
+        # clear is exercised by
+        # ``test_daemon_reap_completed_agent_tasks.TestReapArnClearAcrossAllTerminalBranches``.
         arn_clears = [
             e
             for e in conn.cursor_instance.executed
             if "SET agent_task_arn = NULL" in e[0]
         ]
-        assert arn_clears, "ARN clear must still run even when stamp is skipped"
+        assert arn_clears == [], (
+            "post-#3805: _reap_finalize_ecs_success must NOT clear "
+            "agent_task_arn — the clear lives at the reaper call site"
+        )
 
 
 # --------------------------------------------------------------------------
