@@ -353,6 +353,80 @@ class TestResumeRetryingAgentExecutionModeFilter:
 
 
 # --------------------------------------------------------------------------
+# #3809 — _warn_on_ecs_retrying_rows must emit at most once per agent_id
+# --------------------------------------------------------------------------
+
+
+class TestWarnOnEcsRetryingRowsOnceShotPerAgent:
+    """The ``agent_ecs_retry_not_supported`` WARNING must fire once per agent.
+
+    Pre-#3809, :meth:`_warn_on_ecs_retrying_rows` re-emitted the WARN
+    on every supervisor tick (~every 10s) for every ECS-mode retrying
+    row in the table. With two such rows persistently stuck this
+    floods CloudWatch with ~720 WARN lines/hour for the same two
+    rows. The legitimate signal is "two ECS agents need cleanup" —
+    fire that ONCE per ``(run_id, agent_id)`` pair, not every tick.
+
+    #3809 introduces a per-process ``_observed_ecs_retrying`` set that
+    gates emission: an ``agent_id`` already in the set is skipped on
+    subsequent ticks. The set is in-memory only — daemon restart
+    resets it (and re-emits one WARN per row), which is the right
+    cadence for an operator-visible signal.
+    """
+
+    def test_warning_emits_once_per_agent_across_five_ticks(
+        self, tmp_path: Path
+    ) -> None:
+        """Stage two ECS-retrying rows, run 5 supervisor ticks, expect 2 warns."""
+        d, conn, handler = _make_daemon(tmp_path)
+        # Each call to _warn_on_ecs_retrying_rows issues ONE SELECT
+        # (`fetchall`) returning the same two rows. Five ticks → five
+        # SELECTs returning the same payload.
+        rows = [
+            ("agent-ecs-1", 3778),
+            ("agent-ecs-2", 3641),
+        ]
+        conn.cursor_instance.fetchall_queue = [rows for _ in range(5)]
+
+        for _ in range(5):
+            d._warn_on_ecs_retrying_rows()
+
+        warn_events = handler.events("agent_ecs_retry_not_supported")
+        # Exactly TWO warnings — one per distinct agent_id — across
+        # all five ticks. Pre-#3809 this asserted-against-10
+        # (5 ticks × 2 rows).
+        assert len(warn_events) == 2, (
+            f"#3809 — expected 2 warnings (one per agent_id) across 5 "
+            f"ticks, got {len(warn_events)}. The warning must be gated "
+            f"on a per-process set so persistent ECS-retrying rows "
+            f"don't flood CloudWatch every tick."
+        )
+        emitted_agent_ids = sorted(getattr(r, "agent_id") for r in warn_events)
+        assert emitted_agent_ids == ["agent-ecs-1", "agent-ecs-2"]
+
+    def test_new_agent_after_first_emission_still_warns(self, tmp_path: Path) -> None:
+        """A new ECS-retrying row appearing later still produces a warning."""
+        d, conn, handler = _make_daemon(tmp_path)
+        # Tick 1: only agent-ecs-1 is retrying.
+        # Tick 2: agent-ecs-2 also retrying. Should warn for agent-ecs-2 only.
+        # Tick 3: both rows still retrying. No new warnings.
+        conn.cursor_instance.fetchall_queue = [
+            [("agent-ecs-1", 3778)],
+            [("agent-ecs-1", 3778), ("agent-ecs-2", 3641)],
+            [("agent-ecs-1", 3778), ("agent-ecs-2", 3641)],
+        ]
+
+        for _ in range(3):
+            d._warn_on_ecs_retrying_rows()
+
+        warn_events = handler.events("agent_ecs_retry_not_supported")
+        emitted_agent_ids = sorted(getattr(r, "agent_id") for r in warn_events)
+        assert emitted_agent_ids == ["agent-ecs-1", "agent-ecs-2"], (
+            f"#3809 — expected one WARN per distinct agent_id, got {emitted_agent_ids}"
+        )
+
+
+# --------------------------------------------------------------------------
 # Fix 3 — _handle_force_stop branches on execution_mode for signal delivery
 # --------------------------------------------------------------------------
 
