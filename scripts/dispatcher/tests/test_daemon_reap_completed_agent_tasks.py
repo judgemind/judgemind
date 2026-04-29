@@ -785,56 +785,62 @@ class TestReapArnClearIdempotence:
 
 
 # --------------------------------------------------------------------------
-# Issue #3344 — untracked-ARN handling.
+# Issue #3801 — untracked-ARN reaper branch deleted.
 #
-# After #3329 the SELECT picks up every row with a non-NULL ARN. But ECS
-# Fargate retains stopped-task metadata for ~1h; rows older than that
-# return NO entry from DescribeTasks (or return one with empty
-# lastStatus). Pre-#3344 those rows stayed in the SELECT forever (zero
-# forward progress per tick) and eventually wedged the daemon.
+# Pre-#3801 (#3344) the reaper detected ARNs sent vs ARNs returned with
+# usable metadata, and ran the per-row finalize sequence (label strip +
+# merged_at stamp + ARN clear) on the difference. At observed
+# ``reap_active=75 / reap_untracked=74`` that's 74-148 sequential ``gh``
+# subprocess calls per scheduler tick, which holds the GIL long enough
+# that the watchdog cannot preempt — the load-bearing wedge of
+# 2026-04-29.
 #
-# The fix: detect ARNs we sent vs ARNs returned with usable metadata,
-# and run the same finalize sequence (label strip + merged_at stamp +
-# ARN clear) on the difference. Verified by:
-# - 5 sent, 2 returned -> 3 untracked finalize sequences fire.
-# - 1 returned with empty lastStatus -> treated as untracked.
+# The fix consolidated stale-ARN cleanup into a single bulk SQL UPDATE
+# in :meth:`_housekeeping_tick` and deleted the per-row reaper branch.
+# These tests verify:
+# - 5 sent, 2 returned -> ZERO per-row work for the 3 missing rows.
+# - 1 returned with empty lastStatus -> SKIPPED (no per-row work, no
+#   ``still_running`` increment).
 # - re-running with all rows ARN-cleared -> SELECT empty, zero work.
 # --------------------------------------------------------------------------
 
 
 class TestReapUntrackedArns:
-    """Stale-ARN cascade fix (#3344)."""
+    """Reaper untracked-ARN branch is deleted (#3801).
 
-    def _queue_per_row_finalize_cursors(
-        self, conn: _FakeConn, rows_count: int
-    ) -> list[_FakeCursor]:
-        """Per untracked row, ``_reap_finalize_ecs_success`` issues two
-        UPDATEs (merged_at gated, then ARN clear). Queue the cursors so
-        the test can assert on each.
-        """
-        cursors: list[_FakeCursor] = []
-        for _ in range(rows_count):
-            merged_at_cur = _FakeCursor()
-            arn_clear_cur = _FakeCursor()
-            conn.queue_cursor(merged_at_cur)
-            conn.queue_cursor(arn_clear_cur)
-            cursors.extend([merged_at_cur, arn_clear_cur])
-        return cursors
+    Pre-#3801 the reaper iterated ``_reap_finalize_ecs_success`` over
+    every row whose ARN ECS had no metadata for. At observed
+    ``reap_active=75 / reap_untracked=74`` that's 74-148 sequential
+    ``gh`` subprocess calls per scheduler tick (label strip + PR-state
+    verify), holding the GIL long enough that the watchdog could not
+    preempt — the load-bearing wedge of 2026-04-29.
 
-    def test_three_of_five_arns_missing_runs_untracked_finalize(
+    The fix is a housekeeping bulk SQL ``UPDATE dispatcher.agents SET
+    agent_task_arn = NULL WHERE started_at < now() - interval '%s
+    hours'`` that drains the backlog in one round-trip
+    (:meth:`_clear_stale_agent_task_arns`). After housekeeping clears
+    the backlog, the reaper's ``agent_task_arn IS NOT NULL`` SELECT
+    is naturally bounded by ``started_at >= now() - <age>`` — well
+    inside the Fargate stopped-task retention window (~1h) — so the
+    untracked branch is unreachable. The branch was deleted; these
+    tests pin the new behavior.
+    """
+
+    def test_arn_missing_from_describe_tasks_does_no_per_row_work(
         self, caplog: Any
     ) -> None:
         """SELECT returns 5 ARNs; DescribeTasks returns only 2.
 
         The 3 missing rows must:
-        - emit ``agent_runner_reaped_arn_untracked`` (one per row).
-        - run the finalize sequence (label strip + merged_at stamp gated
-          by ``pr_number IS NOT NULL`` + ``agent_task_arn = NULL``).
-        - drop out of the next tick's SELECT (verified by the ARN-clear
-          UPDATE).
-        - increment ``reaped_untracked``; not ``still_running``.
+        - NOT emit ``agent_runner_reaped_arn_untracked``.
+        - NOT call ``_gh_issue_remove_labels`` per row.
+        - NOT issue per-row UPDATEs.
+        - leave ``reaped_untracked`` at 0 (key still in summary for
+          cockpit back-compat — see the docstring on this class).
 
-        The 2 returned rows follow the regular STOPPED-success path.
+        The 2 returned rows still follow the regular STOPPED-success
+        path. The housekeeping bulk-clear (run on its own cadence) is
+        responsible for nulling those stale ARNs out of the SELECT.
         """
         d, conn = _make_daemon()
         d._read_agent_pr_number = lambda agent_id: int(agent_id.split("-")[1]) + 1000  # type: ignore[method-assign]
@@ -854,16 +860,10 @@ class TestReapUntrackedArns:
         # ECS retention has dropped the first 3 ARNs entirely; only the
         # last 2 come back in the response.
         returned_arns = all_arns[3:]
-        missing_arns = all_arns[:3]
-
-        # Per untracked row: 2 cursors (merged_at + ARN clear).
-        untracked_cursors = self._queue_per_row_finalize_cursors(
-            conn, rows_count=len(missing_arns)
-        )
 
         # The 2 returned rows take the STOPPED-success-already-terminal
         # path. Each needs: status read, finalize merged_at, ARN clear.
-        for i in range(3, 5):
+        for _ in range(2):
             status_cur = _FakeCursor()
             status_cur.fetchone_queue = [("succeeded", "done")]
             conn.queue_cursor(status_cur)
@@ -891,83 +891,41 @@ class TestReapUntrackedArns:
             summary = d._reap_completed_agent_tasks()
 
         assert summary["active"] == 5
-        assert summary["reaped_untracked"] == 3
+        # #3801 — untracked branch deleted; counter stays at 0 always.
+        assert summary["reaped_untracked"] == 0
         # The 2 returned rows ran the success-already-terminal path.
         assert summary["reaped_success"] == 2
         assert summary["reaped_failure"] == 0
         assert summary["still_running"] == 0
 
-        # Three untracked-ARN events, one per missing row.
-        events = [getattr(r, "event", None) for r in caplog.records]
+        # No untracked-ARN events at all.
         untracked_events = [
             r
             for r in caplog.records
             if getattr(r, "event", None) == "agent_runner_reaped_arn_untracked"
         ]
-        assert len(untracked_events) == 3
-        # Each event names the untracked ARN + agent_id + issue_number.
-        evt_arns = {getattr(r, "task_arn", None) for r in untracked_events}
-        assert evt_arns == set(missing_arns)
-        evt_agents = {getattr(r, "agent_id", None) for r in untracked_events}
-        assert evt_agents == {f"agent-{i}" for i in range(3)}
-        evt_issues = {getattr(r, "issue_number", None) for r in untracked_events}
-        assert evt_issues == {1000, 1001, 1002}
-        # Reason indicates the missing-from-response cause.
-        assert all(
-            getattr(r, "reason", None) == "not_in_describe_tasks_response"
-            for r in untracked_events
-        )
+        assert untracked_events == []
 
-        # Label strip called for the 3 untracked + 2 returned = 5 total.
-        # Each call uses STATUS_IN_PROGRESS_LABEL.
-        assert remove_labels_mock.call_count == 5
-        all_label_args = [c.args[1] for c in remove_labels_mock.call_args_list]
-        assert all(args == [daemon.STATUS_IN_PROGRESS_LABEL] for args in all_label_args)
+        # Label strip called only for the 2 returned rows (not 5 — that
+        # would be the pre-#3801 behavior).
+        assert remove_labels_mock.call_count == 2
 
-        # All three untracked rows issued a merged_at UPDATE (gated by
-        # ``pr_number IS NOT NULL`` so it's a no-op when no PR exists)
-        # AND an ARN-clear UPDATE. The cursor ordering interleaves
-        # (merged_at, arn_clear, merged_at, arn_clear, merged_at,
-        # arn_clear) per row.
-        for i in range(3):
-            merged_cur = untracked_cursors[i * 2]
-            arn_cur = untracked_cursors[i * 2 + 1]
-            merged_sqls = [s for s, _ in merged_cur.executed]
-            assert any("merged_at" in s for s in merged_sqls), merged_sqls
-            assert any("merged_at IS NULL" in s for s in merged_sqls)
-            assert any("pr_number IS NOT NULL" in s for s in merged_sqls)
-            arn_sqls = [s for s, _ in arn_cur.executed]
-            assert any("SET agent_task_arn = NULL" in s for s in arn_sqls), arn_sqls
+    def test_empty_last_status_is_skipped_not_finalized(self, caplog: Any) -> None:
+        """Fargate occasionally returns an entry with empty lastStatus.
 
-        # ``still_running`` did not absorb any of the untracked rows —
-        # this is the regression bar pre-#3344 was missing.
-        assert "agent_runner_reaped_arn_untracked" in events
-
-    def test_empty_last_status_treated_as_untracked(self, caplog: Any) -> None:
-        """Fargate occasionally returns an entry with empty lastStatus
-        — it counts as no usable metadata, same as missing entirely.
-
-        SELECT returns 1 ARN; DescribeTasks returns it but with
-        ``lastStatus`` empty. The row must be reaped via the untracked
-        path (label strip + merged_at + ARN clear), NOT carried as
-        ``still_running``.
+        Pre-#3801 the reaper treated those as untracked and ran the
+        per-row finalize. Post-#3801 the reaper skips them — they will
+        be cleared by the next housekeeping bulk-clear or by the reaper
+        on a future tick once Fargate produces metadata. ``still_running``
+        does NOT increment (the empty-status row is not "running"), and
+        no per-row work fires.
         """
         d, conn = _make_daemon()
-        d._read_agent_pr_number = lambda agent_id: 4242  # type: ignore[method-assign]
-        d._fetch_pr_status = lambda pr_number: {
-            "state": "MERGED",
-            "mergedAt": "2026-04-29T12:00:00Z",
-        }  # type: ignore[method-assign]
         caplog.set_level(logging.INFO, logger="test.daemon_reap")
 
         arn = "arn:aws:ecs:us-west-2:123:task/jm/empty-status"
         select_cur = _FakeCursor(rows=[("agent-empty", 4242, arn, "done", "succeeded")])
         conn.queue_cursor(select_cur)
-        # Per-untracked finalize cursors.
-        merged_cur = _FakeCursor()
-        arn_clear_cur = _FakeCursor()
-        conn.queue_cursor(merged_cur)
-        conn.queue_cursor(arn_clear_cur)
 
         fake_client = MagicMock()
         fake_client.describe_tasks.return_value = {
@@ -988,31 +946,24 @@ class TestReapUntrackedArns:
         ):
             summary = d._reap_completed_agent_tasks()
 
-        assert summary["reaped_untracked"] == 1
+        # All counters at zero — no work fired for the empty-status row.
+        assert summary["reaped_untracked"] == 0
         assert summary["still_running"] == 0
         assert summary["reaped_success"] == 0
         assert summary["reaped_failure"] == 0
-        # Untracked path does not route via _handle_agent_failure or
-        # _mark_agent_terminal — it relies on the agent-runner having
-        # already written its terminal row (or accepts the row as gone).
+
+        # No per-row work fired.
+        remove_labels_mock.assert_not_called()
         fail_mock.assert_not_called()
         mark_mock.assert_not_called()
-        # Label stripped, merged_at gated, ARN cleared.
-        remove_labels_mock.assert_called_once_with(
-            4242, [daemon.STATUS_IN_PROGRESS_LABEL]
-        )
-        merged_sqls = [s for s, _ in merged_cur.executed]
-        assert any("merged_at" in s for s in merged_sqls)
-        arn_sqls = [s for s, _ in arn_clear_cur.executed]
-        assert any("SET agent_task_arn = NULL" in s for s in arn_sqls)
-        # Event reason should indicate empty lastStatus.
+
+        # No untracked event was emitted (the entire branch is gone).
         evts = [
             r
             for r in caplog.records
             if getattr(r, "event", None) == "agent_runner_reaped_arn_untracked"
         ]
-        assert len(evts) == 1
-        assert getattr(evts[0], "reason", None) == "empty_last_status"
+        assert evts == []
 
     def test_idempotence_after_arn_clear_select_empty(self) -> None:
         """After a tick clears all 5 ARNs via the untracked path, the
