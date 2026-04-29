@@ -13911,6 +13911,9 @@ class DispatcherDaemon:
                 # a hard-coded ``interval '24 hours'`` into the SQL —
                 # makes the constant the single source of truth and
                 # keeps the query tunable from one place.
+                # exec-mode-agnostic (#3158): status-only read; resurrection
+                # is mode-independent — both ECS and subprocess agents can
+                # hold an open PR at failure time.
                 cur.execute(
                     "SELECT agent_id, pr_number, issue_number "
                     "FROM dispatcher.agents "
