@@ -6454,19 +6454,30 @@ class DispatcherDaemon:
     def _fetch_issue_titles_for_blockers(
         self, numbers: set[int]
     ) -> dict[int, str | None]:
-        """Fetch issue titles for a set of blocker issue numbers.
+        """Fetch titles for a set of blocker issue/PR numbers.
 
-        Issues a single batched GitHub GraphQL query with one aliased
-        ``issue(number: N)`` field per capped blocker number, routed
+        Issues a single batched GitHub GraphQL query that aliases BOTH
+        ``issue(number: N)`` and ``pullRequest(number: N)`` per capped
+        blocker number. The parser prefers the issue-typed result, falling
+        back to the PR-typed result when the issue side is null. Routed
         through ``_subprocess_with_retry`` with
         ``event_name='blocker_title_fetch'``. Returns ``{number: title}``
         with ``None`` on failure (404, rate-limit, network error).
 
         Single-tick scope — no cross-tick caching. Issue #2989.
         Issue #3435: batched GraphQL replaces the per-issue loop.
+        Issue #3759: union both fields so PR-numbered blockers (e.g.
+        ``Blocked by #<fixing-PR>``) resolve cleanly. The pre-#3759
+        ``issue(number:N)``-only query emitted a top-level GraphQL error
+        on every PR number (``"Could not resolve to an Issue with the
+        number of N"``), which surfaced as a non-zero ``gh api graphql``
+        exit and failed the whole batch — even when other blockers in the
+        batch were valid issues.
 
         Caps the number of lookups at ``MAX_BLOCKER_TITLE_FETCH`` to bound
         worst-case query size when GitHub is rate-limited (issue #2989).
+        Two aliased fields per number means ``2 × MAX_BLOCKER_TITLE_FETCH``
+        nodes per query, still well under GitHub's 500-node GraphQL limit.
         """
         if not numbers:
             return {}
@@ -6479,9 +6490,16 @@ class DispatcherDaemon:
         owner = repo_parts[0]
         name = repo_parts[1] if len(repo_parts) > 1 else ""
 
-        # Build a single GraphQL query with one aliased field per number.
+        # Build a single GraphQL query with two aliased fields per number:
+        # one for the Issue-typed lookup, one for the PullRequest-typed
+        # lookup. GitHub's GraphQL ``issue(number:N)`` only resolves Issue
+        # nodes, and ``pullRequest(number:N)`` only resolves PR nodes —
+        # so unioning both is the only way to handle a number that could
+        # be either type without triggering a partial GraphQL error.
         alias_fields = " ".join(
-            f"i{n}: issue(number: {n}) {{ number title }}" for n in capped
+            f"i{n}_issue: issue(number: {n}) {{ number title }} "
+            f"i{n}_pr: pullRequest(number: {n}) {{ number title }}"
+            for n in capped
         )
         query = (
             f'query {{ repository(owner:"{owner}", name:"{name}") '
@@ -6508,17 +6526,22 @@ class DispatcherDaemon:
             )
             return {n: None for n in capped}
 
+        def _title_from(node: object) -> str | None:
+            """Return the ``title`` string from an alias node, or None."""
+            if isinstance(node, dict):
+                title = node.get("title")
+                if isinstance(title, str):
+                    return title
+            return None
+
         try:
             payload = json.loads(outcome["result"].stdout or "{}")
             repo_data = payload["data"]["repository"]
+            # Prefer the issue-typed result; fall back to PR-typed.
             return {
                 n: (
-                    repo_data[f"i{n}"]["title"]
-                    if (
-                        isinstance(repo_data.get(f"i{n}"), dict)
-                        and isinstance(repo_data[f"i{n}"].get("title"), str)
-                    )
-                    else None
+                    _title_from(repo_data.get(f"i{n}_issue"))
+                    or _title_from(repo_data.get(f"i{n}_pr"))
                 )
                 for n in capped
             }
