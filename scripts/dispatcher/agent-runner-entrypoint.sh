@@ -4275,6 +4275,27 @@ dispatch_transition_action() {
                         "$_hint" \
                         "phase=${_phase} emitted route_to_diagnoser hint=$_hint"
                     ;;
+                push_failed)
+                    # #3789: ``handle_push_and_pr`` emitted
+                    # ``{"push_failed": true, "reason": "..."}``
+                    # because ``git push`` failed (timeout, PAT
+                    # scope, pre-push hook reject, etc.). The
+                    # transition shim returned
+                    # FAILURE_HINT_PUSH_FAILED so the daemon routes
+                    # to a dedicated diagnoser fix-shape (bump
+                    # push timeout, fix PAT scope, investigate
+                    # hook) rather than the generic advance-to-
+                    # awaiting_ci that previously left the agent
+                    # reaping as missing_pr (#3663). Pull
+                    # ``push_reason`` from the transition context
+                    # for the failures-row reason text.
+                    local _pf_reason
+                    _pf_reason=$(printf '%s' "$_output" | jq -r '.reason // "unknown"' 2>/dev/null || printf 'unknown')
+                    agent_runner_reaped_failure \
+                        "push_failed" \
+                        "push_failed" \
+                        "phase=${_phase} git push failed (reason=${_pf_reason})"
+                    ;;
                 claude_phase_timeout)
                     # #3766: the ``claude -p`` per-phase timeout fired
                     # (rc=124). The transition shim returned
