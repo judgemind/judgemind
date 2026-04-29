@@ -1445,6 +1445,18 @@ FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB = "agent_runner_route_stub"
 #: backstop for any internal hang the timeouts don't anticipate.
 FAILURE_CATEGORY_AGENT_SILENT_HANG = "agent_silent_hang"
 
+#: #3777 — agent-runner's ``timeout`` wrapper fired (rc=124) and the
+#: entrypoint short-circuited out of ``run_claude_phase`` with a
+#: structured ``{"category":"claude_phase_timeout"}`` envelope.  Distinct
+#: from ``ralph_not_ship`` (silent exit, empty buffers) and from
+#: ``agent_silent_hang`` (container alive but no I/O).  Tier-3 first-
+#: occurrence: the diagnoser should look at ``elapsed_seconds`` in the
+#: block_reason, compare against the per-phase cap
+#: (``CLAUDE_PHASE_TIMEOUT_RALPH_SECONDS``), and either bump the cap
+#: (if the phase genuinely needs more wall-clock) or investigate a
+#: stuck tool-loop (if the timeout is already generous).
+FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT = "claude_phase_timeout"
+
 #: #3366 — terminal-phase → failure-category map for the bypass-prone
 #: terminals the ECS entrypoint emits with ``status='failed'`` AND
 #: container exit 0. The reaper observes these in the
@@ -1491,6 +1503,12 @@ BYPASSED_TERMINAL_PHASES_TO_ROUTE: dict[str, str] = {
     # #3586 — ralph returned non-SHIP verdict; diagnoser takes over from
     # the former local handler so it can file prereqs / close / escalate.
     "ralph_not_ship": FAILURE_CATEGORY_RALPH_NOT_SHIP,
+    # #3777 — ``timeout`` wrapper fired (rc=124); entrypoint emitted
+    # structured ``{"category":"claude_phase_timeout"}`` envelope and
+    # advanced to this descriptive terminal.  Routes to dedicated
+    # diagnoser category so operators can distinguish timeout terminals
+    # from the silent-exit ``ralph_not_ship`` shape.
+    "claude_phase_timeout": FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT,
 }
 
 #: GitHub's rejection stderr fragment when branch protection's
@@ -1806,6 +1824,10 @@ TIER_3_CATEGORIES: frozenset[str] = frozenset(
         # here so the empowered diagnoser can apply broader judgment
         # than the entrypoint's local routing table.
         FAILURE_CATEGORY_AGENT_RUNNER_ROUTE_STUB,
+        # #3777: timeout wrapper (rc=124) fired inside run_claude_phase.
+        # Diagnoser should inspect elapsed_seconds vs. per-phase cap
+        # and decide to bump the cap or investigate a stuck tool-loop.
+        FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT,
     }
 )
 

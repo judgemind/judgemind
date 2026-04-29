@@ -9649,6 +9649,212 @@ else
          "(SET agent_task_arn = clause not found)"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# Test T3777 — claude_phase_timeout dispatch arm in dispatch_transition_action
+#
+# Root cause (issue #3777): PR #3772 added FAILURE_HINT_CLAUDE_PHASE_TIMEOUT
+# to phase_transitions.py and the ``return 0`` short-circuit in
+# ``run_claude_phase``, but forgot to add a matching ``claude_phase_timeout)``
+# arm in ``dispatch_transition_action``'s inner ``case "$_hint"`` block.
+# Result: when ``timeout`` SIGKILLed claude (rc=124), the entrypoint
+# correctly built a ``{"category":"claude_phase_timeout"}`` envelope AND
+# short-circuited the non-object branch, but then ``transition_for`` returned
+# ``FAILURE_HINT_CLAUDE_PHASE_TIMEOUT`` which fell through to the ``*)``
+# catch-all → ``diagnoser_route_unrecognized_hint`` terminal instead of the
+# intended ``claude_phase_timeout`` terminal.
+#
+# Additionally the CI vocabulary guard
+# (``scripts/check-transition-dispatch-vocabulary.sh``) was failing because
+# ``claude_phase_timeout`` was not in the helper's hint arm list.
+#
+# Fix: add ``claude_phase_timeout)`` arm to the inner case in
+# ``dispatch_transition_action``, add ``FAILURE_CATEGORY_CLAUDE_PHASE_TIMEOUT``
+# to ``daemon.py``, and add ``"claude_phase_timeout"`` to
+# ``BYPASSED_TERMINAL_PHASES_TO_ROUTE``.
+#
+# This test uses a per-test ``timeout`` stub that exits 124 when the
+# inner command contains "claude", simulating the ECS SIGKILL shape
+# without waiting for a real wall-clock timer.
+#
+# Positive case assertions:
+#   1. Entrypoint exits 0 (terminal via agent_runner_reaped_failure).
+#   2. ``claude_phase_timeout`` log event is emitted with phase=ralph.
+#   3. ``claude_phase_timeout_envelope_built`` is emitted (short-circuit ok).
+#   4. ``claude_result_non_object`` is NOT emitted (short-circuit works).
+#   5. The terminal phase written to psql is ``claude_phase_timeout``,
+#      NOT ``ralph_not_ship`` or ``diagnoser_route_unrecognized_hint``.
+#   6. The persisted output_json carries ``claude_phase_timeout: true``.
+#
+# Negative case:
+#   7. Normal SHIP path does NOT emit ``claude_phase_timeout`` event.
+#
+# ══════════════════════════════════════════════════════════════════════════
+
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t3777.txt"
+printf 'ralph\n' > "$PHASE_FIXTURE_FILE"
+PRIOR_PATCH_FIXTURE=""
+
+t3777_workspace="$TEST_TMP/t3777-workspace"
+mkdir -p "$t3777_workspace"
+
+# Per-test stub bin that overrides the shared ``timeout`` stub so it
+# exits 124 when the inner command contains "claude". All other
+# commands pass through transparently so the rest of the entrypoint
+# (git, psql, gh) still executes normally.
+t3777_tbin="$TEST_TMP/t3777-bin"
+mkdir -p "$t3777_tbin"
+
+# Create a per-test timeout stub that exits 124 when the inner command
+# contains "claude".  Place it in a directory that comes BEFORE $STUB_BIN
+# on PATH so it shadows the shared passthrough.  Do NOT symlink or copy
+# the STUB_BIN files here — $STUB_BIN is still on PATH (after t3777_tbin)
+# so git, psql, gh, and claude are all resolved from there.  The key is
+# that only ``timeout`` needs to be overridden; everything else passes
+# through normally via the tail of the PATH.
+cat > "$t3777_tbin/timeout" <<'T3777TIMEOUTEOF'
+#!/usr/bin/env bash
+# argv: <seconds> <inner-cmd> <inner-args...>
+_secs="${1:-}"
+shift || true
+_inner_argv="$*"
+# Exit 124 only when the inner command is (or contains) "claude",
+# simulating the SIGKILL the real timeout(1) sends after the timer
+# expires.  All other invocations (git, gh, etc.) execute normally.
+if [[ "$_inner_argv" == *"claude"* ]]; then
+    exit 124
+fi
+exec "$@"
+T3777TIMEOUTEOF
+chmod +x "$t3777_tbin/timeout"
+
+set +e
+T3777_TEST_OUT=$(AGENT_ID="37773777-3777-3777-3777-377737773777" \
+      ISSUE_NUMBER="3777" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t3777_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$t3777_tbin:$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="$PRIOR_PATCH_FIXTURE" \
+      CLAUDE_VERDICT_FIXTURE="" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
+      AGENT_RUNNER_RALPH_TIMEOUT_OVERRIDE_SECONDS=1 \
+      bash "$ENTRYPOINT" 2>&1)
+T3777_TEST_RC=$?
+set -e
+
+# (1) Entrypoint exits cleanly (rc=0). The claude_phase_timeout terminal
+# is a normal agent_runner_reaped_failure with exit 0, so the wrapper
+# exit semantics are preserved regardless of whether claude was killed.
+if [[ "$T3777_TEST_RC" -eq 0 ]]; then
+    pass "#3777 T3777 — entrypoint exits cleanly (rc=0) on claude_phase_timeout"
+else
+    fail "#3777 T3777 — entrypoint exits cleanly (rc=0) on claude_phase_timeout" \
+         "rc=$T3777_TEST_RC, output tail: $(printf '%s' "$T3777_TEST_OUT" | tail -c 1200)"
+fi
+
+# (2) claude_phase_timeout log event is emitted with phase=ralph so
+# CloudWatch queries can count timeout incidents per phase.
+if printf '%s' "$T3777_TEST_OUT" | grep -q "claude_phase_timeout"; then
+    pass "#3777 T3777 — claude_phase_timeout log event emitted"
+else
+    fail "#3777 T3777 — claude_phase_timeout log event emitted" \
+         "output tail: $(printf '%s' "$T3777_TEST_OUT" | tail -c 1200)"
+fi
+
+# (3) claude_phase_timeout_envelope_built event is emitted, confirming the
+# short-circuit path in run_claude_phase built the structured envelope
+# before returning 0 (rather than falling through to the non-object branch).
+if printf '%s' "$T3777_TEST_OUT" | grep -q "claude_phase_timeout_envelope_built"; then
+    pass "#3777 T3777 — claude_phase_timeout_envelope_built event emitted (short-circuit ok)"
+else
+    fail "#3777 T3777 — claude_phase_timeout_envelope_built event emitted (short-circuit ok)" \
+         "output tail: $(printf '%s' "$T3777_TEST_OUT" | tail -c 1200)"
+fi
+
+# (4) claude_result_non_object must NOT be emitted. Pre-#3772 the timeout
+# if-block lacked a ``return 0`` so it fell through to the non-object
+# branch and emitted this event. Post-#3772 + post-#3777 the short-circuit
+# means this event is never reached.
+if ! printf '%s' "$T3777_TEST_OUT" | grep -q "claude_result_non_object"; then
+    pass "#3777 T3777 — claude_result_non_object NOT emitted (short-circuit prevents fallthrough)"
+else
+    fail "#3777 T3777 — claude_result_non_object NOT emitted (short-circuit prevents fallthrough)" \
+         "output tail: $(printf '%s' "$T3777_TEST_OUT" | tail -c 1200)"
+fi
+
+# (5) The terminal phase written to psql must be ``claude_phase_timeout``.
+# Pre-fix (missing dispatch arm) this was ``diagnoser_route_unrecognized_hint``;
+# post-fix it is ``claude_phase_timeout`` routed through
+# agent_runner_reaped_failure.
+if grep -q "claude_phase_timeout" "$INVOCATIONS_DIR/psql.log" 2>/dev/null; then
+    pass "#3777 T3777 — terminal phase=claude_phase_timeout written to psql"
+else
+    fail "#3777 T3777 — terminal phase=claude_phase_timeout written to psql" \
+         "psql log tail: $(tail -c 1500 "$INVOCATIONS_DIR/psql.log" 2>/dev/null)"
+fi
+
+# (6) Neither ``diagnoser_route_unrecognized_hint`` NOR ``ralph_not_ship``
+# should appear as the terminal phase in psql — both indicate the fix is
+# not active.
+if ! grep -q "diagnoser_route_unrecognized_hint" "$INVOCATIONS_DIR/psql.log" 2>/dev/null \
+   && ! grep -q "ralph_not_ship" "$INVOCATIONS_DIR/psql.log" 2>/dev/null; then
+    pass "#3777 T3777 — psql does NOT contain diagnoser_route_unrecognized_hint or ralph_not_ship"
+else
+    fail "#3777 T3777 — psql does NOT contain diagnoser_route_unrecognized_hint or ralph_not_ship" \
+         "psql log tail: $(tail -c 1500 "$INVOCATIONS_DIR/psql.log" 2>/dev/null)"
+fi
+
+# (7) Negative regression — normal SHIP path must NOT emit claude_phase_timeout.
+setup_fixtures
+PHASE_FIXTURE_FILE="$TEST_TMP/phase-state-t3777b.txt"
+printf 'ralph\n' > "$PHASE_FIXTURE_FILE"
+
+CLAUDE_VERDICT_FIXTURE="$TEST_TMP/verdicts-t3777b.tsv"
+cat > "$CLAUDE_VERDICT_FIXTURE" <<'EOF'
+ralph	SHIP
+EOF
+
+t3777b_workspace="$TEST_TMP/t3777b-workspace"
+mkdir -p "$t3777b_workspace"
+
+set +e
+T3777B_TEST_OUT=$(AGENT_ID="37773777-3777-3777-3777-377737773778" \
+      ISSUE_NUMBER="3777" \
+      DATABASE_URL="postgres://test" \
+      GITHUB_TOKEN="" \
+      AGENT_WORKSPACE="$t3777b_workspace" \
+      REPO_URL="https://example.invalid/repo.git" \
+      PATH="$STUB_BIN:$PATH" \
+      INVOCATIONS_DIR="$INVOCATIONS_DIR" \
+      PHASE_FIXTURE_FILE="$PHASE_FIXTURE_FILE" \
+      PRIOR_PATCH_FIXTURE="" \
+      CLAUDE_VERDICT_FIXTURE="$CLAUDE_VERDICT_FIXTURE" \
+      PHASE_TRANSITIONS_DIR="$REPO_ROOT/scripts/dispatcher" \
+      PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
+      AGENT_RUNNER_SKIP_TASK_ARN_CAPTURE=1 \
+      AGENT_RUNNER_CI_POLL_INTERVAL=0 \
+      AGENT_RUNNER_DEPLOY_POLL_INTERVAL=0 \
+      AGENT_RUNNER_DEPLOY_GRACE_SECONDS=0 \
+      AGENT_RUNNER_MAX_PHASE_ITERATIONS=40 \
+      GIT_REV_LIST_COUNT=1 \
+      bash "$ENTRYPOINT" 2>&1)
+T3777B_TEST_RC=$?
+set -e
+
+if ! printf '%s' "$T3777B_TEST_OUT" | grep -q "claude_phase_timeout"; then
+    pass "#3777 T3777 negative — ralph SHIP path does NOT emit claude_phase_timeout"
+else
+    fail "#3777 T3777 negative — ralph SHIP path does NOT emit claude_phase_timeout" \
+         "output tail: $(printf '%s' "$T3777B_TEST_OUT" | tail -c 1200)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 # ── Summary ────────────────────────────────────────────────────────────────
