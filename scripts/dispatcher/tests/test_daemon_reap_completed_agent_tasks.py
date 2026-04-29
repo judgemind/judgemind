@@ -1050,3 +1050,165 @@ class TestReapUntrackedArns:
             "still_running": 0,
             "reaped_untracked": 0,
         }
+
+
+# --------------------------------------------------------------------------
+# Issue #3792 — per-batch budget enforcement for the untracked-ARN loop.
+#
+# The wedge post-mortem (tick #26: reap_untracked=71, tick_elapsed=7.559)
+# showed the untracked finalize loop could run for the entire tick budget.
+# The fix adds REAP_UNTRACKED_BATCH_BUDGET_SECONDS and breaks out early,
+# emitting ``daemon.reap_untracked_budget_exceeded``.
+# --------------------------------------------------------------------------
+
+
+class TestReapUntrackedBatchBudget:
+    """Batch-budget enforcement for the untracked-ARN finalize loop."""
+
+    def _build_untracked_rows(self, n: int) -> tuple[list[Any], list[str]]:
+        """Build ``n`` agent rows and their corresponding ARNs."""
+        arns = [f"arn:aws:ecs:us-west-2:123:task/jm/untracked-{i}" for i in range(n)]
+        rows = [
+            (f"agent-{i}", 9000 + i, arns[i], "done", "succeeded") for i in range(n)
+        ]
+        return rows, arns
+
+    def test_reap_untracked_batch_budget_exceeded(self, caplog: Any) -> None:
+        """75 untracked ARNs, slow finalize (0.5s each) → budget fires + early bail.
+
+        Monkeypatches ``time.monotonic`` to simulate elapsed time so the test
+        runs instantly. Also patches ``_reap_finalize_ecs_success`` to avoid
+        real DB calls and assert the call count stays below 75.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.WARNING, logger="test.daemon_reap")
+
+        n_arns = 75
+        rows, arns = self._build_untracked_rows(n_arns)
+
+        select_cur = _FakeCursor(rows=rows)
+        conn.queue_cursor(select_cur)
+
+        fake_client = MagicMock()
+        # DescribeTasks returns all ARNs with empty lastStatus so they all
+        # fall into the untracked path.
+        fake_client.describe_tasks.return_value = {
+            "tasks": [{"taskArn": arn, "lastStatus": ""} for arn in arns]
+        }
+
+        finalize_calls: list[str] = []
+
+        # Simulate monotonic advancing 0.5s per finalize call: each call to
+        # time.monotonic inside the loop returns a value 0.5s larger.
+        # Budget is REAP_UNTRACKED_BATCH_BUDGET_SECONDS (30s), so after
+        # 60 finalize calls the loop would breach (30 / 0.5 = 60).
+        # Since we check BEFORE calling finalize, the budget check fires
+        # once elapsed >= 30s, which happens when the loop has processed
+        # 60 items (60 * 0.5 = 30s elapsed before the 61st iteration).
+        _call_count = [0]
+        _base_time = 1000.0
+
+        def fake_monotonic() -> float:
+            # Returns a time that advances 0.5s per finalize-related call.
+            # We need to advance on each call inside the loop.
+            t = _base_time + _call_count[0] * 0.5
+            _call_count[0] += 1
+            return t
+
+        def fake_finalize(agent_id: str, issue_number: Any) -> None:
+            finalize_calls.append(agent_id)
+
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels"),
+            patch.object(d, "_reap_finalize_ecs_success", side_effect=fake_finalize),
+            patch.object(daemon.time, "monotonic", side_effect=fake_monotonic),
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        # The budget log must have fired.
+        budget_events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "reap_untracked_budget_exceeded"
+        ]
+        assert budget_events, (
+            "expected daemon.reap_untracked_budget_exceeded WARNING to fire"
+        )
+        # We must have bailed early — not all 75 finalize calls ran.
+        assert summary["reaped_untracked"] < n_arns, (
+            f"expected early bail: reaped_untracked={summary['reaped_untracked']} "
+            f"should be < {n_arns}"
+        )
+        # arns_remaining in the log event must be > 0.
+        evt = budget_events[0]
+        assert getattr(evt, "arns_remaining", 0) > 0, (
+            "budget event must carry arns_remaining > 0"
+        )
+        assert getattr(evt, "arns_processed", -1) == summary["reaped_untracked"]
+
+    def test_reap_untracked_loop_completes_under_budget(self, caplog: Any) -> None:
+        """70 untracked ARNs, fast finalize → loop completes with budget_breached=False.
+
+        Monkeypatches ``time.monotonic`` to return fast times (no elapsed time)
+        so the budget is never triggered, verifying the happy path.
+        """
+        d, conn = _make_daemon()
+        caplog.set_level(logging.INFO, logger="test.daemon_reap")
+
+        n_arns = 70
+        rows, arns = self._build_untracked_rows(n_arns)
+
+        select_cur = _FakeCursor(rows=rows)
+        conn.queue_cursor(select_cur)
+
+        fake_client = MagicMock()
+        fake_client.describe_tasks.return_value = {
+            "tasks": [{"taskArn": arn, "lastStatus": ""} for arn in arns]
+        }
+
+        finalize_calls: list[str] = []
+
+        # Monotonic always returns the same base time (no elapsed time) so
+        # the budget check never fires.
+        def fake_monotonic_fast() -> float:
+            return 1000.0
+
+        def fake_finalize(agent_id: str, issue_number: Any) -> None:
+            finalize_calls.append(agent_id)
+
+        with (
+            patch.object(d, "_make_ecs_client", return_value=fake_client),
+            patch.object(d, "_gh_issue_remove_labels"),
+            patch.object(d, "_reap_finalize_ecs_success", side_effect=fake_finalize),
+            patch.object(daemon.time, "monotonic", side_effect=fake_monotonic_fast),
+        ):
+            summary = d._reap_completed_agent_tasks()
+
+        # All 70 ARNs must have been finalized.
+        assert summary["reaped_untracked"] == n_arns, (
+            f"expected all {n_arns} ARNs processed, got {summary['reaped_untracked']}"
+        )
+        # No budget-exceeded event.
+        budget_events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "reap_untracked_budget_exceeded"
+        ]
+        assert budget_events == [], (
+            f"expected no budget_exceeded event, got: {budget_events!r}"
+        )
+        # Completion log must fire with budget_breached=False.
+        completion_events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "reap_untracked_loop_completed"
+        ]
+        assert completion_events, (
+            "expected daemon.reap_untracked_loop_completed INFO to fire"
+        )
+        evt = completion_events[0]
+        assert getattr(evt, "budget_breached", True) is False, (
+            "completion event must carry budget_breached=False"
+        )
+        assert getattr(evt, "arns_processed", -1) == n_arns

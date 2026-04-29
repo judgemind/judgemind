@@ -35,6 +35,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 # Make ``scripts`` importable without installing the repo as a package.
 _SCRIPTS = Path(__file__).resolve().parents[2]
@@ -769,3 +770,98 @@ class TestDbErrorPaths:
 
         assert rows == []
         assert handler.events("orphan_pr_list_failed")
+
+
+# --------------------------------------------------------------------------
+# Issue #3792 — per-candidate timing in _resurrect_orphan_pr_agents.
+# A candidate whose loop body takes ≥5s must emit
+# ``daemon.orphan_pr_sweep_slow_candidate`` WARNING.
+# --------------------------------------------------------------------------
+
+
+class TestOrphanPrSweepTiming:
+    """Per-candidate slow-candidate WARNING + sweep-completed INFO."""
+
+    def test_slow_candidate_fires_warning(self, tmp_path: Path) -> None:
+        """One resurrected candidate taking ≥5s → slow_candidate warning fires.
+
+        Monkeypatches ``time.monotonic`` to return a value 6s after the
+        per-candidate start so the ≥5s threshold fires.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+
+        agent_id = "agent-slow-resurrect"
+        pr_number = 5001
+        issue_number = 5000
+
+        conn.cursor_instance.fetchall_queue.append(
+            [(agent_id, pr_number, issue_number)]
+        )
+        # _count_orphan_pr_resurrections: 0 prior attempts.
+        conn.cursor_instance.fetch_queue.append((0,))
+
+        d._fetch_pr_status = lambda pr: _pr_status_green()  # type: ignore[method-assign]
+        d._mark_agent_resurrected_for_orphan_pr = lambda agent: True  # type: ignore[method-assign]
+
+        # Simulate the per-candidate loop body taking 6s.
+        # time.monotonic is called:
+        #   1. t_sweep_start = time.monotonic()    → returns 1000.0
+        #   2. t_candidate_start = time.monotonic() → returns 1000.0
+        #   3. candidate_elapsed = time.monotonic() - t_candidate_start → returns 1006.0 (6s elapsed)
+        #   4. total_elapsed = time.monotonic() - t_sweep_start → returns 1006.0
+        mono_values = iter([1000.0, 1000.0, 1006.0, 1006.0])
+
+        from dispatcher import daemon as daemon_mod
+
+        with patch.object(daemon_mod.time, "monotonic", side_effect=mono_values):
+            n = d._resurrect_orphan_pr_agents()
+
+        assert n == 1, "expected one resurrection"
+
+        # Per-candidate slow-candidate WARNING must have fired.
+        slow_events = handler.events("orphan_pr_sweep_slow_candidate")
+        assert slow_events, (
+            "expected daemon.orphan_pr_sweep_slow_candidate WARNING to fire "
+            "for a candidate that takes ≥5s"
+        )
+        ev = slow_events[0]
+        assert ev.agent_id == agent_id  # type: ignore[attr-defined]
+        assert ev.pr_number == pr_number  # type: ignore[attr-defined]
+        assert ev.issue_number == issue_number  # type: ignore[attr-defined]
+        assert getattr(ev, "elapsed_s", 0) >= 5.0  # type: ignore[attr-defined]
+
+        # End-of-sweep INFO must also fire.
+        completed_events = handler.events("orphan_pr_sweep_completed")
+        assert completed_events, (
+            "expected daemon.orphan_pr_sweep_completed INFO to fire"
+        )
+        ce = completed_events[0]
+        assert ce.candidates_seen == 1  # type: ignore[attr-defined]
+        assert ce.candidates_resurrected == 1  # type: ignore[attr-defined]
+
+    def test_fast_candidate_no_slow_warning(self, tmp_path: Path) -> None:
+        """A fast candidate (< 5s) must NOT emit orphan_pr_sweep_slow_candidate."""
+        d, conn, handler = _make_daemon(tmp_path)
+
+        conn.cursor_instance.fetchall_queue.append(
+            [("agent-fast-resurrect", 6001, 6000)]
+        )
+        conn.cursor_instance.fetch_queue.append((0,))
+        d._fetch_pr_status = lambda pr: _pr_status_green()  # type: ignore[method-assign]
+        d._mark_agent_resurrected_for_orphan_pr = lambda agent: True  # type: ignore[method-assign]
+
+        # All monotonic calls return the same base time (0 elapsed).
+        from dispatcher import daemon as daemon_mod
+
+        with patch.object(daemon_mod.time, "monotonic", return_value=1000.0):
+            n = d._resurrect_orphan_pr_agents()
+
+        assert n == 1
+        # No slow-candidate warning.
+        assert handler.events("orphan_pr_sweep_slow_candidate") == [], (
+            "fast candidate must not trigger slow_candidate warning"
+        )
+        # Completed INFO must fire.
+        assert handler.events("orphan_pr_sweep_completed"), (
+            "orphan_pr_sweep_completed must always fire"
+        )
