@@ -35,6 +35,16 @@ env:
   TASK_FAMILY: judgemind-scraper-dev
   SCHEDULER_NAME: judgemind-scraper-dev
   CONTAINER_NAME: scraper
+  # Terraform-managed source of truth for the per-court scraper task's
+  # container_definitions. See #3770 / parent #2840 — without this, the
+  # deploy-* path re-registers the running task-def's content and silently
+  # re-introduces fields terraform has removed. The parameter name follows
+  # the convention defined in
+  # `infra/terraform/modules/compute/main.tf::aws_ssm_parameter.scraper_container_definitions`.
+  SCRAPER_CONTAINER_DEFS_SSM_PARAMETER: /judgemind/scraper/dev/container-definitions
+  # Same source-of-truth pattern, ingestion-worker task. See
+  # `infra/terraform/modules/compute/main.tf::aws_ssm_parameter.ingestion_worker_container_definitions`.
+  INGESTION_WORKER_CONTAINER_DEFS_SSM_PARAMETER: /judgemind/ingestion-worker/dev/container-definitions
 
 jobs:
   build-and-push:
@@ -126,6 +136,7 @@ jobs:
           image-uri: ${{ needs.build-and-push.outputs.image_uri }}
           deploy-mode: scheduler
           scheduler-name: ${{ env.SCHEDULER_NAME }}
+          desired-container-definitions-ssm-parameter: ${{ env.SCRAPER_CONTAINER_DEFS_SSM_PARAMETER }}
 
       - name: Set deployment status
         if: always()
@@ -190,6 +201,7 @@ jobs:
           deploy-mode: service
           ecs-cluster: ${{ env.ECS_CLUSTER }}
           ecs-service: ${{ env.INGESTION_SERVICE }}
+          desired-container-definitions-ssm-parameter: ${{ env.INGESTION_WORKER_CONTAINER_DEFS_SSM_PARAMETER }}
 
       - name: Set deployment status
         if: always()

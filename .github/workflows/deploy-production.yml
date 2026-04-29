@@ -19,6 +19,15 @@ env:
   TASK_FAMILY: judgemind-scraper-production
   SCHEDULER_NAME: judgemind-scraper-production
   CONTAINER_NAME: scraper
+  # Terraform-managed source of truth for the production scraper task's
+  # container_definitions. See #3770 / parent #2840 — without this, the
+  # deploy-* path re-registers the running task-def's content and silently
+  # re-introduces fields terraform has removed. The parameter name follows
+  # the convention defined in
+  # `infra/terraform/modules/compute/main.tf::aws_ssm_parameter.scraper_container_definitions`,
+  # populated for `environment = "production"` on the next production
+  # terraform apply.
+  SCRAPER_CONTAINER_DEFS_SSM_PARAMETER: /judgemind/scraper/production/container-definitions
 
 jobs:
   deploy-production:
@@ -81,6 +90,7 @@ jobs:
           image-uri: ${{ steps.verify-image.outputs.image_uri }}
           deploy-mode: scheduler
           scheduler-name: ${{ env.SCHEDULER_NAME }}
+          desired-container-definitions-ssm-parameter: ${{ env.SCRAPER_CONTAINER_DEFS_SSM_PARAMETER }}
 
       - name: Set deployment status
         if: always()

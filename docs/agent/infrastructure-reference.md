@@ -161,11 +161,13 @@ The hybrid pragmatism: family-level metadata (`cpu`, `memory`, `network_mode`, `
 
 1. Each terraform module that owns a task-definition publishes `aws_ssm_parameter "container_definitions"` with `value = aws_ecs_task_definition.<svc>.container_definitions`. Currently wired:
    - `infra/terraform/modules/api-service/main.tf` → `/judgemind/api/<env>/container-definitions`
+   - `infra/terraform/modules/compute/main.tf` (per-court scraper) → `/judgemind/scraper/<env>/container-definitions`
+   - `infra/terraform/modules/compute/main.tf` (ingestion-worker) → `/judgemind/ingestion-worker/<env>/container-definitions`
 2. `dev-apply` in `terraform.yml` runs on every `push:main` that touches `infra/terraform/**`, so the SSM parameter is always in sync with the latest committed terraform render.
 3. `.github/actions/ecs-deploy/action.yml` accepts an optional input `desired-container-definitions-ssm-parameter`. When set, the action invokes `scripts/ecs-render-task-def.sh` with that parameter name; the script reads the JSON from SSM, substitutes the new image into the named container, and registers the new revision.
 4. When the input is empty, the action falls back to the legacy `describe-task-definition` source — preserving behaviour for any deploy-* workflow that has not yet opted in.
 
-**Coverage and follow-ups.** Wired today: `deploy-api.yml`. Not yet wired: `deploy-scraper.yml`, `deploy-production.yml`. Migrating the remaining workflows is straightforward: add the SSM parameter resource to the relevant module (compute, scraper-zero-record-check, dispatcher-agent-runner, etc.), pass the parameter name to the composite action. File a follow-up issue when migrating each so the SSM parameter creation lands in the same PR as the workflow opt-in.
+**Coverage and follow-ups.** Wired today: `deploy-api.yml` (#3769), `deploy-scraper.yml` (#3770 — both the scraper job and the ingestion-worker job), `deploy-production.yml` (#3770 — production scraper). Every workflow that consumes `.github/actions/ecs-deploy/action.yml` is now on the SSM-source path. The `infra/terraform/modules/scraper-zero-record-check/` task-def is launched directly by EventBridge Scheduler (and one-shot via `scripts/ecs-run-task.sh`), not through the composite action, so it does not need migration. New deploy-* workflows that adopt `ecs-deploy/action.yml` should opt in to SSM-source mode as part of their first PR — add the `aws_ssm_parameter` to the owning module and pass the name to the composite action via `desired-container-definitions-ssm-parameter`.
 
 **Operator gotcha.** When adding a new env var or secret to an SSM-source-mode task-definition, the change must land via terraform — direct edits to `register-task-definition` calls or one-off CLI tweaks will be silently overwritten by the next deploy. The SSM parameter is rendered from `aws_ecs_task_definition.<svc>.container_definitions`, so any change to that resource flows through automatically.
 

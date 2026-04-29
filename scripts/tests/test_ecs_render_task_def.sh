@@ -199,6 +199,119 @@ write_ssm_param() {
 JSON
 }
 
+# Build a synthetic "current task-def" response for the ingestion-worker
+# family. Mirrors the shape produced by `infra/terraform/modules/compute`:
+# container name is "ingestion-worker", a `command` field is present, and the
+# secrets set is a superset of the api task-def. Used by the #3770 follow-up
+# tests that verify the SSM-source path generalizes beyond the api task.
+write_describe_task_def_ingestion_worker() {
+    local file="$1"
+    local include_legacy_secret="${2:-true}"
+
+    local secrets='[{"name":"DATABASE_URL","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"},{"name":"OPENSEARCH_PASSWORD","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:os-DDD:password::"},{"name":"ANTHROPIC_API_KEY","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:anth-EEE"}]'
+    if [[ "$include_legacy_secret" == "true" ]]; then
+        secrets='[{"name":"DATABASE_URL","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"},{"name":"OPENSEARCH_PASSWORD","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:os-DDD:password::"},{"name":"ANTHROPIC_API_KEY","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:anth-EEE"},{"name":"LEGACY_REMOVED_SECRET","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:legacy-FFF"}]'
+    fi
+
+    cat > "$file" << JSON
+{
+  "taskDefinition": {
+    "taskDefinitionArn": "arn:aws:ecs:us-west-2:111:task-definition/judgemind-ingestion-worker-dev:42",
+    "family": "judgemind-ingestion-worker-dev",
+    "executionRoleArn": "arn:aws:iam::111:role/exec-role",
+    "taskRoleArn": "arn:aws:iam::111:role/judgemind-ingestion-worker-task-dev",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "256",
+    "memory": "512",
+    "containerDefinitions": [
+      {
+        "name": "ingestion-worker",
+        "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:OLDSHA",
+        "command": ["ingestion"],
+        "essential": true,
+        "secrets": $secrets,
+        "environment": [{"name":"ENVIRONMENT","value":"dev"},{"name":"LLM_PROVIDER","value":"gemini"}]
+      }
+    ]
+  }
+}
+JSON
+}
+
+# SSM-parameter response for the ingestion-worker task. Terraform-managed
+# desired state — does NOT include LEGACY_REMOVED_SECRET (so the SSM-source
+# path provably drops it). Container name is "ingestion-worker", matching the
+# resource in `infra/terraform/modules/compute/main.tf::aws_ecs_task_definition.ingestion_worker`.
+write_ssm_param_ingestion_worker() {
+    local file="$1"
+
+    cat > "$file" << 'JSON'
+{
+  "Parameter": {
+    "Name": "/judgemind/ingestion-worker/dev/container-definitions",
+    "Type": "String",
+    "Value": "[{\"name\":\"ingestion-worker\",\"image\":\"PLACEHOLDER\",\"command\":[\"ingestion\"],\"essential\":true,\"secrets\":[{\"name\":\"DATABASE_URL\",\"valueFrom\":\"arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::\"},{\"name\":\"OPENSEARCH_PASSWORD\",\"valueFrom\":\"arn:aws:secretsmanager:us-west-2:111:secret:os-DDD:password::\"},{\"name\":\"ANTHROPIC_API_KEY\",\"valueFrom\":\"arn:aws:secretsmanager:us-west-2:111:secret:anth-EEE\"}],\"environment\":[{\"name\":\"ENVIRONMENT\",\"value\":\"dev\"},{\"name\":\"LLM_PROVIDER\",\"value\":\"gemini\"}]}]"
+  }
+}
+JSON
+}
+
+# Build a synthetic "current task-def" response for the scraper family. Per-
+# court scraper running off the same image, container name "scraper". Mirrors
+# `infra/terraform/modules/compute/main.tf::aws_ecs_task_definition.scraper`.
+write_describe_task_def_scraper() {
+    local file="$1"
+    local include_legacy_secret="${2:-true}"
+
+    local secrets='[{"name":"DATABASE_URL","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"},{"name":"COURTLISTENER_API_TOKEN","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:cl-GGG"}]'
+    if [[ "$include_legacy_secret" == "true" ]]; then
+        secrets='[{"name":"DATABASE_URL","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::"},{"name":"COURTLISTENER_API_TOKEN","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:cl-GGG"},{"name":"LEGACY_REMOVED_SECRET","valueFrom":"arn:aws:secretsmanager:us-west-2:111:secret:legacy-FFF"}]'
+    fi
+
+    cat > "$file" << JSON
+{
+  "taskDefinition": {
+    "taskDefinitionArn": "arn:aws:ecs:us-west-2:111:task-definition/judgemind-scraper-dev:55",
+    "family": "judgemind-scraper-dev",
+    "executionRoleArn": "arn:aws:iam::111:role/exec-role",
+    "taskRoleArn": "arn:aws:iam::111:role/judgemind-scraper-task-dev",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "1024",
+    "memory": "2048",
+    "containerDefinitions": [
+      {
+        "name": "scraper",
+        "image": "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:OLDSHA",
+        "essential": true,
+        "stopTimeout": 120,
+        "secrets": $secrets,
+        "environment": [{"name":"ENVIRONMENT","value":"dev"}]
+      }
+    ]
+  }
+}
+JSON
+}
+
+# SSM-parameter response for the scraper task. Terraform-managed desired
+# state without LEGACY_REMOVED_SECRET. Container name is "scraper", matching
+# the resource in `infra/terraform/modules/compute/main.tf::aws_ecs_task_definition.scraper`.
+write_ssm_param_scraper() {
+    local file="$1"
+
+    cat > "$file" << 'JSON'
+{
+  "Parameter": {
+    "Name": "/judgemind/scraper/dev/container-definitions",
+    "Type": "String",
+    "Value": "[{\"name\":\"scraper\",\"image\":\"PLACEHOLDER\",\"essential\":true,\"stopTimeout\":120,\"secrets\":[{\"name\":\"DATABASE_URL\",\"valueFrom\":\"arn:aws:secretsmanager:us-west-2:111:secret:db-AAA:url::\"},{\"name\":\"COURTLISTENER_API_TOKEN\",\"valueFrom\":\"arn:aws:secretsmanager:us-west-2:111:secret:cl-GGG\"}],\"environment\":[{\"name\":\"ENVIRONMENT\",\"value\":\"dev\"}]}]"
+  }
+}
+JSON
+}
+
 # Build the synthetic register-task-definition response.
 write_register_output() {
     local file="$1"
@@ -444,6 +557,73 @@ test_ssm_path_unknown_container_fails() {
     pass "$label"
 }
 
+# ─── Test 7: SSM-source path generalises to the ingestion-worker task ────
+# Regression test for #3770 (chunk C of #2840). The SSM-source path was
+# wired into deploy-api by #3769; this test asserts the same script handles
+# the ingestion-worker task family — different container name
+# ("ingestion-worker"), different secret set, additional `command` field —
+# without regressing the bug-class fix.
+test_ssm_path_ingestion_worker_drops_legacy_secret() {
+    local label="SSM source path: ingestion-worker family — terraform-removed LEGACY_REMOVED_SECRET does NOT come back"
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+
+    # Currently running ingestion-worker task-def still has LEGACY_REMOVED_SECRET.
+    write_describe_task_def_ingestion_worker "$tmpdir/describe-task-def.json" "true"
+    # Terraform-managed SSM parameter omits it.
+    write_ssm_param_ingestion_worker "$tmpdir/ssm-param.json"
+
+    run_script "$tmpdir" \
+        --task-family judgemind-ingestion-worker-dev \
+        --container-name ingestion-worker \
+        --image-uri "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:NEWSHA" \
+        --desired-container-definitions-ssm-parameter "/judgemind/ingestion-worker/dev/container-definitions"
+
+    assert_exit "$tmpdir" "0" "$label" || return
+    assert_call_log_contains "$tmpdir" "ssm get-parameter" "$label" || return
+    # LEGACY_REMOVED_SECRET must NOT have leaked through from the running task-def.
+    assert_register_args_NOT_contain "$tmpdir" "LEGACY_REMOVED_SECRET" "$label" || return
+    # Image swap still happened.
+    assert_register_args_contain "$tmpdir" "judgemind/scraper:NEWSHA" "$label" || return
+    # Terraform-managed secrets ARE present.
+    assert_register_args_contain "$tmpdir" "DATABASE_URL" "$label" || return
+    assert_register_args_contain "$tmpdir" "ANTHROPIC_API_KEY" "$label" || return
+    # The `command` field from the SSM render survives.
+    assert_register_args_contain "$tmpdir" "ingestion" "$label" || return
+
+    pass "$label"
+}
+
+# ─── Test 8: SSM-source path generalises to the scraper task ─────────────
+# Same #3770 regression-class as test 7, but for the per-court scraper
+# task-def. Container name is "scraper" and the task carries different
+# secrets (DATABASE_URL + COURTLISTENER_API_TOKEN).
+test_ssm_path_scraper_drops_legacy_secret() {
+    local label="SSM source path: scraper family — terraform-removed LEGACY_REMOVED_SECRET does NOT come back"
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+
+    write_describe_task_def_scraper "$tmpdir/describe-task-def.json" "true"
+    write_ssm_param_scraper "$tmpdir/ssm-param.json"
+
+    run_script "$tmpdir" \
+        --task-family judgemind-scraper-dev \
+        --container-name scraper \
+        --image-uri "111.dkr.ecr.us-west-2.amazonaws.com/judgemind/scraper:NEWSHA" \
+        --desired-container-definitions-ssm-parameter "/judgemind/scraper/dev/container-definitions"
+
+    assert_exit "$tmpdir" "0" "$label" || return
+    assert_call_log_contains "$tmpdir" "ssm get-parameter" "$label" || return
+    assert_register_args_NOT_contain "$tmpdir" "LEGACY_REMOVED_SECRET" "$label" || return
+    # Image swap still happened.
+    assert_register_args_contain "$tmpdir" "judgemind/scraper:NEWSHA" "$label" || return
+    # Terraform-managed secrets ARE present.
+    assert_register_args_contain "$tmpdir" "DATABASE_URL" "$label" || return
+    assert_register_args_contain "$tmpdir" "COURTLISTENER_API_TOKEN" "$label" || return
+
+    pass "$label"
+}
+
 # ─── Run all tests ───────────────────────────────────────────────────────
 
 test_legacy_path_uses_describe_task_def
@@ -452,6 +632,8 @@ test_ssm_path_swaps_image
 test_ssm_path_preserves_task_metadata
 test_missing_required_arg_fails
 test_ssm_path_unknown_container_fails
+test_ssm_path_ingestion_worker_drops_legacy_secret
+test_ssm_path_scraper_drops_legacy_secret
 
 echo
 echo "Tests: $TESTS, Failures: $FAILURES"

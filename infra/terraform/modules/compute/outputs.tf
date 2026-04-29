@@ -47,3 +47,13 @@ output "ingestion_worker_log_group" {
   description = "CloudWatch log group for ingestion worker output (empty if not deployed)"
   value       = local.deploy_ingestion ? aws_cloudwatch_log_group.ingestion_worker[0].name : ""
 }
+
+output "scraper_container_definitions_ssm_parameter_name" {
+  description = "SSM parameter holding terraform-rendered container_definitions JSON for the per-court scraper task. Pass to .github/actions/ecs-deploy as `desired-container-definitions-ssm-parameter` to make terraform the source of truth on deploy. See #3770."
+  value       = aws_ssm_parameter.scraper_container_definitions.name
+}
+
+output "ingestion_worker_container_definitions_ssm_parameter_name" {
+  description = "SSM parameter holding terraform-rendered container_definitions JSON for the ingestion-worker task (empty if ingestion is not deployed). Pass to .github/actions/ecs-deploy as `desired-container-definitions-ssm-parameter` to make terraform the source of truth on deploy. See #3770."
+  value       = local.deploy_ingestion ? aws_ssm_parameter.ingestion_worker_container_definitions[0].name : ""
+}

@@ -198,6 +198,25 @@ resource "aws_ecs_task_definition" "scraper" {
   ])
 }
 
+# ─── SSM: terraform-managed container_definitions for deploy-scraper ────────
+# Stores the rendered container_definitions JSON that terraform considers the
+# desired state for the per-court scraper task. The deploy-scraper workflow's
+# `ecs-deploy` composite action reads this parameter (instead of the running
+# task-def) when registering a new revision, so secrets / env vars terraform
+# has removed can never leak back in via the legacy "preserve current task-def
+# content" path. See #3770 / parent #2840 for the bug class this prevents and
+# #3769 for the deploy-api precedent.
+#
+# Tier "Advanced" supports values up to 8KB (Standard caps at 4KB) — gives
+# headroom for future env-var / secret additions without a tier bump.
+resource "aws_ssm_parameter" "scraper_container_definitions" {
+  name        = "/judgemind/scraper/${var.environment}/container-definitions"
+  description = "Terraform-rendered container_definitions JSON for the ${var.environment} scraper task. Read by .github/actions/ecs-deploy when --desired-container-definitions-ssm-parameter is set. See #3770 / #2840."
+  type        = "String"
+  tier        = "Advanced"
+  value       = aws_ecs_task_definition.scraper.container_definitions
+}
+
 # ─── EventBridge Scheduler ──────────────────────────────────────────────────
 # Runs the scraper task on a twice-daily schedule. EventBridge Scheduler replaces
 # the legacy CloudWatch Events / EventBridge Rules pattern and supports
@@ -502,6 +521,27 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
       }
     }
   ])
+}
+
+# ─── SSM: terraform-managed container_definitions for ingestion-worker ──────
+# Same pattern as `aws_ssm_parameter.scraper_container_definitions` above:
+# terraform writes the rendered container_definitions JSON to SSM so the
+# ingestion-worker job in deploy-scraper.yml can read it via `ecs-deploy`'s
+# `desired-container-definitions-ssm-parameter` input. Closes the
+# preserve-secrets bug class for ingestion-worker. See #3770 / parent #2840
+# and the deploy-api precedent in #3769.
+#
+# Conditional on local.deploy_ingestion mirrors the gate on the task-def
+# resource — when ingestion is not deployed (no DB connection secret), the
+# SSM parameter is also absent so terraform doesn't churn on an unused write.
+resource "aws_ssm_parameter" "ingestion_worker_container_definitions" {
+  count = local.deploy_ingestion ? 1 : 0
+
+  name        = "/judgemind/ingestion-worker/${var.environment}/container-definitions"
+  description = "Terraform-rendered container_definitions JSON for the ${var.environment} ingestion-worker task. Read by .github/actions/ecs-deploy when --desired-container-definitions-ssm-parameter is set. See #3770 / #2840."
+  type        = "String"
+  tier        = "Advanced"
+  value       = aws_ecs_task_definition.ingestion_worker[0].container_definitions
 }
 
 resource "aws_ecs_service" "ingestion_worker" {
