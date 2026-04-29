@@ -1707,6 +1707,14 @@ def _is_short_unsubstantive_ruling(
     # to recover the full context on a later pass, not this filter's.
     if not ruling.extracted_case_number and not ruling.extracted_case_title:
         return False
+    # Cross-reference stubs (e.g. "Ctrl Click on Line 10 for tentative
+    # ruling.") are valid calendar-pointer rows awaiting cross-ref
+    # resolution (#3663).  Even when they are short and lack motion_type /
+    # outcome, they must not be classified as unsubstantive noise — they
+    # carry a real case_number and will be resolved (or survive as stubs) by
+    # subsequent pipeline steps.
+    if _XREF_LINE_RE.search(stripped):
+        return False
     # The three-signal test: missing motion_type AND outcome AND short.
     return ruling.motion_type is None and ruling.outcome is None
 
@@ -1770,6 +1778,88 @@ def _drop_short_unsubstantive_rulings(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: role-literal orphan filter (#3663)
+# ---------------------------------------------------------------------------
+#
+# SC (Santa Clara) multi-page PDFs produce two LLM rows per case:
+#
+#   1. **Calendar row** (pages 2–3): correct extracted_case_number,
+#      correct extracted_case_title, and a short cross-reference stub like
+#      "Ctrl Click on Line 10 for tentative ruling."  This row carries the
+#      ``entry_number`` from the PDF's calendar index.
+#
+#   2. **Body-section orphan** (later pages): empty extracted_case_number,
+#      a role-literal extracted_case_title ("Plaintiff v. FCA"), real
+#      analysis text, and no entry_number.  The LLM emits this row because
+#      the ruling body starts a fresh page without a proper case header.
+#
+# The calendar row is the authoritative record — it has the real case
+# number and is the target of any cross-references from other calendar
+# rows.  The body orphan must be dropped; keeping it causes the downstream
+# pipeline to create a derived ruling with an ``UNKNOWN-<sha>`` placeholder
+# case_number instead of the real one.
+#
+# Drop condition (all three must hold):
+#   * ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``
+#   * ``extracted_case_number`` is None or empty string
+#   * ``entry_number`` is None
+#
+# The entry_number guard is critical: real calendar rows (the rows we want
+# to keep) almost always carry an entry_number from the PDF index.  Requiring
+# its absence prevents accidental drops of calendar rows whose court used a
+# generic "Plaintiff" as the actual party pseudonym while still providing a
+# calendar line number.
+
+
+def _drop_role_literal_orphan_rulings(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Drop body-section orphans whose title is a role literal and have no case_number (#3663).
+
+    SC multi-page PDFs emit two LLM rows per case:
+
+    1. A **calendar row** with the real ``extracted_case_number``,
+       ``extracted_case_title``, and ``entry_number`` (a stub
+       cross-reference text like "Ctrl Click on Line N …").
+    2. A **body-section orphan** with empty ``extracted_case_number``,
+       a role-literal title like ``"Plaintiff v. FCA"`` (matching
+       ``_ROLE_LITERAL_TITLE_RE``), and no ``entry_number``.
+
+    The orphan is an artefact of multi-page PDF parsing — the ruling body
+    starts on a fresh page without a proper case header, so the LLM
+    fabricates a role-literal title.  Keeping the orphan causes the
+    pipeline to create a derived ruling with an ``UNKNOWN-<sha>``
+    placeholder case_number.
+
+    Rules:
+
+    - A ruling is dropped when ALL THREE conditions hold:
+      1. ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``
+      2. ``extracted_case_number`` is None or empty
+      3. ``entry_number`` is None
+    - Rulings with a valid ``extracted_case_number`` are ALWAYS preserved,
+      even when the title happens to be role-literal (genuine pseudonym
+      cases, e.g. Doe v. Smith).
+    - Rulings with a valid ``entry_number`` are preserved — they are real
+      calendar rows, not orphans.
+    """
+    kept: list[ExtractedRuling] = []
+    for ruling in rulings:
+        title = ruling.extracted_case_title or ""
+        has_case_number = bool(ruling.extracted_case_number)
+        has_entry_number = ruling.entry_number is not None
+        if _ROLE_LITERAL_TITLE_RE.match(title) and not has_case_number and not has_entry_number:
+            logger.warning(
+                "llm_extractor.role_literal_orphan_dropped",
+                case_title=ruling.extracted_case_title,
+                text_length=len(ruling.ruling_text) if ruling.ruling_text else 0,
+            )
+            continue
+        kept.append(ruling)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: cache-hit filter re-application (#2513)
 # ---------------------------------------------------------------------------
 #
@@ -1813,6 +1903,7 @@ def _apply_pdf_cache_hit_filters(
     """
     original_count = len(rulings)
     rulings = _resolve_cross_references(rulings)
+    rulings = _drop_role_literal_orphan_rulings(rulings)
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
     rulings = _truncate_concatenated_case_titles(rulings)
@@ -3788,6 +3879,16 @@ def _join_page_rows(
     # from the referenced entry so enrichment can extract an outcome.
     if entry_number_to_index:
         rulings = _resolve_cross_references(rulings, entry_number_to_index)
+
+    # Post-processing: drop SC body-section orphans (#3663).
+    # SC multi-page PDFs produce a body-section row with an empty
+    # case_number, role-literal title ("Plaintiff v. FCA"), and no
+    # entry_number.  Must run AFTER cross-reference resolution so any
+    # calendar row that WAS resolved keeps its real ruling_text, and the
+    # orphan — which has no entry_number and thus was never a cross-ref
+    # target — is discarded.  Run BEFORE the calendar-listing filter so the
+    # orphan's long ruling_text doesn't confuse the calendar-only heuristic.
+    rulings = _drop_role_literal_orphan_rulings(rulings)
 
     # Post-processing: drop calendar-listing-only rows (#2446).
     # Orange County department calendar PDFs sometimes list cases with only

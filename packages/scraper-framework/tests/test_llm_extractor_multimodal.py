@@ -26,6 +26,7 @@ from framework.llm_extractor import (
     _create_google_client,
     _deduplicate_ruling_texts,
     _drop_calendar_listing_rulings,
+    _drop_role_literal_orphan_rulings,
     _drop_short_unsubstantive_rulings,
     _extract_case_number_from_info,
     _extract_case_title_from_info,
@@ -4422,3 +4423,257 @@ class TestOcNoCaseNumberCalendarPdfRegression:
         for r in rulings:
             assert r.ruling_text is not None
             assert r.ruling_text.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# TestRoleLiteralOrphanDrop — SC multi-page PDF body-section orphan filter
+# (#3663)
+# ---------------------------------------------------------------------------
+
+
+class TestRoleLiteralOrphanDrop:
+    """Tests for ``_drop_role_literal_orphan_rulings`` and related changes (#3663).
+
+    SC multi-page PDFs produce two LLM rows per case:
+    1. Calendar row (page 2-3): correct case_number/case_title, stub ruling_text
+       like "Ctrl Click on Line 10 for tentative ruling."
+    2. Body-section orphan (later pages): empty case_number, role-literal title
+       ("Plaintiff v. FCA"), real analysis text, no entry_number.
+
+    The orphan must be dropped; the calendar row must survive.
+    """
+
+    # ------------------------------------------------------------------
+    # Unit tests for _drop_role_literal_orphan_rulings directly
+    # ------------------------------------------------------------------
+
+    def test_drops_orphan_with_role_literal_title_no_case_number_no_entry(self) -> None:
+        """Orphan with role-literal title, empty case_number, and no entry_number is dropped."""
+        body_text = (
+            "The Court has reviewed the opposition briefs.  Plaintiff's motion for "
+            "summary judgment is DENIED.  There are triable issues of material fact "
+            "regarding the design defect claim.  " * 30
+        )
+        orphan = ExtractedRuling(
+            extracted_case_title="Plaintiff v. FCA",
+            extracted_case_number=None,
+            entry_number=None,
+            ruling_text=body_text,
+        )
+        result = _drop_role_literal_orphan_rulings([orphan])
+        assert result == []
+
+    def test_drops_orphan_with_empty_string_case_number(self) -> None:
+        """Orphan with empty string case_number (not None) is also dropped."""
+        orphan = ExtractedRuling(
+            extracted_case_title="Defendant v. Plaintiff",
+            extracted_case_number="",
+            entry_number=None,
+            ruling_text="Some analysis text." * 50,
+        )
+        result = _drop_role_literal_orphan_rulings([orphan])
+        assert result == []
+
+    def test_preserves_orphan_with_valid_case_number(self) -> None:
+        """Pseudonym case: role-literal-ish title WITH a valid case_number is NOT dropped."""
+        pseudonym = ExtractedRuling(
+            extracted_case_title="Plaintiff v. Smith",
+            extracted_case_number="24CV123456",
+            entry_number=None,
+            ruling_text="The motion is DENIED." * 50,
+        )
+        result = _drop_role_literal_orphan_rulings([pseudonym])
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "24CV123456"
+
+    def test_preserves_ruling_with_entry_number(self) -> None:
+        """Orphan-shaped ruling with an entry_number (real calendar row) is NOT dropped."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Plaintiff v. FCA US LLC",
+            extracted_case_number=None,
+            entry_number=5,
+            ruling_text="The Court rules as follows: DENIED." * 30,
+        )
+        result = _drop_role_literal_orphan_rulings([ruling])
+        assert len(result) == 1
+
+    def test_preserves_real_case_title(self) -> None:
+        """A ruling with a non-role-literal title is not affected."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Yin Labson vs FCA US LLC",
+            extracted_case_number="25CV458975",
+            entry_number=10,
+            ruling_text="Ctrl Click on Line 10 for tentative ruling.",
+        )
+        result = _drop_role_literal_orphan_rulings([ruling])
+        assert len(result) == 1
+
+    def test_drops_petitioner_respondent_variant(self) -> None:
+        """Petitioner v. Respondent form is also a role-literal and is dropped."""
+        orphan = ExtractedRuling(
+            extracted_case_title="Petitioner v. Respondent",
+            extracted_case_number=None,
+            entry_number=None,
+            ruling_text="The petition is reviewed." * 50,
+        )
+        result = _drop_role_literal_orphan_rulings([orphan])
+        assert result == []
+
+    def test_empty_list(self) -> None:
+        """Empty list returns empty list."""
+        assert _drop_role_literal_orphan_rulings([]) == []
+
+    def test_mixed_list_drops_only_orphans(self) -> None:
+        """Only orphans are dropped; real rulings survive."""
+        real = ExtractedRuling(
+            extracted_case_title="Yin Labson vs FCA US LLC",
+            extracted_case_number="25CV458975",
+            entry_number=10,
+            ruling_text="Ctrl Click on Line 10 for tentative ruling.",
+        )
+        orphan = ExtractedRuling(
+            extracted_case_title="Plaintiff v. FCA",
+            extracted_case_number=None,
+            entry_number=None,
+            ruling_text="Analysis text here." * 100,
+        )
+        result = _drop_role_literal_orphan_rulings([real, orphan])
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "25CV458975"
+
+    # ------------------------------------------------------------------
+    # SC end-to-end via _join_page_rows (#3663 AC1 + AC2)
+    # ------------------------------------------------------------------
+
+    def test_sc_end_to_end_join_page_rows_drops_body_orphan(self) -> None:
+        """SC calendar row + body orphan → after _join_page_rows, exactly 1 ruling survives.
+
+        Regression test for issue #3663: SC multi-page PDFs produce:
+        - Calendar row: correct case_number/title, short xref stub text
+        - Body orphan: empty case_number, role-literal title, long analysis text
+
+        After _join_page_rows, exactly 1 ruling must survive (the calendar row)
+        with the calendar's case_number preserved.
+        """
+        long_body = (
+            "The Court has reviewed the motion papers.  Plaintiff's motion for "
+            "summary judgment is DENIED on all grounds.  There are triable issues "
+            "of material fact regarding the product liability claims raised by "
+            "plaintiff.  The defendant's alternative motion to strike is also denied. "
+        ) * 10  # ~3000 chars
+
+        rows = [
+            {
+                "entry_number": 10,
+                "case_info": "25CV458975 Yin Labson vs FCA US LLC",
+                "ruling_text": "Ctrl Click on Line 10 for tentative ruling.",
+            },
+            {
+                "entry_number": None,
+                "case_info": "Plaintiff v. FCA",
+                "ruling_text": long_body,
+            },
+        ]
+        rulings = _join_page_rows(rows)
+
+        # Exactly 1 ruling should remain — the calendar row (orphan dropped)
+        assert len(rulings) == 1, (
+            f"Expected 1 ruling after orphan drop, got {len(rulings)}: "
+            f"{[(r.extracted_case_number, r.extracted_case_title) for r in rulings]}"
+        )
+        surviving = rulings[0]
+        assert surviving.extracted_case_number == "25CV458975", (
+            f"Calendar row case_number must survive, got {surviving.extracted_case_number!r}"
+        )
+        assert surviving.extracted_case_title == "Yin Labson vs FCA US LLC"
+
+    def test_sc_multiple_calendar_rows_all_survive(self) -> None:
+        """Multiple calendar rows with one body orphan → all calendar rows survive."""
+        long_body = "The Court reviewed the filings. DENIED. " * 80
+
+        rows = [
+            {
+                "entry_number": 8,
+                "case_info": "24CV111111 Smith v. Jones",
+                "ruling_text": "Ctrl Click on Line 8 for tentative ruling.",
+            },
+            {
+                "entry_number": 9,
+                "case_info": "24CV222222 Doe v. Roe",
+                "ruling_text": "Ctrl Click on Line 9 for tentative ruling.",
+            },
+            {
+                "entry_number": None,
+                "case_info": "Plaintiff v. Defendant",
+                "ruling_text": long_body,
+            },
+        ]
+        rulings = _join_page_rows(rows)
+
+        assert len(rulings) == 2, (
+            f"Expected 2 rulings (both calendar rows), got {len(rulings)}: "
+            f"{[(r.extracted_case_number, r.extracted_case_title) for r in rulings]}"
+        )
+        case_numbers = {r.extracted_case_number for r in rulings}
+        assert "24CV111111" in case_numbers
+        assert "24CV222222" in case_numbers
+
+    # ------------------------------------------------------------------
+    # _drop_short_unsubstantive_rulings: xref stubs exempted (#3663)
+    # ------------------------------------------------------------------
+
+    def test_calendar_stub_xref_preserved_by_short_unsubstantive_filter(self) -> None:
+        """Calendar xref stubs matching _XREF_LINE_RE are not dropped (#3663).
+
+        AC2: calendar rows with 'Ctrl Click on Line N for tentative ruling.'
+        text (matching _XREF_LINE_RE) must survive the short-unsubstantive
+        filter — they are valid cross-reference stubs, not empty-cell noise.
+        """
+        stub = ExtractedRuling(
+            extracted_case_number="25CV458975",
+            extracted_case_title="Yin Labson vs FCA US LLC",
+            ruling_text="Ctrl Click on Line 10 for tentative ruling.",
+            motion_type=None,
+            outcome=None,
+            entry_number=10,
+        )
+        result = _drop_short_unsubstantive_rulings([stub])
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "25CV458975"
+
+    def test_see_line_xref_stub_preserved(self) -> None:
+        """'See Line N for tentative ruling.' stubs are also preserved."""
+        stub = ExtractedRuling(
+            extracted_case_number="24CV999888",
+            extracted_case_title="Johnson v. ABC Corp",
+            ruling_text="See Line 4 for tentative ruling.",
+            motion_type=None,
+            outcome=None,
+            entry_number=4,
+        )
+        result = _drop_short_unsubstantive_rulings([stub])
+        assert len(result) == 1
+
+    def test_scroll_down_xref_stub_preserved(self) -> None:
+        """'Scroll down to Line N' stubs are also preserved."""
+        stub = ExtractedRuling(
+            extracted_case_number="25CV777666",
+            extracted_case_title="Garcia v. State",
+            ruling_text="Scroll down to Line 3 for tentative ruling.",
+            motion_type=None,
+            outcome=None,
+        )
+        result = _drop_short_unsubstantive_rulings([stub])
+        assert len(result) == 1
+
+    def test_non_xref_short_noise_still_dropped(self) -> None:
+        """Non-xref short noise without motion/outcome is still dropped by the filter."""
+        noise = ExtractedRuling(
+            extracted_case_number="30-2024-00001",
+            extracted_case_title="Malki vs Karanouh",
+            ruling_text="MALKI, Wajih v. KARANOUH, Abdulmajid",
+            motion_type=None,
+            outcome=None,
+        )
+        result = _drop_short_unsubstantive_rulings([noise])
+        assert result == []
