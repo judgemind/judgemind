@@ -13876,6 +13876,9 @@ class DispatcherDaemon:
                 # a hard-coded ``interval '24 hours'`` into the SQL —
                 # makes the constant the single source of truth and
                 # keeps the query tunable from one place.
+                # exec-mode-agnostic (#3158): candidates are selected
+                # regardless of mode; the resurrection path sets
+                # execution_mode='subprocess' unconditionally.
                 cur.execute(
                     "SELECT agent_id, pr_number, issue_number "
                     "FROM dispatcher.agents "
