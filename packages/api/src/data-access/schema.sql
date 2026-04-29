@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 49 migrations.
+-- Generated from 56 migrations.
 
 
 
@@ -469,6 +469,9 @@ CREATE TABLE dispatcher.config (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_by text NOT NULL
 );
+
+
+COMMENT ON TABLE dispatcher.config IS 'Live-editable key/value settings for the dispatcher daemon. ``concurrency_cap`` is runtime state (the breaker may rewrite it to 0); ``target_concurrency_cap`` is operator intent (the breaker reads it on auto-close to know what cap to restore). Issue #3779.';
 
 
 CREATE TABLE dispatcher.diagnoses (
@@ -1265,10 +1268,10 @@ CREATE INDEX idx_documents_hash ON derived.documents USING btree (content_hash);
 CREATE INDEX idx_documents_hearing_date ON derived.documents USING btree (hearing_date);
 
 
-CREATE INDEX idx_judge_aliases_raw_name ON derived.judge_aliases USING btree (lower(raw_name));
-
-
 CREATE UNIQUE INDEX idx_judge_aliases_judge_raw_source_uniq ON derived.judge_aliases USING btree (judge_id, lower(raw_name), source) WHERE (source IS NOT NULL);
+
+
+CREATE INDEX idx_judge_aliases_raw_name ON derived.judge_aliases USING btree (lower(raw_name));
 
 
 CREATE INDEX idx_parties_canonical_name_lower ON derived.parties USING btree (lower(canonical_name));
