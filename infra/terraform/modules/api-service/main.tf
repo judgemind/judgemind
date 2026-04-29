@@ -369,6 +369,31 @@ resource "aws_ecs_task_definition" "api" {
   ])
 }
 
+# ─── SSM: terraform-managed container_definitions for deploy-api ────────────
+# Stores the rendered container_definitions JSON that terraform considers the
+# desired state. The deploy-api workflow's `ecs-deploy` composite action reads
+# this parameter (instead of the running task-def) when registering a new
+# revision, so secrets / env vars terraform has removed can never leak back
+# in via the legacy "preserve current task-def content" path. See #3765 /
+# parent #2840 for the bug class this prevents.
+#
+# The parameter is updated on every terraform apply that produces a new
+# `container_definitions` rendering. deploy-api uses the parameter value as
+# the base for its register-task-definition call, substitutes the new image
+# URI into the named container, and registers. This makes terraform the
+# single source of truth for the non-image fields (secrets, env, log config,
+# port mappings, etc.).
+resource "aws_ssm_parameter" "container_definitions" {
+  name        = "/judgemind/api/${var.environment}/container-definitions"
+  description = "Terraform-rendered container_definitions JSON for the ${var.environment} API task. Read by .github/actions/ecs-deploy when --desired-container-definitions-ssm-parameter is set. See #3765 / #2840."
+  type        = "String"
+  # Tier "Advanced" supports values up to 8KB (Standard caps at 4KB). The
+  # rendered JSON for the API container is currently <2KB but Advanced gives
+  # headroom for future env-var / secret additions without a tier bump.
+  tier  = "Advanced"
+  value = aws_ecs_task_definition.api.container_definitions
+}
+
 # ─── ECS Service ────────────────────────────────────────────────────────────
 
 resource "aws_ecs_service" "api" {

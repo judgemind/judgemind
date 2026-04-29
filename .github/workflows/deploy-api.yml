@@ -35,6 +35,12 @@ env:
   ECS_SERVICE: judgemind-api-dev
   TASK_FAMILY: judgemind-api-dev
   CONTAINER_NAME: api
+  # Terraform-managed source of truth for container_definitions. See #3765 /
+  # #2840 — without this, deploy-api re-registers the running task-def's
+  # content and silently re-introduces fields terraform has removed. The
+  # parameter name follows the convention defined in
+  # `infra/terraform/modules/api-service/main.tf::aws_ssm_parameter.container_definitions`.
+  CONTAINER_DEFS_SSM_PARAMETER: /judgemind/api/dev/container-definitions
 
 jobs:
   build-and-push:
@@ -127,6 +133,7 @@ jobs:
           deploy-mode: service
           ecs-cluster: ${{ env.ECS_CLUSTER }}
           ecs-service: ${{ env.ECS_SERVICE }}
+          desired-container-definitions-ssm-parameter: ${{ env.CONTAINER_DEFS_SSM_PARAMETER }}
 
       - name: Set deployment status
         if: always()

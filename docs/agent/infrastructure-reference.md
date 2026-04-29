@@ -145,6 +145,32 @@ A regression test fixture lives in `infra/terraform/modules/dispatcher-daemon/te
 
 **Workaround for past silent drops.** If you encounter a deployed task-def revision that's missing a secret despite the HCL being correct: register a corrected revision out-of-band via `aws ecs register-task-definition` with the missing entry injected, then `aws ecs update-service --task-definition <family>:<rev> --force-new-deployment`. The next terraform apply will reconcile to a clean state once the postcondition catches any remaining drift.
 
+### Terraform task-def edits — deploy-* preserve-secrets gotcha
+
+**Background.** Parent issue #2840 surfaced a sibling failure mode to the silent-drop above: `.github/actions/ecs-deploy/action.yml` (consumed by `deploy-api.yml`, `deploy-scraper.yml`, `deploy-production.yml`) historically read the *currently registered* task-definition revision via `aws ecs describe-task-definition`, swapped the image, and re-registered. That implicitly preserved every other field — including secrets, env vars, and IAM role ARNs that terraform may have *removed* in the interim.
+
+The concrete symptom: PR #2820 removed `GITHUB_TOKEN` from the API task-def in terraform. Subsequent `deploy-api` runs re-registered task-def revisions that still contained `GITHUB_TOKEN` — sourced from the *previous* revision deploy-api itself had registered before #2820 merged. Terraform's removal never propagated end-to-end because every merge to `main` re-ran deploy-api with the previous revision as the base.
+
+**Architectural decision (#3765 — chunk B of #2840): Option 1 — Terraform writes the rendered `container_definitions` JSON to an SSM parameter; `ecs-deploy` reads the desired state from there.** Terraform becomes the single source of truth for non-image task-definition fields (secrets, env vars, log config, port mappings). The deploy-* workflows substitute the new image URI into the named container at deploy time and register a new revision based on terraform's intent — not on whatever stale content the running revision happens to carry.
+
+The hybrid pragmatism: family-level metadata (`cpu`, `memory`, `network_mode`, `execution_role_arn`, `requires_compatibilities`) still comes from `describe-task-definition`. Those fields rarely change and live on the task-definition itself, not the container_definitions array, so reading them from the running revision is harmless. Only the `container_definitions` array — where the silent-preserve bug manifests — switches to the SSM source.
+
+**Why not Option 2** (terraform manages only the initial revision, deploy-* owns subsequent edits via template files in the repo)? It splits desired-state ownership across two systems with two versioning models — terraform's HCL conditionals + provider rendering, versus deploy-* templates that are not exercised on every infra apply. The SSM-source approach (Option 1) keeps the desired state computed once, by terraform, and shipped to the deploy job at read time.
+
+**Mechanism.**
+
+1. Each terraform module that owns a task-definition publishes `aws_ssm_parameter "container_definitions"` with `value = aws_ecs_task_definition.<svc>.container_definitions`. Currently wired:
+   - `infra/terraform/modules/api-service/main.tf` → `/judgemind/api/<env>/container-definitions`
+2. `dev-apply` in `terraform.yml` runs on every `push:main` that touches `infra/terraform/**`, so the SSM parameter is always in sync with the latest committed terraform render.
+3. `.github/actions/ecs-deploy/action.yml` accepts an optional input `desired-container-definitions-ssm-parameter`. When set, the action invokes `scripts/ecs-render-task-def.sh` with that parameter name; the script reads the JSON from SSM, substitutes the new image into the named container, and registers the new revision.
+4. When the input is empty, the action falls back to the legacy `describe-task-definition` source — preserving behaviour for any deploy-* workflow that has not yet opted in.
+
+**Coverage and follow-ups.** Wired today: `deploy-api.yml`. Not yet wired: `deploy-scraper.yml`, `deploy-production.yml`. Migrating the remaining workflows is straightforward: add the SSM parameter resource to the relevant module (compute, scraper-zero-record-check, dispatcher-agent-runner, etc.), pass the parameter name to the composite action. File a follow-up issue when migrating each so the SSM parameter creation lands in the same PR as the workflow opt-in.
+
+**Operator gotcha.** When adding a new env var or secret to an SSM-source-mode task-definition, the change must land via terraform — direct edits to `register-task-definition` calls or one-off CLI tweaks will be silently overwritten by the next deploy. The SSM parameter is rendered from `aws_ecs_task_definition.<svc>.container_definitions`, so any change to that resource flows through automatically.
+
+**Test fixture.** `scripts/tests/test_ecs_render_task_def.sh` exercises the SSM-source path with a mock AWS CLI: it stages a "running" task-def that contains a secret terraform has since removed, points the script at an SSM-parameter response that omits the secret, and asserts the registered revision does **not** include the removed secret. This is the regression test for the #3765 preserve-bug class — it would have failed against the pre-fix action.
+
 ## Dispatcher v2 Cutover
 
 The dispatcher v2 daemon is an opt-in production replacement for the laptop-dispatcher's `/dispatcher` skill. It runs on Fargate, claims `agent/ready` issues from GitHub, and drives each one end-to-end through `claude -p '/task-v2-*'` subprocesses (plan → ralph → summary → push → CI watch → merge → deploy watch → verify → retro → cleanup). Phase 3 (#2782) shipped all the orchestration code; Phase 3E (#2798) was the final code piece. **The cutover from `concurrency_cap=0` (cold) to `concurrency_cap=1` (one in-flight agent) is an explicit operator action — not part of any PR.**
