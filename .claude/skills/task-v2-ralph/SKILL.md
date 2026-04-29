@@ -389,6 +389,8 @@ Capture stdout. If the output is non-empty it is the `## Iteration feedback` sec
 
 Use the Write tool to emit `{worktree}/tmp/dispatcher-output/ralph.json` with the fields above. Exit 0.
 
+**STOP CHECK before exiting (Layer 4 hardening, #3782):** verify that `{worktree}/tmp/dispatcher-output/ralph.json` was successfully written **this turn** by an actual Write tool call. If you have not yet executed the Write, do it now. Do NOT assume the JSON was written. Do NOT pre-emptively summarize the result before the Write. Do NOT exit the conversation while the only evidence of completion is your in-context narrative. The dispatcher reads the JSON from disk — if the file is absent, the wrapper falls back to a Layer-4 synthesis from `{worktree}/tmp/ralph/ralph-done.txt`, which produces a correct verdict but loses the richer fields (full `summary`, `iteration_feedback`, `infeasible_acs` for AC_INFEASIBLE) you assembled in this skill. The Write is the load-bearing final step; everything before it is preparation.
+
 ---
 
 ## Context-budget note (spike 0.3)

@@ -244,6 +244,21 @@ log "branch_ready" "branch=$BRANCH_NAME"
 source "$(dirname "${BASH_SOURCE[0]}")/agent_runner_install_fargate_hook.sh"
 install_fargate_preflight_hook
 
+# ── Layer 4 silent-ralph fallback helper (#3782) ----------------------------
+#
+# Defines `synthesize_ralph_output_from_done_marker <worktree>` for the
+# phase loop's `_output == "{}"` && `_current == "ralph"` branch. When
+# the inner `/task-v2-ralph` skill completes its conversation cleanly
+# but never executes Step 4 (the Write of `dispatcher-output/ralph.json`),
+# the wrapper falls back to synthesising a structured verdict from the
+# already-written `tmp/ralph/ralph-done.txt`. Layers 1-3 of the saga
+# (#3694, #3757, #3766) reduced the silent-exit cohort from "model
+# stopped early + permission denied + SIGKILL" to just "model stopped
+# early"; Layer 4 closes the residual gap.
+
+# shellcheck source=./agent_runner_synthesize_ralph_output.sh
+source "$(dirname "${BASH_SOURCE[0]}")/agent_runner_synthesize_ralph_output.sh"
+
 # ── Apply prior ralph patch (if any) ---------------------------------------
 #
 # Mirrors the daemon's `_apply_prior_ralph_patch` semantics: pull the
@@ -5675,6 +5690,33 @@ while true; do
                 # only emits ``{}`` for the non-object .result fallback;
                 # any legitimate ralph output, even an empty BLOCKED, is at
                 # least ``{"verdict": "..."}``).
+                if [[ "$_output" == "{}" ]]; then
+                    # Layer 4 silent-ralph fallback (#3782). Before
+                    # falling through to the ``ralph_done_marker_missing``
+                    # path, check whether the inner ``/task-v2-ralph``
+                    # skill DID write its inner ``ralph-done.txt`` (Step
+                    # 3b of the inner SKILL.md is marked CRITICAL — and
+                    # is reliably written) but the outer wrapper's Step
+                    # 4 Write of ``dispatcher-output/ralph.json`` was
+                    # skipped (the model finished its conversation
+                    # without doing the final tool call). Synthesize the
+                    # dispatcher-output JSON from the inner state files.
+                    # On success, ``_output`` carries a structured verdict
+                    # matching what ralph actually achieved; on failure
+                    # (ralph-done.txt missing — the genuinely-silent
+                    # case), the helper returns non-zero and we fall
+                    # through to the original Layer 1 instrumentation.
+                    _layer4_synth=""
+                    if _layer4_synth=$(synthesize_ralph_output_from_done_marker "$REPO_ROOT" 2>>"$AGENT_WORKSPACE/claude-p-ralph.stderr.log"); then
+                        if [[ -n "$_layer4_synth" ]]; then
+                            _output="$_layer4_synth"
+                        fi
+                    fi
+                fi
+                # If the Layer 4 synthesis didn't produce a verdict, fall
+                # through to Layer 1 instrumentation. Re-check
+                # ``_output == "{}"`` so a successful synthesis above
+                # short-circuits this block entirely.
                 if [[ "$_output" == "{}" ]]; then
                     _ralph_stdout_tail=""
                     _ralph_stderr_tail=""
