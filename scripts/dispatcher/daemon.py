@@ -18762,6 +18762,14 @@ class DispatcherDaemon:
                 # :data:`TERMINAL_AGENT_STATUSES`. Mark the marker
                 # consumed so it doesn't re-fire on the next tick.
                 with self._conn.cursor() as cur:
+                    # exec-mode-agnostic (#3158): terminal-status read;
+                    # the staleness check is identical for subprocess
+                    # and ECS agents — both modes write the same
+                    # ``status`` values via ``_mark_agent_terminal`` /
+                    # the agent_runner entrypoint, and this SELECT
+                    # only inspects ``status``. Mode-specific teardown
+                    # (e.g. ``agent_task_arn`` clear) lives in the
+                    # caller of ``_mark_agent_terminal``.
                     cur.execute(
                         "SELECT status FROM dispatcher.agents WHERE agent_id = %s",
                         (agent_id,),
