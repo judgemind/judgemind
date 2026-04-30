@@ -1146,7 +1146,9 @@ _MOTION_TYPE_CASE_TYPE_MAP: dict[str, str] = {
     "lis_pendens": "civil",
     "request_for_dismissal": "civil",
     # Probate-specific motion types
-    "petition": "probate",
+    # NOTE: bare "petition" is intentionally excluded — it is the catch-all
+    # label used in civil, limited-civil, federal, and Watermaster cases and
+    # therefore cannot be reliably mapped to probate (#3691).
     "petition_for_probate": "probate",
     "guardianship_petition": "probate",
     "trust_petition": "probate",

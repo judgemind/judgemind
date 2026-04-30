@@ -4941,6 +4941,9 @@ class TestFullReparseDocument:
         When the case number has no embedded type code (e.g. Ventura's
         ``202300574258``), the case_type should be derived from the
         motion_type via ``extract_case_type_from_motion_type()``.
+
+        Bare ``petition`` no longer maps to probate (#3691) — all-digit case
+        numbers with motion_type ``petition`` produce case_type ``None``.
         """
         from courts.ca.fresno_tentatives import SplitRuling
 
@@ -4965,9 +4968,9 @@ class TestFullReparseDocument:
             # demurrer => civil
             assert result[0]["case_type"] == "civil"
             assert result[0]["extraction_methods"]["case_type"] == "motion_type"
-            # petition => probate
-            assert result[1]["case_type"] == "probate"
-            assert result[1]["extraction_methods"]["case_type"] == "motion_type"
+            # petition => None (bare "petition" is ambiguous — removed from map in #3691)
+            assert result[1]["case_type"] is None
+            assert "case_type" not in result[1]["extraction_methods"]
         finally:
             reingest._SPLIT_REGISTRY.pop("test-ct-mt", None)
 

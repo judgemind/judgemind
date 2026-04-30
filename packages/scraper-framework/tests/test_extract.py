@@ -958,8 +958,33 @@ class TestExtractCaseTypeFromMotionType:
 
     # --- Probate motion types ---
 
-    def test_petition(self) -> None:
-        assert extract_case_type_from_motion_type("petition") == "probate"
+    def test_petition_too_broad_returns_none(self) -> None:
+        """Bare 'petition' is ambiguous — civil/limited-civil/federal/Watermaster
+        cases all use this label, so it must NOT map to probate."""
+        assert extract_case_type_from_motion_type("petition") is None
+
+    @pytest.mark.parametrize(
+        "motion_type,case_number,scraper_id",
+        [
+            # Contra Costa limited-civil
+            ("petition", "L25-03538", "ca-cc-tentatives"),
+            # Federal generic
+            ("petition", "24CV12345", "federal-pacer"),
+            # Fresno civil
+            ("petition", "2024CV019999", "ca-fresno-tentatives"),
+        ],
+    )
+    def test_petition_non_probate_fixtures_return_none(
+        self, motion_type: str, case_number: str, scraper_id: str
+    ) -> None:
+        """Regression: petition + non-probate case numbers/scrapers all return None.
+
+        These fixtures previously incorrectly mapped to 'probate' via the
+        bare 'petition' entry that has now been removed (#3691).
+        """
+        _ = case_number  # context only — extract_case_type_from_motion_type is motion-type-only
+        _ = scraper_id
+        assert extract_case_type_from_motion_type(motion_type) is None
 
     def test_petition_for_probate(self) -> None:
         assert extract_case_type_from_motion_type("petition_for_probate") == "probate"
