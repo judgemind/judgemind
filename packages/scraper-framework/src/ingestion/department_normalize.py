@@ -46,6 +46,14 @@ _LA_COURTHOUSE_ALIASES: dict[str, str] = {
     "SEP": "P",
 }
 
+# Long Beach Courthouse identifiers (case-folded).
+# S25–S29 are distinct courtrooms at LB; we skip the letter+digits collapse
+# so these codes survive normalization intact.  The display name comes from
+# ``_OPTION_TEXT_RE`` in ``la_tentatives.py``; ``LBC``/``LBCV`` are the
+# case-number prefixes — included defensively in case they ever appear in the
+# event payload.
+_LA_LB_COURTHOUSE_NAMES: frozenset[str] = frozenset({"long beach courthouse", "lbc", "lbcv"})
+
 # ---------------------------------------------------------------------------
 # Riverside
 # ---------------------------------------------------------------------------
@@ -66,7 +74,12 @@ _SB_HYPHEN_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
 # ---------------------------------------------------------------------------
 
 
-def normalize_department(county: str, department: str | None) -> str | None:
+def normalize_department(
+    county: str,
+    department: str | None,
+    *,
+    courthouse: str | None = None,
+) -> str | None:
     """Normalize a department name using county-specific rules.
 
     Parameters
@@ -75,6 +88,10 @@ def normalize_department(county: str, department: str | None) -> str | None:
         The county name (e.g. ``"Los Angeles"``, ``"Riverside"``).
     department : str | None
         The raw department value from the scraper or LLM.
+    courthouse : str | None
+        Optional courthouse display name or code.  Used by the LA normalizer
+        to skip the letter+digits collapse for courthouses (e.g. Long Beach)
+        where the combined code is a real identifier, not a glued suffix.
 
     Returns
     -------
@@ -92,7 +109,7 @@ def normalize_department(county: str, department: str | None) -> str | None:
     county_lower = county.lower()
 
     if county_lower == "los angeles":
-        dept = _normalize_la(dept)
+        dept = _normalize_la(dept, courthouse=courthouse)
     elif county_lower == "riverside":
         dept = _normalize_riverside(dept)
     elif county_lower == "san bernardino":
@@ -101,7 +118,7 @@ def normalize_department(county: str, department: str | None) -> str | None:
     return dept if dept else None
 
 
-def _normalize_la(dept: str) -> str:
+def _normalize_la(dept: str, *, courthouse: str | None = None) -> str:
     """Normalize an LA County department name.
 
     Transformations (applied in order):
@@ -109,7 +126,10 @@ def _normalize_la(dept: str) -> str:
     1. Strip ``SSC-`` courthouse prefix (reveals underlying pattern).
     2. Map known courthouse aliases (``SEP`` -> ``P``).
     3. Strip `` #N`` courtroom/calendar suffix.
-    4. Strip single-letter + digits glue (``X14`` -> ``X``).
+    4. Strip single-letter + digits glue (``X14`` -> ``X``), **unless**
+       the courthouse is a Long Beach courthouse — at LB these combined
+       codes (``S25``–``S29``) identify distinct courtrooms and must be
+       preserved.
     """
     # 1. Strip SSC- prefix first to reveal underlying patterns
     m = _LA_SSC_PREFIX_RE.match(dept)
@@ -124,10 +144,13 @@ def _normalize_la(dept: str) -> str:
     # 3. Strip " #N" suffix
     dept = _LA_COURTROOM_SUFFIX_RE.sub("", dept).strip()
 
-    # 4. Single letter + digits -> letter only
-    m = _LA_LETTER_PLUS_DIGITS_RE.match(dept)
-    if m:
-        dept = m.group(1)
+    # 4. Single letter + digits -> letter only.
+    # Skip for Long Beach Courthouse where the combined code is meaningful.
+    is_lb = (courthouse or "").strip().lower() in _LA_LB_COURTHOUSE_NAMES
+    if not is_lb:
+        m = _LA_LETTER_PLUS_DIGITS_RE.match(dept)
+        if m:
+            dept = m.group(1)
 
     return dept
 
