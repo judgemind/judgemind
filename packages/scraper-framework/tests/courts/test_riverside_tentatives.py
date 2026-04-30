@@ -24,11 +24,13 @@ The scraper now passes whole PDFs through without splitting.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import anthropic
 import httpx
 import pytest
 import respx
@@ -979,3 +981,142 @@ def test_riv_default_config() -> None:
     assert config.county == "Riverside"
     assert config.court == "Superior Court"
     assert len(config.schedule_windows) == 2
+
+
+# ---------------------------------------------------------------------------
+# AC#3: Multi-entry extraction drops "No tentative ruling" stub row (#3715)
+# ---------------------------------------------------------------------------
+
+
+def _make_anthropic_response(text: str) -> MagicMock:
+    """Build a minimal mock Anthropic messages.create() response."""
+    content_block = MagicMock()
+    content_block.text = text
+
+    usage = MagicMock()
+    usage.input_tokens = 100
+    usage.output_tokens = 50
+
+    response = MagicMock()
+    response.content = [content_block]
+    response.usage = usage
+    return response
+
+
+def test_extract_riverside_multi_entry_drops_no_tentative_row() -> None:
+    """AC#3: A 3-entry PDF with one 'No tentative ruling.' stub produces N-1 rulings.
+
+    Fixture: 3 numbered entries:
+      1. CVRI2600001 — substantive ruling (MSJ, DENY, multi-paragraph)
+      2. CVRI2600002 — bare "No tentative ruling." stub (< 200 chars)
+      3. CVRI2600003 — off-calendar entry
+
+    The post-processor must drop entry 2 (the stub), yielding 2 rulings, not 3.
+    """
+    from framework.llm_extractor import LlmExtractor
+    from framework.prompts.riverside import RIVERSIDE_SYSTEM_PROMPT
+
+    # The mock LLM returns all 3 entries — the sanitizer is responsible for
+    # dropping the stub, so this tests the post-processing pipeline.
+    llm_output = {
+        "extracted_judge_name": "Arthur Hester III",
+        "hearing_date": "2026-04-15",
+        "department": "PS1",
+        "rulings": [
+            {
+                "extracted_case_number": "CVRI2600001",
+                "extracted_case_title": "Smith v. Jones",
+                "case_type": "civil",
+                "outcome": "denied",
+                "motion_type": "summary_judgment",
+                "ruling_text": (
+                    "DENY Defendant's Motion for Summary Judgment.\n\n"
+                    "The court has reviewed the moving papers, opposition, and reply. "
+                    "Under CCP section 437c, the moving party bears the initial burden "
+                    "of showing that one or more elements of the cause of action cannot "
+                    "be established. Defendant has not met this burden. The motion is DENIED. "
+                    "Trial is set for June 10, 2026."
+                ),
+                "extracted_parties": [],
+                "confidence": {
+                    "case_number": "high",
+                    "case_title": "high",
+                    "parties": "high",
+                    "judge": "high",
+                    "ruling_text": "high",
+                    "outcome": "high",
+                },
+            },
+            {
+                "extracted_case_number": "CVRI2600002",
+                "extracted_case_title": "Doe v. Roe",
+                "case_type": "civil",
+                "outcome": "other",
+                "motion_type": None,
+                "ruling_text": "No tentative ruling.",
+                "extracted_parties": [],
+                "confidence": {
+                    "case_number": "high",
+                    "case_title": "high",
+                    "parties": "high",
+                    "judge": "high",
+                    "ruling_text": "high",
+                    "outcome": "high",
+                },
+            },
+            {
+                "extracted_case_number": "CVRI2600003",
+                "extracted_case_title": "Garcia v. Torres",
+                "case_type": "civil",
+                "outcome": "off_calendar",
+                "motion_type": None,
+                "ruling_text": "Off calendar.",
+                "extracted_parties": [],
+                "confidence": {
+                    "case_number": "high",
+                    "case_title": "high",
+                    "parties": "high",
+                    "judge": "high",
+                    "ruling_text": "high",
+                    "outcome": "high",
+                },
+            },
+        ],
+    }
+
+    mock_response = _make_anthropic_response(json.dumps(llm_output))
+    mock_client = MagicMock(spec=anthropic.Anthropic)
+    mock_client.messages = MagicMock()
+    mock_client.messages.create.return_value = mock_response
+
+    with patch.object(anthropic, "Anthropic", return_value=mock_client):
+        extractor = LlmExtractor(api_key="test-key")
+    extractor._client = mock_client
+    extractor._cache = None  # Disable S3 cache for the test
+
+    raw_text = (
+        "Tentative Rulings for April 15, 2026\n"
+        "Department PS1 - Honorable Arthur Hester III\n\n"
+        "1.\nCVRI2600001\nSMITH VS JONES\n"
+        "Hearing re: Motion for Summary Judgment\n"
+        "Tentative Ruling: DENY.\n\n"
+        "2.\nCVRI2600002\nDOE VS ROE\n"
+        "Hearing re: Demurrer\n"
+        "Tentative Ruling: No tentative ruling.\n\n"
+        "3.\nCVRI2600003\nGARCIA VS TORRES\n"
+        "Hearing re: Motion to Compel\n"
+        "Tentative Ruling: Off calendar.\n"
+    )
+
+    rulings = extractor.extract(raw_text, system_prompt=RIVERSIDE_SYSTEM_PROMPT)
+
+    # The stub (entry 2) must be dropped; entries 1 and 3 must be kept.
+    assert len(rulings) == 2, (
+        f"Expected 2 rulings after dropping the 'No tentative ruling' stub, "
+        f"got {len(rulings)}: {[r.extracted_case_number for r in rulings]}"
+    )
+
+    case_numbers = {r.extracted_case_number for r in rulings}
+    assert "CVRI2600001" in case_numbers, "Substantive ruling should be kept"
+    assert "CVRI2600003" in case_numbers, "Off-calendar entry should be kept"
+    assert "CVRI2600002" not in case_numbers, "Stub should be dropped"

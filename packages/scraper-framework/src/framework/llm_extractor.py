@@ -1222,6 +1222,76 @@ def _sanitize_riverside_rulings(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: Riverside "No tentative ruling" stub filter (#3715)
+# ---------------------------------------------------------------------------
+#
+# Riverside PDFs sometimes include per-entry bodies that are ONLY a bare
+# "No tentative ruling." statement — these are not substantive rulings and
+# should not appear in ``derived.rulings``.  They are typically very short
+# (< 200 chars) and match a recognisable pattern.
+#
+# The pattern tolerates:
+#   - An optional motion-header preamble on one or more lines
+#   - An optional "Tentative Ruling:" label prefix
+#   - "No tentative ruling" or "No further tentative ruling" variants
+#   - Up to 200 chars of trailing boilerplate (", appearances required.", etc.)
+#
+# Substantive carve-out: if the ruling_text starts with "No tentative ruling"
+# but is >= 200 chars overall, it stays with outcome='other' — the judge may
+# have added a substantial narrative.
+#
+# Cross-reference entries are exempt: their ruling_text is intentionally
+# sparse because they share text with the referent entry.
+
+_RIVERSIDE_NO_TENTATIVE_RULING_STUB_RE = re.compile(
+    r"^\s*(?:[A-Z][\w \-,'\\.]{0,150}\n+)?"
+    r"(?:Tentative Ruling:\s*)?No (?:further )?tentative ruling[\s\S]{0,200}$",
+    re.IGNORECASE,
+)
+
+
+def _drop_riverside_no_tentative_ruling_stubs(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Drop Riverside 'No tentative ruling.' stub entries from the rulings list (#3715).
+
+    Entries whose ``ruling_text`` consists entirely of a bare
+    "No tentative ruling." variant (≤ 200 chars total) are dropped so that
+    they do not pollute ``derived.rulings``.
+
+    Rules:
+    - Entries with ``cross_reference_source`` set are exempt — they share
+      text intentionally via cross-reference resolution and are the
+      referent's responsibility.
+    - Entries with ``ruling_text`` of ``None`` or empty are preserved.
+    - Drop when ``len(ruling_text.strip()) < 200`` AND the stub regex matches
+      the entire stripped text.
+
+    This filter is idempotent — applying it to already-filtered rulings is
+    a no-op.
+    """
+    kept: list[ExtractedRuling] = []
+    for ruling in rulings:
+        if ruling.cross_reference_source is not None:
+            kept.append(ruling)
+            continue
+        if not ruling.ruling_text:
+            kept.append(ruling)
+            continue
+        stripped = ruling.ruling_text.strip()
+        if len(stripped) < 200 and _RIVERSIDE_NO_TENTATIVE_RULING_STUB_RE.match(stripped):
+            logger.warning(
+                "llm_extractor.riverside_no_tentative_stub_dropped",
+                case_number=ruling.extracted_case_number,
+                length=len(stripped),
+                preview=stripped[:80],
+            )
+            continue
+        kept.append(ruling)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: San Bernardino title and ruling_text sanitizers (#2565)
 # ---------------------------------------------------------------------------
 #
@@ -2063,6 +2133,7 @@ def _apply_text_cache_hit_filters(
     rulings = _truncate_repeated_name_tails(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+    rulings = _drop_riverside_no_tentative_ruling_stubs(rulings)
     rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
     if len(rulings) != original_count:
         logger.info(
@@ -2440,6 +2511,11 @@ class LlmExtractor:
         # no-ops on clean rulings and on non-Riverside documents (the
         # cross-case truncator only triggers on CVRI/CVSW/RIC/… tokens).
         rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
+
+        # Post-processing: Riverside "No tentative ruling" stub filter (#3715).
+        # Drop per-entry stubs whose only content is a bare "No tentative ruling."
+        # variant (≤ 200 chars). No-op on clean rulings and non-Riverside docs.
+        rulings = _drop_riverside_no_tentative_ruling_stubs(rulings)
 
         # Post-processing: San Bernardino title and ruling_text sanitizers (#2565).
         # Truncate ruling_text at foreign CIVSB/CIVRS case numbers and rebuild
