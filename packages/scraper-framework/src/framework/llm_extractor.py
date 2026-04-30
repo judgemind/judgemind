@@ -820,6 +820,122 @@ def _truncate_concatenated_case_titles(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: repeated-name tail sanitizer (#3684)
+# ---------------------------------------------------------------------------
+#
+# Some LLM extractions produce an ``extracted_case_title`` that duplicates the
+# party-name tail verbatim — for example::
+#
+#   "Hearns vs. FCA US, LLC. Tenaya Hearns Tenaya Hearns Tenaya Hearns Tenaya Hearns"
+#
+# should be sanitized to::
+#
+#   "Hearns vs. FCA US, LLC."
+#
+# The guard detects a tail-run of capitalized N-gram repetitions (N in 1–3),
+# requires at least 2 repetitions, and strips the repeated tail, keeping only
+# the first occurrence.  The capitalization gate prevents accidental truncation
+# of lowercase connector phrases like "Department of Maintenance Maintenance".
+
+
+def _truncate_repeated_name_tail(title: str | None) -> str | None:
+    """Return *title* with a repeated capitalized N-gram tail stripped (#3684).
+
+    The heuristic:
+
+    1. Return ``None`` / empty / whitespace-only inputs unchanged.
+    2. Tokenize on whitespace.  For N in ``(3, 2, 1)`` (longest-first to
+       avoid a 1-gram match shadowing a legitimate 3-gram match):
+       a. Require at least ``2 * N`` tokens.
+       b. Require the candidate N-gram (last N tokens) to be all capitalized
+          (first char uppercase).  This guards against truncating lowercase-
+          connector phrases such as ``"Department of Maintenance Maintenance"``.
+       c. Walk backwards to count the number of consecutive repetitions of
+          the N-gram at the tail.  Require at least 2 repetitions.
+       d. If exactly 2 repetitions are found, keep the first occurrence:
+          cut at ``first_rep_start + N`` (i.e. after the first occurrence).
+          This covers ``"...Maintenance Corporation Maintenance Corporation"``
+          → ``"...Maintenance Corporation"``.
+       e. If 3 or more repetitions are found, strip the entire repeated run
+          (including the first occurrence): cut at ``first_rep_start``.
+          This covers the Hearns pattern where 4 identical 2-grams appear and
+          ALL of them are clearly artifact (``"LLC. Tenaya Hearns × 4"``).
+       f. Strip trailing whitespace and stray connector punctuation (``,;:``).
+    3. If no repetition is found, return *title* unchanged.
+
+    Idempotent: applying this function twice produces the same result as
+    applying it once.
+    """
+    if title is None:
+        return None
+    if not title.strip():
+        return title
+
+    tokens = title.split()
+    total = len(tokens)
+
+    for n in (3, 2, 1):
+        if total < 2 * n:
+            continue
+        # Candidate N-gram is the last N tokens.
+        candidate = tokens[-n:]
+        # Capitalization gate: every token in the candidate N-gram must start
+        # with an uppercase character.
+        if not all(tok and tok[0].isupper() for tok in candidate):
+            continue
+        # Walk backwards counting consecutive repetitions.
+        rep_count = 0
+        pos = total
+        while pos >= n and tokens[pos - n : pos] == candidate:
+            rep_count += 1
+            pos -= n
+        if rep_count < 2:
+            continue
+        # first_rep_start is the index where the FIRST occurrence of the
+        # repeated N-gram starts.
+        first_rep_start = pos
+        if rep_count == 2:
+            # Keep the first occurrence; strip only the duplicate tail copy.
+            cut = first_rep_start + n
+        else:
+            # 3+ repetitions — strip the entire run, including first copy.
+            cut = first_rep_start
+        result = " ".join(tokens[:cut])
+        result = result.rstrip()
+        result = re.sub(r"[,;:]+$", "", result).rstrip()
+        return result
+
+    return title
+
+
+def _truncate_repeated_name_tails(
+    rulings: list[ExtractedRuling],
+) -> list[ExtractedRuling]:
+    """Strip repeated capitalized name tails from ``extracted_case_title`` (#3684).
+
+    Runs ``_truncate_repeated_name_tail`` on each ruling's title and rewrites
+    the ruling via ``model_copy`` when the title changes.  Preserves every
+    other field.  Logs one ``llm_extractor.truncate_repeated_name_tail``
+    record per rewritten title so production can observe the guard's activity.
+
+    This post-processor is idempotent — re-applying it to already-clean output
+    is a no-op.
+    """
+    for i, ruling in enumerate(rulings):
+        original = ruling.extracted_case_title
+        truncated = _truncate_repeated_name_tail(original)
+        if truncated != original:
+            rulings[i] = ruling.model_copy(update={"extracted_case_title": truncated})
+            logger.warning(
+                "llm_extractor.truncate_repeated_name_tail",
+                case_number=ruling.extracted_case_number,
+                original_title=original,
+                truncated_title=truncated,
+            )
+    return rulings
+
+
+# ---------------------------------------------------------------------------
 # Post-processing: Riverside title motion-tail sanitizer (#2564)
 # ---------------------------------------------------------------------------
 #
@@ -1909,6 +2025,7 @@ def _apply_pdf_cache_hit_filters(
     rulings = _drop_calendar_listing_rulings(rulings)
     rulings = _drop_short_unsubstantive_rulings(rulings)
     rulings = _truncate_concatenated_case_titles(rulings)
+    rulings = _truncate_repeated_name_tails(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _filter_citation_artifacts(rulings)
     if len(rulings) != original_count:
@@ -1942,6 +2059,7 @@ def _apply_text_cache_hit_filters(
     original_count = len(rulings)
     rulings = _filter_citation_artifacts(rulings)
     rulings = _truncate_concatenated_case_titles(rulings)
+    rulings = _truncate_repeated_name_tails(rulings)
     rulings = _deduplicate_ruling_texts(rulings)
     rulings = _sanitize_riverside_rulings(rulings, case_number_re=_RIVERSIDE_CASE_NUMBER_RE)
     rulings = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
@@ -3918,6 +4036,7 @@ def _join_page_rows(
     # deterministic flag rule ``check_no_multiple_adversarial_patterns`` in
     # the worker's validation step.
     rulings = _truncate_concatenated_case_titles(rulings)
+    rulings = _truncate_repeated_name_tails(rulings)
 
     # Post-processing: deduplicate identical ruling texts (#2096).
     # The LLM sometimes produces the same ruling text for multiple cases
