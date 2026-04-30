@@ -1635,3 +1635,96 @@ def test_cc_fetch_llm_disabled_uses_regex(mock_llm_enabled: MagicMock) -> None:
     assert len(docs) == 1
     assert docs[0].department == "14"
     assert docs[0].extra.get("_llm_extracted") is not True
+
+
+# ---------------------------------------------------------------------------
+# Regression: probate PDFs use content-hash filenames — hearing_date from PDF header
+# (#3739)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_fetch_probate_hash_filename_hearing_date_llm_path(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """Probate PDFs use content-hash filenames (e.g. 594361f8.pdf) that do not
+    match the NN_MMDDYY pattern.  With LLM enabled, each emitted doc must still
+    carry hearing_date populated from the PDF calendar header, not the filename."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Content-hash-style href — _cc_hearing_date_from_filename returns None for this.
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR/Department 30/594361f8.pdf">Mar 16</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    # Load probate fixture: calendar header "COURT CALENDAR FOR MARCH 16, 2026"
+    pdf_bytes = _load_bytes("cc_dept30_031626.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="P24-00001",
+            ruling_text="The petition is granted.",
+            case_title="Estate of Test",
+            case_type="probate",
+            motion_type=None,
+            outcome="granted",
+            parties=[],
+        ),
+    ]
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    doc = docs[0]
+    # Core regression assertion: hearing_date must be populated from PDF header
+    assert doc.hearing_date == datetime(2026, 3, 16), (
+        f"Expected hearing_date 2026-03-16 from PDF header, got {doc.hearing_date!r}"
+    )
+    # LLM path markers must be set
+    assert doc.extra.get("pre_split") is True
+    assert doc.extra.get("_llm_extracted") is True
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=False)
+def test_cc_fetch_probate_hash_filename_hearing_date_regex_path(
+    mock_llm_enabled: MagicMock,
+) -> None:
+    """Probate PDFs use content-hash filenames.  With LLM disabled (single-doc
+    regex path), hearing_date must still be populated from the PDF calendar header."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Content-hash-style href
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR/Department 30/594361f8.pdf">Mar 16</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept30_031626.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.hearing_date == datetime(2026, 3, 16), (
+        f"Expected hearing_date 2026-03-16 from PDF header, got {doc.hearing_date!r}"
+    )
