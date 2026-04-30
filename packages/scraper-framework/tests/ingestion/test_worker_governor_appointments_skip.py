@@ -180,7 +180,7 @@ class TestGovernorAppointmentsSkip:
             # was called (i.e. the early-return guard was NOT triggered).
             try:
                 worker.process_event(event)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass  # We don't care about downstream errors here.
 
         # DB connection was attempted — proof the early-return did not fire.
