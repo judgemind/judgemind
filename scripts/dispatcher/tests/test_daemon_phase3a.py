@@ -3788,6 +3788,66 @@ class TestQueueScanExcludesInProgressLabel:
         assert [i["number"] for i in issues] == [1, 3]
 
 
+class TestQueueScanExcludesNeedsHumanLabel:
+    """``_fetch_agent_ready_issues`` filters out ``status/needs-human`` (#3825).
+
+    The diagnoser writes ``status/needs-human`` whenever it escalates an
+    issue to operator attention (``daemon.py`` ``_diagnose_and_escalate``
+    path). Before #3825, the queue-scan filter only dropped
+    ``status/blocked`` and ``status/in-progress`` — the daemon would
+    re-claim a needs-human issue every tick, costing ~10 minutes of
+    agent runtime per claim before terminating at
+    ``push_and_pr_no_unmerged_files``. The fix mirrors the existing
+    ``status/blocked`` / ``status/in-progress`` filter: one literal
+    string check inside the same loop.
+    """
+
+    def test_needs_human_label_excludes_issue_from_candidate_list(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issues carrying ``status/needs-human`` alongside ``agent/ready`` drop.
+
+        The diagnoser-side write is the producer; this filter is the
+        consumer side. Without it, the daemon's queue-scan keeps
+        returning the issue and the dispatcher keeps spawning agents
+        on it.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = json.dumps(
+                [
+                    {
+                        "number": 1,
+                        "labels": [{"name": "agent/ready"}],
+                        "title": "ok",
+                    },
+                    {
+                        "number": 2,
+                        "labels": [
+                            {"name": "agent/ready"},
+                            {"name": "status/needs-human"},
+                        ],
+                        "title": "needs-human",
+                    },
+                    {
+                        "number": 3,
+                        "labels": [{"name": "agent/ready"}],
+                        "title": "ok2",
+                    },
+                ]
+            )
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        issues = d._fetch_agent_ready_issues()
+        # #2 drops; #1 + #3 remain.
+        assert [i["number"] for i in issues] == [1, 3]
+
+
 class TestGhIssueRemoveLabelsHelper:
     """Thin helper tests for :meth:`_gh_issue_remove_labels` (#2866)."""
 
