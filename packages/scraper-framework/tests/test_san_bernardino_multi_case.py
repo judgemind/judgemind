@@ -209,6 +209,20 @@ def test_rebuild_role_literal_title_none_input() -> None:
     assert result is None
 
 
+def test_rebuild_title_from_parties_accepts_dict_shaped_parties() -> None:
+    """_rebuild_title_from_parties accepts dict-shaped parties (LA path) — #3749.
+
+    LA uses list[dict[str, str]] rather than pydantic ExtractedParty instances.
+    The dict-adapter branch must return the same rebuilt title as the getattr path.
+    """
+    parties = [
+        {"name": "Sumayya Aasi", "role": "plaintiff"},
+        {"name": "General Motors, LLC", "role": "defendant"},
+    ]
+    result = _rebuild_title_from_parties("Plaintiff v. General Motors, LLC", parties)
+    assert result == "Sumayya Aasi v. General Motors, LLC"
+
+
 # ---------------------------------------------------------------------------
 # _sanitize_san_bernardino_rulings — orchestrator covers all paths
 # ---------------------------------------------------------------------------
