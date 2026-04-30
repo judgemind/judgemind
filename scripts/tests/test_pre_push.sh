@@ -732,6 +732,132 @@ else
 fi
 
 # ───────────────────────────────────────────────────────────────────────
+# Scenario 16: Unannotated dispatcher.agents SQL site is rejected (#3818)
+# ───────────────────────────────────────────────────────────────────────
+# A daemon.py change that adds an UPDATE/SELECT against dispatcher.agents
+# without a nearby execution_mode token, agent_task_arn token, or
+# `# exec-mode-agnostic (#NNNN)` annotation must fail the pre-push hook
+# locally — mirrors the CI `Verify every dispatcher.agents SQL site is
+# execution_mode-aware` step. Without the wiring (#3818), the hook would
+# silently pass and the agent would learn about the failure 10-20 minutes
+# later when CI runs.
+echo "[scenario 16] unannotated dispatcher.agents SQL site rejected (#3818)"
+init_workspace
+
+# Copy the real check script into the scratch workspace so the hook can
+# run it. The hook gates on `scripts/dispatcher/daemon.py` change
+# detection; we seed a daemon.py with a deliberately unannotated SQL site.
+CHECK_EXEC_MODE_SH="$REPO_ROOT/scripts/check-dispatcher-execution-mode-aware.sh"
+if [ ! -x "$CHECK_EXEC_MODE_SH" ]; then
+    report_skip "scripts/check-dispatcher-execution-mode-aware.sh unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-exec-mode-bad
+    mkdir -p "$WORK/scripts/dispatcher" "$WORK/scripts"
+    cp "$CHECK_EXEC_MODE_SH" "$WORK/scripts/check-dispatcher-execution-mode-aware.sh"
+    chmod +x "$WORK/scripts/check-dispatcher-execution-mode-aware.sh"
+    # daemon.py with an UPDATE site lacking execution_mode / agent_task_arn /
+    # exec-mode-agnostic annotation within the +/- 60-line window.
+    cat > "$WORK/scripts/dispatcher/daemon.py" <<'PY'
+"""Daemon stub for testing the pre-push check (#3818)."""
+
+
+def mark_agent_done(agent_id: str) -> None:
+    """Mark an agent done by writing to the agents table.
+
+    No mode awareness here, no task ARN field reference,
+    no audit annotation — this is exactly the shape the
+    #3818 wiring is supposed to catch locally.
+    """
+    _execute(
+        "UPDATE dispatcher.agents SET status = 'done' WHERE id = %s",
+        (agent_id,),
+    )
+
+
+def _execute(sql: str, params: tuple) -> None:
+    """Stub query executor."""
+    del sql, params
+PY
+    git -C "$WORK" add scripts/check-dispatcher-execution-mode-aware.sh \
+        scripts/dispatcher/daemon.py
+    git -C "$WORK" commit --quiet -m "feat: add unannotated daemon.py SQL site"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-exec-mode-bad $feat_sha refs/heads/feature-exec-mode-bad $ZERO_SHA"
+
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject unannotated daemon.py SQL site (#3818), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "scripts/check-dispatcher-execution-mode-aware.sh"; then
+        report_fail "expected check-dispatcher-execution-mode-aware.sh to fire on daemon.py change (#3818)" "$hook_out"
+    elif ! echo "$hook_out" | grep -qE "exec-mode-agnostic|execution_mode"; then
+        report_fail "expected failure message to surface annotation guidance (#3818)" "$hook_out"
+    else
+        report_pass "hook rejects unannotated dispatcher.agents SQL site in daemon.py (#3818)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 17: Annotated dispatcher.agents SQL site passes (#3818)
+# ───────────────────────────────────────────────────────────────────────
+# Regression guard: a daemon.py change that DOES carry the
+# `# exec-mode-agnostic (#NNNN)` annotation must NOT fail the new check.
+# Without this scenario the negative test above could be satisfied by a
+# check that fails on every daemon.py change — we need the positive case
+# to pin down the actual contract.
+echo "[scenario 17] annotated dispatcher.agents SQL site passes (#3818)"
+init_workspace
+
+if [ ! -x "$CHECK_EXEC_MODE_SH" ]; then
+    report_skip "scripts/check-dispatcher-execution-mode-aware.sh unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-exec-mode-good
+    mkdir -p "$WORK/scripts/dispatcher" "$WORK/scripts"
+    cp "$CHECK_EXEC_MODE_SH" "$WORK/scripts/check-dispatcher-execution-mode-aware.sh"
+    chmod +x "$WORK/scripts/check-dispatcher-execution-mode-aware.sh"
+    cat > "$WORK/scripts/dispatcher/daemon.py" <<'PY'
+"""Daemon stub for testing the exec-mode-aware pre-push check (#3818)."""
+
+
+def mark_agent_done(agent_id: str) -> None:
+    """Mark an agent done by writing to dispatcher.agents.
+
+    exec-mode-agnostic (#3158): terminal stamp; teardown is
+    handled by the caller per execution_mode in
+    _mark_agent_terminal — no mode branch needed here.
+    """
+    # exec-mode-agnostic (#3158): phase-driven terminal writer.
+    _execute(
+        "UPDATE dispatcher.agents SET status = 'done' WHERE id = %s",
+        (agent_id,),
+    )
+
+
+def _execute(sql: str, params: tuple) -> None:
+    """Stub query executor."""
+    del sql, params
+PY
+    git -C "$WORK" add scripts/check-dispatcher-execution-mode-aware.sh \
+        scripts/dispatcher/daemon.py
+    git -C "$WORK" commit --quiet -m "feat: add annotated daemon.py SQL site"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-exec-mode-good $feat_sha refs/heads/feature-exec-mode-good $ZERO_SHA"
+
+    if [ "$hook_rc" -ne 0 ]; then
+        # The hook may exit non-zero for unrelated reasons in the
+        # scratch workspace (e.g. ruff missing), so we only fail
+        # this scenario if the exec-mode check itself flagged.
+        if echo "$hook_out" | grep -q "FAILED: scripts/check-dispatcher-execution-mode-aware.sh"; then
+            report_fail "annotated daemon.py SQL site must NOT trigger exec-mode check (#3818)" "$hook_out"
+        else
+            report_pass "annotated daemon.py SQL site does not trigger exec-mode check (#3818); hook rc=$hook_rc came from unrelated branch"
+        fi
+    else
+        report_pass "annotated daemon.py SQL site passes pre-push hook (#3818)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
 # Summary
 # ───────────────────────────────────────────────────────────────────────
 echo ""
