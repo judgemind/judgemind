@@ -1308,6 +1308,25 @@ class IngestionWorker:
         source_url: str = event_data.get("source_url", "")
         scraper_id: str = event_data.get("scraper_id", "")
 
+        # Pipeline branch — non-ruling scrapers (#3688).
+        # The ca-governor-appointments scraper emits judge-bio press releases
+        # that share the CapturedDocument shape but are NOT rulings. Without
+        # this branch the LLM extractor produces UNKNOWN-* case_numbers,
+        # empty case_titles, and a 'Governor / Statewide' court row that
+        # pollutes derived.rulings (178 rows as of 2026-04-28). Raw HTML is
+        # preserved in S3 + staging.captures so #2144 can recover appointee
+        # data via courts.ca.governor_appointments.parse_appointees().
+        if scraper_id == "ca-governor-appointments":
+            logger.info(
+                "Routing governor-appointment document to bio path (skipping ruling extraction)",
+                extra={
+                    "document_id": document_id,
+                    "scraper_id": scraper_id,
+                    "telemetry_event": "governor_appointment_routed_to_bio_path",
+                },
+            )
+            return
+
         # PDF preprocessing: if ruling_text is raw PDF binary, extract text first.
         # This handles documents where the scraper stored raw PDF bytes instead of
         # extracted text (e.g. Riverside, Orange county PDFs).

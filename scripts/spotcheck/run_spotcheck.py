@@ -44,6 +44,8 @@ ALL_COUNTIES = [
     "Fresno",
     "San Francisco",
     "San Diego",
+    "Statewide",
+    "Federal",
 ]
 
 
