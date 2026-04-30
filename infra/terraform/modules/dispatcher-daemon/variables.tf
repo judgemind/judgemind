@@ -243,6 +243,12 @@ variable "agent_runner_security_group_id" {
   default     = ""
 }
 
+variable "agent_runner_ecr_repository_arn" {
+  description = "ARN of the agent-runner ECR repository (judgemind/dispatcher-agent-runner). When set alongside agent_runner_task_definition_family, the daemon's task role is granted ecr:DescribeImages so _check_agent_runner_image_freshness (#3754) can resolve the latest pushed digest. Empty disables the grant — freshness check fails-open with the existing AccessDenied warning."
+  type        = string
+  default     = ""
+}
+
 # ─── Document-archive S3 census access (#3050) ──────────────────────────────
 
 variable "document_archive_bucket_arn" {

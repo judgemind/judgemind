@@ -342,6 +342,7 @@ module "dispatcher_daemon" {
   agent_runner_task_role_arn          = module.dispatcher_agent_runner.task_role_arn
   agent_runner_subnet_ids             = module.networking.private_subnet_ids
   agent_runner_security_group_id      = module.dispatcher_agent_runner.security_group_id
+  agent_runner_ecr_repository_arn     = module.ecr.dispatcher_agent_runner_repository_arn
 }
 
 # ─── Dispatcher agent-runner task def (Stage 1b, #3090) ─────────────────────
