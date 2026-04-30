@@ -21,6 +21,7 @@ from ingestion.extract import (
     is_valid_case_number,
     normalize_motion_type,
     normalize_outcome,
+    strip_trailing_connectors,
 )
 
 
@@ -2297,6 +2298,61 @@ class TestCleanCaseTitle:
                 "an",
                 "as",
             }
+
+
+# ---------------------------------------------------------------------------
+# strip_trailing_connectors helper (#3730)
+# ---------------------------------------------------------------------------
+
+
+class TestStripTrailingConnectors:
+    """Unit tests for strip_trailing_connectors() — the module-level helper
+    that removes dangling English connector words from case titles (#3730).
+
+    These cover the stand-alone helper, independent of the 120-char truncation
+    path exercised by TestCleanCaseTitle.
+    """
+
+    def test_strips_trailing_and(self) -> None:
+        """Simple case: 'Smith v. Jones and' → 'Smith v. Jones'."""
+        assert strip_trailing_connectors("Smith v. Jones and") == "Smith v. Jones"
+
+    def test_strips_trailing_to_on_la_shaped_title(self) -> None:
+        """115-char LA-shaped title ending in connector word is stripped."""
+        # Real-world shape: 115 chars, ends in ' to' (AC #3 detection query hits this)
+        title = "Smith v. City of Los Angeles, a public entity; and Does 1 to"
+        assert len(title) <= 120
+        result = strip_trailing_connectors(title)
+        assert result is not None
+        last_word = result.rstrip().split()[-1].lower()
+        assert last_word not in {"to", "and"}
+        assert "Does 1" in result
+
+    def test_strips_trailing_of(self) -> None:
+        """Trailing 'of' is stripped correctly."""
+        title = "Smith v. The Regents of the University of"
+        result = strip_trailing_connectors(title)
+        assert result == "Smith v. The Regents of the University"
+
+    def test_noop_connector_mid_string(self) -> None:
+        """Connector mid-string does not cause truncation — 'Partners' is preserved."""
+        title = "Smith v. Jones and Partners"
+        assert strip_trailing_connectors(title) == "Smith v. Jones and Partners"
+
+    def test_noop_no_connector(self) -> None:
+        """Title with no trailing connector is returned unchanged."""
+        title = "Smith v. Jones"
+        assert strip_trailing_connectors(title) == "Smith v. Jones"
+
+    def test_strips_chained_connector(self) -> None:
+        """Chained connectors like ', and the' are stripped in one pass."""
+        title = "Smith v. Jones, and the"
+        result = strip_trailing_connectors(title)
+        assert result == "Smith v. Jones"
+
+    def test_empty_string_passthrough(self) -> None:
+        """Empty string is returned unchanged (no crash)."""
+        assert strip_trailing_connectors("") == ""
 
 
 # ---------------------------------------------------------------------------
