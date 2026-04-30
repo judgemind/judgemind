@@ -311,6 +311,18 @@ PDF_PER_PAGE_PROMPT = (
     "with entry_number / case_number / case_title populated and "
     '`ruling_text=""`. Downstream filters will drop these rows; do '
     "NOT copy the case caption or motion label into ruling_text.\n\n"
+    "**Orange County multi-line tabular layout** (OC Superior Court "
+    "PDFs): The case number sits in a right-hand column next to the "
+    "case name. In many OC PDFs, the case number column wraps across "
+    "two visual lines — the case name appears on one line and the "
+    "case number appears on the next line in the same row. Additionally, "
+    "the printed number may show only the year-and-sequence portion "
+    "(e.g. ``2023-01329371``) without the ``30-`` court prefix. Always "
+    "capture the full case number as printed in case_number even when "
+    "the layout splits it visually across lines. Return empty string "
+    "ONLY when the case number is genuinely illegible — not when it is "
+    "merely hard to align with the case name because of the multi-line "
+    "table layout.\n\n"
     "## Formatting rules\n\n"
     "- Transcribe ruling_text as **Markdown** preserving formatting:\n"
     "  - Use **bold** for bold text and headings\n"
@@ -3854,6 +3866,8 @@ def _append_ruling_from_case(
     header_judge: str | None,
     header_dept: str | None,
     header_date: str | None,
+    header_case_number: str | None = None,
+    single_ruling_doc: bool = False,
     entry_number: int | None = None,
 ) -> None:
     """Append one ``ExtractedRuling`` built from a single case_info string.
@@ -3862,8 +3876,17 @@ def _append_ruling_from_case(
     Extracted from the main conversion loop in ``_join_page_rows`` so the
     fused-row splitter (#2500) can emit one ruling per sub-case while
     reusing the same post-processing.
+
+    When ``_extract_case_number_from_info`` returns None AND
+    ``single_ruling_doc=True``, ``header_case_number`` is used as a fallback
+    to avoid UNKNOWN-synthetic case numbers on OC pages where the case number
+    appears in the document header rather than inline in case_info (#3729).
+    The ``single_ruling_doc`` gate prevents mis-attributing one
+    document-header case_number to multiple cases on the same page.
     """
     case_number = _extract_case_number_from_info(case_info)
+    if case_number is None and single_ruling_doc and header_case_number:
+        case_number = header_case_number
     case_title = _extract_case_title_from_info(case_info)
     text = ruling_text.strip() if ruling_text else None
     text = text or None
@@ -3962,13 +3985,14 @@ def _join_page_rows(
     # Group rows into cases.
     cases: list[dict] = []  # Each: {case_info, ruling_text}
 
-    # Extract judge/department/hearing_date from header rows before
+    # Extract judge/department/hearing_date/case_number from header rows before
     # skipping them.  Header rows typically have entry_number=null,
     # empty ruling_text, and case_info containing metadata.  These
     # are emitted by _parse_page_rows when it encounters a page_header.
     header_judge: str | None = None
     header_dept: str | None = None
     header_date: str | None = None
+    header_case_number: str | None = None
     for row in rows:
         if row["entry_number"] is None and not row["ruling_text"] and row.get("case_info"):
             info = row["case_info"]
@@ -3983,13 +4007,17 @@ def _join_page_rows(
             # Extract hearing date from header (ISO, month-name, or slash formats).
             if not header_date:
                 header_date = _parse_header_date(info)
+            # Extract case number from header case_info (#3729 — OC single-ruling docs
+            # sometimes encode the case number in the document header rather than inline).
+            if not header_case_number:
+                header_case_number = _extract_case_number_from_info(info)
 
     # Permissive second pass: when the strict pass did not find a judge or
     # department, scan case_info of ALL rows (regardless of entry_number or
     # ruling_text) for the patterns.  OC multimodal PDFs embed this metadata
     # inside regular ruling rows rather than in a dedicated header row (#3722).
     # First match wins; strict-pass hits are never overwritten.
-    if not header_judge or not header_dept:
+    if not header_judge or not header_dept or not header_case_number:
         for row in rows:
             info = row.get("case_info") or ""
             if not info:
@@ -4006,7 +4034,9 @@ def _join_page_rows(
                 dept_match = re.search(r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE)
                 if dept_match:
                     header_dept = dept_match.group(1).strip()
-            if header_judge and header_dept:
+            if not header_case_number:
+                header_case_number = _extract_case_number_from_info(info)
+            if header_judge and header_dept and header_case_number:
                 break
 
     # Track entry_number -> case_index for cross-reference resolution (#2317).
@@ -4074,6 +4104,14 @@ def _join_page_rows(
             # entry_number — subsequent sub-cases stay None because the
             # original entry_number unambiguously refers to the first ruling.
             sub_entry_number = case["entry_number"] if idx == 0 else None
+            # Pass header_case_number + single_ruling_doc only when there
+            # is exactly one case AND no fused-row split occurred (#3729).
+            # Fused-split sub-cases (idx > 0) must never inherit the header
+            # case_number — the number belongs to the first sub-case, not
+            # the continuation block that was merged by the LLM.
+            _effective_header_cn = (
+                header_case_number if len(cases) == 1 and len(sub_case_infos) == 1 else None
+            )
             _append_ruling_from_case(
                 rulings,
                 sub_info,
@@ -4082,6 +4120,8 @@ def _join_page_rows(
                 header_judge=header_judge,
                 header_dept=header_dept,
                 header_date=header_date,
+                header_case_number=_effective_header_cn,
+                single_ruling_doc=(len(cases) == 1 and len(sub_case_infos) == 1),
                 entry_number=sub_entry_number,
             )
 

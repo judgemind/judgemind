@@ -6706,3 +6706,197 @@ def test_llm_split_skips_metric_below_threshold() -> None:
     assert not any("INSERT INTO data_quality_metrics" in s for s in executed_sql), (
         "20% null rate (1/5) must NOT trigger the multimodal_all_null_metadata metric (#3722)."
     )
+
+
+# ---------------------------------------------------------------------------
+# #3729 — multimodal_case_number_miss telemetry
+# ---------------------------------------------------------------------------
+
+
+def test_multimodal_case_number_miss_telemetry_emitted_at_30pct() -> None:
+    """When >= 30% of converted rulings have UNKNOWN- case_number, write telemetry (#3729).
+
+    Feeds a synthetic event through ``_llm_split_document`` where 3 of 10
+    rulings have ``case_number`` starting with ``UNKNOWN-``.  Asserts that one
+    ``data_quality_metrics`` row with ``metric_name="multimodal_case_number_miss"``
+    is written inside a savepoint-protected block.
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    def _make_ruling(case_num: str) -> ExtractedRuling:
+        return ExtractedRuling(
+            extracted_case_number=case_num,
+            extracted_case_title="Foo v. Bar",
+            extracted_judge_name="Smith",
+            department="C28",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-16",
+            extracted_parties=[],
+            ruling_text="GRANTED.",
+            case_type=None,
+        )
+
+    rulings = [
+        _make_ruling("30-2024-30000001"),
+        _make_ruling("30-2024-30000002"),
+        _make_ruling("30-2024-30000003"),
+        _make_ruling("30-2024-30000004"),
+        _make_ruling("30-2024-30000005"),
+        _make_ruling("30-2024-30000006"),
+        _make_ruling("30-2024-30000007"),
+        # 3 of 10 rulings have UNKNOWN- case_number (30% miss rate)
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000101"),
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000102"),
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000103"),
+    ]
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = rulings
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000070",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/miss-30pct.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert any("INSERT INTO data_quality_metrics" in s for s in executed_sql), (
+        "30% UNKNOWN case_number rate (3/10) must trigger the "
+        "multimodal_case_number_miss metric (#3729)."
+    )
+    metric_calls = [
+        c for c in mock_cur.execute.call_args_list if "INSERT INTO data_quality_metrics" in c[0][0]
+    ]
+    # At least one metric row for case_number_miss must exist
+    assert any(
+        len(c[0]) > 1 and isinstance(c[0][1], tuple) and c[0][1][1] == "multimodal_case_number_miss"
+        for c in metric_calls
+    ), "metric_name must be 'multimodal_case_number_miss'"
+    # Verify metadata fields
+    cn_miss_call = next(
+        c
+        for c in metric_calls
+        if len(c[0]) > 1
+        and isinstance(c[0][1], tuple)
+        and c[0][1][1] == "multimodal_case_number_miss"
+    )
+    params = cn_miss_call[0][1]
+    assert params[0] == "Orange"
+    assert params[1] == "multimodal_case_number_miss"
+    assert params[2] == 1
+    meta = json.loads(params[3])
+    assert meta["document_id"] == "multimodal-doc-0000-0000-000000000070"
+    assert meta["s3_key"] == "ca/orange/superior_court/raw/miss-30pct.pdf"
+    assert meta["state"] == "CA"
+    assert meta["ruling_count"] == 10
+    assert meta["miss_count"] == 3
+    assert abs(meta["miss_ratio"] - 0.3) < 1e-9
+    # Savepoint must be used for best-effort protection.
+    assert any("SAVEPOINT multimodal_case_number_miss_metric" in s for s in executed_sql)
+
+
+def test_multimodal_case_number_miss_skipped_below_threshold() -> None:
+    """Telemetry does NOT fire when miss ratio < 0.30 (#3729).
+
+    1 of 10 rulings with UNKNOWN- case_number (10% miss rate) must NOT trigger
+    the multimodal_case_number_miss metric.
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    def _make_ruling(case_num: str) -> ExtractedRuling:
+        return ExtractedRuling(
+            extracted_case_number=case_num,
+            extracted_case_title="Foo v. Bar",
+            extracted_judge_name="Smith",
+            department="C28",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-16",
+            extracted_parties=[],
+            ruling_text="GRANTED.",
+            case_type=None,
+        )
+
+    rulings = [
+        _make_ruling("30-2024-40000001"),
+        _make_ruling("30-2024-40000002"),
+        _make_ruling("30-2024-40000003"),
+        _make_ruling("30-2024-40000004"),
+        _make_ruling("30-2024-40000005"),
+        _make_ruling("30-2024-40000006"),
+        _make_ruling("30-2024-40000007"),
+        _make_ruling("30-2024-40000008"),
+        _make_ruling("30-2024-40000009"),
+        # Only 1 of 10 has UNKNOWN- (10% miss rate — below threshold)
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000201"),
+    ]
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = rulings
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000080",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/miss-below-threshold.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    # No case_number_miss metric should be written
+    assert not any("multimodal_case_number_miss" in s for s in executed_sql), (
+        "10% miss rate (1/10) must NOT trigger the multimodal_case_number_miss metric (#3729)."
+    )

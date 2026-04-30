@@ -22,7 +22,9 @@ import anthropic
 import pytest
 
 from framework.llm_extractor import (
+    PDF_PER_PAGE_PROMPT,
     LlmExtractor,
+    _append_ruling_from_case,
     _create_google_client,
     _deduplicate_ruling_texts,
     _drop_calendar_listing_rulings,
@@ -716,6 +718,16 @@ class TestExtractCaseNumberFromInfo:
         """County prefix is stripped from case number."""
         result = _extract_case_number_from_info("30-2024-01393434 Smith v. Jones")
         assert result == "2024-01393434"
+
+    def test_oc_multi_line_layout_returns_full_number(self) -> None:
+        """OC multi-line layout: case number on second line is extracted correctly (#3729).
+
+        In OC tabular PDFs the case number column may wrap to a second line so
+        the LLM emits ``case_info`` as ``"OCMH Inc. v. Daniel\\n2023-01329371"``.
+        _extract_case_number_from_info must return the full number.
+        """
+        result = _extract_case_number_from_info("OCMH Inc. v. Daniel\n2023-01329371")
+        assert result == "2023-01329371"
 
 
 # ---------------------------------------------------------------------------
@@ -4797,3 +4809,70 @@ class TestRoleLiteralOrphanDrop:
         )
         result = _drop_short_unsubstantive_rulings([noise])
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Per-page prompt content — OC multi-line case number layout (#3729)
+# ---------------------------------------------------------------------------
+
+
+class TestPdfPerPagePromptContent:
+    """Verify the per-page prompt explicitly covers OC case number column layout."""
+
+    def test_oc_multi_line_case_number_rule(self) -> None:
+        """Prompt must describe the OC case number column / multi-line layout (#3729).
+
+        The OC tabular PDFs place case numbers in a right-hand column that may
+        wrap visually across two lines.  The LLM prompt must contain an explicit
+        rule so the model does not leave case_number empty when the number is on
+        the second visual line.
+        """
+        assert "case number column" in PDF_PER_PAGE_PROMPT or "multi-line" in PDF_PER_PAGE_PROMPT, (
+            "PDF_PER_PAGE_PROMPT must mention the OC case number column / multi-line layout rule "
+            "so the LLM does not return empty case_number for wrapped numbers (#3729)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# _append_ruling_from_case — header_case_number fallback (#3729)
+# ---------------------------------------------------------------------------
+
+
+class TestAppendRulingFromCaseMetadataFallback:
+    """Verify header_case_number fallback in _append_ruling_from_case (#3729)."""
+
+    def test_metadata_case_number_used_when_extract_returns_none_single_ruling(self) -> None:
+        """header_case_number is used as fallback when case_info has no number
+        and single_ruling_doc=True (#3729)."""
+        rulings: list[ExtractedRuling] = []
+        _append_ruling_from_case(
+            rulings,
+            "Daniel only no number",
+            "",
+            metadata=None,
+            header_judge=None,
+            header_dept=None,
+            header_date=None,
+            header_case_number="2023-01329371",
+            single_ruling_doc=True,
+        )
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number == "2023-01329371"
+
+    def test_header_case_number_not_used_when_multiple_rulings(self) -> None:
+        """header_case_number is NOT used when single_ruling_doc=False to avoid
+        mis-attributing one document-header case_number to multiple cases (#3729)."""
+        rulings: list[ExtractedRuling] = []
+        _append_ruling_from_case(
+            rulings,
+            "Daniel only no number",
+            "",
+            metadata=None,
+            header_judge=None,
+            header_dept=None,
+            header_date=None,
+            header_case_number="2023-01329371",
+            single_ruling_doc=False,
+        )
+        assert len(rulings) == 1
+        assert rulings[0].extracted_case_number is None
