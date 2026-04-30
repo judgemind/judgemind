@@ -27,6 +27,7 @@ import pytest
 
 from framework.llm_extractor import (
     LlmExtractor,
+    _drop_riverside_no_tentative_ruling_stubs,
     _sanitize_riverside_rulings,
     _sanitize_title_cost_itemization_tail,
     _sanitize_title_motion_tail,
@@ -467,23 +468,19 @@ class TestRiversidePromptRule5bBehavioural:
         )
 
         # --- Assert per-entry boundaries in the post-processed output ---
-        assert len(rulings) == 2, f"Expected 2 rulings, got {len(rulings)}"
+        # Note: the fixture's entry 2 has ruling_text="No tentative ruling — a
+        # hearing will be conducted." which is correctly dropped by the
+        # _drop_riverside_no_tentative_ruling_stubs filter (#3715).  After that
+        # filter, only the substantive entry 1 remains.
+        assert len(rulings) == 1, (
+            f"Expected 1 ruling (entry 2 stub dropped by #3715 filter), got {len(rulings)}"
+        )
 
         # Entry 1: has a substantive motion and outcome
         entry1 = rulings[0]
         assert entry1.extracted_case_number == "CVRI2500001"
         assert entry1.motion_type is not None
         assert entry1.outcome is not None
-
-        # Entry 2: calendar-only line — motion_type and outcome must be null
-        entry2 = rulings[1]
-        assert entry2.extracted_case_number == "CVRI2500002"
-        assert entry2.motion_type is None, (
-            f"Rule 5b violation: entry 2 motion_type should be None, got {entry2.motion_type!r}"
-        )
-        assert entry2.outcome is None, (
-            f"Rule 5b violation: entry 2 outcome should be None, got {entry2.outcome!r}"
-        )
 
     def test_riverside_prompt_rule_5b_block_present_with_required_semantics(self) -> None:
         """Structural test: rule 5b block exists and contains all required semantics.
@@ -524,3 +521,102 @@ class TestRiversidePromptRule5bBehavioural:
             "Rule 5b block must contain boundary language: "
             "'derived only', 'only from that entry', or 'never carry forward'"
         )
+
+
+# ---------------------------------------------------------------------------
+# _drop_riverside_no_tentative_ruling_stubs — unit tests (#3715)
+# ---------------------------------------------------------------------------
+
+
+def test_drop_riverside_no_tentative_ruling_stubs_drops_bare_stub() -> None:
+    """A bare 'No tentative ruling.' entry (short) is dropped."""
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500001",
+        extracted_case_title="Smith v. Jones",
+        ruling_text="No tentative ruling.",
+    )
+    result = _drop_riverside_no_tentative_ruling_stubs([ruling])
+    assert result == []
+
+
+def test_drop_riverside_no_tentative_ruling_stubs_drops_with_motion_header_preamble() -> None:
+    """A stub with motion-header preamble is dropped when total length < 200 chars."""
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500002",
+        extracted_case_title="Doe v. Roe",
+        ruling_text="Motion to Compel\nNo tentative ruling. Appearances required.",
+    )
+    result = _drop_riverside_no_tentative_ruling_stubs([ruling])
+    assert result == []
+
+
+def test_drop_riverside_no_tentative_ruling_stubs_keeps_substantive_ruling() -> None:
+    """A ruling_text starting 'No tentative ruling' but > 200 chars is kept."""
+    long_text = (
+        "No tentative ruling on this motion. "
+        + "The court has reviewed the extensive briefing submitted by both parties "
+        "and has considered the oral argument presented at the hearing. "
+        "The motion raises complex questions of law regarding CCP section 437c. "
+        "The court requires additional time to consider the voluminous evidence submitted."
+    )
+    assert len(long_text) >= 200
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500003",
+        extracted_case_title="Garcia v. Torres",
+        ruling_text=long_text,
+    )
+    result = _drop_riverside_no_tentative_ruling_stubs([ruling])
+    assert len(result) == 1
+    assert result[0].extracted_case_number == "CVRI2500003"
+
+
+def test_drop_riverside_no_tentative_ruling_stubs_skips_cross_reference_source() -> None:
+    """Entries with cross_reference_source set are exempt from the stub filter."""
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500004",
+        extracted_case_title="Lopez v. Rivera",
+        ruling_text="No tentative ruling.",
+        cross_reference_source=1,
+    )
+    result = _drop_riverside_no_tentative_ruling_stubs([ruling])
+    assert len(result) == 1
+    assert result[0].extracted_case_number == "CVRI2500004"
+
+
+def test_drop_riverside_no_tentative_ruling_stubs_drops_further_variant() -> None:
+    """'No further tentative ruling' variant is also dropped when short."""
+    ruling = ExtractedRuling(
+        extracted_case_number="CVRI2500005",
+        extracted_case_title="Wilson v. Adams",
+        ruling_text="No further tentative ruling. Appearances are required.",
+    )
+    result = _drop_riverside_no_tentative_ruling_stubs([ruling])
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# RIVERSIDE_SYSTEM_PROMPT — new prompt guard tests (#3715)
+# ---------------------------------------------------------------------------
+
+
+def test_riverside_prompt_contains_drop_rule_for_no_tentative_stubs() -> None:
+    """RIVERSIDE_SYSTEM_PROMPT must instruct LLM to DROP bare 'No tentative ruling' entries."""
+    prompt_lower = RIVERSIDE_SYSTEM_PROMPT.lower()
+    # The new rule must use DROP language near 'no tentative ruling'
+    assert "drop" in prompt_lower or "omit" in prompt_lower or "exclude" in prompt_lower, (
+        "RIVERSIDE_SYSTEM_PROMPT must contain DROP/OMIT/EXCLUDE instruction "
+        "for bare 'No tentative ruling' stub entries (#3715)"
+    )
+
+
+def test_riverside_prompt_contains_off_calendar_outcome_mapping() -> None:
+    """RIVERSIDE_SYSTEM_PROMPT must map 'Off calendar' to outcome='off_calendar'."""
+    assert "off_calendar" in RIVERSIDE_SYSTEM_PROMPT, (
+        "RIVERSIDE_SYSTEM_PROMPT must contain explicit 'off_calendar' mapping "
+        "for 'Off calendar' / 'Taken off calendar' entries (#3715)"
+    )
+    prompt_lower = RIVERSIDE_SYSTEM_PROMPT.lower()
+    assert "off calendar" in prompt_lower or "taken off calendar" in prompt_lower, (
+        "RIVERSIDE_SYSTEM_PROMPT must mention 'off calendar' or 'taken off calendar' "
+        "in the outcome taxonomy (#3715)"
+    )
