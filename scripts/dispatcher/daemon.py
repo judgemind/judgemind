@@ -26225,6 +26225,183 @@ class DispatcherDaemon:
                 )
         return {"checked": checked, "cleared": cleared, "errors": errors}
 
+    def _housekeeping_close_orphan_prs(self) -> dict[str, int]:
+        """Close open ``agent/*`` PRs whose every target issue is CLOSED (#3852).
+
+        Calls ``gh pr list`` to fetch all open PRs, then for each PR on an
+        ``agent/`` branch whose ``closingIssuesReferences`` are all CLOSED,
+        posts a close comment and deletes the branch via ``gh pr close``.
+
+        Skips:
+        * PRs on non-``agent/`` branches (operator-authored branches are
+          untouched).
+        * PRs with no ``closingIssuesReferences`` (no clear target — leave
+          for operator review).
+        * PRs where ANY referenced issue is still OPEN.
+
+        Per-PR try/except so one ``gh pr close`` flake does not starve
+        siblings. Returns ``{closed, scanned, skipped_non_agent,
+        skipped_no_target, skipped_open_target}`` for observability.
+        Failures are caught by the caller (:meth:`_housekeeping_tick`).
+        """
+        list_cmd = [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            self._cfg.github_repo,
+            "--state",
+            "open",
+            "--limit",
+            "200",
+            "--json",
+            "number,headRefName,closingIssuesReferences",
+        ]
+        list_outcome = self._subprocess_with_retry(
+            list_cmd,
+            event_name="orphan_pr_gc_list",
+            timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if not list_outcome["ok"]:
+            self._log.warning(
+                "daemon.orphan_pr_gc_list_failed",
+                extra={
+                    "event": "orphan_pr_gc_list_failed",
+                    "run_id": self._run_id,
+                    "reason": list_outcome.get("reason"),
+                    "exit_code": list_outcome.get("exit_code"),
+                    "stderr_tail": list_outcome.get("stderr_tail"),
+                },
+            )
+            return {
+                "closed": 0,
+                "scanned": 0,
+                "skipped_non_agent": 0,
+                "skipped_no_target": 0,
+                "skipped_open_target": 0,
+            }
+
+        try:
+            pr_rows: list[dict[str, Any]] = json.loads(
+                list_outcome["result"].stdout or "[]"
+            )
+        except json.JSONDecodeError:
+            self._log.warning(
+                "daemon.orphan_pr_gc_list_invalid_json",
+                extra={
+                    "event": "orphan_pr_gc_list_invalid_json",
+                    "run_id": self._run_id,
+                },
+            )
+            return {
+                "closed": 0,
+                "scanned": 0,
+                "skipped_non_agent": 0,
+                "skipped_no_target": 0,
+                "skipped_open_target": 0,
+            }
+
+        scanned = 0
+        closed = 0
+        skipped_non_agent = 0
+        skipped_no_target = 0
+        skipped_open_target = 0
+
+        for pr in pr_rows:
+            scanned += 1
+            pr_number: int = pr.get("number", 0)
+            head_ref: str = pr.get("headRefName", "")
+            refs: list[dict[str, Any]] = pr.get("closingIssuesReferences", [])
+
+            if not head_ref.startswith("agent/"):
+                skipped_non_agent += 1
+                continue
+
+            if not refs:
+                skipped_no_target += 1
+                continue
+
+            if any(r.get("state") != "CLOSED" for r in refs):
+                skipped_open_target += 1
+                continue
+
+            # All referenced issues are CLOSED — close the PR and delete branch.
+            target_numbers = [r.get("number") for r in refs]
+            comment = (
+                f"Closing — target issue(s) {target_numbers} already CLOSED; daemon GC."
+            )
+            try:
+                close_cmd = [
+                    "gh",
+                    "pr",
+                    "close",
+                    str(pr_number),
+                    "--repo",
+                    self._cfg.github_repo,
+                    "--comment",
+                    comment,
+                    "--delete-branch",
+                ]
+                close_outcome = self._subprocess_with_retry(
+                    close_cmd,
+                    event_name="orphan_pr_gc_close",
+                    timeout=GH_POLL_SUBPROCESS_TIMEOUT_SECONDS,
+                    extra_log_fields={"pr_number": pr_number},
+                )
+                if not close_outcome["ok"]:
+                    self._log.warning(
+                        "daemon.orphan_pr_gc_close_failed",
+                        extra={
+                            "event": "orphan_pr_gc_close_failed",
+                            "run_id": self._run_id,
+                            "pr_number": pr_number,
+                            "targets": target_numbers,
+                            "reason": close_outcome.get("reason"),
+                            "exit_code": close_outcome.get("exit_code"),
+                            "stderr_tail": close_outcome.get("stderr_tail"),
+                        },
+                    )
+                    continue
+                closed += 1
+                self._log.info(
+                    "daemon.orphan_pr_closed",
+                    extra={
+                        "event": "orphan_pr_closed",
+                        "run_id": self._run_id,
+                        "pr_number": pr_number,
+                        "targets": target_numbers,
+                    },
+                )
+            except Exception:
+                self._log.exception(
+                    "daemon.orphan_pr_gc_close_error",
+                    extra={
+                        "event": "orphan_pr_gc_close_error",
+                        "run_id": self._run_id,
+                        "pr_number": pr_number,
+                    },
+                )
+
+        self._log.info(
+            "daemon.housekeeping_orphan_pr_gc",
+            extra={
+                "event": "housekeeping_orphan_pr_gc",
+                "run_id": self._run_id,
+                "closed": closed,
+                "scanned": scanned,
+                "skipped_non_agent": skipped_non_agent,
+                "skipped_no_target": skipped_no_target,
+                "skipped_open_target": skipped_open_target,
+            },
+        )
+        return {
+            "closed": closed,
+            "scanned": scanned,
+            "skipped_non_agent": skipped_non_agent,
+            "skipped_no_target": skipped_no_target,
+            "skipped_open_target": skipped_open_target,
+        }
+
     def _housekeeping_tick(self) -> dict[str, int]:
         """Run one housekeeping tick. Prunes stale rows from dispatcher tables.
 
@@ -26348,6 +26525,20 @@ class DispatcherDaemon:
                 "daemon.terminal_ended_at_backfill_failed",
                 extra={
                     "event": "terminal_ended_at_backfill_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Issue #3852: close open ``agent/*`` PRs whose every target issue
+        # is CLOSED. Runs in its own try/except so a GitHub flake here
+        # does not break the prune loop or the other healers.
+        try:
+            self._housekeeping_close_orphan_prs()
+        except Exception:
+            self._log.exception(
+                "daemon.housekeeping_orphan_pr_gc_failed",
+                extra={
+                    "event": "housekeeping_orphan_pr_gc_failed",
                     "run_id": self._run_id,
                 },
             )
