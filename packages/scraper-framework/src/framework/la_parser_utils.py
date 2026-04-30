@@ -24,9 +24,12 @@ import re
 
 # Role prefixes to strip from party names.  Matches role labels followed by
 # comma and/or whitespace (e.g. "Defendant ", "Plaintiffs, ").
+_ONE_ROLE = (
+    r"(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
+    r"|Cross-Complainants?|Cross-Defendants?)"
+)
 ROLE_PREFIX_RE = re.compile(
-    r"^(?:Defendants?|Plaintiffs?|Petitioners?|Respondents?"
-    r"|Cross-Complainants?|Cross-Defendants?)[,\s]+",
+    r"^(?:" + _ONE_ROLE + r"(?:/|&|\s+(?:and|&)\s+))*" + _ONE_ROLE + r"[,\s]+",
     re.IGNORECASE,
 )
 
@@ -129,6 +132,7 @@ CASE_NAME_FIELD_RE = re.compile(
     r"(?:"
     r"\s+(?:COMP|COMPLAINT|PET|PETITION|FAC)\.?\s*FILED"
     r"|\s+CASE\s+NUMBER"
+    r"|\s+Case\s+No\.?:?"
     r"|\s*$"
     r")",
     re.IGNORECASE | re.MULTILINE,
