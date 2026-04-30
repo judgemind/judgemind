@@ -1380,6 +1380,38 @@ _IN_THE_NOT_MATTER_RE = re.compile(
 _MIN_TITLE_LENGTH = 3
 _MAX_TITLE_LENGTH = 120
 
+# Trailing English connectors left after 120-char word-boundary truncation (#3730).
+# Greedy so it strips chains like ", and the" in one pass.
+_TRAILING_CONNECTOR_RE = re.compile(
+    r"(?:[\s,;:]+(?:and|or|but|the|for|of|to|in|on|with|by|a|an|as))+$",
+    re.IGNORECASE,
+)
+
+
+def strip_trailing_connectors(title: str) -> str:
+    """Strip trailing English connector words from a case title.
+
+    Removes chains like ``', and the'``, ``' of'``, ``' to'`` that appear at
+    the end of a title — typically after a 120-char word-boundary truncation or
+    from an LLM extraction that cut mid-sentence (#3730).
+
+    Well-formed titles are returned unchanged.  Returns the original value (not
+    an empty string) if stripping would leave nothing.
+
+    Args:
+        title: The raw case title string.
+
+    Returns:
+        The title with any trailing connector words removed, or the original
+        string if no connector was found (or if *title* is empty/None).
+    """
+    if not title:
+        return title
+    stripped = _TRAILING_CONNECTOR_RE.sub("", title)
+    if stripped == title:
+        return title
+    return stripped.rstrip(".,;: ") or title
+
 
 def is_plausible_case_title(title: str) -> bool:
     """Return True if *title* looks like a real case title, not motion text.
@@ -1680,7 +1712,8 @@ def clean_case_title(raw_title: str) -> str | None:
             if max_def_len > 10:
                 space_idx = parts[1].rfind(" ", 0, max_def_len)
                 if space_idx > 5:
-                    title = parts[0] + " v. " + parts[1][:space_idx].rstrip(".,;: ")
+                    tail = strip_trailing_connectors(parts[1][:space_idx].rstrip(".,;: "))
+                    title = parts[0] + " v. " + tail
         if len(title) > _MAX_TITLE_LENGTH:
             return None
 

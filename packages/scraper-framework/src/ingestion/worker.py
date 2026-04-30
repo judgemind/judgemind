@@ -85,6 +85,7 @@ from .extract import (
     normalize_outcome,
     strip_case_number_prefix_suffix,
     strip_trailing_case_number,
+    strip_trailing_connectors,
 )
 from .llm_extract import (
     LLMExtractionResult,
@@ -1753,6 +1754,22 @@ class IngestionWorker:
                     },
                 )
                 case_title = without_prefix
+
+        # Strip trailing connector words from LLM-extracted titles that are
+        # already <=120 chars (i.e. they bypass clean_case_title's truncation
+        # path) but still end in a dangling connector (#3730).
+        if case_title:
+            sanitized = strip_trailing_connectors(case_title)
+            if sanitized and sanitized != case_title:
+                logger.info(
+                    "Stripped trailing connector from title",
+                    extra={
+                        "document_id": document_id,
+                        "old_title": case_title[:120],
+                        "new_title": sanitized[:120],
+                    },
+                )
+                case_title = sanitized
 
         # For LLM-extracted events, the LLM-provided case_title can be
         # messy (motion descriptions, case citations, multiple parties).

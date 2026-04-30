@@ -5687,6 +5687,52 @@ def test_process_event_oc_prefix_suffix_not_stripped_when_prefix_none(
 
 
 @patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.psycopg")
+def test_process_event_strips_trailing_connector_from_case_title(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Worker strips trailing connector words from case_title (#3730).
+
+    Covers worker.py lines 1764 and 1772 — the logger.info call and the
+    ``case_title = sanitized`` assignment in the connector-stripping block.
+    """
+    worker, _ = _make_worker()
+    worker._llm_client = None  # prevent any LLM calls
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    dirty_title = "Smith v. Jones and"
+    event = _make_event(
+        case_title=dirty_title,
+        hearing_date=None,
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    all_sql_args = []
+    for call in mock_cur.execute.call_args_list:
+        args = call[0]
+        if len(args) > 1 and args[1] is not None:
+            all_sql_args.extend(args[1] if isinstance(args[1], (list, tuple)) else [])
+    # The clean title (without trailing "and") should appear in SQL args.
+    assert "Smith v. Jones" in all_sql_args
+    # The dirty title must not have leaked into any SQL parameter.
+    for a in all_sql_args:
+        if isinstance(a, str):
+            assert a != dirty_title, f"Unstripped title leaked into SQL: {a!r}"
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
 def test_process_event_rejects_probate_decedent_as_judge(
