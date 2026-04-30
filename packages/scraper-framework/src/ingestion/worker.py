@@ -83,6 +83,7 @@ from .extract import (
     is_valid_case_number,
     normalize_motion_type,
     normalize_outcome,
+    strip_case_number_prefix_suffix,
     strip_trailing_case_number,
 )
 from .llm_extract import (
@@ -1460,6 +1461,7 @@ class IngestionWorker:
         # LLM extraction — primary method for missing fields
         # ------------------------------------------------------------------
         llm_result: LLMExtractionResult | None = None
+        case_number_prefix: str | None = None
         skip_llm = is_llm_extracted or is_extraction_none
         if not skip_llm and missing_fields and ruling_text and self._llm_client is not None:
             metadata = {
@@ -1522,6 +1524,8 @@ class IngestionWorker:
 
                 # Apply ruling-level fields from the matched ruling
                 if ruling is not None:
+                    if ruling.case_number_prefix:
+                        case_number_prefix = ruling.case_number_prefix
                     if not case_number and ruling.case_number:
                         if is_valid_case_number(ruling.case_number):
                             case_number = ruling.case_number
@@ -1718,6 +1722,18 @@ class IngestionWorker:
                     },
                 )
                 case_title = without_cn2
+            without_prefix = strip_case_number_prefix_suffix(case_title, case_number_prefix)
+            if without_prefix and without_prefix != case_title:
+                logger.info(
+                    "Stripped OC case number prefix suffix from title",
+                    extra={
+                        "document_id": document_id,
+                        "old_title": case_title[:120],
+                        "new_title": without_prefix[:120],
+                        "prefix": case_number_prefix,
+                    },
+                )
+                case_title = without_prefix
 
         # For LLM-extracted events, the LLM-provided case_title can be
         # messy (motion descriptions, case citations, multiple parties).

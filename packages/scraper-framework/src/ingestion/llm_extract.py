@@ -151,6 +151,7 @@ class LLMRulingResult:
     motion_type: str | None = None
     parties: list[dict[str, str]] = field(default_factory=list)
     confidence: FieldConfidence = field(default_factory=FieldConfidence)
+    case_number_prefix: str | None = None
 
 
 @dataclass
@@ -513,6 +514,24 @@ def _normalize_case_number(raw: str) -> str:
     """Strip county prefix from case numbers (e.g. OC format)."""
     m = _COUNTY_PREFIX_RE.match(raw.strip())
     return m.group(1) if m else raw.strip()
+
+
+def _extract_case_number_prefix(raw: str) -> str | None:
+    """Extract the county prefix from an OC-style case number.
+
+    Returns the numeric prefix (e.g. ``"30"``) when the raw case number
+    starts with 2-3 digits followed by a ``-`` (e.g. ``"30-2025-01498771"``).
+    Returns ``None`` for LA-style case numbers like ``"22SMCV01940"`` or for
+    any other format that doesn't match.
+    """
+    raw = raw.strip()
+    m = _COUNTY_PREFIX_RE.match(raw)
+    if m:
+        # Extract the prefix portion (everything before the first "-")
+        prefix = raw.split("-", 1)[0]
+        if prefix.isdigit() and 2 <= len(prefix) <= 3:
+            return prefix
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1118,8 +1137,11 @@ def _parse_response(
 
         # Normalize case number — support both old and new field names
         case_number = r.get("extracted_case_number") or r.get("case_number")
+        case_number_prefix: str | None = None
         if case_number:
-            case_number = _normalize_case_number(str(case_number))
+            raw_case_number = str(case_number)
+            case_number_prefix = _extract_case_number_prefix(raw_case_number)
+            case_number = _normalize_case_number(raw_case_number)
 
         # Case title — support both old and new field names
         case_title = r.get("extracted_case_title") or r.get("case_title")
@@ -1173,6 +1195,7 @@ def _parse_response(
                 motion_type=r.get("motion_type"),
                 parties=parties,
                 confidence=confidence,
+                case_number_prefix=case_number_prefix,
             )
         )
 

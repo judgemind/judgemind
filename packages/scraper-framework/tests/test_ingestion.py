@@ -5562,6 +5562,133 @@ def test_process_event_strips_trailing_case_number_from_title(
 @patch("ingestion.worker.resolve_judge", return_value=None)
 @patch("ingestion.worker.extract_fields_llm")
 @patch("ingestion.worker.psycopg")
+def test_process_event_strips_oc_prefix_suffix_from_title(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """Worker strips trailing OC court-prefix suffix from case_title (#3680).
+
+    The LLM sometimes copies the OC case number prefix ``"30"`` into the tail
+    of the case title, e.g. ``"Thomson vs. Toyota Motor Sales, U.S.A., Inc. 30"``.
+    The worker should strip the trailing `` 30`` so the persisted title is clean.
+    """
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    # LLM returns a title with trailing OC prefix "30"
+    mock_llm.return_value = LLMExtractionResult(
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="2025-01498771",
+                case_number_prefix="30",
+                case_title="Thomson vs. Toyota Motor Sales, U.S.A., Inc. 30",
+                outcome="granted",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        hearing_date=None,
+        ruling_text="Some ruling text",
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    mock_llm.assert_called_once()
+    # Gather all bound args from SQL calls
+    all_sql_args = []
+    for call in mock_cur.execute.call_args_list:
+        args = call[0]
+        if len(args) > 1 and args[1] is not None:
+            all_sql_args.extend(args[1] if isinstance(args[1], (list, tuple)) else [])
+    # The clean title (without trailing " 30") should appear in SQL args
+    assert "Thomson vs. Toyota Motor Sales, U.S.A., Inc." in all_sql_args
+    # The contaminated title should NOT appear
+    contaminated = "Thomson vs. Toyota Motor Sales, U.S.A., Inc. 30"
+    for a in all_sql_args:
+        if isinstance(a, str):
+            assert a != contaminated, f"Contaminated title leaked into SQL: {a!r}"
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
+def test_process_event_oc_prefix_suffix_not_stripped_when_prefix_none(
+    mock_psycopg: MagicMock,
+    mock_llm: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When case_number_prefix is None, the title should remain unchanged (#3680).
+
+    Regression guard: ensure the prefix-strip only fires when a prefix is set.
+    """
+    from ingestion.llm_extract import LLMExtractionResult, LLMRulingResult
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),
+        ("case-uuid-1",),
+        (True,),
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [True, False]
+    mock_cur.rowcount = 1
+
+    original_title = "Smith v. Jones"
+    mock_llm.return_value = LLMExtractionResult(
+        case_count=1,
+        rulings=[
+            LLMRulingResult(
+                case_number="24NNCV02551",
+                case_number_prefix=None,
+                case_title=original_title,
+                outcome="denied",
+            )
+        ],
+    )
+
+    event = _make_event(
+        case_number=None,
+        case_title=None,
+        hearing_date=None,
+        ruling_text="Some ruling text",
+    )
+    with patch.object(worker, "_llm_split_document", return_value=False):
+        worker.process_event(event)
+
+    mock_llm.assert_called_once()
+    all_sql_args = []
+    for call in mock_cur.execute.call_args_list:
+        args = call[0]
+        if len(args) > 1 and args[1] is not None:
+            all_sql_args.extend(args[1] if isinstance(args[1], (list, tuple)) else [])
+    assert original_title in all_sql_args
+
+
+@patch("ingestion.worker.resolve_judge", return_value=None)
+@patch("ingestion.worker.extract_fields_llm")
+@patch("ingestion.worker.psycopg")
 def test_process_event_rejects_probate_decedent_as_judge(
     mock_psycopg: MagicMock,
     mock_llm: MagicMock,

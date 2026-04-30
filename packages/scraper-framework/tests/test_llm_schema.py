@@ -486,3 +486,7 @@ class TestExtractionSystemPrompt:
     def test_prompt_includes_verbatim_instruction(self) -> None:
         """Ruling text must be preserved verbatim."""
         assert "verbatim" in EXTRACTION_SYSTEM_PROMPT.lower()
+
+    def test_prompt_forbids_case_number_in_title(self) -> None:
+        """Rule 14 must instruct the LLM not to copy case number into title (#3680)."""
+        assert "Never include any portion of the case number" in EXTRACTION_SYSTEM_PROMPT

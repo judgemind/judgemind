@@ -1925,6 +1925,54 @@ def strip_trailing_case_number(title: str | None) -> str | None:
     return stripped if stripped else title
 
 
+# Matches a trailing space + 2-3 digit prefix with optional punctuation at end.
+_TRAILING_PREFIX_RE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def strip_case_number_prefix_suffix(title: str | None, prefix: str | None) -> str | None:
+    """Strip a trailing court-prefix suffix from a case title (#3680).
+
+    OC-style case numbers begin with a numeric county prefix (e.g. ``"30"``).
+    The LLM sometimes copies this prefix into the tail of the case title,
+    producing contaminated titles like ``"Thomson vs. Toyota Motor Sales 30"``.
+    This helper removes the trailing ``" <prefix>"`` token when ``prefix`` is
+    a purely-numeric 2-3 digit string.
+
+    Only a trailing occurrence is removed — a prefix appearing in the middle
+    of a title (e.g. ``"Acme 30 LLC vs. Doe"``) is left untouched.
+
+    Parameters
+    ----------
+    title : str | None
+        The raw case title that may have a trailing court prefix.
+    prefix : str | None
+        The county prefix extracted from the raw case number (e.g. ``"30"``).
+
+    Returns
+    -------
+    str | None
+        The title with the trailing prefix stripped, or the original input if
+        no match is found.  Returns ``None`` if *title* is ``None``.  Returns
+        empty string unchanged (same contract as ``strip_trailing_case_number``).
+    """
+    if title is None:
+        return None
+    if not title:
+        return title
+    if not prefix:
+        return title
+    # Only act on purely numeric 2-3 digit prefixes (e.g. "30", "37")
+    if not prefix.isdigit() or not (2 <= len(prefix) <= 3):
+        return title
+    # Build (or reuse) a compiled regex for this prefix
+    if prefix not in _TRAILING_PREFIX_RE_CACHE:
+        escaped = re.escape(prefix)
+        _TRAILING_PREFIX_RE_CACHE[prefix] = re.compile(r"\s+" + escaped + r"[.,;:]*\s*$")
+    pat = _TRAILING_PREFIX_RE_CACHE[prefix]
+    stripped = pat.sub("", title)
+    return stripped if stripped else title
+
+
 def dedupe_repeated_title(title: str | None) -> str | None:
     """Collapse exact repeated substrings in a case title (#2370).
 

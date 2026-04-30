@@ -2346,6 +2346,90 @@ class TestStripTrailingCaseNumber:
         assert strip_trailing_case_number(raw) == "X"
 
 
+class TestStripCaseNumberPrefixSuffix:
+    """Tests for strip_case_number_prefix_suffix() — removes OC-style court
+    prefix appended to the tail of a case title (#3680).
+
+    OC case numbers start with ``"30-"``.  The LLM sometimes copies the ``30``
+    prefix into the case title, producing contaminated titles like
+    ``"Thomson vs. Toyota Motor Sales 30"``.
+    """
+
+    def test_strips_trailing_oc_prefix(self) -> None:
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        result = strip_case_number_prefix_suffix("Thomson vs. Toyota 30", "30")
+        assert result == "Thomson vs. Toyota"
+
+    def test_strips_trailing_prefix_with_whitespace(self) -> None:
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        # Extra spaces before the trailing prefix should be consumed.
+        assert (
+            strip_case_number_prefix_suffix("Thomson vs. Toyota  30", "30") == "Thomson vs. Toyota"
+        )
+
+    def test_no_change_when_prefix_is_none(self) -> None:
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert (
+            strip_case_number_prefix_suffix("Thomson vs. Toyota 30", None)
+            == "Thomson vs. Toyota 30"
+        )
+
+    def test_no_change_when_prefix_mid_name(self) -> None:
+        """Do not strip prefix that appears mid-title (e.g. company name fragment)."""
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert strip_case_number_prefix_suffix("Acme 30 LLC vs. Doe", "30") == "Acme 30 LLC vs. Doe"
+
+    def test_no_change_when_prefix_non_digit(self) -> None:
+        """Prefix with non-digit characters should not be stripped."""
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert (
+            strip_case_number_prefix_suffix("Thomson vs. Toyota 30A", "30A")
+            == "Thomson vs. Toyota 30A"
+        )
+
+    def test_none_title_returns_none(self) -> None:
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert strip_case_number_prefix_suffix(None, "30") is None
+
+    def test_empty_title_unchanged(self) -> None:
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert strip_case_number_prefix_suffix("", "30") == ""
+
+    def test_empty_prefix_unchanged(self) -> None:
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        result = strip_case_number_prefix_suffix("Thomson vs. Toyota 30", "")
+        assert result == "Thomson vs. Toyota 30"
+
+    def test_strips_trailing_punctuation_after_prefix(self) -> None:
+        """Trailing punctuation after the prefix should also be removed."""
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        result = strip_case_number_prefix_suffix("Thomson vs. Toyota 30.", "30")
+        assert result == "Thomson vs. Toyota"
+
+    def test_single_digit_prefix_not_stripped(self) -> None:
+        """A single-digit prefix is too short — do not strip."""
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert strip_case_number_prefix_suffix("Smith v. Jones 3", "3") == "Smith v. Jones 3"
+
+    def test_four_digit_prefix_not_stripped(self) -> None:
+        """A four-digit prefix is too long — do not strip."""
+        from ingestion.extract import strip_case_number_prefix_suffix
+
+        assert (
+            strip_case_number_prefix_suffix("Smith v. Jones 2025", "2025") == "Smith v. Jones 2025"
+        )
+
+
 class TestTitleCleanupOrdering:
     """End-to-end tests for the strip → dedupe → strip cleanup ordering (#3511).
 
