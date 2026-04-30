@@ -378,3 +378,42 @@ def test_dev_db_contaminated_titles(
         assert token not in truncated, (
             f"{title!r} -> {truncated!r} still contains later-caption token {token!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Degenerate fallback guard (issue #3673)
+# ---------------------------------------------------------------------------
+
+
+class TestDegenerateFallbackGuard:
+    """Tests that the priority-3 else branch does not produce half-caption titles.
+
+    When the fused middle region is a single token (no whitespace), the old
+    code produced ``title[:first_end].rstrip()`` — e.g. ``"Carrasco vs"`` from
+    ``"Carrasco vs County v. Smith"``.  The guard added by #3673 detects this
+    degenerate shape and returns the original title unchanged instead.
+    """
+
+    def test_carrasco_orange_unchanged(self) -> None:
+        """Orange-county 'vs' fusion: full title returned unchanged (NOT 'Carrasco vs')."""
+        title = "Carrasco vs County v. Smith"
+        result = _truncate_concatenated_title(title)
+        assert result == title, f"Expected unchanged title {title!r}, got {result!r}"
+
+    def test_dotted_initial_unchanged(self) -> None:
+        """Dotted-initial plaintiff: full title returned unchanged (NOT 'C. vs')."""
+        title = "C. vs Foo v. Bar"
+        result = _truncate_concatenated_title(title)
+        assert result == title, f"Expected unchanged title {title!r}, got {result!r}"
+
+    def test_riverside_vs_unchanged(self) -> None:
+        """Riverside-style 'Vs' fusion: full title returned unchanged."""
+        title = "Alfaro Facundo Vs County v. Smith"
+        result = _truncate_concatenated_title(title)
+        assert result == title, f"Expected unchanged title {title!r}, got {result!r}"
+
+    def test_uppercase_vs_unchanged(self) -> None:
+        """Uppercase 'VS.' casing variant: IGNORECASE flag is exercised."""
+        title = "Garcia VS. County v. Smith"
+        result = _truncate_concatenated_title(title)
+        assert result == title, f"Expected unchanged title {title!r}, got {result!r}"

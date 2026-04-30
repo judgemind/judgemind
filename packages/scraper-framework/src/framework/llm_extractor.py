@@ -779,6 +779,8 @@ def _truncate_concatenated_title(title: str | None) -> str | None:
                 # only the first-separator + no defendant — this is the
                 # degenerate case and is rare in real data.
                 result = title[:first_end].rstrip()
+                if re.search(r"\bv[s]?\.?\s*$", result, re.IGNORECASE):
+                    return title  # degenerate fallback would lose defendant; keep fused title
 
     # Final cleanup: strip trailing whitespace and stray connector
     # punctuation that can be left behind at the boundary.
