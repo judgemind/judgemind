@@ -4193,9 +4193,30 @@ advance_phase() {
     _next="$1"
     _status="${2:-}"
     if [[ -n "$_status" ]]; then
-        db_exec "UPDATE dispatcher.agents
-                    SET phase = '$_next', status = '$_status'
-                  WHERE agent_id = '$AGENT_ID';"
+        # #3822 — when the new status is a TERMINAL_STATUSES member, also
+        # stamp ``ended_at`` so the admin cockpit's "Recently Completed"
+        # query (filters on ``status terminal AND ended_at IS NOT NULL``,
+        # see packages/api/src/graphql/dispatcher/resolvers.ts:534-548)
+        # actually surfaces the row. Without this, the merge handler's
+        # ``advance_phase awaiting_deploy succeeded`` write leaves
+        # ended_at NULL — the next outer-loop iteration sees a terminal
+        # status and exits via ``external_terminal_observed`` BEFORE
+        # ``mark_ended`` runs (see lines around the main loop's
+        # is_terminal_status check). The same shape leaks via
+        # ``agent_runner_reaped_failure`` below. ``COALESCE(ended_at,
+        # now())`` is idempotent + race-safe with the daemon's
+        # housekeeping-side bulk backfill.
+        if is_terminal_status "$_status"; then
+            db_exec "UPDATE dispatcher.agents
+                        SET phase = '$_next',
+                            status = '$_status',
+                            ended_at = COALESCE(ended_at, now())
+                      WHERE agent_id = '$AGENT_ID';"
+        else
+            db_exec "UPDATE dispatcher.agents
+                        SET phase = '$_next', status = '$_status'
+                      WHERE agent_id = '$AGENT_ID';"
+        fi
     else
         db_exec "UPDATE dispatcher.agents
                     SET phase = '$_next'
@@ -4787,8 +4808,14 @@ ON CONFLICT (agent_id, phase, attempt) DO UPDATE
       ts = now();
 EOF
     set -e
+    # #3822 — same shape as ``advance_phase``'s terminal write: stamp
+    # ``ended_at`` so the admin cockpit's "Recently Completed" query
+    # surfaces this row. ``COALESCE(ended_at, now())`` is idempotent +
+    # race-safe with the daemon's housekeeping bulk backfill.
     db_exec "UPDATE dispatcher.agents
-                SET phase = '$_term_phase', status = 'failed'
+                SET phase = '$_term_phase',
+                    status = 'failed',
+                    ended_at = COALESCE(ended_at, now())
               WHERE agent_id = '$AGENT_ID';"
     log "phase_advanced" "next_phase=$_term_phase" "status=failed"
     # #3494 — exit unconditionally after marking the agent terminal in

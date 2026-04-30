@@ -26071,6 +26071,62 @@ class DispatcherDaemon:
         )
         return rows_cleared
 
+    def _backfill_terminal_ended_at(self) -> int:
+        """Bulk-stamp ``ended_at`` for terminal-status rows missing it (#3822).
+
+        Mirrors :meth:`_clear_stale_agent_task_arns`'s shape: a single
+        ``UPDATE dispatcher.agents`` round-trip that heals every row whose
+        status is in :data:`TERMINAL_AGENT_STATUSES` but whose ``ended_at``
+        is still NULL. The agent-runner-side fix (``advance_phase`` and
+        ``agent_runner_reaped_failure`` in
+        ``scripts/dispatcher/agent-runner-entrypoint.sh``) is the primary
+        — it stamps ``ended_at`` synchronously with the terminal status
+        write. This bulk backfill is the safety net that catches:
+
+        * existing terminal rows written before the agent-runner fix
+          shipped (so the admin cockpit's "Recently Completed" panel
+          backfills retroactively),
+        * future races where the agent-runner crashes between the
+          status write and any potential later ``ended_at`` write
+          (defense in depth).
+
+        The invariant the admin cockpit query depends on
+        (``packages/api/src/graphql/dispatcher/resolvers.ts:534-548``) is
+        ``status terminal ⇒ ended_at NOT NULL``. Both fixes together
+        enforce it.
+
+        Returns the number of rows stamped (``cur.rowcount``). Logs
+        ``daemon.terminal_ended_at_backfilled`` with the count for
+        observability. Failures are caught by the caller
+        (:meth:`_housekeeping_tick`).
+        """
+        assert self._conn is not None, "connect() must run before housekeeping"
+        # ``TERMINAL_AGENT_STATUSES`` is the daemon-internal frozenset
+        # mirrored by ``phase_transitions.TERMINAL_STATUSES``. The values
+        # are class constants (never user-controlled), but we still pass
+        # them via psycopg parameter substitution to keep parity with the
+        # other housekeeping helpers.
+        terminal_statuses = sorted(TERMINAL_AGENT_STATUSES)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE dispatcher.agents "
+                "SET ended_at = now() "
+                "WHERE status = ANY(%s::text[]) "
+                "  AND ended_at IS NULL",
+                (terminal_statuses,),
+            )
+            rows_stamped = cur.rowcount or 0
+        self._conn.commit()
+        self._log.info(
+            "daemon.terminal_ended_at_backfilled",
+            extra={
+                "event": "terminal_ended_at_backfilled",
+                "run_id": self._run_id,
+                "rows_stamped": rows_stamped,
+            },
+        )
+        return rows_stamped
+
     def _reconcile_stale_merged_at(self) -> dict[str, int]:
         """Hourly guard that clears false-shipped ``merged_at`` stamps (#3752).
 
@@ -26262,6 +26318,28 @@ class DispatcherDaemon:
                 "daemon.stale_arn_bulk_clear_failed",
                 extra={
                     "event": "stale_arn_bulk_clear_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Issue #3822: stamp ``ended_at`` on terminal-status rows that
+        # were missed by the agent-runner-side write. Healing pass for
+        # the admin cockpit's "Recently Completed" panel — see
+        # :meth:`_backfill_terminal_ended_at` for the full rationale.
+        # Runs in its own try/except so a DB hiccup here does not
+        # affect the prune loop, merged_at reconcile, or the stale-ARN
+        # bulk-clear.
+        try:
+            self._backfill_terminal_ended_at()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            self._log.exception(
+                "daemon.terminal_ended_at_backfill_failed",
+                extra={
+                    "event": "terminal_ended_at_backfill_failed",
                     "run_id": self._run_id,
                 },
             )
