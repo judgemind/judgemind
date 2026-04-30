@@ -21,6 +21,11 @@ This module provides:
 
 Department codes are normalized by stripping leading zeros for comparison,
 using the same normalization as the LA mapping module.
+
+SD convention: purely-numeric department codes in the assignments page (e.g. "64")
+correspond to the Central courthouse, which the civil calendar encodes explicitly
+as "C-NN" (e.g. "C-64").  ``build_department_judge_map`` stores both keys so
+lookups from either source format succeed.
 """
 
 from __future__ import annotations
@@ -135,6 +140,10 @@ def build_department_judge_map(
                 existing=dept_map[norm_dept],
                 duplicate=entry.judge_name,
             )
+        # SD convention: bare-numeric dept in the assignments page = Central courthouse;
+        # the calendar writes C-NN explicitly, so alias both keys.
+        if norm_dept.isdigit() and f"C-{norm_dept}" not in dept_map:
+            dept_map[f"C-{norm_dept}"] = entry.judge_name
     return dept_map
 
 

@@ -151,6 +151,40 @@ class TestBuildDepartmentJudgeMap:
         dept_map = build_department_judge_map(entries)
         assert dept_map["N-18"] == "First Judge"
 
+    def test_central_dept_gets_both_keys(self) -> None:
+        """Purely-numeric Central dept creates both 'NN' and 'C-NN' keys."""
+        entries = [DepartmentJudge(department="64", judge_name="Loren G. Freestone")]
+        dept_map = build_department_judge_map(entries)
+        assert dept_map["64"] == "Loren G. Freestone"
+        assert dept_map["C-64"] == "Loren G. Freestone"
+
+    def test_non_numeric_dept_not_aliased(self) -> None:
+        """A non-numeric dept like 'N-18' must NOT get a spurious 'C-N-18' alias."""
+        entries = [DepartmentJudge(department="N-18", judge_name="Renee N.G. Stackhouse")]
+        dept_map = build_department_judge_map(entries)
+        assert "N-18" in dept_map
+        assert "C-N-18" not in dept_map
+
+    def test_existing_c_nn_entry_not_overwritten(self) -> None:
+        """If 'C-64' already exists, the alias write must not overwrite it."""
+        entries = [
+            DepartmentJudge(department="C-64", judge_name="Original Judge"),
+            DepartmentJudge(department="64", judge_name="Loren G. Freestone"),
+        ]
+        dept_map = build_department_judge_map(entries)
+        assert dept_map["C-64"] == "Original Judge"
+        assert dept_map["64"] == "Loren G. Freestone"
+
+    def test_fixture_central_depts_have_both_forms(self) -> None:
+        """Real fixture: bare-numeric Central entries are aliased to 'C-NN' form."""
+        html = _load("sd_judge_assignments.html")
+        entries = parse_judge_assignments_html(html)
+        dept_map = build_department_judge_map(entries)
+        # Dept 64 (Loren G. Freestone) is a bare-numeric Central entry in the fixture.
+        assert "64" in dept_map
+        assert "C-64" in dept_map
+        assert dept_map["64"] == dept_map["C-64"]
+
 
 # ---------------------------------------------------------------------------
 # lookup_judge_for_department — unit tests
