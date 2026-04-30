@@ -406,6 +406,18 @@ case "$subcommand" in
         # `git commit --allow-empty -m <msg>` — #3176 stale-rollup unstick.
         exit "${GIT_COMMIT_EXIT:-0}"
         ;;
+    diff)
+        # ``git diff --quiet origin/main HEAD`` is called by the
+        # _post_rebase_no_diff_to_main helper (#3682). Return exit code
+        # GIT_DIFF_QUIET_RC (default 1 = diff exists = continue to push).
+        # Tests that want the already-applied path can set GIT_DIFF_QUIET_RC=0.
+        for _arg in "$@"; do
+            if [[ "$_arg" == "--quiet" ]]; then
+                exit "${GIT_DIFF_QUIET_RC:-1}"
+            fi
+        done
+        exit 0
+        ;;
     *)
         exit 0
         ;;
