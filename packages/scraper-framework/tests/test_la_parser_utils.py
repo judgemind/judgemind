@@ -7,6 +7,8 @@ See #1465 for deduplication rationale.
 
 from __future__ import annotations
 
+import pytest
+
 from framework.la_parser_utils import (
     BARE_ROLE_LABELS,
     CASE_NAME_FIELD_RE,
@@ -77,6 +79,23 @@ class TestRolePrefixRe:
     def test_case_insensitive(self) -> None:
         result = ROLE_PREFIX_RE.sub("", "DEFENDANT Acme Corp")
         assert result == "Acme Corp"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (
+                "Plaintiffs and Cross-Defendants Jane Does 1\u20135 and John Doe 1",
+                "Jane Does 1\u20135 and John Doe 1",
+            ),
+            ("Defendant/Cross-Complainant Foo", "Foo"),
+            ("Plaintiff/Cross-Defendant Weinreb", "Weinreb"),
+            ("Defendants and Cross-Complainants William Robinson, Jr.", "William Robinson, Jr."),
+            ("Plaintiff & Cross-Defendant Bar Corp", "Bar Corp"),
+        ],
+    )
+    def test_role_prefix_combined_labels(self, raw: str, expected: str) -> None:
+        result = ROLE_PREFIX_RE.sub("", raw)
+        assert result == expected
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +267,23 @@ class TestCaseNameFieldRe:
         assert m is not None
         title = m.group("title").strip()
         assert title == "In re Smith"
+
+    @pytest.mark.parametrize(
+        "boundary",
+        [
+            "Case No.:",
+            "Case No:",
+            "Case No.",
+            "Case Number",
+        ],
+    )
+    def test_case_name_field_boundaries(self, boundary: str) -> None:
+        text = f"CASE NAME: Smith v. Jones  {boundary} 25SMCV01234"
+        m = CASE_NAME_FIELD_RE.search(text)
+        assert m is not None, f"No match for boundary {boundary!r}"
+        title = m.group("title").strip()
+        assert title == "Smith v. Jones", f"title={title!r} for boundary {boundary!r}"
+        assert "25SMCV01234" not in title
 
 
 # ---------------------------------------------------------------------------
