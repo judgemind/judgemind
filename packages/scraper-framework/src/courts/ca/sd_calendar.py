@@ -617,7 +617,9 @@ class SDCalendarScraper(BaseScraper):
             matching = [h for h in hearings if _case_numbers_match(doc.case_number, h.case_number)]
 
         if matching:
-            hearing = matching[0]
+            # Prefer the first row that has a real judge name; fall back to
+            # matching[0] when every row has judge_name=None.
+            hearing = next((h for h in matching if h.judge_name is not None), matching[0])
             # Populate metadata fields that are not already set.
             if not doc.department:
                 doc.department = hearing.department

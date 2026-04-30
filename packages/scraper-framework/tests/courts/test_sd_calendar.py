@@ -1135,6 +1135,74 @@ class TestParseDocumentMetadata:
         assert config is not None
         assert config.method == ExtractionMethod.NONE
 
+    def test_prefers_real_judge_over_placeholder(self) -> None:
+        """parse_document picks the matching row with a real judge name, not the placeholder.
+
+        When multiple rows for the same case number exist — one with a generic
+        placeholder (e.g. 'Judge C-72 Central' → None) and one with a real judge
+        name — parse_document must return the real judge name.  The placeholder
+        row comes first to ensure the new selection logic, not insertion order,
+        drives the result.
+        """
+        config = _make_config()
+        scraper = SDCalendarScraper(config)
+
+        from framework.models import CapturedDocument
+
+        # Build a synthetic two-row calendar page: placeholder row first,
+        # then a real-judge row for the same case number in the same dept.
+        html = (
+            "<html><head></head><body>"
+            "<h1>CIVIL CALENDAR For Friday, 03/13/2026</h1>"
+            "<h3>CENTRAL DIVISION, CENTRAL COURTHOUSE</h3>"
+            '<div class="department">'
+            "<h2><a name='C-72'></a>Department: C-72</h2>"
+            '<table class="tables">'
+            "<thead><tr>"
+            "<th>Time</th><th>Case#</th><th>Title</th>"
+            "<th>Event</th><th>Officer</th><th>Party</th><th>Attorney</th>"
+            "</tr></thead>"
+            "<tbody>"
+            # Row 1: placeholder judge (parses to judge_name=None) — comes first.
+            "<tr>"
+            "<td>9:00 AM</td>"
+            "<td>24CU016153C</td>"
+            "<td>Smith vs Jones</td>"
+            "<td>Motion Hearing</td>"
+            "<td>Judge C-72 Central</td>"
+            "<td><p>(PL) John Smith</p></td>"
+            "<td><p>Jane Doe</p></td>"
+            "</tr>"
+            # Row 2: real judge name.
+            "<tr>"
+            "<td>9:00 AM</td>"
+            "<td>24CU016153C</td>"
+            "<td>Smith vs Jones</td>"
+            "<td>Motion Hearing</td>"
+            "<td>Judge MARCELLA O. MCLAUGHLIN</td>"
+            "<td><p>(PL) John Smith</p></td>"
+            "<td><p>Jane Doe</p></td>"
+            "</tr>"
+            "</tbody>"
+            "</table>"
+            "</div>"
+            "</body></html>"
+        )
+        doc = CapturedDocument(
+            scraper_id="ca-sd-calendar",
+            state="CA",
+            county="San Diego",
+            court="Superior Court",
+            source_url="http://example.com",
+            capture_timestamp=datetime(2026, 3, 13),
+            content_format=ContentFormat.HTML,
+            raw_content=html.encode("utf-8"),
+            content_hash="abc123",
+            case_number="24CU016153C",
+        )
+        result = scraper.parse_document(doc)
+        assert result.judge_name == "Marcella O. Mclaughlin"
+
 
 # ---------------------------------------------------------------------------
 # default_config — factory test
