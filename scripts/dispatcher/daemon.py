@@ -4147,18 +4147,24 @@ class DispatcherDaemon:
                 f"gh issue list returned non-list JSON: {type(issues).__name__}"
             )
 
-        # Defensive filter: drop rows that also carry ``status/blocked``
-        # or ``status/in-progress``. The ``gh --label agent/ready`` call
-        # returns issues that carry the label; a blocked or in-progress
-        # issue that still has ``agent/ready`` attached (e.g. mid-
-        # transition) should not inflate the queue depth because the
-        # daemon would never spawn on it. ``status/in-progress`` is the
-        # /task-skill↔daemon interlock signal — after #2927 the /task
-        # subagent uses label-only coordination (add
+        # Defensive filter: drop rows that also carry ``status/blocked``,
+        # ``status/in-progress``, or ``status/needs-human``. The
+        # ``gh --label agent/ready`` call returns issues that carry the
+        # label; a blocked, in-progress, or human-flagged issue that
+        # still has ``agent/ready`` attached (e.g. mid-transition or
+        # mid-escalation) should not inflate the queue depth because
+        # the daemon would never spawn on it. ``status/in-progress`` is
+        # the /task-skill↔daemon interlock signal — after #2927 the
+        # /task subagent uses label-only coordination (add
         # ``status/in-progress`` BEFORE removing ``agent/ready``), so
         # the label here is the sole race-defense primitive. The
         # daemon's pre-claim recheck in ``_atomic_claim`` re-reads the
         # label set at claim time to close the ~100ms propagation race.
+        # ``status/needs-human`` is the diagnoser's escalation signal
+        # (see ``_diagnose_and_escalate``); without this consumer-side
+        # filter the daemon would re-claim a needs-human issue every
+        # tick and waste a full agent run before reaching
+        # ``push_and_pr_no_unmerged_files`` (#3825).
         filtered: list[dict[str, Any]] = []
         for issue in issues:
             if not isinstance(issue, dict):
@@ -4170,6 +4176,8 @@ class DispatcherDaemon:
             if "status/blocked" in label_names:
                 continue
             if STATUS_IN_PROGRESS_LABEL in label_names:
+                continue
+            if "status/needs-human" in label_names:
                 continue
             filtered.append(issue)
         return filtered
