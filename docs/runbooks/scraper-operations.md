@@ -71,12 +71,32 @@ terraform output scraper_security_group_id
 
 ### Registered Scraper IDs
 
-| ID                          | Court                              |
-| --------------------------- | ---------------------------------- |
-| `ca-la-tentatives-civil`    | LA Superior Court tentative rulings |
-| `ca-oc-tentatives`          | Orange County tentative rulings     |
-| `ca-riverside-tentatives`   | Riverside County tentative rulings  |
-| `ca-sb-tentatives`          | San Bernardino tentative rulings    |
+Authoritative source: `_REGISTRY` in
+`packages/scraper-framework/src/framework/runner.py`. Pass any of these as a
+positional argument to `python -m framework.runner <id> [<id> ...]` to run
+a subset.
+
+| ID                                | Court / source                                    |
+| --------------------------------- | ------------------------------------------------- |
+| `ca-cc-tentatives`                | Contra Costa tentative rulings                    |
+| `ca-cc-tentatives-portal`         | Contra Costa portal (parallel capture path)       |
+| `ca-fresno-tentatives-civil`      | Fresno civil tentative rulings                    |
+| `ca-governor-appointments`        | CA Governor judicial appointments                 |
+| `ca-la-tentatives-civil`          | LA Superior Court civil tentative rulings         |
+| `ca-la-tentatives-appellate`      | LA Court of Appeal tentative rulings              |
+| `ca-oc-tentatives`                | Orange County civil tentative rulings             |
+| `ca-oc-tentatives-family-law`     | Orange County family law tentative rulings        |
+| `ca-oc-tentatives-probate`        | Orange County probate tentative rulings           |
+| `ca-riverside-tentatives`         | Riverside civil tentative rulings                 |
+| `ca-sb-tentatives`                | San Bernardino civil tentative rulings            |
+| `ca-sc-tentatives`                | Santa Clara civil tentative rulings               |
+| `ca-sd-calendar`                  | San Diego civil calendar (Phase 1)                |
+| `ca-sd-pipeline`                  | San Diego ROA pipeline driver (Phase 2)           |
+| `ca-sd-tentatives`                | San Diego ROA tentative rulings (Phase 2)         |
+| `ca-sf-tentatives-civil`          | San Francisco civil tentative rulings             |
+| `ca-sf-tentatives-family-law`     | San Francisco family law tentative rulings        |
+| `ca-ventura-tentatives`           | Ventura tentative rulings                         |
+| `federal-courtlistener-opinions`  | CourtListener federal opinions feed               |
 
 ---
 
