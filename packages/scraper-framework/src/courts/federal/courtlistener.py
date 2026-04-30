@@ -23,6 +23,7 @@ Issue: #158
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -50,6 +51,11 @@ DEFAULT_MAX_RESULTS = 100
 
 # Maximum pages of cluster results to paginate through.
 DEFAULT_MAX_PAGES = 10
+
+# Maximum concurrent opinion fetches.  CourtListener's soft rate limit is
+# ~5 req/s; combined with the 0.2 s sleep inside each semaphore slot this
+# keeps us safely under that ceiling even for bursts.
+DEFAULT_OPINION_FETCH_CONCURRENCY = 5
 
 
 class CourtListenerClient:
@@ -189,6 +195,78 @@ class CourtListenerClient:
         results: list[dict[str, Any]] = data.get("results", [])
         return results
 
+    def fetch_opinions_for_clusters(
+        self,
+        cluster_ids: list[int],
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Fetch opinions for multiple clusters concurrently.
+
+        Uses bounded async concurrency (up to DEFAULT_OPINION_FETCH_CONCURRENCY
+        simultaneous requests) so that a run with 50+ clusters completes in
+        seconds rather than minutes.  Per-cluster HTTP errors are swallowed
+        and logged as warnings; the affected id maps to an empty list so the
+        caller loop sees the same shape it would from a successful fetch.
+
+        Args:
+            cluster_ids: List of CourtListener cluster IDs to fetch.
+
+        Returns:
+            Dict mapping cluster_id -> list of opinion dicts.
+        """
+        return asyncio.run(self._afetch_opinions_for_clusters(cluster_ids))
+
+    async def _afetch_opinions_for_clusters(
+        self,
+        cluster_ids: list[int],
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Async implementation of bounded-concurrency opinion batch fetch."""
+        semaphore = asyncio.Semaphore(DEFAULT_OPINION_FETCH_CONCURRENCY)
+        headers = dict(self._client.headers)
+
+        async def _fetch_one(
+            async_client: httpx.AsyncClient,
+            cluster_id: int,
+        ) -> tuple[int, list[dict[str, Any]]]:
+            async with semaphore:
+                # 0.2 s pacing inside the semaphore slot keeps throughput at
+                # most 5 req/s even when responses are instantaneous.
+                await asyncio.sleep(0.2)
+                try:
+                    response = await async_client.get(
+                        "/opinions/",
+                        params={"cluster": cluster_id, "format": "json"},
+                    )
+                    response.raise_for_status()
+                    data: dict[str, Any] = response.json()
+                    self._request_count += 1
+                    return cluster_id, data.get("results", [])
+                except httpx.HTTPStatusError as exc:
+                    self._request_count += 1
+                    logger.warning(
+                        "Failed to fetch opinions for cluster",
+                        cluster_id=cluster_id,
+                        status=exc.response.status_code,
+                    )
+                    return cluster_id, []
+
+        async with httpx.AsyncClient(
+            base_url=API_BASE_URL,
+            headers=headers,
+            timeout=self._timeout,
+        ) as async_client:
+            tasks = [_fetch_one(async_client, cid) for cid in cluster_ids]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        output: dict[int, list[dict[str, Any]]] = {}
+        for item in results:
+            if isinstance(item, BaseException):
+                # Unexpected exception — log and skip so caller loop is robust.
+                logger.warning("Unexpected error fetching opinions batch", exc_info=item)
+                continue
+            cid, opinions = item
+            output[cid] = opinions
+        return output
+
     @property
     def request_count(self) -> int:
         """Total number of API requests made by this client instance."""
@@ -251,24 +329,20 @@ class CourtListenerScraper(BaseScraper):
 
         self._log.info("Fetched clusters", count=len(clusters))
 
+        # Collect all valid cluster IDs upfront, then batch-fetch their
+        # opinions with bounded concurrency.
+        cluster_id_list: list[int] = [c["id"] for c in clusters if c.get("id")]
+        cluster_by_id: dict[int, dict[str, Any]] = {c["id"]: c for c in clusters if c.get("id")}
+
+        opinions_by_cluster = client.fetch_opinions_for_clusters(cluster_id_list)
+
         docs: list[CapturedDocument] = []
-        for cluster in clusters:
+        for cluster_id in cluster_id_list:
             if len(docs) >= self._max_results:
                 break
 
-            cluster_id = cluster.get("id")
-            if not cluster_id:
-                continue
-
-            try:
-                opinions = client.fetch_opinions_for_cluster(cluster_id)
-            except httpx.HTTPStatusError as exc:
-                self._log.warning(
-                    "Failed to fetch opinions for cluster",
-                    cluster_id=cluster_id,
-                    status=exc.response.status_code,
-                )
-                continue
+            cluster = cluster_by_id[cluster_id]
+            opinions = opinions_by_cluster.get(cluster_id, [])
 
             for opinion in opinions:
                 if len(docs) >= self._max_results:

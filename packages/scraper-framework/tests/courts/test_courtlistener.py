@@ -10,14 +10,18 @@ Tests use mocked HTTP responses to verify:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import datetime
 
 import httpx
+import pytest
 import respx
 
 from courts.federal.courtlistener import (
     API_BASE_URL,
+    DEFAULT_OPINION_FETCH_CONCURRENCY,
     CourtListenerClient,
     CourtListenerScraper,
     _extract_docket_number,
@@ -694,3 +698,125 @@ class TestDefaultConfig:
         config = default_config()
         assert len(config.target_urls) == 1
         assert "clusters" in config.target_urls[0]
+
+
+# ---------------------------------------------------------------------------
+# Bounded-concurrency batch opinion fetch tests
+# ---------------------------------------------------------------------------
+
+
+class TestFetchOpinionsForClusters:
+    """Regression tests for fetch_opinions_for_clusters / _afetch_opinions_for_clusters."""
+
+    @respx.mock
+    def test_fetch_opinions_for_clusters_concurrency_capped(self) -> None:
+        """Concurrent opinion fetches are capped at DEFAULT_OPINION_FETCH_CONCURRENCY.
+
+        Spawns 12 cluster IDs and tracks how many requests are in-flight
+        simultaneously.  The semaphore must prevent more than 5 concurrent
+        calls even when there is no network latency in the mock.
+        """
+        num_clusters = 12
+        in_flight: list[int] = [0]
+        max_inflight: list[int] = [0]
+
+        async def _slow_handler(request: httpx.Request) -> httpx.Response:
+            in_flight[0] += 1
+            max_inflight[0] = max(max_inflight[0], in_flight[0])
+            # Yield control so other coroutines have a chance to run concurrently.
+            await asyncio.sleep(0)
+            in_flight[0] -= 1
+            cluster_id = int(request.url.params["cluster"])
+            opinion = _make_opinion(opinion_id=cluster_id * 10, cluster_id=cluster_id)
+            return httpx.Response(200, json=_make_paginated_response([opinion]))
+
+        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_slow_handler)
+
+        cluster_ids = list(range(1, num_clusters + 1))
+        client = CourtListenerClient(request_delay=0)
+        result = client.fetch_opinions_for_clusters(cluster_ids)
+        client.close()
+
+        # All 12 clusters must be present in the result.
+        assert len(result) == num_clusters
+        for cid in cluster_ids:
+            assert cid in result
+            assert len(result[cid]) == 1
+
+        # At no point should more than DEFAULT_OPINION_FETCH_CONCURRENCY requests
+        # have been in-flight simultaneously.
+        assert max_inflight[0] <= DEFAULT_OPINION_FETCH_CONCURRENCY
+
+    @respx.mock
+    def test_fetch_opinions_for_clusters_partial_failure(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A 500 for one cluster returns empty list for that id; others succeed.
+
+        Also verifies that a warning is emitted for the failed cluster.
+        Structlog renders to stdout in tests, so we capture that.
+        """
+        cluster_ids = [100, 200, 300]
+        failing_id = 200
+
+        def _mock_opinions(request: httpx.Request) -> httpx.Response:
+            cluster_id = int(request.url.params["cluster"])
+            if cluster_id == failing_id:
+                return httpx.Response(500, json={"detail": "Server error"})
+            opinion = _make_opinion(opinion_id=cluster_id * 10, cluster_id=cluster_id)
+            return httpx.Response(200, json=_make_paginated_response([opinion]))
+
+        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_mock_opinions)
+
+        client = CourtListenerClient(request_delay=0)
+        result = client.fetch_opinions_for_clusters(cluster_ids)
+        client.close()
+
+        # Failing cluster returns empty list.
+        assert result[failing_id] == []
+
+        # Successful clusters return their opinions.
+        assert len(result[100]) == 1
+        assert len(result[300]) == 1
+
+        # All three cluster IDs appear in result (failed one has empty list, not missing).
+        assert set(result.keys()) == {100, 200, 300}
+
+        # Structlog warning for the failing cluster was rendered to stdout.
+        captured = capsys.readouterr()
+        assert str(failing_id) in captured.out
+
+    @respx.mock
+    def test_50_cluster_fetch_completes_quickly(self) -> None:
+        """Fetching 50 clusters with mocked responses finishes well under 5 s.
+
+        With 5 concurrent slots each sleeping 0.2 s, the theoretical minimum
+        wall-clock time for 50 clusters is ceil(50/5)*0.2 = 2.0 s.  The test
+        asserts < 5 s to give a comfortable margin for CI overhead while still
+        proving that the code is not sequential (sequential would take ≥10 s).
+        Also verifies that exactly 50 opinion API requests were issued.
+        """
+        num_clusters = 50
+
+        def _mock_opinions(request: httpx.Request) -> httpx.Response:
+            cluster_id = int(request.url.params["cluster"])
+            opinion = _make_opinion(opinion_id=cluster_id * 10, cluster_id=cluster_id)
+            return httpx.Response(200, json=_make_paginated_response([opinion]))
+
+        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_mock_opinions)
+
+        cluster_ids = list(range(1, num_clusters + 1))
+        client = CourtListenerClient(request_delay=0)
+
+        start = time.monotonic()
+        result = client.fetch_opinions_for_clusters(cluster_ids)
+        elapsed = time.monotonic() - start
+
+        client.close()
+
+        assert len(result) == num_clusters, f"Expected {num_clusters} results, got {len(result)}"
+        assert elapsed < 5.0, f"Batch fetch took {elapsed:.2f}s, expected < 5s"
+        # One opinion API request per cluster.
+        assert client.request_count == num_clusters, (
+            f"Expected {num_clusters} API requests, got {client.request_count}"
+        )
