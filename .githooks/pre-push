@@ -617,6 +617,32 @@ if [ -n "$changed_dispatcher_deps" ]; then
     else
         echo "  WARNING: scripts/check-no-git-repo-root-anchor.sh not found or not executable — skipping" >&2
     fi
+
+    # Issue #3818: every UPDATE/SELECT against dispatcher.agents in
+    # daemon.py must observe execution_mode (or carry an explicit
+    # `# exec-mode-agnostic (#3158)` annotation). Mirrors the CI step
+    # `Verify every dispatcher.agents SQL site is execution_mode-aware`
+    # so a missing annotation is caught locally instead of after a
+    # 10-20 minute CI round trip. The script is sub-second.
+    if echo "$changed_files" | grep -q '^scripts/dispatcher/daemon\.py$'; then
+        if [ -x scripts/check-dispatcher-execution-mode-aware.sh ]; then
+            if ! run_check "_" "scripts/check-dispatcher-execution-mode-aware.sh" \
+                    scripts/check-dispatcher-execution-mode-aware.sh; then
+                echo "  A new UPDATE/SELECT against dispatcher.agents in" >&2
+                echo "  scripts/dispatcher/daemon.py is missing nearby" >&2
+                echo "  execution_mode awareness." >&2
+                echo "" >&2
+                echo "  Fix: add an execution_mode branch, OR annotate the" >&2
+                echo "  call site with a nearby comment of the form" >&2
+                echo "    # exec-mode-agnostic (#3158): <reason>" >&2
+                echo "  See the #3158 audit at" >&2
+                echo "  docs/investigations/dispatcher-execution-mode-audit-2026-04.md" >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: scripts/check-dispatcher-execution-mode-aware.sh not found or not executable — skipping" >&2
+        fi
+    fi
 fi
 
 # -------------------------------------------------------------------
