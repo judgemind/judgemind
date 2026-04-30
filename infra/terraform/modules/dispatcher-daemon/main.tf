@@ -681,6 +681,21 @@ resource "aws_iam_role_policy" "task_launch_agent_runner" {
   })
 }
 
+resource "aws_iam_role_policy" "task_describe_agent_runner_image" {
+  count = var.agent_runner_ecr_repository_arn != "" ? 1 : 0
+  name  = "${local.service_name}-task-describe-agent-runner-image"
+  role  = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AllowDescribeAgentRunnerImage"
+      Effect   = "Allow"
+      Action   = "ecr:DescribeImages"
+      Resource = var.agent_runner_ecr_repository_arn
+    }]
+  })
+}
+
 # ─── ECS Task Definition ────────────────────────────────────────────────────
 # 1 vCPU / 2 GB RAM matches §14 of the spec. Ephemeral storage is pinned to
 # 50 GB per spike 0.6 (realistic mixed peak is ~10 GB across 5 concurrent
