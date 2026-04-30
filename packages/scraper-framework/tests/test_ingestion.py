@@ -6451,6 +6451,10 @@ def test_llm_split_writes_multimodal_all_null_metadata_metric() -> None:
     assert meta["s3_key"] == "ca/orange/superior_court/raw/multi-ruling.pdf"
     assert meta["state"] == "CA"
     assert meta["ruling_count"] == 2
+    # New fields added in #3722.
+    assert meta["null_count"] == 2
+    assert meta["total_rulings"] == 2
+    assert meta["null_ratio"] == 1.0
     # Savepoint must be used for best-effort protection.
     assert any("SAVEPOINT multimodal_null_metadata_metric" in s for s in executed_sql)
 
@@ -6535,3 +6539,170 @@ def test_llm_split_multimodal_null_metadata_insert_failure_swallowed() -> None:
     assert any(
         "ROLLBACK TO SAVEPOINT multimodal_null_metadata_metric" in s for s in executed_sql
     ), "Inner handler must roll back the savepoint on INSERT failure (#3559)."
+
+
+def test_llm_split_writes_metric_at_50pct_null() -> None:
+    """Telemetry fires when null_count / total_rulings >= 0.50 (#3722).
+
+    1 populated ruling + 2 null rulings (66% null) should trigger the metric.
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    populated_ruling = ExtractedRuling(
+        extracted_case_number="30-2024-10000001",
+        extracted_case_title="Alpha v. Beta",
+        extracted_judge_name="Smith",
+        department="C25",
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="GRANTED.",
+        case_type=None,
+    )
+    null_ruling_1 = ExtractedRuling(
+        extracted_case_number="30-2024-10000002",
+        extracted_case_title="Gamma v. Delta",
+        extracted_judge_name=None,
+        department=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="DENIED.",
+        case_type=None,
+    )
+    null_ruling_2 = ExtractedRuling(
+        extracted_case_number="30-2024-10000003",
+        extracted_case_title="Epsilon v. Zeta",
+        extracted_judge_name=None,
+        department=None,
+        motion_type=None,
+        outcome=None,
+        hearing_date="2026-03-16",
+        extracted_parties=[],
+        ruling_text="OVERRULED.",
+        case_type=None,
+    )
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = [populated_ruling, null_ruling_1, null_ruling_2]
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000050",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/multi-50pct-null.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert any("INSERT INTO data_quality_metrics" in s for s in executed_sql), (
+        "50% null rate (2/3) must trigger the multimodal_all_null_metadata metric (#3722)."
+    )
+    metric_calls = [
+        call
+        for call in mock_cur.execute.call_args_list
+        if "INSERT INTO data_quality_metrics" in call[0][0]
+    ]
+    params = metric_calls[0][0][1]
+    meta = json.loads(params[3])
+    assert meta["null_count"] == 2
+    assert meta["total_rulings"] == 3
+    assert abs(meta["null_ratio"] - 2 / 3) < 1e-9
+
+
+def test_llm_split_skips_metric_below_threshold() -> None:
+    """Telemetry does NOT fire when null_count / total_rulings < 0.50 (#3722).
+
+    4 populated rulings + 1 null ruling (20% null) must NOT trigger the metric.
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    def _make_ruling(case_num: str, *, null: bool) -> ExtractedRuling:
+        return ExtractedRuling(
+            extracted_case_number=case_num,
+            extracted_case_title="Foo v. Bar",
+            extracted_judge_name=None if null else "Smith",
+            department=None if null else "C25",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-16",
+            extracted_parties=[],
+            ruling_text="GRANTED.",
+            case_type=None,
+        )
+
+    rulings = [
+        _make_ruling("30-2024-20000001", null=False),
+        _make_ruling("30-2024-20000002", null=False),
+        _make_ruling("30-2024-20000003", null=False),
+        _make_ruling("30-2024-20000004", null=False),
+        _make_ruling("30-2024-20000005", null=True),
+    ]
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = rulings
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000060",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/multi-below-threshold.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert not any("INSERT INTO data_quality_metrics" in s for s in executed_sql), (
+        "20% null rate (1/5) must NOT trigger the multimodal_all_null_metadata metric (#3722)."
+    )

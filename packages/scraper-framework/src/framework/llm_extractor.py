@@ -3984,6 +3984,31 @@ def _join_page_rows(
             if not header_date:
                 header_date = _parse_header_date(info)
 
+    # Permissive second pass: when the strict pass did not find a judge or
+    # department, scan case_info of ALL rows (regardless of entry_number or
+    # ruling_text) for the patterns.  OC multimodal PDFs embed this metadata
+    # inside regular ruling rows rather than in a dedicated header row (#3722).
+    # First match wins; strict-pass hits are never overwritten.
+    if not header_judge or not header_dept:
+        for row in rows:
+            info = row.get("case_info") or ""
+            if not info:
+                continue
+            if not header_judge:
+                judge_match = re.search(
+                    r"(?:Hon\.?\s+|Honorable\s+|JUDGE\s+)([A-Z][A-Za-z .'-]{2,80})",
+                    info,
+                    re.IGNORECASE,
+                )
+                if judge_match:
+                    header_judge = judge_match.group(1).strip()
+            if not header_dept:
+                dept_match = re.search(r"(?:Department|Dept\.?)\s+([A-Z0-9]+)", info, re.IGNORECASE)
+                if dept_match:
+                    header_dept = dept_match.group(1).strip()
+            if header_judge and header_dept:
+                break
+
     # Track entry_number -> case_index for cross-reference resolution (#2317).
     entry_number_to_index: dict[int, int] = {}
 

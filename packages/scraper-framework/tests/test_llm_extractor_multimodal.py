@@ -1098,6 +1098,106 @@ class TestJoinPageRows:
         """
         assert _parse_header_date("13/05/2026") is None
 
+    def test_metadata_fallback_judge_via_permissive_scan(self) -> None:
+        """Permissive second pass picks up judge name from a non-header row (#3722).
+
+        When 'Hon. Smith' appears only inside an entry_number=1 row's case_info
+        (not a strict header row), the permissive scan must still populate
+        extracted_judge_name for all returned rulings.
+        """
+        rows = [
+            # Non-header row (has entry_number) with judge info on its own line in case_info.
+            # This mirrors OC PDFs where the judge name is embedded in the first ruling row.
+            {
+                "entry_number": 1,
+                "case_info": "Hon. Smith\n2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED.",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Gamma v. Delta",
+                "ruling_text": "DENIED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].extracted_judge_name == "Smith"
+        assert rulings[1].extracted_judge_name == "Smith"
+
+    def test_metadata_fallback_dept_via_permissive_scan(self) -> None:
+        """Permissive second pass picks up department from a non-header row (#3722).
+
+        When 'Department C44' appears only inside an entry_number=1 row's case_info
+        (not a strict header row), the permissive scan must populate department
+        for all returned rulings.
+        """
+        rows = [
+            # Non-header row (has entry_number) with dept info embedded in case_info.
+            {
+                "entry_number": 1,
+                "case_info": "Department C44\n2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED.",
+            },
+            {
+                "entry_number": 2,
+                "case_info": "2024-00002 Gamma v. Delta",
+                "ruling_text": "DENIED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 2
+        assert rulings[0].department == "C44"
+        assert rulings[1].department == "C44"
+
+    def test_strict_header_takes_precedence_over_permissive(self) -> None:
+        """Strict header scan result wins when both strict and permissive matches exist (#3722).
+
+        A genuine header row (entry_number=None, empty ruling_text) with 'JUDGE STRICT'
+        must win over 'Hon. Permissive' found in a regular row's case_info.
+        """
+        rows = [
+            # Strict header row — should populate header_judge = "STRICT".
+            {
+                "entry_number": None,
+                "case_info": "JUDGE STRICT",
+                "ruling_text": "",
+            },
+            # Non-header row with a different judge name — permissive pass must NOT overwrite.
+            {
+                "entry_number": 1,
+                "case_info": "Hon. Permissive\n2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED.",
+            },
+        ]
+        rulings = _join_page_rows(rows)
+        assert len(rulings) == 1
+        assert rulings[0].extracted_judge_name == "STRICT"
+
+    def test_metadata_kwarg_overrides_both(self) -> None:
+        """metadata kwarg wins over both strict header and permissive scan (#3722).
+
+        When metadata={"judge_name": "Override"} is passed, neither the strict
+        header row nor the permissive scan result should appear in the ruling.
+        """
+        rows = [
+            # Strict header row.
+            {
+                "entry_number": None,
+                "case_info": "JUDGE STRICT",
+                "ruling_text": "",
+            },
+            # Non-header row with yet another judge name in case_info.
+            {
+                "entry_number": 1,
+                "case_info": "Hon. Permissive\n2024-00001 Alpha v. Beta",
+                "ruling_text": "GRANTED.",
+            },
+        ]
+        metadata = {"judge_name": "Override"}
+        rulings = _join_page_rows(rows, metadata=metadata)
+        assert len(rulings) == 1
+        assert rulings[0].extracted_judge_name == "Override"
+
 
 # ---------------------------------------------------------------------------
 # Calendar header detection tests (#2096)
