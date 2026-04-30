@@ -6900,3 +6900,84 @@ def test_multimodal_case_number_miss_skipped_below_threshold() -> None:
     assert not any("multimodal_case_number_miss" in s for s in executed_sql), (
         "10% miss rate (1/10) must NOT trigger the multimodal_case_number_miss metric (#3729)."
     )
+
+
+def test_multimodal_case_number_miss_telemetry_db_error_swallowed() -> None:
+    """INSERT failure triggers ROLLBACK TO SAVEPOINT and is swallowed (#3729).
+
+    When the INSERT INTO data_quality_metrics raises an exception, the inner
+    except block must execute ROLLBACK TO SAVEPOINT and re-raise; the outer
+    except block swallows it so _llm_split_document still returns True.
+    """
+    from framework.llm_schema import ExtractedRuling
+
+    worker, _ = _make_worker()
+    worker._llm_client = MagicMock()
+
+    def _make_ruling(case_num: str) -> ExtractedRuling:
+        return ExtractedRuling(
+            extracted_case_number=case_num,
+            extracted_case_title="Foo v. Bar",
+            extracted_judge_name="Smith",
+            department="C28",
+            motion_type=None,
+            outcome=None,
+            hearing_date="2026-03-16",
+            extracted_parties=[],
+            ruling_text="GRANTED.",
+            case_type=None,
+        )
+
+    rulings = [
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000301"),
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000302"),
+        _make_ruling("UNKNOWN-aaaaaaaa-0000-0000-0000-000000000303"),
+        _make_ruling("30-2024-50000001"),
+    ]
+
+    mock_extractor = MagicMock()
+    mock_extractor.extract.return_value = rulings
+
+    event = _make_event(
+        document_id="multimodal-doc-0000-0000-000000000090",
+        scraper_id="ca-oc-tentatives",
+        state="CA",
+        county="Orange",
+        s3_key="ca/orange/superior_court/raw/miss-db-error.pdf",
+        ruling_text="Some multipage ruling text",
+        judge_name=None,
+        department=None,
+    )
+
+    mock_conn, mock_cur = _make_mock_conn()
+
+    db_error = Exception("simulated DB error")
+
+    def _execute_side_effect(sql: str, *args: object, **kwargs: object) -> None:
+        if "INSERT INTO data_quality_metrics" in sql:
+            raise db_error
+
+    mock_cur.execute.side_effect = _execute_side_effect
+
+    with (
+        patch.object(worker, "_get_framework_extractor", return_value=mock_extractor),
+        patch.object(worker, "_get_multimodal_extractor", return_value=None),
+        patch.object(worker, "_get_connection", return_value=mock_conn),
+        patch("ingestion.worker.delete_stale_split_children", return_value=0),
+        patch.object(worker, "process_event"),
+    ):
+        result = worker._llm_split_document(
+            event,
+            event["document_id"],
+            event["ruling_text"],
+            event["state"],
+            event["county"],
+            raw_pdf_bytes=None,
+        )
+
+    assert result is True, "DB error in telemetry write must not propagate — best-effort"
+    executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
+    assert any("SAVEPOINT multimodal_case_number_miss_metric" in s for s in executed_sql)
+    assert any("ROLLBACK TO SAVEPOINT multimodal_case_number_miss_metric" in s for s in executed_sql), (
+        "Inner except must execute ROLLBACK TO SAVEPOINT when INSERT raises (#3729)."
+    )
