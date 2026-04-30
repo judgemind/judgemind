@@ -1890,7 +1890,11 @@ class IngestionWorker:
         # Normalize department name before it's used for lookups or DB
         # writes (#2141).  Placed here so the dept-to-judge lookup below
         # sees the canonical department name.
-        department = normalize_department(county, department)
+        department = normalize_department(
+            county,
+            department,
+            courthouse=event_data.get("courthouse"),
+        )
 
         # Apply Contra Costa department reassignment mapping (#2612).
         # Runs after normalization so both sides of the comparison are in

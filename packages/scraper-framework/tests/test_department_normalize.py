@@ -338,3 +338,43 @@ class TestAlphanumericDepartmentCodes:
         """Orange uses alphanumeric codes (CX*, CM*, N*, W*, L*, C*) — all
         must pass through."""
         assert normalize_department("Orange", raw) == raw
+
+
+# ---------------------------------------------------------------------------
+# LA County — Long Beach courthouse (S25–S29 must survive, #3741)
+# ---------------------------------------------------------------------------
+
+
+class TestLALongBeach:
+    """S25–S29 dept codes survive when courthouse is Long Beach.
+
+    These are distinct courtrooms at the Long Beach Courthouse.  The generic
+    LA letter+digits collapse rule must be skipped for LB courthouses so that
+    analytics can distinguish S25 from S27 etc.
+
+    See: https://github.com/judgemind/judgemind/issues/3741
+    """
+
+    @pytest.mark.parametrize("dept", ["S25", "S26", "S27", "S28", "S29"])
+    @pytest.mark.parametrize(
+        "courthouse",
+        [
+            "Long Beach Courthouse",
+            "long beach courthouse",
+            "LBC",
+            "LBCV",
+            "lbc",
+            "lbcv",
+        ],
+    )
+    def test_lb_dept_codes_survive(self, dept: str, courthouse: str) -> None:
+        """S25–S29 must not be collapsed to 'S' for Long Beach Courthouse."""
+        assert normalize_department("Los Angeles", dept, courthouse=courthouse) == dept
+
+    def test_pomona_l10_still_collapses(self) -> None:
+        """Non-LB courthouse: L10 must still collapse to 'L'."""
+        assert normalize_department("Los Angeles", "L10", courthouse="Pomona Courthouse") == "L"
+
+    def test_courthouse_omitted_back_compat(self) -> None:
+        """Omitting courthouse kwarg preserves existing collapse behaviour."""
+        assert normalize_department("Los Angeles", "X14") == "X"
