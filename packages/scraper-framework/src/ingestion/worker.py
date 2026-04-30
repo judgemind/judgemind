@@ -2908,6 +2908,53 @@ class IngestionWorker:
                     exc_info=True,
                 )
 
+        # When a document produces results but >= 30% of entries have a missing
+        # or UNKNOWN- synthetic case_number, write a best-effort telemetry row
+        # so the OC case_number miss rate is dashboard-queryable (#3729).
+        miss_count = sum(
+            1 for cr in converted if not cr.case_number or cr.case_number.startswith("UNKNOWN-")
+        )
+        if len(converted) > 0 and miss_count / len(converted) >= 0.3:
+            try:
+                conn = self._get_connection()
+                with conn.cursor() as cur:
+                    cur.execute("SAVEPOINT multimodal_case_number_miss_metric")
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO data_quality_metrics
+                                (recorded_at, county, metric_name,
+                                 metric_value, metadata)
+                            VALUES (now(), %s, %s, %s, %s::jsonb)
+                            """,
+                            (
+                                county,
+                                "multimodal_case_number_miss",
+                                1,
+                                json.dumps(
+                                    {
+                                        "document_id": document_id,
+                                        "s3_key": event_data.get("s3_key"),
+                                        "state": state,
+                                        "county": county,
+                                        "scraper_id": event_data.get("scraper_id"),
+                                        "ruling_count": len(converted),
+                                        "miss_count": miss_count,
+                                        "miss_ratio": miss_count / len(converted),
+                                    }
+                                ),
+                            ),
+                        )
+                        cur.execute("RELEASE SAVEPOINT multimodal_case_number_miss_metric")
+                    except Exception:  # noqa: BLE001 — best-effort
+                        cur.execute("ROLLBACK TO SAVEPOINT multimodal_case_number_miss_metric")
+                        raise
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                logger.debug(
+                    "multimodal_case_number_miss telemetry write failed",
+                    exc_info=True,
+                )
+
         # Clean up stale split-child documents from a previous processing run
         # that produced more rulings than this run (#2295).  The new split IDs
         # will be upserted cleanly; any old IDs beyond the new count are
