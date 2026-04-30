@@ -555,6 +555,12 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                         )
                         continue
 
+                    # Fallback: recover hearing_date from PDF cover-page header
+                    # when the filename-date regex misses (e.g. probate PDFs use
+                    # content-hash filenames like 594361f8.pdf, not NN_MMDDYY.pdf).
+                    if hearing_date is None and text is not None:
+                        hearing_date = _cc_hearing_date_from_pdf(text)
+
                     # LLM extraction path: send PDF text to LLM, get back
                     # structured rulings with all fields.
                     if use_llm and text is not None:
