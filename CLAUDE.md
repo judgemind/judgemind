@@ -84,6 +84,7 @@ Consult these docs before making changes in their domain:
 | `docs/agent/issue-authoring.md` | Writing acceptance criteria, sub-tasks, investigation follow-ups |
 | `docs/agent/task-dependencies.md` | Blocking/unblocking issues, `Blocked by` mechanics |
 | `docs/agent/infrastructure-reference.md` | ECS script execution, Terraform apply, secrets, Vercel, Reingest vs Rebuild |
+| `docs/agent/llm-cache.md` | LLM extraction cache semantics, what re-runs on cache hit, when --bust-llm-cache is required, surgical cleanup guidance |
 | `docs/agent/local-dev.md` | Docker Compose, local DB rebuild, S3 cache, local env vars |
 | `docs/agent/unattended-patterns.md` | Permission-prompt workarounds for git, curl, secrets, `.claude/` writes |
 | `docs/agent/interactive-shell-rules.md` | Hook-enforced shell NEVERs, operator-laptop vs. Fargate scope |
