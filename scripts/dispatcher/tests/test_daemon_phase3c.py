@@ -1038,6 +1038,264 @@ class TestProcessRetryMarkersBudgetedRetriesUnchanged:
 
 
 # --------------------------------------------------------------------------
+# Issue #3814 — gate retry application on current agent status
+# --------------------------------------------------------------------------
+
+
+class TestProcessRetryMarkersStaleTerminalSkip:
+    """Regression: ``stuck_timeout`` retry markers can race with a successful
+    terminal write — the daemon enqueues the marker, the agent's entrypoint
+    writes ``status='succeeded'`` moments later, and the reaper observes
+    the success. On the next supervisor tick the still-unresolved marker
+    fires and would overwrite ``status`` back to ``retrying``, leaving a
+    phantom ``retrying`` row for an agent that already shipped (concrete
+    instance: ae54c68b / PR #3813 / issue #3638 — 2026-04-29).
+
+    Fix: ``_process_retry_markers`` SELECTs the row's current status before
+    applying the retry. If it is in :data:`TERMINAL_AGENT_STATUSES`, mark
+    the marker consumed, log ``retry_marker_stale_terminal_skip``, and
+    skip both the budgeted-reset and infra-preemption-terminal paths. The
+    row stays terminal.
+    """
+
+    def _seed_marker_with_status(
+        self,
+        tmp_path: Path,
+        reason: str,
+        current_status: str | None,
+    ) -> tuple[Any, Any, Any]:
+        """Wire one due marker plus a single fetchone() for the status SELECT.
+
+        ``current_status=None`` simulates a missing-row case (the SELECT
+        returns ``None`` — the status check falls through to the regular
+        path so the existing reset behaviour still runs).
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue = [
+            [
+                (
+                    77,  # marker_id
+                    "agent-stale-terminal",
+                    reason,
+                    1,  # attempt
+                    str(tmp_path / "worktrees" / "agent-stale-terminal"),
+                    101,  # issue_number
+                ),
+            ],
+        ]
+        if current_status is None:
+            conn.cursor_instance.fetch_queue = [None]
+        else:
+            conn.cursor_instance.fetch_queue = [(current_status,)]
+        return d, conn, handler
+
+    def test_succeeded_row_skips_retry_write_and_logs(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Concrete instance reproducer: ``status='succeeded'`` AND a pending
+        ``stuck_timeout`` marker → row stays ``succeeded``, marker resolves,
+        ``retry_marker_stale_terminal_skip`` is logged.
+        """
+        d, conn, handler = self._seed_marker_with_status(
+            tmp_path,
+            daemon.FAILURE_CATEGORY_STUCK_TIMEOUT,
+            "succeeded",
+        )
+        # Worktree was already cleaned up by the success path. The skip
+        # branch must not call _drop_worktree_best_effort — assert that
+        # by counting calls.
+        cleanup_calls = {"count": 0}
+        monkeypatch.setattr(
+            d,
+            "_drop_worktree_best_effort",
+            lambda _p: (
+                cleanup_calls.__setitem__("count", cleanup_calls["count"] + 1) or True
+            ),
+        )
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        # (a) Row remains status='succeeded' — no UPDATE writing
+        # status='retrying' was emitted.
+        retrying_writes = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
+        ]
+        assert retrying_writes == [], (
+            "stale terminal skip must not write status='retrying' back over "
+            "a succeeded row"
+        )
+
+        # No retries_used++ either.
+        incremented = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert incremented == [], "stale terminal skip must not consume retry budget"
+
+        # No phase_transitions(retry_reset) insert either — the row is
+        # terminal so no MAX(ts) clock reset is needed.
+        retry_reset_inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.phase_transitions" in e[0]
+            and e[1] is not None
+            and "retry_reset" in str(e[1])
+        ]
+        assert retry_reset_inserts == [], (
+            "stale terminal skip must not insert retry_reset phase_transition"
+        )
+
+        # (b) Marker resolved.
+        resolves = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.retry_markers" in e[0] and "resolved_at" in e[0]
+        ]
+        assert resolves, "stale-terminal marker must be marked consumed"
+
+        # (c) retry_marker_stale_terminal_skip logged with the right fields.
+        skip_events = handler.events("retry_marker_stale_terminal_skip")
+        assert len(skip_events) == 1
+        evt = skip_events[0]
+        assert getattr(evt, "agent_id", None) == "agent-stale-terminal"
+        assert getattr(evt, "issue_number", None) == 101
+        assert getattr(evt, "reason", None) == daemon.FAILURE_CATEGORY_STUCK_TIMEOUT
+        assert getattr(evt, "marker_id", None) == 77
+        assert getattr(evt, "current_status", None) == "succeeded"
+
+        # The downstream retry_processed / retry_terminal_and_reclaim
+        # events MUST NOT fire.
+        assert handler.events("retry_processed") == []
+        assert handler.events("retry_terminal_and_reclaim") == []
+
+        # Worktree drop is owned by the success-path reaper; the skip
+        # branch must not redundantly call it.
+        assert cleanup_calls["count"] == 0
+
+    def test_failed_row_skips_retry_write(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``status='failed'`` is also terminal — same skip semantics."""
+        d, conn, handler = self._seed_marker_with_status(
+            tmp_path,
+            daemon.FAILURE_CATEGORY_SUBPROCESS_CRASH,
+            "failed",
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        retrying_writes = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
+        ]
+        assert retrying_writes == []
+
+        skip_events = handler.events("retry_marker_stale_terminal_skip")
+        assert len(skip_events) == 1
+        assert getattr(skip_events[0], "current_status", None) == "failed"
+        assert handler.events("retry_processed") == []
+
+    def test_needs_review_row_skips_retry_write(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``status='needs_review'`` is terminal — same skip semantics."""
+        d, conn, handler = self._seed_marker_with_status(
+            tmp_path,
+            daemon.FAILURE_CATEGORY_STUCK_TIMEOUT,
+            "needs_review",
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        retrying_writes = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0] and "status = 'retrying'" in e[0]
+        ]
+        assert retrying_writes == []
+
+        skip_events = handler.events("retry_marker_stale_terminal_skip")
+        assert len(skip_events) == 1
+        assert getattr(skip_events[0], "current_status", None) == "needs_review"
+
+    def test_running_row_still_takes_normal_reset_path(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Non-terminal status (``running``) must NOT short-circuit — the
+        normal budgeted reset behaviour still applies. Guards against the
+        gate being too aggressive.
+        """
+        d, conn, handler = self._seed_marker_with_status(
+            tmp_path,
+            daemon.FAILURE_CATEGORY_STUCK_TIMEOUT,
+            "running",
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+
+        retrying_writes = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.agents" in e[0]
+            and "status = 'retrying'" in e[0]
+            and "retries_used = retries_used + 1" in e[0]
+        ]
+        assert retrying_writes, (
+            "running rows must continue to take the budgeted reset path"
+        )
+        assert handler.events("retry_processed")
+        assert handler.events("retry_marker_stale_terminal_skip") == []
+
+    def test_terminal_row_blocks_infra_preemption_path_too(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Even infra-preemption markers must skip when the row is
+        terminal — overwriting a ``succeeded`` row with
+        ``_mark_agent_terminal(failed)`` would corrupt the success
+        record just as badly as a retrying flip would.
+        """
+        d, conn, handler = self._seed_marker_with_status(
+            tmp_path,
+            daemon.FAILURE_CATEGORY_DAEMON_RESTART_ABANDONED,
+            "succeeded",
+        )
+        monkeypatch.setattr(d, "_drop_worktree_best_effort", lambda _p: True)
+
+        # If the gate fails the test would call _mark_agent_terminal —
+        # use a counter to assert it does NOT.
+        terminal_calls = {"count": 0}
+        monkeypatch.setattr(
+            d,
+            "_mark_agent_terminal",
+            lambda *a, **kw: terminal_calls.__setitem__(
+                "count", terminal_calls["count"] + 1
+            ),
+        )
+        monkeypatch.setattr(d, "_gh_issue_add_labels", lambda n, labels: None)
+
+        processed = d._process_retry_markers()
+        assert processed == 1
+        assert terminal_calls["count"] == 0, (
+            "stale terminal skip must run before the infra-preemption "
+            "terminal-and-reclaim branch"
+        )
+        assert handler.events("retry_terminal_and_reclaim") == []
+        assert handler.events("retry_marker_stale_terminal_skip")
+
+
+# --------------------------------------------------------------------------
 # _drop_worktree_best_effort
 # --------------------------------------------------------------------------
 

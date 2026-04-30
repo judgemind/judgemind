@@ -18740,6 +18740,75 @@ class DispatcherDaemon:
             retry_counted = reason not in _INFRA_PREEMPTION_CATEGORIES
 
             try:
+                # Issue #3814 — gate retry application on current agent
+                # status. ``stuck_timeout`` (and other budgeted reasons)
+                # can race with a successful terminal write: the daemon
+                # detects the phase as stuck, enqueues a retry marker
+                # writing ``status='retrying'``, but the agent's own
+                # entrypoint then writes ``status='succeeded'`` (PR
+                # merged) moments later. The reaper observes the
+                # success and reaps; the retry marker, still queued in
+                # ``dispatcher.retry_markers``, fires on the next
+                # supervisor tick and would overwrite ``status`` back
+                # to ``retrying`` — leaving a phantom ``retrying`` row
+                # for an agent that already shipped. Concrete instance:
+                # ae54c68b / PR #3813 (issue #3638) succeeded at
+                # 22:56Z but the row landed at ``retrying`` because the
+                # merge phase had hit a 74-min stuck_timeout at
+                # 22:55:40Z. Fix: SELECT the current status and skip
+                # the retry-row write (both branches: budgeted reset
+                # AND infra-preemption terminal-and-reclaim) when the
+                # row is already in
+                # :data:`TERMINAL_AGENT_STATUSES`. Mark the marker
+                # consumed so it doesn't re-fire on the next tick.
+                with self._conn.cursor() as cur:
+                    # exec-mode-agnostic (#3158): terminal-status read;
+                    # the staleness check is identical for subprocess
+                    # and ECS agents — both modes write the same
+                    # ``status`` values via ``_mark_agent_terminal`` /
+                    # the agent_runner entrypoint, and this SELECT
+                    # only inspects ``status``. Mode-specific teardown
+                    # (e.g. ``agent_task_arn`` clear) lives in the
+                    # caller of ``_mark_agent_terminal``.
+                    cur.execute(
+                        "SELECT status FROM dispatcher.agents WHERE agent_id = %s",
+                        (agent_id,),
+                    )
+                    status_row = cur.fetchone()
+                self._conn.commit()
+                current_status = (
+                    str(status_row[0])
+                    if status_row is not None and status_row[0] is not None
+                    else None
+                )
+                if (
+                    current_status is not None
+                    and current_status in TERMINAL_AGENT_STATUSES
+                ):
+                    with self._conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE dispatcher.retry_markers "
+                            "SET resolved_at = now() "
+                            "WHERE marker_id = %s",
+                            (marker_id,),
+                        )
+                    self._conn.commit()
+                    self._log.info(
+                        "daemon.retry_marker_stale_terminal_skip",
+                        extra={
+                            "event": "retry_marker_stale_terminal_skip",
+                            "run_id": self._run_id,
+                            "agent_id": agent_id,
+                            "issue_number": issue_number,
+                            "reason": reason,
+                            "attempt": attempt,
+                            "marker_id": marker_id,
+                            "current_status": current_status,
+                        },
+                    )
+                    processed += 1
+                    continue
+
                 self._drop_worktree_best_effort(worktree_path)
 
                 if not retry_counted:
