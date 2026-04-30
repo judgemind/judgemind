@@ -1547,6 +1547,26 @@ class TestIsCalendarListingOnly:
         )
         assert _is_calendar_listing_only(text) is False
 
+    def test_non_cc_ruling_with_bare_hearing_in_re_preserved(self) -> None:
+        """Non-CC rulings with bare 'Hearing in re' are preserved (#3699).
+
+        The bare HEARING IN RE alternative was removed from
+        _PROBATE_CALENDAR_LISTING_RE because non-CC courts use this phrase
+        in real rulings with verbs like 'ruled' that are absent from
+        _RULING_VERB_RE.  Without the fix the text below was incorrectly
+        dropped as a CC calendar-listing pointer.
+        """
+        # >100 chars so the length-gate bypass path is exercised.
+        # Uses only 'ruled' which is NOT in _RULING_VERB_RE — no GRANTED/DENIED/etc.
+        # This is the exact bug vector: old regex matched bare HEARING IN RE,
+        # _RULING_VERB_RE did not fire, so the real ruling was falsely dropped.
+        text = (
+            "Hearing in re petition for approval of minor's compromise; "
+            "the court has considered all papers submitted and ruled on the merits.  "
+            "Counsel to prepare and submit a proposed order within ten days."
+        )
+        assert _is_calendar_listing_only(text) is False
+
 
 class TestIsCalendarListingOnlyWidened2489:
     """Additional widened-filter cases for #2489.
