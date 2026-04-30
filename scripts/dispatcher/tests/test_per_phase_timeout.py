@@ -237,48 +237,63 @@ class TestTimeoutBlockedEnvelopeBranch:
 
     def test_rc_124_branch_short_circuits_output_resolution(self) -> None:
         text = _script_text()
-        # The branch must ``return 0`` (or ``return`` with a printed
-        # envelope) BEFORE the existing ``read_phase_output`` /
-        # ``.result`` resolution path so the truthful envelope wins.
-        rc124_match = re.search(r'\[\[\s*"\$_rc"\s*-eq\s*124\s*\]\]', text)
-        assert rc124_match is not None, (
-            'Could not find ``[[ "$_rc" -eq 124 ]]`` block — expected '
-            "near the timeout handling in run_claude_phase (#3766)."
+        # Anchor on the BLOCKED envelope construction, not the bare rc==124
+        # condition — the salvage prelude (#3832) introduces an additional
+        # ``read_phase_output`` call between rc==124 and this block, so the
+        # bare-condition anchor would point inside the salvage block and the
+        # ``between`` slice would no longer contain the BLOCKED printf/return.
+        blocked_match = re.search(
+            r'_timeout_output=\$\(jq -n -c', text
         )
-        rc124_idx = rc124_match.start()
-        # The first ``read_phase_output`` after rc124_idx is the
-        # output-resolution call. The new branch must print the
-        # envelope + return BEFORE that call.
-        rpo_idx = text.find("if _file_output=$(read_phase_output", rc124_idx)
-        assert rpo_idx > rc124_idx, (
-            "Could not locate read_phase_output after the rc==124 branch "
-            "in run_claude_phase. (#3766)"
+        assert blocked_match is not None, (
+            "Could not find BLOCKED envelope construction "
+            "``_timeout_output=$(jq -n -c`` in run_claude_phase. "
+            "Expected inside the rc==124 branch (#3766, #3832)."
         )
-        between = text[rc124_idx:rpo_idx]
+        blocked_idx = blocked_match.start()
+        # The first ``read_phase_output`` AFTER the BLOCKED construction is
+        # the outer output-resolution call (below the rc==124 block entirely).
+        # The envelope must printf + return 0 before that outer call.
+        rpo_idx = text.find("if _file_output=$(read_phase_output", blocked_idx)
+        assert rpo_idx > blocked_idx, (
+            "Could not locate read_phase_output after the BLOCKED envelope "
+            "construction in run_claude_phase. (#3766)"
+        )
+        between = text[blocked_idx:rpo_idx]
         # The branch must print the JSON envelope (so the caller
         # captures it via $()) AND return 0 (so the function exits
         # cleanly without overwriting the envelope).
         assert "printf" in between, (
-            "rc==124 branch must ``printf`` the structured BLOCKED envelope "
+            "rc==124 BLOCKED branch must ``printf`` the structured envelope "
             "to stdout before falling through to ``read_phase_output`` (#3766)."
         )
         assert "return 0" in between, (
-            "rc==124 branch must ``return 0`` after printing the envelope "
-            "so the existing output-resolution path doesn't overwrite it "
-            "with ``ralph_done_marker_missing`` (#3766)."
+            "rc==124 BLOCKED branch must ``return 0`` after printing the "
+            "envelope so the existing output-resolution path doesn't "
+            "overwrite it with ``ralph_done_marker_missing`` (#3766)."
         )
 
     def test_rc_124_envelope_carries_elapsed_seconds(self) -> None:
         # The diagnoser uses ``elapsed_seconds`` to decide whether to
         # bump the per-phase cap or investigate runaway iteration count.
+        # Anchor on the BLOCKED envelope construction (same as
+        # test_rc_124_branch_short_circuits_output_resolution) — the
+        # salvage prelude (#3832) inserts a read_phase_output call before
+        # the BLOCKED block, so using the bare rc==124 condition as anchor
+        # would yield a ``between`` slice that doesn't contain the BLOCKED
+        # ``elapsed_seconds`` field.
         text = _script_text()
-        rc124_match = re.search(r'\[\[\s*"\$_rc"\s*-eq\s*124\s*\]\]', text)
-        assert rc124_match is not None
-        rc124_idx = rc124_match.start()
-        rpo_idx = text.find("if _file_output=$(read_phase_output", rc124_idx)
-        between = text[rc124_idx:rpo_idx]
+        blocked_match = re.search(r'_timeout_output=\$\(jq -n -c', text)
+        assert blocked_match is not None, (
+            "Could not find BLOCKED envelope construction "
+            "``_timeout_output=$(jq -n -c`` — expected in the rc==124 "
+            "branch of run_claude_phase (#3766, #3832)."
+        )
+        blocked_idx = blocked_match.start()
+        rpo_idx = text.find("if _file_output=$(read_phase_output", blocked_idx)
+        between = text[blocked_idx:rpo_idx]
         assert "elapsed_seconds" in between, (
-            "rc==124 envelope must carry ``elapsed_seconds`` so the "
+            "rc==124 BLOCKED envelope must carry ``elapsed_seconds`` so the "
             "diagnoser can decide whether to bump the per-phase cap or "
             "investigate (#3766)."
         )
@@ -313,4 +328,111 @@ class TestPhaseTransitionsExportsTimeoutHint:
             "FAILURE_HINT_CLAUDE_PHASE_TIMEOUT must be listed in "
             "phase_transitions.py::__all__ so it can be imported by "
             "daemon.py for the failure-category mapping table (#3766)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Salvage prelude — rc==124 but claude already finished (#3832)
+# ---------------------------------------------------------------------------
+
+
+class TestClaudePhaseTimeoutSalvage:
+    """When ``timeout`` exits 124 but the claude output envelope already has
+    ``is_error=false`` and ``terminal_reason="completed"``, the salvage
+    prelude must route through the normal output-resolution chain instead
+    of emitting a BLOCKED envelope (#3832)."""
+
+    def test_salvage_check_present_in_rc_124_branch(self) -> None:
+        text = _script_text()
+        # Both sentinel field checks must be present near the rc==124 branch.
+        assert "is_error == false" in text, (
+            "Salvage prelude must check ``.is_error == false`` to confirm "
+            "claude finished cleanly before the wrapper was killed (#3832)."
+        )
+        assert 'terminal_reason == "completed"' in text, (
+            "Salvage prelude must check ``.terminal_reason == \"completed\"`` "
+            "to confirm the envelope is a completed run, not a mid-iteration "
+            "kill (#3832)."
+        )
+        # Both checks must appear within the rc==124 branch body, not
+        # elsewhere in the file. Verify they appear before the BLOCKED
+        # envelope construction.
+        rc124_match = re.search(r'\[\[\s*"\$_rc"\s*-eq\s*124\s*\]\]', text)
+        assert rc124_match is not None
+        rc124_idx = rc124_match.start()
+        blocked_idx = text.find("_timeout_output=$(jq -n -c", rc124_idx)
+        assert blocked_idx > rc124_idx, (
+            "Could not find BLOCKED envelope construction after rc==124 (#3832)."
+        )
+        between = text[rc124_idx:blocked_idx]
+        assert "is_error == false" in between, (
+            "``is_error == false`` check must appear inside the rc==124 branch "
+            "BEFORE the BLOCKED envelope construction (#3832)."
+        )
+        assert 'terminal_reason == "completed"' in between, (
+            "``terminal_reason == \"completed\"`` check must appear inside the "
+            "rc==124 branch BEFORE the BLOCKED envelope construction (#3832)."
+        )
+
+    def test_salvage_logs_distinct_event(self) -> None:
+        text = _script_text()
+        assert "claude_phase_timeout_salvaged" in text, (
+            "Salvage prelude must emit a distinct ``claude_phase_timeout_salvaged`` "
+            "log event so operators can dashboard the false-positive rate "
+            "separately from real timeouts (#3832)."
+        )
+
+    def test_salvage_event_carries_required_fields(self) -> None:
+        text = _script_text()
+        # Find the salvage log call and verify all required arg keys are present.
+        salvage_log_idx = text.find('"claude_phase_timeout_salvaged"')
+        assert salvage_log_idx >= 0, (
+            "Could not find ``claude_phase_timeout_salvaged`` log call (#3832)."
+        )
+        # Look at the next 300 chars after the event name for the arg keys.
+        call_region = text[salvage_log_idx : salvage_log_idx + 300]
+        assert "phase=" in call_region, (
+            "salvage log call must carry ``phase=`` arg (#3832)."
+        )
+        assert "claude_duration_ms=" in call_region, (
+            "salvage log call must carry ``claude_duration_ms=`` arg so "
+            "operators know how long claude actually ran (#3832)."
+        )
+        assert "wrapper_deadline_seconds=" in call_region, (
+            "salvage log call must carry ``wrapper_deadline_seconds=`` arg "
+            "so operators can compare against the phase cap (#3832)."
+        )
+
+    def test_salvage_routes_through_phase_output_resolution(self) -> None:
+        text = _script_text()
+        # The salvage block must call read_phase_output "$_skill" so it
+        # reaches the same dispatcher-output file resolution path as the
+        # clean-exit branch.
+        rc124_match = re.search(r'\[\[\s*"\$_rc"\s*-eq\s*124\s*\]\]', text)
+        assert rc124_match is not None
+        rc124_idx = rc124_match.start()
+        blocked_idx = text.find("_timeout_output=$(jq -n -c", rc124_idx)
+        assert blocked_idx > rc124_idx
+        salvage_region = text[rc124_idx:blocked_idx]
+        assert 'read_phase_output "$_skill"' in salvage_region, (
+            "Salvage prelude must call ``read_phase_output \"$_skill\"`` so "
+            "dispatcher-output files written by the skill are picked up on "
+            "the salvage path, exactly as the clean-exit branch does (#3832)."
+        )
+
+    def test_blocked_envelope_still_emitted_when_no_salvage(self) -> None:
+        text = _script_text()
+        # The BLOCKED envelope construction must still be present so that
+        # genuine mid-iteration timeouts (no completed envelope) continue
+        # to produce a structured BLOCKED verdict.
+        assert "_timeout_output=$(jq -n -c" in text, (
+            "BLOCKED envelope construction ``_timeout_output=$(jq -n -c`` "
+            "must still be present — genuine timeouts must still emit a "
+            "structured BLOCKED verdict even after the salvage prelude is "
+            "added (#3832)."
+        )
+        assert 'category="claude_phase_timeout"' in text or \
+               'category: "claude_phase_timeout"' in text, (
+            "BLOCKED envelope must still carry ``category=\"claude_phase_timeout\"`` "
+            "so the diagnoser routes genuine timeouts correctly (#3832)."
         )

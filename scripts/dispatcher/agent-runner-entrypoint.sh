@@ -2119,6 +2119,31 @@ run_claude_phase() {
     # branch so the failure surfaces with a real exit code rather than
     # silently re-routing through the json-parse path.
     if [[ "$_rc" -eq 124 ]]; then
+        # #3832: salvage prelude — if claude already finished before timeout()
+        # SIGKILLed the wrapper, the output JSON will have is_error=false and
+        # terminal_reason="completed". Route through the same output-resolution
+        # chain as the clean-exit branch (see lines ~2176-2267, canonical copy)
+        # instead of emitting a misleading BLOCKED envelope.
+        if jq -e '.result and .is_error == false and (.terminal_reason == "completed")' \
+                "$_out_file" >/dev/null 2>&1; then
+            _claude_duration_ms=$(jq -r '.duration_ms // "unknown"' "$_out_file" 2>/dev/null)
+            log "claude_phase_timeout_salvaged" \
+                "phase=$_phase" \
+                "claude_duration_ms=$_claude_duration_ms" \
+                "wrapper_deadline_seconds=$_phase_timeout"
+            # Output resolution mirrors the clean-exit branch below exactly:
+            # 1. dispatcher-output file; 2. .result object; 3. salvage-failed BLOCKED.
+            _file_output=""
+            if _file_output=$(read_phase_output "$_skill"); then
+                printf '%s' "$_file_output"
+                return 0
+            fi
+            if jq -e '.result | type == "object"' "$_out_file" >/dev/null 2>&1; then
+                jq -c '.result' "$_out_file" 2>/dev/null || printf '{}'
+                return 0
+            fi
+            # .result is non-object (string-shaped) — fall through to BLOCKED path.
+        fi
         log "claude_phase_timeout" \
             "phase=$_phase" \
             "elapsed_seconds=$_phase_timeout"
