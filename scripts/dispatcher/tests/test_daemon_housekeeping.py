@@ -1350,3 +1350,387 @@ class TestBackfillStampsThreeTerminalRowsAndPreservesRunning:
         assert "succeeded" in statuses
         assert "failed" in statuses
         assert "crashed" in statuses
+
+
+# --------------------------------------------------------------------------
+# _housekeeping_close_orphan_prs (#3852)
+# --------------------------------------------------------------------------
+
+import json as _json  # noqa: E402 — local alias for test helpers below
+
+
+def _make_subprocess_result(stdout: str, returncode: int = 0) -> Any:
+    """Build a minimal CompletedProcess-like object for test stubs."""
+
+    class _FakeResult:
+        def __init__(self, out: str, rc: int) -> None:
+            self.stdout = out
+            self.returncode = rc
+
+    return _FakeResult(stdout, returncode)
+
+
+def _ok_outcome(stdout: str) -> dict[str, Any]:
+    return {"ok": True, "result": _make_subprocess_result(stdout), "attempts": 1}
+
+
+def _fail_outcome(reason: str = "nonzero_exit", exit_code: int = 1) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "exit_code": exit_code,
+        "stderr_tail": "some error",
+        "attempts": 3,
+    }
+
+
+_THREE_PRS = _json.dumps(
+    [
+        # PR 10: agent/ branch, all issues CLOSED → should be closed.
+        {
+            "number": 10,
+            "headRefName": "agent/foo",
+            "closingIssuesReferences": [{"number": 111, "state": "CLOSED"}],
+        },
+        # PR 20: agent/ branch, one CLOSED + one OPEN → skip (open target).
+        {
+            "number": 20,
+            "headRefName": "agent/bar",
+            "closingIssuesReferences": [
+                {"number": 222, "state": "CLOSED"},
+                {"number": 333, "state": "OPEN"},
+            ],
+        },
+        # PR 30: agent/ branch, empty closingIssuesReferences → skip (no target).
+        {
+            "number": 30,
+            "headRefName": "agent/baz",
+            "closingIssuesReferences": [],
+        },
+    ]
+)
+
+
+class TestHousekeepingCloseOrphanPRs:
+    """``_housekeeping_close_orphan_prs`` closes only ``agent/*`` PRs whose
+    every closing-issue is CLOSED, leaves all others alone (#3852)."""
+
+    def test_regression_fixture_three_prs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Three fake PRs: only the all-CLOSED one triggers ``gh pr close``."""
+        d, _conn, handler = _make_daemon_with_capture()
+
+        close_calls: list[tuple[int, list[str]]] = []
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if event_name == "orphan_pr_gc_list":
+                return _ok_outcome(_THREE_PRS)
+            if event_name == "orphan_pr_gc_close":
+                pr_num = int(cmd[cmd.index("close") + 1])
+                close_calls.append((pr_num, list(cmd)))
+                return _ok_outcome("")
+            return _fail_outcome()
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        result = d._housekeeping_close_orphan_prs()
+
+        # Only PR 10 (all-CLOSED target) should have been closed.
+        assert [c[0] for c in close_calls] == [10]
+
+        # Return dict.
+        assert result["closed"] == 1
+        assert result["scanned"] == 3
+        assert result["skipped_no_target"] == 1
+        assert result["skipped_open_target"] == 1
+        assert result["skipped_non_agent"] == 0
+
+        # Per-close log event.
+        closed_events = handler.events("orphan_pr_closed")
+        assert len(closed_events) == 1
+        assert closed_events[0].pr_number == 10
+
+        # Summary log event.
+        summary_events = handler.events("housekeeping_orphan_pr_gc")
+        assert len(summary_events) == 1
+        rec = summary_events[0]
+        assert rec.closed == 1
+        assert rec.scanned == 3
+        assert rec.run_id == "test-run-id"
+
+    def test_non_agent_branch_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PRs on non-``agent/`` branches are never closed."""
+        d, _conn, handler = _make_daemon_with_capture()
+
+        pr_data = _json.dumps(
+            [
+                {
+                    "number": 99,
+                    "headRefName": "worktree-agent-x",
+                    "closingIssuesReferences": [{"number": 555, "state": "CLOSED"}],
+                }
+            ]
+        )
+        close_calls: list[int] = []
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if event_name == "orphan_pr_gc_list":
+                return _ok_outcome(pr_data)
+            if event_name == "orphan_pr_gc_close":
+                close_calls.append(int(cmd[cmd.index("close") + 1]))
+                return _ok_outcome("")
+            return _fail_outcome()
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        result = d._housekeeping_close_orphan_prs()
+
+        assert close_calls == []
+        assert result["skipped_non_agent"] == 1
+        assert result["closed"] == 0
+
+    def test_gh_pr_list_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When ``gh pr list`` fails, helper logs and returns zero-count dict."""
+        d, _conn, handler = _make_daemon_with_capture()
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return _fail_outcome()
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        result = d._housekeeping_close_orphan_prs()
+
+        assert result == {
+            "closed": 0,
+            "scanned": 0,
+            "skipped_non_agent": 0,
+            "skipped_no_target": 0,
+            "skipped_open_target": 0,
+        }
+        failure_events = handler.events("orphan_pr_gc_list_failed")
+        assert len(failure_events) == 1
+        closed_events = handler.events("orphan_pr_closed")
+        assert closed_events == []
+
+    def test_gh_pr_close_failure_sibling_continues(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If ``gh pr close`` fails for one PR, sibling PRs are still attempted."""
+        d, _conn, handler = _make_daemon_with_capture()
+
+        # Two PRs that both qualify — close #10 fails, close #11 succeeds.
+        two_prs = _json.dumps(
+            [
+                {
+                    "number": 10,
+                    "headRefName": "agent/foo",
+                    "closingIssuesReferences": [{"number": 100, "state": "CLOSED"}],
+                },
+                {
+                    "number": 11,
+                    "headRefName": "agent/bar",
+                    "closingIssuesReferences": [{"number": 101, "state": "CLOSED"}],
+                },
+            ]
+        )
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if event_name == "orphan_pr_gc_list":
+                return _ok_outcome(two_prs)
+            if event_name == "orphan_pr_gc_close":
+                pr_num = int(cmd[cmd.index("close") + 1])
+                if pr_num == 10:
+                    return _fail_outcome()
+                return _ok_outcome("")
+            return _fail_outcome()
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        result = d._housekeeping_close_orphan_prs()
+
+        # PR 10 failed — but PR 11 still closed.
+        assert result["closed"] == 1
+        assert result["scanned"] == 2
+
+        fail_events = handler.events("orphan_pr_gc_close_failed")
+        assert len(fail_events) == 1
+        assert fail_events[0].pr_number == 10
+
+        closed_events = handler.events("orphan_pr_closed")
+        assert len(closed_events) == 1
+        assert closed_events[0].pr_number == 11
+
+    def test_close_comment_includes_target_numbers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``--comment`` passed to ``gh pr close`` cites the target issue numbers."""
+        d, _conn, _handler = _make_daemon_with_capture()
+
+        pr_data = _json.dumps(
+            [
+                {
+                    "number": 42,
+                    "headRefName": "agent/fix-thing",
+                    "closingIssuesReferences": [
+                        {"number": 77, "state": "CLOSED"},
+                        {"number": 88, "state": "CLOSED"},
+                    ],
+                }
+            ]
+        )
+        comments_seen: list[str] = []
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if event_name == "orphan_pr_gc_list":
+                return _ok_outcome(pr_data)
+            if event_name == "orphan_pr_gc_close":
+                comment_idx = cmd.index("--comment") + 1
+                comments_seen.append(cmd[comment_idx])
+                return _ok_outcome("")
+            return _fail_outcome()
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        d._housekeeping_close_orphan_prs()
+
+        assert len(comments_seen) == 1
+        comment = comments_seen[0]
+        # Comment must mention both target numbers.
+        assert "77" in comment
+        assert "88" in comment
+        assert "CLOSED" in comment
+
+    def test_delete_branch_flag_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``gh pr close`` must include ``--delete-branch`` to clean up the ref."""
+        d, _conn, _handler = _make_daemon_with_capture()
+
+        pr_data = _json.dumps(
+            [
+                {
+                    "number": 55,
+                    "headRefName": "agent/cleanup",
+                    "closingIssuesReferences": [{"number": 200, "state": "CLOSED"}],
+                }
+            ]
+        )
+        close_cmds: list[list[str]] = []
+
+        def fake_subprocess(
+            cmd: list[str],
+            *,
+            event_name: str,
+            timeout: float,
+            extra_log_fields: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            if event_name == "orphan_pr_gc_list":
+                return _ok_outcome(pr_data)
+            if event_name == "orphan_pr_gc_close":
+                close_cmds.append(list(cmd))
+                return _ok_outcome("")
+            return _fail_outcome()
+
+        monkeypatch.setattr(d, "_subprocess_with_retry", fake_subprocess)
+
+        d._housekeeping_close_orphan_prs()
+
+        assert len(close_cmds) == 1
+        assert "--delete-branch" in close_cmds[0]
+
+
+class TestHousekeepingTickWiresInOrphanPRGC:
+    """``_housekeeping_tick`` calls ``_housekeeping_close_orphan_prs`` (#3852).
+
+    Regression: an accidental decouple would silently stop GC from running
+    without any test failure in the unit-level healer tests.
+    """
+
+    def test_tick_calls_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The tick must invoke the helper exactly once per run."""
+        d, _conn, handler = _make_daemon_with_capture()
+
+        called: dict[str, int] = {"count": 0}
+
+        def fake_gc() -> dict[str, int]:
+            called["count"] += 1
+            return {
+                "closed": 0,
+                "scanned": 0,
+                "skipped_non_agent": 0,
+                "skipped_no_target": 0,
+                "skipped_open_target": 0,
+            }
+
+        monkeypatch.setattr(d, "_housekeeping_close_orphan_prs", fake_gc, raising=True)
+        monkeypatch.setattr(
+            d,
+            "_reconcile_stale_merged_at",
+            lambda: {"checked": 0, "cleared": 0, "errors": 0},
+        )
+        monkeypatch.setattr(d, "_clear_stale_agent_task_arns", lambda: 0, raising=True)
+        monkeypatch.setattr(d, "_backfill_terminal_ended_at", lambda: 0, raising=True)
+
+        d._housekeeping_tick()
+
+        assert called["count"] == 1
+        assert d._housekeeping_ticks == 1
+        assert handler.events("housekeeping_orphan_pr_gc_failed") == []
+
+    def test_tick_catches_helper_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the helper raises, the tick logs and continues; ticks counter still advances."""
+        d, conn, handler = _make_daemon_with_capture()
+
+        def boom() -> dict[str, int]:
+            raise RuntimeError("gh unavailable")
+
+        monkeypatch.setattr(d, "_housekeeping_close_orphan_prs", boom, raising=True)
+        monkeypatch.setattr(
+            d,
+            "_reconcile_stale_merged_at",
+            lambda: {"checked": 0, "cleared": 0, "errors": 0},
+        )
+        monkeypatch.setattr(d, "_clear_stale_agent_task_arns", lambda: 0, raising=True)
+        monkeypatch.setattr(d, "_backfill_terminal_ended_at", lambda: 0, raising=True)
+
+        target_count = len(daemon.DispatcherDaemon._HOUSEKEEPING_TARGETS)
+        conn.cursor_instance.fetch_queue = [None] * target_count
+
+        # Must not propagate the exception.
+        result = d._housekeeping_tick()
+
+        failure_events = handler.events("housekeeping_orphan_pr_gc_failed")
+        assert len(failure_events) == 1
+        assert "queue_snapshots" in result
+        assert d._housekeeping_ticks == 1
