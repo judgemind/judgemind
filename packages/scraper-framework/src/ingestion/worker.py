@@ -2861,13 +2861,12 @@ class IngestionWorker:
             fallback_text=ruling_text,
         )
 
-        # When a multi-ruling document produces results but every entry is
-        # missing both judge and department, the header metadata was not
+        # When a multi-ruling document produces results but >= 50% of entries
+        # are missing both judge and department, the header metadata was not
         # captured by the LLM — write a best-effort telemetry row so the
-        # failure rate is dashboard-queryable (#3559).
-        if len(converted) > 1 and all(
-            cr.judge_name is None and cr.department is None for cr in converted
-        ):
+        # failure rate is dashboard-queryable (#3559, #3722).
+        null_count = sum(1 for cr in converted if cr.judge_name is None and cr.department is None)
+        if len(converted) > 1 and null_count / len(converted) >= 0.5:
             try:
                 conn = self._get_connection()
                 with conn.cursor() as cur:
@@ -2892,6 +2891,9 @@ class IngestionWorker:
                                         "county": county,
                                         "scraper_id": event_data.get("scraper_id"),
                                         "ruling_count": len(converted),
+                                        "null_count": null_count,
+                                        "total_rulings": len(converted),
+                                        "null_ratio": null_count / len(converted),
                                     }
                                 ),
                             ),
