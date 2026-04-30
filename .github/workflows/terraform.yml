@@ -74,6 +74,27 @@ jobs:
         if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
         run: bash infra/terraform/modules/dispatcher-daemon/tests/postconditions/check.sh
 
+      # Postcondition fixture tests for the remaining ECS task-def modules
+      # (#3768, parent #2840): same defense-in-depth pattern as the dispatcher
+      # check above — verifies that the content-level postcondition fires when
+      # the rendered container_definitions JSON drops a required secret entry
+      # while its ARN variable remains non-empty.
+      - name: api-service postcondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/api-service/tests/postconditions/check.sh
+
+      - name: compute postcondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/compute/tests/postconditions/check.sh
+
+      - name: scraper-zero-record-check postcondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/scraper-zero-record-check/tests/postconditions/check.sh
+
+      - name: dispatcher-agent-runner postcondition check
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/dispatcher-agent-runner/tests/postconditions/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.

@@ -196,6 +196,62 @@ resource "aws_ecs_task_definition" "scraper" {
       }
     }
   ])
+
+  # Content-level postconditions on the rendered container_definitions
+  # JSON. Defense-in-depth against the #2840 silent-drop class of bug:
+  # an apply that produces a task-def revision without a required
+  # secret entry, despite the corresponding ARN variable being non-
+  # empty (caused by a stale data-source evaluation, provider
+  # content-hash dedup, or any other future regression that drops a
+  # `concat()` branch from the rendered JSON).
+  #
+  # These complement the variable-level preconditions above: those
+  # catch "ARN unset"; these catch "ARN set but didn't propagate to
+  # the rendered JSON". A regression test for this pattern lives in
+  # `tests/postconditions/`.
+  #
+  # `self.container_definitions` is the rendered JSON string AS
+  # PASSED TO THE AWS PROVIDER — the same content that becomes the
+  # registered task-definition revision. If the secret name is not
+  # in that string, the secret would not be injected into the
+  # container, regardless of what `var.X_secret_arn` says.
+  lifecycle {
+    postcondition {
+      condition = (
+        var.db_connection_secret_arn == "" ||
+        strcontains(self.container_definitions, "DATABASE_URL")
+      )
+      error_message = "compute/scraper: rendered container_definitions is missing DATABASE_URL despite db_connection_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.courtlistener_api_token_secret_arn == "" ||
+        strcontains(self.container_definitions, "COURTLISTENER_API_TOKEN")
+      )
+      error_message = "compute/scraper: rendered container_definitions is missing COURTLISTENER_API_TOKEN despite courtlistener_api_token_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.capsolver_api_key_secret_arn == "" ||
+        strcontains(self.container_definitions, "CAPSOLVER_API_KEY")
+      )
+      error_message = "compute/scraper: rendered container_definitions is missing CAPSOLVER_API_KEY despite capsolver_api_key_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.proxy_secret_arn == "" ||
+        strcontains(self.container_definitions, "SD_PROXY_URL")
+      )
+      error_message = "compute/scraper: rendered container_definitions is missing SD_PROXY_URL despite proxy_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.proxy_secret_arn == "" ||
+        strcontains(self.container_definitions, "SF_PROXY_URL")
+      )
+      error_message = "compute/scraper: rendered container_definitions is missing SF_PROXY_URL despite proxy_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+  }
 }
 
 # ─── SSM: terraform-managed container_definitions for deploy-scraper ────────
@@ -521,6 +577,59 @@ resource "aws_ecs_task_definition" "ingestion_worker" {
       }
     }
   ])
+
+  # Content-level postconditions on the rendered container_definitions
+  # JSON. Defense-in-depth against the #2840 silent-drop class of bug:
+  # an apply that produces a task-def revision without a required
+  # secret entry, despite the corresponding ARN variable being non-
+  # empty (caused by a stale data-source evaluation, provider
+  # content-hash dedup, or any other future regression that drops a
+  # `concat()` branch from the rendered JSON).
+  #
+  # These complement the variable-level preconditions above: those
+  # catch "ARN unset"; these catch "ARN set but didn't propagate to
+  # the rendered JSON". A regression test for this pattern lives in
+  # `tests/postconditions/`.
+  #
+  # `self.container_definitions` is the rendered JSON string AS
+  # PASSED TO THE AWS PROVIDER — the same content that becomes the
+  # registered task-definition revision. If the secret name is not
+  # in that string, the secret would not be injected into the
+  # container, regardless of what `var.X_secret_arn` says.
+  lifecycle {
+    postcondition {
+      condition     = strcontains(self.container_definitions, "DATABASE_URL")
+      error_message = "compute/ingestion-worker: rendered container_definitions is missing DATABASE_URL. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.opensearch_credentials_secret_arn == "" ||
+        strcontains(self.container_definitions, "OPENSEARCH_USERNAME")
+      )
+      error_message = "compute/ingestion-worker: rendered container_definitions is missing OPENSEARCH_USERNAME despite opensearch_credentials_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.opensearch_credentials_secret_arn == "" ||
+        strcontains(self.container_definitions, "OPENSEARCH_PASSWORD")
+      )
+      error_message = "compute/ingestion-worker: rendered container_definitions is missing OPENSEARCH_PASSWORD despite opensearch_credentials_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.anthropic_api_key_secret_arn == "" ||
+        strcontains(self.container_definitions, "ANTHROPIC_API_KEY")
+      )
+      error_message = "compute/ingestion-worker: rendered container_definitions is missing ANTHROPIC_API_KEY despite anthropic_api_key_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.google_api_key_secret_arn == "" ||
+        strcontains(self.container_definitions, "GOOGLE_API_KEY")
+      )
+      error_message = "compute/ingestion-worker: rendered container_definitions is missing GOOGLE_API_KEY despite google_api_key_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+  }
 }
 
 # ─── SSM: terraform-managed container_definitions for ingestion-worker ──────

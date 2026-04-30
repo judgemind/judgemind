@@ -597,6 +597,48 @@ resource "aws_ecs_task_definition" "agent_runner" {
       }
     }
   ])
+
+  # Content-level postconditions on the rendered container_definitions
+  # JSON. Defense-in-depth against the #2840 silent-drop class of bug:
+  # an apply that produces a task-def revision without a required
+  # secret entry, despite the corresponding ARN variable being non-
+  # empty (caused by a stale data-source evaluation, provider
+  # content-hash dedup, or any other future regression that drops a
+  # `concat()` branch from the rendered JSON).
+  #
+  # These complement the variable-level preconditions above: those
+  # catch "ARN unset"; these catch "ARN set but didn't propagate to
+  # the rendered JSON". A regression test for this pattern lives in
+  # `tests/postconditions/`.
+  #
+  # `self.container_definitions` is the rendered JSON string AS
+  # PASSED TO THE AWS PROVIDER — the same content that becomes the
+  # registered task-definition revision. If the secret name is not
+  # in that string, the secret would not be injected into the
+  # container, regardless of what `var.X_secret_arn` says.
+  lifecycle {
+    postcondition {
+      condition = (
+        var.anthropic_api_key_secret_arn == "" ||
+        strcontains(self.container_definitions, "ANTHROPIC_API_KEY")
+      )
+      error_message = "dispatcher-agent-runner: rendered container_definitions is missing ANTHROPIC_API_KEY despite anthropic_api_key_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.db_connection_secret_arn == "" ||
+        strcontains(self.container_definitions, "DATABASE_URL")
+      )
+      error_message = "dispatcher-agent-runner: rendered container_definitions is missing DATABASE_URL despite db_connection_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+    postcondition {
+      condition = (
+        var.github_token_secret_arn == "" ||
+        strcontains(self.container_definitions, "GITHUB_TOKEN")
+      )
+      error_message = "dispatcher-agent-runner: rendered container_definitions is missing GITHUB_TOKEN despite github_token_secret_arn being set. See #3764 / parent #2840 for the silent-drop bug class this guards against."
+    }
+  }
 }
 
 # ── Agent-runner error alarm (#3093) ─────────────────────────────────────────
