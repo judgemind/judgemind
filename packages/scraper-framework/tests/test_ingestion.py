@@ -6978,6 +6978,9 @@ def test_multimodal_case_number_miss_telemetry_db_error_swallowed() -> None:
     assert result is True, "DB error in telemetry write must not propagate — best-effort"
     executed_sql = [call[0][0] for call in mock_cur.execute.call_args_list]
     assert any("SAVEPOINT multimodal_case_number_miss_metric" in s for s in executed_sql)
-    assert any("ROLLBACK TO SAVEPOINT multimodal_case_number_miss_metric" in s for s in executed_sql), (
+    assert any(
+        "ROLLBACK TO SAVEPOINT multimodal_case_number_miss_metric" in s
+        for s in executed_sql
+    ), (
         "Inner except must execute ROLLBACK TO SAVEPOINT when INSERT raises (#3729)."
     )
