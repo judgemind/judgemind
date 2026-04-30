@@ -1430,6 +1430,45 @@ CREATE TRIGGER trg_parties_updated_at BEFORE UPDATE ON derived.parties FOR EACH 
 CREATE TRIGGER trg_rulings_updated_at BEFORE UPDATE ON derived.rulings FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
+CREATE OR REPLACE FUNCTION derived.rulings_block_non_active_document()
+RETURNS trigger
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    doc_status text;
+BEGIN
+    SELECT status INTO doc_status
+    FROM derived.documents
+    WHERE id = NEW.document_id;
+
+    IF doc_status IS NULL THEN
+        RAISE EXCEPTION
+            'cannot insert/update ruling: document % not found',
+            NEW.document_id
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF doc_status != 'active' THEN
+        RAISE EXCEPTION
+            'cannot insert/update ruling: document % has status %, expected active',
+            NEW.document_id,
+            doc_status
+            USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+CREATE TRIGGER trg_rulings_block_non_active_document
+    BEFORE INSERT OR UPDATE OF document_id
+    ON derived.rulings
+    FOR EACH ROW
+    EXECUTE FUNCTION derived.rulings_block_non_active_document();
+
+
 CREATE TRIGGER trg_alert_subscriptions_updated_at BEFORE UPDATE ON public.alert_subscriptions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 

@@ -2207,6 +2207,67 @@ class TestInsertRulingContentDedup:
             "UPDATE documents … superseded must have run before metric INSERT attempted."
         )
 
+    def test_supersede_uses_delete_then_update_order_regression_guard(self) -> None:
+        """Regression guard (AC#4, #3728): dedup-supersede must DELETE rulings
+        before UPDATE documents so the new trigger cannot reject an otherwise
+        valid subsequent INSERT on the winner's active document.
+
+        The DELETE-first ordering is important because after #3728 a
+        ``BEFORE INSERT OR UPDATE OF document_id`` trigger blocks inserting
+        rulings onto non-active documents.  If the code were to UPDATE the
+        loser's status to 'superseded' BEFORE deleting its rulings, a re-ingest
+        of the same document would re-try the ruling INSERT on the now-superseded
+        document and hit the trigger.  DELETE-first avoids the race.
+
+        This test verifies that the DELETE call precedes the UPDATE call in the
+        execute call list, which is the contract the trigger depends on.
+        """
+        import psycopg.errors
+
+        conn = _mock_conn()
+        cur = conn.cursor.return_value.__enter__.return_value
+        exc = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")
+
+        def side_effect_execute(sql: str, params: tuple | None = None) -> None:
+            if "INSERT INTO rulings" in sql:
+                raise exc
+
+        cur.execute = MagicMock(side_effect=side_effect_execute)
+        cur.fetchone = MagicMock(return_value=("winner-doc-id",))
+
+        insert_ruling(
+            conn,
+            document_id="losing-doc",
+            case_id="case-1",
+            court_id="court-1",
+            hearing_date=date(2026, 3, 5),
+            ruling_text="Motion GRANTED",
+            department="Dept. 1",
+        )
+
+        execute_calls = cur.execute.call_args_list
+        # Find the index of the first DELETE FROM rulings call.
+        delete_idx = next(
+            (i for i, c in enumerate(execute_calls) if "DELETE FROM rulings" in c[0][0]),
+            None,
+        )
+        # Find the index of the first UPDATE documents SET status='superseded' call.
+        update_idx = next(
+            (
+                i
+                for i, c in enumerate(execute_calls)
+                if "UPDATE documents" in c[0][0] and "superseded" in c[0][0]
+            ),
+            None,
+        )
+        assert delete_idx is not None, "DELETE FROM rulings must be called"
+        assert update_idx is not None, "UPDATE documents … superseded must be called"
+        assert delete_idx < update_idx, (
+            "DELETE FROM rulings must precede UPDATE documents SET status='superseded' "
+            "so the DB trigger does not block subsequent re-ingest of the same ruling "
+            "onto the winner's active document (#3728)."
+        )
+
 
 # ---------------------------------------------------------------------------
 # _is_all_caps_title

@@ -43,6 +43,7 @@ let courtId: string;
 let judgeId: string;
 let caseId: string;
 let rulingId: string;
+let supersededRulingId: string;
 const insertedPartyIds: string[] = [];
 const insertedDocIds: string[] = [];
 
@@ -123,6 +124,41 @@ async function seedData(): Promise<void> {
   );
   const docId3 = dRows3[0].id;
   insertedDocIds.push(docId3);
+
+  // Superseded document (#3728) — used to seed an orphan ruling for resolver
+  // filter tests. Inserted before the ruling rows so the trigger does not
+  // interfere with the active-doc rulings already seeded above.
+  const { rows: dRowsSuperseded } = await pool.query<{ id: string }>(
+    `INSERT INTO documents
+       (case_id, court_id, document_type, s3_key, s3_bucket, format, content_hash,
+        source_url, scraper_id, captured_at, hearing_date, status)
+     VALUES ($1, $2, 'ruling', 'ca/la/ca-la-test/doc-superseded.html', 'judgemind-document-archive-dev',
+             'html', 'supersededhash001', 'https://www.lacourt.ca.gov',
+             'ca-la-tentatives-civil', NOW(), '2026-02-28', 'superseded')
+     RETURNING id`,
+    [caseId, courtId],
+  );
+  const supersededDocId = dRowsSuperseded[0].id;
+  insertedDocIds.push(supersededDocId);
+
+  // Insert the orphan ruling via session_replication_role = 'replica' to bypass
+  // the trigger (the trigger is the feature under test in rulings-supersede-trigger
+  // test; here we need to pre-seed the row to verify the resolver filter).
+  await pool.query(`SET session_replication_role = 'replica'`);
+  try {
+    const { rows: srRows } = await pool.query<{ id: string }>(
+      `INSERT INTO rulings
+         (document_id, case_id, judge_id, court_id, hearing_date, outcome, motion_type,
+          is_tentative, department, ruling_text)
+       VALUES ($1, $2, $3, $4, '2026-02-28', 'granted', 'msj', true, 'Dept. 3',
+               'TENTATIVE RULING: Orphan ruling on superseded doc — must be excluded.')
+       RETURNING id`,
+      [supersededDocId, caseId, judgeId, courtId],
+    );
+    supersededRulingId = srRows[0].id;
+  } finally {
+    await pool.query(`SET session_replication_role = 'origin'`);
+  }
 
   // Ruling 1 — granted / msj / 2026-03-02
   const { rows: rRows } = await pool.query<{ id: string }>(
@@ -559,6 +595,26 @@ describe('GraphQL schema — integration', () => {
       const edges = ((body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string; hearingDate: string } }>);
       // Should contain the future ruling (2099-12-31)
       expect(edges.some((e) => e.node.hearingDate === '2099-12-31')).toBe(true);
+    });
+
+    it('rulings query excludes superseded ruling — resolver status filter (#3728)', async () => {
+      // The orphan ruling on the superseded document was inserted via the
+      // replica-role bypass in seedData(). The resolver's d.status='active'
+      // JOIN must exclude it from the GraphQL rulings list.
+      const body = await gql(
+        `query($id: ID!) {
+          rulings(courtId: $id, includeFuture: true) { edges { node { id } } }
+        }`,
+        { id: courtId },
+      );
+      expect(body.errors).toBeUndefined();
+      const edges = (
+        (body.data?.rulings as Record<string, unknown>).edges as Array<{ node: { id: string } }>
+      );
+      // The seeded rulingId (on active doc) must appear.
+      expect(edges.some((e) => e.node.id === rulingId)).toBe(true);
+      // The orphan ruling (on superseded doc) must NOT appear.
+      expect(edges.every((e) => e.node.id !== supersededRulingId)).toBe(true);
     });
 
     it('filters by motionType', async () => {

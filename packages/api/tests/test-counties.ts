@@ -93,6 +93,14 @@ export const TEST_COUNTY_REGISTRY = {
     counties: [] as const,
     courtCodes: [] as const,
   },
+
+  /**
+   * rulings-supersede-trigger.integration.test.ts — DB trigger guard (#3728)
+   */
+  rulingsSupersedeTriger: {
+    counties: ['Test Trigger County'] as const,
+    courtCodes: ['ca-trigger-test'] as const,
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

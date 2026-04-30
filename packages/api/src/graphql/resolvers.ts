@@ -435,14 +435,19 @@ export const resolvers = {
         params.push(hearingDate, id);
       }
 
-      // Only JOIN tables when their columns are used in filters
+      // Always join documents to filter by active status (#3728).
+      // Only JOIN courts/cases when their columns are used in filters.
       const needCasesJoin = caseNumber !== undefined || caseType !== undefined;
       const joins = [
+        'JOIN documents d ON d.id = r.document_id',
         county !== undefined ? 'JOIN courts ct ON ct.id = r.court_id' : '',
         needCasesJoin ? 'JOIN cases cs ON cs.id = r.case_id' : '',
       ]
         .filter(Boolean)
         .join(' ');
+
+      // Only return rulings on active documents (#3728).
+      conditions.push(`d.status = 'active'`);
 
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
       params.push(limit + 1);
