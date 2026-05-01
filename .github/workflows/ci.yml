@@ -688,6 +688,16 @@ jobs:
       - name: Verify every daemon git/gh subprocess site has retry or cold-path annotation
         if: matrix.shard == 'python'
         run: scripts/check-git-gh-retries.sh
+      # Issue #3776: every *_TIMEOUT_SECONDS constant referenced inside a
+      # phase-loop function (one that dispatches on a ``phase`` argument)
+      # must use a per-phase access form (BY_PHASE table, token embedding
+      # the phase name, or *_for_phase() helper), or carry a
+      # ``# global-by-design (#NNNN)`` annotation on its declaration.
+      # Prevents accidental uniform-across-all-phases caps when per-phase
+      # tuning is the intent.
+      - name: Verify phase-loop functions use per-phase timeout lookups
+        if: matrix.shard == 'python'
+        run: scripts/check-per-phase-timeouts.sh
       # Issue #3213: every ``subprocess.run(...)`` call site in
       # ``scripts/**/*.py`` (excluding ``scripts/**/tests/**``) must have
       # a ``timeout=`` kwarg or a ``**kwargs`` splat. An unbounded blocking
