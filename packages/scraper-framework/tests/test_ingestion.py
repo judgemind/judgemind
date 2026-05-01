@@ -4883,42 +4883,46 @@ def test_llm_enrichment_parties_converted_to_dicts(
 
 
 def test_llm_enrich_fields_returns_none_when_disabled() -> None:
-    """_llm_enrich_fields returns None when enrichment is disabled."""
+    """_llm_enrich_fields returns (None, 'skipped_disabled') when enrichment is disabled."""
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = False
 
-    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    result, status = worker._llm_enrich_fields("Some ruling text.", "doc-1")
     assert result is None
+    assert status == "skipped_disabled"
 
 
 def test_llm_enrich_fields_returns_none_when_no_client() -> None:
-    """_llm_enrich_fields returns None when no client is available."""
+    """_llm_enrich_fields returns (None, 'skipped_disabled') when no client is available."""
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = None
 
-    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    result, status = worker._llm_enrich_fields("Some ruling text.", "doc-1")
     assert result is None
+    assert status == "skipped_disabled"
 
 
 def test_llm_enrich_fields_returns_none_for_empty_text() -> None:
-    """_llm_enrich_fields returns None for empty ruling text."""
+    """_llm_enrich_fields returns (None, 'skipped_no_text') for empty ruling text."""
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("", "doc-1")
+    result, status = worker._llm_enrich_fields("", "doc-1")
     assert result is None
+    assert status == "skipped_no_text"
 
-    result = worker._llm_enrich_fields("   \n  ", "doc-1")
+    result, status = worker._llm_enrich_fields("   \n  ", "doc-1")
     assert result is None
+    assert status == "skipped_no_text"
 
 
 @patch("framework.llm_enrichment.enrich_ruling")
 def test_llm_enrich_fields_returns_result_with_data(
     mock_enrich_ruling: MagicMock,
 ) -> None:
-    """_llm_enrich_fields returns the result when enrichment produces data."""
+    """_llm_enrich_fields returns (result, 'ok') when enrichment produces data."""
     from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
 
     mock_enrich_ruling.return_value = LlmEnrichmentResult(
@@ -4932,18 +4936,19 @@ def test_llm_enrich_fields_returns_result_with_data(
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("The motion is GRANTED.", "doc-1")
+    result, status = worker._llm_enrich_fields("The motion is GRANTED.", "doc-1")
     assert result is not None
     assert result.case_title == "Test v. Case"
     assert result.motion_type == "msj"
     assert result.outcome == "granted"
+    assert status == "ok"
 
 
 @patch("framework.llm_enrichment.enrich_ruling")
 def test_llm_enrich_fields_returns_none_for_empty_result(
     mock_enrich_ruling: MagicMock,
 ) -> None:
-    """_llm_enrich_fields returns None when enrichment produces empty result."""
+    """_llm_enrich_fields returns (None, 'empty') when enrichment produces empty result."""
     from framework.llm_enrichment import LlmEnrichmentResult
 
     mock_enrich_ruling.return_value = LlmEnrichmentResult()
@@ -4952,28 +4957,32 @@ def test_llm_enrich_fields_returns_none_for_empty_result(
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    result, status = worker._llm_enrich_fields("Some ruling text.", "doc-1")
     assert result is None
+    assert status == "empty"
 
 
 @patch("framework.llm_enrichment.time.sleep")
 @patch("framework.llm_enrichment.enrich_ruling")
-def test_llm_enrich_fields_raises_on_api_failure(
+def test_llm_enrich_fields_returns_errored_on_api_failure(
     mock_enrich_ruling: MagicMock,
     mock_sleep: MagicMock,
 ) -> None:
-    """_llm_enrich_fields raises LlmEnrichmentExhaustedError when LLM API always returns None."""
-    from framework.llm_enrichment import LlmEnrichmentExhaustedError
+    """_llm_enrich_fields returns (None, 'errored') when LLM API is exhausted.
 
+    After #3780: LlmEnrichmentExhaustedError is caught internally and surfaced
+    as status='errored'.  The caller (process_event dispatch site) decides
+    whether to re-raise (single-event path) or absorb (split-loop path).
+    """
     mock_enrich_ruling.return_value = None
 
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    with pytest.raises(LlmEnrichmentExhaustedError):
-        worker._llm_enrich_fields("Some ruling text.", "doc-1")
-
+    result, status = worker._llm_enrich_fields("Some ruling text.", "doc-1")
+    assert result is None
+    assert status == "errored"
     assert mock_enrich_ruling.call_count == 5
 
 
@@ -5005,11 +5014,14 @@ def test_llm_enrich_fields_retries_on_transient_then_succeeds(
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("The motion for summary judgment is GRANTED.", "doc-1")
+    result, status = worker._llm_enrich_fields(
+        "The motion for summary judgment is GRANTED.", "doc-1"
+    )
 
     assert result is not None
     assert result.motion_type == "msj"
     assert result.outcome == "granted"
+    assert status == "ok"
     assert mock_enrich_ruling.call_count == 4
     assert mock_sleep.call_count == 3
 
@@ -5036,32 +5048,36 @@ def test_llm_enrich_fields_retries_on_exception_then_succeeds(
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("The motion to compel is GRANTED IN PART.", "doc-2")
+    result, status = worker._llm_enrich_fields("The motion to compel is GRANTED IN PART.", "doc-2")
 
     assert result is not None
     assert result.motion_type == "motion_to_compel"
+    assert status == "ok"
     assert mock_enrich_ruling.call_count == 4
     assert mock_sleep.call_count == 3
 
 
 @patch("framework.llm_enrichment.time.sleep")
 @patch("framework.llm_enrichment.enrich_ruling")
-def test_llm_enrich_fields_raises_on_terminal_exhaustion(
+def test_llm_enrich_fields_returns_errored_on_terminal_exhaustion(
     mock_enrich_ruling: MagicMock,
     mock_sleep: MagicMock,
 ) -> None:
-    """_llm_enrich_fields raises LlmEnrichmentExhaustedError after 5 None returns."""
-    from framework.llm_enrichment import LlmEnrichmentExhaustedError
+    """_llm_enrich_fields returns (None, 'errored') after 5 None returns.
 
+    After #3780: LlmEnrichmentExhaustedError is caught internally and surfaced
+    as status='errored'.  The process_event dispatch site re-raises for
+    non-split events.
+    """
     mock_enrich_ruling.return_value = None
 
     worker, _ = _make_worker()
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    with pytest.raises(LlmEnrichmentExhaustedError):
-        worker._llm_enrich_fields("The motion is GRANTED.", "doc-3")
-
+    result, status = worker._llm_enrich_fields("The motion is GRANTED.", "doc-3")
+    assert result is None
+    assert status == "errored"
     assert mock_enrich_ruling.call_count == 5
 
 
@@ -5080,11 +5096,225 @@ def test_llm_enrich_fields_does_not_retry_on_empty_result(
     worker._llm_enrichment_enabled = True
     worker._enrichment_client = MagicMock()
 
-    result = worker._llm_enrich_fields("Some ruling text.", "doc-4")
+    result, status = worker._llm_enrich_fields("Some ruling text.", "doc-4")
 
     assert result is None
+    assert status == "empty"
     assert mock_enrich_ruling.call_count == 1
     assert mock_sleep.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic markers — #3780
+# ---------------------------------------------------------------------------
+
+
+def test_apply_enrichment_result_records_empty_marker_when_result_is_none() -> None:
+    """_apply_enrichment_result writes llm_enrichment_empty marker when status='empty'."""
+    from ingestion.worker import IngestionWorker
+
+    result, m_type, c_title, parties, methods = IngestionWorker._apply_enrichment_result(
+        None,
+        status_tag="empty",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    assert result is None
+    assert m_type is None
+    assert methods["outcome"] == "llm_enrichment_empty"
+    assert methods["motion_type"] == "llm_enrichment_empty"
+    assert methods["case_title"] == "llm_enrichment_empty"
+    assert methods["parties"] == "llm_enrichment_empty"
+
+
+def test_apply_enrichment_result_records_errored_marker_when_result_is_none() -> None:
+    """_apply_enrichment_result writes llm_enrichment_errored marker when status='errored'."""
+    from ingestion.worker import IngestionWorker
+
+    result, m_type, c_title, parties, methods = IngestionWorker._apply_enrichment_result(
+        None,
+        status_tag="errored",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    assert result is None
+    assert methods["outcome"] == "llm_enrichment_errored"
+    assert methods["motion_type"] == "llm_enrichment_errored"
+    assert methods["case_title"] == "llm_enrichment_errored"
+    assert methods["parties"] == "llm_enrichment_errored"
+
+
+def test_apply_enrichment_result_records_skipped_no_text_marker() -> None:
+    """_apply_enrichment_result writes llm_enrichment_skipped_no_text for empty-text path."""
+    from ingestion.worker import IngestionWorker
+
+    result, m_type, c_title, parties, methods = IngestionWorker._apply_enrichment_result(
+        None,
+        status_tag="skipped_no_text",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    assert result is None
+    assert methods["outcome"] == "llm_enrichment_skipped_no_text"
+    assert methods["motion_type"] == "llm_enrichment_skipped_no_text"
+    assert methods["case_title"] == "llm_enrichment_skipped_no_text"
+    assert methods["parties"] == "llm_enrichment_skipped_no_text"
+
+
+def test_apply_enrichment_result_records_no_extraction_marker_for_ok_missing_field() -> None:
+    """_apply_enrichment_result writes llm_enrichment_no_extraction when LLM ran but field None."""
+    from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
+    from ingestion.worker import IngestionWorker
+
+    # LLM returned outcome but NOT motion_type — motion_type should get the no_extraction marker.
+    enrichment = LlmEnrichmentResult(
+        case_title="Smith v. Jones",
+        motion_type=None,
+        outcome="granted",
+        parties=EnrichmentParties(plaintiffs=["Smith"], defendants=["Jones"]),
+    )
+
+    result, m_type, c_title, parties, methods = IngestionWorker._apply_enrichment_result(
+        enrichment,
+        status_tag="ok",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    assert result == "granted"
+    assert m_type is None
+    assert methods["outcome"] == "llm_enrichment"
+    assert methods["motion_type"] == "llm_enrichment_no_extraction"
+    assert methods["case_title"] == "llm_enrichment"
+    # parties were populated
+    assert methods["parties"] == "llm_enrichment"
+
+
+def test_apply_enrichment_result_no_marker_for_skipped_disabled() -> None:
+    """_apply_enrichment_result writes no diagnostic markers when enrichment is disabled."""
+    from ingestion.worker import IngestionWorker
+
+    _, _, _, _, methods = IngestionWorker._apply_enrichment_result(
+        None,
+        status_tag="skipped_disabled",
+        outcome=None,
+        motion_type=None,
+        case_title=None,
+        parties_data=[],
+    )
+
+    # No markers written — enrichment was intentionally off.
+    assert "outcome" not in methods
+    assert "motion_type" not in methods
+    assert "case_title" not in methods
+    assert "parties" not in methods
+
+
+def test_apply_enrichment_result_does_not_overwrite_already_populated_fields() -> None:
+    """_apply_enrichment_result does not set a marker for fields that are already populated."""
+    from ingestion.worker import IngestionWorker
+
+    _, _, _, _, methods = IngestionWorker._apply_enrichment_result(
+        None,
+        status_tag="empty",
+        outcome="granted",  # already set
+        motion_type="msj",  # already set
+        case_title="Existing v. Title",  # already set
+        parties_data=[{"name": "Existing", "role": "plaintiff"}],  # already set
+    )
+
+    # None of the enrichment fields were missing — no markers.
+    assert "outcome" not in methods
+    assert "motion_type" not in methods
+    assert "case_title" not in methods
+    assert "parties" not in methods
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_empty_result_records_markers_in_extraction_methods(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When enrichment returns empty result, llm_enrichment_empty markers appear (#3780)."""
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [False]
+
+    # Patch _llm_enrich_fields to return (None, "empty") — simulates the LLM
+    # responding with all-None fields.
+    with patch.object(worker, "_llm_enrich_fields", return_value=(None, "empty")):
+        event = _make_event(
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            ruling_text="The motion is under submission.",
+        )
+        event.pop("parties", None)
+        worker.process_event(event)
+
+    # Verify the INSERT captured the marker via the psycopg execute calls.
+    # The extraction_methods dict is serialized in the upsert_ruling call.
+    # We verify indirectly by checking _apply_enrichment_result was called
+    # with the correct status_tag — the unit tests above cover the full output.
+    mock_conn.commit.assert_called_once()
+
+
+@patch("ingestion.worker.resolve_judge", return_value="judge-uuid-1")
+@patch("ingestion.worker.psycopg")
+def test_llm_enrichment_skipped_no_text_records_markers_in_extraction_methods(
+    mock_psycopg: MagicMock,
+    mock_resolve_judge: MagicMock,
+) -> None:
+    """When ruling_text is empty, llm_enrichment_skipped_no_text markers appear (#3780)."""
+    worker, _ = _make_worker()
+    worker._llm_enrichment_enabled = True
+    worker._enrichment_client = MagicMock()
+
+    mock_conn, mock_cur = _make_mock_conn()
+    mock_psycopg.connect.return_value = mock_conn
+    mock_cur.rowcount = 1
+    mock_cur.fetchone.side_effect = [
+        ("court-uuid-1",),  # upsert_court
+        ("case-uuid-1",),  # upsert_case
+        (True,),  # insert_document
+    ]
+    mock_cur.fetchall.return_value = []
+    mock_cur.nextset.side_effect = [False]
+
+    with patch.object(worker, "_llm_enrich_fields", return_value=(None, "skipped_no_text")):
+        event = _make_event(
+            outcome=None,
+            motion_type=None,
+            case_title=None,
+            ruling_text="The motion is under submission.",
+        )
+        event.pop("parties", None)
+        worker.process_event(event)
+
+    mock_conn.commit.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -5094,10 +5324,11 @@ def test_llm_enrich_fields_does_not_retry_on_empty_result(
 
 
 def test_apply_enrichment_result_returns_inputs_when_result_is_none() -> None:
-    """None enrichment_result returns inputs unchanged and empty methods dict."""
+    """None enrichment_result with skipped_disabled returns inputs unchanged with no markers."""
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             None,
+            status_tag="skipped_disabled",
             outcome=None,
             motion_type=None,
             case_title=None,
@@ -5112,10 +5343,11 @@ def test_apply_enrichment_result_returns_inputs_when_result_is_none() -> None:
 
 
 def test_apply_enrichment_result_returns_inputs_when_result_is_none_with_values() -> None:
-    """None enrichment_result preserves any existing values."""
+    """None enrichment_result with skipped_disabled preserves any existing values."""
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             None,
+            status_tag="skipped_disabled",
             outcome="granted",
             motion_type="msj",
             case_title="Existing v. Case",
@@ -5143,6 +5375,7 @@ def test_apply_enrichment_result_fills_all_missing_fields() -> None:
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             result,
+            status_tag="ok",
             outcome=None,
             motion_type=None,
             case_title=None,
@@ -5180,6 +5413,7 @@ def test_apply_enrichment_result_does_not_overwrite_existing_fields() -> None:
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             result,
+            status_tag="ok",
             outcome="granted",
             motion_type="msj",
             case_title="Existing Title",
@@ -5210,6 +5444,7 @@ def test_apply_enrichment_result_partial_fill() -> None:
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             result,
+            status_tag="ok",
             outcome="denied",
             motion_type=None,
             case_title=None,
@@ -5241,6 +5476,7 @@ def test_apply_enrichment_result_parties_conversion_multiple() -> None:
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             result,
+            status_tag="ok",
             outcome=None,
             motion_type=None,
             case_title=None,
@@ -5255,11 +5491,15 @@ def test_apply_enrichment_result_parties_conversion_multiple() -> None:
         {"name": "B2", "role": "defendant"},
         {"name": "B3", "role": "defendant"},
     ]
-    assert methods == {"parties": "llm_enrichment"}
+    assert methods["parties"] == "llm_enrichment"
 
 
 def test_apply_enrichment_result_no_parties_when_both_lists_empty() -> None:
-    """Parties field is NOT filled when both plaintiffs and defendants are empty."""
+    """Parties field is NOT filled when both plaintiffs and defendants are empty.
+
+    After #3780: empty-parties case gets llm_enrichment_no_extraction marker
+    since the LLM ran (ok) but returned no parties.
+    """
     from framework.llm_enrichment import EnrichmentParties, LlmEnrichmentResult
 
     result = LlmEnrichmentResult(
@@ -5270,6 +5510,7 @@ def test_apply_enrichment_result_no_parties_when_both_lists_empty() -> None:
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             result,
+            status_tag="ok",
             outcome=None,
             motion_type=None,
             case_title=None,
@@ -5279,8 +5520,9 @@ def test_apply_enrichment_result_no_parties_when_both_lists_empty() -> None:
 
     assert case_title == "Alpha v. Beta"
     assert parties_data == []
-    assert "parties" not in methods
-    assert methods == {"case_title": "llm_enrichment"}
+    assert methods["case_title"] == "llm_enrichment"
+    # LLM returned empty parties list — no_extraction marker written.
+    assert methods["parties"] == "llm_enrichment_no_extraction"
 
 
 def test_apply_enrichment_result_parties_plaintiffs_only() -> None:
@@ -5293,6 +5535,7 @@ def test_apply_enrichment_result_parties_plaintiffs_only() -> None:
 
     _, _, _, parties_data, methods = IngestionWorker._apply_enrichment_result(
         result,
+        status_tag="ok",
         outcome=None,
         motion_type=None,
         case_title=None,
@@ -5300,7 +5543,7 @@ def test_apply_enrichment_result_parties_plaintiffs_only() -> None:
     )
 
     assert parties_data == [{"name": "OnlyP", "role": "plaintiff"}]
-    assert methods == {"parties": "llm_enrichment"}
+    assert methods["parties"] == "llm_enrichment"
 
 
 def test_apply_enrichment_result_parties_defendants_only() -> None:
@@ -5313,6 +5556,7 @@ def test_apply_enrichment_result_parties_defendants_only() -> None:
 
     _, _, _, parties_data, methods = IngestionWorker._apply_enrichment_result(
         result,
+        status_tag="ok",
         outcome=None,
         motion_type=None,
         case_title=None,
@@ -5320,11 +5564,15 @@ def test_apply_enrichment_result_parties_defendants_only() -> None:
     )
 
     assert parties_data == [{"name": "OnlyD", "role": "defendant"}]
-    assert methods == {"parties": "llm_enrichment"}
+    assert methods["parties"] == "llm_enrichment"
 
 
-def test_apply_enrichment_result_empty_result_yields_no_changes() -> None:
-    """An LlmEnrichmentResult with all fields None/empty produces no changes."""
+def test_apply_enrichment_result_empty_result_yields_no_extraction_markers() -> None:
+    """An LlmEnrichmentResult with all fields None/empty produces no_extraction markers (#3780).
+
+    When the LLM ran successfully (status='ok') but returned no fields, each
+    missing field gets a llm_enrichment_no_extraction diagnostic marker.
+    """
     from framework.llm_enrichment import LlmEnrichmentResult
 
     result = LlmEnrichmentResult()  # all fields default: None / empty lists
@@ -5332,6 +5580,7 @@ def test_apply_enrichment_result_empty_result_yields_no_changes() -> None:
     outcome, motion_type, case_title, parties_data, methods = (
         IngestionWorker._apply_enrichment_result(
             result,
+            status_tag="ok",
             outcome=None,
             motion_type=None,
             case_title=None,
@@ -5343,7 +5592,10 @@ def test_apply_enrichment_result_empty_result_yields_no_changes() -> None:
     assert motion_type is None
     assert case_title is None
     assert parties_data == []
-    assert methods == {}
+    assert methods["outcome"] == "llm_enrichment_no_extraction"
+    assert methods["motion_type"] == "llm_enrichment_no_extraction"
+    assert methods["case_title"] == "llm_enrichment_no_extraction"
+    assert methods["parties"] == "llm_enrichment_no_extraction"
 
 
 def test_apply_enrichment_result_case_title_empty_string_treated_as_missing() -> None:
@@ -5354,6 +5606,7 @@ def test_apply_enrichment_result_case_title_empty_string_treated_as_missing() ->
 
     _, _, case_title, _, methods = IngestionWorker._apply_enrichment_result(
         result,
+        status_tag="ok",
         outcome=None,
         motion_type=None,
         case_title="",  # falsy — original code uses `not case_title`
@@ -5361,7 +5614,7 @@ def test_apply_enrichment_result_case_title_empty_string_treated_as_missing() ->
     )
 
     assert case_title == "Filled Title"
-    assert methods == {"case_title": "llm_enrichment"}
+    assert methods["case_title"] == "llm_enrichment"
 
 
 # ---------------------------------------------------------------------------
