@@ -7402,7 +7402,11 @@ class TestApplyLlmEnrichment:
         mock_enrich.assert_not_called()
 
     def test_skipped_when_ruling_text_empty(self) -> None:
-        """Cross-contamination guard result (None text) must not trigger enrichment."""
+        """Cross-contamination guard result (None text) must not trigger enrichment.
+
+        After #3780: skipped_no_text markers are written so we can distinguish
+        this from other failure modes in derived.rulings.extraction_methods.
+        """
         extracted = self._make_extracted(ruling_text=None)
         mock_client = MagicMock()
 
@@ -7416,9 +7420,17 @@ class TestApplyLlmEnrichment:
             )
 
         mock_enrich.assert_not_called()
+        # Diagnostic markers written for null fields — distinguishes no-text
+        # from no-client (regex-only) mode.
+        methods = extracted["extraction_methods"]
+        assert methods.get("outcome") == "llm_enrichment_skipped_no_text"
+        assert methods.get("motion_type") == "llm_enrichment_skipped_no_text"
 
     def test_skipped_when_ruling_text_whitespace(self) -> None:
-        """Whitespace-only text must not trigger enrichment."""
+        """Whitespace-only text must not trigger enrichment.
+
+        After #3780: skipped_no_text markers are written.
+        """
         extracted = self._make_extracted(ruling_text="   \n\t  ")
         mock_client = MagicMock()
 
@@ -7432,6 +7444,8 @@ class TestApplyLlmEnrichment:
             )
 
         mock_enrich.assert_not_called()
+        methods = extracted["extraction_methods"]
+        assert methods.get("outcome") == "llm_enrichment_skipped_no_text"
 
     def test_skipped_when_no_llm_client(self) -> None:
         """Regex-only mode (no client) must not attempt enrichment."""
@@ -7450,8 +7464,12 @@ class TestApplyLlmEnrichment:
         assert extracted["outcome"] is None
         assert extracted["motion_type"] is None
 
-    def test_llm_returns_empty_result_is_handled_gracefully(self) -> None:
-        """LLM returning all-None result (empty LlmEnrichmentResult) is a no-op."""
+    def test_llm_returns_empty_result_writes_empty_markers(self) -> None:
+        """LLM returning all-None result writes llm_enrichment_empty markers (#3780).
+
+        The pipeline still produces a ruling with null enrichment fields, but
+        now records diagnostic markers so we can identify this failure mode.
+        """
         extracted = self._make_extracted()
         mock_client = MagicMock()
 
@@ -7466,6 +7484,11 @@ class TestApplyLlmEnrichment:
 
         assert extracted["outcome"] is None
         assert extracted["motion_type"] is None
+        methods = extracted["extraction_methods"]
+        assert methods.get("outcome") == "llm_enrichment_empty"
+        assert methods.get("motion_type") == "llm_enrichment_empty"
+        assert methods.get("case_title") == "llm_enrichment_empty"
+        assert methods.get("parties") == "llm_enrichment_empty"
 
     def test_llm_exhausted_raises(self) -> None:
         """Terminal LLM exhaustion propagates LlmEnrichmentExhaustedError."""
@@ -7535,7 +7558,9 @@ class TestApplyLlmEnrichment:
         assert methods["outcome"] == "llm_enrichment"
         assert methods["case_title"] == "llm_enrichment"
         assert "motion_type" not in methods
-        assert "parties" not in methods
+        # parties was missing and enrichment returned no parties — diagnostic
+        # marker written so we can identify no-extraction cases (#3780).
+        assert methods["parties"] == "llm_enrichment_no_extraction"
 
     @patch("framework.llm_enrichment.time.sleep")
     @patch("framework.llm_enrichment.enrich_ruling")
@@ -7596,6 +7621,103 @@ class TestApplyLlmEnrichment:
             )
 
         assert mock_enrich_ruling.call_count == 5
+
+    # -----------------------------------------------------------------------
+    # Diagnostic markers — #3780
+    # -----------------------------------------------------------------------
+
+    def test_errored_writes_diagnostic_markers_before_raising(self) -> None:
+        """llm_enrichment_errored markers are written before ExhaustedError re-raises (#3780)."""
+        from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+
+        with patch.object(
+            reingest,
+            "enrich_ruling_with_retry",
+            side_effect=LlmEnrichmentExhaustedError("exhausted"),
+        ):
+            with pytest.raises(LlmEnrichmentExhaustedError):
+                reingest._apply_llm_enrichment(
+                    extracted,
+                    llm_client=mock_client,
+                    llm_provider="google",
+                    llm_model=None,
+                    document_id="doc-errored",
+                )
+
+        methods = extracted["extraction_methods"]
+        assert methods.get("outcome") == "llm_enrichment_errored"
+        assert methods.get("motion_type") == "llm_enrichment_errored"
+        assert methods.get("case_title") == "llm_enrichment_errored"
+        assert methods.get("parties") == "llm_enrichment_errored"
+
+    def test_no_extraction_marker_for_ok_but_field_none(self) -> None:
+        """llm_enrichment_no_extraction is written when LLM ran but field is still None (#3780)."""
+        extracted = self._make_extracted()
+        mock_client = MagicMock()
+        # Enrichment returns outcome but not motion_type.
+        enrichment = self._make_enrichment_result(outcome="granted")
+
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=enrichment):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-no-extraction",
+            )
+
+        methods = extracted["extraction_methods"]
+        assert methods.get("outcome") == "llm_enrichment"
+        assert methods.get("motion_type") == "llm_enrichment_no_extraction"
+        assert methods.get("case_title") == "llm_enrichment_no_extraction"
+        assert methods.get("parties") == "llm_enrichment_no_extraction"
+
+    def test_no_marker_for_already_populated_fields_on_empty_result(self) -> None:
+        """Populated fields do not get a diagnostic marker when enrichment returns None (#3780)."""
+        extracted = self._make_extracted(
+            outcome="granted",  # already set
+            motion_type="demurrer",  # already set
+        )
+        mock_client = MagicMock()
+
+        with patch.object(reingest, "enrich_ruling_with_retry", return_value=None):
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=mock_client,
+                llm_provider="google",
+                llm_model=None,
+                document_id="doc-no-marker",
+            )
+
+        methods = extracted["extraction_methods"]
+        # outcome and motion_type were already set — no markers for them.
+        assert "outcome" not in methods
+        assert "motion_type" not in methods
+        # case_title and parties were missing — markers written.
+        assert methods.get("case_title") == "llm_enrichment_empty"
+        assert methods.get("parties") == "llm_enrichment_empty"
+
+    def test_skipped_when_no_llm_client_writes_no_markers(self) -> None:
+        """Regex-only mode (no client) must not write diagnostic markers (#3780)."""
+        extracted = self._make_extracted()
+
+        with patch.object(reingest, "enrich_ruling_with_retry") as mock_enrich:
+            reingest._apply_llm_enrichment(
+                extracted,
+                llm_client=None,
+                llm_provider=None,
+                llm_model=None,
+                document_id="doc-no-client",
+            )
+
+        mock_enrich.assert_not_called()
+        # Regex-only mode intentionally skips enrichment — no markers.
+        methods = extracted.get("extraction_methods", {})
+        assert "outcome" not in methods
+        assert "motion_type" not in methods
 
 
 class TestReparseMultimodalCallsEnrichment:
@@ -7853,6 +7975,10 @@ class TestReparseMultimodalCallsEnrichment:
         # The pipeline still produces a ruling, just with no enrichment fields.
         assert results[0]["ruling_text"] == "Motion GRANTED."
         assert results[0]["outcome"] is None
+        # After #3780: llm_enrichment_empty marker must appear in extraction_methods.
+        methods = results[0].get("extraction_methods", {})
+        assert methods.get("outcome") == "llm_enrichment_empty"
+        assert methods.get("motion_type") == "llm_enrichment_empty"
 
     def test_enrichment_reuses_multimodal_extractor_client(self) -> None:
         """When the multimodal extractor has its own client, enrichment reuses it.

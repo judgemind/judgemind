@@ -524,11 +524,14 @@ class TestSingleEventExhaustionStillPropagates:
         worker._enrichment_client = MagicMock()
         worker._llm_enrichment_enabled = True
 
-        # Make _llm_enrich_fields raise LlmEnrichmentExhaustedError.
+        # Simulate _llm_enrich_fields returning (None, "errored") — the new
+        # signature after #3780: the helper catches LlmEnrichmentExhaustedError
+        # internally and surfaces it as a status tag.  The dispatch site then
+        # re-raises after recording the diagnostic marker.
         with patch.object(
             worker,
             "_llm_enrich_fields",
-            side_effect=LlmEnrichmentExhaustedError("exhausted"),
+            return_value=(None, "errored"),
         ):
             # Use a split event (pre-extracted, bypasses all split-detection paths)
             # with case_number set so it's not treated as a bad-split fragment.
@@ -538,6 +541,8 @@ class TestSingleEventExhaustionStillPropagates:
                 _split_index=0,
                 _split_count=1,
                 case_number="24CV00001",
+                outcome=None,
+                motion_type=None,
             )
 
             with pytest.raises(LlmEnrichmentExhaustedError):

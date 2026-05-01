@@ -2151,7 +2151,7 @@ class TestMultimodalSplitEnrichment:
         with patch.object(
             worker,
             "_llm_enrich_fields",
-            return_value=enrichment_result,
+            return_value=(enrichment_result, "ok"),
         ) as mock_enrich:
             worker.process_event(split_event)
 
@@ -2204,7 +2204,7 @@ class TestMultimodalSplitEnrichment:
             patch.object(
                 worker,
                 "_llm_enrich_fields",
-                return_value=enrichment_result,
+                return_value=(enrichment_result, "ok"),
             ),
             patch("ingestion.worker.insert_document_and_ruling") as mock_insert,
             patch(

@@ -116,6 +116,15 @@ logger = logging.getLogger(__name__)
 # enrichment stage (``_llm_enrich_fields`` → ``_apply_enrichment_result``).
 _ENRICHMENT_METHOD_TAG = "llm_enrichment"
 
+# Diagnostic markers written to extraction_methods when the LLM enrichment
+# stage runs but does NOT populate a field.  These distinguish four failure
+# modes so we can query derived.rulings.extraction_methods after deploy and
+# identify the dominant cause of null outcome/motion_type (#3780).
+_ENRICHMENT_EMPTY_TAG = "llm_enrichment_empty"
+_ENRICHMENT_NO_EXTRACTION_TAG = "llm_enrichment_no_extraction"
+_ENRICHMENT_ERRORED_TAG = "llm_enrichment_errored"
+_ENRICHMENT_SKIPPED_NO_TEXT_TAG = "llm_enrichment_skipped_no_text"
+
 # ---------------------------------------------------------------------------
 # Markdown ↔ HTML/plain text for multimodal PDF extraction
 # ---------------------------------------------------------------------------
@@ -956,7 +965,7 @@ class IngestionWorker:
         self,
         ruling_text: str,
         document_id: str,
-    ) -> object | None:
+    ) -> tuple[object | None, str]:
         """Run LLM enrichment on ruling text to extract structured fields.
 
         Calls ``enrich_ruling()`` from ``framework.llm_enrichment`` to extract
@@ -975,28 +984,49 @@ class IngestionWorker:
 
         Returns
         -------
-        LlmEnrichmentResult | None
-            The enrichment result, or ``None`` if enrichment is disabled,
-            the client is unavailable, or the LLM call failed.
+        tuple[LlmEnrichmentResult | None, str]
+            ``(result, status_tag)`` where ``status_tag`` is one of:
+
+            * ``"ok"`` — enrichment ran and returned a non-None result.
+            * ``"empty"`` — enrichment ran but the LLM returned all-None
+              fields (``enrich_ruling_with_retry`` returned ``None``).
+            * ``"errored"`` — ``LlmEnrichmentExhaustedError`` was raised;
+              ``result`` is ``None``.  The caller decides whether to re-raise
+              (single-event path) or absorb (split-loop path).
+            * ``"skipped_no_text"`` — ``ruling_text`` was empty/whitespace;
+              enrichment was never attempted.
+            * ``"skipped_disabled"`` — enrichment is disabled or the client
+              is unavailable; enrichment was never attempted.
         """
         if not self._llm_enrichment_enabled:
-            return None
+            return None, "skipped_disabled"
 
         if not self._enrichment_client:
-            return None
+            return None, "skipped_disabled"
 
         if not ruling_text or not ruling_text.strip():
-            return None
+            return None, "skipped_no_text"
 
-        from framework.llm_enrichment import enrich_ruling_with_retry
+        from framework.llm_enrichment import LlmEnrichmentExhaustedError, enrich_ruling_with_retry
 
         t0 = time.monotonic()
-        result = enrich_ruling_with_retry(
-            ruling_text,
-            provider=self._llm_provider or "google",
-            model=self._llm_model,
-            client=self._enrichment_client,
-        )
+        try:
+            result = enrich_ruling_with_retry(
+                ruling_text,
+                provider=self._llm_provider or "google",
+                model=self._llm_model,
+                client=self._enrichment_client,
+            )
+        except LlmEnrichmentExhaustedError:
+            latency_ms = round((time.monotonic() - t0) * 1000)
+            logger.warning(
+                "LLM enrichment exhausted all retries",
+                extra={
+                    "document_id": document_id,
+                    "enrichment_latency_ms": latency_ms,
+                },
+            )
+            return None, "errored"
         latency_ms = round((time.monotonic() - t0) * 1000)
 
         if result is None:
@@ -1009,7 +1039,7 @@ class IngestionWorker:
                     "enrichment_latency_ms": latency_ms,
                 },
             )
-            return None
+            return None, "empty"
 
         logger.info(
             "LLM enrichment completed",
@@ -1025,12 +1055,13 @@ class IngestionWorker:
             },
         )
 
-        return result
+        return result, "ok"
 
     @staticmethod
     def _apply_enrichment_result(
         enrichment_result: Any,
         *,
+        status_tag: str,
         outcome: str | None,
         motion_type: str | None,
         case_title: str | None,
@@ -1051,6 +1082,11 @@ class IngestionWorker:
         converts :class:`EnrichmentParties` (plaintiffs/defendants lists)
         to the ``list[dict]`` format used by the rest of the pipeline.
 
+        When enrichment ran but a field is still ``None`` after the merge,
+        a diagnostic marker is written to the returned methods dict.  This
+        enables post-deploy querying of ``derived.rulings.extraction_methods``
+        to identify the dominant failure mode for null-outcome rows (#3780).
+
         Parameters
         ----------
         enrichment_result :
@@ -1060,6 +1096,16 @@ class IngestionWorker:
             the lazy import in :meth:`_llm_enrich_fields`).  When ``None``,
             all current values are returned unchanged and the methods dict
             is empty.
+        status_tag :
+            The status tag returned by :meth:`_llm_enrich_fields`.  Controls
+            which diagnostic marker is written for fields that remain ``None``
+            after the merge:
+
+            * ``"empty"`` → ``_ENRICHMENT_EMPTY_TAG``
+            * ``"errored"`` → ``_ENRICHMENT_ERRORED_TAG``
+            * ``"skipped_no_text"`` → ``_ENRICHMENT_SKIPPED_NO_TEXT_TAG``
+            * ``"ok"`` and field still ``None`` → ``_ENRICHMENT_NO_EXTRACTION_TAG``
+            * ``"skipped_disabled"`` → no diagnostic marker (enrichment intentionally off)
         outcome, motion_type, case_title, parties_data :
             Current values to merge into.
 
@@ -1068,10 +1114,10 @@ class IngestionWorker:
         tuple
             ``(outcome, motion_type, case_title, parties_data,
             extraction_methods_entries)``.  ``extraction_methods_entries``
-            contains one entry per field the helper actually populated,
-            each mapping the field name to the enrichment method tag.
-            Fields that were left unchanged (either already set or absent
-            from the enrichment result) are NOT present.
+            contains one entry per field the helper actually populated
+            (``"llm_enrichment"``) or a diagnostic marker for fields that
+            the enrichment stage was expected to fill but left as ``None``.
+            Fields already populated before enrichment ran are NOT present.
 
         Notes
         -----
@@ -1083,18 +1129,60 @@ class IngestionWorker:
         methods: dict[str, str] = {}
         method_tag = _ENRICHMENT_METHOD_TAG
 
+        # Map status_tag to the diagnostic marker for fields that remain None.
+        # "skipped_disabled" means enrichment was intentionally off — no marker.
+        _failure_marker: str | None
+        if status_tag == "empty":
+            _failure_marker = _ENRICHMENT_EMPTY_TAG
+        elif status_tag == "errored":
+            _failure_marker = _ENRICHMENT_ERRORED_TAG
+        elif status_tag == "skipped_no_text":
+            _failure_marker = _ENRICHMENT_SKIPPED_NO_TEXT_TAG
+        elif status_tag == "ok":
+            _failure_marker = _ENRICHMENT_NO_EXTRACTION_TAG
+        else:
+            # "skipped_disabled" or any future tag — no diagnostic marker.
+            _failure_marker = None
+
+        # Enrichment did not run or was disabled — nothing to merge.
+        if enrichment_result is None and status_tag == "skipped_disabled":
+            return outcome, motion_type, case_title, parties_data, methods
+
         if enrichment_result is None:
+            # Enrichment ran but produced no result (empty / errored /
+            # skipped_no_text).  Record diagnostic markers for each field
+            # that is still None and that the enrichment gate was expected
+            # to fill.
+            if _failure_marker is not None:
+                if outcome is None:
+                    methods["outcome"] = _failure_marker
+                if motion_type is None:
+                    methods["motion_type"] = _failure_marker
+                if not case_title:
+                    methods["case_title"] = _failure_marker
+                if not parties_data:
+                    methods["parties"] = _failure_marker
             return outcome, motion_type, case_title, parties_data, methods
 
         if outcome is None and enrichment_result.outcome is not None:
             outcome = enrichment_result.outcome
             methods["outcome"] = method_tag
+        elif outcome is None and _failure_marker is not None:
+            # Enrichment ran (ok) but did not return this field.
+            methods["outcome"] = _failure_marker
+
         if motion_type is None and enrichment_result.motion_type is not None:
             motion_type = enrichment_result.motion_type
             methods["motion_type"] = method_tag
+        elif motion_type is None and _failure_marker is not None:
+            methods["motion_type"] = _failure_marker
+
         if not case_title and enrichment_result.case_title is not None:
             case_title = enrichment_result.case_title
             methods["case_title"] = method_tag
+        elif not case_title and _failure_marker is not None:
+            methods["case_title"] = _failure_marker
+
         if not parties_data and (
             enrichment_result.parties.plaintiffs or enrichment_result.parties.defendants
         ):
@@ -1106,6 +1194,8 @@ class IngestionWorker:
             for name in enrichment_result.parties.defendants:
                 parties_data.append({"name": name, "role": "defendant"})
             methods["parties"] = method_tag
+        elif not parties_data and _failure_marker is not None:
+            methods["parties"] = _failure_marker
 
         return outcome, motion_type, case_title, parties_data, methods
 
@@ -1637,7 +1727,7 @@ class IngestionWorker:
             )
             extraction_methods.setdefault("motion_type", "skipped_bad_split_fragment")
         if enrichment_fields_missing:
-            enrichment_result = self._llm_enrich_fields(ruling_text, document_id)
+            enrichment_result, enrich_status = self._llm_enrich_fields(ruling_text, document_id)
             (
                 outcome,
                 motion_type,
@@ -1646,12 +1736,20 @@ class IngestionWorker:
                 enrichment_methods,
             ) = self._apply_enrichment_result(
                 enrichment_result,
+                status_tag=enrich_status,
                 outcome=outcome,
                 motion_type=motion_type,
                 case_title=case_title,
                 parties_data=parties_data,
             )
             extraction_methods.update(enrichment_methods)
+            if enrich_status == "errored":
+                # Re-raise for non-split events so the caller's retry /
+                # dead-letter logic can act on the exhaustion.  The
+                # diagnostic marker has already been recorded above.
+                from framework.llm_enrichment import LlmEnrichmentExhaustedError
+
+                raise LlmEnrichmentExhaustedError("LLM enrichment exhausted all retries")
 
         # ------------------------------------------------------------------
         # Remaining regex fallbacks — hearing_date, judge_name, case_number,

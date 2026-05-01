@@ -1492,6 +1492,18 @@ def _apply_llm_enrichment(
 
     ruling_text = extracted.get("ruling_text")
     if not ruling_text or not ruling_text.strip():
+        # No ruling text — enrichment cannot run.  Record diagnostic markers
+        # for each field that is still missing so we can distinguish this case
+        # from a successful enrichment that returned no-extraction (#3780).
+        extraction_methods = extracted.setdefault("extraction_methods", {})
+        if not extracted.get("outcome"):
+            extraction_methods.setdefault("outcome", "llm_enrichment_skipped_no_text")
+        if not extracted.get("motion_type"):
+            extraction_methods.setdefault("motion_type", "llm_enrichment_skipped_no_text")
+        if not extracted.get("case_title"):
+            extraction_methods.setdefault("case_title", "llm_enrichment_skipped_no_text")
+        if not extracted.get("parties"):
+            extraction_methods.setdefault("parties", "llm_enrichment_skipped_no_text")
         return
 
     # Skip if all enrichment fields are already populated.
@@ -1502,33 +1514,68 @@ def _apply_llm_enrichment(
     if has_case_title and has_motion_type and has_outcome and has_parties:
         return
 
-    result = enrich_ruling_with_retry(
-        ruling_text,
-        provider=llm_provider or "google",
-        model=llm_model,
-        client=llm_client,
-    )
+    extraction_methods = extracted.setdefault("extraction_methods", {})
+
+    try:
+        result = enrich_ruling_with_retry(
+            ruling_text,
+            provider=llm_provider or "google",
+            model=llm_model,
+            client=llm_client,
+        )
+    except LlmEnrichmentExhaustedError:
+        # Terminal LLM failure — record diagnostic markers and re-raise so
+        # the caller surfaces the failure rather than committing NULL rows.
+        logger.warning(
+            "LLM enrichment exhausted all retries",
+            document_id=document_id,
+        )
+        if not has_outcome:
+            extraction_methods.setdefault("outcome", "llm_enrichment_errored")
+        if not has_motion_type:
+            extraction_methods.setdefault("motion_type", "llm_enrichment_errored")
+        if not has_case_title:
+            extraction_methods.setdefault("case_title", "llm_enrichment_errored")
+        if not has_parties:
+            extraction_methods.setdefault("parties", "llm_enrichment_errored")
+        raise
 
     if result is None:
         # LLM responded but extracted nothing (all-None fields).  Not a
-        # transient failure — leave fields unchanged.
+        # transient failure — record diagnostic markers and return.
         logger.info(
             "LLM enrichment returned empty result — no fields populated",
             document_id=document_id,
         )
+        if not has_outcome:
+            extraction_methods.setdefault("outcome", "llm_enrichment_empty")
+        if not has_motion_type:
+            extraction_methods.setdefault("motion_type", "llm_enrichment_empty")
+        if not has_case_title:
+            extraction_methods.setdefault("case_title", "llm_enrichment_empty")
+        if not has_parties:
+            extraction_methods.setdefault("parties", "llm_enrichment_empty")
         return
-
-    extraction_methods = extracted.setdefault("extraction_methods", {})
 
     if not has_outcome and result.outcome is not None:
         extracted["outcome"] = result.outcome
         extraction_methods["outcome"] = "llm_enrichment"
+    elif not has_outcome:
+        # Enrichment ran successfully but did not return this field.
+        extraction_methods.setdefault("outcome", "llm_enrichment_no_extraction")
+
     if not has_motion_type and result.motion_type is not None:
         extracted["motion_type"] = result.motion_type
         extraction_methods["motion_type"] = "llm_enrichment"
+    elif not has_motion_type:
+        extraction_methods.setdefault("motion_type", "llm_enrichment_no_extraction")
+
     if not has_case_title and result.case_title is not None:
         extracted["case_title"] = result.case_title
         extraction_methods["case_title"] = "llm_enrichment"
+    elif not has_case_title:
+        extraction_methods.setdefault("case_title", "llm_enrichment_no_extraction")
+
     if not has_parties and (result.parties.plaintiffs or result.parties.defendants):
         # Convert from EnrichmentParties to the list[dict] format used by
         # the rest of the reingest pipeline.  Matches worker.py lines
@@ -1540,6 +1587,8 @@ def _apply_llm_enrichment(
             parties_data.append({"name": name, "role": "defendant"})
         extracted["parties"] = parties_data
         extraction_methods["parties"] = "llm_enrichment"
+    elif not has_parties:
+        extraction_methods.setdefault("parties", "llm_enrichment_no_extraction")
 
     logger.info(
         "LLM enrichment applied",
