@@ -509,7 +509,7 @@ ORCHESTRATION_JOIN_TIMEOUT_SECONDS = 10
 #: from the orchestration path. Matches the 180-minute ceiling from
 #: spec §18 Risk 4a and the ``dispatcher.config.subprocess_timeout_s``
 #: seed value (10800s). Enforced via ``subprocess.run(..., timeout=...)``.
-CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60
+CLAUDE_P_SUBPROCESS_TIMEOUT_SECONDS = 180 * 60  # global-by-design (#3776)
 
 #: Character cap on the ``stderr_tail`` field attached to
 #: ``daemon.subprocess_failed`` structured events. Previously 500; raised
