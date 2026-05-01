@@ -33,6 +33,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENTRYPOINT="$REPO_ROOT/scripts/dispatcher/agent-runner-entrypoint.sh"
+# #3775: run_claude_phase, phase_to_skill, write_phase_input, read_phase_output,
+# and claude_phase_timeout_seconds_by_phase were extracted to a sourceable helper.
+# Tests that awk-extract those functions must read from HELPER, not ENTRYPOINT.
+HELPER="$(dirname "$ENTRYPOINT")/agent_runner_run_claude_phase.sh"
 FAILURES=0
 TESTS=0
 
@@ -3649,11 +3653,6 @@ for fn in db_exec db_query_one log persist_phase_output \
           read_merge_conflict_attempts \
           increment_merge_conflict_attempts \
           apply_resolved_files \
-          claude_phase_timeout_seconds_by_phase \
-          run_claude_phase \
-          write_phase_input \
-          phase_to_skill \
-          read_phase_output \
           handle_fix_conflict; do
     awk -v FN="^${fn}\\\\(\\\\)" '
         $0 ~ FN { in_fn=1 }
@@ -3662,14 +3661,28 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t41_funcs"
 done
 
+# #3775: the following 5 functions were extracted from the entrypoint to
+# the sourceable helper agent_runner_run_claude_phase.sh. Read from HELPER.
+for fn in claude_phase_timeout_seconds_by_phase \
+          run_claude_phase \
+          write_phase_input \
+          phase_to_skill \
+          read_phase_output; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$HELPER" >> "$t41_funcs"
+done
+
 # #3683: run_claude_phase wraps ``claude -p`` in
 # ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"``. Include the constant so
 # the sourced fixture doesn't fail under ``set -u``.
-grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
-# #3766: per-phase constants + DEFAULT fallback consumed by
-# claude_phase_timeout_seconds_by_phase.
-grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
-grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs"
+grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t41_funcs" || true
+# #3766/#3775: per-phase constants + DEFAULT fallback consumed by
+# claude_phase_timeout_seconds_by_phase (now in HELPER).
+grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$HELPER" >> "$t41_funcs"
+grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$HELPER" >> "$t41_funcs"
 
 # Sanity: handle_fix_conflict was extracted.
 if grep -q "^handle_fix_conflict()" "$t41_funcs"; then
@@ -4160,11 +4173,6 @@ t44_funcs="$TEST_TMP/t44-funcs.sh"
 printf 'exec 3>&1\n' > "$t44_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
-          phase_to_skill \
-          read_phase_output \
-          write_phase_input \
-          claude_phase_timeout_seconds_by_phase \
-          run_claude_phase \
           advance_phase \
           agent_runner_reaped_failure \
           handle_fix_ci; do
@@ -4175,13 +4183,27 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t44_funcs"
 done
 
+# #3775: the following 5 functions were extracted from the entrypoint to
+# the sourceable helper agent_runner_run_claude_phase.sh. Read from HELPER.
+for fn in phase_to_skill \
+          read_phase_output \
+          write_phase_input \
+          claude_phase_timeout_seconds_by_phase \
+          run_claude_phase; do
+    awk -v FN="^${fn}\\\\(\\\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$HELPER" >> "$t44_funcs"
+done
+
 # #3683: run_claude_phase wraps ``claude -p`` in ``timeout`` — include
 # the constant so the sourced fixture doesn't fail under ``set -u``.
-grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs"
-# #3766: per-phase constants + DEFAULT fallback consumed by
-# claude_phase_timeout_seconds_by_phase.
-grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs"
-grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs"
+grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t44_funcs" || true
+# #3766/#3775: per-phase constants + DEFAULT fallback consumed by
+# claude_phase_timeout_seconds_by_phase (now in HELPER).
+grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$HELPER" >> "$t44_funcs"
+grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$HELPER" >> "$t44_funcs"
 
 # Sanity: handle_fix_ci and its dependencies were extracted.
 if grep -q "^handle_fix_ci()" "$t44_funcs"; then
@@ -5674,11 +5696,6 @@ t58_funcs="$TEST_TMP/t58-funcs.sh"
 printf 'exec 3>&1\n' > "$t58_funcs"
 
 for fn in db_exec db_query_one log persist_phase_output \
-          phase_to_skill \
-          read_phase_output \
-          write_phase_input \
-          claude_phase_timeout_seconds_by_phase \
-          run_claude_phase \
           advance_phase \
           agent_runner_reaped_failure \
           transition_for; do
@@ -5689,16 +5706,30 @@ for fn in db_exec db_query_one log persist_phase_output \
     ' "$ENTRYPOINT" >> "$t58_funcs"
 done
 
+# #3775: the following 5 functions were extracted from the entrypoint to
+# the sourceable helper agent_runner_run_claude_phase.sh. Read from HELPER.
+for fn in phase_to_skill \
+          read_phase_output \
+          write_phase_input \
+          claude_phase_timeout_seconds_by_phase \
+          run_claude_phase; do
+    awk -v FN="^${fn}\\(\\)" '
+        $0 ~ FN { in_fn=1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$HELPER" >> "$t58_funcs"
+done
+
 # #3683: run_claude_phase wraps ``claude -p`` in
 # ``timeout "$CLAUDE_PHASE_TIMEOUT_SECONDS"``. Include the constant so
 # the sourced fixture doesn't fail under ``set -u``.
-grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
-# #3766: per-phase timeout constants + DEFAULT fallback consumed by
-# ``claude_phase_timeout_seconds_by_phase``. Include all of them so
-# the sourced fixture doesn't fail under ``set -u`` when the lookup
-# function falls through to one of the per-phase entries.
-grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
-grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs"
+grep '^CLAUDE_PHASE_TIMEOUT_SECONDS=' "$ENTRYPOINT" >> "$t58_funcs" || true
+# #3766/#3775: per-phase timeout constants + DEFAULT fallback consumed by
+# ``claude_phase_timeout_seconds_by_phase`` (now in HELPER). Include all
+# of them so the sourced fixture doesn't fail under ``set -u`` when the
+# lookup function falls through to one of the per-phase entries.
+grep '^CLAUDE_PHASE_TIMEOUT_[A-Z_]*_SECONDS=' "$HELPER" >> "$t58_funcs"
+grep '^DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS=' "$HELPER" >> "$t58_funcs"
 
 # Sanity: phase_to_skill maps operational.
 if grep -q "operational)" "$t58_funcs"; then

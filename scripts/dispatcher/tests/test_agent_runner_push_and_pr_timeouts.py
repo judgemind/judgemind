@@ -35,10 +35,20 @@ import re
 from pathlib import Path
 
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[1] / "agent-runner-entrypoint.sh"
+# #3775: run_claude_phase was extracted to this sourceable helper.
+_HELPER_PATH = Path(__file__).resolve().parents[1] / "agent_runner_run_claude_phase.sh"
 
 
 def _script_text() -> str:
     return _ENTRYPOINT_PATH.read_text(encoding="utf-8")
+
+
+def _helper_text() -> str:
+    """Read agent_runner_run_claude_phase.sh — contains run_claude_phase,
+    phase_to_skill, write_phase_input, read_phase_output,
+    claude_phase_timeout_seconds_by_phase, and the per-phase timeout
+    constants (#3775)."""
+    return _HELPER_PATH.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +282,8 @@ class TestTimeoutWrappersPresent:
         return _logical_lines(body, base_lineno=start_lineno + 1)
 
     def _run_claude_phase_lines(self) -> list[tuple[int, str]]:
-        text = _script_text()
+        # #3775: run_claude_phase was extracted to agent_runner_run_claude_phase.sh.
+        text = _helper_text()
         start_lineno, body = _extract_function_body(text, "run_claude_phase")
         return _logical_lines(body, base_lineno=start_lineno + 1)
 
