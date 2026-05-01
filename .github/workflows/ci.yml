@@ -778,6 +778,15 @@ jobs:
           # dedicated CI jobs. See the comment above this step for why.
           SKIP_TESTS: "scripts/tests/test_pre_push.sh"
         run: scripts/run-scripts-tests.sh
+      - name: Run all scripts/dispatcher/tests shell tests
+        if: matrix.shard == 'shell'
+        shell: bash
+        # TESTS_DIR is already plumbed by scripts/run-scripts-tests.sh and
+        # unit-tested by scripts/tests/test_scripts_tests_runner.sh.
+        # This step auto-picks up test_agent_runner_run_claude_phase.sh (#3775),
+        # test_agent_runner_hook_swap.sh (#3757), and
+        # test_ralph_output_synthesis.sh (#3782).
+        run: TESTS_DIR=scripts/dispatcher/tests scripts/run-scripts-tests.sh
 
   # ---------------------------------------------------------------
   # Dispatcher integration tests — real git/subprocess, no mocks.

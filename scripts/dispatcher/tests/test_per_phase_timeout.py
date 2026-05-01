@@ -44,11 +44,22 @@ import re
 from pathlib import Path
 
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[1] / "agent-runner-entrypoint.sh"
+_HELPER_PATH = Path(__file__).resolve().parents[1] / "agent_runner_run_claude_phase.sh"
 _PHASE_TRANSITIONS_PATH = Path(__file__).resolve().parents[1] / "phase_transitions.py"
 
 
 def _script_text() -> str:
+    """Read the entrypoint. Use _helper_text() for content moved to the helper
+    by #3775 (run_claude_phase, phase_to_skill, timeout constants, etc.)."""
     return _ENTRYPOINT_PATH.read_text(encoding="utf-8")
+
+
+def _helper_text() -> str:
+    """Read agent_runner_run_claude_phase.sh — the sourceable helper that
+    contains run_claude_phase, phase_to_skill, write_phase_input,
+    read_phase_output, claude_phase_timeout_seconds_by_phase, and the
+    per-phase timeout constants block (#3775)."""
+    return _HELPER_PATH.read_text(encoding="utf-8")
 
 
 def _phase_transitions_text() -> str:
@@ -68,31 +79,34 @@ class TestPerPhaseTimeoutTablePresent:
     function is named ``claude_phase_timeout_seconds_by_phase``."""
 
     def test_lookup_function_defined(self) -> None:
-        text = _script_text()
+        # #3775: function moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         assert "claude_phase_timeout_seconds_by_phase()" in text, (
-            "agent-runner-entrypoint.sh must define a "
+            "agent_runner_run_claude_phase.sh must define a "
             "``claude_phase_timeout_seconds_by_phase`` function so each "
             "phase can have its own ``claude -p`` timeout (#3766). Bash "
             "3.2 compat (per scripts/check-bash-compat.sh) prohibits "
             "``declare -A`` so we use a case-statement lookup — same "
-            "pattern as ``phase_to_skill``."
+            "pattern as ``phase_to_skill``. (#3775 extracted to helper.)"
         )
 
     def test_table_anchor_comment_present(self) -> None:
-        text = _script_text()
+        # #3775: constants block + anchor comment moved to the helper.
+        text = _helper_text()
         # The CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE anchor stays in the
         # comment block as a grep target — future refactors that drop
         # the per-phase semantics will trip this lint even if the
         # function itself gets renamed.
         assert "CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE" in text, (
-            "agent-runner-entrypoint.sh must keep the "
+            "agent_runner_run_claude_phase.sh must keep the "
             "``CLAUDE_PHASE_TIMEOUT_SECONDS_BY_PHASE`` name as a comment "
             "anchor so this lint catches regressions where the "
-            "per-phase semantics get silently dropped (#3766)."
+            "per-phase semantics get silently dropped (#3766, #3775)."
         )
 
     def test_default_constant_defined(self) -> None:
-        text = _script_text()
+        # #3775: constant moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # Fallback for any phase not listed in the table — keeps the
         # legacy 1800s ceiling for unknown phases.
         assert (
@@ -100,39 +114,41 @@ class TestPerPhaseTimeoutTablePresent:
             in text
         ), (
             "DEFAULT_CLAUDE_PHASE_TIMEOUT_SECONDS must be defined with default "
-            "1800s (#3766). It is the fallback for phases not listed in the "
-            "per-phase lookup table."
+            "1800s in agent_runner_run_claude_phase.sh (#3766, #3775). It is the "
+            "fallback for phases not listed in the per-phase lookup table."
         )
 
     def test_ralph_entry_at_5400(self) -> None:
-        text = _script_text()
+        # #3775: constant moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # Ralph SKILL.md describes the phase as "long-tail (~45-90 min
         # internally)" — so the cap must cover the upper bound. 5400s
         # = 90 min. Match the per-phase constant.
         assert "CLAUDE_PHASE_TIMEOUT_RALPH_SECONDS=5400" in text, (
-            "agent-runner-entrypoint.sh must map ``ralph`` → 5400s "
+            "agent_runner_run_claude_phase.sh must map ``ralph`` → 5400s "
             "(90 min, SKILL.md upper bound) via "
             "``CLAUDE_PHASE_TIMEOUT_RALPH_SECONDS=5400``. Two terminals "
             "on the post-#3761 deploy (#3641, #3638) hit the previous "
-            "1800s cap. (#3766)"
+            "1800s cap. (#3766, #3775 extracted to helper.)"
         )
 
     def test_lookup_call_in_run_claude_phase(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # The ``timeout`` invocation must source the per-phase value
         # via the lookup function. Look for the assignment near the
         # rc==124 / claude_phase_begin block.
         run_claude_idx = text.find("run_claude_phase()")
         assert run_claude_idx > 0, (
-            "Could not locate run_claude_phase() — entrypoint structure "
-            "drifted. (#3766)"
+            "Could not locate run_claude_phase() in agent_runner_run_claude_phase.sh"
+            " — helper structure drifted. (#3766, #3775)"
         )
         # The lookup call must appear inside run_claude_phase before the
         # timeout invocation.
         # Find the function body up to the next top-level function
         # definition (a heuristic that matches the file's existing
         # structure).
-        next_func = text.find("\nhandle_scheduled_skill()", run_claude_idx)
+        next_func = text.find("\nclaude_phase_timeout_seconds_by_phase()", run_claude_idx)
         body = (
             text[run_claude_idx:next_func] if next_func > 0 else text[run_claude_idx:]
         )
@@ -140,7 +156,7 @@ class TestPerPhaseTimeoutTablePresent:
             "run_claude_phase must call ``claude_phase_timeout_seconds_by_phase`` "
             "to look up the per-phase timeout (#3766). Hard-coded "
             "``$CLAUDE_PHASE_TIMEOUT_SECONDS`` would defeat the per-phase "
-            "fix and re-introduce the 30-min cap on ralph."
+            "fix and re-introduce the 30-min cap on ralph. (#3775 extracted to helper.)"
         )
 
     def test_known_phases_present_in_lookup(self) -> None:
@@ -149,7 +165,8 @@ class TestPerPhaseTimeoutTablePresent:
         # silent-drop case where a future PR adds a phase but forgets
         # the timeout entry — without an arm, the phase falls through
         # to the ``*)`` default which uses the legacy 1800s ceiling.
-        text = _script_text()
+        # #3775: constants block moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         for phase in (
             "planning",
             "ralph",
@@ -164,9 +181,9 @@ class TestPerPhaseTimeoutTablePresent:
             # a more specific anchor.
             phase_const = f"CLAUDE_PHASE_TIMEOUT_{phase.upper()}_SECONDS"
             assert phase_const in text, (
-                f"agent-runner-entrypoint.sh must define "
+                f"agent_runner_run_claude_phase.sh must define "
                 f"``{phase_const}`` so the per-phase cap is documented "
-                f"and the lookup case-arm has a concrete fallback (#3766)."
+                f"and the lookup case-arm has a concrete fallback (#3766, #3775)."
             )
 
 
@@ -178,21 +195,23 @@ class TestPerPhaseOverrideEnvVars:
     authoritative default."""
 
     def test_ralph_override_env_var_present(self) -> None:
-        text = _script_text()
+        # #3775: lookup function moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         assert "AGENT_RUNNER_RALPH_TIMEOUT_OVERRIDE_SECONDS" in text, (
-            "agent-runner-entrypoint.sh must accept "
+            "agent_runner_run_claude_phase.sh must accept "
             "``AGENT_RUNNER_RALPH_TIMEOUT_OVERRIDE_SECONDS`` so tests can "
-            "drive the ralph timeout to ~1s deterministically (#3766)."
+            "drive the ralph timeout to ~1s deterministically (#3766, #3775)."
         )
 
     def test_fix_ci_override_env_var_present(self) -> None:
         # fix_ci is the next-most-likely phase to hit a long-tail timeout
         # (claude reading 100MB CI logs). Override hook needed for parity.
-        text = _script_text()
+        # #3775: lookup function moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         assert "AGENT_RUNNER_FIX_CI_TIMEOUT_OVERRIDE_SECONDS" in text, (
-            "agent-runner-entrypoint.sh must accept "
+            "agent_runner_run_claude_phase.sh must accept "
             "``AGENT_RUNNER_FIX_CI_TIMEOUT_OVERRIDE_SECONDS`` so tests "
-            "can drive the fix_ci timeout deterministically (#3766)."
+            "can drive the fix_ci timeout deterministically (#3766, #3775)."
         )
 
 
@@ -209,7 +228,8 @@ class TestTimeoutBlockedEnvelopeBranch:
     ``ralph_not_ship`` shape with empty stdout/stderr)."""
 
     def test_rc_124_emits_blocked_envelope(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # The new branch must build a JSON envelope that includes
         # both ``"verdict": "BLOCKED"`` and
         # ``"category": "claude_phase_timeout"``. Use a relaxed regex
@@ -232,11 +252,12 @@ class TestTimeoutBlockedEnvelopeBranch:
             "rc==124 branch must emit a structured envelope co-locating "
             "``verdict=BLOCKED`` and ``category=claude_phase_timeout`` so the "
             "diagnoser sees the timeout as a distinct category, not "
-            "``ralph_not_ship`` (#3766)."
+            "``ralph_not_ship`` (#3766, #3775 extracted to helper)."
         )
 
     def test_rc_124_branch_short_circuits_output_resolution(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # Anchor on the BLOCKED envelope construction, not the bare rc==124
         # condition — the salvage prelude (#3832) introduces an additional
         # ``read_phase_output`` call between rc==124 and this block, so the
@@ -248,7 +269,7 @@ class TestTimeoutBlockedEnvelopeBranch:
         assert blocked_match is not None, (
             "Could not find BLOCKED envelope construction "
             "``_timeout_output=$(jq -n -c`` in run_claude_phase. "
-            "Expected inside the rc==124 branch (#3766, #3832)."
+            "Expected inside the rc==124 branch (#3766, #3832, #3775)."
         )
         blocked_idx = blocked_match.start()
         # The first ``read_phase_output`` AFTER the BLOCKED construction is
@@ -257,7 +278,7 @@ class TestTimeoutBlockedEnvelopeBranch:
         rpo_idx = text.find("if _file_output=$(read_phase_output", blocked_idx)
         assert rpo_idx > blocked_idx, (
             "Could not locate read_phase_output after the BLOCKED envelope "
-            "construction in run_claude_phase. (#3766)"
+            "construction in run_claude_phase. (#3766, #3775)"
         )
         between = text[blocked_idx:rpo_idx]
         # The branch must print the JSON envelope (so the caller
@@ -265,12 +286,12 @@ class TestTimeoutBlockedEnvelopeBranch:
         # cleanly without overwriting the envelope).
         assert "printf" in between, (
             "rc==124 BLOCKED branch must ``printf`` the structured envelope "
-            "to stdout before falling through to ``read_phase_output`` (#3766)."
+            "to stdout before falling through to ``read_phase_output`` (#3766, #3775)."
         )
         assert "return 0" in between, (
             "rc==124 BLOCKED branch must ``return 0`` after printing the "
             "envelope so the existing output-resolution path doesn't "
-            "overwrite it with ``ralph_done_marker_missing`` (#3766)."
+            "overwrite it with ``ralph_done_marker_missing`` (#3766, #3775)."
         )
 
     def test_rc_124_envelope_carries_elapsed_seconds(self) -> None:
@@ -282,12 +303,13 @@ class TestTimeoutBlockedEnvelopeBranch:
         # the BLOCKED block, so using the bare rc==124 condition as anchor
         # would yield a ``between`` slice that doesn't contain the BLOCKED
         # ``elapsed_seconds`` field.
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         blocked_match = re.search(r'_timeout_output=\$\(jq -n -c', text)
         assert blocked_match is not None, (
             "Could not find BLOCKED envelope construction "
             "``_timeout_output=$(jq -n -c`` — expected in the rc==124 "
-            "branch of run_claude_phase (#3766, #3832)."
+            "branch of run_claude_phase (#3766, #3832, #3775)."
         )
         blocked_idx = blocked_match.start()
         rpo_idx = text.find("if _file_output=$(read_phase_output", blocked_idx)
@@ -295,7 +317,7 @@ class TestTimeoutBlockedEnvelopeBranch:
         assert "elapsed_seconds" in between, (
             "rc==124 BLOCKED envelope must carry ``elapsed_seconds`` so the "
             "diagnoser can decide whether to bump the per-phase cap or "
-            "investigate (#3766)."
+            "investigate (#3766, #3775)."
         )
 
 
@@ -343,7 +365,8 @@ class TestClaudePhaseTimeoutSalvage:
     of emitting a BLOCKED envelope (#3832)."""
 
     def test_salvage_check_present_in_rc_124_branch(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # Both sentinel field checks must be present near the rc==124 branch.
         assert "is_error == false" in text, (
             "Salvage prelude must check ``.is_error == false`` to confirm "
@@ -362,32 +385,34 @@ class TestClaudePhaseTimeoutSalvage:
         rc124_idx = rc124_match.start()
         blocked_idx = text.find("_timeout_output=$(jq -n -c", rc124_idx)
         assert blocked_idx > rc124_idx, (
-            "Could not find BLOCKED envelope construction after rc==124 (#3832)."
+            "Could not find BLOCKED envelope construction after rc==124 (#3832, #3775)."
         )
         between = text[rc124_idx:blocked_idx]
         assert "is_error == false" in between, (
             "``is_error == false`` check must appear inside the rc==124 branch "
-            "BEFORE the BLOCKED envelope construction (#3832)."
+            "BEFORE the BLOCKED envelope construction (#3832, #3775)."
         )
         assert 'terminal_reason == "completed"' in between, (
             "``terminal_reason == \"completed\"`` check must appear inside the "
-            "rc==124 branch BEFORE the BLOCKED envelope construction (#3832)."
+            "rc==124 branch BEFORE the BLOCKED envelope construction (#3832, #3775)."
         )
 
     def test_salvage_logs_distinct_event(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         assert "claude_phase_timeout_salvaged" in text, (
             "Salvage prelude must emit a distinct ``claude_phase_timeout_salvaged`` "
             "log event so operators can dashboard the false-positive rate "
-            "separately from real timeouts (#3832)."
+            "separately from real timeouts (#3832, #3775)."
         )
 
     def test_salvage_event_carries_required_fields(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # Find the salvage log call and verify all required arg keys are present.
         salvage_log_idx = text.find('"claude_phase_timeout_salvaged"')
         assert salvage_log_idx >= 0, (
-            "Could not find ``claude_phase_timeout_salvaged`` log call (#3832)."
+            "Could not find ``claude_phase_timeout_salvaged`` log call (#3832, #3775)."
         )
         # Look at the next 300 chars after the event name for the arg keys.
         call_region = text[salvage_log_idx : salvage_log_idx + 300]
@@ -404,7 +429,8 @@ class TestClaudePhaseTimeoutSalvage:
         )
 
     def test_salvage_routes_through_phase_output_resolution(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # The salvage block must call read_phase_output "$_skill" so it
         # reaches the same dispatcher-output file resolution path as the
         # clean-exit branch.
@@ -417,11 +443,12 @@ class TestClaudePhaseTimeoutSalvage:
         assert 'read_phase_output "$_skill"' in salvage_region, (
             "Salvage prelude must call ``read_phase_output \"$_skill\"`` so "
             "dispatcher-output files written by the skill are picked up on "
-            "the salvage path, exactly as the clean-exit branch does (#3832)."
+            "the salvage path, exactly as the clean-exit branch does (#3832, #3775)."
         )
 
     def test_blocked_envelope_still_emitted_when_no_salvage(self) -> None:
-        text = _script_text()
+        # #3775: run_claude_phase moved to agent_runner_run_claude_phase.sh helper.
+        text = _helper_text()
         # The BLOCKED envelope construction must still be present so that
         # genuine mid-iteration timeouts (no completed envelope) continue
         # to produce a structured BLOCKED verdict.
@@ -429,10 +456,10 @@ class TestClaudePhaseTimeoutSalvage:
             "BLOCKED envelope construction ``_timeout_output=$(jq -n -c`` "
             "must still be present — genuine timeouts must still emit a "
             "structured BLOCKED verdict even after the salvage prelude is "
-            "added (#3832)."
+            "added (#3832, #3775)."
         )
         assert 'category="claude_phase_timeout"' in text or \
                'category: "claude_phase_timeout"' in text, (
             "BLOCKED envelope must still carry ``category=\"claude_phase_timeout\"`` "
-            "so the diagnoser routes genuine timeouts correctly (#3832)."
+            "so the diagnoser routes genuine timeouts correctly (#3832, #3775)."
         )
