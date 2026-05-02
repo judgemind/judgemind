@@ -189,6 +189,52 @@ class TestSanBernardino:
 
 
 # ---------------------------------------------------------------------------
+# Orange County — leading-zero strip
+# ---------------------------------------------------------------------------
+
+
+class TestOrangeCounty:
+    """Strip leading zeros from letter+number Orange County department codes.
+
+    Canonical form is unpadded (W08 -> W8, H01 -> H1).  Consistent with the
+    Riverside leading-zero-strip pattern for numeric-only departments.
+
+    See: https://github.com/judgemind/judgemind/issues/3968
+    """
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("W08", "W8"),
+            ("W8", "W8"),  # idempotent
+            ("H01", "H1"),
+            ("H001", "H1"),
+            ("C03", "C3"),
+            ("H012", "H12"),  # multi-digit suffix preserved
+            ("L0612", "L612"),
+            ("CX02", "CX2"),
+            ("CM01", "CM1"),
+        ],
+    )
+    def test_leading_zero_stripped(self, raw: str, expected: str) -> None:
+        assert normalize_department("Orange", raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "L10",  # no leading zero — unchanged
+            "L11",
+            "W5",
+            "L611",
+            "H0",  # letter+zero only, no significant digit — unchanged
+            "C44",
+        ],
+    )
+    def test_no_leading_zero_unchanged(self, raw: str) -> None:
+        assert normalize_department("Orange", raw) == raw
+
+
+# ---------------------------------------------------------------------------
 # Other counties — passthrough
 # ---------------------------------------------------------------------------
 
@@ -199,7 +245,8 @@ class TestOtherCounties:
     @pytest.mark.parametrize(
         "county",
         [
-            "Orange",
+            # Orange is no longer pure passthrough — it has a leading-zero
+            # strip rule; see TestOrangeCounty below.
             "San Diego",
             "Fresno",
             "Ventura",
@@ -214,6 +261,7 @@ class TestOtherCounties:
         assert normalize_department(county, "14") == "14"
 
     def test_whitespace_stripped(self) -> None:
+        # C25 has no leading zeros so it survives Orange's leading-zero strip.
         assert normalize_department("Orange", "  C25  ") == "C25"
 
 
@@ -327,16 +375,16 @@ class TestAlphanumericDepartmentCodes:
             "N1",
             "N15",
             "C44",
-            "CM01",
+            # CM01 and CX02 are now actively normalized to CM1/CX2 by the
+            # Orange leading-zero strip rule — removed from passthrough list.
             "CM7",
-            "CX02",
             "W5",
             "L10",
         ],
     )
     def test_orange_alphanumeric_passthrough(self, raw: str) -> None:
-        """Orange uses alphanumeric codes (CX*, CM*, N*, W*, L*, C*) — all
-        must pass through."""
+        """Orange uses alphanumeric codes (CX*, CM*, N*, W*, L*, C*) — codes
+        without leading zeros must pass through unchanged."""
         assert normalize_department("Orange", raw) == raw
 
 

@@ -12,6 +12,8 @@ Rules by county:
 * **Riverside** — strip leading zeros from purely numeric departments.
 * **San Bernardino** — strip hyphens from letter+number codes
   (``S-17`` -> ``S17``).
+* **Orange** — strip leading zeros from letter+number codes
+  (``W08`` -> ``W8``, ``H01`` -> ``H1``).
 * All other counties — pass through unchanged (after whitespace strip).
 
 Called by the ingestion worker before DB writes so both scraper-provided
@@ -68,6 +70,15 @@ _LA_LB_COURTHOUSE_NAMES: frozenset[str] = frozenset({"long beach courthouse", "l
 # Hyphen between letter and number: "S-17" -> "S17", "R-14" -> "R14".
 _SB_HYPHEN_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
 
+# ---------------------------------------------------------------------------
+# Orange
+# ---------------------------------------------------------------------------
+
+# Leading zeros after a letter prefix: "W08" -> "W8", "H001" -> "H1".
+# Anchored at start; replaces LETTERS+ZEROS+SIGNIFICANT_DIGIT prefix with
+# LETTERS+SIGNIFICANT_DIGIT, leaving trailing characters intact.
+_OC_LEADING_ZERO_RE = re.compile(r"^([A-Z]+)0+([1-9])")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -114,6 +125,8 @@ def normalize_department(
         dept = _normalize_riverside(dept)
     elif county_lower == "san bernardino":
         dept = _normalize_san_bernardino(dept)
+    elif county_lower == "orange":
+        dept = _normalize_orange(dept)
 
     return dept if dept else None
 
@@ -175,3 +188,13 @@ def _normalize_san_bernardino(dept: str) -> str:
     if m:
         return f"{m.group(1)}{m.group(2)}"
     return dept
+
+
+def _normalize_orange(dept: str) -> str:
+    """Normalize an Orange County department name.
+
+    Strips leading zeros from letter+number codes (``W08`` -> ``W8``,
+    ``H001`` -> ``H1``).  Trailing characters after the significant digit
+    are preserved (``H012`` -> ``H12``, ``L0612`` -> ``L612``).
+    """
+    return _OC_LEADING_ZERO_RE.sub(r"\1\2", dept)
