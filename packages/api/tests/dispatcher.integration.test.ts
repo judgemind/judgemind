@@ -911,6 +911,48 @@ describe('queueReady — SQL predicate functions contract (#3001)', () => {
     expect(queueDepth).toBe(0);
     expect(queueReady).toHaveLength(0);
   });
+
+  it('migration 57: succeeded+merged_at=NULL blocks re-claim; succeeded+merged_at=now() does not (#3738)', async () => {
+    // Pins migration 57's merged-aware gate against revert.
+    // A succeeded row with merged_at IS NULL must still block (function
+    // returns TRUE). Once merged_at is stamped the row must no longer
+    // block (function returns FALSE).
+    const ISSUE_M57 = 57001;
+
+    // Seed a succeeded row with merged_at NULL.
+    const { rows: seedRows } = await pool.query<{ agent_id: string }>(
+      `INSERT INTO dispatcher.agents (issue_number, worktree_path, phase, status, started_at, merged_at)
+       VALUES ($1, $2, 'push_and_pr', 'succeeded', now() - interval '1 hour', NULL)
+       RETURNING agent_id`,
+      [ISSUE_M57, `/tmp/${MARKER}/agent-m57`],
+    );
+    const agentIdM57 = seedRows[0].agent_id;
+    insertedAgentIds.push(agentIdM57);
+
+    // succeeded + merged_at IS NULL → function must return TRUE (still blocking).
+    const { rows: rowsBlocking } = await pool.query<{ result: boolean }>(
+      `SELECT dispatcher.issue_has_active_agent($1) AS result`,
+      [ISSUE_M57],
+    );
+    expect(rowsBlocking[0].result).toBe(true);
+
+    // Stamp merged_at = now() on the row.
+    await pool.query(
+      `UPDATE dispatcher.agents SET merged_at = now() WHERE agent_id = $1`,
+      [agentIdM57],
+    );
+
+    // succeeded + merged_at IS NOT NULL → function must return FALSE (re-claimable).
+    const { rows: rowsNotBlocking } = await pool.query<{ result: boolean }>(
+      `SELECT dispatcher.issue_has_active_agent($1) AS result`,
+      [ISSUE_M57],
+    );
+    expect(rowsNotBlocking[0].result).toBe(false);
+
+    // Cleanup.
+    await pool.query(`DELETE FROM dispatcher.agents WHERE agent_id = $1`, [agentIdM57]);
+    insertedAgentIds.splice(insertedAgentIds.indexOf(agentIdM57), 1);
+  });
 });
 
 // ---------------------------------------------------------------------------
