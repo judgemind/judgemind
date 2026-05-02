@@ -26,7 +26,7 @@ The single long-lived process for dispatcher-v3. Each tick (default 30s):
    ``outcome_summary`` itself; the launcher only writes a fallback
    sentinel if it's still null (so the watch query stops matching).
    STOPPED-non-zero / OOM / spot-reclaim → set ``status='needs_review'``
-   and emit a TODO marker for the C6 Telegram alert.
+   and fire a Telegram alert via ``_mark_agent_needs_review`` (#3883).
 5. **Recover partial claims** — rows with ``status='claiming'`` and
    ``task_arn IS NULL`` that have aged past
    :data:`PARTIAL_CLAIM_RECOVERY_AGE_SECONDS` are marked ``failed``
@@ -86,6 +86,9 @@ import subprocess
 import sys
 import time
 from typing import Any, Callable, Optional
+
+from dispatcher_v3 import telegram
+from dispatcher_v3.breaker import BreakerEvaluator
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -234,6 +237,18 @@ log = logging.getLogger("dispatcher_v3.launcher")
 # ---------------------------------------------------------------------------
 
 
+def _default_telegram_alerter(message: str, *, trigger: str, run_id: str) -> None:
+    """Default Telegram alert hook — wraps :func:`telegram.send_alert`.
+
+    Discards the ``(returncode, event_name)`` tuple — best-effort by
+    design, the helper itself logs a structured event regardless of
+    outcome. Tests inject a recorder via the :class:`Launcher`
+    ``telegram_alerter`` constructor arg to assert call counts +
+    arguments without spinning up the subprocess seam.
+    """
+    telegram.send_alert(message=message, trigger=trigger, run_id=run_id)
+
+
 def _check_issue_author_trusted(
     issue_number: int,
     *,
@@ -304,6 +319,8 @@ class Launcher:
         subprocess_runner: Callable[..., subprocess.CompletedProcess[str]]
         | None = None,
         trust_checker: Callable[[int], bool] | None = None,
+        breaker: BreakerEvaluator | None = None,
+        telegram_alerter: Callable[..., None] | None = None,
     ) -> None:
         self._run_id = run_id
         self._github_repo = github_repo
@@ -325,6 +342,21 @@ class Launcher:
         self._subprocess_runner = subprocess_runner or subprocess.run
         self._trust_checker = trust_checker or (
             lambda n: _check_issue_author_trusted(n, runner=self._subprocess_runner)
+        )
+        # Telegram-alert seam: tests inject a recorder; production wraps
+        # the module-level :func:`telegram.send_alert` via the default
+        # below. The launcher's two outbound trigger sites
+        # (``_mark_agent_needs_review`` and the breaker eval) both pipe
+        # through this hook so a single test fake captures both.
+        self._telegram_alerter = telegram_alerter or _default_telegram_alerter
+        # Breaker is constructed lazily so a launcher built without a
+        # connection (early in :class:`Launcher.__init__`-only tests)
+        # doesn't crash. When ``conn`` is None the breaker is unused —
+        # the watch-loop short-circuits before reaching it.
+        self._breaker = breaker or BreakerEvaluator(
+            conn=conn,
+            run_id=run_id,
+            telegram_alerter=self._telegram_alerter,
         )
 
     # -- public tick API ---------------------------------------------------
@@ -356,10 +388,38 @@ class Launcher:
         summary["diagnosers_watched"] = d_watched
         summary["diagnoser_transitions"] = d_transitions
         summary["recovered"] = self._recover_partial_claims()
+        # Breaker auto-close runs BEFORE the claim step so a freshly-
+        # closed breaker (operator reflip + or time-based eligibility)
+        # restores the cap on the same tick the launcher then consults
+        # ``concurrency_cap_v3`` for claiming.
+        summary["breaker_auto_closed"] = self._maybe_auto_close_breaker()
         claims, skipped = self._claim_if_cap_allows()
         summary["claims"] = claims
         summary["claim_skipped"] = skipped
         return summary
+
+    # -- breaker auto-close hop -------------------------------------------
+
+    def _maybe_auto_close_breaker(self) -> bool:
+        """Delegate to :meth:`BreakerEvaluator.maybe_auto_close`.
+
+        Wrapped on the launcher so the tick step has a stable name and
+        so test fakes can override the breaker entirely (constructor
+        arg ``breaker=...``) without monkey-patching an attribute.
+        """
+        if self._conn is None:
+            return False
+        try:
+            return self._breaker.maybe_auto_close()
+        except Exception:
+            log.exception(
+                "launcher.breaker_auto_close_failed",
+                extra={
+                    "event": "breaker_auto_close_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            return False
 
     def run_forever(
         self, *, tick_interval: int = DEFAULT_TICK_INTERVAL_SECONDS
@@ -1176,6 +1236,22 @@ class Launcher:
         # transition (the row is already terminal in the DB).
         if issue_number:
             self._gh_remove_labels(issue_number, [LABEL_STATUS_IN_PROGRESS])
+        # Feed the v3 circuit breaker (#3883). Append the outcome row
+        # and evaluate the rolling window. A breaker failure here is
+        # logged but does not block the terminal transition — the
+        # row is already updated in the DB by this point.
+        try:
+            self._breaker.record_and_evaluate(agent_id=agent_id, status=status)
+        except Exception:
+            log.exception(
+                "launcher.breaker_eval_failed",
+                extra={
+                    "event": "breaker_eval_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "status": status,
+                },
+            )
 
     # -- step 3b: diagnoser invocation (issue #3882, spec §4.2) -----------
 
@@ -1459,8 +1535,8 @@ class Launcher:
                 # STOPPED-non-zero: bump agent to needs_review. The
                 # operator inspects from the cockpit; the per-issue
                 # claim budget governs whether a future ready-flip
-                # re-claims the issue. TODO(#3883 — C6): emit a
-                # Telegram alert here once the C6 wiring lands.
+                # re-claims the issue. The Telegram alert is now
+                # emitted inside ``_mark_agent_needs_review`` (#3883).
                 self._mark_agent_needs_review(
                     agent_id=str(agent_id),
                     diagnoser_exit_code=exit_code,
@@ -1522,9 +1598,19 @@ class Launcher:
         Per spec §4.2 the next claim of the same issue bypasses the
         diagnoser entirely on its first failure — there's no recursion;
         the per-issue claim budget is what governs further attempts.
+
+        Also fires a Telegram alert (#3883) so the operator sees the
+        needs_review transition without polling the cockpit. The DB
+        write above is the authoritative state; the alert is the
+        human notification, best-effort and logged separately on
+        failure.
         """
         if self._conn is None:
             return
+        # Look up the issue number FIRST so the Telegram message can
+        # name the issue even if the UPDATE below fails. The lookup
+        # is best-effort — fall through to a 0 sentinel.
+        issue_number = self._lookup_issue_number(agent_id)
         # Build a compact summary string. Truncate the raw stoppedReason
         # so we don't blow past TEXT-column display widths in the cockpit.
         reason_tail = (diagnoser_exit_reason or "").strip()[:160]
@@ -1561,10 +1647,51 @@ class Launcher:
                 "diagnoser_exit_code": diagnoser_exit_code,
             },
         )
-        # TODO(#3883 — C6): once the Telegram-alert helper lands, emit
-        # an alert here so the operator sees the needs_review transition
-        # without polling the cockpit. The DB write above is the
-        # authoritative state; the alert is the human notification.
+        # Fire the Telegram alert (#3883 fills the prior C5 TODO marker).
+        # Best-effort — a Telegram outage / config gap is logged inside
+        # the helper; the DB transition is the authoritative state.
+        try:
+            self._telegram_alerter(
+                telegram.render_needs_review(
+                    issue_number=issue_number,
+                    agent_id=agent_id,
+                    diagnoser_exit_code=diagnoser_exit_code,
+                    diagnoser_exit_reason=diagnoser_exit_reason,
+                ),
+                trigger="needs_review",
+                run_id=self._run_id,
+            )
+        except Exception:
+            log.exception(
+                "launcher.needs_review_telegram_failed",
+                extra={
+                    "event": "needs_review_telegram_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+
+    def _lookup_issue_number(self, agent_id: str) -> int:
+        """Fetch the agent row's ``issue_number`` (0 sentinel on miss/error)."""
+        if self._conn is None:
+            return 0
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT issue_number FROM dispatcher.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._safe_rollback()
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
 
     # -- step 4: watch in-flight diagnosers --------------------------------
     # (defined above as part of step 3b's diagnoser-invocation block —
