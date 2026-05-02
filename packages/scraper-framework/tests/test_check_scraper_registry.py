@@ -75,7 +75,6 @@ class TestFindScraperModules:
         """Helper modules without default_config are not included."""
         modules = check_registry.find_scraper_modules(COURTS_DIR)
         excluded = [
-            "courts.ca.example",
             "courts.ca.pdf_link_scraper",
             "courts.ca.la_dept_judges",
             "courts.ca.riverside_dept_judges",
