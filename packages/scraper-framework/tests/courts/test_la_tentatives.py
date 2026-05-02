@@ -41,6 +41,7 @@ from courts.ca.la_tentatives import (
     _parse_appellate_dropdown_options,
     _parse_dropdown_options,
     _parse_option,
+    _rebuild_reversed_title_from_parties,
     _replace_ruling_text_from_html,
     _sanitize_title,
     _split_cases_html,
@@ -4027,3 +4028,275 @@ class TestLlmExtractRulingsRoleLiteralTitle:
         assert result is not None
         assert len(result) == 1
         assert result[0].case_title == "Aasi v. American Honda"
+
+
+# ---------------------------------------------------------------------------
+# TestLlmExtractRulingsReversedTitle — reversed case_title correction (#3846)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmExtractRulingsReversedTitle:
+    """Tests for reversed case_title detection and correction in _llm_extract_rulings().
+
+    When the defendant is the moving party, the LLM occasionally emits the
+    defendant first in extracted_case_title — e.g. "Rampart Property Management,
+    Inc v. Samson Hill" when the real caption has plaintiff Samson Hill and
+    defendant Rampart.  The _rebuild_reversed_title_from_parties sanitizer
+    detects and corrects this before the title reaches the DB.  See #3846.
+    """
+
+    def test_reversed_title_rebuilt_from_parties(self) -> None:
+        """Rampart fixture: defendant-first title is corrected to plaintiff-first."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCV12345",
+                "extracted_case_title": "Rampart Property Management, Inc v. Samson Hill",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [
+                    {"name": "Samson Hill", "role": "plaintiff"},
+                    {"name": "Rampart Property Management, Inc", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 24STCV12345</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Samson Hill v. Rampart Property Management, Inc"
+
+    def test_reversed_title_with_moving_responding_only_rebuilt_when_plaintiff_role_also_emitted(
+        self,
+    ) -> None:
+        """Dual-axis emission: caption plaintiff/defendant + body moving/responding roles.
+
+        When the caption identifies roles (plaintiff/defendant) AND the body
+        also identifies them as moving_party/responding_party, the LLM should
+        emit both role pairs.  The reversed-title sanitizer uses the
+        plaintiff/defendant pair to correct the title order.
+        """
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV67890",
+                "extracted_case_title": "Foo Corp v. Jane Doe",
+                "outcome": "granted",
+                "ruling_text": "The motion is GRANTED.",
+                "parties": [
+                    {"name": "Jane Doe", "role": "plaintiff"},
+                    {"name": "Foo Corp", "role": "defendant"},
+                    {"name": "Foo Corp", "role": "moving_party"},
+                    {"name": "Jane Doe", "role": "responding_party"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV67890</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        # Reversed title should be corrected to plaintiff-first.
+        assert result[0].case_title == "Jane Doe v. Foo Corp"
+        # Both role pairs should be present in parties.
+        party_roles = {(p["name"], p["role"]) for p in result[0].parties}
+        assert ("Jane Doe", "plaintiff") in party_roles
+        assert ("Foo Corp", "defendant") in party_roles
+        assert ("Foo Corp", "moving_party") in party_roles
+        assert ("Jane Doe", "responding_party") in party_roles
+
+    def test_reversed_title_petition_cases_use_petitioner_respondent(self) -> None:
+        """Petition case: respondent-first title is corrected to petitioner-first."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCP11111",
+                "extracted_case_title": "Big Bank v. Alice Petitioner",
+                "outcome": "denied",
+                "ruling_text": "The petition is DENIED.",
+                "parties": [
+                    {"name": "Alice Petitioner", "role": "petitioner"},
+                    {"name": "Big Bank", "role": "respondent"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 24STCP11111</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title == "Alice Petitioner v. Big Bank"
+
+    def test_reversed_title_left_unchanged_when_only_moving_responding_roles_stored(
+        self,
+    ) -> None:
+        """No plaintiff/defendant pair → reversed-title sanitizer is a no-op.
+
+        When the LLM only stores moving_party/responding_party (caption didn't
+        identify plaintiff/defendant roles), the sanitizer has no plaintiff/defendant
+        names to work with and must leave the title unchanged.
+        """
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV22222",
+                "extracted_case_title": "Acme Corp v. Bob Smith",
+                "outcome": "granted",
+                "ruling_text": "The motion is GRANTED.",
+                "parties": [
+                    {"name": "Acme Corp", "role": "moving_party"},
+                    {"name": "Bob Smith", "role": "responding_party"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV22222</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        # No plaintiff/defendant roles → title unchanged.
+        assert result[0].case_title == "Acme Corp v. Bob Smith"
+
+    def test_clean_plaintiff_first_title_passes_through(self) -> None:
+        """Control: a correct plaintiff-first title is not modified by the sanitizer."""
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCV33333",
+                "extracted_case_title": "Maria Lopez v. City of Los Angeles",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [
+                    {"name": "Maria Lopez", "role": "plaintiff"},
+                    {"name": "City of Los Angeles", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 24STCV33333</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        # Plaintiff-first title should pass through unchanged.
+        assert result[0].case_title == "Maria Lopez v. City of Los Angeles"
+
+    def test_role_literal_then_reversed_chain_runs_role_literal_first(self) -> None:
+        """Order-of-operations: role-literal sanitizer fires first, then reversed-title check.
+
+        When a title matches _ROLE_LITERAL_TITLE_RE, the role-literal sanitizer
+        runs and replaces the title.  The reversed-title check then runs on the
+        rebuilt title.  This test verifies the two-step chain produces a
+        correctly ordered plaintiff-first title.
+        """
+        rulings_data = [
+            {
+                "extracted_case_number": "24STCV44444",
+                "extracted_case_title": "Plaintiff v. Defendant",
+                "outcome": "granted",
+                "ruling_text": "The motion is GRANTED.",
+                "parties": [
+                    {"name": "Carlos Rivera", "role": "plaintiff"},
+                    {"name": "Tech Solutions Inc", "role": "defendant"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 24STCV44444</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        # Role-literal sanitizer rebuilds first; reversed-title check is a no-op
+        # because the rebuilt title is already plaintiff-first.
+        assert result[0].case_title == "Carlos Rivera v. Tech Solutions Inc"
+
+
+# ---------------------------------------------------------------------------
+# TestRebuildReversedTitleFromParties — unit tests for the helper (#3846)
+# ---------------------------------------------------------------------------
+
+
+class TestRebuildReversedTitleFromParties:
+    """Unit tests for _rebuild_reversed_title_from_parties()."""
+
+    def test_returns_none_on_none_title(self) -> None:
+        parties = [
+            {"name": "Samson Hill", "role": "plaintiff"},
+            {"name": "Rampart Corp", "role": "defendant"},
+        ]
+        assert _rebuild_reversed_title_from_parties(None, parties) is None
+
+    def test_returns_none_on_empty_string_title(self) -> None:
+        parties = [
+            {"name": "Samson Hill", "role": "plaintiff"},
+            {"name": "Rampart Corp", "role": "defendant"},
+        ]
+        assert _rebuild_reversed_title_from_parties("", parties) is None
+
+    def test_returns_none_when_no_v_separator(self) -> None:
+        parties = [
+            {"name": "Samson Hill", "role": "plaintiff"},
+            {"name": "Rampart Corp", "role": "defendant"},
+        ]
+        assert _rebuild_reversed_title_from_parties("Rampart Corp", parties) is None
+
+    def test_corrects_reversed_title(self) -> None:
+        parties = [
+            {"name": "Samson Hill", "role": "plaintiff"},
+            {"name": "Rampart Property Management, Inc", "role": "defendant"},
+        ]
+        result = _rebuild_reversed_title_from_parties(
+            "Rampart Property Management, Inc v. Samson Hill", parties
+        )
+        assert result == "Samson Hill v. Rampart Property Management, Inc"
+
+    def test_leaves_correct_title_unchanged(self) -> None:
+        parties = [
+            {"name": "Samson Hill", "role": "plaintiff"},
+            {"name": "Rampart Property Management, Inc", "role": "defendant"},
+        ]
+        result = _rebuild_reversed_title_from_parties(
+            "Samson Hill v. Rampart Property Management, Inc", parties
+        )
+        assert result is None
+
+    def test_petition_case_reversed(self) -> None:
+        parties = [
+            {"name": "Alice Petitioner", "role": "petitioner"},
+            {"name": "Big Bank", "role": "respondent"},
+        ]
+        result = _rebuild_reversed_title_from_parties("Big Bank v. Alice Petitioner", parties)
+        assert result == "Alice Petitioner v. Big Bank"
+
+    def test_petition_case_correct_order_unchanged(self) -> None:
+        parties = [
+            {"name": "Alice Petitioner", "role": "petitioner"},
+            {"name": "Big Bank", "role": "respondent"},
+        ]
+        result = _rebuild_reversed_title_from_parties("Alice Petitioner v. Big Bank", parties)
+        assert result is None
+
+    def test_returns_none_when_no_plaintiff_defendant_parties(self) -> None:
+        parties = [
+            {"name": "Acme Corp", "role": "moving_party"},
+            {"name": "Bob Smith", "role": "responding_party"},
+        ]
+        result = _rebuild_reversed_title_from_parties("Acme Corp v. Bob Smith", parties)
+        assert result is None
+
+    def test_returns_none_on_empty_parties(self) -> None:
+        result = _rebuild_reversed_title_from_parties("Foo v. Bar", [])
+        assert result is None
