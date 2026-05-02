@@ -429,7 +429,7 @@ module "dispatcher_v3_iam" {
   github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
 }
 
-# ─── Dispatcher v3 sessions bucket (F-this-issue, #3891) ────────────────────
+# ─── Dispatcher v3 sessions bucket (#3891) ──────────────────────────────────
 # Per `docs/specs/dispatcher-v3-spec.md` §4.1 session capture. Stores
 # per-agent session logs (raw stream-json jsonl + compact transcript)
 # emitted by the v3 task-runner and diagnoser. Private bucket, IAM-only
@@ -449,6 +449,69 @@ module "dispatcher_v3_sessions" {
   # Default 365 days. Operators can override here if a future incident
   # review needs an extended audit window without changing the module.
   # session_retention_days = 365
+}
+
+# ─── Dispatcher v3 task-defs (F2, #3887) ────────────────────────────────────
+# Per `docs/specs/dispatcher-v3-spec.md` §4 + §6. Four ECS Fargate task
+# definitions baked from the F1 image (#3915, judgemind/dispatcher-v3)
+# with different `command` argv selecting the per-task entrypoint:
+#
+#   * `<prefix>-launcher`        — long-running scheduler (1 vCPU / 2 GiB).
+#     Wired into F4's ECS service (follow-up).
+#   * `<prefix>-task-runner`     — one-shot per-agent (4 vCPU / 16 GiB,
+#     stopTimeout 6h). Launched by the launcher via ecs:RunTask.
+#   * `<prefix>-diagnoser`       — one-shot per-failure (2 vCPU / 8 GiB,
+#     stopTimeout 1h).
+#   * `<prefix>-scheduled-skill` — one-shot per-cron-trigger (2 vCPU /
+#     8 GiB, stopTimeout 2h). Wired into F5's EventBridge schedules
+#     (follow-up).
+#
+# Image is digest-pinned at apply time via `data "aws_ecr_image"` —
+# every rendered task-def references @sha256:<digest> instead of the
+# mutable :latest tag. This is the structural defense against the v2
+# image-staleness drift documented in #3754. Re-runs of terraform apply
+# after a fresh deploy-dispatcher-v3.yml push resolve a new digest and
+# register fresh task-def revisions.
+#
+# Until F4 lands, the launcher task-def exists but no service runs;
+# until F5 lands, the scheduled-skill task-def has no EventBridge
+# triggers. The IAM-side launcher_role's RunTask grant (F3 #3921)
+# already covers task-runner / diagnoser / scheduled-skill families,
+# so no IAM updates are needed when those follow-ups land.
+module "dispatcher_v3_task_defs" {
+  source = "../../modules/dispatcher-v3-task-defs"
+
+  environment     = "dev"
+  ecs_cluster_arn = module.compute.cluster_arn
+
+  # F1 (#3915) image — ECR repo provisioned by modules/ecr.
+  ecr_repository_name = "judgemind/dispatcher-v3"
+  ecr_repository_url  = module.ecr.dispatcher_v3_repository_url
+  # Default `latest` resolves to the most recent <sha7> via
+  # data.aws_ecr_image at apply time. Override if a specific build is
+  # needed for a debug session.
+  image_tag = "latest"
+
+  # F3 (#3921) IAM role ARNs.
+  launcher_role_arn   = module.dispatcher_v3_iam.launcher_role_arn
+  agent_task_role_arn = module.dispatcher_v3_iam.agent_task_role_arn
+  execution_role_arn  = module.dispatcher_v3_iam.execution_role_arn
+
+  # Secrets — re-use the same ARNs the v2 daemon already has wired.
+  anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
+  db_connection_secret_arn     = module.database.db_connection_secret_arn
+  github_token_secret_arn      = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+  # Telegram secret stays empty until the launcher needs to page the
+  # operator — the launcher task-def's secrets block omits the entry
+  # entirely when this is empty.
+  telegram_bot_token_secret_arn = ""
+
+  github_repo = "judgemind/judgemind"
+  repo_url    = "https://github.com/judgemind/judgemind.git"
+
+  # Sessions bucket from #3891 — the task-runner entrypoint archives
+  # session logs to s3://<bucket>/<agent_id>.jsonl on exit (spec §4.1).
+  sessions_bucket_name = module.dispatcher_v3_sessions.bucket_id
 }
 
 output "ecr_repository_url" {
@@ -757,4 +820,57 @@ output "dispatcher_v3_sessions_bucket" {
 output "dispatcher_v3_sessions_bucket_arn" {
   description = "Dev dispatcher-v3 sessions bucket ARN. Useful for `aws iam simulate-principal-policy` regression checks against the agent_task_role policies."
   value       = module.dispatcher_v3_sessions.bucket_arn
+}
+
+# ─── Dispatcher v3 task-defs outputs (F2, #3887) ────────────────────────────
+# Consumed by F4 (launcher ECS service) and F5 (EventBridge schedules).
+
+output "dispatcher_v3_launcher_task_definition_family" {
+  description = "Dev dispatcher-v3 launcher task definition family (judgemind-dispatcher-v3-launcher). F4's ECS service references this family-only so revisions roll forward without an explicit task_definition update."
+  value       = module.dispatcher_v3_task_defs.launcher_task_definition_family
+}
+
+output "dispatcher_v3_task_runner_task_definition_family" {
+  description = "Dev dispatcher-v3 task-runner task definition family. The launcher passes this to ecs:RunTask when claiming an issue."
+  value       = module.dispatcher_v3_task_defs.task_runner_task_definition_family
+}
+
+output "dispatcher_v3_diagnoser_task_definition_family" {
+  description = "Dev dispatcher-v3 diagnoser task definition family. The launcher passes this to ecs:RunTask after a task-runner exits non-zero."
+  value       = module.dispatcher_v3_task_defs.diagnoser_task_definition_family
+}
+
+output "dispatcher_v3_scheduled_skill_task_definition_family" {
+  description = "Dev dispatcher-v3 scheduled-skill task definition family. EventBridge cron rules (F5) target this family with a per-skill SKILL_NAME env override."
+  value       = module.dispatcher_v3_task_defs.scheduled_skill_task_definition_family
+}
+
+output "dispatcher_v3_image_digest" {
+  description = "Resolved image digest baked into every dispatcher-v3 task-def revision (sha256:...)."
+  value       = module.dispatcher_v3_task_defs.image_digest
+}
+
+output "dispatcher_v3_image_uri" {
+  description = "Full digest-pinned image URI baked into every dispatcher-v3 task-def revision (<repo>@sha256:<digest>)."
+  value       = module.dispatcher_v3_task_defs.image_uri
+}
+
+output "dispatcher_v3_launcher_log_group" {
+  description = "Dev CloudWatch log group for the dispatcher-v3 launcher task (/judgemind/dispatcher-v3/launcher)."
+  value       = module.dispatcher_v3_task_defs.launcher_log_group_name
+}
+
+output "dispatcher_v3_task_runner_log_group" {
+  description = "Dev CloudWatch log group for the dispatcher-v3 task-runner task (/judgemind/dispatcher-v3/task-runner). Read by the launcher's silent-hang detector via DescribeLogStreams."
+  value       = module.dispatcher_v3_task_defs.task_runner_log_group_name
+}
+
+output "dispatcher_v3_diagnoser_log_group" {
+  description = "Dev CloudWatch log group for the dispatcher-v3 diagnoser task (/judgemind/dispatcher-v3/diagnoser)."
+  value       = module.dispatcher_v3_task_defs.diagnoser_log_group_name
+}
+
+output "dispatcher_v3_scheduled_skill_log_group" {
+  description = "Dev CloudWatch log group for the dispatcher-v3 scheduled-skill task (/judgemind/dispatcher-v3/scheduled-skill)."
+  value       = module.dispatcher_v3_task_defs.scheduled_skill_log_group_name
 }
