@@ -29,6 +29,12 @@ from framework.s3_cache import make_s3_client
 
 from .worker import InfrastructureError, IngestionWorker
 
+# Early-flush print before structlog is configured so that any pre-logging
+# failures (import errors, configure_structlog crash) are visible in CloudWatch
+# as plain text rather than silence.  This is intentionally a bare print()
+# because structlog is not yet configured.  See #3917.
+print("ingestion-worker starting", flush=True)
+
 # Configure structlog for its own loggers (structlog.get_logger()) AND route
 # standard-library logging (logging.getLogger()) through structlog.
 # json=True forces JSON output regardless of terminal — the ingestion worker
