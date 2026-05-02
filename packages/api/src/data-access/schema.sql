@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 59 migrations.
+-- Generated from 61 migrations.
 
 
 
@@ -375,7 +375,6 @@ CREATE TABLE dispatcher.agents (
     current_milestone text,
     current_milestone_detail text,
     current_milestone_at timestamp with time zone,
-    session_s3_key text,
     diagnoser_arn text,
     outcome_summary text
 );
@@ -436,9 +435,6 @@ COMMENT ON COLUMN dispatcher.agents.current_milestone_detail IS 'v3-only — fre
 
 
 COMMENT ON COLUMN dispatcher.agents.current_milestone_at IS 'v3-only — timestamp the current milestone was entered. NULL on every v2-written row. Issue #3872.';
-
-
-COMMENT ON COLUMN dispatcher.agents.session_s3_key IS 'v3-only — S3 key of the agent''s transcript bundle. NULL on every v2-written row. Issue #3872.';
 
 
 COMMENT ON COLUMN dispatcher.agents.diagnoser_arn IS 'v3-only — ECS task ARN of the running diagnoser when an async-spawned diagnoser is in flight for this agent. NULL when no diagnoser is active and on every v2-written row. Issue #3872.';
