@@ -461,6 +461,52 @@ module "dispatcher_v3_sessions" {
   # session_retention_days = 365
 }
 
+# ─── Dispatcher v3 agent-runner security group (#3939) ─────────────────────
+# Security group attached to every ECS task-runner ENI launched by the
+# v3 launcher via ecs:RunTask. Provisioned at the env layer (not inside
+# F2 or F4) to avoid a module-level cycle: F2 needs the SG ID to thread
+# into the launcher's AGENT_RUNNER_SECURITY_GROUP_ID env var, F4's ECS
+# service references F2's launcher task-def ARN -- so wiring the SG
+# inside F4 and reading it from F2 would cycle through F4 → F2 → F4.
+#
+# Egress profile mirrors F4's launcher SG: HTTPS for GitHub / Anthropic /
+# ECR / Secrets Manager / S3, Postgres for dispatcher.* writes, Redis
+# for the future event bus (spec §6). Same posture as v2's
+# dispatcher-agent-runner module's SG -- task-runners need outbound
+# HTTPS for `git clone`, `pip install`, `npm install`, etc.
+#
+# No inbound rules: task-runners are one-shot batch workloads, not
+# service endpoints.
+resource "aws_security_group" "dispatcher_v3_agent_runner" {
+  name        = "judgemind-dispatcher-v3-agent-runner-dev"
+  description = "Dispatcher v3 task-runner ECS task ENI -- outbound only (HTTPS, Postgres, Redis). #3939."
+  vpc_id      = module.networking.vpc_id
+
+  egress {
+    description = "HTTPS to GitHub, Anthropic, ECR, Secrets Manager, S3"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "PostgreSQL (dispatcher.* state writes from task-runner)"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "Redis (event bus, reserved for future phases)"
+    from_port   = 6379
+    to_port     = 6379
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 # ─── Dispatcher v3 task-defs (F2, #3887) ────────────────────────────────────
 # Per `docs/specs/dispatcher-v3-spec.md` §4 + §6. Four ECS Fargate task
 # definitions baked from the F1 image (#3915, judgemind/dispatcher-v3)
@@ -522,6 +568,15 @@ module "dispatcher_v3_task_defs" {
   # Sessions bucket from #3891 — the task-runner entrypoint archives
   # session logs to s3://<bucket>/<agent_id>.jsonl on exit (spec §4.1).
   sessions_bucket_name = module.dispatcher_v3_sessions.bucket_id
+
+  # Launcher → task-runner network handoff (#3939). The launcher's
+  # `_build_launcher_from_env` reads these three values at boot to
+  # assemble each ecs:RunTask request. Subnets reuse the launcher
+  # service's own private subnets; the security group is provisioned
+  # above at env-layer (avoids the F2 ↔ F4 module cycle that would
+  # arise if F2 read it from F4's outputs).
+  agent_runner_subnet_ids        = module.networking.private_subnet_ids
+  agent_runner_security_group_id = aws_security_group.dispatcher_v3_agent_runner.id
 }
 
 # ─── Dispatcher v3 launcher ECS service (F4, #3889) ─────────────────────────
