@@ -28,6 +28,7 @@ import json
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -1330,6 +1331,58 @@ def _drop_riverside_no_tentative_ruling_stubs(
 # log markers precise and to keep each county's configuration self-contained.
 
 
+def _disjoint_plaintiff_names(parties_a: list, parties_b: list) -> bool:
+    """Return True when the plaintiff name sets of two party lists are disjoint (#3791).
+
+    Used to detect the inherited-case-number misattribution shape in San Bernardino
+    multi-case PDFs: when two rulings share a CIVSB/CIVRS case number but have
+    completely different plaintiff names, the LLM likely inherited the case number
+    from the prior section rather than finding a distinct case number in the text.
+
+    Conservative behaviour: returns ``False`` (don't fire) when either side has
+    no plaintiffs, so the guard never fires on sparse data.
+
+    Parameters
+    ----------
+    parties_a:
+        Plaintiff party list for the anchor ruling.
+    parties_b:
+        Plaintiff party list for the subsequent ruling.
+
+    Both lists may contain ``ExtractedParty`` pydantic instances **or** plain
+    ``dict`` objects with ``name`` and ``role`` keys (the LA path).
+
+    Returns
+    -------
+    bool
+        ``True`` only when both sides have at least one plaintiff and all
+        plaintiff names from *parties_a* are absent from *parties_b*
+        (case-insensitively).
+    """
+
+    def _plaintiff_names(parties: list) -> set[str]:
+        names: set[str] = set()
+        for party in parties:
+            if isinstance(party, dict):
+                role = (party.get("role") or "").lower()
+                name = (party.get("name") or "").strip()
+            else:
+                role = (getattr(party, "role", None) or "").lower()
+                name = (getattr(party, "name", None) or "").strip()
+            if role in {"plaintiff", "petitioner"} and name:
+                names.add(name.lower())
+        return names
+
+    names_a = _plaintiff_names(parties_a)
+    names_b = _plaintiff_names(parties_b)
+
+    # Conservative: if either set is empty we cannot make a reliable comparison
+    if not names_a or not names_b:
+        return False
+
+    return names_a.isdisjoint(names_b)
+
+
 def _rebuild_title_from_parties(
     title: str | None,
     parties: list,
@@ -1462,6 +1515,62 @@ def _sanitize_san_bernardino_rulings(
 
         if updates:
             rulings[i] = ruling.model_copy(update=updates)
+
+    # --- Second pass: inherited-case-number guard (#3791) ---
+    # Group rulings by extracted_case_number (SB-scoped only).
+    # For any group of size >= 2, compare each subsequent ruling's plaintiffs
+    # to the anchor (first) ruling's plaintiffs.  When the sets are disjoint,
+    # the LLM likely inherited the case number — null it out and rebuild the
+    # title from the subsequent ruling's own parties.
+    # Build an index: case_number -> [(position, ruling)]
+    cn_groups: dict[str, list[tuple[int, ExtractedRuling]]] = defaultdict(list)
+    for i, ruling in enumerate(rulings):
+        if ruling.extracted_case_number and case_number_re.search(ruling.extracted_case_number):
+            cn_groups[ruling.extracted_case_number].append((i, ruling))
+
+    for shared_cn, group in cn_groups.items():
+        if len(group) < 2:
+            continue
+
+        _anchor_idx, anchor_ruling = group[0]
+        anchor_parties = anchor_ruling.extracted_parties or []
+
+        for pos_idx, (i, ruling) in enumerate(group):
+            if pos_idx == 0:
+                # Anchor is left unchanged
+                continue
+
+            subsequent_parties = ruling.extracted_parties or []
+            if not _disjoint_plaintiff_names(anchor_parties, subsequent_parties):
+                # Conservative: same plaintiffs (multi-motion shape) or
+                # empty anchor — do nothing.
+                continue
+
+            # Plaintiff sets are disjoint: this ruling likely inherited the
+            # case number from the anchor.  Null out the case number.
+            # The title is already extracted from this ruling's own caption
+            # and is kept as-is; only extracted_case_number is cleared.
+            logger.warning(
+                "llm_extractor.sb_inherited_case_number_nullified",
+                shared_case_number=shared_cn,
+                anchor_plaintiffs=[
+                    (p.get("name") if isinstance(p, dict) else getattr(p, "name", None))
+                    for p in anchor_parties
+                    if (
+                        p.get("role") if isinstance(p, dict) else getattr(p, "role", None) or ""
+                    ).lower()
+                    in {"plaintiff", "petitioner"}
+                ],
+                subsequent_plaintiffs=[
+                    (p.get("name") if isinstance(p, dict) else getattr(p, "name", None))
+                    for p in subsequent_parties
+                    if (
+                        p.get("role") if isinstance(p, dict) else getattr(p, "role", None) or ""
+                    ).lower()
+                    in {"plaintiff", "petitioner"}
+                ],
+            )
+            rulings[i] = ruling.model_copy(update={"extracted_case_number": None})
 
     return rulings
 

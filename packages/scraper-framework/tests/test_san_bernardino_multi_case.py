@@ -29,6 +29,7 @@ import pytest
 
 from framework.llm_extractor import (
     _SB_CASE_NUMBER_RE,
+    _disjoint_plaintiff_names,
     _rebuild_title_from_parties,
     _sanitize_san_bernardino_rulings,
     _truncate_concatenated_case_titles,
@@ -339,3 +340,169 @@ def test_san_bernardino_prompt_forbids_role_literal_title() -> None:
     # The new Rule 3b must mention role words to guard against the LLM
     # emitting 'Plaintiff' / 'Defendant' as the party name.
     assert "Plaintiff" in SAN_BERNARDINO_SYSTEM_PROMPT or "role" in SAN_BERNARDINO_SYSTEM_PROMPT
+
+
+def test_san_bernardino_prompt_contains_caption_without_number_rule() -> None:
+    """SAN_BERNARDINO_SYSTEM_PROMPT must document the caption-without-number rule (AC1)."""
+    # Rule 4b must explicitly instruct the LLM not to inherit the prior section's
+    # case number when a section has a distinct caption but no visible CIVSB/CIVRS token.
+    prompt_lower = SAN_BERNARDINO_SYSTEM_PROMPT.lower()
+    assert "caption" in prompt_lower and (
+        "caption_without_number" in prompt_lower
+        or "caption-without-number" in prompt_lower
+        or "no" in prompt_lower  # "no visible ... case number" phrasing
+    )
+    # The rule must also instruct null/absent case_number handling
+    assert "null" in prompt_lower or "inherit" in prompt_lower
+
+
+# ---------------------------------------------------------------------------
+# _disjoint_plaintiff_names helper
+# ---------------------------------------------------------------------------
+
+
+def test_disjoint_plaintiff_names_returns_true_for_disjoint_sets() -> None:
+    """Two rulings with completely different plaintiff names are detected as disjoint."""
+    parties_a = [
+        ExtractedParty(name="Bernard Austin", role="plaintiff"),
+        ExtractedParty(name="Pepper Dale", role="defendant"),
+    ]
+    parties_b = [
+        ExtractedParty(name="Maria Juana Montalvo", role="plaintiff"),
+        ExtractedParty(name="Loma Linda University Medical Center", role="defendant"),
+    ]
+    assert _disjoint_plaintiff_names(parties_a, parties_b) is True
+
+
+def test_disjoint_plaintiff_names_returns_false_when_same_plaintiff() -> None:
+    """Two rulings sharing the same plaintiff are not disjoint (multi-motion shape)."""
+    parties_a = [
+        ExtractedParty(name="Bernard Austin", role="plaintiff"),
+        ExtractedParty(name="Pepper Dale", role="defendant"),
+    ]
+    parties_b = [
+        ExtractedParty(name="Bernard Austin", role="plaintiff"),
+        ExtractedParty(name="City of San Bernardino", role="defendant"),
+    ]
+    assert _disjoint_plaintiff_names(parties_a, parties_b) is False
+
+
+def test_disjoint_plaintiff_names_case_insensitive() -> None:
+    """Name comparison is case-insensitive."""
+    parties_a = [ExtractedParty(name="BERNARD AUSTIN", role="plaintiff")]
+    parties_b = [ExtractedParty(name="bernard austin", role="plaintiff")]
+    assert _disjoint_plaintiff_names(parties_a, parties_b) is False
+
+
+def test_disjoint_plaintiff_names_empty_a_is_conservative() -> None:
+    """When anchor has no plaintiffs, return False (conservative — don't fire)."""
+    parties_b = [ExtractedParty(name="Maria Montalvo", role="plaintiff")]
+    assert _disjoint_plaintiff_names([], parties_b) is False
+
+
+def test_disjoint_plaintiff_names_empty_b_is_conservative() -> None:
+    """When subsequent ruling has no plaintiffs, return False (conservative)."""
+    parties_a = [ExtractedParty(name="Bernard Austin", role="plaintiff")]
+    assert _disjoint_plaintiff_names(parties_a, []) is False
+
+
+def test_disjoint_plaintiff_names_accepts_dict_shaped_parties() -> None:
+    """_disjoint_plaintiff_names accepts dict-shaped parties (LA path)."""
+    parties_a = [{"name": "Bernard Austin", "role": "plaintiff"}]
+    parties_b = [{"name": "Maria Montalvo", "role": "plaintiff"}]
+    assert _disjoint_plaintiff_names(parties_a, parties_b) is True
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_san_bernardino_rulings — inherited case_number guard (AC2)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_sb_rulings_nullifies_inherited_case_number_when_disjoint_parties(
+    fixture_data: dict,
+) -> None:
+    """Second ruling with disjoint plaintiff names gets its case_number nulled (AC2).
+
+    Simulates the real-world shape: two rulings sharing CIVSB1234567 where
+    ruling[0] is Bernard Austin (anchor) and ruling[1] is Maria Juana Montalvo
+    (subsequent — different case, LLM incorrectly inherited the case number).
+    """
+    entry = fixture_data["inherited_case_number"][0]
+    rulings = [
+        ExtractedRuling(
+            extracted_case_number=r["extracted_case_number"],
+            extracted_case_title=r["extracted_case_title"],
+            ruling_text=r["ruling_text"],
+            extracted_parties=[
+                ExtractedParty(name=p["name"], role=p["role"])
+                for p in r.get("extracted_parties", [])
+            ],
+        )
+        for r in entry["input_rulings"]
+    ]
+    result = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
+
+    # Anchor (ruling[0]) is unchanged
+    assert result[0].extracted_case_number == entry["expected"][0]["extracted_case_number"]
+    assert result[0].extracted_case_title == entry["expected"][0]["extracted_case_title"]
+
+    # Subsequent (ruling[1]) has case_number nulled and title rebuilt from its own parties
+    assert result[1].extracted_case_number is None
+    assert result[1].extracted_case_title == entry["expected"][1]["extracted_case_title"]
+
+
+def test_sanitize_sb_rulings_keeps_inherited_case_number_when_parties_match() -> None:
+    """Two rulings with the same plaintiff (legitimate multi-motion shape) are untouched."""
+    shared_cn = "CIVSB2419120"
+    rulings = [
+        ExtractedRuling(
+            extracted_case_number=shared_cn,
+            extracted_case_title="Bernard Austin v. Pepper Dale",
+            ruling_text="Motion to compel GRANTED.",
+            extracted_parties=[
+                ExtractedParty(name="Bernard Austin", role="plaintiff"),
+                ExtractedParty(name="Pepper Dale", role="defendant"),
+            ],
+        ),
+        ExtractedRuling(
+            extracted_case_number=shared_cn,
+            extracted_case_title="Bernard Austin v. Pepper Dale",
+            ruling_text="Motion to set aside default DENIED.",
+            extracted_parties=[
+                ExtractedParty(name="Bernard Austin", role="plaintiff"),
+                ExtractedParty(name="Pepper Dale", role="defendant"),
+            ],
+        ),
+    ]
+    result = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
+    # Both rulings keep their case_number
+    assert result[0].extracted_case_number == shared_cn
+    assert result[1].extracted_case_number == shared_cn
+
+
+def test_sanitize_sb_rulings_inherited_case_number_no_anchor_parties_is_noop() -> None:
+    """When anchor has no plaintiffs, heuristic conservatively leaves subsequent unchanged."""
+    shared_cn = "CIVSB2419120"
+    rulings = [
+        ExtractedRuling(
+            extracted_case_number=shared_cn,
+            extracted_case_title="Unknown v. Pepper Dale",
+            ruling_text="Motion GRANTED.",
+            extracted_parties=[
+                ExtractedParty(name="Pepper Dale", role="defendant"),
+                # No plaintiff parties for anchor
+            ],
+        ),
+        ExtractedRuling(
+            extracted_case_number=shared_cn,
+            extracted_case_title="Maria Montalvo v. Loma Linda University",
+            ruling_text="Motion DENIED.",
+            extracted_parties=[
+                ExtractedParty(name="Maria Montalvo", role="plaintiff"),
+                ExtractedParty(name="Loma Linda University", role="defendant"),
+            ],
+        ),
+    ]
+    result = _sanitize_san_bernardino_rulings(rulings, case_number_re=_SB_CASE_NUMBER_RE)
+    # Conservative: anchor has no plaintiffs so subsequent is left unchanged
+    assert result[1].extracted_case_number == shared_cn

@@ -85,5 +85,40 @@
       "case_number": "CIVRS2401204",
       "note": "Role-literal title with no extracted_parties — cannot rebuild, returns None"
     }
+  ],
+  "inherited_case_number": [
+    {
+      "note": "Two rulings share CIVSB2419120 but have disjoint plaintiffs — ruling[1] inherited the case number from ruling[0]. Expected: ruling[0] unchanged, ruling[1] case_number nulled and title rebuilt from its own parties.",
+      "input_rulings": [
+        {
+          "extracted_case_number": "CIVSB2419120",
+          "extracted_case_title": "Bernard Austin v. Pepper Dale",
+          "ruling_text": "Tentative Ruling: DENIED. Plaintiff's motion to compel further responses is denied.",
+          "extracted_parties": [
+            {"name": "Bernard Austin", "role": "plaintiff"},
+            {"name": "Pepper Dale", "role": "defendant"}
+          ]
+        },
+        {
+          "extracted_case_number": "CIVSB2419120",
+          "extracted_case_title": "Maria Juana Montalvo v. Loma Linda University Medical Center",
+          "ruling_text": "Tentative Ruling: GRANTED. Defendant's motion for summary judgment is granted.",
+          "extracted_parties": [
+            {"name": "Maria Juana Montalvo", "role": "plaintiff"},
+            {"name": "Loma Linda University Medical Center", "role": "defendant"}
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "extracted_case_number": "CIVSB2419120",
+          "extracted_case_title": "Bernard Austin v. Pepper Dale"
+        },
+        {
+          "extracted_case_number": null,
+          "extracted_case_title": "Maria Juana Montalvo v. Loma Linda University Medical Center"
+        }
+      ]
+    }
   ]
 }
