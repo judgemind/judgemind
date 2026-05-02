@@ -112,7 +112,7 @@ Tentative rulings are the highest-priority data type. The capture pipeline has d
 
 Judgemind integrates with existing open legal data sources to avoid duplicating effort:
 
-- **CourtListener (Free Law Project):** Federal opinions and some state appellate data. Implemented as a scraper (`packages/scraper-framework/src/courts/federal/courtlistener.py`) that ingests via their API, with regression tests against recorded responses.
+- **CourtListener (Free Law Project):** Federal opinions and some state appellate data. Implemented as a scraper (`packages/scraper-framework/src/courts/federal/courtlistener.py`) that ingests via their API; each opinion's `cluster.court` short-ID is mapped to (state, county) at scrape time via `_CL_COURT_ID_TO_JURISDICTION` so federal and state appellate opinions land in the correct jurisdiction. Unknown court IDs produce `("Unknown", "Unknown")` and emit a structured warning to CloudWatch. Regression tests cover jurisdiction assignment for SCOTUS, circuit courts, and state appellate courts.
 
 ### 3.1.5 Scraper Development & Quality Assurance
 

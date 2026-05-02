@@ -404,11 +404,33 @@ class CourtListenerScraper(BaseScraper):
             parts = court_id.rstrip("/").split("/")
             court_id = parts[-1] if parts else court_id
 
+        # Resolve jurisdiction from court_id mapping.
+        # Default to ("Unknown", "Unknown") on miss and emit a structured warning
+        # so unknown IDs surface in CloudWatch rather than silently inheriting
+        # the scraper-level "Federal" defaults.
+        if court_id in _CL_COURT_ID_TO_JURISDICTION:
+            resolved_state, resolved_county = _CL_COURT_ID_TO_JURISDICTION[court_id]
+        elif court_id:
+            resolved_state, resolved_county = ("Unknown", "Unknown")
+            logger.warning(
+                "Unknown CourtListener court_id — defaulting to Unknown jurisdiction",
+                courtlistener_court_id=court_id,
+            )
+        else:
+            # Empty court_id — fall back to config defaults (Federal/Federal for the
+            # standard federal-courtlistener scraper) rather than Unknown.
+            resolved_state = self.config.state
+            resolved_county = self.config.county
+
         doc = self._make_base_doc(
             source_url=source_url,
             raw_content=raw_content,
             content_format=ContentFormat.TEXT,
         )
+
+        # Override state/county with the resolved jurisdiction
+        doc.state = resolved_state
+        doc.county = resolved_county
 
         # Map structured fields
         doc.case_title = cluster.get("case_name") or cluster.get("case_name_short") or None
@@ -479,6 +501,334 @@ def _parse_date(date_str: str | None) -> datetime | None:
         return datetime.strptime(date_str, "%Y-%m-%d")
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Court ID → (state, county) jurisdiction mapping
+# ---------------------------------------------------------------------------
+
+#: Maps CourtListener short court IDs to (state, county) tuples.
+#:
+#: Federal courts map to ("Federal", "Federal").
+#: State high courts and appellate courts map to ("<State>", "Statewide").
+#: On a miss, the scraper defaults to ("Unknown", "Unknown") and logs a warning.
+#:
+#: Source: https://www.courtlistener.com/api/rest/v4/courts/?format=json
+_CL_COURT_ID_TO_JURISDICTION: dict[str, tuple[str, str]] = {
+    # Supreme Court of the United States
+    "scotus": ("Federal", "Federal"),
+    # Federal Circuit Courts of Appeals
+    "ca1": ("Federal", "Federal"),
+    "ca2": ("Federal", "Federal"),
+    "ca3": ("Federal", "Federal"),
+    "ca4": ("Federal", "Federal"),
+    "ca5": ("Federal", "Federal"),
+    "ca6": ("Federal", "Federal"),
+    "ca7": ("Federal", "Federal"),
+    "ca8": ("Federal", "Federal"),
+    "ca9": ("Federal", "Federal"),
+    "ca10": ("Federal", "Federal"),
+    "ca11": ("Federal", "Federal"),
+    "cadc": ("Federal", "Federal"),  # DC Circuit
+    "cafc": ("Federal", "Federal"),  # Federal Circuit
+    # Federal District Courts (select — catches common ones)
+    "dcd": ("Federal", "Federal"),
+    "almd": ("Federal", "Federal"),
+    "alnd": ("Federal", "Federal"),
+    "alsd": ("Federal", "Federal"),
+    "akd": ("Federal", "Federal"),
+    "azd": ("Federal", "Federal"),
+    "ared": ("Federal", "Federal"),
+    "arwd": ("Federal", "Federal"),
+    "cacd": ("Federal", "Federal"),
+    "caed": ("Federal", "Federal"),
+    "cand": ("Federal", "Federal"),
+    "casd": ("Federal", "Federal"),
+    "cod": ("Federal", "Federal"),
+    "ctd": ("Federal", "Federal"),
+    "ded": ("Federal", "Federal"),
+    "flmd": ("Federal", "Federal"),
+    "flnd": ("Federal", "Federal"),
+    "flsd": ("Federal", "Federal"),
+    "gamd": ("Federal", "Federal"),
+    "gand": ("Federal", "Federal"),
+    "gasd": ("Federal", "Federal"),
+    "hid": ("Federal", "Federal"),
+    "idd": ("Federal", "Federal"),
+    "ilcd": ("Federal", "Federal"),
+    "ilnd": ("Federal", "Federal"),
+    "ilsd": ("Federal", "Federal"),
+    "innd": ("Federal", "Federal"),
+    "insd": ("Federal", "Federal"),
+    "iand": ("Federal", "Federal"),
+    "iasd": ("Federal", "Federal"),
+    "ksd": ("Federal", "Federal"),
+    "kyed": ("Federal", "Federal"),
+    "kywd": ("Federal", "Federal"),
+    "laed": ("Federal", "Federal"),
+    "lamd": ("Federal", "Federal"),
+    "lawd": ("Federal", "Federal"),
+    "med": ("Federal", "Federal"),
+    "mdd": ("Federal", "Federal"),
+    "mad": ("Federal", "Federal"),
+    "mied": ("Federal", "Federal"),
+    "miwd": ("Federal", "Federal"),
+    "mnd": ("Federal", "Federal"),
+    "msnd": ("Federal", "Federal"),
+    "mssd": ("Federal", "Federal"),
+    "moed": ("Federal", "Federal"),
+    "mowd": ("Federal", "Federal"),
+    "mtd": ("Federal", "Federal"),
+    "ned": ("Federal", "Federal"),
+    "nvd": ("Federal", "Federal"),
+    "nhd": ("Federal", "Federal"),
+    "njd": ("Federal", "Federal"),
+    "nmd": ("Federal", "Federal"),
+    "nyed": ("Federal", "Federal"),
+    "nynd": ("Federal", "Federal"),
+    "nysd": ("Federal", "Federal"),
+    "nywd": ("Federal", "Federal"),
+    "nced": ("Federal", "Federal"),
+    "ncmd": ("Federal", "Federal"),
+    "ncwd": ("Federal", "Federal"),
+    "ndd": ("Federal", "Federal"),
+    "ohnd": ("Federal", "Federal"),
+    "ohsd": ("Federal", "Federal"),
+    "oked": ("Federal", "Federal"),
+    "oknd": ("Federal", "Federal"),
+    "okwd": ("Federal", "Federal"),
+    "ord": ("Federal", "Federal"),
+    "paed": ("Federal", "Federal"),
+    "pamd": ("Federal", "Federal"),
+    "pawd": ("Federal", "Federal"),
+    "rid": ("Federal", "Federal"),
+    "scd": ("Federal", "Federal"),
+    "sdd": ("Federal", "Federal"),
+    "tned": ("Federal", "Federal"),
+    "tnmd": ("Federal", "Federal"),
+    "tnwd": ("Federal", "Federal"),
+    "txed": ("Federal", "Federal"),
+    "txnd": ("Federal", "Federal"),
+    "txsd": ("Federal", "Federal"),
+    "txwd": ("Federal", "Federal"),
+    "utd": ("Federal", "Federal"),
+    "vtd": ("Federal", "Federal"),
+    "vaed": ("Federal", "Federal"),
+    "vawd": ("Federal", "Federal"),
+    "waed": ("Federal", "Federal"),
+    "wawd": ("Federal", "Federal"),
+    "wvnd": ("Federal", "Federal"),
+    "wvsd": ("Federal", "Federal"),
+    "wied": ("Federal", "Federal"),
+    "wiwd": ("Federal", "Federal"),
+    "wyd": ("Federal", "Federal"),
+    # Specialty federal courts
+    "uscfc": ("Federal", "Federal"),  # Court of Federal Claims
+    "cc": ("Federal", "Federal"),  # Court of Claims (historical)
+    "uscit": ("Federal", "Federal"),  # Court of International Trade
+    "bap1": ("Federal", "Federal"),
+    "bap2": ("Federal", "Federal"),
+    "bap6": ("Federal", "Federal"),
+    "bap8": ("Federal", "Federal"),
+    "bap9": ("Federal", "Federal"),
+    "bap10": ("Federal", "Federal"),
+    "bapme": ("Federal", "Federal"),
+    "bapma": ("Federal", "Federal"),
+    # -----------------------------------------------------------------------
+    # State high courts (supreme courts)
+    # -----------------------------------------------------------------------
+    "cal": ("California", "Statewide"),
+    "tex": ("Texas", "Statewide"),
+    "ny": ("New York", "Statewide"),
+    "fla": ("Florida", "Statewide"),
+    "ga": ("Georgia", "Statewide"),
+    "ohio": ("Ohio", "Statewide"),
+    "ill": ("Illinois", "Statewide"),
+    "pa": ("Pennsylvania", "Statewide"),
+    "mich": ("Michigan", "Statewide"),
+    "nc": ("North Carolina", "Statewide"),
+    "nj": ("New Jersey", "Statewide"),
+    "va": ("Virginia", "Statewide"),
+    "wash": ("Washington", "Statewide"),
+    "ariz": ("Arizona", "Statewide"),
+    "tenn": ("Tennessee", "Statewide"),
+    "mo": ("Missouri", "Statewide"),
+    "md": ("Maryland", "Statewide"),
+    "wis": ("Wisconsin", "Statewide"),
+    "minn": ("Minnesota", "Statewide"),
+    "colo": ("Colorado", "Statewide"),
+    "sc": ("South Carolina", "Statewide"),
+    "ala": ("Alabama", "Statewide"),
+    "la": ("Louisiana", "Statewide"),
+    "ky": ("Kentucky", "Statewide"),
+    "ore": ("Oregon", "Statewide"),
+    "okla": ("Oklahoma", "Statewide"),
+    "conn": ("Connecticut", "Statewide"),
+    "utah": ("Utah", "Statewide"),
+    "iowa": ("Iowa", "Statewide"),
+    "nev": ("Nevada", "Statewide"),
+    "ark": ("Arkansas", "Statewide"),
+    "miss": ("Mississippi", "Statewide"),
+    "kan": ("Kansas", "Statewide"),
+    "nm": ("New Mexico", "Statewide"),
+    "neb": ("Nebraska", "Statewide"),
+    "wva": ("West Virginia", "Statewide"),
+    "idaho": ("Idaho", "Statewide"),
+    "hi": ("Hawaii", "Statewide"),
+    "me": ("Maine", "Statewide"),
+    "nh": ("New Hampshire", "Statewide"),
+    "ri": ("Rhode Island", "Statewide"),
+    "mont": ("Montana", "Statewide"),
+    "del": ("Delaware", "Statewide"),
+    "sd": ("South Dakota", "Statewide"),
+    "nd": ("North Dakota", "Statewide"),
+    "alaska": ("Alaska", "Statewide"),
+    "vt": ("Vermont", "Statewide"),
+    "wyo": ("Wyoming", "Statewide"),
+    # -----------------------------------------------------------------------
+    # State appellate courts
+    # -----------------------------------------------------------------------
+    # Texas Courts of Appeals (14 districts)
+    "texapp1": ("Texas", "Statewide"),
+    "texapp2": ("Texas", "Statewide"),
+    "texapp3": ("Texas", "Statewide"),
+    "texapp4": ("Texas", "Statewide"),
+    "texapp5": ("Texas", "Statewide"),
+    "texapp6": ("Texas", "Statewide"),
+    "texapp7": ("Texas", "Statewide"),
+    "texapp8": ("Texas", "Statewide"),
+    "texapp9": ("Texas", "Statewide"),
+    "texapp10": ("Texas", "Statewide"),
+    "texapp11": ("Texas", "Statewide"),
+    "texapp12": ("Texas", "Statewide"),
+    "texapp13": ("Texas", "Statewide"),
+    "texapp14": ("Texas", "Statewide"),
+    # Texas Court of Criminal Appeals
+    "texcrimapp": ("Texas", "Statewide"),
+    # New York Appellate Divisions
+    "nyappdiv1": ("New York", "Statewide"),
+    "nyappdiv2": ("New York", "Statewide"),
+    "nyappdiv3": ("New York", "Statewide"),
+    "nyappdiv4": ("New York", "Statewide"),
+    # New York Appellate Term
+    "nyappterm1": ("New York", "Statewide"),
+    "nyappterm2": ("New York", "Statewide"),
+    # Florida District Courts of Appeal
+    "fladistctapp": ("Florida", "Statewide"),
+    "fladistctapp1": ("Florida", "Statewide"),
+    "fladistctapp2": ("Florida", "Statewide"),
+    "fladistctapp3": ("Florida", "Statewide"),
+    "fladistctapp4": ("Florida", "Statewide"),
+    "fladistctapp5": ("Florida", "Statewide"),
+    "fladistctapp6": ("Florida", "Statewide"),
+    # Georgia Court of Appeals
+    "gactapp": ("Georgia", "Statewide"),
+    # Ohio Courts of Appeals (12 districts)
+    "ohioctapp1": ("Ohio", "Statewide"),
+    "ohioctapp2": ("Ohio", "Statewide"),
+    "ohioctapp3": ("Ohio", "Statewide"),
+    "ohioctapp4": ("Ohio", "Statewide"),
+    "ohioctapp5": ("Ohio", "Statewide"),
+    "ohioctapp6": ("Ohio", "Statewide"),
+    "ohioctapp7": ("Ohio", "Statewide"),
+    "ohioctapp8": ("Ohio", "Statewide"),
+    "ohioctapp9": ("Ohio", "Statewide"),
+    "ohioctapp10": ("Ohio", "Statewide"),
+    "ohioctapp11": ("Ohio", "Statewide"),
+    "ohioctapp12": ("Ohio", "Statewide"),
+    # California Courts of Appeal
+    "calctapp1": ("California", "Statewide"),
+    "calctapp2": ("California", "Statewide"),
+    "calctapp3": ("California", "Statewide"),
+    "calctapp4": ("California", "Statewide"),
+    "calctapp5": ("California", "Statewide"),
+    "calctapp6": ("California", "Statewide"),
+    # Illinois Appellate Courts
+    "illappct1": ("Illinois", "Statewide"),
+    "illappct2": ("Illinois", "Statewide"),
+    "illappct3": ("Illinois", "Statewide"),
+    "illappct4": ("Illinois", "Statewide"),
+    "illappct5": ("Illinois", "Statewide"),
+    # Pennsylvania Superior and Commonwealth Courts
+    "pasuperct": ("Pennsylvania", "Statewide"),
+    "pacommwct": ("Pennsylvania", "Statewide"),
+    # Michigan Court of Appeals
+    "michctapp": ("Michigan", "Statewide"),
+    # North Carolina Court of Appeals
+    "ncctapp": ("North Carolina", "Statewide"),
+    # New Jersey Appellate Division
+    "njsuperctappdiv": ("New Jersey", "Statewide"),
+    # Virginia Court of Appeals
+    "vactapp": ("Virginia", "Statewide"),
+    # Washington Court of Appeals
+    "washctapp1": ("Washington", "Statewide"),
+    "washctapp2": ("Washington", "Statewide"),
+    "washctapp3": ("Washington", "Statewide"),
+    # Arizona Court of Appeals
+    "arizctapp1": ("Arizona", "Statewide"),
+    "arizctapp2": ("Arizona", "Statewide"),
+    # Tennessee Court of Appeals
+    "tennctapp": ("Tennessee", "Statewide"),
+    "tenncrimapp": ("Tennessee", "Statewide"),
+    # Missouri Court of Appeals
+    "moctapp": ("Missouri", "Statewide"),
+    "moctappwdist": ("Missouri", "Statewide"),
+    "moctappedist": ("Missouri", "Statewide"),
+    "moctappsdist": ("Missouri", "Statewide"),
+    # Maryland Court of Special Appeals
+    "mdctspecapp": ("Maryland", "Statewide"),
+    # Wisconsin Court of Appeals
+    "wisctapp1": ("Wisconsin", "Statewide"),
+    "wisctapp2": ("Wisconsin", "Statewide"),
+    "wisctapp3": ("Wisconsin", "Statewide"),
+    "wisctapp4": ("Wisconsin", "Statewide"),
+    # Minnesota Court of Appeals
+    "minnctapp": ("Minnesota", "Statewide"),
+    # Colorado Court of Appeals
+    "coloctapp": ("Colorado", "Statewide"),
+    # South Carolina Court of Appeals
+    "scctapp": ("South Carolina", "Statewide"),
+    # Alabama Court of Civil Appeals / Court of Criminal Appeals
+    "alacivapp": ("Alabama", "Statewide"),
+    "alacrimapp": ("Alabama", "Statewide"),
+    # Louisiana Courts of Appeal
+    "laapp1": ("Louisiana", "Statewide"),
+    "laapp2": ("Louisiana", "Statewide"),
+    "laapp3": ("Louisiana", "Statewide"),
+    "laapp4": ("Louisiana", "Statewide"),
+    "laapp5": ("Louisiana", "Statewide"),
+    # Kentucky Court of Appeals
+    "kyctapp": ("Kentucky", "Statewide"),
+    # Oregon Court of Appeals
+    "orctapp": ("Oregon", "Statewide"),
+    # Oklahoma Court of Civil Appeals / Court of Criminal Appeals
+    "oklacivilapp": ("Oklahoma", "Statewide"),
+    "oklacrimapp": ("Oklahoma", "Statewide"),
+    # Connecticut Appellate Court
+    "connappct": ("Connecticut", "Statewide"),
+    # Utah Court of Appeals
+    "utahctapp": ("Utah", "Statewide"),
+    # Iowa Court of Appeals
+    "iowactapp": ("Iowa", "Statewide"),
+    # Arkansas Court of Appeals
+    "arkctapp": ("Arkansas", "Statewide"),
+    # Mississippi Court of Appeals
+    "missctapp": ("Mississippi", "Statewide"),
+    # Kansas Court of Appeals
+    "kanctapp": ("Kansas", "Statewide"),
+    # New Mexico Court of Appeals
+    "nmctapp": ("New Mexico", "Statewide"),
+    # Nebraska Court of Appeals
+    "nebctapp": ("Nebraska", "Statewide"),
+    # West Virginia Intermediate Court of Appeals
+    "wvactapp": ("West Virginia", "Statewide"),
+    # Idaho Court of Appeals
+    "idahoctapp": ("Idaho", "Statewide"),
+    # Montana
+    "montag": ("Montana", "Statewide"),
+    # DC Court of Appeals (local, not federal circuit)
+    "dc": ("District of Columbia", "Statewide"),
+}
 
 
 # CourtListener opinion type codes

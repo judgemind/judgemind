@@ -428,3 +428,66 @@ class TestStreamMaxlen:
         health = _make_health()
         with pytest.raises(redis.ConnectionError):
             bus.emit_health(health)
+
+
+# ---------------------------------------------------------------------------
+# Tests: extra dict round-trip through emit_document_captured (AC1 / #3842)
+# ---------------------------------------------------------------------------
+
+
+class TestExtraRoundTrip:
+    """Verify that doc.extra survives the EventBus serialization hop."""
+
+    def test_extra_round_trips(self) -> None:
+        """Non-empty doc.extra must appear verbatim in the emitted Redis payload."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+
+        extra = {
+            "courtlistener_court_id": "texapp1",
+            "courtlistener_cluster_id": 42,
+            "courtlistener_opinion_id": 99,
+            "precedential_status": "Published",
+        }
+        doc = _make_doc(extra=extra)
+        bus.emit_document_captured(doc, producer_id="test-extra-round-trip")
+
+        call_args = mock_redis.xadd.call_args
+        payload = json.loads(call_args[0][1]["data"])
+
+        assert "extra" in payload, "extra key missing from emitted payload"
+        assert payload["extra"] == extra, (
+            f"extra was mangled: expected {extra!r}, got {payload['extra']!r}"
+        )
+
+    def test_empty_extra_round_trips_as_empty_dict(self) -> None:
+        """When doc.extra is empty, the payload must contain extra={}."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+
+        doc = _make_doc()  # extra defaults to {}
+        bus.emit_document_captured(doc, producer_id="test")
+
+        call_args = mock_redis.xadd.call_args
+        payload = json.loads(call_args[0][1]["data"])
+
+        assert "extra" in payload, "extra key missing from emitted payload even when empty"
+        assert payload["extra"] == {}, f"expected empty dict, got {payload['extra']!r}"
+
+    def test_extra_with_nested_values_round_trips(self) -> None:
+        """Nested values inside extra (lists, nested dicts) survive serialization."""
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+
+        extra = {
+            "tags": ["federal", "civil"],
+            "metadata": {"source": "courtlistener", "version": 4},
+        }
+        doc = _make_doc(extra=extra)
+        bus.emit_document_captured(doc, producer_id="test")
+
+        payload = json.loads(mock_redis.xadd.call_args[0][1]["data"])
+        assert payload["extra"] == extra

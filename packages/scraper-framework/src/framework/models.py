@@ -163,6 +163,7 @@ class DocumentCapturedEvent(EventEnvelope):
     hearing_date: datetime | None
     capture_timestamp: datetime
     parties: list[dict[str, str]] = Field(default_factory=list)
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class ScraperHealthEvent(EventEnvelope):
