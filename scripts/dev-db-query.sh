@@ -177,6 +177,19 @@ while true; do
     sleep 3
 done
 
+# ─── Wait for ECS Exec agent to be ready ────────────────────────────────────
+# Even when list-tasks returns a running ARN the execute-command agent inside
+# the container may not be accepting connections yet (common during a rolling
+# deploy). Poll with a harmless probe before running the real query so the
+# user sees clear retry progress instead of the raw AWS error.
+
+# shellcheck source=scripts/_ecs_exec_lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_ecs_exec_lib.sh"
+
+if ! wait_for_exec_agent_ready "$CLUSTER" "$task_arn" "$CONTAINER" "$REGION"; then
+    exit 1
+fi
+
 # ─── Build the command ───────────────────────────────────────────────────────
 
 echo "Running query on dev database via ECS Exec..." >&2

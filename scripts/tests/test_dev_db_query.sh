@@ -539,6 +539,129 @@ test_polls_then_gives_up_with_clear_error() {
     fi
 }
 
+# ── Exec-agent readiness probe tests (#3896) ──────────────────────────────
+
+# Mock aws that returns a task ARN on list-tasks, and for execute-command
+# either exits 0 immediately (success) or fails with the retryable
+# InvalidParameterException message N times before succeeding (or always fails
+# to test deadline).
+#
+# Args:
+#   $1 — number of execute-command calls that return the retryable error
+#        (0 = succeed immediately; -1 = always fail / deadline)
+#   $2 — (optional) tmpdir base; if omitted a new one is created
+#
+# Prints the mock_bin path.
+setup_mock_aws_exec_agent() {
+    local retryable_calls="$1"
+    local tmpdir
+    tmpdir=$(make_temp_dir)
+    local mock_bin="$tmpdir/bin"
+    local state_file="$tmpdir/exec_call_count"
+    mkdir -p "$mock_bin"
+    echo "0" > "$state_file"
+
+    # Write a separate retryable-error payload file so the mock script can
+    # cat it without needing inline heredocs (which are blocked by the
+    # preflight hook in interactive Bash calls but are fine in written files).
+    local err_file="$tmpdir/exec_err.txt"
+    printf 'An error occurred (InvalidParameterException) when calling the ExecuteCommand operation: The execute command agent is not running. Please wait until the exec agent on your task is ready.\n' \
+        > "$err_file"
+
+    cat > "$mock_bin/aws" << MOCK_AWS
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "list-tasks" ]]; then
+    echo "arn:aws:ecs:us-west-2:000000000000:task/fake-cluster/fake-exec-task"
+    exit 0
+fi
+if [[ "\${1:-}" == "ecs" && "\${2:-}" == "execute-command" ]]; then
+    count=\$(cat "$state_file")
+    count=\$((count + 1))
+    echo "\$count" > "$state_file"
+    # retryable_calls == -1 means always fail
+    if [[ $retryable_calls -eq -1 || \$count -le $retryable_calls ]]; then
+        cat "$err_file" >&2
+        exit 1
+    fi
+    echo "[]"
+    exit 0
+fi
+echo "Mock aws: unexpected command: \$*" >&2
+exit 1
+MOCK_AWS
+    chmod +x "$mock_bin/aws"
+    echo "$mock_bin"
+}
+
+test_exec_agent_probe_success() {
+    # Probe exits 0 on first call — no retry messages, real query reached.
+    local mock_bin
+    mock_bin=$(setup_mock_aws_exec_agent 0)
+    local output rc=0
+    output=$(LIST_TASKS_POLL_TIMEOUT_SECS=10 EXEC_AGENT_POLL_TIMEOUT_SECS=10 \
+        run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+
+    if [[ "$output" == *"exec agent"*"not ready"* ]]; then
+        fail "exec_agent_probe_success: no retry message expected" "got: $output"
+        return
+    fi
+    # Script should have reached execute-command (rc=0 or probe stage passed).
+    # The mock execute-command returns "[]" which after SSM strip is empty
+    # (or passes through) — either way the script must NOT have exited from
+    # the probe-failure path.
+    if [[ "$output" == *"ECS exec agent on task"*"did not come up"* ]]; then
+        fail "exec_agent_probe_success: must not emit deadline message" "got: $output"
+        return
+    fi
+    pass "exec_agent_probe_success: probe succeeds immediately, no retry noise"
+}
+
+test_exec_agent_probe_retries() {
+    # Probe returns retryable error on calls 1–2, succeeds on call 3.
+    # Must emit retry messages and then proceed (not exit non-zero).
+    local mock_bin
+    mock_bin=$(setup_mock_aws_exec_agent 2)
+    local output rc=0
+    output=$(LIST_TASKS_POLL_TIMEOUT_SECS=10 EXEC_AGENT_POLL_TIMEOUT_SECS=20 \
+        run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+
+    if [[ "$output" != *"exec agent"*"not ready"* ]]; then
+        fail "exec_agent_probe_retries: expected retry message in output" "got: $output"
+        return
+    fi
+    if [[ "$output" == *"ECS exec agent on task"*"did not come up"* ]]; then
+        fail "exec_agent_probe_retries: must not emit deadline message when probe eventually succeeds" \
+            "got: $output"
+        return
+    fi
+    pass "exec_agent_probe_retries: retry messages printed, script proceeds after agent ready"
+}
+
+test_exec_agent_probe_deadline_msg() {
+    # Probe always returns the retryable error. With a very short timeout the
+    # script must exit non-zero and emit the specific deadline message — NOT the
+    # raw "execute command was not enabled" text alone.
+    local mock_bin
+    mock_bin=$(setup_mock_aws_exec_agent -1)
+    local output rc=0
+    output=$(LIST_TASKS_POLL_TIMEOUT_SECS=10 EXEC_AGENT_POLL_TIMEOUT_SECS=2 \
+        run_script "$mock_bin" "SELECT 1" 2>&1) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        fail "exec_agent_probe_deadline_msg: must exit non-zero on deadline" "got: $output"
+        return
+    fi
+    if [[ "$output" != *"ECS exec agent on task"*"did not come up"* ]]; then
+        fail "exec_agent_probe_deadline_msg: must print specific deadline message" "got: $output"
+        return
+    fi
+    # The raw AWS message must not be the only error shown (it should be wrapped
+    # or replaced by the specific deadline message).
+    # We allow the raw message to appear in addition (it may be in retry lines),
+    # but the final-failure path must emit our friendly message.
+    pass "exec_agent_probe_deadline_msg: exits non-zero with specific deadline message"
+}
+
 # ── Run all ────────────────────────────────────────────────────────────────
 
 test_no_args_shows_usage
@@ -560,6 +683,9 @@ test_strips_own_line_cannot_perform
 test_empty_output_after_strip_is_ok
 test_polls_until_task_appears
 test_polls_then_gives_up_with_clear_error
+test_exec_agent_probe_success
+test_exec_agent_probe_retries
+test_exec_agent_probe_deadline_msg
 
 echo ""
 echo "────────────────────────────────────────────────"
