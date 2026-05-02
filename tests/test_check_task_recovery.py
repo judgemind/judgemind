@@ -26,10 +26,10 @@ def _build_fake_worktree(base: str, agent_id: str) -> tuple[str, str]:
     """Create a fake repo_root + worktree under `base` and return their paths."""
     repo_root = os.path.join(base, "repo")
     worktree = os.path.join(repo_root, ".claude", "worktrees", agent_id)
-    status_dir = os.path.join(repo_root, "tmp", "agent-status")
+    status_dir = os.path.join(worktree, "tmp")
     os.makedirs(worktree, exist_ok=True)
     os.makedirs(status_dir, exist_ok=True)
-    return worktree, os.path.join(status_dir, f"{agent_id}.txt")
+    return worktree, os.path.join(status_dir, "agent-status.txt")
 
 
 def run_script(worktree: str) -> subprocess.CompletedProcess[str]:
@@ -259,6 +259,30 @@ def test_spotcheck_step_phase_returns_resume_with_next_step() -> None:
         assert "2.5" in result.stdout or "orphan" in result.stdout.lower() or "spotcheck" in result.stdout.lower()
 
 
+def test_status_file_inside_worktree_sandbox_compatible() -> None:
+    """Status file path returned by the script is fully inside the worktree.
+
+    This verifies the sandbox-compatibility guarantee: the path must begin with
+    the worktree root so that worktree-sandboxed agents can write to it without
+    triggering a cross-worktree BLOCKED error.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        worktree, status_path = _build_fake_worktree(tmp, "agent-sandbox")
+        with open(status_path, "w") as f:
+            f.write("issue: #9999\nphase: claiming\nupdated: x\nsummary: y\n")
+        # The status file itself must be under the worktree
+        assert status_path.startswith(worktree), (
+            f"STATUS_FILE {status_path!r} is not inside the worktree {worktree!r}"
+        )
+        # Also confirm the script reads the file successfully (returns RESUME, not UNKNOWN)
+        result = run_script(worktree)
+        assert result.returncode == 1, (
+            f"expected exit 1 (RESUME), got {result.returncode}: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "RESUME" in result.stdout
+
+
 def main() -> int:
     tests = [
         ("missing status file -> UNKNOWN", test_missing_status_file_returns_unknown),
@@ -276,6 +300,7 @@ def main() -> int:
         ("empty phase field -> UNKNOWN", test_empty_phase_field_returns_unknown),
         ("phase=audit-category-1.5 -> RESUME with next category", test_audit_category_phase_returns_resume_with_next_category),
         ("phase=spotcheck-step-2 -> RESUME with next step", test_spotcheck_step_phase_returns_resume_with_next_step),
+        ("status file is inside worktree (sandbox compatible)", test_status_file_inside_worktree_sandbox_compatible),
     ]
     for desc, fn in tests:
         run_test(desc, fn)

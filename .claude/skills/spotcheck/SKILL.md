@@ -49,7 +49,7 @@ Increment `autocompact_count` in the status file (initialize to `1` if absent).
 
 ## Step 0 — Set up
 
-Create `{worktree}/tmp/spotcheck/` and the agent status file (`{repo_root}/tmp/agent-status/{agent-id}.txt`):
+Create `{worktree}/tmp/spotcheck/` and the agent status file (`{worktree}/tmp/agent-status.txt`):
 
 ```
 issue: spotcheck-<timestamp>

@@ -69,7 +69,7 @@ When either path writes the verdict, the outer loop (§2e) terminates with `ralp
 
 ### Status file
 
-The `/task` skill sets up a status file at `{repo_root}/tmp/agent-status/{agent-id}.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0. Derive the status file path from the worktree path (e.g. `.claude/worktrees/agent-ab4722a2` -> `{repo_root}/tmp/agent-status/agent-ab4722a2.txt`, or `worktrees/worker-2` -> `{repo_root}/tmp/agent-status/worker-2.txt`).
+The `/task` skill sets up a status file at `{worktree}/tmp/agent-status.txt`. The `/ralph` skill writes status updates to this file at each worker/reviewer phase transition using the Write tool. The format is defined in `/task` Step 0.
 
 Under dispatcher v2, `/task-v2-ralph` does not provision this status file — the daemon owns agent status via `dispatcher.phase_transitions` rows. If the status file does not exist when ralph starts, skip the status-write steps silently (best-effort observability, not a correctness gate).
 

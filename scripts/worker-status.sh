@@ -29,6 +29,7 @@ WORKERS=$(
             /^worktree / {
                 path = $2
                 num = ""
+                wt_path = ""
                 # Match paths ending in /worktrees/worker-<digits>
                 n = split(path, parts, "/")
                 if (n >= 2 && parts[n-1] == "worktrees") {
@@ -37,13 +38,14 @@ WORKERS=$(
                     sub(/^worker-/, "", candidate)
                     if (candidate ~ /^[0-9]+$/) {
                         num = candidate
+                        wt_path = path
                     }
                 }
             }
             /^branch / {
                 if (num != "") {
                     branch = substr($2, 12)   # strip "refs/heads/"
-                    print num, branch
+                    print num, branch, wt_path
                 }
             }
         '
@@ -67,14 +69,14 @@ printf "%-8s %-45s %-7s %-7s %-15s %s\n" \
 # ---------------------------------------------------------------------------
 OUTPUT=""
 
-while read -r worker_num branch; do
+while read -r worker_num branch worker_path; do
     pr_num="—"
     issue_num="—"
     ci_status="—"
     agent_phase="—"
 
-    # --- Agent status file ---
-    status_file="$REPO_ROOT/tmp/agent-status/worker-${worker_num}.txt"
+    # --- Agent status file (lives inside the worktree) ---
+    status_file="$worker_path/tmp/agent-status.txt"
     if [[ -f "$status_file" ]]; then
         agent_phase=$(awk -F': ' '/^phase:/ { print $2 }' "$status_file")
         file_issue=$(awk -F': ' '/^issue:/ { print $2 }' "$status_file")

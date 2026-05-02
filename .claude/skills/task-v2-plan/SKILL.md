@@ -238,4 +238,4 @@ For an issue "ops: restore Santa Clara county data after SC outage (#2419)":
 - Prefer MCP for GitHub reads (`mcp__github__get_issue`, `mcp__github__get_file_contents`). Keep `gh` for writes — but in this phase, you should make no writes to GitHub at all.
 - Use Grep, Glob, and Read tools — never `find`, `cat`, `head`, `tail` from Bash.
 - If context exceeds ~20k tokens from long issue bodies or comment threads: summarize comments >2k tokens in `plan_text` rather than quoting verbatim. The downstream phases only see your `plan.json`, not the raw issue.
-- The dispatcher-daemon owns the agent status in `dispatcher.phase_transitions`. Do NOT write to any file under `{repo_root}/tmp/agent-status/` — that convention belongs to the laptop-dispatcher `/task` skill, not the Fargate daemon.
+- The dispatcher-daemon owns the agent status in `dispatcher.phase_transitions`. Do NOT write to `{worktree}/tmp/agent-status.txt` — that convention belongs to the laptop-dispatcher `/task` skill, not the Fargate daemon.

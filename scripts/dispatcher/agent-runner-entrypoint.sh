@@ -3707,7 +3707,7 @@ stop_ralph_head_watcher() {
 
 # ── Skill phase watcher (#3462) ───────────────────────────────────────────
 #
-# Tails ``$REPO_ROOT/tmp/agent-status/$AGENT_ID.txt`` while a scheduled
+# Tails ``$REPO_ROOT/tmp/agent-status.txt`` while a scheduled
 # skill (audit, spotcheck, etc.) is running and fans each ``phase:``
 # change out as a structured ``agent_runner.skill_phase_change`` event
 # on stdout (fd 3 via ``log``).
@@ -3737,7 +3737,7 @@ skill_phase_watcher_loop() {
     _watcher_sleep_pid=""
     trap '[[ -n "$_watcher_sleep_pid" ]] && kill "$_watcher_sleep_pid" 2>/dev/null; exit 0' TERM INT
 
-    _status_file="$REPO_ROOT/tmp/agent-status/$AGENT_ID.txt"
+    _status_file="$REPO_ROOT/tmp/agent-status.txt"
     _last_phase=""
 
     log "skill_phase_watcher_started" \
