@@ -2128,7 +2128,8 @@ def _drop_short_unsubstantive_rulings(
 # case_number instead of the real one.
 #
 # Drop condition (all three must hold):
-#   * ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``
+#   * ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``, OR
+#     ``_BRACKETED_PLACEHOLDER_TITLE_RE`` matches anywhere in the title
 #   * ``extracted_case_number`` is None or empty string
 #   * ``entry_number`` is None
 #
@@ -2162,12 +2163,13 @@ def _drop_role_literal_orphan_rulings(
     Rules:
 
     - A ruling is dropped when ALL THREE conditions hold:
-      1. ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``
+      1. ``_ROLE_LITERAL_TITLE_RE`` matches ``extracted_case_title``, OR
+         ``_BRACKETED_PLACEHOLDER_TITLE_RE`` matches anywhere in the title
       2. ``extracted_case_number`` is None or empty
       3. ``entry_number`` is None
     - Rulings with a valid ``extracted_case_number`` are ALWAYS preserved,
-      even when the title happens to be role-literal (genuine pseudonym
-      cases, e.g. Doe v. Smith).
+      even when the title happens to be role-literal or a bracketed
+      placeholder (genuine pseudonym cases, e.g. Doe v. Smith).
     - Rulings with a valid ``entry_number`` are preserved — they are real
       calendar rows, not orphans.
     """
@@ -2176,7 +2178,11 @@ def _drop_role_literal_orphan_rulings(
         title = ruling.extracted_case_title or ""
         has_case_number = bool(ruling.extracted_case_number)
         has_entry_number = ruling.entry_number is not None
-        if _ROLE_LITERAL_TITLE_RE.match(title) and not has_case_number and not has_entry_number:
+        if (
+            (_ROLE_LITERAL_TITLE_RE.match(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title))
+            and not has_case_number
+            and not has_entry_number
+        ):
             logger.warning(
                 "llm_extractor.role_literal_orphan_dropped",
                 case_title=ruling.extracted_case_title,
