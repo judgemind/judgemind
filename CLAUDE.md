@@ -156,6 +156,7 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 
 - **Claim interlock (`status/in-progress` label, label-only).** On claim, `/task` adds `status/in-progress` before removing `agent/ready`; removes it on terminal. Issue #2927 replaced the prior DB-row + label interlock (#2866) with this label-only flow.
 - **Single-issue rule.** Each PR addresses exactly one issue.
+- **No placeholder PR titles or empty bodies.** Never push or merge a PR titled `WIP:`, `ralph output`, or any placeholder, and never with an empty body. `task-v2-summary` (or A.2b in `/task`) MUST replace the title and populate the body before the push that opens the PR. CI rejects placeholder titles via `.github/workflows/pr-title-check.yml`.
 - **All commits on the worktree branch.** Every change goes through a PR.
 - **Scope completeness check before implementing.** Grep for all locations affected by the change.
 - **Ralph for testable code only** (Python, TypeScript). Non-testable tasks implement directly, then run pre-PR checks and self-review the diff.
