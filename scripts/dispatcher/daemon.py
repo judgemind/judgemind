@@ -414,6 +414,42 @@ DEFAULT_AGENT_EXECUTION_MODE = "ecs"
 #: an unknown launch lane.
 AGENT_EXECUTION_MODES: frozenset[str] = frozenset({"subprocess", "ecs"})
 
+#: Cohabitation scoping (#3875). Every v2-daemon query against
+#: ``dispatcher.agents`` that selects or updates more than one row by
+#: criteria *other* than the row's ``agent_id`` UUID PK MUST include
+#: this fragment in its ``WHERE`` clause so v2 only sees v2-owned
+#: rows. v3 cohabits the same table — its rows have
+#: ``parent_run_id`` whose lineage in ``dispatcher.runs`` carries
+#: ``dispatcher_version='v3'`` (column added by migration 56,
+#: #3872). Without this filter, v2's recovery / sweep / reaper code
+#: would silently corrupt v3-owned rows during the rollout window —
+#: e.g. :meth:`_clear_stale_agent_task_arns` would null v3's task
+#: ARNs at the 2h mark, :meth:`_check_stuck_agents` would stop v3
+#: tasks via ``ecs:StopTask``, :meth:`recover_abandoned_agents`
+#: would flip v3 rows to ``crashed`` on every v2 redeploy.
+#:
+#: Queries scoped by ``WHERE agent_id = %s`` do NOT need this filter
+#: — ``agent_id`` is a UUID PK, and v3's UUIDs cannot collide with
+#: ``agent_id`` values v2 would have on hand (v2 only learns
+#: ``agent_id`` values from rows it itself inserted; v3 never hands
+#: a UUID into a v2 code path). Such sites are still tagged with the
+#: marker comment ``# v2-scoped: by-agent-id`` so the CI grep test
+#: (``tests/test_agent_query_scoping.py``) can recognize them as
+#: explicitly-considered-and-safe.
+#:
+#: The subquery against ``dispatcher.runs`` is uncached: every call
+#: re-evaluates it. The runs table is small (<100 rows lifetime) and
+#: the daemon's tick cadence is seconds, not microseconds — the
+#: extra plan time is unmeasurable next to the GitHub API round-
+#: trips that dominate every supervisor tick. A future optimization
+#: could materialize a per-tick cache of v2 run_ids if profiling
+#: ever surfaces the cost.
+V2_SCOPED_PARENT_RUN_FILTER = (
+    "parent_run_id IN ("
+    "SELECT run_id FROM dispatcher.runs WHERE dispatcher_version = 'v2'"
+    ")"
+)
+
 #: Number of ``ecs:RunTask`` attempts per agent launch. Three attempts
 #: with 1s + 2s backoff mirrors the retry shape used by
 #: :meth:`DispatcherDaemon._baseline_fetch_origin_main` (issue #3085)
@@ -4517,8 +4553,13 @@ class DispatcherDaemon:
                 # exec-mode-agnostic (#3158): concurrency-cap predicate;
                 # ``status='running'`` counts equally for subprocess
                 # and ECS agents — they both consume one cap slot.
+                # v2-scoped: parent-run-id-filter (#3875) — v3-owned
+                # running rows must not consume v2's cap slot.
                 cur.execute(
-                    "SELECT 1 FROM dispatcher.agents WHERE status = 'running' LIMIT 1",
+                    "SELECT 1 FROM dispatcher.agents "
+                    "WHERE status = 'running' "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
+                    "LIMIT 1",
                 )
                 row = cur.fetchone()
             self._conn.commit()
@@ -4560,8 +4601,12 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before checking"
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: parent-run-id-filter (#3875) — v3-owned
+                # running rows must not consume v2's cap slot.
                 cur.execute(
-                    "SELECT COUNT(*) FROM dispatcher.agents WHERE status = 'running'",
+                    "SELECT COUNT(*) FROM dispatcher.agents "
+                    "WHERE status = 'running' "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER}",
                 )
                 row = cur.fetchone()
             self._conn.commit()
@@ -5000,6 +5045,9 @@ class DispatcherDaemon:
         # exec-mode-agnostic (#3158): orphan-PR scan covers all failed agents
         # regardless of how they were launched; execution_mode does not affect
         # PR resurrection eligibility.
+        # v2-scoped: parent-run-id-filter (#3875) — only v2-claim-paths
+        # should defer to v2's resurrection sweep; a v3-failed agent on
+        # the same issue must not block a v2 claim attempt.
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
@@ -5010,6 +5058,7 @@ class DispatcherDaemon:
                     "  AND pr_number IS NOT NULL "
                     "  AND ended_at IS NOT NULL "
                     "  AND ended_at > now() - %s "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY ended_at DESC "
                     "LIMIT 1",
                     (issue_number, ORPHAN_PR_RESURRECTION_LOOKBACK),
@@ -5165,6 +5214,12 @@ class DispatcherDaemon:
 
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: daemon-write-with-run-id (#3875) — INSERT
+                # tags ``parent_run_id = self._run_id`` whose row in
+                # ``dispatcher.runs`` carries ``dispatcher_version='v2'``
+                # (set by :meth:`check_lease_and_register_run`). Source
+                # of truth for the V2_SCOPED_PARENT_RUN_FILTER on every
+                # subsequent v2 read/update.
                 cur.execute(
                     "INSERT INTO dispatcher.agents "
                     "    (agent_id, parent_run_id, kind, issue_number, "
@@ -5278,10 +5333,14 @@ class DispatcherDaemon:
                 # exec-mode-agnostic (#3158): race-lost diagnostic;
                 # both subprocess and ECS agents write ``kind='task'``
                 # and the race classification is identical.
+                # v2-scoped: parent-run-id-filter (#3875) — race-lost
+                # logging is a v2-only diagnostic; a v3 active row on
+                # the same issue is not the race v2 just lost.
                 cur.execute(
                     "SELECT kind FROM dispatcher.agents "
                     "WHERE issue_number = %s "
                     "  AND status IN ('running', 'retrying') "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "LIMIT 1",
                     (issue_number,),
                 )
@@ -5583,13 +5642,32 @@ class DispatcherDaemon:
                 # migration set ``DEFAULT 'subprocess' NOT NULL`` so in
                 # practice every row has a value, but NULL is
                 # defensively coerced to ``'subprocess'`` downstream.
+                # v2-scoped: parent-run-id-filter (#3875) — gate on
+                # ``parent_run_id`` lineage being v2 BEFORE the prior-
+                # run-mismatch test so v3-owned rows are never seen by
+                # this sweep. Without this, a v3-owned running row
+                # whose parent_run_id is one of v3's runs would match
+                # the ``parent_run_id <> self._run_id`` half (since
+                # any v3 run_id is non-equal to v2's self._run_id) and
+                # be flipped to crashed + daemon_restart_abandoned on
+                # every v2 redeploy. This is the most destructive of
+                # the v2/v3 collision sites — see #3875.
+                #
+                # The IN-subquery is NULL-rejecting, so pre-#3872
+                # NULL ``parent_run_id`` rows are dropped from this
+                # sweep. Those rows fall back to the existing
+                # stuck_timeout sweep on the next supervisor tick (a
+                # 30-minute delay vs. immediate recovery, but the
+                # backstop is still correct). #3872 landed weeks
+                # before v3 ships, so any in-production NULL rows are
+                # long-since terminal — the regression is theoretical.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, "
                     "       execution_mode, agent_task_arn "
                     "FROM dispatcher.agents "
                     "WHERE status = 'running' "
-                    "  AND (parent_run_id IS NULL "
-                    "       OR parent_run_id <> %s)",
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
+                    "  AND parent_run_id <> %s",
                     (self._run_id,),
                 )
                 for row in cur.fetchall():
@@ -10232,10 +10310,13 @@ class DispatcherDaemon:
                 # to order the right way anyway).
                 # #3158: ``COALESCE(execution_mode, 'subprocess') <> 'ecs'``
                 # excludes ECS-mode rows — see docstring.
+                # v2-scoped: parent-run-id-filter (#3875) — only v2 rows
+                # belong on the v2 subprocess-resume lane.
                 cur.execute(
                     "SELECT agent_id, issue_number FROM dispatcher.agents "
                     "WHERE status = 'retrying' "
                     "  AND COALESCE(execution_mode, 'subprocess') <> 'ecs' "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY started_at ASC "
                     "LIMIT 1",
                 )
@@ -10376,11 +10457,15 @@ class DispatcherDaemon:
         assert self._conn is not None, "connect() must run before ecs retry check"
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: parent-run-id-filter (#3875) — v3-owned
+                # ECS retrying rows are v3's problem to surface, not
+                # v2's WARN-emitting diagnostic.
                 cur.execute(
                     "SELECT agent_id, issue_number "
                     "FROM dispatcher.agents "
                     "WHERE status = 'retrying' "
                     "  AND execution_mode = 'ecs' "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "LIMIT 5",
                 )
                 rows = cur.fetchall()
@@ -11131,6 +11216,10 @@ class DispatcherDaemon:
         non_infra_phases = list(_INFRA_PREEMPTION_CATEGORIES)
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: parent-run-id-filter (#3875) — prior-
+                # attempts context for a v2 ralph rerun should reflect
+                # only v2's prior attempts on the same issue. v3's
+                # failures are surfaced through v3's own retry context.
                 cur.execute(
                     "SELECT "
                     "  a.failure_summary, "
@@ -11145,6 +11234,7 @@ class DispatcherDaemon:
                     "WHERE a.issue_number = %s "
                     "  AND a.status IN ('failed', 'crashed') "
                     "  AND a.phase != ALL(%s) "
+                    f"  AND a.{V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY a.started_at DESC "
                     "LIMIT 3",
                     (issue_number, non_infra_phases),
@@ -14029,6 +14119,10 @@ class DispatcherDaemon:
                 # a hard-coded ``interval '24 hours'`` into the SQL —
                 # makes the constant the single source of truth and
                 # keeps the query tunable from one place.
+                # v2-scoped: parent-run-id-filter (#3875) — v2's
+                # orphan-PR resurrection sweep must not touch v3 PRs.
+                # Without this, v2 would attempt to merge a v3-owned
+                # mergeable PR via :meth:`_mark_agent_resurrected_for_orphan_pr`.
                 cur.execute(
                     "SELECT agent_id, pr_number, issue_number "
                     "FROM dispatcher.agents "
@@ -14037,6 +14131,7 @@ class DispatcherDaemon:
                     "  AND issue_number IS NOT NULL "
                     "  AND ended_at IS NOT NULL "
                     "  AND ended_at > now() - %s "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY ended_at DESC",
                     (ORPHAN_PR_RESURRECTION_LOOKBACK,),
                 )
@@ -14271,6 +14366,9 @@ class DispatcherDaemon:
                 # while a NULL-issue row sits in any
                 # ``status='succeeded' phase IN ('done',
                 # 'retro_done', 'retro_failed')`` state).
+                # v2-scoped: parent-run-id-filter (#3875) — supervisor
+                # advance loop must not drive v3-owned agents through
+                # v2's merge / verify / retro state machine.
                 cur.execute(
                     "SELECT agent_id, issue_number, phase, pr_number, "
                     "       worktree_path, retries_used, status, "
@@ -14283,6 +14381,7 @@ class DispatcherDaemon:
                     "        AND phase IN ('awaiting_deploy', 'done', "
                     "                      'retro_done', 'retro_failed'))) "
                     "  AND issue_number IS NOT NULL "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY started_at ASC",
                 )
                 for row in cur.fetchall():
@@ -17954,6 +18053,10 @@ class DispatcherDaemon:
         ] = []
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: parent-run-id-filter (#3875) — stuck-
+                # timeout sweep would otherwise SIGKILL/StopTask v3
+                # agents and flip their rows to crashed. v3 owns its
+                # own stuck detection.
                 cur.execute(
                     "SELECT a.agent_id, a.issue_number, a.phase, "
                     "       EXTRACT(EPOCH FROM ("
@@ -17971,7 +18074,8 @@ class DispatcherDaemon:
                     "    FROM dispatcher.phase_transitions "
                     "    WHERE agent_id = a.agent_id"
                     ") pt ON TRUE "
-                    "WHERE a.status = 'running'",
+                    "WHERE a.status = 'running' "
+                    f"  AND a.{V2_SCOPED_PARENT_RUN_FILTER}",
                 )
                 rows = cur.fetchall()
                 for row in rows:
@@ -23951,9 +24055,14 @@ class DispatcherDaemon:
                 # same way, so the predicate doesn't need to branch on
                 # execution_mode. Mirrors :meth:`_has_active_agent`'s
                 # exec-mode-agnostic SELECT pattern.
+                # v2-scoped: parent-run-id-filter (#3875) — v2's
+                # scheduled-skill collision guard considers only v2-
+                # owned skill agents.
                 cur.execute(
                     "SELECT 1 FROM dispatcher.agents "
-                    " WHERE status = 'running' AND phase = %s LIMIT 1",
+                    " WHERE status = 'running' AND phase = %s "
+                    f"   AND {V2_SCOPED_PARENT_RUN_FILTER} "
+                    " LIMIT 1",
                     (name,),
                 )
                 row = cur.fetchone()
@@ -23976,15 +24085,21 @@ class DispatcherDaemon:
         try:
             with self._conn.cursor() as cur:
                 if since is None:
-                    cur.execute(
-                        "SELECT COUNT(*) FROM dispatcher.agents "
-                        " WHERE merged_at IS NOT NULL"
-                    )
-                else:
+                    # v2-scoped: parent-run-id-filter (#3875) — every_n_merges
+                    # trigger fires off v2 merges only.
                     cur.execute(
                         "SELECT COUNT(*) FROM dispatcher.agents "
                         " WHERE merged_at IS NOT NULL "
-                        "   AND merged_at > %s",
+                        f"   AND {V2_SCOPED_PARENT_RUN_FILTER}"
+                    )
+                else:
+                    # v2-scoped: parent-run-id-filter (#3875) — every_n_merges
+                    # trigger fires off v2 merges only.
+                    cur.execute(
+                        "SELECT COUNT(*) FROM dispatcher.agents "
+                        " WHERE merged_at IS NOT NULL "
+                        "   AND merged_at > %s "
+                        f"   AND {V2_SCOPED_PARENT_RUN_FILTER}",
                         (since,),
                     )
                 row = cur.fetchone()
@@ -24026,6 +24141,9 @@ class DispatcherDaemon:
         agent_id = str(uuid.uuid4())
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: daemon-write-with-run-id (#3875) — INSERT
+                # tags parent_run_id = self._run_id (v2). Source of
+                # truth for v2-scoping reads on this row.
                 cur.execute(
                     "INSERT INTO dispatcher.agents "
                     "    (agent_id, parent_run_id, kind, issue_number, "
@@ -25356,11 +25474,16 @@ class DispatcherDaemon:
         # filter does not pull in legacy work.
         try:
             with self._conn.cursor() as cur:
+                # v2-scoped: parent-run-id-filter (#3875) — ECS reaper
+                # would otherwise call ecs:DescribeTasks on v3's ARNs
+                # and route their STOPPED transitions through v2's
+                # _handle_agent_failure path.
                 cur.execute(
                     "SELECT agent_id, issue_number, agent_task_arn, "
                     "       phase, status "
                     "FROM dispatcher.agents "
                     "WHERE agent_task_arn IS NOT NULL "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER} "
                     "LIMIT 100"
                 )
                 rows = cur.fetchall()
@@ -26084,12 +26207,19 @@ class DispatcherDaemon:
         # parameter substitution rather than f-string interpolation —
         # mirrors the housekeeping DELETE pattern. ``cutoff_hours`` is
         # validated positive int by ``_read_retention_days``.
+        # v2-scoped: parent-run-id-filter (#3875) — without this, the
+        # 2h bulk clear would null v3's task ARNs at exactly the
+        # moment v3's per-agent Fargate tasks are still running. The
+        # adversarial review of the v3 spec called this the most
+        # destructive site in the v2 daemon. v3 owns its own stale-
+        # ARN cleanup against its own run lineage.
         with self._conn.cursor() as cur:
             cur.execute(
                 "UPDATE dispatcher.agents "
                 "SET agent_task_arn = NULL "
                 "WHERE agent_task_arn IS NOT NULL "
-                "  AND started_at < now() - make_interval(hours => %s)",
+                "  AND started_at < now() - make_interval(hours => %s) "
+                f"  AND {V2_SCOPED_PARENT_RUN_FILTER}",
                 (cutoff_hours,),
             )
             rows_cleared = cur.rowcount or 0
@@ -26141,12 +26271,16 @@ class DispatcherDaemon:
         # them via psycopg parameter substitution to keep parity with the
         # other housekeeping helpers.
         terminal_statuses = sorted(TERMINAL_AGENT_STATUSES)
+        # v2-scoped: parent-run-id-filter (#3875) — bulk ended_at
+        # backfill for v2 rows only; v3 owns its own ended_at
+        # invariant against its own run lineage.
         with self._conn.cursor() as cur:
             cur.execute(
                 "UPDATE dispatcher.agents "
                 "SET ended_at = now() "
                 "WHERE status = ANY(%s::text[]) "
-                "  AND ended_at IS NULL",
+                "  AND ended_at IS NULL "
+                f"  AND {V2_SCOPED_PARENT_RUN_FILTER}",
                 (terminal_statuses,),
             )
             rows_stamped = cur.rowcount or 0
@@ -26182,11 +26316,16 @@ class DispatcherDaemon:
                 # exec-mode-agnostic (#3158): merged_at reconcile scans all
                 # agents; pr_number semantics are identical across ECS and
                 # subprocess lanes — both set it after the gh pr merge call.
+                # v2-scoped: parent-run-id-filter (#3875) — without this,
+                # v2 would call gh pr view on v3-owned PRs and clear v3's
+                # merged_at if the PR isn't observed merged from gh's
+                # vantage. v3 owns its own merged_at reconciliation.
                 cur.execute(
                     "SELECT agent_id, pr_number FROM dispatcher.agents "
                     "WHERE merged_at IS NOT NULL "
                     "  AND pr_number IS NOT NULL "
-                    "  AND merged_at > now() - INTERVAL '24 hours'",
+                    "  AND merged_at > now() - INTERVAL '24 hours' "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER}",
                 )
                 rows = list(cur.fetchall())
             self._conn.commit()
