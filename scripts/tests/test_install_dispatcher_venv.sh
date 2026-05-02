@@ -74,6 +74,16 @@ OUTPUT=$("$SCRIPT" --help 2>&1 || true)
 assert_exit_code 1 "$RC" "--help exits non-zero (unknown args rejected)"
 assert_contains "$OUTPUT" "Usage:" "usage message printed for --help"
 
+# --- Test 4: install line includes pytest-xdist ---
+echo "--- Test 4: install line includes pytest-xdist ---"
+if grep -E '^[^#].*install.*pytest-xdist' "$SCRIPT" >/dev/null 2>&1; then
+    echo "PASS: install line includes pytest-xdist"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: install line does not include pytest-xdist in $SCRIPT"
+    FAIL=$((FAIL + 1))
+fi
+
 # --- Summary ---
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -6,7 +6,7 @@
 # scripts/install-package-venv.sh (which requires a packages/<name>/ directory
 # with a pyproject.toml) cannot bootstrap the dispatcher's venv. This dedicated
 # helper fills that gap: it creates scripts/dispatcher/.venv and installs the
-# four runtime dependencies the dispatcher tests need.
+# five runtime dependencies the dispatcher tests need.
 #
 # Usage:
 #   scripts/install-dispatcher-venv.sh
@@ -17,9 +17,10 @@
 # dependencies are already satisfied.
 #
 # Dependency installation order:
-#   1. pytest, ruff, boto3  (PyPI)
-#   2. judgemind-config      (local editable, last so a PyPI flake does not
-#                             leave a half-populated venv that claims readiness)
+#   1. pytest, pytest-xdist, ruff, boto3  (PyPI)
+#   2. judgemind-config                    (local editable, last so a PyPI flake
+#                                          does not leave a half-populated venv
+#                                          that claims readiness)
 #
 # Exit codes:
 #   0 — venv is populated and usable
@@ -80,8 +81,8 @@ fi
 # Install these first so a judgemind-config install failure does not leave
 # a venv that looks partially ready.
 
-echo "Installing PyPI dependencies: pytest ruff boto3"
-"$PIP" install --quiet pytest ruff boto3
+echo "Installing PyPI dependencies: pytest pytest-xdist ruff boto3"
+"$PIP" install --quiet pytest pytest-xdist ruff boto3
 
 # ── Install local sibling dependency ─────────────────────────────────────
 # judgemind-config is an unpublished local package. Install it last (editable)

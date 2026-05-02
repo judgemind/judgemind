@@ -33,7 +33,7 @@ Run scripts via `scripts/run-py.sh scripts/<name>.py` — it reads the header an
 scripts/install-dispatcher-venv.sh
 ```
 
-This creates `scripts/dispatcher/.venv` and installs `pytest`, `ruff`, `boto3`, and an editable `packages/judgemind-config` — the four dependencies required by the dispatcher test suite. The script is idempotent: re-running it on an existing venv is safe.
+This creates `scripts/dispatcher/.venv` and installs `pytest`, `pytest-xdist`, `ruff`, `boto3`, and an editable `packages/judgemind-config` — the five dependencies required by the dispatcher test suite. The script is idempotent: re-running it on an existing venv is safe.
 
 **One-off and permanent markers.** **Every** top-level script must carry exactly one of the following markers, as a standalone top-level comment anywhere in the **first 50 lines** of the file (the header comment block — the marker sits adjacent to the `# venv:` header, typically just before or after the module docstring):
 
