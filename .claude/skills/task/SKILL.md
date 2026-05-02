@@ -34,7 +34,16 @@ mkdir -p {worktree}/tmp
 
 ### Status file setup
 
-After confirming the worktree, set up the agent status file so the dispatcher can monitor progress **and so you can recover from autocompact**. Derive an identifier from the worktree path (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`).
+After confirming the worktree, set up the agent status file so the dispatcher can monitor progress **and so you can recover from autocompact**.
+
+**Determining the agent-id (`AGENT_ID` env var precedence):**
+
+1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s status-file path, claim comment, and any future `progress.sh` calls correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#6 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
+2. **Otherwise, fall back to the cwd-derived id** (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`). This is today's behavior — Agent-tool spawn via the dispatcher-v2 daemon does not export `AGENT_ID`, so the cwd-derived path remains the fallback.
+
+Quick check (env var first, cwd fallback): `echo "${AGENT_ID:-$(basename "$PWD")}"`.
+
+The chosen value is `{agent-id}` for the rest of this skill — it appears in the status-file path (below), the claim comment in Step 2, and any future `progress.sh` calls.
 
 The status file lives at `{repo_root}/tmp/agent-status/{agent-id}.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
 
@@ -146,7 +155,7 @@ Write the claim comment to a temp file, then post it (write — stays on `gh`):
 ```
 gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/claim_comment.txt
 ```
-Comment content: `Picking this up in {agent-id}.`
+Comment content: `Picking this up in {agent-id}.` (Use the same `{agent-id}` resolved in Step 0 — i.e. `AGENT_ID` env var if set, else cwd-derived.)
 
 Once MCP writes are unblocked (follow-up issue referenced from `docs/agent/gh-to-mcp-migration.md`), this becomes `mcp__github__update_issue` + `mcp__github__add_issue_comment` with no tmp-file preamble.
 
