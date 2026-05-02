@@ -19428,9 +19428,11 @@ class DispatcherDaemon:
         is a terminal regardless of which runtime produced it.
 
         ``parent_run_id`` (#3872) carries the daemon-run lineage so
-        v3's per-run circuit-breaker scope can filter
-        ``WHERE parent_run_id = current_run_id``. v2's breaker
-        ignores this column today.
+        each daemon's circuit-breaker scope can filter on it.
+        v2's :meth:`_evaluate_circuit_breaker` uses
+        :data:`V2_SCOPED_PARENT_RUN_FILTER` (#3876) to exclude v3
+        outcomes from its rolling window during cohabitation; v3's
+        launcher will have its own per-run breaker (separate issue).
         """
         assert self._conn is not None, "connect() must run before outcome write"
         with self._conn.cursor() as cur:
@@ -19533,6 +19535,20 @@ class DispatcherDaemon:
                 # "freshest failure row per agent" semantics. agent_id
                 # may be NULL on synthetic test rows; the subquery
                 # simply returns NULL → treated as non-infra.
+                #
+                # #3876: scope the rolling window to v2-owned outcomes.
+                # During v2/v3 cohabitation v3's terminal_outcomes rows
+                # land in the same table (with their own
+                # ``parent_run_id`` lineage). Without this filter, a
+                # cluster of v3 failures during ramp would count toward
+                # v2's breaker threshold and prematurely flip v2's
+                # ``concurrency_cap``. The filter is the same
+                # :data:`V2_SCOPED_PARENT_RUN_FILTER` used by the
+                # ``dispatcher.agents`` recovery sites in #3875 — pre-
+                # cohabitation rows have ``parent_run_id`` backfilled to
+                # v2-owned ``runs.run_id`` values by migration #56, so
+                # the filter is a no-op for the steady-state v2-only
+                # window.
                 cur.execute(
                     "SELECT t.status, "
                     "       (SELECT f.category FROM dispatcher.failures f "
@@ -19540,6 +19556,7 @@ class DispatcherDaemon:
                     "        ORDER BY f.ts DESC LIMIT 1) AS latest_category "
                     "FROM dispatcher.terminal_outcomes t "
                     "WHERE t.ended_at > now() - make_interval(mins => %s) "
+                    f"  AND t.{V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY t.ended_at DESC "
                     "LIMIT %s",
                     (window_minutes, window_size),
@@ -20131,6 +20148,12 @@ class DispatcherDaemon:
         (``daemon_restart_abandoned``, ``paused_by_killswitch``) are
         filtered out before the count.
 
+        #3876: v2-scoped via :data:`V2_SCOPED_PARENT_RUN_FILTER` —
+        the auto-close path must use the same scope as the open path
+        in :meth:`_evaluate_circuit_breaker`, otherwise a stretch of
+        v3 successes (or v3 bad outcomes that age out of v3's window
+        on a different cadence) could spuriously close v2's breaker.
+
         Returns the bad-outcome count, or ``None`` on DB error so the
         caller can fail-safe (do nothing this tick).
         """
@@ -20144,6 +20167,7 @@ class DispatcherDaemon:
                     "        ORDER BY f.ts DESC LIMIT 1) AS latest_category "
                     "FROM dispatcher.terminal_outcomes t "
                     "WHERE t.ended_at > now() - make_interval(mins => %s) "
+                    f"  AND t.{V2_SCOPED_PARENT_RUN_FILTER} "
                     "ORDER BY t.ended_at DESC "
                     "LIMIT %s",
                     (window_minutes, window_size),
@@ -26440,10 +26464,14 @@ class DispatcherDaemon:
             with self._conn.cursor() as cur:
                 # exec-mode-agnostic (#3158): reads succeeded+merged rows for GH-side
                 # cleanup only; execution_mode has no bearing on whether a PR merged.
+                # v2-scoped: parent-run-id-filter (#3876) — v3 owns its own
+                # post-merge issue close path; v2 must not close v3-owned
+                # rows during cohabitation.
                 cur.execute(
                     "SELECT issue_number, pr_number FROM dispatcher.agents "
                     "WHERE status = 'succeeded' "
-                    "  AND merged_at IS NOT NULL",
+                    "  AND merged_at IS NOT NULL "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER}",
                 )
                 rows = list(cur.fetchall())
             self._conn.commit()
