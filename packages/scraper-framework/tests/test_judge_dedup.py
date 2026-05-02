@@ -492,8 +492,8 @@ class TestResolveJudgeRosterIntegration:
         all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
         assert "roster_match" in all_sql
 
-    def test_roster_match_no_existing_judge_uses_roster_name(self) -> None:
-        """When roster match found but no existing judge, uses roster canonical name."""
+    def test_roster_match_no_existing_judge_uses_incoming_canonical(self) -> None:
+        """When roster match found but no existing judge, incoming spelling wins (#3858)."""
         mock_conn, mock_cur = self._make_mock_conn()
 
         mock_cur.fetchone.side_effect = [
@@ -512,13 +512,18 @@ class TestResolveJudgeRosterIntegration:
         result = resolve_judge(mock_conn, "Jennifer Mccarthey", "court-uuid-1")
 
         assert result == "new-judge-uuid"
-        # The INSERT should use the roster-normalized name, not "Jennifer Mccarthey"
+        # INSERT INTO judges must use incoming canonical, not the roster typo
         insert_calls = [
             c for c in mock_cur.execute.call_args_list if "INSERT INTO judges" in str(c)
         ]
         assert len(insert_calls) == 1
         insert_sql = str(insert_calls[0])
-        assert "Jennifer Mccartney" in insert_sql
+        assert "Jennifer Mccarthey" in insert_sql
+        assert "Jennifer Mccartney" not in insert_sql
+        # Roster typo stored as roster_match alias, not as canonical
+        all_sql = " ".join(str(c) for c in mock_cur.execute.call_args_list)
+        assert "roster_match" in all_sql
+        assert "Jennifer Mccartney" in all_sql
 
     def test_no_roster_falls_through_to_create(self) -> None:
         """When no roster data exists, falls through to creating a new judge."""
