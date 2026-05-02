@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1199,3 +1202,236 @@ class TestRunScrapersDbRecording:
 
         assert exit_code == 1
         mock_conn.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Parallel runner tests
+# ---------------------------------------------------------------------------
+
+
+class TestRunScrapersParallel:
+    """Tests for SCRAPER_RUNNER_PARALLEL env var — parallel execution path."""
+
+    def test_default_is_sequential(self) -> None:
+        """With no SCRAPER_RUNNER_PARALLEL set, ThreadPoolExecutor must not be used."""
+        entries = [("test-stub", StubScraper, _stub_config)]
+
+        env = os.environ.copy()
+        env.pop("SCRAPER_RUNNER_PARALLEL", None)
+
+        with (
+            _patch_registry(entries),
+            patch.dict(os.environ, env, clear=True),
+            patch("framework.runner.ThreadPoolExecutor") as mock_tpe,
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 0
+        mock_tpe.assert_not_called()
+
+    def test_parallel_max_workers_one_takes_sequential_path(self) -> None:
+        """SCRAPER_RUNNER_PARALLEL=1 must behave identically to the default (no TPE)."""
+        entries = [("test-stub", StubScraper, _stub_config)]
+
+        with (
+            _patch_registry(entries),
+            patch.dict(os.environ, {"SCRAPER_RUNNER_PARALLEL": "1"}),
+            patch("framework.runner.ThreadPoolExecutor") as mock_tpe,
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 0
+        mock_tpe.assert_not_called()
+
+    def test_parallel_runs_concurrently(self) -> None:
+        """SCRAPER_RUNNER_PARALLEL=4 with 4 scrapers should run them concurrently.
+
+        Each scraper blocks on a barrier until all 4 have entered fetch_documents,
+        proving that all 4 are executing in parallel and not sequentially.
+        The wall time must be significantly less than 4× a single scraper's sleep.
+        """
+        barrier = threading.Barrier(4, timeout=10)
+        thread_ids: list[int] = []
+        lock = threading.Lock()
+
+        class BarrierScraper(BaseScraper):
+            def fetch_documents(self) -> list[CapturedDocument]:
+                with lock:
+                    thread_ids.append(threading.get_ident())
+                # Wait until all 4 scrapers have entered — proves concurrency
+                barrier.wait()
+                time.sleep(0.05)
+                return []
+
+            def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+                return doc
+
+        def make_config(scraper_id: str) -> Any:
+            def config_factory(s3_bucket: str = "") -> ScraperConfig:
+                return ScraperConfig(
+                    scraper_id=scraper_id,
+                    state="CA",
+                    county="Test",
+                    court="Superior Court",
+                    target_urls=["https://example.com"],
+                )
+
+            return config_factory
+
+        entries = [
+            (f"parallel-stub-{i}", BarrierScraper, make_config(f"parallel-stub-{i}"))
+            for i in range(4)
+        ]
+
+        start = time.monotonic()
+        with (
+            _patch_registry(entries),
+            patch.dict(os.environ, {"SCRAPER_RUNNER_PARALLEL": "4"}),
+        ):
+            exit_code = run_scrapers()
+        elapsed = time.monotonic() - start
+
+        assert exit_code == 0
+        assert len(thread_ids) == 4
+        # All 4 ran in parallel — wall time < 4 × 0.05s sleep (i.e., < 0.18s)
+        assert elapsed < 0.18, f"Expected parallel execution but elapsed={elapsed:.3f}s"
+        # All 4 scrapers ran in distinct threads
+        assert len(set(thread_ids)) == 4, "Expected 4 distinct thread IDs"
+
+    def test_parallel_db_writes_all_land(self) -> None:
+        """SCRAPER_RUNNER_PARALLEL=4 with 8 scrapers: each gets its own per-call
+        MagicMock connection; exactly 8 INSERT INTO scraper_runs calls must be
+        recorded (one per scraper, none lost).
+
+        Note: _connect_db is called once at the top of run_scrapers for the shared
+        roster connection, then once per scraper in parallel mode — so 9 total calls
+        for 8 scrapers.  Each per-scraper connection (the last 8) must be closed by
+        the helper exactly once.
+        """
+        per_conn_mocks: list[MagicMock] = []
+        conns_lock = threading.Lock()
+
+        def make_conn() -> MagicMock:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+            mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+            with conns_lock:
+                per_conn_mocks.append(mock_conn)
+            return mock_conn
+
+        def make_config(scraper_id: str) -> Any:
+            def config_factory(s3_bucket: str = "") -> ScraperConfig:
+                return ScraperConfig(
+                    scraper_id=scraper_id,
+                    state="CA",
+                    county="Test",
+                    court="Superior Court",
+                    target_urls=["https://example.com"],
+                )
+
+            return config_factory
+
+        entries = [(f"db-stub-{i}", StubScraper, make_config(f"db-stub-{i}")) for i in range(8)]
+
+        with (
+            _patch_registry(entries),
+            patch.dict(os.environ, {"SCRAPER_RUNNER_PARALLEL": "4"}),
+            patch("framework.runner._connect_db", side_effect=make_conn),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 0
+        # 1 top-level call + 8 per-scraper calls = 9 total
+        assert len(per_conn_mocks) == 9
+
+        # Tally INSERT INTO scraper_runs calls across all connections
+        total_inserts = 0
+        for mock_conn in per_conn_mocks:
+            mock_cursor = mock_conn.cursor.return_value.__enter__.return_value
+            for call in mock_cursor.execute.call_args_list:
+                if call[0] and "INSERT INTO scraper_runs" in str(call[0][0]):
+                    total_inserts += 1
+
+        assert total_inserts == 8, f"Expected 8 inserts, got {total_inserts}"
+
+        # Each per-scraper connection (index 1..8) must be closed by the helper.
+        # The top-level conn (index 0) is closed by run_scrapers' finally block.
+        for mock_conn in per_conn_mocks:
+            mock_conn.close.assert_called_once()
+
+    def test_parallel_failure_isolated(self) -> None:
+        """3 scrapers with SCRAPER_RUNNER_PARALLEL=3: the middle one raises an
+        exception. exit_code must be 1 AND the other two scrapers must still have
+        recorded their successful rows.
+        """
+        ran: list[str] = []
+        ran_lock = threading.Lock()
+        per_conn_mocks: list[MagicMock] = []
+        conns_lock = threading.Lock()
+
+        def make_conn() -> MagicMock:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+            mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+            with conns_lock:
+                per_conn_mocks.append(mock_conn)
+            return mock_conn
+
+        class TrackingStub(StubScraper):
+            def fetch_documents(self) -> list[CapturedDocument]:
+                with ran_lock:
+                    ran.append(self.config.scraper_id)
+                return []
+
+        class FailingScraper2(BaseScraper):
+            def fetch_documents(self) -> list[CapturedDocument]:
+                raise RuntimeError("middle scraper explodes")
+
+            def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+                return doc
+
+        def make_config(scraper_id: str) -> Any:
+            def config_factory(s3_bucket: str = "") -> ScraperConfig:
+                return ScraperConfig(
+                    scraper_id=scraper_id,
+                    state="CA",
+                    county="Test",
+                    court="Superior Court",
+                    target_urls=["https://example.com"],
+                )
+
+            return config_factory
+
+        entries = [
+            ("iso-good-1", TrackingStub, make_config("iso-good-1")),
+            ("iso-fail", FailingScraper2, make_config("iso-fail")),
+            ("iso-good-2", TrackingStub, make_config("iso-good-2")),
+        ]
+
+        with (
+            _patch_registry(entries),
+            patch.dict(os.environ, {"SCRAPER_RUNNER_PARALLEL": "3"}),
+            patch("framework.runner._connect_db", side_effect=make_conn),
+        ):
+            exit_code = run_scrapers()
+
+        assert exit_code == 1, "Expected exit_code=1 due to failing scraper"
+        assert "iso-good-1" in ran, "iso-good-1 must still run"
+        assert "iso-good-2" in ran, "iso-good-2 must still run"
+
+        # Verify that good scrapers recorded successful rows
+        total_success_inserts = 0
+        for mock_conn in per_conn_mocks:
+            mock_cursor = mock_conn.cursor.return_value.__enter__.return_value
+            for call in mock_cursor.execute.call_args_list:
+                if call[0] and "INSERT INTO scraper_runs" in str(call[0][0]):
+                    params = call[0][1]
+                    if params[4] == "success":
+                        total_success_inserts += 1
+
+        assert total_success_inserts == 2, (
+            f"Expected 2 successful inserts (iso-good-1 and iso-good-2), "
+            f"got {total_success_inserts}"
+        )
