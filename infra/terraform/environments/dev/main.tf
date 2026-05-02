@@ -429,6 +429,28 @@ module "dispatcher_v3_iam" {
   github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
 }
 
+# ─── Dispatcher v3 sessions bucket (F-this-issue, #3891) ────────────────────
+# Per `docs/specs/dispatcher-v3-spec.md` §4.1 session capture. Stores
+# per-agent session logs (raw stream-json jsonl + compact transcript)
+# emitted by the v3 task-runner and diagnoser. Private bucket, IAM-only
+# access from the v3 agent_task_role, lifecycle Standard for 30 days
+# then Glacier-IR with a configurable expiration (default 365 days).
+#
+# The bucket policy grants only s3:PutObject and s3:GetObject to the
+# agent_task_role; ListBucket is intentionally omitted (the diagnoser
+# reads by exact key from the agents table, never enumerates).
+module "dispatcher_v3_sessions" {
+  source = "../../modules/dispatcher-v3-sessions-bucket"
+
+  environment         = "dev"
+  bucket_name         = "judgemind-dispatcher-v3-sessions"
+  agent_task_role_arn = module.dispatcher_v3_iam.agent_task_role_arn
+
+  # Default 365 days. Operators can override here if a future incident
+  # review needs an extended audit window without changing the module.
+  # session_retention_days = 365
+}
+
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url
@@ -725,4 +747,14 @@ output "dispatcher_v3_agent_task_role_arn" {
 output "dispatcher_v3_execution_role_arn" {
   description = "Dev dispatcher-v3 shared task-execution role ARN (used by every v3 task definition for ECR pull + secret injection + log writes)"
   value       = module.dispatcher_v3_iam.execution_role_arn
+}
+
+output "dispatcher_v3_sessions_bucket" {
+  description = "Dev dispatcher-v3 sessions bucket name. Wired into F2 task definitions as the SESSIONS_BUCKET env var (per spec section 4.1)."
+  value       = module.dispatcher_v3_sessions.bucket_id
+}
+
+output "dispatcher_v3_sessions_bucket_arn" {
+  description = "Dev dispatcher-v3 sessions bucket ARN. Useful for `aws iam simulate-principal-policy` regression checks against the agent_task_role policies."
+  value       = module.dispatcher_v3_sessions.bucket_arn
 }
