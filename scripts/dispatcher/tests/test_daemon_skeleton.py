@@ -160,6 +160,34 @@ class TestLeaseCheck:
         assert any("INSERT INTO dispatcher.runs" in sql for sql, _ in executed)
         assert fake_conn.commits == 1
 
+    def test_run_insert_writes_dispatcher_version_v2(self) -> None:
+        """v2 daemon stamps ``dispatcher_version='v2'`` on every run insert.
+
+        Regression guard for #3872 (v3 cohabitation): once v3 deploys and
+        starts inserting ``dispatcher_version='v3'`` rows, v2's runs MUST
+        be unambiguously tagged ``'v2'`` so the per-run scope filters on
+        downstream tables (agents.parent_run_id → runs.dispatcher_version)
+        return the right slice.
+        """
+        fake_conn = _FakeConnection()
+        fake_conn.cursor_instance.fetch_queue = [None, ("new-run-id",)]
+
+        d = _make_daemon(fake_conn=fake_conn)
+        d.check_lease_and_register_run()
+
+        executed = fake_conn.cursor_instance.executed
+        run_inserts = [
+            e for e in executed if e[0].startswith("INSERT INTO dispatcher.runs")
+        ]
+        assert len(run_inserts) == 1
+        sql, _params = run_inserts[0]
+        # Column list contains dispatcher_version, and the literal 'v2'
+        # is in the VALUES clause (not bound — we want the value
+        # observable in psycopg-3 query logging without consulting the
+        # column DEFAULT).
+        assert "dispatcher_version" in sql
+        assert "'v2'" in sql
+
     def test_insert_returns_no_row_raises(self) -> None:
         fake_conn = _FakeConnection()
         # Weird state: lease OK, but INSERT ... RETURNING yields nothing.
