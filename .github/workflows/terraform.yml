@@ -102,6 +102,15 @@ jobs:
       - name: dispatcher-v3-iam policy-shape check
         run: bash infra/terraform/modules/dispatcher-v3-iam/tests/policy-checks/check.sh
 
+      # Policy-shape regression test for dispatcher-v3-sessions-bucket
+      # (#3891). Static analysis of the rendered HCL — no AWS
+      # credentials needed. Asserts the spec §4.1 invariants (bucket is
+      # private, lifecycle uses GLACIER_IR not deep Glacier, bucket
+      # policy is scoped to the agent_task_role and grants only
+      # PutObject + GetObject).
+      - name: dispatcher-v3-sessions-bucket policy-shape check
+        run: bash infra/terraform/modules/dispatcher-v3-sessions-bucket/tests/policy-checks/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.
