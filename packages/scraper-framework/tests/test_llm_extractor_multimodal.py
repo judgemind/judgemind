@@ -25,6 +25,7 @@ from framework.llm_extractor import (
     PDF_PER_PAGE_PROMPT,
     LlmExtractor,
     _append_ruling_from_case,
+    _build_case_number_to_index,
     _create_google_client,
     _deduplicate_ruling_texts,
     _drop_calendar_listing_rulings,
@@ -3755,6 +3756,114 @@ class TestResolveCrossReferences:
         result = _resolve_cross_references(rulings, None)
         assert result[0].ruling_text == "See Line 1 for tentative ruling."
         assert result[0].cross_reference_source is None
+
+    def test_oc_duplicate_case_number_stub_resolves_to_substantive_entry(self) -> None:
+        """OC stub with same case number as substantive entry resolves correctly (#4000).
+
+        Substantive at index 0, stub at index 1.  Both share case number 06CC10916.
+        The helper must pick the entry with the longest ruling_text (index 0) so
+        the stub (index 1) resolves to the substantive ruling, not to itself.
+        """
+        substantive_text = (
+            "The motion for summary judgment is DENIED. "
+            "Plaintiff has demonstrated triable issues of material fact. "
+        ) * 10  # > 100 chars, clearly substantive
+        stub_text = "See the tentative ruling above for Smith, case no. 06CC10916"
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="06CC10916",
+                ruling_text=substantive_text,
+            ),
+            ExtractedRuling(
+                extracted_case_number="06CC10916",
+                ruling_text=stub_text,
+            ),
+        ]
+        # Pass both maps as None so _build_case_number_to_index is exercised.
+        result = _resolve_cross_references(
+            rulings, entry_number_to_index=None, case_number_to_index=None
+        )
+        assert result[1].ruling_text == substantive_text
+        assert result[1].cross_reference_source is not None
+
+    def test_oc_duplicate_case_number_stub_first_substantive_second(self) -> None:
+        """OC stub at index 0, substantive at index 1 — stub still resolves (#4000).
+
+        Verifies the helper's longest-text preference is order-independent.
+        """
+        substantive_text = (
+            "The demurrer is OVERRULED. Defendant shall answer within 10 days. "
+        ) * 10  # > 100 chars
+        stub_text = "See the tentative ruling above for Jones, case no. 06CC10916"
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="06CC10916",
+                ruling_text=stub_text,
+            ),
+            ExtractedRuling(
+                extracted_case_number="06CC10916",
+                ruling_text=substantive_text,
+            ),
+        ]
+        result = _resolve_cross_references(
+            rulings, entry_number_to_index=None, case_number_to_index=None
+        )
+        assert result[0].ruling_text == substantive_text
+        assert result[0].cross_reference_source is not None
+
+    def test_oc_three_rulings_share_case_number_prefers_longest(self) -> None:
+        """Three OC rulings with same case number — both stubs resolve to longest (#4000)."""
+        longest_text = (
+            "The motion to compel further responses is GRANTED IN PART. "
+            "Defendant shall provide further responses within 30 days. "
+        ) * 10  # > 100 chars, clearly the substantive entry
+        stub_a = "See the tentative ruling above for Brown, case no. 30-2022-01234567"
+        stub_b = "See the tentative ruling above for Davis, case no. 30-2022-01234567"
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="30-2022-01234567",
+                ruling_text=stub_a,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2022-01234567",
+                ruling_text=longest_text,
+            ),
+            ExtractedRuling(
+                extracted_case_number="30-2022-01234567",
+                ruling_text=stub_b,
+            ),
+        ]
+        result = _resolve_cross_references(
+            rulings, entry_number_to_index=None, case_number_to_index=None
+        )
+        # Both stubs should resolve to the longest entry (index 1).
+        assert result[0].ruling_text == longest_text
+        assert result[0].cross_reference_source is not None
+        assert result[2].ruling_text == longest_text
+        assert result[2].cross_reference_source is not None
+        # The substantive entry itself should be unchanged.
+        assert result[1].ruling_text == longest_text
+        assert result[1].cross_reference_source is None
+
+    def test_build_case_number_to_index_prefers_longest(self) -> None:
+        """_build_case_number_to_index picks the index with the longest ruling_text (#4000)."""
+        short_text = "See ruling above for Smith, case no. 06CC10916"
+        long_text = "The motion is GRANTED. " * 20
+        medium_text = "DENIED without prejudice. " * 5
+
+        rulings = [
+            ExtractedRuling(extracted_case_number="06CC10916", ruling_text=short_text),
+            ExtractedRuling(extracted_case_number="06CC10916", ruling_text=long_text),
+            ExtractedRuling(extracted_case_number="06CC10916", ruling_text=medium_text),
+            ExtractedRuling(extracted_case_number="OTHER-001", ruling_text="Different case text."),
+        ]
+        result = _build_case_number_to_index(rulings)
+        # Must pick index 1 (longest text) for 06CC10916.
+        assert result["06CC10916"] == 1
+        # OTHER-001 has only one entry — straightforward.
+        assert result["OTHER-001"] == 3
+        # Entries without a case number are not in the map (none here).
+        assert len(result) == 2
 
 
 class TestCrossReferenceIntegration:

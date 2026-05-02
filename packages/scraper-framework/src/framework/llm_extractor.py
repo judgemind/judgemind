@@ -2342,6 +2342,34 @@ _XREF_REF_MIN_TEXT_LENGTH = 100
 _XREF_STUB_MAX_TEXT_LENGTH = 2000
 
 
+def _build_case_number_to_index(rulings: list[ExtractedRuling]) -> dict[str, int]:
+    """Build a case-number → ruling-index map that prefers the substantive entry (#4000).
+
+    When multiple OC rulings share a case number (a stub and the substantive
+    ruling it references), a plain dict comprehension with last-write-wins
+    semantics may store the stub index instead of the substantive one.  The
+    stub's xref then resolves to itself (``ref_idx == i``) and stays unresolved.
+
+    This helper breaks the tie by keeping the index of the entry with the
+    *longest* ``ruling_text`` for each case number.  Length is a reliable
+    proxy for substantiveness: OC stubs are by construction short cross-
+    reference phrases, while substantive rulings contain the full court text.
+    """
+    result: dict[str, int] = {}
+    for i, r in enumerate(rulings):
+        if not r.extracted_case_number:
+            continue
+        key = r.extracted_case_number
+        current_text = r.ruling_text or ""
+        if key not in result:
+            result[key] = i
+        else:
+            existing_text = rulings[result[key]].ruling_text or ""
+            if len(current_text) > len(existing_text):
+                result[key] = i
+    return result
+
+
 def _resolve_cross_references(
     rulings: list[ExtractedRuling],
     entry_number_to_index: dict[int, int] | None = None,
@@ -2400,10 +2428,9 @@ def _resolve_cross_references(
         }
 
     # When no case-number map is provided, build it from per-ruling extracted_case_number.
+    # Use the helper so that duplicate case numbers keep the substantive (longest) entry.
     if case_number_to_index is None:
-        case_number_to_index = {
-            r.extracted_case_number: i for i, r in enumerate(rulings) if r.extracted_case_number
-        }
+        case_number_to_index = _build_case_number_to_index(rulings)
 
     # Build reverse map: index -> entry_number (for "order above" lookups).
     index_to_entry: dict[int, int] = {v: k for k, v in entry_number_to_index.items()}
@@ -2524,7 +2551,12 @@ def _resolve_cross_references(
                     rulings[i] = ruling.model_copy(
                         update={
                             "ruling_text": ref_text,
-                            "cross_reference_source": ref_ruling.entry_number,
+                            # Use entry_number when available; fall back to the
+                            # list index so cross_reference_source is always set
+                            # (the only consumer is ``is not None`` guard logic).
+                            "cross_reference_source": ref_ruling.entry_number
+                            if ref_ruling.entry_number is not None
+                            else ref_idx,
                         }
                     )
                     logger.info(
@@ -4360,9 +4392,7 @@ def _join_page_rows(
     # "See Ruling for #N Above".  Orange County PDFs use case-number refs.
     # Copy the ruling text from the referenced entry so enrichment can
     # extract an outcome.
-    case_number_to_index = {
-        r.extracted_case_number: i for i, r in enumerate(rulings) if r.extracted_case_number
-    }
+    case_number_to_index = _build_case_number_to_index(rulings)
     rulings = _resolve_cross_references(
         rulings, entry_number_to_index or None, case_number_to_index
     )
