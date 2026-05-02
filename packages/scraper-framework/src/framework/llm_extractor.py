@@ -136,6 +136,18 @@ _ROLE_LITERAL_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches a case_title that contains an LLM-hallucinated bracketed placeholder
+# for a party name, e.g. "Ezra Arce v. [Defendant not specified]" or
+# "[Plaintiff name unknown] v. Smith".  The bracket must contain a role word
+# (plaintiff/defendant/petitioner/respondent/party/name/case) followed by a
+# qualifier (not specified, unknown, missing, not listed, not provided, tbd).
+# No anchor — the bracket can appear anywhere in the title.  See #3988.
+_BRACKETED_PLACEHOLDER_TITLE_RE = re.compile(
+    r"\[(?:plaintiff|defendant|petitioner|respondent|party|name|case)[^\]]*"
+    r"(?:not specified|unknown|missing|not listed|not provided|tbd)[^\]]*\]",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # LLM result cache
 # ---------------------------------------------------------------------------
@@ -1410,7 +1422,9 @@ def _rebuild_title_from_parties(
         Rebuilt title string, or ``None`` if the pattern does not match or
         parties are insufficient to rebuild.
     """
-    if not title or not _ROLE_LITERAL_TITLE_RE.match(title):
+    if not title or not (
+        _ROLE_LITERAL_TITLE_RE.match(title) or _BRACKETED_PLACEHOLDER_TITLE_RE.search(title)
+    ):
         return None
 
     # Determine which role pair to look for.  Petitions use petitioner/respondent;

@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from framework.llm_extractor import (
+    _BRACKETED_PLACEHOLDER_TITLE_RE,
     _SB_CASE_NUMBER_RE,
     _disjoint_plaintiff_names,
     _rebuild_title_from_parties,
@@ -222,6 +223,70 @@ def test_rebuild_title_from_parties_accepts_dict_shaped_parties() -> None:
     ]
     result = _rebuild_title_from_parties("Plaintiff v. General Motors, LLC", parties)
     assert result == "Sumayya Aasi v. General Motors, LLC"
+
+
+# ---------------------------------------------------------------------------
+# _BRACKETED_PLACEHOLDER_TITLE_RE — bracketed-placeholder title guard (#3988)
+# ---------------------------------------------------------------------------
+
+
+def test_bracketed_placeholder_re_matches_defendant_not_specified() -> None:
+    """Matches the canonical Arce shape: 'Ezra Arce v. [Defendant not specified]'."""
+    assert _BRACKETED_PLACEHOLDER_TITLE_RE.search("Ezra Arce v. [Defendant not specified]")
+
+
+def test_bracketed_placeholder_re_matches_plaintiff_unknown() -> None:
+    """Matches bracketed placeholder at start of title: '[Plaintiff name unknown] v. Smith'."""
+    assert _BRACKETED_PLACEHOLDER_TITLE_RE.search("[Plaintiff name unknown] v. Smith")
+
+
+def test_bracketed_placeholder_re_matches_respondent_missing() -> None:
+    """Matches mid-title bracketed placeholder: 'In re Doe [Respondent missing]'."""
+    assert _BRACKETED_PLACEHOLDER_TITLE_RE.search("In re Doe [Respondent missing]")
+
+
+def test_bracketed_placeholder_re_does_not_match_clean_title() -> None:
+    """A clean title like 'Smith v. Jones' produces no match."""
+    assert not _BRACKETED_PLACEHOLDER_TITLE_RE.search("Smith v. Jones")
+
+
+def test_bracketed_placeholder_re_does_not_match_non_role_brackets() -> None:
+    """False-positive guardrail: 'Smith v. Acme [DBA Acme Corp.]' should NOT match.
+
+    'DBA' is a real annotation bracket, not a placeholder — the regex must
+    restrict matches to role words followed by qualifier words.
+    """
+    assert not _BRACKETED_PLACEHOLDER_TITLE_RE.search("Smith v. Acme [DBA Acme Corp.]")
+
+
+def test_rebuild_title_from_parties_handles_bracketed_placeholder() -> None:
+    """Bracketed-placeholder title with only one real party returns None (drop path).
+
+    The LA Arce shape: 'Ezra Arce v. [Defendant not specified]' with only a
+    plaintiff in extracted_parties.  _rebuild_title_from_parties cannot build
+    'P v. D', so returns None — caller nulls the title.
+    """
+    result = _rebuild_title_from_parties(
+        "Ezra Arce v. [Defendant not specified]",
+        [{"name": "Ezra Arce", "role": "plaintiff"}],
+    )
+    assert result is None
+
+
+def test_rebuild_title_from_parties_rebuilds_bracketed_placeholder_with_both_parties() -> None:
+    """Bracketed-placeholder title with both parties returns rebuilt 'P v. D'.
+
+    When extracted_parties contains both plaintiff and defendant, the title
+    should be rebuilt as 'PlaintiffName v. DefendantName'.
+    """
+    result = _rebuild_title_from_parties(
+        "Ezra Arce v. [Defendant not specified]",
+        [
+            {"name": "Ezra Arce", "role": "plaintiff"},
+            {"name": "John Doe Corp", "role": "defendant"},
+        ],
+    )
+    assert result == "Ezra Arce v. John Doe Corp"
 
 
 # ---------------------------------------------------------------------------

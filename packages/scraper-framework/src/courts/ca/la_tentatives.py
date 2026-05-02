@@ -86,6 +86,9 @@ from framework.la_parser_utils import (
     SKIP_RESPONDING_PHRASES as _SKIP_RESPONDING_PHRASES,
 )
 from framework.llm_extractor import (
+    _BRACKETED_PLACEHOLDER_TITLE_RE as _BRACKETED_PLACEHOLDER_TITLE_RE,
+)
+from framework.llm_extractor import (
     _ROLE_LITERAL_TITLE_RE as _ROLE_LITERAL_TITLE_RE,
 )
 from framework.llm_extractor import (
@@ -619,20 +622,36 @@ def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
                     parties.append({"name": name, "role": str(p["role"])})
 
         case_title = entry.get("extracted_case_title")
-        if case_title and _ROLE_LITERAL_TITLE_RE.match(case_title):
+        if case_title and (
+            _ROLE_LITERAL_TITLE_RE.match(case_title)
+            or _BRACKETED_PLACEHOLDER_TITLE_RE.search(case_title)
+        ):
             rebuilt = _rebuild_title_from_parties(case_title, parties)
             if rebuilt is not None:
-                logger.info(
-                    "la.llm_role_literal_title_rebuilt",
-                    before=case_title,
-                    after=rebuilt,
-                )
+                if _BRACKETED_PLACEHOLDER_TITLE_RE.search(case_title):
+                    logger.info(
+                        "la.llm_bracketed_placeholder_title_rebuilt",
+                        before=case_title,
+                        after=rebuilt,
+                    )
+                else:
+                    logger.info(
+                        "la.llm_role_literal_title_rebuilt",
+                        before=case_title,
+                        after=rebuilt,
+                    )
                 case_title = rebuilt
             else:
-                logger.info(
-                    "la.llm_role_literal_title_dropped",
-                    before=case_title,
-                )
+                if _BRACKETED_PLACEHOLDER_TITLE_RE.search(case_title):
+                    logger.info(
+                        "la.llm_bracketed_placeholder_title_dropped",
+                        before=case_title,
+                    )
+                else:
+                    logger.info(
+                        "la.llm_role_literal_title_dropped",
+                        before=case_title,
+                    )
                 case_title = None
 
         # Reversed-title sanitizer (#3846): detect and correct cases where the
