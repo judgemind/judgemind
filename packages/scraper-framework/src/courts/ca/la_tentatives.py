@@ -376,10 +376,14 @@ LA_SYSTEM_PROMPT = (
     "has 3 'Case Number:' entries, return 3 rulings.\n"
     "2. Extract the case number EXACTLY as it appears (including any "
     "leading digits).\n"
-    "3. For extracted_case_title, name the parties explicitly: "
-    "'<plaintiff_name> v. <defendant_name>' (e.g. 'Aasi v. American Honda Motor Co.'). "
+    "3. For extracted_case_title, ALWAYS list plaintiff/petitioner first, then 'v.', "
+    "then defendant/respondent — even when the defendant is the moving party. "
+    "Format: '<plaintiff_name> v. <defendant_name>' (e.g. 'Aasi v. American Honda Motor Co.'). "
     "Strip legal entity descriptors like 'an individual', 'a corporation', etc. "
     "Use title case. "
+    "Counter-example: if the caption block shows "
+    "'MOVING PARTY: Defendant Foo Corp / RESPONDING PARTY: Plaintiff Bar Inc', "
+    "the correct extracted_case_title is 'Bar Inc v. Foo Corp' — NOT 'Foo Corp v. Bar Inc'. "
     "If the caption does not name both parties, return null for extracted_case_title — "
     "do NOT use the literal words 'Plaintiff', 'Defendant', 'Petitioner', or 'Respondent' "
     "as party names in the title.\n"
@@ -388,7 +392,11 @@ LA_SYSTEM_PROMPT = (
     "truncate or summarize.\n"
     "5. For parties, extract each party with their role (plaintiff, "
     "defendant, petitioner, respondent, cross-complainant, "
-    "cross-defendant, moving_party, responding_party).\n"
+    "cross-defendant, moving_party, responding_party). "
+    "When the caption block identifies parties by plaintiff/defendant (or petitioner/respondent) "
+    "AND the body also identifies them as moving_party/responding_party, emit BOTH role pairs "
+    "as separate entries — e.g. emit {name: 'Bar Inc', role: 'plaintiff'} AND "
+    "{name: 'Bar Inc', role: 'responding_party'} for the same person.\n"
     "6. Skip the department header boilerplate — only extract from "
     "case entries.\n"
     "7. Pages with only department headers and no 'Case Number:' "
@@ -432,6 +440,114 @@ LA_SYSTEM_PROMPT = (
     "  ]\n"
     "}"
 )
+
+
+def _rebuild_reversed_title_from_parties(
+    title: str | None,
+    parties: list[dict[str, str]],
+) -> str | None:
+    """Rebuild a reversed case title when defendant appears first (#3846).
+
+    The LLM occasionally emits the defendant/respondent first in
+    ``extracted_case_title`` — for example ``"Rampart Property Management,
+    Inc v. Samson Hill"`` when the real caption has plaintiff Samson Hill and
+    defendant Rampart.  This happens most often when the defendant is the
+    moving party and appears prominently at the top of the motion caption.
+
+    This helper detects the reversal by substring-matching the title's first
+    segment against the stored plaintiff/petitioner names and defendant/respondent
+    names.  Specifically, the title is considered reversed when:
+
+    - the first segment (before ``" v. "``) substring-matches a
+      defendant/respondent name (normalized to lowercase, stripped), AND
+    - the first segment does NOT substring-match any plaintiff/petitioner name.
+
+    On a detected reversal, returns ``"<first plaintiff> v. <first defendant>"``.
+    Petition cases use petitioner/respondent roles instead.
+
+    Returns ``None`` in all other cases (no reversal detected, title unchanged).
+
+    Parameters
+    ----------
+    title:
+        The ``extracted_case_title`` from the LLM — may or may not be reversed.
+    parties:
+        The ``parties`` list from the same ruling entry, as dicts with
+        ``name`` and ``role`` keys.
+
+    Returns
+    -------
+    str | None
+        Corrected plaintiff-first title, or ``None`` if no reversal detected.
+    """
+    if not title:
+        return None
+
+    # Split on " v. " (case-insensitive) to get the first segment.
+    lower_title = title.lower()
+    sep = " v. "
+    sep_idx = lower_title.find(sep)
+    if sep_idx == -1:
+        return None
+
+    first_segment = lower_title[:sep_idx].strip()
+
+    # Collect plaintiff/petitioner and defendant/respondent names.
+    # Petition cases: petitioner/respondent.  Everything else: plaintiff/defendant.
+    plaintiff_names: list[str] = []
+    defendant_names: list[str] = []
+
+    # Determine role pairs based on parties present.  Check for petitioner first
+    # (a case has petitioner/respondent OR plaintiff/defendant, not both).
+    has_petitioner = any((p.get("role") or "").lower() == "petitioner" for p in parties)
+    if has_petitioner:
+        plaintiff_roles = {"petitioner"}
+        defendant_roles = {"respondent"}
+    else:
+        plaintiff_roles = {"plaintiff"}
+        defendant_roles = {"defendant"}
+
+    for party in parties:
+        role = (party.get("role") or "").lower()
+        name = (party.get("name") or "").strip()
+        if not name:
+            continue
+        if role in plaintiff_roles:
+            plaintiff_names.append(name.lower())
+        elif role in defendant_roles:
+            defendant_names.append(name.lower())
+
+    if not plaintiff_names or not defendant_names:
+        return None
+
+    # Check whether the first segment matches a defendant name (reversed)
+    # and does NOT match a plaintiff name (clean title).
+    def _segment_matches(segment: str, names: list[str]) -> bool:
+        for name in names:
+            if name in segment or segment in name:
+                return True
+        return False
+
+    first_matches_defendant = _segment_matches(first_segment, defendant_names)
+    first_matches_plaintiff = _segment_matches(first_segment, plaintiff_names)
+
+    if first_matches_defendant and not first_matches_plaintiff:
+        # Reversal detected — find the canonical (un-normalized) names.
+        plaintiff_name: str | None = None
+        defendant_name: str | None = None
+        for party in parties:
+            role = (party.get("role") or "").lower()
+            name = (party.get("name") or "").strip()
+            if not name:
+                continue
+            if role in plaintiff_roles and plaintiff_name is None:
+                plaintiff_name = name
+            elif role in defendant_roles and defendant_name is None:
+                defendant_name = name
+        if plaintiff_name and defendant_name:
+            return f"{plaintiff_name} v. {defendant_name}"
+
+    return None
 
 
 def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
@@ -518,6 +634,19 @@ def _llm_extract_rulings(ruling_html: str) -> list[LASplitRuling] | None:
                     before=case_title,
                 )
                 case_title = None
+
+        # Reversed-title sanitizer (#3846): detect and correct cases where the
+        # defendant appears first in extracted_case_title (e.g. when the defendant
+        # is the moving party and appears at the top of the caption block).
+        if case_title is not None:
+            reversed_rebuilt = _rebuild_reversed_title_from_parties(case_title, parties)
+            if reversed_rebuilt is not None:
+                logger.info(
+                    "la.llm_reversed_title_rebuilt",
+                    before=case_title,
+                    after=reversed_rebuilt,
+                )
+                case_title = reversed_rebuilt
 
         rulings.append(
             LASplitRuling(
