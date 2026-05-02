@@ -212,9 +212,7 @@ function commandRowToGraphQL(row: Row, created: boolean): Record<string, unknown
 // Data access — dispatcherState
 // ---------------------------------------------------------------------------
 
-interface DispatcherStateArgs {
-  // No top-level args; nested fields have their own args.
-}
+type DispatcherStateArgs = Record<string, never>;
 
 async function queryCurrentRun(pool: Pool): Promise<Row | null> {
   const { rows } = await pool.query<Row>(
