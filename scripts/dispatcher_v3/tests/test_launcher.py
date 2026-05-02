@@ -1491,7 +1491,7 @@ def test_wall_clock_exit_reason_is_distinct_from_silent_hang() -> None:
 
 
 def test_wall_clock_default_constants_match_spec() -> None:
-    """Pin the default cap values per spec §11 OQ#4 + issue body.
+    """Pin the default cap values per spec §11 OQ#3 + issue body.
 
     A future change that bumps these defaults must do so deliberately
     (the test fails loudly) -- the spec values are referenced by
