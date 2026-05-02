@@ -240,6 +240,138 @@ class TestApplyPdfCacheHitFilters:
         assert result[0].ruling_text == target_text
         assert result[0].cross_reference_source is None
 
+    def test_resolve_riverside_xref_on_cache_hit(self) -> None:
+        """_apply_pdf_cache_hit_filters resolves Riverside stubs via entry_number (#3857).
+
+        Simulates the Riverside cache-hit scenario: two cached ExtractedRuling
+        objects where the stub (entry_number=2) points to the target
+        (entry_number=1) via "See Ruling for #1 Above".
+        """
+        target_text = (
+            "The motion to compel further responses is GRANTED. Defendant shall "
+            "serve verified, code-compliant responses without objection within "
+            "thirty (30) days. Sanctions are awarded in the amount of $1,500 "
+            "payable to counsel for the moving party within 30 days of this ruling."
+        )
+        stub_text = (
+            "MOTION TO COMPEL FURTHER RESPONSES TO FORM INTERROGATORIES\n\n"
+            "Tentative Ruling:\nSee Ruling for #1 Above"
+        )
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="RIC2200001",
+                extracted_case_title="Smith v. Jones",
+                ruling_text=target_text,
+                entry_number=1,
+            ),
+            ExtractedRuling(
+                extracted_case_number="RIC2200002",
+                extracted_case_title="Doe v. Roe",
+                ruling_text=stub_text,
+                entry_number=2,
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+
+        # Both rulings survive (neither is a calendar listing or short text).
+        assert len(result) == 2
+
+        # Stub (index 1) must have been resolved: ruling_text replaced with
+        # the target's text and cross_reference_source set to 1.
+        assert result[1].ruling_text == target_text
+        assert result[1].cross_reference_source == 1
+
+        # Target (index 0) is unchanged.
+        assert result[0].ruling_text == target_text
+        assert result[0].cross_reference_source is None
+
+    def test_resolve_orange_case_number_xref_on_cache_hit(self) -> None:
+        """_apply_pdf_cache_hit_filters resolves OC stubs via case number (#3857).
+
+        Simulates the Orange County cache-hit scenario: two cached ExtractedRuling
+        objects where the stub references the target by case number via
+        "See the tentative ruling set forth above for <Party>, case no. XXXXXX".
+        """
+        target_text = (
+            "The demurrer is SUSTAINED with twenty (20) days leave to amend. "
+            "Plaintiff's first cause of action fails to allege sufficient facts "
+            "to support a claim for fraud. Plaintiff must plead each element of "
+            "fraud with the requisite particularity. The motion to strike is "
+            "GRANTED as to the punitive damages allegations."
+        )
+        stub_text = (
+            "See the tentative ruling set forth above for "
+            "People of the State of California vs. Boys from the Hood, "
+            "case no. 06CC10916"
+        )
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="06CC10916",
+                extracted_case_title="People of the State of California vs. Boys from the Hood",
+                ruling_text=target_text,
+                entry_number=1,
+            ),
+            ExtractedRuling(
+                extracted_case_number="06CC10917",
+                extracted_case_title="State v. Smith",
+                ruling_text=stub_text,
+                entry_number=2,
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+
+        # Both rulings survive.
+        assert len(result) == 2
+
+        # Stub (index 1) must have been resolved: ruling_text replaced with
+        # the target's text and cross_reference_source set to target's entry_number.
+        assert result[1].ruling_text == target_text
+        assert result[1].cross_reference_source == 1
+
+        # Target (index 0) is unchanged.
+        assert result[0].ruling_text == target_text
+        assert result[0].cross_reference_source is None
+
+    def test_riverside_xref_not_resolved_when_target_text_too_short(self) -> None:
+        """Riverside stub is left unchanged when the target text is too short (#3857).
+
+        When the referenced entry's ruling_text is shorter than
+        _XREF_REF_MIN_TEXT_LENGTH (100 chars), the resolver must leave the stub
+        unchanged — copying short text would propagate a stub, not resolve it.
+
+        The target text is padded to 50 chars (above the short-unsubstantive
+        filter floor) but below the 100-char xref copy threshold.
+        """
+        # 50 chars — survives short-unsubstantive filter but < 100 char xref threshold.
+        short_target_text = "Motion DENIED. See prior order for full reasoning."
+        assert len(short_target_text) < 100
+        stub_text = (
+            "MOTION TO COMPEL FURTHER RESPONSES TO FORM INTERROGATORIES\n\n"
+            "Tentative Ruling:\nSee Ruling for #1 Above"
+        )
+        rulings = [
+            ExtractedRuling(
+                extracted_case_number="RIC2200001",
+                extracted_case_title="Smith v. Jones",
+                ruling_text=short_target_text,
+                entry_number=1,
+            ),
+            ExtractedRuling(
+                extracted_case_number="RIC2200002",
+                extracted_case_title="Doe v. Roe",
+                ruling_text=stub_text,
+                entry_number=2,
+            ),
+        ]
+        result = _apply_pdf_cache_hit_filters(rulings, content_key="abc123def456")
+
+        # Both rulings survive (neither is a calendar listing or unsubstantive).
+        assert len(result) == 2
+
+        # Stub must remain unchanged because target text is too short to copy.
+        assert result[1].ruling_text == stub_text
+        assert result[1].cross_reference_source is None
+
 
 class TestApplyTextCacheHitFilters:
     """Unit tests for ``_apply_text_cache_hit_filters`` (#2513)."""
