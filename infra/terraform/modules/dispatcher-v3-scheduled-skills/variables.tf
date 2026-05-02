@@ -136,9 +136,9 @@ variable "dispatcher_daily_report_schedule_expression" {
 }
 
 variable "spotcheck_schedule_expression" {
-  description = "Schedule expression for the `spotcheck` rule. Default `cron(0 18 ? * MON *)` (weekly Monday 18:00 UTC) per issue body."
+  description = "Schedule expression for the `spotcheck` rule. Default `cron(0 * * * ? *)` (hourly at :00) - matches v2's live cadence per migration 52 (#3459 operator directive 2026-04-26). The skill's own state-awareness (gh issue list + comment-on-existing) prevents the higher cadence from filing duplicate findings."
   type        = string
-  default     = "cron(0 18 ? * MON *)"
+  default     = "cron(0 * * * ? *)"
 }
 
 variable "schedule_state_enabled" {
