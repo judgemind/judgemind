@@ -1447,3 +1447,152 @@ class TestCaseTitlePreference:
 
         assert len(docs) == 1
         assert docs[0].case_title == "Smith"
+
+
+# ---------------------------------------------------------------------------
+# Post-pagination cap tests (AC1: ≤ max_results requests for opinion+docket)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchCapsToMaxResults:
+    """Verify that cluster_id_list is capped to _max_results AFTER full pagination."""
+
+    @respx.mock
+    def test_docket_and_opinion_fetches_capped_to_max_results(self) -> None:
+        """With 50 clusters paginated and max_results=10, opinion+docket requests ≤ 10.
+
+        Proves that the cap is applied before the concurrent fetches, not just in
+        the doc-build loop.  Without the fix, 50 opinion requests and 50 docket
+        requests would be issued.
+        """
+        num_clusters = 50
+        max_results = 10
+
+        # Build 50 distinct clusters, all on a single page for simplicity.
+        clusters = [
+            _make_cluster(
+                cluster_id=2000 + i,
+                case_name=f"Case {i} v. Defendant",
+                docket=f"{API_BASE_URL}/dockets/{3000 + i}/?format=json",
+            )
+            for i in range(num_clusters)
+        ]
+
+        opinion_request_count = 0
+        docket_request_count = 0
+
+        def _mock_opinions(request: httpx.Request) -> httpx.Response:
+            nonlocal opinion_request_count
+            opinion_request_count += 1
+            cluster_id = int(request.url.params["cluster"])
+            opinion = _make_opinion(
+                opinion_id=cluster_id * 10,
+                cluster_id=cluster_id,
+                plain_text=f"Opinion for cluster {cluster_id}",
+            )
+            return httpx.Response(200, json=_make_paginated_response([opinion]))
+
+        def _mock_dockets(request: httpx.Request) -> httpx.Response:
+            nonlocal docket_request_count
+            docket_request_count += 1
+            path_parts = str(request.url.path).rstrip("/").split("/")
+            docket_id = int(path_parts[-1])
+            return httpx.Response(
+                200, json={"id": docket_id, "docket_number": f"1:24-cv-{docket_id:05d}"}
+            )
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response(clusters))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_mock_opinions)
+        respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_dockets)
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7, max_results=max_results)
+        docs = scraper.fetch_documents()
+
+        # The cap must limit both opinion and docket fetches to ≤ max_results each.
+        assert opinion_request_count <= max_results, (
+            f"Expected ≤ {max_results} opinion requests, got {opinion_request_count}"
+        )
+        assert docket_request_count <= max_results, (
+            f"Expected ≤ {max_results} docket requests, got {docket_request_count}"
+        )
+        # Final document count must also not exceed max_results.
+        assert len(docs) <= max_results, f"Expected ≤ {max_results} docs, got {len(docs)}"
+
+    @respx.mock
+    def test_post_pagination_cap_preserves_date_modified_order(self) -> None:
+        """Cap is applied on the post-pagination flat list, so most-recent clusters win.
+
+        Page 1 (date_modified=2026-04-01) comes first in the flat list because
+        fetch_clusters returns results in -date_modified order.  With max_results=3
+        the cap must select from page 1's clusters, not page 2's.
+        """
+        max_results = 3
+
+        # Page 1: more-recent clusters (date_modified 2026-04-01)
+        page1_clusters = [
+            _make_cluster(
+                cluster_id=5000 + i,
+                case_name=f"Recent Case {i}",
+                date_modified="2026-04-01T10:00:00Z",
+            )
+            for i in range(5)
+        ]
+        # Page 2: older clusters (date_modified 2026-03-01)
+        page2_clusters = [
+            _make_cluster(
+                cluster_id=6000 + i,
+                case_name=f"Older Case {i}",
+                date_modified="2026-03-01T10:00:00Z",
+            )
+            for i in range(5)
+        ]
+
+        page1_response = _make_paginated_response(
+            page1_clusters,
+            next_url=f"{API_BASE_URL}/clusters/?cursor=page2",
+            count=10,
+        )
+        page2_response = _make_paginated_response(page2_clusters)
+
+        cluster_call_count = 0
+
+        def _handle_clusters(request: httpx.Request) -> httpx.Response:
+            nonlocal cluster_call_count
+            cluster_call_count += 1
+            if cluster_call_count == 1:
+                return httpx.Response(200, json=page1_response)
+            return httpx.Response(200, json=page2_response)
+
+        def _mock_opinions(request: httpx.Request) -> httpx.Response:
+            cluster_id = int(request.url.params["cluster"])
+            opinion = _make_opinion(
+                opinion_id=cluster_id * 10,
+                cluster_id=cluster_id,
+                plain_text=f"Opinion for cluster {cluster_id}",
+            )
+            return httpx.Response(200, json=_make_paginated_response([opinion]))
+
+        respx.get(url__startswith=f"{API_BASE_URL}/clusters/").mock(side_effect=_handle_clusters)
+        respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_mock_opinions)
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7, max_results=max_results)
+        docs = scraper.fetch_documents()
+
+        # All returned docs must come from page 1 clusters (ids 5000-5004).
+        page1_ids = {5000 + i for i in range(5)}
+        for doc in docs:
+            cluster_id_in_doc = doc.extra["courtlistener_cluster_id"]
+            assert cluster_id_in_doc in page1_ids, (
+                f"Doc cluster_id={cluster_id_in_doc} is not from page 1 "
+                f"(page1_ids={page1_ids}). Cap must be post-pagination."
+            )
+        # Confirm we got max_results docs (one per cluster since each has one opinion).
+        assert len(docs) == max_results, (
+            f"Expected exactly {max_results} docs from page 1, got {len(docs)}"
+        )
