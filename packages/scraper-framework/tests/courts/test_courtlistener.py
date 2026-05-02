@@ -1049,3 +1049,81 @@ class TestExtraSurvivesEventEmission:
         payload = _json.loads(mock_redis.xadd.call_args[0][1]["data"])
         assert payload["state"] == "Texas"
         assert payload["county"] == "Statewide"
+
+
+# ---------------------------------------------------------------------------
+# case_title field preference (AC1: case_name_full > case_name > case_name_short)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseTitlePreference:
+    """Verify _map_to_document uses case_name_full > case_name > case_name_short."""
+
+    @respx.mock
+    def test_case_title_prefers_case_name_full(self) -> None:
+        """When case_name_full is set it wins over case_name and case_name_short."""
+        cluster = _make_cluster(case_name="Smith v. Jones")
+        cluster["case_name_full"] = "Joseph Lester Smith v. Williams Jones et al."
+        cluster["case_name_short"] = "Smith"
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        assert docs[0].case_title == "Joseph Lester Smith v. Williams Jones et al."
+
+    @respx.mock
+    def test_case_title_falls_back_to_case_name(self) -> None:
+        """When case_name_full is absent/empty, case_name is used."""
+        cluster = _make_cluster(case_name="Smith v. Jones")
+        cluster["case_name_full"] = ""
+        cluster["case_name_short"] = "Smith"
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        assert docs[0].case_title == "Smith v. Jones"
+
+    @respx.mock
+    def test_case_title_falls_back_to_case_name_short(self) -> None:
+        """When both case_name_full and case_name are absent/empty, case_name_short is used."""
+        cluster = _make_cluster(case_name="")
+        cluster["case_name_full"] = ""
+        cluster["case_name_short"] = "Smith"
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        assert docs[0].case_title == "Smith"

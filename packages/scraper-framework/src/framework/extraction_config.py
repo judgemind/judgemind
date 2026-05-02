@@ -147,6 +147,18 @@ _COUNTY_CONFIGS: dict[tuple[str, str], CountyExtractionConfig] = {
         model="gemini-2.5-flash-lite",
         max_output_tokens=32768,
     ),
+    # Federal CourtListener clusters ship structured case_name_full, docket_number,
+    # judges, and date_filed — the per-document plain text is a federal opinion, not
+    # a CA tentative-ruling calendar.  Running the default CA-tuned LLM prompt over
+    # federal opinion text produces truncation and field-contamination failures
+    # (issue #3967).  ExtractionMethod.NONE short-circuits LLM extraction in
+    # worker.py:1579-1588 so the scraper-populated fields are used as-is.
+    # Precedent: the SD calendar _SCRAPER_CONFIGS entry (#2331) uses the same shape.
+    # Key uses ("FEDERAL", "FEDERAL") because get_county_extraction_config uppercases
+    # both halves at extraction_config.py:225.
+    ("FEDERAL", "FEDERAL"): CountyExtractionConfig(
+        method=ExtractionMethod.NONE,
+    ),
 }
 
 

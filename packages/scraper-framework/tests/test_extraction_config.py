@@ -1129,3 +1129,35 @@ class TestScraperLevelOverrides:
         """The _SCRAPER_CONFIGS registry contains the SD calendar entry."""
         assert "ca-sd-calendar" in _SCRAPER_CONFIGS
         assert _SCRAPER_CONFIGS["ca-sd-calendar"].method == ExtractionMethod.NONE
+
+
+# ---------------------------------------------------------------------------
+# Federal CourtListener extraction config (#3967)
+# ---------------------------------------------------------------------------
+
+
+class TestFederalExtractionConfig:
+    """Verify Federal CourtListener uses ExtractionMethod.NONE (#3967)."""
+
+    def test_federal_returns_none_method(self) -> None:
+        """Federal state + Federal county returns ExtractionMethod.NONE."""
+        config = get_county_extraction_config("Federal", "Federal")
+        assert config is not None
+        assert config.method == ExtractionMethod.NONE
+
+    def test_federal_uppercase_lookup(self) -> None:
+        """Uppercase 'FEDERAL'/'FEDERAL' lookup also returns NONE."""
+        config = get_county_extraction_config("FEDERAL", "FEDERAL")
+        assert config is not None
+        assert config.method == ExtractionMethod.NONE
+
+    def test_federal_mixed_case_lookup(self) -> None:
+        """Mixed-case lookup is normalized and returns NONE."""
+        config = get_county_extraction_config("federal", "federal")
+        assert config is not None
+        assert config.method == ExtractionMethod.NONE
+
+    def test_federal_county_config_in_registry(self) -> None:
+        """The Federal entry is directly accessible in _COUNTY_CONFIGS."""
+        assert ("FEDERAL", "FEDERAL") in _COUNTY_CONFIGS
+        assert _COUNTY_CONFIGS[("FEDERAL", "FEDERAL")].method == ExtractionMethod.NONE
