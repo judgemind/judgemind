@@ -26440,10 +26440,13 @@ class DispatcherDaemon:
             with self._conn.cursor() as cur:
                 # exec-mode-agnostic (#3158): reads succeeded+merged rows for GH-side
                 # cleanup only; execution_mode has no bearing on whether a PR merged.
+                # v2-scoped: housekeeping cleanup only operates on v2-owned rows;
+                # v3 closes its own issues via the diagnoser path.
                 cur.execute(
                     "SELECT issue_number, pr_number FROM dispatcher.agents "
                     "WHERE status = 'succeeded' "
-                    "  AND merged_at IS NOT NULL",
+                    "  AND merged_at IS NOT NULL "
+                    f"  AND {V2_SCOPED_PARENT_RUN_FILTER}",
                 )
                 rows = list(cur.fetchall())
             self._conn.commit()
