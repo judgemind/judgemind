@@ -230,38 +230,70 @@ variable "scheduled_skill_memory" {
   default     = 8192
 }
 
-# --- stopTimeout caps --------------------------------------------------
+# --- Wall-clock caps (launcher-side) -----------------------------------
 #
-# Wall-clock guard rails per spec section 4 + issue body. Exceeding the
-# cap triggers ecs:StopTask from the launcher's silent-hang detector
-# (spec section 4.1). Fargate enforces a platform-level stopTimeout cap
-# of 120s on the SIGTERM-to-SIGKILL grace window, but the long values
-# below are propagated as task-level metadata read by the launcher when
-# computing its own per-agent timeout (`silent_hang_minutes` for
-# launcher-side StopTask). The container itself is not directly killed
-# by ECS at the cap -- the launcher is the source of truth for "this
-# task has run too long."
+# Per-task-def wall-clock guard rails per spec section 4 + issue body.
+# Exceeding a cap triggers ecs:StopTask from the launcher's silent-hang
+# detector loop (`scripts/dispatcher_v3/launcher.py::_watch_in_flight`),
+# which marks the agent row failed with `exit_reason='wall_clock_exceeded'`.
 #
-# We expose them as variables so the spec section 4 caps stay
-# observable at the call site (environments/dev/main.tf) without
-# spelunking into the module body.
+# Naming note: the variable names retain the legacy `_stop_timeout_seconds`
+# suffix for backwards compatibility with the F2 module's existing
+# `environments/dev/main.tf` callers (and any internal tooling that
+# reads `module.dispatcher_v3_task_defs.var.task_runner_stop_timeout_seconds`
+# via terraform state). The values are NO LONGER set as the rendered
+# `stopTimeout` field on the container definition -- that field is
+# hardcoded to 120 (Fargate's platform max) via
+# `local.fargate_stop_timeout_seconds` in `main.tf`. Pre-#3940 these
+# values WERE set as `stopTimeout`, which caused every dev-apply to
+# fail with `ClientException: Tasks using the Fargate launch type must
+# have a container stop timeout of less than 120 seconds.`
+#
+# Today the variables are propagated to the launcher container's
+# environment as `TASK_RUNNER_WALL_CLOCK_SECONDS` /
+# `DIAGNOSER_WALL_CLOCK_SECONDS` / `SCHEDULED_SKILL_WALL_CLOCK_SECONDS`
+# env vars (rendered as strings via `tostring()` in
+# `local.launcher_environment`); the launcher reads them in
+# `_build_launcher_from_env`. Renaming the variables themselves was
+# avoided to keep the public surface stable -- the docstrings below
+# document the actual semantics.
+#
+# Validation: each variable rejects values <= 0 (the launcher's
+# wall-clock check would never fire) and values > 1209600 (Fargate's
+# platform-level max task lifetime is 14 days; anything larger is a
+# typo).
 
 variable "task_runner_stop_timeout_seconds" {
-  description = "Wall-clock cap for a task-runner ECS task in seconds. Default 21600 (6h) per issue body. The launcher's silent-hang detector reads this from the task-def metadata and StopTask's any task-runner that exceeds it."
+  description = "Launcher-side wall-clock cap for a task-runner ECS task in seconds (NOT the Fargate stopTimeout). Default 21600 (6h) per issue body. The launcher's `_watch_in_flight` loop reads this via the `TASK_RUNNER_WALL_CLOCK_SECONDS` env var on the launcher task-def and ecs:StopTask's any task-runner whose `now - started_at` exceeds it. The rendered Fargate `stopTimeout` field on the task-runner container is hardcoded to 120s -- see local.fargate_stop_timeout_seconds in main.tf and #3940."
   type        = number
   default     = 21600
+
+  validation {
+    condition     = var.task_runner_stop_timeout_seconds > 0 && var.task_runner_stop_timeout_seconds <= 1209600
+    error_message = "task_runner_stop_timeout_seconds must be in (0, 1209600] -- positive and at most Fargate's 14-day task-lifetime ceiling."
+  }
 }
 
 variable "diagnoser_stop_timeout_seconds" {
-  description = "Wall-clock cap for a diagnoser ECS task in seconds. Default 3600 (1h) per issue body -- the diagnoser is a one-shot read + side-effect skill that should not run long."
+  description = "Launcher-side wall-clock cap for a diagnoser ECS task in seconds (NOT the Fargate stopTimeout). Default 3600 (1h) per issue body -- the diagnoser is a one-shot read + side-effect skill that should not run long. Read by the launcher via the `DIAGNOSER_WALL_CLOCK_SECONDS` env var. See #3940 for the wall-clock-vs-stopTimeout split rationale."
   type        = number
   default     = 3600
+
+  validation {
+    condition     = var.diagnoser_stop_timeout_seconds > 0 && var.diagnoser_stop_timeout_seconds <= 1209600
+    error_message = "diagnoser_stop_timeout_seconds must be in (0, 1209600] -- positive and at most Fargate's 14-day task-lifetime ceiling."
+  }
 }
 
 variable "scheduled_skill_stop_timeout_seconds" {
-  description = "Wall-clock cap for a scheduled-skill ECS task in seconds. Default 7200 (2h) per issue body."
+  description = "Launcher-side wall-clock cap for a scheduled-skill ECS task in seconds (NOT the Fargate stopTimeout). Default 7200 (2h) per issue body. Read by the launcher via the `SCHEDULED_SKILL_WALL_CLOCK_SECONDS` env var. See #3940."
   type        = number
   default     = 7200
+
+  validation {
+    condition     = var.scheduled_skill_stop_timeout_seconds > 0 && var.scheduled_skill_stop_timeout_seconds <= 1209600
+    error_message = "scheduled_skill_stop_timeout_seconds must be in (0, 1209600] -- positive and at most Fargate's 14-day task-lifetime ceiling."
+  }
 }
 
 # --- Ephemeral storage / log retention ---------------------------------

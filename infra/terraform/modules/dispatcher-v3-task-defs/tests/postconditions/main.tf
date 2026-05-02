@@ -141,3 +141,37 @@ resource "aws_ecs_task_definition" "broken" {
     }
   }
 }
+
+# #3940 stopTimeout-cap regression fixture. Mirrors the production
+# task-runner / diagnoser / scheduled-skill postcondition that asserts
+# `"stopTimeout":120` is present in the rendered container_definitions
+# JSON. Setting a value > 120 here must trip the postcondition at plan
+# time (or, if terraform defers self.* checks to apply, at apply time).
+# Pre-#3940 the wall-clock cap was rendered into stopTimeout directly,
+# which Fargate rejects -- this resource catches that regression class.
+resource "aws_ecs_task_definition" "broken_stop_timeout" {
+  family                   = "judgemind-v3-task-defs-test-broken-stoptimeout"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 4096
+  memory                   = 16384
+  execution_role_arn       = aws_iam_role.fake_exec.arn
+  task_role_arn            = aws_iam_role.fake_task.arn
+
+  container_definitions = jsonencode([
+    {
+      name        = "task-runner"
+      image       = "fake-repo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      essential   = true
+      command     = ["python", "-m", "dispatcher_v3.agent_runner"]
+      stopTimeout = 21600 # The pre-#3940 6h value Fargate rejects.
+    }
+  ])
+
+  lifecycle {
+    postcondition {
+      condition     = strcontains(self.container_definitions, "\"stopTimeout\":120")
+      error_message = "rendered stopTimeout != 120. Fargate rejects task-defs with stopTimeout > 120s; the wall-clock cap must be enforced launcher-side. See #3940."
+    }
+  }
+}

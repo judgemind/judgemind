@@ -128,6 +128,50 @@ DEFAULT_SILENT_HANG_MINUTES = 30
 #: keys off this string (#3882, C5).
 EXIT_REASON_SILENT_HANG = "silent_hang"
 
+#: Default wall-clock cap (seconds) for a task-runner ECS task. The
+#: launcher's ``_watch_in_flight`` loop ecs:StopTask's any task-runner
+#: whose ``now - started_at`` exceeds this. Matches v3 spec §11 OQ#4:
+#: 6h covers virtually every real ``/task`` run including a long ralph
+#: + fix-CI cycle.
+#:
+#: Pre-#3940 this cap was rendered into the task-def's ``stopTimeout``
+#: field, but Fargate rejects task-defs with ``stopTimeout > 120s``.
+#: The fix moves enforcement to the launcher: the F2 task-defs module
+#: passes the per-task-def cap via the ``TASK_RUNNER_WALL_CLOCK_SECONDS``
+#: / ``DIAGNOSER_WALL_CLOCK_SECONDS`` /
+#: ``SCHEDULED_SKILL_WALL_CLOCK_SECONDS`` env vars on the launcher
+#: container; ``_build_launcher_from_env`` parses them.
+#:
+#: A non-positive value disables the wall-clock check entirely (graceful
+#: degradation when the launcher is started outside an F2-rendered
+#: task-def, e.g. local CLI runs).
+DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS = 21600  # 6h
+
+#: Default wall-clock cap for the diagnoser. The diagnoser is a one-shot
+#: read + side-effect skill that should not run long; 1h is a generous
+#: ceiling per issue body. Wired into ``_watch_diagnosers`` symmetrically
+#: with the task-runner case in ``_watch_in_flight``.
+DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS = 3600  # 1h
+
+#: Default wall-clock cap for scheduled-skill tasks. Each scheduled
+#: skill (audit / dispatcher-audit / spotcheck / dispatcher-daily-report)
+#: sits comfortably under 2h.
+#:
+#: Note: scheduled-skill tasks are launched by EventBridge, NOT the
+#: launcher's claim path, so they do not appear in ``dispatcher.agents``
+#: and the launcher does not enforce this cap directly. The value is
+#: still threaded through the launcher env for observability and so a
+#: future ``_watch_scheduled_skills`` (paralleling ``_watch_in_flight``)
+#: can reuse the same plumbing without a config refactor.
+DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS = 7200  # 2h
+
+#: Exit reason recorded on agent rows reaped by the wall-clock-cap
+#: detector. Distinct from ``silent_hang`` so the cockpit / diagnoser
+#: can branch on the kill class -- a wall-clock kill means the agent
+#: was actively producing log output but never finished, while
+#: ``silent_hang`` means it stopped producing output entirely.
+EXIT_REASON_WALL_CLOCK_EXCEEDED = "wall_clock_exceeded"
+
 #: Default CloudWatch Logs group for the v3 ``task-runner`` ECS task
 #: definition. The group name is wired into F2's task-def via the
 #: ``awslogs-group`` log-driver option; the launcher needs the same
@@ -251,6 +295,9 @@ class Launcher:
         runner_name: str = "claude",
         task_runner_log_group: str = DEFAULT_TASK_RUNNER_LOG_GROUP,
         task_runner_log_stream_prefix: str = DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
+        task_runner_wall_clock_seconds: int = DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS,
+        diagnoser_wall_clock_seconds: int = DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS,
+        scheduled_skill_wall_clock_seconds: int = DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS,
         conn: Any = None,
         ecs_client: Any = None,
         cloudwatch_logs_client: Any = None,
@@ -269,6 +316,9 @@ class Launcher:
         self._runner_name = runner_name
         self._task_runner_log_group = task_runner_log_group
         self._task_runner_log_stream_prefix = task_runner_log_stream_prefix
+        self._task_runner_wall_clock_seconds = task_runner_wall_clock_seconds
+        self._diagnoser_wall_clock_seconds = diagnoser_wall_clock_seconds
+        self._scheduled_skill_wall_clock_seconds = scheduled_skill_wall_clock_seconds
         self._conn = conn
         self._ecs_client = ecs_client
         self._cloudwatch_logs_client = cloudwatch_logs_client
@@ -537,34 +587,47 @@ class Launcher:
     def _watch_in_flight(self) -> tuple[int, list[dict[str, Any]]]:
         """For each in-flight v3 agent, resolve STOPPED tasks and reap silent hangs.
 
-        Two liveness signals are checked per RUNNING task this tick:
+        Three liveness signals are checked per RUNNING task this tick:
 
         - **ECS task lifecycle.** STOPPED + exit 0 → ``succeeded``;
           STOPPED + non-zero → ``failed`` with the ECS ``stoppedReason``
           captured. This is the coarse "the container exited" signal.
+        - **Wall-clock cap.** RUNNING + ``now - started_at`` exceeds
+          ``task_runner_wall_clock_seconds`` (default 21600, 6h) →
+          ``ecs:StopTask`` + ``failed`` with
+          ``exit_reason='wall_clock_exceeded'``. The wall-clock cap is
+          the *coarse* liveness check per spec §11 OQ#4; pre-#3940 it
+          was rendered into the task-def's ``stopTimeout`` field, but
+          Fargate rejects task-defs with ``stopTimeout > 120s``, so the
+          launcher enforces it here instead. Checked BEFORE the silent-
+          hang detector so a wall-clock-killed task doesn't spend an
+          extra tick waiting on a CloudWatch round-trip.
         - **CloudWatch session-log silence.** RUNNING + log-stream
           ``lastEventTimestamp`` older than ``silent_hang_minutes``
           (default 30) → ``ecs:StopTask`` + ``failed`` with
           ``exit_reason='silent_hang'``. This catches a wedged
           ``claude -p`` (Anthropic-side hang, network blip, hung HTTP)
-          that consumes a slot for the full wall-clock cap. The
-          wall-clock cap itself is enforced by ECS via the task-def's
-          ``stopTimeout`` (F2's responsibility, not this method).
+          that produces no log output. Distinct from the wall-clock cap
+          because a wall-clock kill means the agent was actively
+          producing output but never finished, while ``silent_hang``
+          means it stopped producing output entirely.
 
-        On any non-success terminal — STOPPED-non-zero or silent-hang
-        reap — the launcher inline-spawns a ``diagnoser`` ECS task
-        (issue #3882, spec §4.2) with ``AGENT_ID`` set. The per-agent
-        cap of 1 diagnoser is enforced inside ``_launch_diagnoser`` via
-        a fresh re-read of the row's ``diagnoser_arn`` value, and the
-        ``exit_reason`` field carries the kill class so the diagnoser
-        SKILL can branch on it when it reads the row.
+        On any non-success terminal — STOPPED-non-zero, wall-clock
+        exceeded, or silent-hang reap — the launcher inline-spawns a
+        ``diagnoser`` ECS task (issue #3882, spec §4.2) with
+        ``AGENT_ID`` set. The per-agent cap of 1 diagnoser is enforced
+        inside ``_launch_diagnoser`` via a fresh re-read of the row's
+        ``diagnoser_arn`` value, and the ``exit_reason`` field carries
+        the kill class so the diagnoser SKILL can branch on it when it
+        reads the row.
         """
         if self._conn is None:
             return 0, []
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents "
+                    "SELECT agent_id, task_arn, issue_number, started_at "
+                    "FROM dispatcher.agents "
                     "WHERE task_arn IS NOT NULL AND ended_at IS NULL "
                     f"  AND {V3_SCOPED_PARENT_RUN_FILTER}",
                 )
@@ -584,8 +647,12 @@ class Launcher:
             d["taskArn"]: d for d in descriptions if isinstance(d.get("taskArn"), str)
         }
         silent_hang_seconds = self._read_silent_hang_minutes() * 60
+        # Wall-clock cap is constructor-injected (env-var driven via
+        # `_build_launcher_from_env`); compute the deadline timestamp
+        # once per tick.
+        wall_clock_seconds = self._task_runner_wall_clock_seconds
         transitions: list[dict[str, Any]] = []
-        for agent_id, task_arn, issue_number in rows:
+        for agent_id, task_arn, issue_number, started_at in rows:
             desc = by_arn.get(str(task_arn))
             if desc is None:
                 continue  # transient API blip — re-check next tick
@@ -599,15 +666,40 @@ class Launcher:
                         desc=desc,
                     )
                 )
-            else:
-                result = self._maybe_reap_silent_hang(
-                    agent_id=str(agent_id),
-                    task_arn=str(task_arn),
-                    issue_number=issue_num,
-                    threshold_seconds=silent_hang_seconds,
-                )
-                if result is not None:
-                    transitions.append(result)
+                continue
+            # RUNNING — check the wall-clock cap first (#3940). Pre-
+            # #3940 this was enforced by Fargate via the task-def's
+            # ``stopTimeout`` field, but Fargate rejects task-defs
+            # whose ``stopTimeout`` exceeds 120 seconds. The launcher
+            # now owns the enforcement: if ``now - started_at`` exceeds
+            # the cap, ``ecs:StopTask`` the task and mark the agent
+            # failed with ``exit_reason='wall_clock_exceeded'``. The
+            # cap is constructor-injected from the launcher's env vars
+            # (``TASK_RUNNER_WALL_CLOCK_SECONDS``); a non-positive cap
+            # disables the check (graceful degradation for tests /
+            # local CLI runs / environments before F2 wired the env
+            # var). Checked BEFORE the silent-hang detector so a
+            # wall-clock-killed task doesn't spend an extra tick
+            # waiting on a CloudWatch round-trip.
+            wall_clock_result = self._maybe_reap_wall_clock(
+                agent_id=str(agent_id),
+                task_arn=str(task_arn),
+                issue_number=issue_num,
+                started_at=started_at,
+                cap_seconds=wall_clock_seconds,
+            )
+            if wall_clock_result is not None:
+                transitions.append(wall_clock_result)
+                continue
+            # RUNNING — silent-hang detector (C4, #3881).
+            silent_hang_result = self._maybe_reap_silent_hang(
+                agent_id=str(agent_id),
+                task_arn=str(task_arn),
+                issue_number=issue_num,
+                threshold_seconds=silent_hang_seconds,
+            )
+            if silent_hang_result is not None:
+                transitions.append(silent_hang_result)
         return len(rows), transitions
 
     def _resolve_stopped_task(
@@ -696,6 +788,66 @@ class Launcher:
             "exit_reason": EXIT_REASON_SILENT_HANG,
         }
         # Silent-hang reaped agents are non-success terminals; run the
+        # diagnoser (cap of 1 enforced inside _launch_diagnoser via
+        # re-read of the row's diagnoser_arn).
+        diagnoser_arn = self._launch_diagnoser(agent_id=agent_id)
+        if diagnoser_arn:
+            transition["diagnoser_arn"] = diagnoser_arn
+        return transition
+
+    def _maybe_reap_wall_clock(
+        self,
+        *,
+        agent_id: str,
+        task_arn: str,
+        issue_number: int,
+        started_at: Any,
+        cap_seconds: int,
+    ) -> Optional[dict[str, Any]]:
+        """Reap a RUNNING task if its age exceeds the wall-clock cap.
+
+        Returns ``None`` when the wall-clock check is disabled
+        (``cap_seconds <= 0``), the row has no ``started_at``, or the
+        task is not yet over the cap. Returns the transition dict when
+        the task is reaped.
+
+        See :func:`_watch_in_flight` for the wall-clock-cap rationale
+        and #3940 for the F2 task-def stopTimeout incident that drove
+        this enforcement into the launcher.
+        """
+        if cap_seconds <= 0 or started_at is None:
+            return None
+        if not self._task_age_exceeds_cap(
+            started_at=started_at,
+            cap_seconds=cap_seconds,
+        ):
+            return None
+        self._stop_task_for_wall_clock(agent_id=agent_id, task_arn=task_arn)
+        self._mark_agent_terminal(
+            agent_id=agent_id,
+            issue_number=issue_number,
+            status="failed",
+            exit_code=None,
+            exit_reason=EXIT_REASON_WALL_CLOCK_EXCEEDED,
+        )
+        log.warning(
+            "launcher.wall_clock_exceeded_reaped",
+            extra={
+                "event": "wall_clock_exceeded_reaped",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "task_arn": task_arn,
+                "cap_seconds": cap_seconds,
+            },
+        )
+        transition: dict[str, Any] = {
+            "agent_id": agent_id,
+            "status": "failed",
+            "exit_code": None,
+            "exit_reason": EXIT_REASON_WALL_CLOCK_EXCEEDED,
+        }
+        # Wall-clock reaped agents are non-success terminals; run the
         # diagnoser (cap of 1 enforced inside _launch_diagnoser via
         # re-read of the row's diagnoser_arn).
         diagnoser_arn = self._launch_diagnoser(agent_id=agent_id)
@@ -924,6 +1076,62 @@ class Launcher:
                 "launcher.silent_hang_stop_failed",
                 extra={
                     "event": "silent_hang_stop_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "task_arn": task_arn,
+                },
+            )
+
+    @staticmethod
+    def _task_age_exceeds_cap(*, started_at: Any, cap_seconds: int) -> bool:
+        """True iff the agent's task is older than the wall-clock cap.
+
+        ``started_at`` arrives as whatever the DB driver hands back for
+        a ``timestamptz`` column — typically a ``datetime`` (psycopg
+        default) but tests pass plain UTC ``datetime`` objects too. We
+        compute the elapsed seconds in UTC; a naive ``datetime`` is
+        treated as already-UTC (matching the v2 daemon's convention).
+
+        Returns False on any unparseable input (defense-in-depth: a
+        misshapen DB row must not flip a healthy agent to failed).
+        """
+        # Lazy-import datetime to keep module-import side effects minimal.
+        from datetime import datetime, timezone  # noqa: PLC0415 — lazy
+
+        if not isinstance(started_at, datetime):
+            return False
+        # Normalize to UTC. A naive datetime is treated as UTC (matches
+        # the convention v2's _silent_hang_check uses for now() values).
+        if started_at.tzinfo is None:
+            started_at_utc = started_at.replace(tzinfo=timezone.utc)
+        else:
+            started_at_utc = started_at.astimezone(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        elapsed = (now_utc - started_at_utc).total_seconds()
+        return elapsed >= cap_seconds
+
+    def _stop_task_for_wall_clock(self, *, agent_id: str, task_arn: str) -> None:
+        """Best-effort ``ecs:StopTask`` on a wall-clock-cap reap.
+
+        Mirrors :meth:`_stop_task_for_silent_hang` -- a failure here is
+        logged but does not block the DB transition. The row will be
+        marked failed regardless, and the next tick's watch loop will
+        resolve the task to STOPPED via the standard path once ECS
+        catches up. Distinct ``reason`` string so CloudTrail records
+        which kill class fired.
+        """
+        try:
+            client = self._get_ecs_client()
+            client.stop_task(
+                cluster=self._ecs_cluster_arn,
+                task=task_arn,
+                reason=f"wall_clock_exceeded:{agent_id}",
+            )
+        except Exception:
+            log.exception(
+                "launcher.wall_clock_stop_failed",
+                extra={
+                    "event": "wall_clock_stop_failed",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                     "task_arn": task_arn,
@@ -1974,6 +2182,46 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_int_env(name: str, default: int, *, fallback_on_zero: bool = False) -> int:
+    """Parse an integer env var with a documented fallback.
+
+    Used by :func:`_build_launcher_from_env` for the wall-clock-cap env
+    vars (``TASK_RUNNER_WALL_CLOCK_SECONDS`` etc.). Empty / unset /
+    non-int values fall back to ``default`` so a misconfigured launcher
+    container does not crash at boot. ``fallback_on_zero=True`` adds
+    "value <= 0" to the fallback set; the wall-clock-cap callers pass
+    True so a typo of ``"0"`` doesn't silently disable the cap.
+    """
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "launcher.env_int_parse_failed",
+            extra={
+                "event": "env_int_parse_failed",
+                "env_name": name,
+                "raw_value": raw,
+                "fallback": default,
+            },
+        )
+        return default
+    if fallback_on_zero and value <= 0:
+        log.warning(
+            "launcher.env_int_non_positive",
+            extra={
+                "event": "env_int_non_positive",
+                "env_name": name,
+                "raw_value": raw,
+                "fallback": default,
+            },
+        )
+        return default
+    return value
+
+
 def _build_launcher_from_env() -> Launcher:
     """Construct a :class:`Launcher` using process env vars.
 
@@ -2000,15 +2248,35 @@ def _build_launcher_from_env() -> Launcher:
         runner_name=os.environ.get("RUNNER", "claude"),
         # Silent-hang detector (#3881). Empty TASK_RUNNER_LOG_GROUP
         # disables the detector — useful for early v3 ramp before F2
-        # has wired the awslogs-group resource. The wall-clock cap on
-        # the task-def's stopTimeout remains the only liveness signal
-        # in that mode.
+        # has wired the awslogs-group resource. The wall-clock cap below
+        # remains the only liveness signal in that mode.
         task_runner_log_group=os.environ.get(
             "TASK_RUNNER_LOG_GROUP", DEFAULT_TASK_RUNNER_LOG_GROUP
         ),
         task_runner_log_stream_prefix=os.environ.get(
             "TASK_RUNNER_LOG_STREAM_PREFIX",
             DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
+        ),
+        # Wall-clock caps (#3940). F2's task-defs module renders these
+        # into the launcher container's environment block as strings
+        # via `tostring(var.<task>_stop_timeout_seconds)`; we parse
+        # back into ints with a documented default fallback. A
+        # non-positive override falls back to the default so a typo
+        # like ``"0"`` doesn't silently disable the cap.
+        task_runner_wall_clock_seconds=_parse_int_env(
+            "TASK_RUNNER_WALL_CLOCK_SECONDS",
+            DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS,
+            fallback_on_zero=True,
+        ),
+        diagnoser_wall_clock_seconds=_parse_int_env(
+            "DIAGNOSER_WALL_CLOCK_SECONDS",
+            DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS,
+            fallback_on_zero=True,
+        ),
+        scheduled_skill_wall_clock_seconds=_parse_int_env(
+            "SCHEDULED_SKILL_WALL_CLOCK_SECONDS",
+            DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS,
+            fallback_on_zero=True,
         ),
     )
 
