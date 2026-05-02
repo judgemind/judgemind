@@ -577,115 +577,131 @@ class Launcher:
             )
             self._safe_rollback()
             return 0, []
-
         if not rows:
             return 0, []
-
-        task_arns = [str(r[1]) for r in rows]
-        descriptions = self._describe_tasks(task_arns)
-        # Index ECS results by ARN for O(1) lookup.
-        by_arn: dict[str, dict[str, Any]] = {}
-        for desc in descriptions:
-            arn = desc.get("taskArn")
-            if isinstance(arn, str):
-                by_arn[arn] = desc
-
-        # Read silent-hang threshold once per tick — `dispatcher.config`
-        # writes are rare so the value is stable across a tick.
+        descriptions = self._describe_tasks([str(r[1]) for r in rows])
+        by_arn = {
+            d["taskArn"]: d for d in descriptions if isinstance(d.get("taskArn"), str)
+        }
         silent_hang_seconds = self._read_silent_hang_minutes() * 60
-
         transitions: list[dict[str, Any]] = []
         for agent_id, task_arn, issue_number in rows:
             desc = by_arn.get(str(task_arn))
             if desc is None:
-                # Task missing from ECS response (very stale ARN). Leave
-                # in place — the next tick will re-check. No-op here so
-                # a transient API blip does not flip an active agent to
-                # failed.
-                continue
-            last_status = str(desc.get("lastStatus") or "")
-            if last_status == "STOPPED":
-                exit_code, exit_reason = self._extract_exit_state(desc)
-                new_status = "succeeded" if exit_code == 0 else "failed"
-                self._mark_agent_terminal(
-                    agent_id=str(agent_id),
-                    issue_number=int(issue_number) if issue_number is not None else 0,
-                    status=new_status,
-                    exit_code=exit_code,
-                    exit_reason=exit_reason,
-                )
-                stopped_transition: dict[str, Any] = {
-                    "agent_id": str(agent_id),
-                    "status": new_status,
-                    "exit_code": exit_code,
-                    "exit_reason": exit_reason,
-                }
-                # On failure, inline-launch the diagnoser (cap of 1 per
-                # agent enforced inside _launch_diagnoser via re-read of
-                # the row).
-                if new_status == "failed":
-                    diagnoser_arn = self._launch_diagnoser(
-                        agent_id=str(agent_id)
+                continue  # transient API blip — re-check next tick
+            issue_num = int(issue_number) if issue_number is not None else 0
+            if str(desc.get("lastStatus") or "") == "STOPPED":
+                transitions.append(
+                    self._resolve_stopped_task(
+                        agent_id=str(agent_id),
+                        task_arn=str(task_arn),
+                        issue_number=issue_num,
+                        desc=desc,
                     )
-                    if diagnoser_arn:
-                        stopped_transition["diagnoser_arn"] = diagnoser_arn
-                transitions.append(stopped_transition)
-                continue
-
-            # RUNNING — check for silent hang. The detector is opt-in
-            # via the log-group config; if ``task_runner_log_group`` is
-            # empty we skip the check entirely (graceful degradation
-            # for environments where F2 has not landed the log group
-            # yet — wall-clock cap is the only liveness signal).
-            if not self._task_runner_log_group:
-                continue
-            stale = self._task_session_is_silent(
-                task_arn=str(task_arn),
-                threshold_seconds=silent_hang_seconds,
-            )
-            if not stale:
-                continue
-            # Stale: stop the task and mark the agent failed.
-            self._stop_task_for_silent_hang(
-                agent_id=str(agent_id),
-                task_arn=str(task_arn),
-            )
-            self._mark_agent_terminal(
-                agent_id=str(agent_id),
-                issue_number=int(issue_number) if issue_number is not None else 0,
-                status="failed",
-                exit_code=None,
-                exit_reason=EXIT_REASON_SILENT_HANG,
-            )
-            log.warning(
-                "launcher.silent_hang_reaped",
-                extra={
-                    "event": "silent_hang_reaped",
-                    "run_id": self._run_id,
-                    "agent_id": str(agent_id),
-                    "issue_number": int(issue_number)
-                    if issue_number is not None
-                    else 0,
-                    "task_arn": str(task_arn),
-                    "threshold_seconds": silent_hang_seconds,
-                },
-            )
-            silent_hang_transition: dict[str, Any] = {
-                "agent_id": str(agent_id),
-                "status": "failed",
-                "exit_code": None,
-                "exit_reason": EXIT_REASON_SILENT_HANG,
-            }
-            # Silent-hang reaped agents are non-success terminals; run
-            # the diagnoser (cap of 1 enforced inside _launch_diagnoser
-            # via re-read of the row's diagnoser_arn).
-            silent_hang_diagnoser_arn = self._launch_diagnoser(
-                agent_id=str(agent_id)
-            )
-            if silent_hang_diagnoser_arn:
-                silent_hang_transition["diagnoser_arn"] = silent_hang_diagnoser_arn
-            transitions.append(silent_hang_transition)
+                )
+            else:
+                result = self._maybe_reap_silent_hang(
+                    agent_id=str(agent_id),
+                    task_arn=str(task_arn),
+                    issue_number=issue_num,
+                    threshold_seconds=silent_hang_seconds,
+                )
+                if result is not None:
+                    transitions.append(result)
         return len(rows), transitions
+
+    def _resolve_stopped_task(
+        self,
+        *,
+        agent_id: str,
+        task_arn: str,
+        issue_number: int,
+        desc: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve a STOPPED ECS task to a terminal agent status.
+
+        Extracts exit state from the ECS task description, marks the agent
+        row terminal, and (on failure) inline-spawns the diagnoser. Returns
+        the transition dict to be appended to the tick's transition list.
+        """
+        exit_code, exit_reason = self._extract_exit_state(desc)
+        new_status = "succeeded" if exit_code == 0 else "failed"
+        self._mark_agent_terminal(
+            agent_id=agent_id,
+            issue_number=issue_number,
+            status=new_status,
+            exit_code=exit_code,
+            exit_reason=exit_reason,
+        )
+        transition: dict[str, Any] = {
+            "agent_id": agent_id,
+            "status": new_status,
+            "exit_code": exit_code,
+            "exit_reason": exit_reason,
+        }
+        # On failure, inline-launch the diagnoser (cap of 1 per agent
+        # enforced inside _launch_diagnoser via re-read of the row).
+        if new_status == "failed":
+            diagnoser_arn = self._launch_diagnoser(agent_id=agent_id)
+            if diagnoser_arn:
+                transition["diagnoser_arn"] = diagnoser_arn
+        return transition
+
+    def _maybe_reap_silent_hang(
+        self,
+        *,
+        agent_id: str,
+        task_arn: str,
+        issue_number: int,
+        threshold_seconds: float,
+    ) -> Optional[dict[str, Any]]:
+        """Reap a RUNNING task if its CloudWatch log stream has gone silent.
+
+        Returns ``None`` if the silent-hang detector is disabled (no log
+        group configured) or the task is not yet stale. Returns the
+        transition dict when the task is reaped.
+        """
+        if not self._task_runner_log_group:
+            return None
+        stale = self._task_session_is_silent(
+            task_arn=task_arn,
+            threshold_seconds=threshold_seconds,
+        )
+        if not stale:
+            return None
+        # Stale: stop the task and mark the agent failed.
+        self._stop_task_for_silent_hang(agent_id=agent_id, task_arn=task_arn)
+        self._mark_agent_terminal(
+            agent_id=agent_id,
+            issue_number=issue_number,
+            status="failed",
+            exit_code=None,
+            exit_reason=EXIT_REASON_SILENT_HANG,
+        )
+        log.warning(
+            "launcher.silent_hang_reaped",
+            extra={
+                "event": "silent_hang_reaped",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "issue_number": issue_number,
+                "task_arn": task_arn,
+                "threshold_seconds": threshold_seconds,
+            },
+        )
+        transition: dict[str, Any] = {
+            "agent_id": agent_id,
+            "status": "failed",
+            "exit_code": None,
+            "exit_reason": EXIT_REASON_SILENT_HANG,
+        }
+        # Silent-hang reaped agents are non-success terminals; run the
+        # diagnoser (cap of 1 enforced inside _launch_diagnoser via
+        # re-read of the row's diagnoser_arn).
+        diagnoser_arn = self._launch_diagnoser(agent_id=agent_id)
+        if diagnoser_arn:
+            transition["diagnoser_arn"] = diagnoser_arn
+        return transition
 
     @staticmethod
     def _extract_exit_state(desc: dict[str, Any]) -> tuple[Optional[int], str]:
@@ -1005,8 +1021,7 @@ class Launcher:
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT diagnoser_arn FROM dispatcher.agents "
-                    "WHERE agent_id = %s",
+                    "SELECT diagnoser_arn FROM dispatcher.agents WHERE agent_id = %s",
                     (agent_id,),
                 )
                 row = cur.fetchone()
@@ -1055,9 +1070,7 @@ class Launcher:
             {"name": "AGENT_ID", "value": agent_id},
         ]
         overrides = {
-            "containerOverrides": [
-                {"name": "diagnoser", "environment": env_pairs}
-            ]
+            "containerOverrides": [{"name": "diagnoser", "environment": env_pairs}]
         }
         network_configuration = {
             "awsvpcConfiguration": {
@@ -1228,10 +1241,12 @@ class Launcher:
                 # outcome_summary (defensive: stops the watch query
                 # from re-matching this row forever).
                 self._mark_diagnoser_succeeded(agent_id=str(agent_id))
-                transitions.append({
-                    "agent_id": str(agent_id),
-                    "diagnoser_status": "succeeded",
-                })
+                transitions.append(
+                    {
+                        "agent_id": str(agent_id),
+                        "diagnoser_status": "succeeded",
+                    }
+                )
             else:
                 # STOPPED-non-zero: bump agent to needs_review. The
                 # operator inspects from the cockpit; the per-issue
@@ -1243,12 +1258,14 @@ class Launcher:
                     diagnoser_exit_code=exit_code,
                     diagnoser_exit_reason=exit_reason,
                 )
-                transitions.append({
-                    "agent_id": str(agent_id),
-                    "diagnoser_status": "failed",
-                    "diagnoser_exit_code": exit_code,
-                    "diagnoser_exit_reason": exit_reason,
-                })
+                transitions.append(
+                    {
+                        "agent_id": str(agent_id),
+                        "diagnoser_status": "failed",
+                        "diagnoser_exit_code": exit_code,
+                        "diagnoser_exit_reason": exit_reason,
+                    }
+                )
         return len(rows), transitions
 
     def _mark_diagnoser_succeeded(self, *, agent_id: str) -> None:
@@ -1974,9 +1991,7 @@ def _build_launcher_from_env() -> Launcher:
         # boots without diagnoser invocation wired (cap=0 means no
         # failures fire either). When unset, ``_launch_diagnoser`` logs
         # and skips; agents still mark ``failed`` correctly.
-        diagnoser_task_definition=os.environ.get(
-            "DIAGNOSER_TASK_DEFINITION", ""
-        ),
+        diagnoser_task_definition=os.environ.get("DIAGNOSER_TASK_DEFINITION", ""),
         agent_runner_subnet_ids=[
             s for s in os.environ.get("AGENT_RUNNER_SUBNET_IDS", "").split(",") if s
         ],
