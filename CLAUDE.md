@@ -79,6 +79,7 @@ Consult these docs before making changes in their domain:
 | `docs/specs/product-spec-v3.md` | Product requirements, feature priorities, scope decisions |
 | `docs/specs/user-journeys.md` | UI/UX decisions, feature design, evaluating what to build |
 | `docs/specs/architecture-spec-v1.md` | Ingestion pipeline, data model, infrastructure decisions |
+| `docs/specs/dispatcher-v3-spec.md` | Dispatcher v3 internals (task-runner ECS task-def, F-fn launcher, scheduled_skill_runner, diagnoser_runner) and progress.sh milestone integration |
 | `docs/web-patterns.md` | **All frontend work** — page layout patterns, component usage, consistency rules |
 | `docs/BRAND.md` | Colors, typography, design principles for all visual work |
 | `docs/web-lessons.md` | Frontend incident lessons, server component error handling |
@@ -114,7 +115,7 @@ The full skill catalog is injected at session start as the `available-skills` sy
 
 ### Dispatcher-internal phase skills
 
-The dispatcher v2 daemon decomposes each task into per-phase subagents (`/task-v2-*`, `/dispatcher-*`, `/diagnose-failure`). Operators do not invoke them directly. Full spec: `docs/specs/dispatcher-v2-spec.md`.
+Two dispatcher implementations cohabit: v2's daemon decomposes tasks into per-phase subagents (`/task-v2-*`, `/dispatcher-*`, `/diagnose-failure`), while v3 runs `/task` end-to-end via its `task-runner` ECS task-def, F-fn launcher, `scheduled_skill_runner`, and `diagnoser_runner` — v2 remains authoritative in production; v3 runs alongside. Operators do not invoke either set of internal components directly; full specs: `docs/specs/dispatcher-v2-spec.md` and `docs/specs/dispatcher-v3-spec.md` (§8 cohabitation).
 
 ### Worktree setup
 
@@ -164,6 +165,7 @@ Use `/task` to claim and work on an issue: `/task`, `/task #42`, or `/task scrap
 - **Verification evidence comment is MANDATORY on every task completion.** For deployed services: curl / DB query / log lines / screenshot. For docs/CI/tooling: state the skip reason.
 - **For new user-visible affordances, the evidence must be the affordance exercised** — not "the page loads." A stop button requires log lines showing the kill AND a DB/state snapshot. Rendering is not evidence.
 - **Deploy before cleanup.** A task is done when the change is deployed, verified, AND evidence posted.
+- **Cockpit milestone beacons.** `/task` calls `scripts/dispatcher/progress.sh "$AGENT_ID" <milestone> || true` at every phase boundary (planning, ralph, summary, push_and_pr, awaiting_ci, fix_ci, merge, awaiting_deploy, verify, retro). Best-effort — always exits 0. Direct-coded task paths must emit these. See `.claude/skills/task/SKILL.md` Step 0 and `docs/specs/dispatcher-v3-spec.md` §4.3.
 - **Never ask for user confirmation during the substeps.** Just execute.
 
 ## Tool Use Rules
