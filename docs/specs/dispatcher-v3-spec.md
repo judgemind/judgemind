@@ -59,7 +59,7 @@ That's the entire launcher. Target ~700 LOC.
 
 #### Task-runner entrypoint
 
-The entrypoint is ~50 lines of Python (`scripts/dispatcher/agent_runner.py`), not bash. The agent task image already has the `dispatcher` Python package installed for the launcher; the entrypoint reuses it. The deliberate choice here is to **structurally preclude the v2 drift pattern** — v2's bash entrypoint started small and grew to 5,857 lines because each "one more case arm" was invisibly cheap. Python doesn't have bash's "just shell out" gravity, and a Python module is testable in CI from day one.
+The entrypoint is ~50 lines of Python (`scripts/dispatcher_v3/agent_runner.py`), not bash. The agent task image has the `dispatcher_v3` Python package installed for use by the launcher; the entrypoint reuses it (single source of truth for argv via `dispatcher_v3.runners.build_argv`). The deliberate choice here is to **structurally preclude the v2 drift pattern** — v2's bash entrypoint started small and grew to 5,857 lines because each "one more case arm" was invisibly cheap. Python doesn't have bash's "just shell out" gravity, and a Python module is testable in CI from day one.
 
 ```python
 #!/usr/bin/env python3
@@ -70,7 +70,7 @@ import os, subprocess, sys
 from pathlib import Path
 import boto3
 
-from dispatcher.runners import build_argv  # §12 — single source of truth
+from dispatcher_v3.runners import build_argv  # §12 — single source of truth
 
 AGENT_ID        = os.environ["AGENT_ID"]
 ISSUE_NUMBER    = os.environ["TASK_ISSUE_NUMBER"]
