@@ -1439,6 +1439,10 @@ def resolve_judge(
         # snapshot for a fuzzy match against official judge names (#2140).
         # This catches typos, initial placement variants, and partial names
         # that steps 2-3 miss.
+        # When the roster name differs from the incoming canonical, we store it
+        # as an alias after creation rather than overwriting canonical (#3858).
+        pending_roster_alias: str | None = None
+        pending_roster_alias_confidence: float | None = None
         roster_names = _get_roster_names(conn, court_id)
         if roster_names:
             roster_match = fuzzy_match_roster_name(canonical, roster_names)
@@ -1523,14 +1527,19 @@ def resolve_judge(
                         )
                         return judge_id
                     else:
-                        # No existing judge with the roster name — use roster name
-                        # as the canonical name instead of the raw-derived name.
-                        canonical = roster_normalized
+                        # No existing judge with the roster name — preserve the
+                        # incoming (LLM-extracted) spelling as canonical (#3858).
+                        # The roster name is stored as a roster_match alias after
+                        # creation so future ingests with the roster spelling
+                        # still resolve to the same judge.
+                        if roster_normalized.lower() != canonical.lower():
+                            pending_roster_alias = roster_normalized
+                            pending_roster_alias_confidence = confidence
                         logger.info(
-                            "resolve_judge: using roster canonical name %r "
-                            "instead of %r (confidence=%.2f)",
+                            "resolve_judge: preserving incoming canonical %r "
+                            "over roster %r as alias (confidence=%.2f)",
+                            canonical,
                             roster_normalized,
-                            normalize_judge_name(raw_name),
                             confidence,
                         )
 
@@ -1561,6 +1570,24 @@ def resolve_judge(
             """,
             (judge_id, raw_name),
         )
+
+        # If a roster name differed from the incoming canonical, insert it as a
+        # roster_match alias so future ingests with the roster spelling resolve
+        # to this judge (#3858).
+        if pending_roster_alias is not None:
+            cur.execute(
+                """
+                INSERT INTO judge_aliases (judge_id, raw_name, source, confidence, is_verified)
+                VALUES (%s::uuid, %s, 'roster_match', %s, FALSE)
+                ON CONFLICT (judge_id, lower(raw_name), source) DO NOTHING
+                """,
+                (judge_id, pending_roster_alias, pending_roster_alias_confidence),
+            )
+            logger.debug(
+                "resolve_judge: stored roster alias %r for new judge %s",
+                pending_roster_alias,
+                judge_id,
+            )
 
         logger.debug("resolve_judge: created new judge %s for %r", judge_id, raw_name)
         return judge_id

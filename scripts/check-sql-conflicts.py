@@ -423,7 +423,13 @@ def _validate_conflict(
     cols: frozenset[str] | None,
 ) -> str | None:
     """Return an error message if the ON CONFLICT target is invalid, else None."""
-    constraints = UNIQUE_CONSTRAINTS.get(table)
+    # Strip schema prefix to match how UNIQUE_CONSTRAINTS is keyed (same logic as _add).
+    normalized = table
+    for prefix in ("public.", "derived.", "telemetry."):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    constraints = UNIQUE_CONSTRAINTS.get(normalized)
     if constraints is None:
         return f"unknown table '{table}' (not in schema reference)"
 

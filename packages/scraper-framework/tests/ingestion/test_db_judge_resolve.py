@@ -522,3 +522,164 @@ class TestStep1Deterministic:
 
         assert sql1 == sql2, f"Step-1 SQL differed between calls:\nCall 1: {sql1}\nCall 2: {sql2}"
         assert "ORDER BY" in sql1, f"Expected Step-1 SQL to contain ORDER BY, got:\n{sql1}"
+
+
+class TestStep3bBootstrapPrefersIncomingSpelling:
+    """Tests for Step 3b bootstrap behavior: incoming spelling wins over roster (#3858).
+
+    When no existing judge is found with the roster name, the judge should be
+    created with the LLM-extracted (incoming) spelling as canonical, not the
+    roster name. The roster name (if it differs by case-insensitive comparison)
+    is stored only as an alias for future lookups.
+    """
+
+    def test_no_existing_judge_uses_incoming_not_roster_canonical(self) -> None:
+        """When no judge exists with roster name, canonical uses incoming not roster.
+
+        Scenario:
+        - Court roster has 'Mattew C. Braner' (typo).
+        - Incoming raw name is 'MATTHEW C. BRANER' (source='sd_calendar').
+        - No existing judge found at any step.
+        - Assert: INSERT INTO judges uses 'Matthew C. Braner' (normalized incoming),
+          NOT 'Mattew C. Braner' (roster typo).
+        - Assert: a roster_match alias IS inserted for 'Mattew C. Braner'.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+
+        clear_roster_cache("court-uuid-bootstrap-1")
+
+        # fetchone sequence:
+        # Step 1: no alias for 'MATTHEW C. BRANER'
+        # Step 2: no exact canonical 'Matthew C. Braner'
+        # _get_roster_names: court_code lookup
+        # _get_roster_names: snapshot lookup
+        # Step 3b: no judge with 'Mattew C. Braner' (the roster name)
+        # Step 4: INSERT INTO judges RETURNING id
+        mock_cur.fetchone.side_effect = [
+            None,  # Step 1: no alias
+            None,  # Step 2: no exact canonical
+            ("ca-san_diego",),  # _get_roster_names: court_code
+            ({"D1": "Mattew C. Braner"},),  # _get_roster_names: snapshot
+            None,  # Step 3b: no judge with roster name exists
+            ("new-judge-uuid",),  # Step 4: INSERT INTO judges RETURNING id
+        ]
+        mock_cur.fetchall.side_effect = [
+            [],  # Step 3: no near-duplicates
+        ]
+
+        result = resolve_judge(
+            mock_conn, "MATTHEW C. BRANER", "court-uuid-bootstrap-1", source="sd_calendar"
+        )
+
+        assert result == "new-judge-uuid"
+
+        all_sql_calls = [str(c) for c in mock_cur.execute.call_args_list]
+
+        # The INSERT INTO judges must use the incoming spelling, not the roster typo
+        insert_judge_calls = [c for c in all_sql_calls if "INSERT INTO judges" in c]
+        assert len(insert_judge_calls) == 1, (
+            f"Expected 1 INSERT INTO judges call, got: {insert_judge_calls}"
+        )
+        assert "Matthew C. Braner" in insert_judge_calls[0], (
+            f"Expected INSERT to use incoming 'Matthew C. Braner', got: {insert_judge_calls[0]}"
+        )
+        assert "Mattew C. Braner" not in insert_judge_calls[0], (
+            "Expected INSERT to NOT use roster typo 'Mattew C. Braner', "
+            f"got: {insert_judge_calls[0]}"
+        )
+
+        # A roster_match alias must be inserted for the roster typo
+        alias_inserts = [c for c in all_sql_calls if "INSERT INTO judge_aliases" in c]
+        assert any("roster_match" in c for c in alias_inserts), (
+            f"Expected a roster_match alias INSERT for 'Mattew C. Braner', got: {alias_inserts}"
+        )
+        assert any("Mattew C. Braner" in c for c in alias_inserts), (
+            f"Expected alias INSERT containing 'Mattew C. Braner', got: {alias_inserts}"
+        )
+
+    def test_no_existing_judge_no_roster_alias_when_incoming_equals_roster(self) -> None:
+        """When incoming and roster names only differ by case, no second alias is inserted.
+
+        If normalize_judge_name(roster) == canonical (case-insensitive), the
+        roster name is not meaningfully different — no extra alias INSERT.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+
+        clear_roster_cache("court-uuid-bootstrap-2")
+
+        # Roster name matches incoming (same letters, different case only)
+        # roster='Matthew C. Braner', incoming='MATTHEW C. BRANER' ->
+        # both normalize to 'Matthew C. Braner'
+        mock_cur.fetchone.side_effect = [
+            None,  # Step 1: no alias
+            None,  # Step 2: no exact canonical
+            ("ca-san_diego",),  # _get_roster_names: court_code
+            ({"D1": "Matthew C. Braner"},),  # _get_roster_names: snapshot (correct spelling)
+            None,  # Step 3b: no judge with roster name exists
+            ("new-judge-uuid-2",),  # Step 4: INSERT INTO judges RETURNING id
+        ]
+        mock_cur.fetchall.side_effect = [
+            [],  # Step 3: no near-duplicates
+        ]
+
+        result = resolve_judge(
+            mock_conn, "MATTHEW C. BRANER", "court-uuid-bootstrap-2", source="sd_calendar"
+        )
+
+        assert result == "new-judge-uuid-2"
+
+        all_sql_calls = [str(c) for c in mock_cur.execute.call_args_list]
+
+        # The INSERT INTO judges must use 'Matthew C. Braner'
+        insert_judge_calls = [c for c in all_sql_calls if "INSERT INTO judges" in c]
+        assert len(insert_judge_calls) == 1
+        assert "Matthew C. Braner" in insert_judge_calls[0]
+
+        # No roster_match alias should be inserted (canonical == roster_normalized)
+        alias_inserts = [c for c in all_sql_calls if "INSERT INTO judge_aliases" in c]
+        roster_match_inserts = [c for c in alias_inserts if "roster_match" in c]
+        assert len(roster_match_inserts) == 0, (
+            f"Expected no roster_match alias when incoming==roster (case-insensitive), "
+            f"got: {roster_match_inserts}"
+        )
+
+    def test_no_existing_judge_no_source_still_creates_with_incoming_canonical(self) -> None:
+        """With source=None, incoming spelling still wins as canonical.
+
+        When no source is provided, the fix still applies: the judge is created
+        with the LLM-extracted (incoming) spelling, not the roster name.
+        """
+        mock_conn, mock_cur = _make_mock_conn()
+
+        clear_roster_cache("court-uuid-bootstrap-3")
+
+        mock_cur.fetchone.side_effect = [
+            None,  # Step 1: no alias
+            None,  # Step 2: no exact canonical
+            ("ca-san_diego",),  # _get_roster_names: court_code
+            ({"D1": "Mattew C. Braner"},),  # _get_roster_names: snapshot (typo)
+            None,  # Step 3b: no judge with roster name exists
+            ("new-judge-uuid-3",),  # Step 4: INSERT INTO judges RETURNING id
+        ]
+        mock_cur.fetchall.side_effect = [
+            [],  # Step 3: no near-duplicates
+        ]
+
+        result = resolve_judge(
+            mock_conn, "MATTHEW C. BRANER", "court-uuid-bootstrap-3", source=None
+        )
+
+        assert result == "new-judge-uuid-3"
+
+        all_sql_calls = [str(c) for c in mock_cur.execute.call_args_list]
+
+        # The INSERT INTO judges must use the incoming spelling
+        insert_judge_calls = [c for c in all_sql_calls if "INSERT INTO judges" in c]
+        assert len(insert_judge_calls) == 1
+        assert "Matthew C. Braner" in insert_judge_calls[0], (
+            f"Expected INSERT to use incoming 'Matthew C. Braner', got: {insert_judge_calls[0]}"
+        )
+        assert "Mattew C. Braner" not in insert_judge_calls[0], (
+            "Expected INSERT to NOT use roster typo 'Mattew C. Braner', "
+            f"got: {insert_judge_calls[0]}"
+        )
