@@ -29,3 +29,8 @@ output "alarm_names" {
   description = "Map of skill name -> CloudWatch alarm name (one alarm per rule). Empty when `enable_alerts = false` or `alert_sns_topic_arn` is unset."
   value       = { for k, v in aws_cloudwatch_metric_alarm.eventbridge_failures : k => v.alarm_name }
 }
+
+output "dlq_depth_alarm_name" {
+  description = "CloudWatch alarm name for the DLQ depth secondary-signal alarm (`AWS/SQS ApproximateNumberOfMessagesVisible`). Null when `enable_alerts = false` or `alert_sns_topic_arn` is unset."
+  value       = try(aws_cloudwatch_metric_alarm.dlq_depth[0].alarm_name, null)
+}

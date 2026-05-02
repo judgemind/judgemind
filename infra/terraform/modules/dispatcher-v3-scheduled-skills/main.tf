@@ -297,6 +297,44 @@ resource "aws_cloudwatch_metric_alarm" "eventbridge_failures" {
   }
 }
 
+# ─── CloudWatch alarm: DLQ depth (secondary signal) ─────────────────────────
+# Secondary to the FailedInvocations alarm above: the FailedInvocations metric
+# fires when EventBridge cannot invoke the ECS target (IAM error, ECS
+# unavailability). The DLQ-depth alarm fires when EventBridge successfully
+# enqueued the dead-letter but the ECS task never drained it -- a different
+# failure mode. Operators can `aws sqs receive-message` the DLQ to inspect the
+# original event payload for root-cause analysis. Also catches any future
+# producer that inadvertently writes to this DLQ. Issues #3956 / #3890.
+#
+# Single resource (not for_each) because the DLQ is shared across all four
+# rules and ApproximateNumberOfMessagesVisible is a per-queue metric, not
+# per-rule.
+
+resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
+  count = var.enable_alerts && var.alert_sns_topic_arn != "" ? 1 : 0
+
+  alarm_name        = "${var.name_prefix}-scheduled-skills-dlq-depth-${var.environment}"
+  alarm_description = "One or more messages are sitting in the dispatcher-v3 scheduled-skills dead-letter queue (`judgemind-${var.name_prefix}-scheduled-skills-dlq-${var.environment}`). Inspect via `aws sqs receive-message --queue-url $(terraform output -raw dispatcher_v3_scheduled_skills_dlq_url)`. Secondary signal to the per-rule FailedInvocations alarms. Issues #3956 / #3890."
+
+  namespace   = "AWS/SQS"
+  metric_name = "ApproximateNumberOfMessagesVisible"
+  statistic   = "Sum"
+
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.dlq_depth_threshold
+  period              = var.dlq_depth_period_seconds
+  evaluation_periods  = var.dlq_depth_evaluation_periods
+  datapoints_to_alarm = var.dlq_depth_evaluation_periods
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.alert_sns_topic_arn]
+  ok_actions    = [var.alert_sns_topic_arn]
+
+  dimensions = {
+    QueueName = aws_sqs_queue.scheduled_skills_dlq.name
+  }
+}
+
 # ─── Postcondition assertions on every rule + target ────────────────────────
 # Defense-in-depth against the silent-drop class (#2840 / #3764) for
 # the SKILL_NAME override. If a regression ever drops the override
