@@ -73,6 +73,18 @@ variable "github_token_secret_arn" {
   default     = ""
 }
 
+variable "anthropic_api_key_secret_arn" {
+  description = "Secrets Manager ARN for ANTHROPIC_API_KEY. Wired into F2's task-runner / diagnoser / scheduled-skill task definitions as a `secrets[]` entry, which means the **execution role** (not the agent task role) is the principal that actually fetches the secret value at task-start time. Without this in `execution_secret_arns` below, ECS RunTask fails with `ResourceInitializationError: AccessDeniedException: User ... is not authorized to perform: secretsmanager:GetSecretValue` and the task never starts. F4 (#3889) surfaced this gap when the launcher task started failing to pull DATABASE_URL even though the launcher task role had RDS connect via judgemind_dispatcher. Same pattern as the v2 dispatcher-daemon's `execution_secrets` policy. Empty disables -- the task-def's `secrets` block omits the entry entirely when this is empty (see F2's `agent_secrets` concat)."
+  type        = string
+  default     = ""
+}
+
+variable "db_connection_secret_arn" {
+  description = "Secrets Manager ARN for the dispatcher-role DATABASE_URL JSON secret (key `url`). Wired into F2's launcher task-def (and the agent task-defs) as a `secrets[]` entry, so the execution role -- not the launcher role -- fetches the secret at task-start time. Without this in `execution_secret_arns` below, ECS RunTask fails with `ResourceInitializationError: AccessDeniedException` and the launcher task never starts. F4 (#3889) surfaced this gap. Empty disables."
+  type        = string
+  default     = ""
+}
+
 # ─── S3 buckets ─────────────────────────────────────────────────────────
 # The agent task role gets full S3 because dev `/task` runs may touch
 # raw/ (S3-as-source-of-truth, see CLAUDE.md §Project Context), spotcheck/
