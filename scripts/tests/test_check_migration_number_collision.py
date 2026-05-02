@@ -28,6 +28,7 @@ parse_added_migration_numbers_from_diff = mod.parse_added_migration_numbers_from
 parse_gh_pr_list = mod.parse_gh_pr_list
 find_collisions = mod.find_collisions
 find_stale_numbers = mod.find_stale_numbers
+pick_next_free_number = mod.pick_next_free_number
 OtherPR = mod.OtherPR
 
 
@@ -334,3 +335,96 @@ class TestFindStaleNumbers:
 
     def test_result_sorted_ascending(self) -> None:
         assert find_stale_numbers([34, 30, 31], 33) == [30, 31]
+
+
+# ---------------------------------------------------------------------------
+# pick_next_free_number — next collision-free migration number
+# ---------------------------------------------------------------------------
+
+
+class TestPickNextFreeNumber:
+    def test_empty_other_prs_returns_latest_plus_one(self) -> None:
+        # No other PRs; highest claimed is latest_on_base=55 → next free = 56.
+        assert pick_next_free_number([], [], latest_on_base=55) == 56
+
+    def test_single_collision_returns_max_plus_one(self) -> None:
+        other = OtherPR(number=2899, title="other", migration_numbers=[56])
+        assert pick_next_free_number([56], [other], latest_on_base=55) == 57
+
+    def test_multi_collision_returns_global_max_plus_one(self) -> None:
+        # Two other PRs claiming 56 and 57; base is 55 → next free = 58.
+        other_a = OtherPR(number=2899, title="a", migration_numbers=[56])
+        other_b = OtherPR(number=2900, title="b", migration_numbers=[57])
+        assert pick_next_free_number([56], [other_a, other_b], latest_on_base=55) == 58
+
+    def test_self_pr_excluded(self) -> None:
+        # current_pr claims 56 in other_prs but should be excluded.
+        me = OtherPR(number=2901, title="me", migration_numbers=[56])
+        other = OtherPR(number=2899, title="other", migration_numbers=[58])
+        assert (
+            pick_next_free_number(
+                [56], [me, other], latest_on_base=55, current_pr_number=2901
+            )
+            == 59
+        )
+
+    def test_no_migrations_on_base_and_no_others(self) -> None:
+        # No base migration, no other PRs → return 1.
+        assert pick_next_free_number([], [], latest_on_base=None) == 1
+
+    def test_no_migrations_on_base_others_present(self) -> None:
+        # Base is empty (None) but another PR claims 3 → next free = 4.
+        other = OtherPR(number=100, title="first", migration_numbers=[3])
+        assert pick_next_free_number([], [other], latest_on_base=None) == 4
+
+    def test_three_concurrent_prs_get_distinct_numbers(self) -> None:
+        """Simulate three concurrent PRs all initially claiming N=56 with main at 55.
+
+        PR A resolves first (no peers yet claiming 56 aside from B and C):
+          called with other_prs=[B(56), C(56)], latest=55 → 57
+        PR B resolves next (A now shows 57):
+          called with other_prs=[A(57), C(56)], latest=55 → 58
+        PR C resolves last (A=57, B=58):
+          called with other_prs=[A(57), B(58)], latest=55 → 59
+        """
+        # Simulate PR A's call: peers B and C both still claim 56.
+        pr_b = OtherPR(number=2900, title="B", migration_numbers=[56])
+        pr_c = OtherPR(number=2901, title="C", migration_numbers=[56])
+        result_a = pick_next_free_number(
+            [56], [pr_b, pr_c], latest_on_base=55, current_pr_number=2899
+        )
+        assert result_a == 57
+
+        # Simulate PR B's call: A has been reassigned to 57, C still on 56.
+        pr_a_updated = OtherPR(number=2899, title="A", migration_numbers=[57])
+        result_b = pick_next_free_number(
+            [56], [pr_a_updated, pr_c], latest_on_base=55, current_pr_number=2900
+        )
+        assert result_b == 58
+
+        # Simulate PR C's call: A=57, B=58.
+        pr_b_updated = OtherPR(number=2900, title="B", migration_numbers=[58])
+        result_c = pick_next_free_number(
+            [56],
+            [pr_a_updated, pr_b_updated],
+            latest_on_base=55,
+            current_pr_number=2901,
+        )
+        assert result_c == 59
+
+    def test_latest_on_base_dominates_when_higher(self) -> None:
+        # Peers only claim 10, but base is at 50 → next free = 51.
+        other = OtherPR(number=1, title="old", migration_numbers=[10])
+        assert pick_next_free_number([10], [other], latest_on_base=50) == 51
+
+    def test_my_numbers_not_used_in_computation(self) -> None:
+        # my_numbers has a very high value (99) but that doesn't influence
+        # the result — only other_prs and latest_on_base matter.
+        other = OtherPR(number=5, title="other", migration_numbers=[56])
+        result = pick_next_free_number([99], [other], latest_on_base=55)
+        assert result == 57
+
+    def test_tie_between_base_and_other_pr_broken_correctly(self) -> None:
+        # Both base and another PR claim 56 → next free = 57.
+        other = OtherPR(number=100, title="tie", migration_numbers=[56])
+        assert pick_next_free_number([56], [other], latest_on_base=56) == 57
