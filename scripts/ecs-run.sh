@@ -165,6 +165,17 @@ fi
 echo "Task: $task_arn" >&2
 echo "" >&2
 
+# ─── Wait for ECS Exec agent to be ready ─────────────────────────────────────
+# Poll with a harmless probe before running the real command so the user sees
+# clear retry progress instead of the raw "execute command was not enabled" error.
+
+# shellcheck source=scripts/_ecs_exec_lib.sh
+source "$SCRIPT_DIR/_ecs_exec_lib.sh"
+
+if ! wait_for_exec_agent_ready "$CLUSTER" "$task_arn" "$CONTAINER" "$REGION"; then
+    exit 1
+fi
+
 # ─── Build and execute the command ─────────────────────────────────────────
 
 if [[ -n "$SCRIPT_PATH" ]]; then
