@@ -42,7 +42,7 @@ claude -p "/diagnose-failure $AGENT_ID"
 
 1. **The agent's row** — current state of the failed agent.
    ```sql
-   SELECT agent_id, issue_number, task_arn, session_s3_key, status, exit_code,
+   SELECT agent_id, issue_number, task_arn, status, exit_code,
           exit_reason, pr_number, outcome_summary, current_milestone,
           current_milestone_detail, current_milestone_at, started_at, ended_at,
           parent_run_id

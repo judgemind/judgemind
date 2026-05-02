@@ -31,7 +31,7 @@ When we want phase-level granularity for a specific failure mode, we add it as a
 - Phase-level retry budgets. `/task` retries internally; if it exits non-zero, the whole task is the unit of retry.
 - A daemon-resident orchestrator. The "daemon" is a thin scheduler.
 - Mid-pipeline resume after daemon crash. Daemon crashes are rare and don't affect in-flight ECS tasks (they keep running).
-- **Per-phase liveness machinery.** No phase-aware stuck-timeout, no per-phase "agent has been on step X for N minutes" check, no DB column the daemon polls to detect "agent disagrees with what phase I think it's in." v3 keeps two coarse liveness signals only: a wall-clock cap (default 6h, §11 OQ#4) and a session-log silent-hang detector (no log growth in 30min, §4.1) — both read external signals (ECS task state, CloudWatch Logs `lastEventTimestamp`), neither requires the daemon to know `/task`'s internal state. The v2-shape `agent_silent_hang` and `stuck_timeout` machinery still applies in spirit (Anthropic-side hangs and network blips affect `claude -p` regardless of who owns the phase loop), but v3 satisfies it with two simple checks rather than five overlapping ones.
+- **Per-phase liveness machinery.** No phase-aware stuck-timeout, no per-phase "agent has been on step X for N minutes" check, no DB column the daemon polls to detect "agent disagrees with what phase I think it's in." v3 keeps two coarse liveness signals only: a wall-clock cap (default 6h, §11 OQ#3) and a session-log silent-hang detector (no log growth in 30min, §4.1) — both read external signals (ECS task state, CloudWatch Logs `lastEventTimestamp`), neither requires the daemon to know `/task`'s internal state. The v2-shape `agent_silent_hang` and `stuck_timeout` machinery still applies in spirit (Anthropic-side hangs and network blips affect `claude -p` regardless of who owns the phase loop), but v3 satisfies it with two simple checks rather than five overlapping ones.
 - Shadow-mode parallel runs (v2 §6b's "second runner executes the same phase in parallel with output discarded"), multi-tenant. Same as v2 non-goals.
 - Sub-1M-token context runners. The design assumes the runner provides ≥1M tokens of context (Claude Sonnet/Opus 4.5+ era). If a future runner ships with a smaller window we'd need to re-introduce phase-style splits — explicitly out of scope for v3 v1.
 
@@ -52,7 +52,17 @@ The only long-lived process. Loop runs every 30s:
    - `RUNNING` and session log size unchanged for `silent_hang_minutes` (default 30) → `ecs:StopTask`, mark `failed` with `exit_reason='silent_hang'`, launch diagnoser. The session log size is read from CloudWatch Logs (`DescribeLogStreams` returns `lastEventTimestamp`) — no S3 round-trip per tick.
    - `STOPPED, exit 0` → mark `succeeded`.
    - `STOPPED, exit non-zero` → mark `failed`, capture `stoppedReason`, launch the diagnoser ECS task (§4.2).
-4. **Claim if cap allows.** If `count(running) < concurrency_cap`, scan `gh issue list --label agent/ready --state open`, pick one trusted issue (author trust check via `scripts/check-issue-author.sh`), check **per-issue claim budget** (`SELECT count(*) FROM agents WHERE issue_number = $1` < `claim_attempts_max`, default 3), then `ecs:RunTask` against the `task-runner` task definition with `TASK_ISSUE_NUMBER=<n>` and `AGENT_ID=<uuid>` env. Issues that have hit the claim budget get `status/needs-human` + Telegram-alert and are skipped. Atomic claim sequence: add `status/in-progress` label → INSERT agents row (`status='claiming'`) → remove `agent/ready` → `ecs:RunTask` → UPDATE agents row with `task_arn`, `status='running'`. Failure mid-sequence reconciles on the next tick.
+4. **Claim if cap allows.** If `count(running) < concurrency_cap`, scan `gh issue list --label agent/ready --state open`, pick one trusted issue (author trust check via `scripts/check-issue-author.sh`), check **per-issue claim budget** (`SELECT count(*) FROM agents WHERE issue_number = $1` < `claim_attempts_max`, default 3), then `ecs:RunTask` against the `task-runner` task definition with `TASK_ISSUE_NUMBER=<n>` and `AGENT_ID=<uuid>` env. Issues that have hit the claim budget get `status/needs-human` + Telegram-alert and are skipped.
+
+   **Atomic claim sequence (matches v2's order — DB row first, see `daemon.py:5142-5240`):**
+
+   1. INSERT `dispatcher.agents` row with `parent_run_id=<this-run>`, `status='running'`, `current_milestone='claiming'`. The partial UNIQUE INDEX on `(issue_number) WHERE status IN ('running', 'retrying')` (migration 25) is the atomic primitive — a duplicate INSERT raises `UniqueViolation` and the launcher abandons the claim. **Note:** writing `status='claiming'` would skip the index gate (the partial predicate does not include `'claiming'`), which under v2/v3 cohabitation would race two daemons to the same `RunTask`. The launcher therefore writes `status='running'` for the row and carries the claiming-step semantics in `current_milestone='claiming'` for cockpit visibility.
+   2. Add `status/in-progress` label.
+   3. Remove `agent/ready` label.
+   4. `ecs:RunTask` against the `task-runner` task definition with `AGENT_ID`, `TASK_ISSUE_NUMBER`, `RUNNER`, `SESSIONS_BUCKET` env.
+   5. UPDATE `dispatcher.agents` SET `task_arn`, advance `current_milestone='running'`.
+
+   Failure mid-sequence reconciles on the next tick.
 5. **Circuit breaker.** Rolling 2-of-3 in last 1h on terminal outcomes; if tripped, set `concurrency_cap=0` and Telegram-alert.
 
 That's the entire launcher. Target ~700 LOC.
@@ -190,7 +200,6 @@ dispatcher.agents (
   issue_number int,
   task_arn text,                       -- ECS task running /task
   diagnoser_arn text,                  -- ECS task running /diagnose-failure (if any)
-  session_s3_key text,                 -- s3://<bucket>/<agent_id>.jsonl, written by task-runner on exit
   status text NOT NULL,                -- claiming, running, succeeded, failed, needs_review
   started_at, ended_at,
   exit_code int,
@@ -302,7 +311,7 @@ The cross-daemon claim race is already handled: both daemons add `status/in-prog
 
 ### 8.3 Schema strategy
 
-- v3 adds: `runs.dispatcher_version`, `terminal_outcomes.parent_run_id`, plus the v3-only columns on `agents` (`current_milestone`, `current_milestone_at`, `session_s3_key`, `diagnoser_arn`, `outcome_summary`).
+- v3 adds: `runs.dispatcher_version`, `terminal_outcomes.parent_run_id`, plus the v3-only columns on `agents` (`current_milestone`, `current_milestone_at`, `diagnoser_arn`, `outcome_summary`). The session-log S3 path is deterministic — `s3://<SESSIONS_BUCKET>/<AGENT_ID>.jsonl` — and the diagnoser builds it from `AGENT_ID` directly, so no column is needed.
 - v2 keeps writing to: `phase_transitions`, `retry_markers`, `failures`, `diagnoses`, `phase_outputs`, `phase_attempts` (if it existed), and the v2-specific columns on `agents` (`phase`, `retries_used`, `merge_unstick_attempts`, `merge_conflict_attempts`, `execution_mode`, `agent_task_arn`).
 - v3 doesn't read any v2-only column. v2 doesn't read any v3-only column. Cross-daemon writes are scoped by `parent_run_id`.
 
@@ -349,10 +358,11 @@ Production accounts are **not** in scope. The trust policy on the agent task rol
 
 1. **Session-log retention and size.** A long ralph run can produce a stream-json transcript of 50–200 MB. CloudWatch Logs retention default 30 days; S3 archive default 90 days, parameterized per `dispatcher.config.session_retention_days`. The diagnoser may want to summarize-then-discard for very large sessions, but that's an in-skill concern, not infra.
 2. **EventBridge vs a tiny scheduler in the launcher.** EventBridge gives outright separation of concerns and zero state coupling, at the cost of one more thing to operate. For four crons, EventBridge is cheaper to operate than a scheduler-in-Python. Default to EventBridge; revisit if a skill needs operator intervention beyond cron.
-3. **Hooks (`PreToolUse`, `SubagentStop`, etc.) inside `/task`'s ECS task.** v2 has hooks writing to `dispatcher.failures` to catch sub-task signals. v3 doesn't have `dispatcher.failures`; the same signals are present in the session log (every tool call is in stream-json), so the diagnoser sees them naturally. **Exception:** the gh-rate-budget hook stays as a *block* (exits non-zero so the tool call is denied locally) — not as a `dispatcher.*` write. It's a circuit breaker, not observation, and lives entirely inside the task-runner.
-4. **The `/task` ECS task wall-clock cap.** Wall-clock cap is the *coarse* liveness check (silent-hang detection in §4.1 is the fine-grained one). Pick a generous wall-clock — 6h covers virtually every real `/task` run including a long ralph + fix-CI cycle. Configure as ECS task `stopTimeout` plus a launcher-side deadline check. If 6h proves wrong, raise it. Silent-hang threshold (default 30min no log growth) is the more typical kill path.
-5. **Trust check — at queue claim or at `/task` start?** Today the launcher does it before `RunTask`. Keep that; it's cheap and the gate is critical.
-6. **`/task` SKILL.md AGENT_ID env-var read.** One-line edit: read `AGENT_ID` from env if set, else fall back to cwd-derived id. Land this edit in v2's `/task` SKILL.md before v3 cutover so v2 still works (env var unset → cwd derivation, same as today).
+3. **The `/task` ECS task wall-clock cap.** Wall-clock cap is the *coarse* liveness check (silent-hang detection in §4.1 is the fine-grained one). Pick a generous wall-clock — 6h covers virtually every real `/task` run including a long ralph + fix-CI cycle. Configure as ECS task `stopTimeout` plus a launcher-side deadline check. If 6h proves wrong, raise it. Silent-hang threshold (default 30min no log growth) is the more typical kill path.
+4. **Trust check — at queue claim or at `/task` start?** Today the launcher does it before `RunTask`. Keep that; it's cheap and the gate is critical.
+5. **`/task` SKILL.md AGENT_ID env-var read.** One-line edit: read `AGENT_ID` from env if set, else fall back to cwd-derived id. Land this edit in v2's `/task` SKILL.md before v3 cutover so v2 still works (env var unset → cwd derivation, same as today).
+
+**Future direction — gh API rate-budget protection.** v2 ships a `PreToolUse` `gh-rate-budget` hook that exits non-zero when remaining API budget is below threshold. v3 does **not** carry the hook over: in practice v2's hook rarely fires (cap=3-5 sustained for months without rate-limit pain in incident logs), and the natural failure mode of `gh` returning 403 is acceptable — agents back off and the v3 circuit breaker catches runaway terminal outcomes before they cascade. Adding the hook is over-engineering against a hypothetical. If rate-limit pain emerges in production, the cleaner intervention is a launcher-side claim gate (~20 LOC): query `gh api rate_limit` each tick, refuse to claim new agents when remaining < threshold. That's a *global* brake (one decision per tick, not per tool call) and *prevents* the problem rather than papering over it after the agent is already running.
 
 ---
 
@@ -402,7 +412,7 @@ What stays runner-shaped:
 
 - **Skills already work cross-tool.** `/task` lives at `.claude/skills/task/SKILL.md`. Symlink `.agents/skills/task/` → that directory and Gemini + OpenCode pick it up natively (the `agentskills.io` standard). OpenCode also reads `.claude/skills/` directly. Cursor 2.4+ supports SKILL.md.
 
-- **Hooks differ per runner.** v2 §6b enumerated the differences (`PreToolUse` vs `BeforeTool`, tool-name namespaces, etc.). The single hook v3 keeps as a *block* (gh-rate-budget, §11 OQ#3) needs a per-runner adapter. Defer until a second runner actually lands.
+- **Hooks differ per runner.** v2 §6b enumerated the differences (`PreToolUse` vs `BeforeTool`, tool-name namespaces, etc.). v3 deliberately keeps zero hooks (rate-budget protection moved to the launcher-side future direction in §11); when a second runner lands and hook adapters become relevant again, the differences are bounded — defer until a second runner actually lands.
 
 - **Per-task runner selection.** `dispatcher.config.runner` (default `claude`) sets the global default. Per-issue override via a label (e.g. `runner/gemini`) read by the launcher at claim-time and passed as env to the task-runner.
 
