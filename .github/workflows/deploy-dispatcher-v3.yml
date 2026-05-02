@@ -121,7 +121,20 @@ jobs:
               --build-arg "GIT_SHA=$SHA_TAG" \
               -f Dockerfile.dispatcher-v3 \
               "${TAGS[@]}" .
-          docker push "$IMAGE_BASE" --all-tags
+          # Retry once on ECR name-unknown race (issue #3920, ref #3886/#3915):
+          # A same-PR Terraform apply may create the ECR repo moments before this push runs.
+          PUSH_OUTPUT=$(docker push "$IMAGE_BASE" --all-tags 2>&1) && RC=0 || RC=$?
+          if [ $RC -ne 0 ]; then
+            if echo "$PUSH_OUTPUT" | grep -qE "name unknown|repository .+ does not exist"; then
+              echo "ECR repository not yet available; sleeping 60s before retry (issue #3920)" | tee -a "$GITHUB_STEP_SUMMARY"
+              sleep 60
+              docker push "$IMAGE_BASE" --all-tags
+              echo "ECR retry succeeded — race condition resolved (issue #3920)" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$PUSH_OUTPUT" >&2
+              exit $RC
+            fi
+          fi
 
           echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
           echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
