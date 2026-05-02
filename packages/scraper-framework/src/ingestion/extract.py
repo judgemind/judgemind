@@ -88,6 +88,13 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
+            r"\b(?:certify|decertify)(?:\s*/\s*(?:certify|decertify))?\s+class\s+action\b",
+            re.IGNORECASE,
+        ),
+        "motion_for_class_certification",
+    ),
+    (
+        re.compile(
             r"\bclass\s+action\s+settlement\b|\bpreliminary\s+approval\b",
             re.IGNORECASE,
         ),
@@ -554,6 +561,14 @@ _MOTION_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             re.IGNORECASE,
         ),
         "other",
+    ),
+    (
+        re.compile(r"\bdiscovery\s+hearing\b", re.IGNORECASE),
+        "discovery",
+    ),
+    (
+        re.compile(r"\bmotion\s+hearing\b", re.IGNORECASE),
+        "motion_hearing_generic",
     ),
 ]
 

@@ -1129,11 +1129,17 @@ class TestNormalizeMotionType:
     def test_already_normalized_ex_parte(self) -> None:
         assert normalize_motion_type("ex_parte_application") == "ex_parte_application"
 
+    def test_already_normalized_motion_hearing_generic(self) -> None:
+        assert normalize_motion_type("motion_hearing_generic") == "motion_hearing_generic"
+
+    def test_already_normalized_discovery(self) -> None:
+        assert normalize_motion_type("discovery") == "discovery"
+
     # --- SD calendar event types ---
 
     def test_sd_calendar_motion_hearing(self) -> None:
-        """Generic 'Motion Hearing' cannot be mapped — return None."""
-        assert normalize_motion_type("Motion Hearing") is None
+        """Generic 'Motion Hearing' maps to motion_hearing_generic."""
+        assert normalize_motion_type("Motion Hearing") == "motion_hearing_generic"
 
     def test_sd_calendar_demurrer_motion_to_strike(self) -> None:
         """Composite 'Demurrer/Motion to Strike' matches demurrer first."""
@@ -1143,8 +1149,8 @@ class TestNormalizeMotionType:
         assert normalize_motion_type("Summary Judgment/Summary Adjudication") == "msj_partial"
 
     def test_sd_calendar_discovery_hearing(self) -> None:
-        """Generic 'Discovery Hearing' cannot be mapped — return None."""
-        assert normalize_motion_type("Discovery Hearing") is None
+        """Generic 'Discovery Hearing' maps to discovery."""
+        assert normalize_motion_type("Discovery Hearing") == "discovery"
 
     def test_sd_calendar_motion_to_quash(self) -> None:
         assert normalize_motion_type("Motion to Quash") == "motion_to_quash"
@@ -1153,8 +1159,11 @@ class TestNormalizeMotionType:
         assert normalize_motion_type("Motion for Sanctions") == "motion_for_sanctions"
 
     def test_sd_calendar_class_action(self) -> None:
-        """Generic class action certify/decertify cannot be mapped."""
-        assert normalize_motion_type("Motion Hearing to Certify/Decertify Class Action") is None
+        """Class action certify/decertify maps to motion_for_class_certification."""
+        assert (
+            normalize_motion_type("Motion Hearing to Certify/Decertify Class Action")
+            == "motion_for_class_certification"
+        )
 
     # --- SD tentatives title-case values ---
 
@@ -1511,6 +1520,9 @@ _SD_CALENDAR_SAMPLES: list[tuple[str, str]] = [
     ("Demurrer/Motion to Strike", "demurrer"),
     ("Motion to Quash", "motion_to_quash"),
     ("Motion for Sanctions", "motion_for_sanctions"),
+    ("Motion Hearing", "motion_hearing_generic"),
+    ("Discovery Hearing", "discovery"),
+    ("Motion Hearing to Certify/Decertify Class Action", "motion_for_class_certification"),
 ]
 
 # -- SD Tentatives (from parse_motion_type in sc_tentatives.py) ---------------
