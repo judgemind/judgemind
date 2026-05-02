@@ -95,6 +95,13 @@ jobs:
         if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
         run: bash infra/terraform/modules/dispatcher-agent-runner/tests/postconditions/check.sh
 
+      # Policy-shape regression test for dispatcher-v3-iam (#3888). Static
+      # analysis of the rendered HCL — no AWS credentials needed. Asserts
+      # the spec §10 invariants (no cross-account principal, launcher
+      # scope is narrow, agent task role pinned to dev account).
+      - name: dispatcher-v3-iam policy-shape check
+        run: bash infra/terraform/modules/dispatcher-v3-iam/tests/policy-checks/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.
