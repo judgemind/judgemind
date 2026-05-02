@@ -373,19 +373,26 @@ class CourtListenerScraper(BaseScraper):
         Returns:
             A CapturedDocument, or None if the opinion has no usable content.
         """
-        # The opinion text can come from several fields; prefer html, fall back
-        # to plain_text.  If neither exists the opinion has no content we can use.
-        opinion_text = (
+        # CourtListener opinions ship two parallel representations:
+        #   - plain_text:           clean text, no markup (what we want for ruling_text)
+        #   - html_with_citations:  same text wrapped in <pre class="inline"> with
+        #                           inline <span class="citation"> links
+        # Storing html_with_citations into ruling_text leaves <pre>/<span> markup
+        # in the canonical text column (derived.rulings.ruling_text); the schema
+        # already has a separate ruling_text_html column for the rich version.
+        plain_text_value = opinion.get("plain_text") or ""
+        html_text_value = (
             opinion.get("html_with_citations")
             or opinion.get("html")
             or opinion.get("html_columbia")
             or opinion.get("html_lawbox")
-            or opinion.get("plain_text")
             or ""
         )
 
-        if not opinion_text:
+        if not plain_text_value and not html_text_value:
             return None
+
+        canonical_text = plain_text_value or html_text_value
 
         raw_content = json.dumps(
             {"cluster": cluster, "opinion": opinion},
@@ -442,7 +449,8 @@ class CourtListenerScraper(BaseScraper):
         doc.case_number = _extract_docket_number(cluster)
         doc.judge_name = _extract_judge_names(cluster)
         doc.hearing_date = _parse_date(cluster.get("date_filed"))
-        doc.ruling_text = opinion_text[:10000] if opinion_text else None
+        doc.ruling_text = canonical_text[:10000] if canonical_text else None
+        doc.ruling_text_html = html_text_value[:10000] if html_text_value else None
         doc.outcome = None  # CourtListener opinions don't have a simple outcome field
         doc.motion_type = _map_opinion_type(opinion.get("type"))
 
