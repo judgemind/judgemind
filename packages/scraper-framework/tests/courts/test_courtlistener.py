@@ -14,12 +14,14 @@ import asyncio
 import json
 import time
 from datetime import datetime
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
 
 from courts.federal.courtlistener import (
+    _CL_COURT_ID_TO_JURISDICTION,
     API_BASE_URL,
     DEFAULT_OPINION_FETCH_CONCURRENCY,
     CourtListenerClient,
@@ -820,3 +822,230 @@ class TestFetchOpinionsForClusters:
         assert client.request_count == num_clusters, (
             f"Expected {num_clusters} API requests, got {client.request_count}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Jurisdiction mapping tests (AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestJurisdictionMapping:
+    """Verify that _CL_COURT_ID_TO_JURISDICTION correctly classifies courts and
+    that CourtListenerScraper applies the mapping in _map_to_document."""
+
+    @pytest.mark.parametrize(
+        "court_id,expected_state,expected_county",
+        [
+            # Federal — SCOTUS and circuit courts
+            ("scotus", "Federal", "Federal"),
+            ("ca9", "Federal", "Federal"),
+            ("ca1", "Federal", "Federal"),
+            ("cadc", "Federal", "Federal"),
+            ("cafc", "Federal", "Federal"),
+            # State high courts
+            ("tex", "Texas", "Statewide"),
+            ("ny", "New York", "Statewide"),
+            ("fla", "Florida", "Statewide"),
+            ("cal", "California", "Statewide"),
+            ("ga", "Georgia", "Statewide"),
+            # State appellate courts
+            ("texapp1", "Texas", "Statewide"),
+            ("texapp14", "Texas", "Statewide"),
+            ("nyappdiv1", "New York", "Statewide"),
+            ("nyappdiv2", "New York", "Statewide"),
+            ("nyappdiv3", "New York", "Statewide"),
+            ("nyappdiv4", "New York", "Statewide"),
+            ("fladistctapp", "Florida", "Statewide"),
+            ("fladistctapp1", "Florida", "Statewide"),
+            ("gactapp", "Georgia", "Statewide"),
+            ("ohioctapp1", "Ohio", "Statewide"),
+        ],
+    )
+    def test_mapping_table_entries(
+        self, court_id: str, expected_state: str, expected_county: str
+    ) -> None:
+        """Direct lookup into the mapping table returns the correct (state, county)."""
+        assert court_id in _CL_COURT_ID_TO_JURISDICTION, (
+            f"Court ID {court_id!r} missing from _CL_COURT_ID_TO_JURISDICTION"
+        )
+        state, county = _CL_COURT_ID_TO_JURISDICTION[court_id]
+        assert state == expected_state, (
+            f"For {court_id!r}: expected state={expected_state!r}, got {state!r}"
+        )
+        assert county == expected_county, (
+            f"For {court_id!r}: expected county={expected_county!r}, got {county!r}"
+        )
+
+    def test_unknown_court_id_not_in_mapping(self) -> None:
+        """A sentinel unknown court_id is absent from the mapping table."""
+        assert "zzunknownsentinel" not in _CL_COURT_ID_TO_JURISDICTION
+
+    @pytest.mark.parametrize(
+        "court_url,expected_state,expected_county",
+        [
+            ("/api/rest/v4/courts/scotus/", "Federal", "Federal"),
+            ("/api/rest/v4/courts/ca9/", "Federal", "Federal"),
+            ("/api/rest/v4/courts/tex/", "Texas", "Statewide"),
+            ("/api/rest/v4/courts/texapp1/", "Texas", "Statewide"),
+            ("/api/rest/v4/courts/nyappdiv1/", "New York", "Statewide"),
+            ("/api/rest/v4/courts/fladistctapp/", "Florida", "Statewide"),
+        ],
+    )
+    @respx.mock
+    def test_scraper_applies_mapping_to_document(
+        self, court_url: str, expected_state: str, expected_county: str
+    ) -> None:
+        """CourtListenerScraper._map_to_document assigns correct state/county via mapping."""
+        cluster = _make_cluster(court=court_url)
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        assert doc.state == expected_state, (
+            f"For court_url={court_url!r}: expected state={expected_state!r}, got {doc.state!r}"
+        )
+        assert doc.county == expected_county, (
+            f"For court_url={court_url!r}: expected county={expected_county!r}, got {doc.county!r}"
+        )
+
+    @respx.mock
+    def test_unknown_court_id_defaults_to_unknown(self, capsys: pytest.CaptureFixture) -> None:
+        """Unknown court_id produces (Unknown, Unknown) and logs a warning."""
+        cluster = _make_cluster(court="/api/rest/v4/courts/zzunknownsentinel/")
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        assert doc.state == "Unknown"
+        assert doc.county == "Unknown"
+
+        # Warning with court_id should be emitted to stdout (structlog renders there in tests)
+        captured = capsys.readouterr()
+        assert "zzunknownsentinel" in captured.out
+
+    @respx.mock
+    def test_empty_court_id_falls_back_to_config_defaults(self) -> None:
+        """Empty court field on cluster falls back to config state/county."""
+        cluster = _make_cluster(court="")
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()  # state="Federal", county="Federal"
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+        assert doc.state == "Federal"
+        assert doc.county == "Federal"
+
+
+# ---------------------------------------------------------------------------
+# extra field survives event emission (AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestExtraSurvivesEventEmission:
+    """Verify that doc.extra round-trips through emit_document_captured."""
+
+    @respx.mock
+    def test_extra_survives_event_emission(self) -> None:
+        """courtlistener_court_id in doc.extra must appear in the emitted Redis payload."""
+        import json as _json
+
+        from framework.events import EventBus
+
+        cluster = _make_cluster(court="/api/rest/v4/courts/texapp1/")
+        opinion = _make_opinion(plain_text="Opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        doc = docs[0]
+
+        # Emit through EventBus backed by a mock Redis
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+        bus.emit_document_captured(doc, producer_id="test-federal-courtlistener")
+
+        call_args = mock_redis.xadd.call_args
+        payload = _json.loads(call_args[0][1]["data"])
+
+        assert "extra" in payload, "extra key missing from emitted payload"
+        assert payload["extra"]["courtlistener_court_id"] == "texapp1"
+        assert payload["extra"]["courtlistener_cluster_id"] == 1001
+        assert payload["extra"]["courtlistener_opinion_id"] == 2001
+
+    @respx.mock
+    def test_extra_state_county_correct_for_texas_appellate(self) -> None:
+        """Texas appellate opinions must have state=Texas, county=Statewide in event."""
+        import json as _json
+
+        from framework.events import EventBus
+
+        cluster = _make_cluster(court="/api/rest/v4/courts/texapp3/")
+        opinion = _make_opinion(plain_text="Texas appellate opinion")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        doc = docs[0]
+        mock_redis = MagicMock()
+        mock_redis.xadd.return_value = b"1234-0"
+        bus = EventBus(mock_redis)
+        bus.emit_document_captured(doc, producer_id="test")
+
+        payload = _json.loads(mock_redis.xadd.call_args[0][1]["data"])
+        assert payload["state"] == "Texas"
+        assert payload["county"] == "Statewide"
