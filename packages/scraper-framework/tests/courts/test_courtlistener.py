@@ -401,14 +401,19 @@ class TestCourtListenerScraper:
         assert doc.court == "CourtListener"
 
     @respx.mock
-    def test_fetch_documents_prefers_html(self) -> None:
-        """Scraper prefers html_with_citations over plain_text."""
+    def test_fetch_documents_uses_plain_text_for_ruling_text(self) -> None:
+        """ruling_text uses plain_text; ruling_text_html captures the HTML variant.
+
+        derived.rulings has separate columns for the canonical text and a rich
+        HTML representation. Storing html_with_citations in ruling_text leaves
+        <pre>/<span> markup in the canonical text column and breaks downstream
+        consumers that expect ruling_text to be plain.
+        """
         cluster = _make_cluster()
         opinion = _make_opinion(
             plain_text="Plain version",
             html="<p>HTML version</p>",
         )
-        # html_with_citations takes priority, set it directly
         opinion["html_with_citations"] = "<p>HTML with <a>citations</a></p>"
 
         respx.get(f"{API_BASE_URL}/clusters/").mock(
@@ -424,7 +429,31 @@ class TestCourtListenerScraper:
         docs = scraper.fetch_documents()
 
         assert len(docs) == 1
-        assert docs[0].ruling_text == "<p>HTML with <a>citations</a></p>"
+        assert docs[0].ruling_text == "Plain version"
+        assert docs[0].ruling_text_html == "<p>HTML with <a>citations</a></p>"
+
+    @respx.mock
+    def test_fetch_documents_falls_back_to_html_when_plain_text_empty(self) -> None:
+        """When plain_text is empty, ruling_text falls back to the HTML variant."""
+        cluster = _make_cluster()
+        opinion = _make_opinion(plain_text="", html="")
+        opinion["html_with_citations"] = "<p>Only HTML available</p>"
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        assert docs[0].ruling_text == "<p>Only HTML available</p>"
+        assert docs[0].ruling_text_html == "<p>Only HTML available</p>"
 
     @respx.mock
     def test_fetch_documents_skips_empty_opinions(self) -> None:
