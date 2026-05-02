@@ -172,7 +172,7 @@ LA_EXTRACTION_PROMPT = (
     "## Output format\n\n"
     "Respond with ONLY a JSON object, no other text:\n\n"
     "{\n"
-    '  "extracted_judge_name": "First M. Last" or null,\n'
+    '  "extracted_judge_name": "<full judge name>" or null,\n'
     '  "hearing_date": "YYYY-MM-DD" or null,\n'
     '  "department": "3" or "P" or "F46" or "205" or null,\n'
     '  "rulings": [\n'

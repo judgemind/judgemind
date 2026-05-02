@@ -1391,6 +1391,22 @@ def test_resolve_judge_rejects_unicode_junk() -> None:
     assert result is None
 
 
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        "First M. Last",
+        "FIRST M. LAST",
+        "first m. last",
+        "First M Last",
+    ],
+)
+def test_normalize_judge_name_rejects_first_m_last_placeholder(placeholder: str) -> None:
+    """normalize_judge_name returns None for 'First M. Last' placeholder variants."""
+    from ingestion.db import normalize_judge_name
+
+    assert normalize_judge_name(placeholder) is None
+
+
 # ---------------------------------------------------------------------------
 # Judge resolution (resolve_judge)
 # ---------------------------------------------------------------------------

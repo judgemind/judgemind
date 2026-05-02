@@ -619,7 +619,9 @@ _GARBAGE_NAME_RE = re.compile(
     r"|Plaintiff"  # party label
     r"|Defendant"  # party label
     r"|^\d{4}\s+"  # starts with a year
-    r"|_{2,}",  # underscores (template placeholders)
+    r"|_{2,}"  # underscores (template placeholders)
+    r"|^[Ff]irst\s+[Mm]\.?\s+[Ll]ast$",  # LLM prompt placeholder "First M. Last"
+    re.IGNORECASE,
 )
 
 # Regex to strip encoding artifacts from judge names.
