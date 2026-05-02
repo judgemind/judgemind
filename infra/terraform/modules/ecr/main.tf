@@ -282,3 +282,92 @@ resource "aws_ecr_repository_policy" "dispatcher_agent_runner" {
     ]
   })
 }
+
+# ─── Dispatcher v3 Repository ────────────────────────────────────────────────
+# Dispatcher v3 unified image (issue #3886; spec
+# `docs/specs/dispatcher-v3-spec.md` §4 + §6). v3 has ONE image with
+# multiple ECS task definitions baked from the same image with different
+# entrypoints (launcher / task-runner / diagnoser / scheduled-skill).
+#
+# Naming: follows the established `judgemind/<service>` convention used by
+# `judgemind/scraper`, `judgemind/api`, `judgemind/dispatcher`, and
+# `judgemind/dispatcher-agent-runner`. Issue #3886's body uses the casual
+# rendering `judgemind-dispatcher-v3` (with a dash) but the canonical
+# project pattern is org/service with a slash. Verify command in the AC:
+#
+#   aws ecr describe-repositories \
+#     --repository-names judgemind/dispatcher-v3 \
+#     --region us-west-2
+#
+# Lifecycle policy: keep last 30 tagged images (vs. 10 for v2). Per the
+# issue body's "keep last 30 images". The wider window matches the higher
+# expected build cadence during the v3 ramp (cohabitation §8) where each
+# operator-driven knob change typically pushes a fresh image.
+#
+# CI image tags: <sha7>, latest, <branch> — same shape as
+# `deploy-dispatcher.yml` and `deploy-agent-runner.yml`. The `tagPrefixList`
+# below covers the SHA tags written by `deploy-dispatcher-v3.yml`; the
+# `latest` and branch tags are mutable so they are not retention candidates.
+
+resource "aws_ecr_repository" "dispatcher_v3" {
+  name                 = "judgemind/dispatcher-v3"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "dispatcher_v3" {
+  repository = aws_ecr_repository.dispatcher_v3.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Purge untagged images after 1 day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Retain last 30 tagged images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["v", "staging", "prod", "sha-"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 30
+        }
+        action = { type = "expire" }
+      }
+    ]
+  })
+}
+
+resource "aws_ecr_repository_policy" "dispatcher_v3" {
+  count      = var.enable_pull_policy ? 1 : 0
+  repository = aws_ecr_repository.dispatcher_v3.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowECSTaskExecutionPull"
+        Effect = "Allow"
+        Principal = {
+          AWS = var.ecs_task_execution_role_arn
+        }
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+      }
+    ]
+  })
+}

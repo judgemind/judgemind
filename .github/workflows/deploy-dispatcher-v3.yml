@@ -1,0 +1,161 @@
+name: Deploy Dispatcher v3
+
+# Builds and pushes the dispatcher v3 unified image
+# (`judgemind/dispatcher-v3`) to ECR on merge to main.
+#
+# v3 ARCHITECTURE NOTE: One image, multiple ECS task definitions baked
+# from the same image with different entrypoints (launcher / task-runner
+# / diagnoser / scheduled-skill). This workflow handles the BUILD +
+# PUSH half. Service rollouts (when the launcher service lands) and
+# task-def re-registers (when the task-runner / diagnoser /
+# scheduled-skill task families land) are wired in follow-up issues —
+# this workflow lands first so the ECR repo + image-build CI exist
+# before any v3 service tries to deploy.
+#
+# This file mirrors `deploy-dispatcher.yml` (build half only — service
+# rollout deferred) and `deploy-agent-runner.yml` (build + task-def
+# re-register; the re-register equivalent will land in a follow-up when
+# the v3 task-defs exist).
+#
+# Build outputs:
+#   ECR image  `<acct>.dkr.ecr.us-west-2.amazonaws.com/judgemind/dispatcher-v3:<sha7>`
+#   Tags: `<sha7>`, `latest`, `<branch>`, and optional `image_tag` input.
+#
+# Triggers:
+#   push to main when anything that affects the image content OR the
+#   deploy workflow itself changes, plus workflow_dispatch for a manual
+#   rebuild without a code change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.dispatcher-v3"
+      - "scripts/dispatcher_v3/**"
+      # scripts/dispatcher_v3/tests/ is pytest-only — never imported by
+      # the launcher / task-runner at runtime, so changes there don't
+      # affect the built image. Excluded so test-only PRs don't trigger
+      # a full v3 image rebuild. Same narrowing as deploy-dispatcher.yml.
+      - "!scripts/dispatcher_v3/tests/**"
+      # Markdown-only changes under scripts/dispatcher_v3/ (design notes,
+      # READMEs) don't affect the image content. Same exclusion as
+      # deploy-dispatcher.yml.
+      - "!scripts/dispatcher_v3/**/*.md"
+      - "scripts/check-issue-author.sh"
+      - "scripts/preflight.sh"
+      - "scripts/preflight-bash-fargate.sh"
+      - ".claude/hooks/preflight_cross_worktree.py"
+      # Vendored transcript renderer — `Dockerfile.dispatcher-v3` COPYs
+      # `vendor/judgemind-transcripts/render-transcript.py` into
+      # `/opt/judgemind-transcripts/`. Changes to the vendored copy must
+      # trigger a rebuild so the new renderer ships.
+      - "vendor/judgemind-transcripts/**"
+      - ".github/workflows/deploy-dispatcher-v3.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Optional image tag (defaults to git SHA)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: deploy-dispatcher-v3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: judgemind/dispatcher-v3
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        run: |
+          IMAGE_BASE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          SHA_TAG="${GITHUB_SHA::7}"
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          CUSTOM_TAG="${{ inputs.image_tag }}"
+
+          TAGS=("-t" "$IMAGE_BASE:$SHA_TAG" "-t" "$IMAGE_BASE:latest" "-t" "$IMAGE_BASE:$BRANCH_TAG")
+
+          if [ -n "$CUSTOM_TAG" ]; then
+            TAGS+=("-t" "$IMAGE_BASE:$CUSTOM_TAG")
+          fi
+
+          # `GIT_SHA` is baked into the image as an env var so the running
+          # launcher / task-runner can self-report its build SHA into
+          # `dispatcher.runs.version_sha` (spec §5).
+          docker build \
+              --build-arg "GIT_SHA=$SHA_TAG" \
+              -f Dockerfile.dispatcher-v3 \
+              "${TAGS[@]}" .
+          docker push "$IMAGE_BASE" --all-tags
+
+          echo "image_uri=$IMAGE_BASE:$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify image landed in ECR
+        env:
+          SHA_TAG: ${{ steps.build.outputs.sha_tag }}
+        run: |
+          # Cheap post-push sanity check — confirms the SHA tag landed
+          # on the same digest as `:latest`. Any failure here means the
+          # push silently dropped or the registry is returning stale
+          # metadata; both worth failing CI for. Same shape as
+          # deploy-agent-runner.yml's verify step.
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$SHA_TAG" \
+            --region "$AWS_REGION" \
+            --no-cli-pager \
+            --output json \
+            --query 'imageDetails[0].{digest:imageDigest,tags:imageTags,pushedAt:imagePushedAt}'
+
+      - name: Publish build summary
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image_uri }}
+          SHA_TAG: ${{ steps.build.outputs.sha_tag }}
+        run: |
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          {
+            echo "### Dispatcher v3 image pushed"
+            echo ""
+            echo "- **Repo:** \`$ECR_REPOSITORY\`"
+            echo "- **SHA tag:** \`$SHA_TAG\`"
+            echo "- **Image URI:** \`$IMAGE_URI\`"
+            echo "- **Also tagged:** \`latest\`, \`$BRANCH_TAG\`"
+            echo ""
+            echo "Next \`ecs:RunTask\` against any v3 task-def family will pull this image via the \`:latest\` tag (once the v3 task-defs land in a follow-up issue)."
+          } >> "$GITHUB_STEP_SUMMARY"
