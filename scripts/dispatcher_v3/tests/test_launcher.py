@@ -156,6 +156,7 @@ def make_launcher(
     runner_name: str = "claude",
     task_runner_log_group: str = "",
     task_runner_log_stream_prefix: str = DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
+    diagnoser_task_definition: str = "judgemind-dispatcher-v3-diagnoser",
 ) -> Launcher:
     """Construct a :class:`Launcher` with sane test defaults.
 
@@ -168,6 +169,7 @@ def make_launcher(
         github_repo="judgemind/judgemind",
         ecs_cluster_arn="arn:aws:ecs:us-west-2:0:cluster/jm",
         task_runner_task_definition="judgemind-task-runner:7",
+        diagnoser_task_definition=diagnoser_task_definition,
         agent_runner_subnet_ids=["subnet-a", "subnet-b"],
         agent_runner_security_group_id="sg-aaa",
         sessions_bucket="judgemind-sessions-dev",
