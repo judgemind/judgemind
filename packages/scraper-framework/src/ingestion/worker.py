@@ -421,12 +421,32 @@ def _try_fresno_pdf_split(
     split_rulings = _split_rulings(ruling_text)
     if not split_rulings:
         # No numbered entries found — fall through to LLM.
+        logger.info(
+            "fresno_split_fall_through",
+            extra={
+                "document_id": document_id,
+                "reason": "no_numbered_entries",
+                "raw_len": len(split_rulings),
+                "scraper_id": event_data.get("scraper_id"),
+                "extraction_method": "fresno_pdf_deterministic",
+            },
+        )
         return False
     if len(split_rulings) == 1:
         # Single-ruling PDF — the deterministic regex extraction does not
         # reliably populate outcome/motion_type. Fall through to the LLM
         # path so _llm_enrich_fields fills those fields (matches pre-#3553
         # behavior; AC4 of #3534, fix for #3599).
+        logger.info(
+            "fresno_split_fall_through",
+            extra={
+                "document_id": document_id,
+                "reason": "single_ruling_pdf",
+                "raw_len": len(split_rulings),
+                "scraper_id": event_data.get("scraper_id"),
+                "extraction_method": "fresno_pdf_deterministic",
+            },
+        )
         return False
 
     logger.info(

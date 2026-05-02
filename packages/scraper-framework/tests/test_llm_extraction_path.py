@@ -9,7 +9,10 @@ Verifies that:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from framework.llm_schema import (
     ExtractedParty,
@@ -2738,7 +2741,7 @@ class TestFresnoPdfSplit:
         assert result is True
         assert mock_process.call_count == 8
 
-    def test_single_ruling_falls_through_to_llm(self) -> None:
+    def test_single_ruling_falls_through_to_llm(self, caplog: pytest.LogCaptureFixture) -> None:
         """Single-ruling Fresno PDFs return False, falling through to the LLM.
 
         The 503 fixture has exactly 1 ruling.  ``_split_rulings`` still
@@ -2768,18 +2771,30 @@ class TestFresnoPdfSplit:
             county="Fresno",
             content_format="pdf",
         )
-        result = _try_fresno_pdf_split(
-            event,
-            event["document_id"],
-            no_rulings_text,
-            dispatched.append,
-        )
+        with caplog.at_level(logging.INFO, logger="ingestion.worker"):
+            result = _try_fresno_pdf_split(
+                event,
+                event["document_id"],
+                no_rulings_text,
+                dispatched.append,
+            )
 
         assert result is False, (
             "_try_fresno_pdf_split must return False when _split_rulings "
             "finds no numbered entries, so the caller falls through to the LLM."
         )
         assert dispatched == [], "No events should be dispatched when split returns []"
+
+        fall_through_records = [
+            r for r in caplog.records if r.getMessage() == "fresno_split_fall_through"
+        ]
+        n = len(fall_through_records)
+        assert n == 1, f"Expected exactly 1 fresno_split_fall_through log record, got {n}"
+        record = fall_through_records[0]
+        assert record.reason == "no_numbered_entries", (
+            f"Expected reason='no_numbered_entries', got {record.reason!r}"
+        )
+        assert record.raw_len == 0, f"Expected raw_len=0, got {record.raw_len!r}"
 
     def test_split_events_carry_distinct_case_numbers(self) -> None:
         """Each dispatched event has a distinct case_number matching its own
@@ -2833,7 +2848,9 @@ class TestFresnoPdfSplit:
             assert ev.get("_original_document_id") == event["document_id"]
             assert ev.get("ruling_text_html") is None
 
-    def test_non_fresno_county_does_not_trigger_split(self) -> None:
+    def test_non_fresno_county_does_not_trigger_split(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Non-Fresno counties (e.g. Orange) are not routed through the
         Fresno splitter even when content_format is ``'pdf'``."""
         from ingestion.worker import _try_fresno_pdf_split
@@ -2858,17 +2875,28 @@ class TestFresnoPdfSplit:
             county="Orange",
             content_format="pdf",
         )
-        result = _try_fresno_pdf_split(
-            event,
-            event["document_id"],
-            text,
-            dispatched.append,
-        )
+        with caplog.at_level(logging.INFO, logger="ingestion.worker"):
+            result = _try_fresno_pdf_split(
+                event,
+                event["document_id"],
+                text,
+                dispatched.append,
+            )
 
         assert result is False, "_try_fresno_pdf_split must return False for non-Fresno counties."
         assert dispatched == []
 
-    def test_non_pdf_content_format_does_not_trigger_split(self) -> None:
+        fall_through_records = [
+            r for r in caplog.records if r.getMessage() == "fresno_split_fall_through"
+        ]
+        assert fall_through_records == [], (
+            "fresno_split_fall_through must NOT be emitted for non-Fresno counties "
+            f"(gate fires before _split_rulings). Got: {fall_through_records}"
+        )
+
+    def test_non_pdf_content_format_does_not_trigger_split(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Fresno county with non-PDF content_format falls through — the
         splitter only triggers on county=Fresno AND content_format=pdf."""
         from ingestion.worker import _try_fresno_pdf_split
@@ -2888,19 +2916,30 @@ class TestFresnoPdfSplit:
             county="Fresno",
             content_format="html",
         )
-        result = _try_fresno_pdf_split(
-            event,
-            event["document_id"],
-            text,
-            dispatched.append,
-        )
+        with caplog.at_level(logging.INFO, logger="ingestion.worker"):
+            result = _try_fresno_pdf_split(
+                event,
+                event["document_id"],
+                text,
+                dispatched.append,
+            )
 
         assert result is False, (
             "_try_fresno_pdf_split must return False when content_format != 'pdf'."
         )
         assert dispatched == []
 
-    def test_single_numbered_ruling_falls_through_to_llm(self) -> None:
+        fall_through_records = [
+            r for r in caplog.records if r.getMessage() == "fresno_split_fall_through"
+        ]
+        assert fall_through_records == [], (
+            "fresno_split_fall_through must NOT be emitted when content_format != 'pdf' "
+            f"(gate fires before _split_rulings). Got: {fall_through_records}"
+        )
+
+    def test_single_numbered_ruling_falls_through_to_llm(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Single-ruling Fresno PDFs (len == 1) must return False (#3599).
 
         When ``_split_rulings`` returns a 1-element list, the deterministic
@@ -2931,18 +2970,30 @@ class TestFresnoPdfSplit:
             county="Fresno",
             content_format="pdf",
         )
-        result = _try_fresno_pdf_split(
-            event,
-            event["document_id"],
-            single_ruling_text,
-            dispatched.append,
-        )
+        with caplog.at_level(logging.INFO, logger="ingestion.worker"):
+            result = _try_fresno_pdf_split(
+                event,
+                event["document_id"],
+                single_ruling_text,
+                dispatched.append,
+            )
 
         assert result is False, (
             "_try_fresno_pdf_split must return False when _split_rulings "
             "returns a 1-element list, so the caller falls through to the LLM."
         )
         assert dispatched == [], "No events should be dispatched for a single-ruling Fresno PDF."
+
+        fall_through_records = [
+            r for r in caplog.records if r.getMessage() == "fresno_split_fall_through"
+        ]
+        n = len(fall_through_records)
+        assert n == 1, f"Expected exactly 1 fresno_split_fall_through log record, got {n}"
+        record = fall_through_records[0]
+        assert record.reason == "single_ruling_pdf", (
+            f"Expected reason='single_ruling_pdf', got {record.reason!r}"
+        )
+        assert record.raw_len == 1, f"Expected raw_len=1, got {record.raw_len!r}"
 
     def test_multi_ruling_still_dispatches_with_llm_extracted_flag(self) -> None:
         """Multi-ruling Fresno PDFs still dispatch with _split_processed=True
