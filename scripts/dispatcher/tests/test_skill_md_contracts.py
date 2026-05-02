@@ -311,27 +311,28 @@ class TestTaskV2VerifyContracts:
 
 
 class TestDiagnoseFailureContracts:
-    """diagnose-failure/SKILL.md must have per-category sections for
-    ralph_ac_infeasible and summary_ac_infeasible, plus the
-    wholesale-replace requirement for new_scope (issue #3010)."""
+    """diagnose-failure/SKILL.md must document the AC-rewrite requirement
+    (wholesale replace, not a partial splice), name the canonical action
+    vocabulary, and carry the #3057 anchor-bias defense framing.
 
-    def test_ralph_ac_infeasible_section(self) -> None:
-        content = _read(_DIAGNOSE_FAILURE_SKILL)
-        assert "ralph_ac_infeasible" in content, (
-            "diagnose-failure/SKILL.md must have a ralph_ac_infeasible "
-            "section (issue #3010)"
-        )
-
-    def test_summary_ac_infeasible_section(self) -> None:
-        content = _read(_DIAGNOSE_FAILURE_SKILL)
-        assert "summary_ac_infeasible" in content, (
-            "diagnose-failure/SKILL.md must have a summary_ac_infeasible "
-            "section (issue #3010)"
-        )
+    The original v2 ``ralph_ac_infeasible`` / ``summary_ac_infeasible``
+    per-category section assertions were dropped in #3874 — those failure
+    categories are v2-specific (v3 has no per-phase pipeline emitting
+    them; the diagnoser sees the whole agent context and decides).
+    The remaining assertions are framing principles preserved across
+    both contracts: "stderr is ground truth", verbatim-quote language,
+    AC-rewrite-as-wholesale-replace, the #3057 anchor-bias forensic.
+    """
 
     def test_default_action_vocabulary(self) -> None:
-        """The three default actions must all appear in the
-        per-category guidance."""
+        """The canonical action vocabulary must all appear in the SKILL.
+
+        v2 had nine actions; v3 has four. ``reissue``, ``escalate``,
+        and ``close`` are the three principle-level actions that exist
+        in both contracts (v3 frames them as "reissue the AC + retry",
+        "mark needs_review" / escalate, and "close the issue"). The
+        contract here is naming presence, not enum identity (issue #3010,
+        carried into #3874)."""
         content = _read(_DIAGNOSE_FAILURE_SKILL)
         for action in ("reissue", "escalate", "close"):
             assert action in content, (
@@ -340,8 +341,11 @@ class TestDiagnoseFailureContracts:
             )
 
     def test_new_scope_wholesale_replace_requirement(self) -> None:
-        """``new_scope`` is always the complete rewritten issue body —
-        not a diff, not a patch, not a partial splice."""
+        """The AC-rewrite (``new_scope`` in v2 prose, "reissue" action
+        body in v3 prose) is always the **complete rewritten issue body**
+        — not a diff, not a patch, not a partial splice. ``gh issue edit
+        --body-file`` doesn't parse content, so any partial body
+        truncates the issue. Issue #3010 (carried into #3874)."""
         content = _read(_DIAGNOSE_FAILURE_SKILL)
         # The SKILL.md uses "wholesale replace" or "complete rewritten
         # issue body" (or both) — lock on either phrase.
@@ -351,7 +355,7 @@ class TestDiagnoseFailureContracts:
             or "complete, well-formed issue body" in content.lower()
         ), (
             "diagnose-failure/SKILL.md must document the wholesale-replace "
-            "requirement for new_scope (issue #3010)"
+            "requirement for the AC-rewrite action (issue #3010)"
         )
 
     # ------------------------------------------------------------------
@@ -388,18 +392,23 @@ class TestDiagnoseFailureContracts:
 
     def test_verbatim_quote_requirement(self) -> None:
         """SKILL.md must require the diagnoser to quote the actual stderr
-        failure line verbatim in the ``reasoning`` field."""
+        failure line verbatim, and must name the field where that quote
+        lands. v2 named the field ``reasoning``; v3 names it
+        ``outcome_summary``. The contract is "verbatim quote into the
+        named output field" — either field name satisfies the assertion
+        (issue #3057, carried into #3874)."""
         content = _read(_DIAGNOSE_FAILURE_SKILL)
         lower = content.lower()
-        # The verbatim-quote language: must mention both "verbatim" and
-        # "reasoning" (the field where the quote lands).
         assert "verbatim" in lower, (
             "diagnose-failure/SKILL.md must mention 'verbatim' quoting "
             "of the stderr failure line (issue #3057)"
         )
-        assert "reasoning" in lower, (
+        # v2 used ``reasoning``; v3 uses ``outcome_summary``. Either
+        # is acceptable — the contract is naming the landing field.
+        assert "reasoning" in lower or "outcome_summary" in lower, (
             "diagnose-failure/SKILL.md must describe where the verbatim "
-            "stderr quote lands (the ``reasoning`` field — issue #3057)"
+            "stderr quote lands (v2: ``reasoning``; v3: ``outcome_summary``"
+            " — issue #3057, #3874)"
         )
 
     def test_3057_issue_reference(self) -> None:
@@ -676,4 +685,122 @@ class TestEmpoweredDiagnoserContracts:
         assert "#3744" in content, (
             "diagnose-failure/SKILL.md must reference '#3744' for traceability "
             "(issue #3744)"
+        )
+
+
+# ------------------------------------------------------------------
+# Issue #3874 — dispatcher-v3 SKILL contract.
+# ------------------------------------------------------------------
+
+
+class TestDiagnoseFailureV3Contracts:
+    """diagnose-failure/SKILL.md must reflect the dispatcher-v3 contract:
+    no v2 ``dispatcher.diagnoses`` / ``next_directive`` / ``recommendation.action``
+    / diagnoser-sentinel-env-var references; documents the S3 → CloudWatch
+    transcript fallback cascade; names the four authoritative actions;
+    writes ``agents.outcome_summary``; and asserts the launcher-polls
+    contract (no recommendation/directive return).
+
+    These are grep-style assertions mapped 1:1 to issue #3874's
+    acceptance-criteria Verify lines."""
+
+    def test_no_v2_legacy_strings(self) -> None:
+        """The four v2-specific identifiers must NOT appear verbatim
+        anywhere in the SKILL — they're the contract surface v3 has
+        explicitly retired (issue #3874 AC #1)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        forbidden = [
+            "dispatcher.diagnoses",
+            "next_directive",
+            "recommendation.action",
+            "JUDGEMIND_DIAGNOSER_RUN",
+        ]
+        hits = [s for s in forbidden if s in content]
+        assert not hits, (
+            f"diagnose-failure/SKILL.md still contains v2-legacy strings "
+            f"(issue #3874 AC #1): {hits}"
+        )
+
+    def test_session_log_cascade_documented(self) -> None:
+        """The SKILL must describe reading the session log via the
+        S3 → CloudWatch fallback cascade (issue #3874 AC #2)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "render-transcript" in content, (
+            "diagnose-failure/SKILL.md must reference render-transcript "
+            "(the compact-S3-transcript renderer) — issue #3874 AC #2"
+        )
+        # Permit either the literal s3:// scheme or the SESSIONS_BUCKET
+        # placeholder; the contract is "S3 archive is the primary read".
+        assert "s3://" in content, (
+            "diagnose-failure/SKILL.md must reference an s3:// URL for "
+            "the sessions bucket (issue #3874 AC #2)"
+        )
+        assert "GetLogEvents" in content, (
+            "diagnose-failure/SKILL.md must reference CloudWatch's "
+            "GetLogEvents as the last-resort fallback (issue #3874 AC #2)"
+        )
+
+    def test_four_authoritative_actions_documented(self) -> None:
+        """The SKILL must describe the four authoritative actions:
+        retry (re-add agent/ready), file follow-up + mark failed,
+        reissue AC + retry, mark needs_review (issue #3874 AC #3)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        # "four" appears in the prose ("four authoritative actions" /
+        # "four, not nine"). Lock on the prose phrase.
+        lower = content.lower()
+        assert "four authoritative actions" in lower or "four, not nine" in lower, (
+            "diagnose-failure/SKILL.md must name the v3 four-action "
+            "vocabulary explicitly (issue #3874 AC #3)"
+        )
+        # Each action's distinguishing string must appear.
+        assert "agent/ready" in content, (
+            "Action 1 (retry) must reference re-adding agent/ready (issue #3874 AC #3)"
+        )
+        assert "needs_review" in content, (
+            "Action 4 (mark needs_review) must reference the "
+            "needs_review status (issue #3874 AC #3)"
+        )
+
+    def test_outcome_summary_write_documented(self) -> None:
+        """The SKILL must document writing ``agents.outcome_summary``
+        as the final step (issue #3874 AC #4)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "outcome_summary" in content, (
+            "diagnose-failure/SKILL.md must document the "
+            "outcome_summary write (issue #3874 AC #4)"
+        )
+        # The write should be described as the final step.
+        lower = content.lower()
+        assert "agents.outcome_summary" in lower or (
+            "outcome_summary" in lower and "exit" in lower
+        ), (
+            "diagnose-failure/SKILL.md must describe the "
+            "outcome_summary write as the final step before exit "
+            "(issue #3874 AC #4)"
+        )
+
+    def test_launcher_polls_contract_documented(self) -> None:
+        """The SKILL must explicitly state that no recommendation or
+        directive is returned — the launcher polls ``agents.status``
+        instead (issue #3874 AC #5)."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "launcher polls" in content, (
+            "diagnose-failure/SKILL.md must state that the launcher "
+            "polls agents.status (issue #3874 AC #5)"
+        )
+        # The "no recommendation/directive return" framing.
+        assert (
+            "no recommendation/directive" in content
+            or "no recommendation" in content.lower()
+        ), (
+            "diagnose-failure/SKILL.md must explicitly state there is "
+            "no recommendation/directive return (issue #3874 AC #5)"
+        )
+
+    def test_3874_issue_reference(self) -> None:
+        """SKILL.md must reference issue #3874 for traceability."""
+        content = _read(_DIAGNOSE_FAILURE_SKILL)
+        assert "#3874" in content, (
+            "diagnose-failure/SKILL.md must reference '#3874' for "
+            "traceability (issue #3874)"
         )

@@ -808,60 +808,20 @@ class TestVerifyFailedPostMergeTierRegistration:
         )
 
 
-class TestVerifyFailedPostMergeSkillContract:
-    """Issue #3071 AC #3: diagnose-failure skill must have a section
-    for verify_failed_post_merge distinguishing post-merge from pre-
-    merge failures."""
-
-    def _skill_content(self) -> str:
-        skill_path = (
-            Path(__file__).resolve().parents[3]
-            / ".claude"
-            / "skills"
-            / "diagnose-failure"
-            / "SKILL.md"
-        )
-        return skill_path.read_text()
-
-    def test_skill_has_verify_failed_post_merge_section(self) -> None:
-        content = self._skill_content()
-        assert "verify_failed_post_merge" in content, (
-            "diagnose-failure/SKILL.md must have a verify_failed_post_merge "
-            "section (issue #3071)"
-        )
-
-    def test_skill_discourages_retry_for_post_merge(self) -> None:
-        """The post-merge section must explicitly tell the diagnoser
-        not to pick ``retry`` (the daemon doesn't re-run verify from
-        the retry-marker path, so a retry recommendation here would
-        leave the agent stuck)."""
-        content = self._skill_content().lower()
-        # Either phrasing is acceptable — the contract is "don't pick retry".
-        assert (
-            "do not pick `retry`" in content
-            or "do not pick retry" in content
-            or "retry` or `retry_with_hint`" in content
-        ), (
-            "diagnose-failure/SKILL.md must discourage `retry` for "
-            "verify_failed_post_merge (issue #3071)"
-        )
-
-    def test_skill_mentions_primary_actions(self) -> None:
-        """The post-merge section must name ``file_prerequisite_task``
-        and ``block_and_comment`` as primary actions — those are the
-        diagnoser responses the issue explicitly calls out."""
-        content = self._skill_content()
-        # Both action names should appear in the new section.
-        new_section_start = content.find("verify_failed_post_merge")
-        assert new_section_start != -1
-        # Look in roughly the next 3000 chars for both mentions.
-        window = content[new_section_start : new_section_start + 4000]
-        assert "file_prerequisite_task" in window, (
-            "verify_failed_post_merge section must name `file_prerequisite_task`"
-        )
-        assert "block_and_comment" in window, (
-            "verify_failed_post_merge section must name `block_and_comment`"
-        )
+# ------------------------------------------------------------------
+# Removed in #3874 — the v2 ``TestVerifyFailedPostMergeSkillContract``
+# class asserted that diagnose-failure/SKILL.md carry a per-category
+# section keyed on the v2 failure-category string ``verify_failed_post_merge``
+# and named the v2 ``file_prerequisite_task`` / ``block_and_comment`` action
+# enums. Both are v2-specific surface area (per-phase failure categories
+# come from v2's pipeline; the action enums are v2's
+# ``recommendation.action`` shape, retired in v3 per spec §4.2 and §7).
+# v3's diagnoser sees the whole agent context and decides — the daemon-side
+# routing of ``verify_failed_post_merge`` continues to live in
+# :class:`TestVerifyFailedPostMergeRouting` below (which exercises
+# :data:`FAILURE_CATEGORY_VERIFY_FAILED_POST_MERGE` in the daemon's
+# routing tables, not the SKILL prose).
+# ------------------------------------------------------------------
 
 
 class TestVerifyFailedPostMergeRouting:
