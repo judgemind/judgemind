@@ -157,7 +157,7 @@ variable "agent_runner_subnet_ids" {
 }
 
 variable "agent_runner_security_group_id" {
-  description = "Security group ID attached to every task-runner ENI launched via ecs:RunTask. Threaded into the launcher container as AGENT_RUNNER_SECURITY_GROUP_ID. Provisioned at the env layer to avoid an F2 ↔ F4 module cycle; egress profile mirrors F4's launcher SG (HTTPS / Postgres / Redis) so task-runners share the launcher's network posture."
+  description = "Security group ID attached to every task-runner ENI launched via ecs:RunTask. Threaded into the launcher container as AGENT_RUNNER_SECURITY_GROUP_ID. Provisioned at the env layer to avoid an F2 <-> F4 module cycle; egress profile mirrors F4's launcher SG (HTTPS / Postgres / Redis) so task-runners share the launcher's network posture."
   type        = string
 
   validation {
