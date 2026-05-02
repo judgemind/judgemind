@@ -267,6 +267,89 @@ class CourtListenerClient:
             output[cid] = opinions
         return output
 
+    def fetch_docket(self, docket_url: str) -> dict[str, Any]:
+        """Fetch a single docket sub-resource by its absolute URL.
+
+        Args:
+            docket_url: Absolute URL to the docket resource
+                        (e.g. ``https://www.courtlistener.com/api/rest/v4/dockets/123/``).
+
+        Returns:
+            Parsed docket dict from the API.
+        """
+        return self._get(docket_url)
+
+    def fetch_dockets_for_clusters(
+        self,
+        cluster_id_to_docket_url: dict[int, str],
+    ) -> dict[int, dict[str, Any]]:
+        """Fetch dockets for multiple clusters concurrently.
+
+        Uses bounded async concurrency identical to ``fetch_opinions_for_clusters``
+        (semaphore=DEFAULT_OPINION_FETCH_CONCURRENCY, 0.2 s pacing).  Per-cluster
+        HTTP errors are swallowed and logged as warnings; the affected id maps to
+        an empty dict so the caller loop sees a consistent shape.
+
+        Args:
+            cluster_id_to_docket_url: Mapping of cluster_id -> absolute docket URL.
+
+        Returns:
+            Dict mapping cluster_id -> docket dict (or {} on error).
+        """
+        return asyncio.run(self._afetch_dockets_for_clusters(cluster_id_to_docket_url))
+
+    async def _afetch_dockets_for_clusters(
+        self,
+        cluster_id_to_docket_url: dict[int, str],
+    ) -> dict[int, dict[str, Any]]:
+        """Async implementation of bounded-concurrency docket batch fetch."""
+        semaphore = asyncio.Semaphore(DEFAULT_OPINION_FETCH_CONCURRENCY)
+        headers = dict(self._client.headers)
+
+        async def _fetch_one(
+            async_client: httpx.AsyncClient,
+            cluster_id: int,
+            docket_url: str,
+        ) -> tuple[int, dict[str, Any]]:
+            async with semaphore:
+                # 0.2 s pacing inside the semaphore slot keeps throughput at
+                # most 5 req/s even when responses are instantaneous.
+                await asyncio.sleep(0.2)
+                try:
+                    response = await async_client.get(docket_url)
+                    response.raise_for_status()
+                    data: dict[str, Any] = response.json()
+                    self._request_count += 1
+                    return cluster_id, data
+                except httpx.HTTPStatusError as exc:
+                    self._request_count += 1
+                    logger.warning(
+                        "Failed to fetch docket for cluster",
+                        cluster_id=cluster_id,
+                        docket_url=docket_url,
+                        status=exc.response.status_code,
+                    )
+                    return cluster_id, {}
+
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=self._timeout,
+        ) as async_client:
+            tasks = [
+                _fetch_one(async_client, cluster_id, docket_url)
+                for cluster_id, docket_url in cluster_id_to_docket_url.items()
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        output: dict[int, dict[str, Any]] = {}
+        for item in results:
+            if isinstance(item, BaseException):
+                logger.warning("Unexpected error fetching dockets batch", exc_info=item)
+                continue
+            cid, docket = item
+            output[cid] = docket
+        return output
+
     @property
     def request_count(self) -> int:
         """Total number of API requests made by this client instance."""
@@ -336,6 +419,12 @@ class CourtListenerScraper(BaseScraper):
 
         opinions_by_cluster = client.fetch_opinions_for_clusters(cluster_id_list)
 
+        # Build docket URL map: skip clusters with no docket URL
+        cluster_id_to_docket_url: dict[int, str] = {
+            c["id"]: c["docket"] for c in clusters if c.get("id") and c.get("docket")
+        }
+        dockets_by_cluster = client.fetch_dockets_for_clusters(cluster_id_to_docket_url)
+
         docs: list[CapturedDocument] = []
         for cluster_id in cluster_id_list:
             if len(docs) >= self._max_results:
@@ -343,12 +432,13 @@ class CourtListenerScraper(BaseScraper):
 
             cluster = cluster_by_id[cluster_id]
             opinions = opinions_by_cluster.get(cluster_id, [])
+            docket = dockets_by_cluster.get(cluster_id)
 
             for opinion in opinions:
                 if len(docs) >= self._max_results:
                     break
 
-                doc = self._map_to_document(cluster, opinion)
+                doc = self._map_to_document(cluster, opinion, docket=docket)
                 if doc is not None:
                     docs.append(doc)
 
@@ -363,12 +453,14 @@ class CourtListenerScraper(BaseScraper):
         self,
         cluster: dict[str, Any],
         opinion: dict[str, Any],
+        docket: dict[str, Any] | None = None,
     ) -> CapturedDocument | None:
         """Map a CourtListener cluster + opinion to a CapturedDocument.
 
         Args:
             cluster: OpinionCluster API response dict.
             opinion: Opinion API response dict.
+            docket: Resolved docket sub-resource dict (optional).
 
         Returns:
             A CapturedDocument, or None if the opinion has no usable content.
@@ -446,7 +538,7 @@ class CourtListenerScraper(BaseScraper):
             or cluster.get("case_name_short")
             or None
         )
-        doc.case_number = _extract_docket_number(cluster)
+        doc.case_number = _extract_docket_number(cluster, docket=docket)
         doc.judge_name = _extract_judge_names(cluster)
         doc.hearing_date = _parse_date(cluster.get("date_filed"))
         doc.ruling_text = canonical_text[:10000] if canonical_text else None
@@ -459,6 +551,7 @@ class CourtListenerScraper(BaseScraper):
             "courtlistener_cluster_id": cluster.get("id"),
             "courtlistener_opinion_id": opinion.get("id"),
             "courtlistener_court_id": court_id,
+            "courtlistener_docket_id": docket.get("id") if docket else None,
             "date_modified": cluster.get("date_modified"),
             "precedential_status": cluster.get("precedential_status"),
             "citation_count": cluster.get("citation_count", 0),
@@ -479,16 +572,30 @@ class CourtListenerScraper(BaseScraper):
         return doc
 
 
-def _extract_docket_number(cluster: dict[str, Any]) -> str | None:
-    """Extract docket number from a cluster's docket reference.
+def _extract_docket_number(
+    cluster: dict[str, Any],
+    docket: dict[str, Any] | None = None,
+) -> str:
+    """Extract docket number from a cluster and/or its resolved docket sub-resource.
 
-    The cluster's docket field is typically a URL to the docket resource.
-    The docket_number is sometimes included directly in the cluster.
+    Resolution order:
+    1. docket['docket_number'] if docket is non-empty and the field is truthy.
+    2. cluster['docket_number'] if truthy.
+    3. f"CL-cluster-{cluster['id']}" — deterministic fallback, never None.
+
+    Args:
+        cluster: OpinionCluster API response dict.
+        docket: Resolved docket sub-resource dict (optional).
+
+    Returns:
+        A non-None docket number string.
     """
+    if docket and docket.get("docket_number"):
+        return str(docket["docket_number"])
     docket_number = cluster.get("docket_number")
     if docket_number:
         return str(docket_number)
-    return None
+    return f"CL-cluster-{cluster['id']}"
 
 
 def _extract_judge_names(cluster: dict[str, Any]) -> str | None:
