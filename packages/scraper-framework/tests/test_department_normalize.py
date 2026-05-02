@@ -233,6 +233,20 @@ class TestOrangeCounty:
     def test_no_leading_zero_unchanged(self, raw: str) -> None:
         assert normalize_department("Orange", raw) == raw
 
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("w08", "W8"),
+            ("Cm01", "CM1"),
+            ("cm01", "CM1"),
+            ("h001", "H1"),
+            ("cx02", "CX2"),
+            ("l0612", "L612"),
+        ],
+    )
+    def test_case_insensitive_leading_zero(self, raw: str, expected: str) -> None:
+        assert normalize_department("Orange", raw) == expected
+
 
 # ---------------------------------------------------------------------------
 # Other counties — passthrough
