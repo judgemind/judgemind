@@ -29,6 +29,8 @@
     "fastify": "^5.8",
     "google-auth-library": "^9.15.1",
     "graphql": "^16.8",
+    "graphql-depth-limit": "^1.1.0",
+    "graphql-validation-complexity": "^0.4.2",
     "jsonwebtoken": "^9.0",
     "node-pg-migrate": "^8.0.4",
     "pg": "^8.11",
@@ -38,6 +40,7 @@
   },
   "devDependencies": {
     "@types/bcrypt": "^5",
+    "@types/graphql-depth-limit": "^1.1.6",
     "@types/jsonwebtoken": "^9",
     "@types/node": "^20",
     "@types/pg": "^8",
