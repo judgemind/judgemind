@@ -156,9 +156,15 @@ def test_failure_launches_diagnoser_and_persists_arn() -> None:
     conn = FakeConn()
     # _watch_in_flight's SELECT returns one in-flight task.
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        # Post-#3940 the watch SELECT also reads ``started_at`` for the
+        # wall-clock-cap check. Pass None as the 4th tuple element to
+        # skip the wall-clock path (this test exercises the diagnoser
+        # invocation on STOPPED-non-zero, not the wall-clock path).
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/run-1", 100)],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/run-1", 100, None)],
         ),
     )
     # _launch_diagnoser's cap-check SELECT returns no prior diagnoser.
@@ -235,9 +241,15 @@ def test_failure_with_no_diagnoser_taskdef_does_not_launch() -> None:
     """
     conn = FakeConn()
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        # Post-#3940 the watch SELECT also reads ``started_at`` for the
+        # wall-clock-cap check. Pass None as the 4th tuple element to
+        # skip the wall-clock path (this test exercises the diagnoser
+        # invocation on STOPPED-non-zero, not the wall-clock path).
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/run-1", 100)],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/run-1", 100, None)],
         ),
     )
     ecs = MagicMock()
@@ -251,9 +263,7 @@ def test_failure_with_no_diagnoser_taskdef_does_not_launch() -> None:
             },
         ],
     }
-    launcher = make_launcher(
-        conn=conn, ecs_client=ecs, diagnoser_task_definition=""
-    )
+    launcher = make_launcher(conn=conn, ecs_client=ecs, diagnoser_task_definition="")
     _, transitions = launcher._watch_in_flight()
     # Status transition still fired — the agent is correctly marked failed.
     assert len(transitions) == 1
@@ -267,9 +277,15 @@ def test_success_does_not_launch_diagnoser() -> None:
     """STOPPED-exit-0 transitions to ``succeeded`` with no diagnoser launch."""
     conn = FakeConn()
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        # Post-#3940 the watch SELECT also reads ``started_at`` for the
+        # wall-clock-cap check. Pass None as the 4th tuple element to
+        # skip the wall-clock path (this test exercises the diagnoser
+        # invocation on STOPPED-non-zero, not the wall-clock path).
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/run-1", 100)],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/run-1", 100, None)],
         ),
     )
     ecs = MagicMock()
@@ -308,7 +324,9 @@ def test_cap_existing_diagnoser_arn_skips_relaunch() -> None:
     conn.install_handler(
         "SELECT diagnoser_arn FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchone", ("arn:task/diag-existing",),
+            cur,
+            "_next_fetchone",
+            ("arn:task/diag-existing",),
         ),
     )
     ecs = MagicMock()
@@ -377,7 +395,9 @@ def test_watch_diagnoser_stopped_zero_is_noop_for_status() -> None:
     conn.install_handler(
         "SELECT agent_id, diagnoser_arn FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/diag-1")],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/diag-1")],
         ),
     )
     ecs = MagicMock()
@@ -400,8 +420,7 @@ def test_watch_diagnoser_stopped_zero_is_noop_for_status() -> None:
     assert transitions[0]["diagnoser_status"] == "succeeded"
     # No ``status='needs_review'`` transition fired.
     assert not any(
-        sql.startswith("UPDATE dispatcher.agents")
-        and "status = 'needs_review'" in sql
+        sql.startswith("UPDATE dispatcher.agents") and "status = 'needs_review'" in sql
         for sql, _ in conn.executed
     )
     # The fallback sentinel was written via COALESCE so a real diagnoser
@@ -426,7 +445,9 @@ def test_watch_diagnoser_running_is_noop() -> None:
     conn.install_handler(
         "SELECT agent_id, diagnoser_arn FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/diag-1")],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/diag-1")],
         ),
     )
     ecs = MagicMock()
@@ -467,7 +488,9 @@ def test_watch_diagnoser_failure_marks_needs_review() -> None:
     conn.install_handler(
         "SELECT agent_id, diagnoser_arn FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/diag-1")],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/diag-1")],
         ),
     )
     ecs = MagicMock()

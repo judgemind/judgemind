@@ -48,9 +48,12 @@ set -e
 
 echo "$plan_output"
 
-# Either the missing-secret postcondition OR the digest-pin
-# postcondition fires at plan time. Both indicate the fixture is
-# well-formed.
+# Any one of the missing-secret / digest-pin / stopTimeout
+# postconditions firing at plan time is sufficient proof the fixture
+# is well-formed. The fixture intentionally trips the missing-secret +
+# digest-pin checks via `aws_ecs_task_definition.broken` and the
+# stopTimeout check via `aws_ecs_task_definition.broken_stop_timeout`
+# (#3940).
 if echo "$plan_output" | grep -q "missing ANTHROPIC_API_KEY"; then
   echo "PASS: missing-secret postcondition fired at plan time (preferred)."
   exit 0
@@ -59,11 +62,15 @@ if echo "$plan_output" | grep -q "is not digest-pinned"; then
   echo "PASS: digest-pin postcondition fired at plan time (preferred)."
   exit 0
 fi
+if echo "$plan_output" | grep -q 'stopTimeout != 120'; then
+  echo "PASS: stopTimeout-cap postcondition fired at plan time (preferred)."
+  exit 0
+fi
 
 if [ "$plan_exit" -eq 0 ]; then
   echo "PASS: plan succeeded -- postconditions deferred to apply (expected when self.* references are not knowable until apply)."
   exit 0
 fi
 
-echo "FAIL: terraform plan exited $plan_exit but neither postcondition error message was visible in the output." >&2
+echo "FAIL: terraform plan exited $plan_exit but no expected postcondition error message was visible in the output." >&2
 exit 1

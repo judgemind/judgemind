@@ -67,9 +67,13 @@ if "psycopg" not in sys.modules:
 from dispatcher_v3.launcher import (  # noqa: E402 — must follow sys.modules patch
     DEFAULT_CLAIM_ATTEMPTS_MAX,
     DEFAULT_CONCURRENCY_CAP_V3,
+    DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS,
+    DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS,
     DEFAULT_SILENT_HANG_MINUTES,
     DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
+    DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS,
     EXIT_REASON_SILENT_HANG,
+    EXIT_REASON_WALL_CLOCK_EXCEEDED,
     LABEL_AGENT_READY,
     LABEL_DISPATCHER_V2_ONLY,
     LABEL_STATUS_IN_PROGRESS,
@@ -77,6 +81,7 @@ from dispatcher_v3.launcher import (  # noqa: E402 — must follow sys.modules p
     PARTIAL_CLAIM_RECOVERY_AGE_SECONDS,
     Launcher,
     _build_arg_parser,
+    _parse_int_env,
 )
 
 
@@ -157,12 +162,18 @@ def make_launcher(
     task_runner_log_group: str = "",
     task_runner_log_stream_prefix: str = DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
     diagnoser_task_definition: str = "judgemind-dispatcher-v3-diagnoser",
+    task_runner_wall_clock_seconds: int = DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS,
+    diagnoser_wall_clock_seconds: int = DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS,
+    scheduled_skill_wall_clock_seconds: int = DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS,
 ) -> Launcher:
     """Construct a :class:`Launcher` with sane test defaults.
 
     The silent-hang detector is OFF by default (``task_runner_log_group=""``)
     so existing watch tests don't have to mock CloudWatch. Tests that
     exercise the detector pass an explicit ``task_runner_log_group``.
+
+    Wall-clock caps default to the production values; tests for the
+    wall-clock path pass small caps to drive a deterministic reap.
     """
     return Launcher(
         run_id="run-test-uuid",
@@ -176,6 +187,9 @@ def make_launcher(
         runner_name=runner_name,
         task_runner_log_group=task_runner_log_group,
         task_runner_log_stream_prefix=task_runner_log_stream_prefix,
+        task_runner_wall_clock_seconds=task_runner_wall_clock_seconds,
+        diagnoser_wall_clock_seconds=diagnoser_wall_clock_seconds,
+        scheduled_skill_wall_clock_seconds=scheduled_skill_wall_clock_seconds,
         conn=conn,
         ecs_client=ecs_client,
         cloudwatch_logs_client=cloudwatch_logs_client,
@@ -360,11 +374,19 @@ def test_claim_race_uniqueviolation_abandons_cleanly() -> None:
 def test_watch_marks_succeeded_on_stopped_exit_zero() -> None:
     conn = FakeConn()
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
             cur,
             "_next_fetchall",
-            [("ag-1", "arn:task/1", 100), ("ag-2", "arn:task/2", 101)],
+            # Pre-#3940 the row was (agent_id, task_arn, issue_number);
+            # post-#3940 the watch query also reads started_at for the
+            # wall-clock-cap check. Pass None to skip the check (this
+            # test is about STOPPED-exit-0 + RUNNING coexistence, not
+            # the wall-clock path).
+            [
+                ("ag-1", "arn:task/1", 100, None),
+                ("ag-2", "arn:task/2", 101, None),
+            ],
         ),
     )
 
@@ -409,11 +431,12 @@ def test_watch_marks_succeeded_on_stopped_exit_zero() -> None:
 def test_watch_marks_failed_on_stopped_nonzero_with_reason() -> None:
     conn = FakeConn()
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
             cur,
             "_next_fetchall",
-            [("ag-1", "arn:task/1", 100)],
+            # 4th column is started_at; None skips the wall-clock check.
+            [("ag-1", "arn:task/1", 100, None)],
         ),
     )
 
@@ -445,11 +468,12 @@ def test_watch_handles_missing_exit_code_as_failure() -> None:
     """A STOPPED task without an exitCode resolves to failed (exit_code=-1)."""
     conn = FakeConn()
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
             cur,
             "_next_fetchall",
-            [("ag-1", "arn:task/1", 100)],
+            # 4th column is started_at; None skips the wall-clock check.
+            [("ag-1", "arn:task/1", 100, None)],
         ),
     )
     ecs = MagicMock()
@@ -485,14 +509,21 @@ def _install_running_agent_row(
     agent_id: str = "ag-1",
     task_arn: str = "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
     issue_number: int = 9001,
+    started_at: Any = None,
 ) -> None:
-    """Install handler returning one RUNNING agent row for the watch query."""
+    """Install handler returning one RUNNING agent row for the watch query.
+
+    Post-#3940 the watch query includes ``started_at`` for the
+    wall-clock-cap check. ``started_at=None`` (the default) skips the
+    wall-clock check; tests that exercise the wall-clock path pass an
+    explicit UTC ``datetime``.
+    """
     conn.install_handler(
-        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        "SELECT agent_id, task_arn, issue_number, started_at FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
             cur,
             "_next_fetchall",
-            [(agent_id, task_arn, issue_number)],
+            [(agent_id, task_arn, issue_number, started_at)],
         ),
     )
 
@@ -1228,4 +1259,354 @@ def test_consume_commands_unknown_is_logged_and_consumed() -> None:
     # No config write for unknown commands.
     assert not any(
         sql.startswith("INSERT INTO dispatcher.config") for sql, _ in conn.executed
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock-cap detector (issue #3940)
+# ---------------------------------------------------------------------------
+#
+# Pre-#3940 the wall-clock cap (default 6h) was rendered into the
+# task-def's ``stopTimeout`` field. Fargate rejected those task-defs
+# (it caps stopTimeout at 120s), so every dev-apply since F2 landed
+# failed. The fix moves enforcement to the launcher: ``_watch_in_flight``
+# now StopTask's any RUNNING task whose ``now - started_at`` exceeds
+# the per-task-def cap, marking the agent failed with
+# ``exit_reason='wall_clock_exceeded'``.
+#
+# These tests pin the contract:
+#   * AC#2: "Launcher silent-hang detector reads the per-task-def cap
+#     from the chosen source (tags / config / constants)." Source is
+#     env-var → constructor (env-var driven, see _build_launcher_from_env).
+#     test_wall_clock_constructor_arg_is_threaded confirms the value
+#     reaches the watch loop and gates reap behavior.
+
+
+def test_wall_clock_reaps_task_older_than_cap() -> None:
+    """RUNNING task whose started_at is older than the cap gets reaped.
+
+    The wall-clock cap is the structural replacement for the Fargate
+    stopTimeout-driven kill (which Fargate rejects at >120s). Pins:
+    (1) ecs:StopTask called with the right ARN; (2) the agent row's
+    UPDATE used ``status='failed'`` and
+    ``exit_reason='wall_clock_exceeded'``; (3) the transition surfaced
+    by the watch loop carries the new exit_reason; (4) the diagnoser
+    is launched (non-success terminal).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    conn = FakeConn()
+    # 2h ago with a 1h cap → should reap.
+    started_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    _install_running_agent_row(conn, started_at=started_at)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+    # RunTask shape for the diagnoser launch path.
+    ecs.run_task.return_value = {
+        "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:0:task/jm/diag-1"}],
+        "failures": [],
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        # 1h cap so the 2h started_at trips it.
+        task_runner_wall_clock_seconds=3600,
+        # Silent-hang detector OFF (default) so the wall-clock path is
+        # the only reap mechanism this test exercises.
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    watched, transitions = launcher._watch_in_flight()
+
+    assert watched == 1
+    # ecs:StopTask called with the wall_clock_exceeded reason prefix.
+    assert ecs.stop_task.call_count == 1
+    stop_kwargs = ecs.stop_task.call_args.kwargs
+    assert stop_kwargs["task"] == "arn:aws:ecs:us-west-2:0:task/jm/abc123def456"
+    assert stop_kwargs["reason"].startswith("wall_clock_exceeded:")
+    # Agent row UPDATE marks failed with the new exit_reason.
+    matching = [
+        (sql, params)
+        for sql, params in conn.executed
+        if sql.startswith("UPDATE dispatcher.agents") and "SET status = %s" in sql
+    ]
+    assert matching, "Expected an UPDATE to dispatcher.agents on wall-clock reap"
+    _, params = matching[-1]
+    assert params[0] == "failed"
+    assert params[2] == EXIT_REASON_WALL_CLOCK_EXCEEDED
+    # Transition surfaced to the caller.
+    assert len(transitions) == 1
+    assert transitions[0]["status"] == "failed"
+    assert transitions[0]["exit_reason"] == EXIT_REASON_WALL_CLOCK_EXCEEDED
+    # Diagnoser launched (non-success terminal triggers diagnosis).
+    assert ecs.run_task.call_count == 1
+    assert "diagnoser_arn" in transitions[0]
+
+
+def test_wall_clock_skips_task_younger_than_cap() -> None:
+    """RUNNING task within the wall-clock budget is left alone."""
+    from datetime import datetime, timedelta, timezone
+
+    conn = FakeConn()
+    # 30min ago with a 6h cap → should NOT reap.
+    started_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _install_running_agent_row(conn, started_at=started_at)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        # Default 6h cap; 30min started_at is well under.
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
+    assert not any(
+        sql.startswith("UPDATE dispatcher.agents") and "SET status = %s" in sql
+        for sql, _ in conn.executed
+    )
+
+
+def test_wall_clock_skipped_when_cap_non_positive() -> None:
+    """Cap <= 0 disables the wall-clock check entirely.
+
+    Graceful degradation for tests / local CLI runs / environments
+    before F2 wired the env var. Pins the AC: a bad env-var override
+    (``"0"``) does not flip a healthy agent to failed.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    conn = FakeConn()
+    # 100h ago — would reap under any positive cap.
+    started_at = datetime.now(timezone.utc) - timedelta(hours=100)
+    _install_running_agent_row(conn, started_at=started_at)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        task_runner_wall_clock_seconds=0,  # disabled
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
+
+
+def test_wall_clock_skipped_when_started_at_missing() -> None:
+    """A row with NULL started_at must not be reaped.
+
+    Defensive guard: a misshapen row (concurrent migration, replication
+    lag) must not flip a healthy agent to failed.
+    """
+    conn = FakeConn()
+    _install_running_agent_row(conn, started_at=None)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        task_runner_wall_clock_seconds=1,  # tiny cap
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
+
+
+def test_wall_clock_naive_datetime_treated_as_utc() -> None:
+    """A naive ``started_at`` (no tzinfo) is interpreted as UTC.
+
+    psycopg returns timezone-aware datetimes by default for ``timestamptz``
+    columns, but tests / older drivers may pass naive datetimes. The
+    helper must treat them as UTC (matching the v2 daemon's convention)
+    rather than interpreting in the local zone.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    # Build a naive datetime by stripping tzinfo from a UTC value (the
+    # spelling that survives Python 3.13+'s deprecation of utcnow()).
+    naive_old = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(tzinfo=None)
+    # Confirm the helper sees this as exceeding a 1h cap.
+    launcher = make_launcher()
+    assert launcher._task_age_exceeds_cap(started_at=naive_old, cap_seconds=3600)
+    # And that a recent naive datetime does NOT exceed.
+    naive_recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).replace(
+        tzinfo=None
+    )
+    assert not launcher._task_age_exceeds_cap(started_at=naive_recent, cap_seconds=3600)
+
+
+def test_wall_clock_exit_reason_is_distinct_from_silent_hang() -> None:
+    """The two reap classes write different exit_reason strings.
+
+    Pin the literal so the diagnoser SKILL (which branches on
+    ``exit_reason`` per spec §4.2) sees them as distinct kill classes.
+    """
+    assert EXIT_REASON_WALL_CLOCK_EXCEEDED == "wall_clock_exceeded"
+    assert EXIT_REASON_SILENT_HANG == "silent_hang"
+    assert EXIT_REASON_WALL_CLOCK_EXCEEDED != EXIT_REASON_SILENT_HANG
+
+
+def test_wall_clock_default_constants_match_spec() -> None:
+    """Pin the default cap values per spec §11 OQ#4 + issue body.
+
+    A future change that bumps these defaults must do so deliberately
+    (the test fails loudly) -- the spec values are referenced by
+    F2's variables.tf docstrings and the dev-apply error messages.
+    """
+    assert DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS == 21600  # 6h
+    assert DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS == 3600  # 1h
+    assert DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS == 7200  # 2h
+
+
+def test_wall_clock_check_handles_non_datetime_started_at() -> None:
+    """A non-datetime ``started_at`` (string, int) returns False.
+
+    Defensive guard against a future migration that changes the column
+    type or a buggy driver returning unexpected types. Must never reap
+    on garbage input.
+    """
+    launcher = make_launcher()
+    # Strings, ints, None, lists — all must return False.
+    assert not launcher._task_age_exceeds_cap(
+        started_at="2026-04-29T12:00:00Z", cap_seconds=1
+    )
+    assert not launcher._task_age_exceeds_cap(started_at=12345, cap_seconds=1)
+    assert not launcher._task_age_exceeds_cap(started_at=None, cap_seconds=1)
+    assert not launcher._task_age_exceeds_cap(started_at=[], cap_seconds=1)
+
+
+# ---------------------------------------------------------------------------
+# _parse_int_env helper (#3940 env-var parsing)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_int_env_returns_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FAKE_WALL_CLOCK_VAR", raising=False)
+    assert _parse_int_env("FAKE_WALL_CLOCK_VAR", 999) == 999
+
+
+def test_parse_int_env_returns_default_on_garbage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_WALL_CLOCK_VAR", "not-a-number")
+    assert _parse_int_env("FAKE_WALL_CLOCK_VAR", 999) == 999
+
+
+def test_parse_int_env_returns_default_on_zero_when_fallback_on_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``fallback_on_zero=True`` rejects ``"0"`` and ``"-5"``.
+
+    Pins the AC: a typo of ``"0"`` for a wall-clock cap must not
+    silently disable the cap -- it falls back to the documented default.
+    """
+    monkeypatch.setenv("FAKE_WALL_CLOCK_VAR", "0")
+    assert _parse_int_env("FAKE_WALL_CLOCK_VAR", 999, fallback_on_zero=True) == 999
+    monkeypatch.setenv("FAKE_WALL_CLOCK_VAR", "-100")
+    assert _parse_int_env("FAKE_WALL_CLOCK_VAR", 999, fallback_on_zero=True) == 999
+
+
+def test_parse_int_env_accepts_valid_int(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_WALL_CLOCK_VAR", "120")
+    assert _parse_int_env("FAKE_WALL_CLOCK_VAR", 999) == 120
+
+
+def test_build_launcher_from_env_threads_wall_clock_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: env vars → constructor args → instance attributes.
+
+    Pins the AC: F2's task-def renders ``TASK_RUNNER_WALL_CLOCK_SECONDS``
+    etc. into the launcher container's environment; this method must
+    parse them back into the launcher's wall-clock-cap fields.
+    """
+    from dispatcher_v3.launcher import _build_launcher_from_env
+
+    monkeypatch.setenv("ECS_CLUSTER_ARN", "arn:aws:ecs:us-west-2:0:cluster/jm")
+    monkeypatch.setenv("TASK_RUNNER_TASK_DEFINITION", "judgemind-task-runner:7")
+    monkeypatch.setenv("AGENT_RUNNER_SECURITY_GROUP_ID", "sg-aaa")
+    monkeypatch.setenv("SESSIONS_BUCKET", "judgemind-sessions-dev")
+    monkeypatch.setenv("AGENT_RUNNER_SUBNET_IDS", "subnet-a,subnet-b")
+    monkeypatch.setenv("TASK_RUNNER_WALL_CLOCK_SECONDS", "1234")
+    monkeypatch.setenv("DIAGNOSER_WALL_CLOCK_SECONDS", "567")
+    monkeypatch.setenv("SCHEDULED_SKILL_WALL_CLOCK_SECONDS", "89")
+
+    launcher = _build_launcher_from_env()
+    assert launcher._task_runner_wall_clock_seconds == 1234
+    assert launcher._diagnoser_wall_clock_seconds == 567
+    assert launcher._scheduled_skill_wall_clock_seconds == 89
+
+
+def test_build_launcher_from_env_falls_back_when_wall_clock_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset env vars → defaults (graceful boot before F2 re-applies)."""
+    from dispatcher_v3.launcher import _build_launcher_from_env
+
+    monkeypatch.setenv("ECS_CLUSTER_ARN", "arn:aws:ecs:us-west-2:0:cluster/jm")
+    monkeypatch.setenv("TASK_RUNNER_TASK_DEFINITION", "judgemind-task-runner:7")
+    monkeypatch.setenv("AGENT_RUNNER_SECURITY_GROUP_ID", "sg-aaa")
+    monkeypatch.setenv("SESSIONS_BUCKET", "judgemind-sessions-dev")
+    monkeypatch.setenv("AGENT_RUNNER_SUBNET_IDS", "subnet-a")
+    monkeypatch.delenv("TASK_RUNNER_WALL_CLOCK_SECONDS", raising=False)
+    monkeypatch.delenv("DIAGNOSER_WALL_CLOCK_SECONDS", raising=False)
+    monkeypatch.delenv("SCHEDULED_SKILL_WALL_CLOCK_SECONDS", raising=False)
+
+    launcher = _build_launcher_from_env()
+    assert (
+        launcher._task_runner_wall_clock_seconds
+        == DEFAULT_TASK_RUNNER_WALL_CLOCK_SECONDS
+    )
+    assert (
+        launcher._diagnoser_wall_clock_seconds == DEFAULT_DIAGNOSER_WALL_CLOCK_SECONDS
+    )
+    assert (
+        launcher._scheduled_skill_wall_clock_seconds
+        == DEFAULT_SCHEDULED_SKILL_WALL_CLOCK_SECONDS
     )

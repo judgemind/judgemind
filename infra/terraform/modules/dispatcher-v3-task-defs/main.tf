@@ -7,15 +7,47 @@
 #   * `<prefix>-launcher`        -- long-running scheduler. Used by F4's
 #     ECS service (single replica). 1 vCPU / 2 GiB.
 #   * `<prefix>-task-runner`     -- one-shot per-agent. Launched by the
-#     launcher via ecs:RunTask. 4 vCPU / 16 GiB. stopTimeout 6h.
+#     launcher via ecs:RunTask. 4 vCPU / 16 GiB. Wall-clock cap 6h
+#     (enforced launcher-side, see below).
 #   * `<prefix>-diagnoser`       -- one-shot per-failure. Launched by
 #     the launcher via ecs:RunTask after a task-runner exits non-zero
 #     (or is StopTask'd by silent-hang detection). 2 vCPU / 8 GiB.
-#     stopTimeout 1h.
+#     Wall-clock cap 1h.
 #   * `<prefix>-scheduled-skill` -- one-shot per-cron-trigger. Launched
 #     by EventBridge (F5) at the per-skill cadence. 2 vCPU / 8 GiB.
-#     stopTimeout 2h. SKILL_NAME injected at RunTask time as an env
+#     Wall-clock cap 2h. SKILL_NAME injected at RunTask time as an env
 #     override.
+#
+# stopTimeout vs wall-clock cap (#3940 fix):
+#
+# Fargate REJECTS task definitions whose containerDefinitions[].stopTimeout
+# exceeds 120 seconds:
+#
+#   ClientException: Tasks using the Fargate launch type must have a
+#   container stop timeout of less than 120 seconds.
+#
+# Pre-#3940, the three short-lived task-defs set stopTimeout to the
+# wall-clock cap value (21600 / 3600 / 7200), and every dev-apply since
+# F2 landed failed at RegisterTaskDefinition. The fix splits the two
+# concepts:
+#
+#   * stopTimeout = 120 (the platform cap on SIGTERM-to-SIGKILL grace).
+#     Hardcoded via local.fargate_stop_timeout_seconds. Same as the
+#     launcher task-def.
+#   * Wall-clock cap (21600 / 3600 / 7200) is the launcher-side timeout
+#     enforced by the silent-hang detector loop in
+#     `scripts/dispatcher_v3/launcher.py` (`_watch_in_flight`). The
+#     launcher reads each cap from its own environment block (env vars
+#     TASK_RUNNER_WALL_CLOCK_SECONDS / DIAGNOSER_WALL_CLOCK_SECONDS /
+#     SCHEDULED_SKILL_WALL_CLOCK_SECONDS, threaded into the launcher
+#     task-def's `environment` array below) and ecs:StopTask's any
+#     RUNNING task whose `now - started_at` exceeds it, marking the
+#     agent row failed with `exit_reason='wall_clock_exceeded'`.
+#
+# A postcondition on each rendered container_definitions JSON asserts
+# `"stopTimeout":120` so a future regression that re-introduces the long
+# values fails at plan/apply time rather than burying the failure in
+# the dev-apply workflow's terraform output (#3941 retro).
 #
 # The single F1 image is digest-pinned at apply time via
 # `data "aws_ecr_image"`. Every rendered task-def references
@@ -74,6 +106,15 @@ locals {
   # task-def in this module ever references a mutable tag.
   image_digest_ref = "${var.ecr_repository_url}@${data.aws_ecr_image.dispatcher_v3.image_digest}"
 
+  # Fargate platform cap on the SIGTERM-to-SIGKILL grace window (the
+  # `stopTimeout` field). AWS rejects task-defs that exceed this value
+  # at RegisterTaskDefinition time -- see file-level docstring for the
+  # #3940 background. This local is the single source of truth for the
+  # rendered `stopTimeout` field across all four task-defs in this
+  # module; the per-task-def wall-clock caps are enforced launcher-
+  # side and are independent of `stopTimeout`.
+  fargate_stop_timeout_seconds = 120
+
   # Common environment block shared by all four task-defs. Per-task-def
   # additions (TASK_ISSUE_NUMBER, AGENT_ID, SKILL_NAME, etc.) are
   # injected at RunTask time via env overrides -- this module's
@@ -88,24 +129,43 @@ locals {
     var.sessions_bucket_name != "" ? [{ name = "SESSIONS_BUCKET", value = var.sessions_bucket_name }] : [],
   )
 
-  # Launcher-only environment block (#3939). The launcher's
-  # `_build_launcher_from_env` (scripts/dispatcher_v3/launcher.py:1496-1526)
-  # reads these three vars at boot to assemble an `ecs:RunTask` request
-  # for each claimed issue -- they're meaningless for the task-runner /
-  # diagnoser / scheduled-skill task-defs (those are the *callees*, not
-  # the caller). Concatenated onto `common_environment` for the launcher
-  # task-def only.
+  # Launcher-only environment block. Merges two contributions:
+  #
+  #   * #3939 -- launcher → task-runner network handoff. The launcher's
+  #     `_build_launcher_from_env` reads TASK_RUNNER_TASK_DEFINITION /
+  #     AGENT_RUNNER_SUBNET_IDS / AGENT_RUNNER_SECURITY_GROUP_ID at boot
+  #     to assemble an `ecs:RunTask` request for each claimed issue.
+  #     Family-only TASK_RUNNER_TASK_DEFINITION lets revisions roll
+  #     forward automatically (a fresh F2 apply registers a new revision
+  #     and the next claim picks it up without an explicit env-var update).
+  #
+  #   * #3940 -- wall-clock cap enforcement. The launcher's
+  #     `_watch_in_flight` reads TASK_RUNNER_WALL_CLOCK_SECONDS /
+  #     DIAGNOSER_WALL_CLOCK_SECONDS / SCHEDULED_SKILL_WALL_CLOCK_SECONDS
+  #     and ecs:StopTask's any RUNNING task whose `now - started_at`
+  #     exceeds its per-task-def cap. Rendered as strings via
+  #     `tostring()` (parsed back to int by `_parse_int_env`).
+  #
+  # All five env vars are meaningless for the task-runner / diagnoser /
+  # scheduled-skill task-defs (those are the *callees*, not the caller).
   launcher_environment = concat(
     local.common_environment,
     [
-      # The launcher launches task-runners by family name -- ecs:RunTask
-      # accepts either a family name or a full ARN, and family-only lets
-      # revisions roll forward automatically (a fresh F2 apply registers
-      # a new revision, and the next launcher claim picks it up without
-      # an explicit env-var update).
       { name = "TASK_RUNNER_TASK_DEFINITION", value = local.family_task_runner },
       { name = "AGENT_RUNNER_SUBNET_IDS", value = join(",", var.agent_runner_subnet_ids) },
       { name = "AGENT_RUNNER_SECURITY_GROUP_ID", value = var.agent_runner_security_group_id },
+      {
+        name  = "TASK_RUNNER_WALL_CLOCK_SECONDS"
+        value = tostring(var.task_runner_stop_timeout_seconds)
+      },
+      {
+        name  = "DIAGNOSER_WALL_CLOCK_SECONDS"
+        value = tostring(var.diagnoser_stop_timeout_seconds)
+      },
+      {
+        name  = "SCHEDULED_SKILL_WALL_CLOCK_SECONDS"
+        value = tostring(var.scheduled_skill_stop_timeout_seconds)
+      },
     ],
   )
 
@@ -209,7 +269,7 @@ resource "aws_ecs_task_definition" "launcher" {
       # launcher must persist a final heartbeat row before exiting --
       # 120s is enough for the scheduler tick to drain and write its
       # final UPDATE.
-      stopTimeout = 120
+      stopTimeout = local.fargate_stop_timeout_seconds
 
       environment = local.launcher_environment
       secrets     = local.launcher_secrets
@@ -271,6 +331,38 @@ resource "aws_ecs_task_definition" "launcher" {
       condition     = strcontains(self.container_definitions, "AGENT_RUNNER_SECURITY_GROUP_ID")
       error_message = "dispatcher-v3-task-defs (launcher): rendered container_definitions is missing AGENT_RUNNER_SECURITY_GROUP_ID. The launcher's _build_launcher_from_env raises KeyError on this var at boot -- see #3939."
     }
+    # The launcher's wall-clock-cap enforcement loop reads each
+    # per-task-def cap from the launcher container's environment block
+    # (`TASK_RUNNER_WALL_CLOCK_SECONDS` / `DIAGNOSER_WALL_CLOCK_SECONDS`
+    # / `SCHEDULED_SKILL_WALL_CLOCK_SECONDS`). A regression that drops
+    # any of those env vars silently disables the wall-clock cap for
+    # that task-def -- agents wedge for the full Fargate platform max
+    # (~14 days) instead of being reaped after 6h / 1h / 2h. Pin all
+    # three so the failure is loud at apply time. See #3940.
+    postcondition {
+      condition     = strcontains(self.container_definitions, "TASK_RUNNER_WALL_CLOCK_SECONDS")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered environment is missing TASK_RUNNER_WALL_CLOCK_SECONDS. The launcher's wall-clock-cap detector reads this env var; without it, task-runner agents wedge for the Fargate platform max instead of the 6h cap. See #3940."
+    }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "DIAGNOSER_WALL_CLOCK_SECONDS")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered environment is missing DIAGNOSER_WALL_CLOCK_SECONDS. See #3940."
+    }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "SCHEDULED_SKILL_WALL_CLOCK_SECONDS")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered environment is missing SCHEDULED_SKILL_WALL_CLOCK_SECONDS. See #3940."
+    }
+    # Regression-class defense for the #3940 root cause. Fargate
+    # rejects task-defs whose `stopTimeout` exceeds 120 seconds at
+    # RegisterTaskDefinition time, so a future change that re-points
+    # `stopTimeout` at a `var.*_stop_timeout_seconds` value (or any
+    # other multi-hour number) breaks dev-apply silently from the
+    # operator's perspective. Asserting the rendered string contains
+    # exactly `"stopTimeout":120` catches the regression at plan/apply
+    # time. See #3941 retro for the rationale.
+    postcondition {
+      condition     = strcontains(self.container_definitions, "\"stopTimeout\":120")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered stopTimeout != 120. Fargate rejects task-defs with stopTimeout > 120s. See #3940."
+    }
   }
 }
 
@@ -304,12 +396,18 @@ resource "aws_ecs_task_definition" "task_runner" {
 
       command = ["python", "-m", "dispatcher_v3.agent_runner"]
 
-      # Wall-clock cap from issue body (6h). The launcher's silent-hang
-      # detector (spec section 4.1) reads this off the task-def metadata
-      # to know when to StopTask a task-runner. Fargate's own cap on
-      # SIGTERM-to-SIGKILL is platform-level (120s) and unrelated; the
-      # six-hour value here is the launcher-side timeout.
-      stopTimeout = var.task_runner_stop_timeout_seconds
+      # Fargate platform-level cap on SIGTERM-to-SIGKILL grace (max
+      # 120s). The 6h wall-clock cap from
+      # `var.task_runner_stop_timeout_seconds` is enforced launcher-
+      # side -- the launcher reads the value via the
+      # `TASK_RUNNER_WALL_CLOCK_SECONDS` env var on its own task-def
+      # and ecs:StopTask's any task-runner whose `now - started_at`
+      # exceeds the cap. Setting `stopTimeout` to the wall-clock value
+      # would cause RegisterTaskDefinition to reject the task-def with
+      # `ClientException: Tasks using the Fargate launch type must
+      # have a container stop timeout of less than 120 seconds.` See
+      # the file-level docstring + #3940 for the full design.
+      stopTimeout = local.fargate_stop_timeout_seconds
 
       environment = local.common_environment
       secrets     = local.agent_secrets
@@ -351,6 +449,10 @@ resource "aws_ecs_task_definition" "task_runner" {
       condition     = strcontains(self.container_definitions, "@sha256:")
       error_message = "dispatcher-v3-task-defs (task-runner): rendered image reference is not digest-pinned. See #3754 image-staleness drift."
     }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "\"stopTimeout\":120")
+      error_message = "dispatcher-v3-task-defs (task-runner): rendered stopTimeout != 120. Fargate rejects task-defs with stopTimeout > 120s; the wall-clock cap is enforced launcher-side via TASK_RUNNER_WALL_CLOCK_SECONDS. See #3940."
+    }
   }
 }
 
@@ -383,9 +485,12 @@ resource "aws_ecs_task_definition" "diagnoser" {
 
       command = ["python", "-m", "dispatcher_v3.diagnoser_runner"]
 
-      # 1h cap per issue body -- the diagnoser is a read + side-effect
-      # skill that should not need long.
-      stopTimeout = var.diagnoser_stop_timeout_seconds
+      # Fargate platform cap (120s) -- the 1h wall-clock cap from
+      # `var.diagnoser_stop_timeout_seconds` is enforced launcher-side
+      # via the `DIAGNOSER_WALL_CLOCK_SECONDS` env var on the launcher
+      # task-def. See the task-runner block above + #3940 for the
+      # design.
+      stopTimeout = local.fargate_stop_timeout_seconds
 
       environment = local.common_environment
       secrets     = local.agent_secrets
@@ -427,6 +532,10 @@ resource "aws_ecs_task_definition" "diagnoser" {
       condition     = strcontains(self.container_definitions, "@sha256:")
       error_message = "dispatcher-v3-task-defs (diagnoser): rendered image reference is not digest-pinned. See #3754 image-staleness drift."
     }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "\"stopTimeout\":120")
+      error_message = "dispatcher-v3-task-defs (diagnoser): rendered stopTimeout != 120. Fargate rejects task-defs with stopTimeout > 120s; the wall-clock cap is enforced launcher-side via DIAGNOSER_WALL_CLOCK_SECONDS. See #3940."
+    }
   }
 }
 
@@ -458,9 +567,12 @@ resource "aws_ecs_task_definition" "scheduled_skill" {
 
       command = ["python", "-m", "dispatcher_v3.scheduled_skill_runner"]
 
-      # 2h cap per issue body -- audit / dispatcher-audit / spotcheck
-      # / dispatcher-daily-report all sit comfortably under this.
-      stopTimeout = var.scheduled_skill_stop_timeout_seconds
+      # Fargate platform cap (120s) -- the 2h wall-clock cap from
+      # `var.scheduled_skill_stop_timeout_seconds` is enforced
+      # launcher-side via the `SCHEDULED_SKILL_WALL_CLOCK_SECONDS` env
+      # var on the launcher task-def. See the task-runner block above
+      # + #3940 for the design.
+      stopTimeout = local.fargate_stop_timeout_seconds
 
       environment = local.common_environment
       secrets     = local.agent_secrets
@@ -501,6 +613,10 @@ resource "aws_ecs_task_definition" "scheduled_skill" {
     postcondition {
       condition     = strcontains(self.container_definitions, "@sha256:")
       error_message = "dispatcher-v3-task-defs (scheduled-skill): rendered image reference is not digest-pinned. See #3754 image-staleness drift."
+    }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "\"stopTimeout\":120")
+      error_message = "dispatcher-v3-task-defs (scheduled-skill): rendered stopTimeout != 120. Fargate rejects task-defs with stopTimeout > 120s; the wall-clock cap is enforced launcher-side via SCHEDULED_SKILL_WALL_CLOCK_SECONDS. See #3940."
     }
   }
 }
