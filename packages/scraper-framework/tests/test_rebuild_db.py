@@ -3243,3 +3243,79 @@ class TestMainPerCourtResetDispatch:
                 pass  # expected — argparse rejects mutually exclusive args
             else:
                 raise AssertionError("expected SystemExit from argparse mutual exclusion")
+
+
+# ---------------------------------------------------------------------------
+# build_event courthouse extraction tests (#4014)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEventCourthouse:
+    """build_event sets event["courthouse"] from HTML body text (#4014).
+
+    The rebuild path does not have a courthouse field in the S3 key metadata.
+    A best-effort regex scan of the HTML body extracts the courthouse name so
+    that normalize_department can skip the letter+digits collapse for LB/CH/AV
+    courthouses.
+    """
+
+    def _la_parsed(self, content_hash: str = "abc123def456") -> dict[str, str]:
+        return {
+            "state": "ca",
+            "county": "los_angeles",
+            "court": "superior_court",
+            "content_hash": content_hash,
+            "ext": "html",
+        }
+
+    def test_chatsworth_courthouse_extracted(self) -> None:
+        """HTML body with 'Chatsworth Courthouse North' → event["courthouse"]."""
+        html = (
+            b"<html><body>Chatsworth Courthouse North Department F49 Tentative Ruling</body></html>"
+        )
+        parsed = self._la_parsed()
+        key = "ca/los_angeles/superior_court/raw/abc123def456.html"
+        event = rebuild_db.build_event(key, html, parsed, "test-bucket")
+        assert event.get("courthouse") == "Chatsworth Courthouse North"
+
+    def test_long_beach_courthouse_extracted(self) -> None:
+        """HTML body with 'Long Beach Courthouse' → event["courthouse"]."""
+        html = b"<html><body>Long Beach Courthouse Department S27 Tentative Ruling</body></html>"
+        parsed = self._la_parsed()
+        key = "ca/los_angeles/superior_court/raw/abc123def456.html"
+        event = rebuild_db.build_event(key, html, parsed, "test-bucket")
+        assert event.get("courthouse") == "Long Beach Courthouse"
+
+    def test_antelope_valley_courthouse_extracted(self) -> None:
+        """HTML body with 'Antelope Valley Courthouse' → event["courthouse"]."""
+        html = (
+            b"<html><body>Antelope Valley Courthouse Department A14 Tentative Ruling</body></html>"
+        )
+        parsed = self._la_parsed()
+        key = "ca/los_angeles/superior_court/raw/abc123def456.html"
+        event = rebuild_db.build_event(key, html, parsed, "test-bucket")
+        assert event.get("courthouse") == "Antelope Valley Courthouse"
+
+    def test_no_courthouse_omits_key(self) -> None:
+        """HTML body without any courthouse string must not set courthouse."""
+        html = b"<html><body>Department X14 Tentative Ruling text here</body></html>"
+        parsed = self._la_parsed()
+        key = "ca/los_angeles/superior_court/raw/abc123def456.html"
+        event = rebuild_db.build_event(key, html, parsed, "test-bucket")
+        assert "courthouse" not in event
+
+    def test_courthouse_extraction_idempotent_non_la(self) -> None:
+        """Non-LA county HTML with a courthouse name: key may or may not appear,
+        but no crash — idempotent."""
+        html = b"<html><body>Long Beach Courthouse some content</body></html>"
+        parsed = {
+            "state": "ca",
+            "county": "orange",
+            "court": "superior_court",
+            "content_hash": "abc123def456",
+            "ext": "html",
+        }
+        key = "ca/orange/superior_court/raw/abc123def456.html"
+        # Should not raise
+        event = rebuild_db.build_event(key, html, parsed, "test-bucket")
+        assert isinstance(event, dict)

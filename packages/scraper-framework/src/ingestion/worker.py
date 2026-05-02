@@ -2029,6 +2029,7 @@ class IngestionWorker:
             county,
             department,
             courthouse=event_data.get("courthouse"),
+            case_number=case_number,
         )
 
         # Apply Contra Costa department reassignment mapping (#2612).
