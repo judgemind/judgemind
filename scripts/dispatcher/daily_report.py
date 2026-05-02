@@ -32,6 +32,11 @@ from typing import Any
 # SQL queries
 # ---------------------------------------------------------------------------
 
+# v2-scoped: parent-run-id-filter (#3875) — the daily report is v2's
+# operational health summary. Without scoping, a v3 cohabitation
+# rollout would mix v3 agents into v2's throughput / streak / failure
+# breakdown, distorting the v2 signal. v3 will get its own report when
+# the launcher ships.
 _SQL_THROUGHPUT = """
 SELECT
     COUNT(*) FILTER (WHERE started_at >= now() - INTERVAL '24 hours')
@@ -45,13 +50,17 @@ SELECT
         AND status = 'shipped'
     ) AS shipped_24h,
     COUNT(*) FILTER (WHERE status = 'running') AS running_now
-FROM dispatcher.agents;
+FROM dispatcher.agents
+WHERE parent_run_id IN (
+    SELECT run_id FROM dispatcher.runs WHERE dispatcher_version = 'v2'
+);
 """
 
 # Strict green streak: count consecutive shipped agents (ordered by ended_at
 # descending) until the first non-shipped row. Uses a window function to
 # assign a row_number; we count rows where the status at that position equals
 # 'shipped' AND no prior row (by row_number) was non-shipped.
+# v2-scoped: parent-run-id-filter (#3875) — streak is v2's metric.
 _SQL_GREEN_STREAK = """
 WITH ordered AS (
     SELECT
@@ -59,6 +68,9 @@ WITH ordered AS (
         ROW_NUMBER() OVER (ORDER BY ended_at DESC NULLS LAST) AS rn
     FROM dispatcher.agents
     WHERE ended_at IS NOT NULL
+      AND parent_run_id IN (
+          SELECT run_id FROM dispatcher.runs WHERE dispatcher_version = 'v2'
+      )
 ),
 streak AS (
     SELECT rn
@@ -101,6 +113,8 @@ GROUP BY
 ORDER BY count DESC;
 """
 
+# v2-scoped: parent-run-id-filter (#3875) — stuck issues from v2's
+# perspective only.
 _SQL_STUCK_ISSUES = """
 SELECT
     a.issue_number,
@@ -110,6 +124,9 @@ FROM dispatcher.agents a
 JOIN dispatcher.failures f USING (agent_id)
 WHERE f.ts >= now() - INTERVAL '24 hours'
   AND a.issue_number IS NOT NULL
+  AND a.parent_run_id IN (
+      SELECT run_id FROM dispatcher.runs WHERE dispatcher_version = 'v2'
+  )
 GROUP BY a.issue_number, f.category
 HAVING COUNT(*) >= 3
 ORDER BY failure_count DESC, a.issue_number;
