@@ -31,6 +31,7 @@
 #  11. run_check helper surfaces ruff error tail + Full log path (#2973 AC1)
 #  12. Migration-only push skips TS lint  no 'checking TypeScript package' (#2877 AC1)
 #  13. Real TS change still fires lint    'checking TypeScript package' present (#2877 AC2)
+#  18. Non-ASCII tf description rejected  em-dash in description -> hook fails (#3923)
 #
 # Run:
 #   scripts/tests/test_pre_push.sh
@@ -854,6 +855,44 @@ PY
         fi
     else
         report_pass "annotated daemon.py SQL site passes pre-push hook (#3818)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────
+# Scenario 18: Non-ASCII tf description rejected by pre-push hook (#3923)
+# ───────────────────────────────────────────────────────────────────────
+# Seeds infra/terraform/bad.tf with a description containing an em-dash
+# (U+2014), copies the real check script into the scratch repo (mirrors the
+# markdown-links scenario 5 pattern), and asserts the hook exits non-zero
+# with the expected FAILED message.
+echo "[scenario 18] non-ASCII tf description (em-dash) — hook rejects push (#3923)"
+init_workspace
+
+NONASCII_TF_SH="$REPO_ROOT/scripts/check-no-nonascii-tf-descriptions.sh"
+if [ ! -x "$NONASCII_TF_SH" ]; then
+    report_skip "scripts/check-no-nonascii-tf-descriptions.sh unavailable — cannot exercise"
+else
+    git -C "$WORK" checkout --quiet -b feature-nonascii-tf
+    mkdir -p "$WORK/infra/terraform" "$WORK/scripts"
+    cp "$NONASCII_TF_SH" "$WORK/scripts/check-no-nonascii-tf-descriptions.sh"
+    chmod +x "$WORK/scripts/check-no-nonascii-tf-descriptions.sh"
+    # Write a .tf file with an em-dash (U+2014) in the description field.
+    # Use printf to embed the UTF-8 encoding of U+2014 (0xE2 0x80 0x94)
+    # without relying on the editor or locale interpretation.
+    printf 'resource "aws_security_group" "bad" {\n  description = "Allows inbound traffic \xe2\x80\x94 see docs"\n}\n' \
+        > "$WORK/infra/terraform/bad.tf"
+    git -C "$WORK" add infra/terraform/bad.tf scripts/check-no-nonascii-tf-descriptions.sh
+    git -C "$WORK" commit --quiet -m "infra: add tf with em-dash description"
+    feat_sha="$(git -C "$WORK" rev-parse HEAD)"
+
+    run_hook "refs/heads/feature-nonascii-tf $feat_sha refs/heads/feature-nonascii-tf $ZERO_SHA"
+
+    if [ "$hook_rc" -eq 0 ]; then
+        report_fail "expected hook to reject em-dash tf description (#3923), exit was 0" "$hook_out"
+    elif ! echo "$hook_out" | grep -q "FAILED: check-no-nonascii-tf-descriptions for terraform"; then
+        report_fail "expected 'FAILED: check-no-nonascii-tf-descriptions for terraform' in output (#3923)" "$hook_out"
+    else
+        report_pass "hook rejects push with non-ASCII Terraform description field (#3923)"
     fi
 fi
 

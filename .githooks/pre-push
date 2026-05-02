@@ -434,6 +434,22 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             echo "  WARNING: terraform not found — skipping fmt check" >&2
         fi
 
+        # Non-ASCII byte check: AWS rejects non-ASCII chars in description
+        # fields at apply time (terraform plan/validate do not catch it).
+        # See issue #3321 for the em-dash incident that broke three apply runs.
+        echo "pre-push: checking for non-ASCII bytes in Terraform description fields..." >&2
+        if [ -x scripts/check-no-nonascii-tf-descriptions.sh ]; then
+            if ! run_check "terraform" "check-no-nonascii-tf-descriptions" scripts/check-no-nonascii-tf-descriptions.sh; then
+                echo "  A Terraform description field contains a non-ASCII byte." >&2
+                echo "  AWS rejects these at apply time. Replace with 7-bit ASCII." >&2
+                echo "  Common offender: em-dash U+2014 -- use '--' or '-' instead." >&2
+                echo "  See issue #3321 for background." >&2
+                failures=$((failures + 1))
+            fi
+        else
+            echo "  WARNING: scripts/check-no-nonascii-tf-descriptions.sh not found or not executable — skipping" >&2
+        fi
+
         # Empty-resource risk check: IAM resources with compact([var.*])
         # Resource lists that lack a count/for_each guard (#2739).
         echo "pre-push: checking for unguarded compact([var.*]) Resource lists..." >&2
