@@ -77,7 +77,7 @@ _SB_HYPHEN_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
 # Leading zeros after a letter prefix: "W08" -> "W8", "H001" -> "H1".
 # Anchored at start; replaces LETTERS+ZEROS+SIGNIFICANT_DIGIT prefix with
 # LETTERS+SIGNIFICANT_DIGIT, leaving trailing characters intact.
-_OC_LEADING_ZERO_RE = re.compile(r"^([A-Z]+)0+([1-9])")
+_OC_LEADING_ZERO_RE = re.compile(r"^([A-Za-z]+)0+([1-9])")
 
 
 # ---------------------------------------------------------------------------
@@ -196,5 +196,10 @@ def _normalize_orange(dept: str) -> str:
     Strips leading zeros from letter+number codes (``W08`` -> ``W8``,
     ``H001`` -> ``H1``).  Trailing characters after the significant digit
     are preserved (``H012`` -> ``H12``, ``L0612`` -> ``L612``).
+
+    Input is uppercased before applying the regex so that lowercase and
+    mixed-case codes (``w08``, ``Cm01``) are normalised to their canonical
+    uppercase form (``W8``, ``CM1``).
     """
+    dept = dept.upper()
     return _OC_LEADING_ZERO_RE.sub(r"\1\2", dept)
