@@ -111,6 +111,17 @@ jobs:
       - name: dispatcher-v3-sessions-bucket policy-shape check
         run: bash infra/terraform/modules/dispatcher-v3-sessions-bucket/tests/policy-checks/check.sh
 
+      # Check-block fixture test for dispatcher-v3-scheduled-skills (#3890).
+      # Verifies the module's two `check` blocks fire at plan time when
+      # the input config violates them: a task-def-arn / family mismatch
+      # (would AccessDenied at every cron firing) and enable_alerts=true
+      # paired with an empty alert_sns_topic_arn (would leave the alarm
+      # with no destination — closes adversarial-review MAJOR 7 only when
+      # the alarm can actually page).
+      - name: dispatcher-v3-scheduled-skills check-block fixture
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: bash infra/terraform/modules/dispatcher-v3-scheduled-skills/tests/postconditions/check.sh
+
       # Plan requires AWS credentials (stored as GitHub Actions secrets).
       # The plan confirms the module is deployable and shows exactly what
       # resources will be created or modified.

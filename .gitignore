@@ -38,6 +38,11 @@ build/
 *.tfvars
 !*.tfvars.example
 infra/terraform/modules/**/placeholder.zip
+# Module test fixtures need `terraform init` for plan-time check coverage,
+# which writes `.terraform.lock.hcl`. The lock file is per-machine and not
+# meant to be committed -- existing fixtures (dispatcher-daemon, api-service,
+# compute, etc.) intentionally don't track it.
+infra/terraform/modules/**/tests/**/.terraform.lock.hcl
 
 # OS
 .DS_Store
