@@ -88,6 +88,27 @@ locals {
     var.sessions_bucket_name != "" ? [{ name = "SESSIONS_BUCKET", value = var.sessions_bucket_name }] : [],
   )
 
+  # Launcher-only environment block (#3939). The launcher's
+  # `_build_launcher_from_env` (scripts/dispatcher_v3/launcher.py:1496-1526)
+  # reads these three vars at boot to assemble an `ecs:RunTask` request
+  # for each claimed issue -- they're meaningless for the task-runner /
+  # diagnoser / scheduled-skill task-defs (those are the *callees*, not
+  # the caller). Concatenated onto `common_environment` for the launcher
+  # task-def only.
+  launcher_environment = concat(
+    local.common_environment,
+    [
+      # The launcher launches task-runners by family name -- ecs:RunTask
+      # accepts either a family name or a full ARN, and family-only lets
+      # revisions roll forward automatically (a fresh F2 apply registers
+      # a new revision, and the next launcher claim picks it up without
+      # an explicit env-var update).
+      { name = "TASK_RUNNER_TASK_DEFINITION", value = local.family_task_runner },
+      { name = "AGENT_RUNNER_SUBNET_IDS", value = join(",", var.agent_runner_subnet_ids) },
+      { name = "AGENT_RUNNER_SECURITY_GROUP_ID", value = var.agent_runner_security_group_id },
+    ],
+  )
+
   # Common secrets block -- agent task-defs (task-runner / diagnoser /
   # scheduled-skill) all read the same set. The launcher reads a
   # narrower subset (DATABASE_URL + TELEGRAM_BOT_TOKEN; no
@@ -190,7 +211,7 @@ resource "aws_ecs_task_definition" "launcher" {
       # final UPDATE.
       stopTimeout = 120
 
-      environment = local.common_environment
+      environment = local.launcher_environment
       secrets     = local.launcher_secrets
 
       logConfiguration = {
@@ -229,6 +250,26 @@ resource "aws_ecs_task_definition" "launcher" {
     postcondition {
       condition     = strcontains(self.container_definitions, "@sha256:")
       error_message = "dispatcher-v3-task-defs (launcher): rendered image reference is not digest-pinned. See #3754 image-staleness drift -- the v3 task-defs structurally prevent this by always referencing @sha256:<digest>."
+    }
+    # Launcher-only env vars (#3939). Same defense-in-depth pattern as
+    # the secret postconditions above: the launcher's
+    # `_build_launcher_from_env` raises KeyError on a missing
+    # TASK_RUNNER_TASK_DEFINITION / AGENT_RUNNER_SUBNET_IDS /
+    # AGENT_RUNNER_SECURITY_GROUP_ID at boot, so a regression that
+    # drops them from the rendered container_definitions would crashloop
+    # the launcher silently from terraform's perspective. These checks
+    # turn the failure into a plan-time error.
+    postcondition {
+      condition     = strcontains(self.container_definitions, "TASK_RUNNER_TASK_DEFINITION")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered container_definitions is missing TASK_RUNNER_TASK_DEFINITION. The launcher's _build_launcher_from_env raises KeyError on this var at boot -- see #3939."
+    }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "AGENT_RUNNER_SUBNET_IDS")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered container_definitions is missing AGENT_RUNNER_SUBNET_IDS. The launcher needs this to assemble the ecs:RunTask awsvpcConfiguration -- see #3939."
+    }
+    postcondition {
+      condition     = strcontains(self.container_definitions, "AGENT_RUNNER_SECURITY_GROUP_ID")
+      error_message = "dispatcher-v3-task-defs (launcher): rendered container_definitions is missing AGENT_RUNNER_SECURITY_GROUP_ID. The launcher's _build_launcher_from_env raises KeyError on this var at boot -- see #3939."
     }
   }
 }

@@ -118,6 +118,54 @@ variable "ecs_cluster_arn" {
   type        = string
 }
 
+# --- Launcher → task-runner network handoff (#3939) --------------------
+#
+# The launcher container's `_build_launcher_from_env` (scripts/dispatcher_v3/
+# launcher.py:1496-1526) reads three env vars at boot to build an
+# `ecs:RunTask` request for each claimed issue:
+#
+#   * TASK_RUNNER_TASK_DEFINITION  -- which task-def family to launch.
+#     Always the task-runner family this same module registers, so we
+#     wire `local.family_task_runner` directly into the launcher's
+#     environment block (no variable needed -- a self-reference would
+#     just propagate a value that's already locally available).
+#   * AGENT_RUNNER_SUBNET_IDS  -- comma-joined private-subnet IDs the
+#     RunTask network configuration places task-runner ENIs in.
+#   * AGENT_RUNNER_SECURITY_GROUP_ID  -- the security group to attach to
+#     each task-runner ENI. Provisioned at the env layer (not inside F2
+#     or F4) to avoid the F2 ↔ F4 module cycle that would arise if F2
+#     read it from F4's outputs while F4 already references F2's
+#     launcher task-def ARN. Egress profile mirrors F4's launcher SG
+#     (HTTPS / Postgres / Redis), so task-runners share the launcher's
+#     network posture. If task-runners ever need a different egress
+#     posture (e.g. tighter scoping to S3 + GitHub + Anthropic only),
+#     the env-layer SG can be tightened without changing this module.
+#
+# Both are required (no default empty-string) because the launcher
+# crashes loudly with KeyError on `os.environ["AGENT_RUNNER_SECURITY_GROUP_ID"]`
+# at boot if either is absent -- there's no "disabled" mode for a
+# launcher that can't actually launch task-runners.
+
+variable "agent_runner_subnet_ids" {
+  description = "Private-subnet IDs the launcher places each task-runner's ENI in via ecs:RunTask `awsvpcConfiguration.subnets`. Threaded into the launcher container as AGENT_RUNNER_SUBNET_IDS (comma-joined). Reuses the same private subnets as the launcher's own ECS service so dev/prod network scopes stay aligned."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.agent_runner_subnet_ids) > 0
+    error_message = "agent_runner_subnet_ids must contain at least one subnet ID -- the launcher's ecs:RunTask call requires a non-empty awsvpcConfiguration.subnets list."
+  }
+}
+
+variable "agent_runner_security_group_id" {
+  description = "Security group ID attached to every task-runner ENI launched via ecs:RunTask. Threaded into the launcher container as AGENT_RUNNER_SECURITY_GROUP_ID. Provisioned at the env layer to avoid an F2 ↔ F4 module cycle; egress profile mirrors F4's launcher SG (HTTPS / Postgres / Redis) so task-runners share the launcher's network posture."
+  type        = string
+
+  validation {
+    condition     = length(var.agent_runner_security_group_id) > 0
+    error_message = "agent_runner_security_group_id must be non-empty -- the launcher's _build_launcher_from_env raises KeyError on os.environ['AGENT_RUNNER_SECURITY_GROUP_ID'] at boot."
+  }
+}
+
 variable "sessions_bucket_name" {
   description = "Name of the v3 sessions S3 bucket (F6, #3893). Exposed to task-runner / diagnoser containers as SESSIONS_BUCKET so the entrypoint can archive session logs on exit. Empty disables -- the entrypoint's upload step short-circuits when SESSIONS_BUCKET is unset."
   type        = string
