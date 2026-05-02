@@ -552,7 +552,15 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 
 **Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 1200000`** as CI runs typically take 10-25 minutes.
 
-`gh run watch` has no MCP equivalent — stays on `gh`:
+Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
+
+```
+scripts/wait-for-ci.sh <PR-N>
+```
+
+This polls the check-runs API with `filter=latest` (deduplicates re-runs) and exits 0 only when `ci-passed` is success, no check has failed, and `mergeStateStatus` is CLEAN or UNSTABLE. Exit 1 = failure, Exit 2 = timeout.
+
+For workflow-run-level watching (deploy workflows in §A.8), `gh run watch` stays as the fallback:
 
 ```
 gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --compact
