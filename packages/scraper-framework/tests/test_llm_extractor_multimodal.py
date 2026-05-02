@@ -4651,6 +4651,34 @@ class TestRoleLiteralOrphanDrop:
         result = _drop_role_literal_orphan_rulings([orphan])
         assert result == []
 
+    def test_drops_orphan_with_bracketed_placeholder_title_no_case_number_no_entry(self) -> None:
+        """Orphan with bracketed-placeholder title, no case_number, no entry_number is dropped."""
+        body_text = (
+            "The Court has reviewed the motion papers.  Plaintiff's motion for "
+            "summary judgment is GRANTED.  Defendant failed to raise a triable "
+            "issue of material fact on any element of the claim.  " * 30
+        )
+        orphan = ExtractedRuling(
+            extracted_case_title="Ezra Arce v. [Defendant not specified]",
+            extracted_case_number=None,
+            entry_number=None,
+            ruling_text=body_text,
+        )
+        result = _drop_role_literal_orphan_rulings([orphan])
+        assert result == []
+
+    def test_preserves_orphan_with_bracketed_placeholder_but_valid_case_number(self) -> None:
+        """Bracketed-placeholder title WITH a valid case_number is NOT dropped."""
+        ruling = ExtractedRuling(
+            extracted_case_title="Ezra Arce v. [Defendant not specified]",
+            extracted_case_number="CIVSB1234567",
+            entry_number=None,
+            ruling_text="The motion is DENIED." * 50,
+        )
+        result = _drop_role_literal_orphan_rulings([ruling])
+        assert len(result) == 1
+        assert result[0].extracted_case_number == "CIVSB1234567"
+
     def test_empty_list(self) -> None:
         """Empty list returns empty list."""
         assert _drop_role_literal_orphan_rulings([]) == []
