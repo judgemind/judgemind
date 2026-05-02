@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # venv: scraper-framework
 # one-off: true
-"""Delete derived.rulings and derived.cases rows created by the ca-governor-appointments
-scraper before the #3688 early-return fix was deployed.
+"""Delete derived.rulings rows created by the ca-governor-appointments scraper before
+the #3688 early-return fix was deployed.
 
 The scraper emits judge-bio press releases that share the CapturedDocument shape but
 are NOT rulings. Before #3688, the ingestion worker passed them through the LLM
 extractor, producing 178 rows with UNKNOWN-* case_numbers, empty case_titles, and a
 'Governor / Statewide' court entry in derived.rulings.
+
+Orphan derived.cases rows are intentionally left in place: the FK chain through
+derived.documents would require tearing down more rows than the user-facing pollution
+warrants, and the #2144 judge-bios pipeline may consume those case+document rows via
+the documents chain. The user-visible pollution is solely in derived.rulings.
 
 Surgical DELETE is used here rather than rebuild_db.py --county Statewide because
 rebuild would re-walk the same S3 press-release objects through the now-fixed scraper
@@ -20,6 +25,7 @@ Usage via ECS (dev DB is in a private VPC):
 The script is idempotent: re-running on a clean DB is a no-op (DELETE returns 0 rows).
 
 See: https://github.com/judgemind/judgemind/issues/3688
+     https://github.com/judgemind/judgemind/issues/3840
 """
 
 from __future__ import annotations
@@ -52,22 +58,6 @@ DELETE_RULINGS_SQL = """
     RETURNING r.id
 """
 
-# Delete orphaned derived.cases rows: cases with no remaining rulings that
-# were created for the Governor court and have an UNKNOWN-* case_number.
-DELETE_CASES_SQL = """
-    DELETE FROM derived.cases c
-    WHERE NOT EXISTS (
-        SELECT 1 FROM derived.rulings r WHERE r.case_id = c.id
-    )
-      AND c.case_number LIKE 'UNKNOWN-%'
-      AND c.court_id IN (
-          SELECT id FROM derived.courts
-          WHERE county = 'Statewide'
-            AND court_name ILIKE '%governor%'
-      )
-    RETURNING c.id
-"""
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -83,16 +73,10 @@ def main() -> None:
             deleted_rulings = cur.rowcount
             logger.info("Deleted %d derived.rulings rows", deleted_rulings)
 
-            logger.info("Deleting orphaned derived.cases rows")
-            cur.execute(DELETE_CASES_SQL)
-            deleted_cases = cur.rowcount
-            logger.info("Deleted %d derived.cases rows", deleted_cases)
-
         conn.commit()
         logger.info(
-            "Cleanup complete — rulings_deleted=%d cases_deleted=%d",
+            "Cleanup complete — rulings_deleted=%d",
             deleted_rulings,
-            deleted_cases,
         )
 
 
