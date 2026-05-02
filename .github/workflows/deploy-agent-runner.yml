@@ -1,12 +1,16 @@
 name: Deploy Agent Runner
 
 # Builds and pushes the dispatcher agent-runner image
-# (`judgemind/dispatcher-agent-runner`) to ECR on merge to main. Mirrors
-# the build-and-push half of `deploy-dispatcher.yml`, without the
-# service rollout step — the agent-runner is a *task definition* family,
-# not a service. New `ecs:RunTask` launches pick up the latest image
-# naturally via the `:latest` tag pinned in the task-def (see
-# `infra/terraform/modules/dispatcher-agent-runner/main.tf`).
+# (`judgemind/dispatcher-agent-runner`) to ECR on merge to main, then
+# re-registers the agent-runner task definition so its `registeredAt`
+# timestamp moves alongside the ECR push. Mirrors the build-and-push
+# half of `deploy-dispatcher.yml`; the agent-runner is a *task
+# definition* family rather than a service, so there's no service to
+# roll — but the daemon's `_check_agent_runner_image_freshness` guard
+# (scripts/dispatcher/daemon.py, AGENT_RUNNER_IMAGE_FRESHNESS_WINDOW_SECONDS)
+# refuses launches when ECR `:latest` was pushed more than 5 minutes
+# AFTER the task-def was last registered. Re-registering inside this
+# workflow keeps that invariant true (see #3863).
 #
 # Background
 # ----------
@@ -140,6 +144,49 @@ jobs:
             --output json \
             --query 'imageDetails[0].{digest:imageDigest,tags:imageTags,pushedAt:imagePushedAt}'
 
+      - name: Re-register agent-runner task definition
+        env:
+          FAMILY: judgemind-dispatcher-agent-runner-dev
+        run: |
+          # The daemon's `_check_agent_runner_image_freshness` guard
+          # (scripts/dispatcher/daemon.py) refuses agent launches when
+          # ECR `:latest` was pushed more than 5 min after the task-def
+          # was last registered. Re-register here so the guard's
+          # invariant holds for the lifetime of this image. Same shape
+          # as `aws ecs update-service --force-new-deployment` for
+          # service-backed task-defs; agent-runner is run-task-only
+          # (no service), so we just register a new revision pointing
+          # at the same `:latest` URI.  See #3863.
+          aws ecs describe-task-definition \
+            --task-definition "$FAMILY" \
+            --region "$AWS_REGION" \
+            --no-cli-pager \
+            > /tmp/agent_runner_td.json
+          jq '.taskDefinition | {
+            family,
+            networkMode,
+            executionRoleArn,
+            taskRoleArn,
+            containerDefinitions,
+            requiresCompatibilities,
+            cpu,
+            memory,
+            runtimePlatform,
+            ephemeralStorage,
+            placementConstraints,
+            volumes,
+            pidMode,
+            ipcMode,
+            proxyConfiguration
+          } | with_entries(select(.value != null))' \
+            /tmp/agent_runner_td.json > /tmp/agent_runner_td_input.json
+          aws ecs register-task-definition \
+            --region "$AWS_REGION" \
+            --cli-input-json file:///tmp/agent_runner_td_input.json \
+            --no-cli-pager \
+            --query 'taskDefinition.{revision: revision, registeredAt: registeredAt, image: containerDefinitions[0].image}' \
+            --output table
+
       - name: Publish build summary
         env:
           IMAGE_URI: ${{ steps.build.outputs.image_uri }}
@@ -155,4 +202,5 @@ jobs:
             echo "- **Also tagged:** \`latest\`, \`$BRANCH_TAG\`"
             echo ""
             echo "Next \`ecs:RunTask\` against the \`judgemind-dispatcher-agent-runner-dev\` family will pull this image via the \`:latest\` tag."
+            echo "Task-def re-registered to refresh the daemon's image-freshness guard (see #3863)."
           } >> "$GITHUB_STEP_SUMMARY"
