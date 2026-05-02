@@ -9,9 +9,14 @@ The single long-lived process for dispatcher-v3. Each tick (default 30s):
 3. **Watch in-flight tasks** — for every v3-owned ``dispatcher.agents``
    row with ``task_arn IS NOT NULL AND ended_at IS NULL``, call
    ``ecs:DescribeTasks`` and resolve the row's terminal state when the
-   task has STOPPED. RUNNING tasks are left in place; the silent-hang
-   detector (issue #3881, C4) and the diagnoser invocation (issue
-   #3882, C5) are deferred to subsequent PRs and marked TODO inline.
+   task has STOPPED. For RUNNING tasks the silent-hang detector
+   (issue #3881) calls ``cloudwatch_logs:DescribeLogStreams`` to read
+   the session log's ``lastEventTimestamp``; if the stream has not
+   received an event in ``silent_hang_minutes`` (default 30), the task
+   is killed via ``ecs:StopTask`` and the agent row is marked
+   ``failed`` with ``exit_reason='silent_hang'``. The diagnoser
+   invocation on STOPPED-non-zero (and silent-hang reap) is the
+   responsibility of issue #3882 (C5) and is marked TODO inline.
 4. **Recover partial claims** — rows with ``status='claiming'`` and
    ``task_arn IS NULL`` that have aged past
    :data:`PARTIAL_CLAIM_RECOVERY_AGE_SECONDS` are marked ``failed``
@@ -97,6 +102,51 @@ GH_SUBPROCESS_TIMEOUT_SECONDS = 30
 #: marks it failed. Mirrors v3 spec §4.1's "5min" guidance.
 PARTIAL_CLAIM_RECOVERY_AGE_SECONDS = 5 * 60
 
+#: Default silent-hang threshold (minutes) when ``dispatcher.config``
+#: does not set ``silent_hang_minutes``. Matches v3 spec §4.1: a
+#: RUNNING task whose CloudWatch log stream has not received an event
+#: in this many minutes is reaped via ``ecs:StopTask`` and the agent
+#: row is marked ``failed`` with ``exit_reason='silent_hang'``.
+#:
+#: Threshold is in minutes (not seconds) for symmetry with the spec
+#: text and the v2 ``silent_hang_minutes`` shape; conversion to
+#: seconds happens once at the comparison site.
+DEFAULT_SILENT_HANG_MINUTES = 30
+
+#: Exit reason recorded on agent rows reaped by the silent-hang
+#: detector. Matches v3 spec §4.1 verbatim. Diagnoser invocation
+#: keys off this string (#3882, C5).
+EXIT_REASON_SILENT_HANG = "silent_hang"
+
+#: Default CloudWatch Logs group for the v3 ``task-runner`` ECS task
+#: definition. The group name is wired into F2's task-def via the
+#: ``awslogs-group`` log-driver option; the launcher needs the same
+#: name to call ``DescribeLogStreams``. Default mirrors the v2
+#: agent-runner naming convention (``/ecs/judgemind-...-${env}``);
+#: F2 will override via the ``TASK_RUNNER_LOG_GROUP`` env var when
+#: it lands the actual log group resource. Empty string disables the
+#: silent-hang detector entirely (graceful degradation when F2 has
+#: not shipped yet — the wall-clock cap remains the only liveness
+#: signal).
+DEFAULT_TASK_RUNNER_LOG_GROUP = ""
+
+#: Default awslogs stream prefix for the ``task-runner`` container.
+#: ECS awslogs driver builds stream names as
+#: ``<prefix>/<container-name>/<task-id>`` where ``task-id`` is the
+#: last URI segment of the task ARN. The launcher reconstructs the
+#: stream name from the prefix + container name + task ARN so it can
+#: filter ``DescribeLogStreams`` to a single stream per task. The
+#: container name is fixed to ``task-runner`` in
+#: :meth:`Launcher._run_task_for_agent`'s ``containerOverrides``.
+DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX = "task-runner"
+
+#: Default CloudWatch ``DescribeLogStreams`` API timeout (seconds).
+#: A misbehaving CW endpoint must not wedge the watch loop — the
+#: launcher catches and logs failures, so individual API stalls just
+#: mean "skip the silent-hang check this tick" without affecting the
+#: rest of the tick.
+CLOUDWATCH_API_TIMEOUT_SECONDS = 10
+
 #: GitHub label names the launcher reads/writes.
 LABEL_AGENT_READY = "agent/ready"
 LABEL_STATUS_IN_PROGRESS = "status/in-progress"
@@ -154,8 +204,11 @@ def _check_issue_author_trusted(
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         log.warning(
             "launcher.trust_check_error",
-            extra={"event": "trust_check_error", "issue_number": issue_number,
-                   "detail": str(exc)},
+            extra={
+                "event": "trust_check_error",
+                "issue_number": issue_number,
+                "detail": str(exc),
+            },
         )
         return False
     return result.returncode == 0
@@ -185,9 +238,13 @@ class Launcher:
         agent_runner_security_group_id: str,
         sessions_bucket: str,
         runner_name: str = "claude",
+        task_runner_log_group: str = DEFAULT_TASK_RUNNER_LOG_GROUP,
+        task_runner_log_stream_prefix: str = DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
         conn: Any = None,
         ecs_client: Any = None,
-        subprocess_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        cloudwatch_logs_client: Any = None,
+        subprocess_runner: Callable[..., subprocess.CompletedProcess[str]]
+        | None = None,
         trust_checker: Callable[[int], bool] | None = None,
     ) -> None:
         self._run_id = run_id
@@ -198,13 +255,14 @@ class Launcher:
         self._agent_runner_security_group_id = agent_runner_security_group_id
         self._sessions_bucket = sessions_bucket
         self._runner_name = runner_name
+        self._task_runner_log_group = task_runner_log_group
+        self._task_runner_log_stream_prefix = task_runner_log_stream_prefix
         self._conn = conn
         self._ecs_client = ecs_client
+        self._cloudwatch_logs_client = cloudwatch_logs_client
         self._subprocess_runner = subprocess_runner or subprocess.run
         self._trust_checker = trust_checker or (
-            lambda n: _check_issue_author_trusted(
-                n, runner=self._subprocess_runner
-            )
+            lambda n: _check_issue_author_trusted(n, runner=self._subprocess_runner)
         )
 
     # -- public tick API ---------------------------------------------------
@@ -236,7 +294,9 @@ class Launcher:
         summary["claim_skipped"] = skipped
         return summary
 
-    def run_forever(self, *, tick_interval: int = DEFAULT_TICK_INTERVAL_SECONDS) -> None:
+    def run_forever(
+        self, *, tick_interval: int = DEFAULT_TICK_INTERVAL_SECONDS
+    ) -> None:
         """Tick forever. The deployed entrypoint when not running tests."""
         log.info("launcher.boot", extra={"event": "boot", "run_id": self._run_id})
         while True:
@@ -405,8 +465,7 @@ class Launcher:
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE dispatcher.runs SET heartbeat_ts = now() "
-                    "WHERE run_id = %s",
+                    "UPDATE dispatcher.runs SET heartbeat_ts = now() WHERE run_id = %s",
                     (self._run_id,),
                 )
             self._conn.commit()
@@ -422,14 +481,27 @@ class Launcher:
     # -- step 3: watch in-flight ------------------------------------------
 
     def _watch_in_flight(self) -> tuple[int, list[dict[str, Any]]]:
-        """For each in-flight v3 agent, resolve STOPPED tasks.
+        """For each in-flight v3 agent, resolve STOPPED tasks and reap silent hangs.
 
-        TODO(#3881 — silent-hang detector): this method only resolves
-        tasks the ECS API reports as STOPPED. The fine-grained "RUNNING
-        but session log has not grown for N minutes" check lands in C4.
-        TODO(#3882 — diagnoser invocation): on STOPPED-non-zero we mark
-        the row failed but do not yet spawn the diagnoser ECS task —
-        that wiring lands in C5.
+        Two liveness signals are checked per RUNNING task this tick:
+
+        - **ECS task lifecycle.** STOPPED + exit 0 → ``succeeded``;
+          STOPPED + non-zero → ``failed`` with the ECS ``stoppedReason``
+          captured. This is the coarse "the container exited" signal.
+        - **CloudWatch session-log silence.** RUNNING + log-stream
+          ``lastEventTimestamp`` older than ``silent_hang_minutes``
+          (default 30) → ``ecs:StopTask`` + ``failed`` with
+          ``exit_reason='silent_hang'``. This catches a wedged
+          ``claude -p`` (Anthropic-side hang, network blip, hung HTTP)
+          that consumes a slot for the full wall-clock cap. The
+          wall-clock cap itself is enforced by ECS via the task-def's
+          ``stopTimeout`` (F2's responsibility, not this method).
+
+        TODO(#3882 — diagnoser invocation): on STOPPED-non-zero AND on
+        silent-hang reap we mark the row failed but do not yet spawn
+        the diagnoser ECS task — that wiring lands in C5. The
+        ``exit_reason`` field carries the kill class so the diagnoser
+        can branch on it when it reads the row.
         """
         if self._conn is None:
             return 0, []
@@ -462,6 +534,10 @@ class Launcher:
             if isinstance(arn, str):
                 by_arn[arn] = desc
 
+        # Read silent-hang threshold once per tick — `dispatcher.config`
+        # writes are rare so the value is stable across a tick.
+        silent_hang_seconds = self._read_silent_hang_minutes() * 60
+
         transitions: list[dict[str, Any]] = []
         for agent_id, task_arn, issue_number in rows:
             desc = by_arn.get(str(task_arn))
@@ -472,20 +548,71 @@ class Launcher:
                 # failed.
                 continue
             last_status = str(desc.get("lastStatus") or "")
-            if last_status != "STOPPED":
+            if last_status == "STOPPED":
+                exit_code, exit_reason = self._extract_exit_state(desc)
+                new_status = "succeeded" if exit_code == 0 else "failed"
+                self._mark_agent_terminal(
+                    agent_id=str(agent_id),
+                    issue_number=int(issue_number) if issue_number is not None else 0,
+                    status=new_status,
+                    exit_code=exit_code,
+                    exit_reason=exit_reason,
+                )
+                transitions.append(
+                    {
+                        "agent_id": str(agent_id),
+                        "status": new_status,
+                        "exit_code": exit_code,
+                        "exit_reason": exit_reason,
+                    }
+                )
                 continue
-            exit_code, exit_reason = self._extract_exit_state(desc)
-            new_status = "succeeded" if exit_code == 0 else "failed"
+
+            # RUNNING — check for silent hang. The detector is opt-in
+            # via the log-group config; if ``task_runner_log_group`` is
+            # empty we skip the check entirely (graceful degradation
+            # for environments where F2 has not landed the log group
+            # yet — wall-clock cap is the only liveness signal).
+            if not self._task_runner_log_group:
+                continue
+            stale = self._task_session_is_silent(
+                task_arn=str(task_arn),
+                threshold_seconds=silent_hang_seconds,
+            )
+            if not stale:
+                continue
+            # Stale: stop the task and mark the agent failed.
+            self._stop_task_for_silent_hang(
+                agent_id=str(agent_id),
+                task_arn=str(task_arn),
+            )
             self._mark_agent_terminal(
                 agent_id=str(agent_id),
                 issue_number=int(issue_number) if issue_number is not None else 0,
-                status=new_status,
-                exit_code=exit_code,
-                exit_reason=exit_reason,
+                status="failed",
+                exit_code=None,
+                exit_reason=EXIT_REASON_SILENT_HANG,
+            )
+            log.warning(
+                "launcher.silent_hang_reaped",
+                extra={
+                    "event": "silent_hang_reaped",
+                    "run_id": self._run_id,
+                    "agent_id": str(agent_id),
+                    "issue_number": int(issue_number)
+                    if issue_number is not None
+                    else 0,
+                    "task_arn": str(task_arn),
+                    "threshold_seconds": silent_hang_seconds,
+                },
             )
             transitions.append(
-                {"agent_id": str(agent_id), "status": new_status,
-                 "exit_code": exit_code, "exit_reason": exit_reason}
+                {
+                    "agent_id": str(agent_id),
+                    "status": "failed",
+                    "exit_code": None,
+                    "exit_reason": EXIT_REASON_SILENT_HANG,
+                }
             )
         return len(rows), transitions
 
@@ -546,6 +673,175 @@ class Launcher:
                 if isinstance(t, dict):
                     results.append(t)
         return results
+
+    # -- silent-hang detection (issue #3881) ------------------------------
+
+    def _task_session_is_silent(
+        self,
+        *,
+        task_arn: str,
+        threshold_seconds: int,
+    ) -> bool:
+        """True iff the task's CW log stream is older than threshold.
+
+        Calls ``cloudwatch_logs:DescribeLogStreams`` filtered to the
+        single stream named ``<prefix>/<container>/<task-id>`` and
+        reads ``lastEventTimestamp`` (ms since epoch). The check is
+        side-effect-free and returns False on any error path so a
+        transient CW API blip never reaps a healthy agent.
+
+        False-paths (return False, do not reap):
+
+        - Stream not found yet (just-launched task — the awslogs driver
+          creates the stream on first event, which can lag the ECS
+          ``RUNNING`` transition by several seconds).
+        - ``lastEventTimestamp`` missing from the response (newly
+          created stream, no events yet).
+        - CW API call raises (rate limit, IAM, network).
+
+        True-path (return True, reap):
+
+        - Stream exists, has a ``lastEventTimestamp``, and the gap
+          between now and that timestamp exceeds ``threshold_seconds``.
+        """
+        stream_name = self._build_log_stream_name(task_arn)
+        if not stream_name:
+            return False
+        last_event_ms = self._fetch_last_event_timestamp(stream_name)
+        if last_event_ms is None:
+            return False
+        # ``time.time()`` is wall-clock, ``last_event_ms`` is epoch ms
+        # (CloudWatch's documented unit for the field). Both come from
+        # the same time domain so the subtraction is meaningful.
+        now_ms = int(time.time() * 1000)
+        gap_ms = now_ms - last_event_ms
+        threshold_ms = threshold_seconds * 1000
+        return gap_ms >= threshold_ms
+
+    def _build_log_stream_name(self, task_arn: str) -> str:
+        """Reconstruct the awslogs stream name for a task ARN.
+
+        ECS awslogs driver names streams as
+        ``<prefix>/<container-name>/<task-id>`` where ``task-id`` is
+        the last URI segment of the task ARN. The container name is
+        fixed to ``task-runner`` (set in
+        :meth:`_run_task_for_agent`'s ``containerOverrides``). Returns
+        an empty string if the ARN is malformed (no segments).
+        """
+        if not task_arn:
+            return ""
+        # Task ARN format: arn:aws:ecs:<region>:<acct>:task/<cluster>/<task-id>
+        # We take the final segment regardless of cluster prefix.
+        task_id = task_arn.rsplit("/", 1)[-1]
+        if not task_id or task_id == task_arn:
+            return ""
+        return f"{self._task_runner_log_stream_prefix}/task-runner/{task_id}"
+
+    def _fetch_last_event_timestamp(self, stream_name: str) -> Optional[int]:
+        """Return the stream's ``lastEventTimestamp`` (ms) or None.
+
+        ``DescribeLogStreams`` with ``logStreamNamePrefix`` returns at
+        most ``limit`` items; we set ``limit=1`` and rely on an exact
+        prefix match to be safe even if the awslogs driver ever adds
+        suffixes. None on any non-happy path so the caller's "skip the
+        reap on error" guard fires.
+        """
+        try:
+            client = self._get_cloudwatch_logs_client()
+        except Exception:
+            log.exception(
+                "launcher.cw_client_init_failed",
+                extra={"event": "cw_client_init_failed", "run_id": self._run_id},
+            )
+            return None
+        try:
+            resp = client.describe_log_streams(
+                logGroupName=self._task_runner_log_group,
+                logStreamNamePrefix=stream_name,
+                limit=1,
+            )
+        except Exception:
+            log.exception(
+                "launcher.describe_log_streams_failed",
+                extra={
+                    "event": "describe_log_streams_failed",
+                    "run_id": self._run_id,
+                    "log_stream_prefix": stream_name,
+                },
+            )
+            return None
+        streams = resp.get("logStreams") or []
+        if not streams:
+            return None
+        first = streams[0]
+        if not isinstance(first, dict):
+            return None
+        # Defend against a same-prefix collision: the first returned
+        # stream must have the exact name we asked for, otherwise we
+        # treat it as "stream not found yet" (False).
+        if str(first.get("logStreamName") or "") != stream_name:
+            return None
+        ts = first.get("lastEventTimestamp")
+        if not isinstance(ts, int):
+            return None
+        return ts
+
+    def _read_silent_hang_minutes(self) -> int:
+        """Read ``dispatcher.config.silent_hang_minutes``; default to 30.
+
+        Returns the threshold in **minutes** (not seconds). Conversion
+        to seconds happens at the comparison site so debugging logs
+        carry the more readable minutes value. Negative or non-int
+        values fall back to the default.
+        """
+        if self._conn is None:
+            return DEFAULT_SILENT_HANG_MINUTES
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM dispatcher.config WHERE key = %s",
+                    ("silent_hang_minutes",),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._safe_rollback()
+            return DEFAULT_SILENT_HANG_MINUTES
+        if row is None or row[0] is None:
+            return DEFAULT_SILENT_HANG_MINUTES
+        try:
+            value = int(row[0])
+        except (TypeError, ValueError):
+            return DEFAULT_SILENT_HANG_MINUTES
+        if value <= 0:
+            return DEFAULT_SILENT_HANG_MINUTES
+        return value
+
+    def _stop_task_for_silent_hang(self, *, agent_id: str, task_arn: str) -> None:
+        """Best-effort ``ecs:StopTask`` on a silent-hang reap.
+
+        A failure here is logged but does not block the DB transition —
+        the row will be marked failed regardless, and the next tick's
+        watch loop will resolve the task to STOPPED via the standard
+        path once ECS catches up.
+        """
+        try:
+            client = self._get_ecs_client()
+            client.stop_task(
+                cluster=self._ecs_cluster_arn,
+                task=task_arn,
+                reason=f"silent_hang:{agent_id}",
+            )
+        except Exception:
+            log.exception(
+                "launcher.silent_hang_stop_failed",
+                extra={
+                    "event": "silent_hang_stop_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "task_arn": task_arn,
+                },
+            )
 
     def _mark_agent_terminal(
         self,
@@ -667,16 +963,25 @@ class Launcher:
             attempts = self._count_prior_attempts(number)
             if attempts >= attempts_max:
                 skipped.append(
-                    {"number": number, "reason": "budget_exhausted",
-                     "attempts": attempts, "limit": attempts_max}
+                    {
+                        "number": number,
+                        "reason": "budget_exhausted",
+                        "attempts": attempts,
+                        "limit": attempts_max,
+                    }
                 )
                 self._gh_add_labels(number, [LABEL_STATUS_NEEDS_HUMAN])
                 continue
             agent_id = self._mint_agent_id()
             outcome = self._claim_one(agent_id=agent_id, issue_number=number)
             if outcome.get("ok"):
-                claims.append({"number": number, "agent_id": agent_id,
-                               "task_arn": outcome.get("task_arn")})
+                claims.append(
+                    {
+                        "number": number,
+                        "agent_id": agent_id,
+                        "task_arn": outcome.get("task_arn"),
+                    }
+                )
                 slots -= 1
             else:
                 skipped.append(
@@ -688,6 +993,7 @@ class Launcher:
     def _mint_agent_id() -> str:
         """Generate a fresh agent UUID. Lazy-imports uuid to keep imports tight."""
         import uuid  # noqa: PLC0415 — lazy
+
         return str(uuid.uuid4())
 
     def _claim_one(self, *, agent_id: str, issue_number: int) -> dict[str, Any]:
@@ -795,9 +1101,7 @@ class Launcher:
             return False
         return True
 
-    def _run_task_for_agent(
-        self, *, agent_id: str, issue_number: int
-    ) -> Optional[str]:
+    def _run_task_for_agent(self, *, agent_id: str, issue_number: int) -> Optional[str]:
         """``ecs:RunTask`` and return the launched task ARN (or None)."""
         client = self._get_ecs_client()
         env_pairs = [
@@ -807,9 +1111,7 @@ class Launcher:
             {"name": "SESSIONS_BUCKET", "value": self._sessions_bucket},
         ]
         overrides = {
-            "containerOverrides": [
-                {"name": "task-runner", "environment": env_pairs}
-            ]
+            "containerOverrides": [{"name": "task-runner", "environment": env_pairs}]
         }
         network_configuration = {
             "awsvpcConfiguration": {
@@ -1012,16 +1314,26 @@ class Launcher:
         scan filter).
         """
         cmd = [
-            "gh", "issue", "list",
-            "--repo", self._github_repo,
-            "--label", "agent/ready",
-            "--state", "open",
-            "--json", "number,title,labels,createdAt",
-            "--limit", str(QUEUE_SCAN_PAGE_LIMIT),
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            self._github_repo,
+            "--label",
+            "agent/ready",
+            "--state",
+            "open",
+            "--json",
+            "number,title,labels,createdAt",
+            "--limit",
+            str(QUEUE_SCAN_PAGE_LIMIT),
         ]
         result = self._subprocess_runner(
-            cmd, capture_output=True, text=True,
-            timeout=GH_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=GH_SUBPROCESS_TIMEOUT_SECONDS,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -1039,9 +1351,7 @@ class Launcher:
             if not isinstance(issue, dict):
                 continue
             labels = issue.get("labels") or []
-            label_names = {
-                e.get("name") for e in labels if isinstance(e, dict)
-            }
+            label_names = {e.get("name") for e in labels if isinstance(e, dict)}
             if LABEL_STATUS_BLOCKED in label_names:
                 continue
             if LABEL_STATUS_IN_PROGRESS in label_names:
@@ -1055,14 +1365,22 @@ class Launcher:
         if not labels:
             return
         cmd = [
-            "gh", "issue", "edit", str(issue_number),
-            "--repo", self._github_repo,
-            "--add-label", ",".join(labels),
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._github_repo,
+            "--add-label",
+            ",".join(labels),
         ]
         try:
             self._subprocess_runner(
-                cmd, capture_output=True, text=True,
-                timeout=GH_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
             )
         except Exception:
             log.exception(
@@ -1079,14 +1397,22 @@ class Launcher:
         if not labels:
             return
         cmd = [
-            "gh", "issue", "edit", str(issue_number),
-            "--repo", self._github_repo,
-            "--remove-label", ",".join(labels),
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._github_repo,
+            "--remove-label",
+            ",".join(labels),
         ]
         try:
             self._subprocess_runner(
-                cmd, capture_output=True, text=True,
-                timeout=GH_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=GH_SUBPROCESS_TIMEOUT_SECONDS,
+                check=False,
             )
         except Exception:
             log.exception(
@@ -1105,8 +1431,23 @@ class Launcher:
         """Return the ECS boto3 client (lazy-built; reused across ticks)."""
         if self._ecs_client is None:
             import boto3  # noqa: PLC0415 — lazy
+
             self._ecs_client = boto3.client("ecs")
         return self._ecs_client
+
+    def _get_cloudwatch_logs_client(self) -> Any:
+        """Return the CloudWatch Logs boto3 client (lazy-built; reused).
+
+        Used by the silent-hang detector to read
+        ``DescribeLogStreams.lastEventTimestamp`` for each in-flight
+        task. Lazy-built so tests with the silent-hang detector
+        disabled (empty log-group config) never instantiate boto3.
+        """
+        if self._cloudwatch_logs_client is None:
+            import boto3  # noqa: PLC0415 — lazy
+
+            self._cloudwatch_logs_client = boto3.client("logs")
+        return self._cloudwatch_logs_client
 
     # -- internals --------------------------------------------------------
 
@@ -1167,11 +1508,21 @@ def _build_launcher_from_env() -> Launcher:
         agent_runner_subnet_ids=[
             s for s in os.environ.get("AGENT_RUNNER_SUBNET_IDS", "").split(",") if s
         ],
-        agent_runner_security_group_id=os.environ[
-            "AGENT_RUNNER_SECURITY_GROUP_ID"
-        ],
+        agent_runner_security_group_id=os.environ["AGENT_RUNNER_SECURITY_GROUP_ID"],
         sessions_bucket=os.environ["SESSIONS_BUCKET"],
         runner_name=os.environ.get("RUNNER", "claude"),
+        # Silent-hang detector (#3881). Empty TASK_RUNNER_LOG_GROUP
+        # disables the detector — useful for early v3 ramp before F2
+        # has wired the awslogs-group resource. The wall-clock cap on
+        # the task-def's stopTimeout remains the only liveness signal
+        # in that mode.
+        task_runner_log_group=os.environ.get(
+            "TASK_RUNNER_LOG_GROUP", DEFAULT_TASK_RUNNER_LOG_GROUP
+        ),
+        task_runner_log_stream_prefix=os.environ.get(
+            "TASK_RUNNER_LOG_STREAM_PREFIX",
+            DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
+        ),
     )
 
 
