@@ -142,6 +142,14 @@ _ROLE_LITERAL_TITLE_RE = re.compile(
 # (plaintiff/defendant/petitioner/respondent/party/name/case) followed by a
 # qualifier (not specified, unknown, missing, not listed, not provided, tbd).
 # No anchor — the bracket can appear anywhere in the title.  See #3988.
+#
+# Explicit non-match envelope (do NOT widen without product confirmation — #4002):
+#   - Role-only:        [DEFENDANT], [Defendant 1]  — no qualifier word present
+#   - Qualifier-only:   [TBD], [Insert defendant here]  — no leading role word
+#   - Possessives:      [defendant's name]  — possessive breaks the role-word token
+#   - Ordinals:         [Defendant 1]  — digit suffix is not a qualifier keyword
+#   - Free-form:        [Name to be determined]  — "Name" alone is not a role word
+#                       used in this position; qualifier phrase not in the allowlist
 _BRACKETED_PLACEHOLDER_TITLE_RE = re.compile(
     r"\[(?:plaintiff|defendant|petitioner|respondent|party|name|case)[^\]]*"
     r"(?:not specified|unknown|missing|not listed|not provided|tbd)[^\]]*\]",

@@ -230,33 +230,28 @@ def test_rebuild_title_from_parties_accepts_dict_shaped_parties() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_bracketed_placeholder_re_matches_defendant_not_specified() -> None:
-    """Matches the canonical Arce shape: 'Ezra Arce v. [Defendant not specified]'."""
-    assert _BRACKETED_PLACEHOLDER_TITLE_RE.search("Ezra Arce v. [Defendant not specified]")
-
-
-def test_bracketed_placeholder_re_matches_plaintiff_unknown() -> None:
-    """Matches bracketed placeholder at start of title: '[Plaintiff name unknown] v. Smith'."""
-    assert _BRACKETED_PLACEHOLDER_TITLE_RE.search("[Plaintiff name unknown] v. Smith")
-
-
-def test_bracketed_placeholder_re_matches_respondent_missing() -> None:
-    """Matches mid-title bracketed placeholder: 'In re Doe [Respondent missing]'."""
-    assert _BRACKETED_PLACEHOLDER_TITLE_RE.search("In re Doe [Respondent missing]")
-
-
-def test_bracketed_placeholder_re_does_not_match_clean_title() -> None:
-    """A clean title like 'Smith v. Jones' produces no match."""
-    assert not _BRACKETED_PLACEHOLDER_TITLE_RE.search("Smith v. Jones")
-
-
-def test_bracketed_placeholder_re_does_not_match_non_role_brackets() -> None:
-    """False-positive guardrail: 'Smith v. Acme [DBA Acme Corp.]' should NOT match.
-
-    'DBA' is a real annotation bracket, not a placeholder — the regex must
-    restrict matches to role words followed by qualifier words.
-    """
-    assert not _BRACKETED_PLACEHOLDER_TITLE_RE.search("Smith v. Acme [DBA Acme Corp.]")
+@pytest.mark.parametrize(
+    "title,should_match",
+    [
+        # Currently-supported shapes (regression guard) — verbatim from removed tests
+        ("Ezra Arce v. [Defendant not specified]", True),
+        ("[Plaintiff name unknown] v. Smith", True),
+        ("In re Doe [Respondent missing]", True),
+        # Clean / non-placeholder brackets — must NOT match
+        ("Smith v. Jones", False),
+        ("Smith v. Acme [DBA Acme Corp.]", False),
+        # Currently-unsupported but real LLM outputs — documented non-matches.
+        # If product later confirms these need catching, widen regex AND flip to True.
+        ("Smith v. [Defendant 1]", False),
+        ("Smith v. [defendant's name]", False),
+        ("Smith v. [DEFENDANT]", False),
+        ("Smith v. [TBD]", False),
+        ("Smith v. [Name to be determined]", False),
+        ("Smith v. [Insert defendant here]", False),
+    ],
+)
+def test_bracketed_placeholder_regex_coverage(title: str, should_match: bool) -> None:
+    assert bool(_BRACKETED_PLACEHOLDER_TITLE_RE.search(title)) is should_match
 
 
 def test_rebuild_title_from_parties_handles_bracketed_placeholder() -> None:
