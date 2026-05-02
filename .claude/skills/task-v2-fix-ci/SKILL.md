@@ -53,7 +53,8 @@ Write `{worktree}/tmp/dispatcher-output/fix-ci.json`:
   "rebase_outcome": "clean" | "resolved" | "conflict_unresolvable" | "skipped",
   "failure_category": "lint" | "format" | "type_error" | "test_failure" | "coverage_floor" |
                        "infra_external" | "missing_secret_or_config" | "build_failure" |
-                       "markdown_links" | "hygiene_guard" | "ci_config" | "other",
+                       "markdown_links" | "hygiene_guard" | "ci_config" |
+                       "migration_collision" | "other",
   "changed_files": ["<path>", ...],
   "commit_message": "fix(<area>): <what was fixed> — CI (#<PR-N>)",
   "block_reason": null | "<string>",
@@ -117,6 +118,7 @@ For each `failing_jobs` entry, classify the root cause from the `log_tail`:
 | `markdown_links` | `scripts/check-markdown-links.sh` failures | Fix the broken link paths |
 | `hygiene_guard` | `scripts/check-no-*.sh` / `check-forbidden-*.sh` / `check-deprecated-*.sh` guards, or `scripts/check-ci-job-skipped.sh` (the #2410/#2505 footgun) | Follow the guard's error message; per CLAUDE.md, self-matching names in ci.yml are the usual cause |
 | `ci_config` | `.github/workflows/*.yml` parse error, job definition malformed | Edit the workflow — but only if the failure is genuinely in the workflow, not in code that the workflow runs |
+| `migration_collision` | `migration-collision-check` job fails: "migration number N is also claimed by PR #M" | See "Resolving migration_collision" sub-section in Step 3 below |
 | `other` | Not in the above | If you can't identify, classify as `BLOCKED` with a clear `block_reason` |
 
 **Unsafe shortcuts — do not use:**
@@ -157,6 +159,40 @@ For `coverage_floor`:
 - Rerun coverage locally to confirm the floor passes.
 
 For `hygiene_guard` failures in `.github/workflows/ci.yml` — the #2410/#2505 footgun is the most common cause. Follow the guard's own error message. If the guard is complaining about a job being SKIPPED on its own CI run, either modify a file that already matches the paths filter, or add `.github/workflows/ci.yml` to the filter.
+
+### Resolving migration_collision
+
+When `failure_category="migration_collision"`:
+
+1. **Confirm the failure source.** Read the `log_tail` for the `migration-collision-check` job and extract the colliding migration number N and the competing PR number(s) M.
+
+2. **Compute the next free number.** After the Step 0 rebase (branch is up to date with `origin/main`), import `pick_next_free_number` from `scripts/check-migration-number-collision.py` or call `scripts/check-migration-number-collision.py --print-next-free` if that flag exists. Pass the current open-PR list (`gh pr list --state open --json number,title,files --limit 200`) and the latest migration number on `origin/main` (`git ls-tree --name-only origin/main:packages/api/migrations | sort | tail -1`). Exclude `current_pr_number` so this PR doesn't count itself.
+
+   Concretely:
+   ```
+   # Run in the worktree
+   python3 scripts/check-migration-number-collision.py --base origin/main --current-pr <PR-N>
+   ```
+   Read the output to see what number is already free, or import `pick_next_free_number` directly in a small driver script written to `tmp/`.
+
+3. **Rename the migration file.**
+   ```
+   git -C <worktree_path> mv packages/api/migrations/<old_N>_<slug>.sql \
+       packages/api/migrations/<new_N>_<slug>.sql
+   ```
+   where `<new_N>` is the next free number from step 2.
+
+4. **Schema.sql does NOT need regeneration.** `packages/api/src/data-access/schema.sql` is a final-state dump and does not reference migration filenames. Do not regenerate it.
+
+5. **Verify the fix locally.**
+   - `bash scripts/check-migration-files.sh` — sequential numbering still passes after the rename.
+   - `python3 scripts/check-migration-number-collision.py --base origin/main --current-pr <PR-N>` — no collision reported.
+
+6. **Return verdict.**
+   - `verdict="PATCHED"`
+   - `failure_category="migration_collision"`
+   - `commit_message="fix(api): renumber migration to <new_N> to resolve collision — CI (#<PR-N>)"`
+   - `changed_files=["packages/api/migrations/<old_N>_<slug>.sql", "packages/api/migrations/<new_N>_<slug>.sql"]`
 
 ## Step 4 — Verify the fix locally
 

@@ -1349,6 +1349,16 @@ FAILURE_CATEGORY_GIT_COMMIT_FAILED = "git_commit_failed"
 #: on the ``block_reason`` text fix-ci surfaced.
 FAILURE_CATEGORY_FIX_CI_BLOCKED = "fix_ci_blocked"
 
+#: Tier-2 category from issue #3790 — the ``migration-collision-check`` CI
+#: job detected that the PR's migration number is already claimed by another
+#: open PR. The ``/task-v2-fix-ci`` skill resolves this by calling
+#: ``pick_next_free_number`` (``scripts/check-migration-number-collision.py``)
+#: and renaming the migration file to the next free slot, then returning
+#: ``verdict='PATCHED'``. Self-healing: each competing PR independently picks
+#: a higher free number on its own fix-ci retry, so concurrent collisions
+#: converge without operator intervention.
+FAILURE_CATEGORY_MIGRATION_COLLISION = "migration_collision"
+
 #: Tier-2 first-occurrence category from issue #3069 — the
 #: ``_apply_fix_ci_patch`` method has eight ``_mark_agent_terminal``
 #: sites covering ``fix_ci_missing_commit_message`` + every git-add /

@@ -234,6 +234,47 @@ def find_stale_numbers(
     return sorted(n for n in my_numbers if n <= latest_on_base)
 
 
+def pick_next_free_number(
+    my_numbers: list[int],
+    other_prs: list[OtherPR],
+    latest_on_base: int | None,
+    current_pr_number: int | None = None,
+) -> int:
+    """Return the next migration number that is free of collisions.
+
+    Computes ``max(claimed_others ∪ {latest_on_base}) + 1`` where
+    ``claimed_others`` is every migration number claimed by *other* open
+    PRs, excluding `current_pr_number` (so a PR never races with itself).
+
+    ``my_numbers`` is accepted for API symmetry with the other pure
+    helpers but is not used in the computation — the caller's own numbers
+    do not affect which next-free slot is available.
+
+    Examples::
+
+        # Three PRs all claim N=56; main is at 55.
+        # PR A calls first: claimed_others = {56 from B, 56 from C}; max=56 → 57
+        # PR B calls next (A's 57 now in other_prs): max=57 → 58
+        # PR C calls next (A=57, B=58 in other_prs): max=58 → 59
+
+    Returns at least 1 (never 0 or negative).
+    """
+    claimed_others: set[int] = set()
+    for pr in other_prs:
+        if current_pr_number is not None and pr.number == current_pr_number:
+            continue
+        claimed_others.update(pr.migration_numbers)
+
+    candidates: list[int] = list(claimed_others)
+    if latest_on_base is not None:
+        candidates.append(latest_on_base)
+
+    if not candidates:
+        return 1
+
+    return max(candidates) + 1
+
+
 # -----------------------------------------------------------------------------
 # I/O: git / gh / filesystem
 # -----------------------------------------------------------------------------
