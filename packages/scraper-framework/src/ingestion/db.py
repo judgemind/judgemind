@@ -791,7 +791,7 @@ def _looks_like_valid_judge_name(name: str) -> bool:
         return False
 
     # Check if last word is a known valid short word (suffix)
-    if last_word.lower() in _VALID_SHORT_FINAL_WORDS:
+    if last_word_stripped.lower() in _VALID_SHORT_FINAL_WORDS:
         return True
 
     # Reject if last word is too short to be a real surname
