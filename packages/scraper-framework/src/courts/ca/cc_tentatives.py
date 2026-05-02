@@ -153,6 +153,62 @@ _OUTCOME_PATTERNS: list[tuple[re.Pattern, str]] = [
 
 
 # ---------------------------------------------------------------------------
+# Phantom-ruling guard — calendar header extraction (#3798)
+# ---------------------------------------------------------------------------
+
+# Format A (civil): "8. 9:00 AM CASE NUMBER: L25-09151"
+# Case-insensitive, multiline.
+_CALENDAR_HEADER_CIVIL_RE = re.compile(
+    r"^\s*\d+[A-Z]?\.\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s+CASE\s+NUMBER:\s+(\S+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Format B (probate): "7. P24-00230 CONSERVATORSHIP OF: JUNE STONE"
+# Also matches: "1. N25-2307 IN THE MATTER OF: AJAY BHALLA"
+# and: "5. MSP19-01440 CONS. OF MARIE ROST"
+# Case-insensitive, multiline.
+_CALENDAR_HEADER_PROBATE_RE = re.compile(
+    r"^\s*\d+[A-Z]?\.\s+(?P<cn>(?:MSP|MS|RS|A)?[CLNP]?\d{2}-?\d{4,8}|MS\d{4})\s+"
+    r"(?:IN\s+THE\s+MATTER\s+OF|CONS\.|CONSERVATORSHIP\s+OF)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_calendar_header_case_numbers(text: str) -> set[str]:
+    """Extract case numbers that appear in top-level numbered calendar headers.
+
+    Scans the PDF text for Format A (civil) and Format B (probate) calendar
+    header lines and returns the set of normalised (upper-stripped) case
+    numbers found.  Only case numbers in actual calendar header lines are
+    returned — body text is not scanned.
+
+    Used by the post-LLM phantom-ruling guard in ``fetch_documents`` to
+    validate that each LLM-extracted ruling corresponds to a real calendar
+    entry in the source PDF (#3798).
+
+    Args:
+        text: Full PDF text as extracted by pdfplumber.
+
+    Returns:
+        Set of normalised case numbers (e.g. ``{'L25-09151', 'C24-02490'}``).
+        Returns an empty set if no calendar header lines are found.
+    """
+    result: set[str] = set()
+
+    for m in _CALENDAR_HEADER_CIVIL_RE.finditer(text):
+        cn = m.group(1).upper().strip()
+        if cn:
+            result.add(cn)
+
+    for m in _CALENDAR_HEADER_PROBATE_RE.finditer(text):
+        cn = m.group("cn").upper().strip()
+        if cn:
+            result.add(cn)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # LLM extraction feature flag and configuration (#2053)
 # ---------------------------------------------------------------------------
 
@@ -571,7 +627,26 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
 
                         llm_rulings = _llm_extract_rulings(text)
                         if llm_rulings is not None:
+                            # Hoist valid_cns computation once per PDF (#3798).
+                            # Used by the phantom-ruling guard below.
+                            valid_cns = _extract_calendar_header_case_numbers(text)
                             for ruling in llm_rulings:
+                                # Phantom-ruling guard (#3798): drop LLM rulings
+                                # whose case_number does not appear in a top-level
+                                # calendar header in the source PDF.  Rulings with
+                                # case_number=None pass through (caught downstream).
+                                if ruling.case_number is not None:
+                                    cn_norm = ruling.case_number.upper().strip()
+                                    if valid_cns and cn_norm not in valid_cns:
+                                        self._log.warning(
+                                            "cc.phantom_ruling_dropped",
+                                            dropped_case_number=ruling.case_number,
+                                            legitimate_count=len(valid_cns),
+                                            department=department,
+                                            judge=effective_judge,
+                                            source_url=href,
+                                        )
+                                        continue
                                 doc = self._make_base_doc(
                                     source_url=href,
                                     raw_content=pdf_content,
