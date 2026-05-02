@@ -514,6 +514,49 @@ module "dispatcher_v3_task_defs" {
   sessions_bucket_name = module.dispatcher_v3_sessions.bucket_id
 }
 
+# ─── Dispatcher v3 launcher ECS service (F4, #3889) ─────────────────────────
+# Per `docs/specs/dispatcher-v3-spec.md` §6 + §9 step 2. Single-replica
+# ECS Fargate service that runs the v3 launcher loop alongside v2's
+# dispatcher daemon. Deploys at desired_count=1 with the launcher
+# observing the queue but claiming nothing — `dispatcher.config.
+# concurrency_cap_v3=0` (seeded by migration 58) keeps it idle until
+# the operator manually flips the cap.
+#
+# References F2's `launcher_task_definition_arn` directly (revision-
+# pinned). Subsequent F2 reapplies that resolve a fresh image digest
+# register a new task-def revision, but the service's
+# `lifecycle.ignore_changes = [task_definition]` block keeps Terraform
+# from churning the service on every apply — operator-driven redeploys
+# go through `aws ecs update-service --force-new-deployment` exactly
+# like v2's dispatcher-daemon.
+#
+# Why a separate service vs piggy-backing on v2's dispatcher-daemon:
+# spec §8.1 explicitly separates the two ECS services so cohabitation
+# stays clean — independent log groups, independent breakers, independent
+# concurrency caps. Wiring v3 onto the v2 service would couple the two
+# rollout knobs (cap=0 means BOTH off) and lose the gradual ramp pattern
+# in §9 step 4 (raise v3 cap by 2, decrease v2 cap by 2).
+module "dispatcher_v3_service" {
+  source = "../../modules/dispatcher-v3-service"
+
+  environment        = "dev"
+  vpc_id             = module.networking.vpc_id
+  private_subnet_ids = module.networking.private_subnet_ids
+  ecs_cluster_arn    = module.compute.cluster_arn
+
+  # F2 (#3887) launcher task-def. Revision-pinned -- Terraform reapplies
+  # after a deploy-dispatcher-v3.yml push will resolve a fresh digest in
+  # F2 and register a new revision; the service ignores those revisions
+  # via lifecycle.ignore_changes = [task_definition] so the operator
+  # controls rollout timing via `update-service --force-new-deployment`.
+  task_definition_arn = module.dispatcher_v3_task_defs.launcher_task_definition_arn
+
+  # Default desired_count=1 -- launcher is RUNNING but idle (cap=0
+  # blocks claims). Operator can scale to 0 as a kill-switch
+  # (rollback button per spec §9 step 4).
+  # desired_count = 1
+}
+
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url
@@ -873,4 +916,24 @@ output "dispatcher_v3_diagnoser_log_group" {
 output "dispatcher_v3_scheduled_skill_log_group" {
   description = "Dev CloudWatch log group for the dispatcher-v3 scheduled-skill task (/judgemind/dispatcher-v3/scheduled-skill)."
   value       = module.dispatcher_v3_task_defs.scheduled_skill_log_group_name
+}
+
+# ─── Dispatcher v3 launcher service outputs (F4, #3889) ─────────────────────
+# Consumed by operators to drive `aws ecs describe-services` /
+# `update-service` flows and by the v3 deploy workflow when forcing a
+# rollout after a fresh image push.
+
+output "dispatcher_v3_service_name" {
+  description = "Dev dispatcher-v3 launcher ECS service name (`judgemind-dispatcher-v3-dev`). Use with `aws ecs describe-services --cluster judgemind-dev --services <service_name>` to inspect runningCount / deployment status. Spec §6."
+  value       = module.dispatcher_v3_service.service_name
+}
+
+output "dispatcher_v3_service_arn" {
+  description = "Dev dispatcher-v3 launcher ECS service ARN."
+  value       = module.dispatcher_v3_service.service_arn
+}
+
+output "dispatcher_v3_service_security_group_id" {
+  description = "Dev dispatcher-v3 launcher security group ID (outbound HTTPS + Postgres + Redis only). Reference from any module that needs to allow ingress from the launcher (e.g. RDS / Redis security groups)."
+  value       = module.dispatcher_v3_service.security_group_id
 }
