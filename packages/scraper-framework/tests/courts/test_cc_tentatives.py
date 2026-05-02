@@ -37,6 +37,7 @@ from courts.ca.cc_tentatives import (
     _cc_hearing_date_from_pdf,
     _cc_judge_from_pdf,
     _cc_llm_enabled,
+    _extract_calendar_header_case_numbers,
     _llm_extract_rulings,
 )
 from courts.ca.cc_tentatives import default_config as cc_default_config
@@ -1671,12 +1672,14 @@ def test_cc_fetch_probate_hash_filename_hearing_date_llm_path(
         return_value=httpx.Response(200, content=pdf_bytes)
     )
 
+    # Use a real case number from the cc_dept30_031626.pdf fixture calendar headers
+    # so the phantom-ruling guard (#3798) does not drop it.
     mock_extract.return_value = [
         CCSplitRuling(
             ruling_index=1,
-            case_number="P24-00001",
+            case_number="P24-00230",
             ruling_text="The petition is granted.",
-            case_title="Estate of Test",
+            case_title="Conservatorship of: June Stone",
             case_type="probate",
             motion_type=None,
             outcome="granted",
@@ -1727,4 +1730,400 @@ def test_cc_fetch_probate_hash_filename_hearing_date_regex_path(
     doc = docs[0]
     assert doc.hearing_date == datetime(2026, 3, 16), (
         f"Expected hearing_date 2026-03-16 from PDF header, got {doc.hearing_date!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _extract_calendar_header_case_numbers — pure unit tests (#3798)
+# ---------------------------------------------------------------------------
+
+
+def test_cc_extract_calendar_header_case_numbers_civil() -> None:
+    """Format A civil header extracts case numbers correctly."""
+    text = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "DEPARTMENT 16\n"
+        "JUDICIAL OFFICER: BENJAMIN T REYES II\n"
+        "HEARING DATE: 03/11/2026\n\n"
+        "8. 9:00 AM CASE NUMBER: L25-09151\n"
+        "CASE NAME: SMITH V. JONES\n"
+        "*TENTATIVE RULING: Granted.\n\n"
+        "9. 9:30 AM CASE NUMBER: C24-03348\n"
+        "CASE NAME: DOE V. DOE\n"
+        "*TENTATIVE RULING: Denied.\n"
+    )
+    result = _extract_calendar_header_case_numbers(text)
+    assert "L25-09151" in result
+    assert "C24-03348" in result
+
+
+def test_cc_extract_calendar_header_case_numbers_probate() -> None:
+    """Format B probate header extracts case numbers correctly."""
+    text = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "PR - MARTINEZ-WAKEFIELD TAYLOR COURTHOUSE\n"
+        "COURT CALENDAR FOR MARCH 16, 2026\n"
+        "DEPARTMENT 30\n\n"
+        "7. P24-00230 CONSERVATORSHIP OF: JUNE STONE\n"
+        "9:00 AM HEARING\n\n"
+        "8. N25-2307 IN THE MATTER OF: AJAY BHALLA\n"
+    )
+    result = _extract_calendar_header_case_numbers(text)
+    assert "P24-00230" in result
+    assert "N25-2307" in result
+
+
+def test_cc_extract_calendar_header_case_numbers_normalised_uppercase() -> None:
+    """Extracted case numbers are normalised to uppercase."""
+    text = "8. 9:00 AM CASE NUMBER: l25-09151\n"
+    result = _extract_calendar_header_case_numbers(text)
+    # After upper(), the lowercase prefix becomes uppercase
+    assert "L25-09151" in result
+
+
+def test_cc_extract_calendar_header_case_numbers_empty() -> None:
+    """Empty text returns empty set."""
+    assert _extract_calendar_header_case_numbers("") == set()
+
+
+def test_cc_extract_calendar_header_case_numbers_no_headers() -> None:
+    """Text with no calendar headers returns empty set."""
+    result = _extract_calendar_header_case_numbers("Just some random text without any entries.")
+    assert result == set()
+
+
+def test_cc_extract_calendar_header_case_numbers_mixed_formats() -> None:
+    """Both Format A and Format B entries are captured from the same text."""
+    text = (
+        "1. 9:00 AM CASE NUMBER: C23-01234\n"
+        "CASE NAME: ALPHA V. BETA\n\n"
+        "2. P24-00230 CONSERVATORSHIP OF: JUNE STONE\n"
+    )
+    result = _extract_calendar_header_case_numbers(text)
+    assert "C23-01234" in result
+    assert "P24-00230" in result
+
+
+# ---------------------------------------------------------------------------
+# Phantom-ruling guard in fetch_documents (#3798)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_phantom_ruling_dropped_civil_citation(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """Phantom ruling dropped; legitimate ruling preserved (AC#1 verify map).
+
+    Text has one civil calendar entry for L25-09151.  LLM returns two rulings:
+    one legitimate (L25-09151) and one phantom (C24-03348).  The guard must
+    drop the phantom and preserve exactly one doc with case_number L25-09151.
+    """
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Build synthetic PDF text with one civil calendar entry
+    pdf_text_header = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "DEPARTMENT 16\n"
+        "JUDICIAL OFFICER: BENJAMIN T REYES II\n"
+        "HEARING DATE: 03/11/2026\n\n"
+        "8. 9:00 AM CASE NUMBER: L25-09151\n"
+        "CASE NAME: SMITH V. JONES\n"
+        "*TENTATIVE RULING: The motion is granted.\n"
+    )
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    # Build a minimal valid PDF wrapping the text via pdfplumber-compatible bytes
+    # Simplest: use the real fixture but override text extraction via mock
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    # LLM returns one legit ruling and one phantom
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="L25-09151",
+            ruling_text="The motion is granted.",
+            case_title="Smith v. Jones",
+            case_type="civil",
+            motion_type="msj",
+            outcome="granted",
+            parties=[],
+        ),
+        CCSplitRuling(
+            ruling_index=2,
+            case_number="C24-03348",
+            ruling_text="The motion is denied.",
+            case_title="Plaintiff v. Defendant",
+            case_type="civil",
+            motion_type="msj",
+            outcome="denied",
+            parties=[],
+        ),
+    ]
+
+    # Patch _extract_pdf_text to return our synthetic text so the guard can
+    # see only L25-09151 in the calendar headers.
+    with patch("courts.ca.cc_tentatives._extract_pdf_text", return_value=pdf_text_header):
+        docs = scraper.fetch_documents()
+
+    # Exactly one doc — the legitimate one
+    assert len(docs) == 1, (
+        f"Expected 1 doc (phantom dropped), got {len(docs)}: {[d.case_number for d in docs]}"
+    )
+    assert docs[0].case_number == "L25-09151"
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_phantom_ruling_legit_multi_motion_preserved(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """Multi-motion rulings with same case_number are all preserved.
+
+    Lines 7, 8, 9 in the calendar all reference C23-02436.  Three LLM rulings
+    share that case_number — all three must survive the guard (consistency with
+    prompt rule 1, lines 93-95 in the task plan).
+    """
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Three calendar entries all for C23-02436
+    pdf_text_header = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "DEPARTMENT 16\n"
+        "JUDICIAL OFFICER: BENJAMIN T REYES II\n"
+        "HEARING DATE: 03/11/2026\n\n"
+        "7. 9:00 AM CASE NUMBER: C23-02436\n"
+        "CASE NAME: ALPHA V. BETA\n"
+        "*HEARING ON MOTION IN RE: MOTION TO COMPEL\n"
+        "*TENTATIVE RULING: Granted.\n\n"
+        "8. 9:15 AM CASE NUMBER: C23-02436\n"
+        "CASE NAME: ALPHA V. BETA\n"
+        "*HEARING ON MOTION IN RE: MOTION FOR SANCTIONS\n"
+        "*TENTATIVE RULING: Denied.\n\n"
+        "9. 9:30 AM CASE NUMBER: C23-02436\n"
+        "CASE NAME: ALPHA V. BETA\n"
+        "*HEARING ON MOTION IN RE: MOTION TO STRIKE\n"
+        "*TENTATIVE RULING: Granted.\n"
+    )
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    # LLM returns three rulings all with C23-02436
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=7,
+            case_number="C23-02436",
+            ruling_text="Granted.",
+            case_title="Alpha v. Beta",
+            case_type="civil",
+            motion_type="motion_to_compel",
+            outcome="granted",
+            parties=[],
+        ),
+        CCSplitRuling(
+            ruling_index=8,
+            case_number="C23-02436",
+            ruling_text="Denied.",
+            case_title="Alpha v. Beta",
+            case_type="civil",
+            motion_type="motion_for_sanctions",
+            outcome="denied",
+            parties=[],
+        ),
+        CCSplitRuling(
+            ruling_index=9,
+            case_number="C23-02436",
+            ruling_text="Granted.",
+            case_title="Alpha v. Beta",
+            case_type="civil",
+            motion_type="motion_to_strike",
+            outcome="granted",
+            parties=[],
+        ),
+    ]
+
+    with patch("courts.ca.cc_tentatives._extract_pdf_text", return_value=pdf_text_header):
+        docs = scraper.fetch_documents()
+
+    # All three must be preserved — same case_number in three valid calendar entries
+    assert len(docs) == 3, f"Expected 3 docs (multi-motion, all legit), got {len(docs)}"
+    for doc in docs:
+        assert doc.case_number == "C23-02436"
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_phantom_ruling_probate_format_b(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """Probate Format B: phantom dropped, legitimate probate ruling preserved."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    pdf_text_header = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "PR - MARTINEZ-WAKEFIELD TAYLOR COURTHOUSE\n"
+        "COURT CALENDAR FOR MARCH 16, 2026\n"
+        "DEPARTMENT 30\n\n"
+        "7. P24-00230 CONSERVATORSHIP OF: JUNE STONE\n"
+        "9:00 AM HEARING\n"
+    )
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 30\\30_031626.pdf">Mar 16</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept30_031626.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    # LLM returns one legit probate ruling and one phantom civil ruling
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=7,
+            case_number="P24-00230",
+            ruling_text="Petition granted.",
+            case_title="Conservatorship of: June Stone",
+            case_type="probate",
+            motion_type="petition",
+            outcome="granted",
+            parties=[],
+        ),
+        CCSplitRuling(
+            ruling_index=99,
+            case_number="C24-03348",
+            ruling_text="Some phantom ruling.",
+            case_title="Phantom v. Case",
+            case_type="civil",
+            motion_type="msj",
+            outcome="denied",
+            parties=[],
+        ),
+    ]
+
+    with patch("courts.ca.cc_tentatives._extract_pdf_text", return_value=pdf_text_header):
+        docs = scraper.fetch_documents()
+
+    assert len(docs) == 1, (
+        f"Expected 1 doc (phantom dropped), got {len(docs)}: {[d.case_number for d in docs]}"
+    )
+    assert docs[0].case_number == "P24-00230"
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_phantom_ruling_null_case_number_passthrough(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """Rulings with case_number=None are appended unchanged (out of scope for guard)."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    # Calendar text has no case number entries (empty valid_cns set)
+    pdf_text_header = (
+        "SUPERIOR COURT OF CALIFORNIA, CONTRA COSTA COUNTY\n"
+        "DEPARTMENT 16\n"
+        "JUDICIAL OFFICER: BENJAMIN T REYES II\n"
+        "HEARING DATE: 03/11/2026\n"
+        "Some preamble with no calendar entries.\n"
+    )
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    # LLM returns one ruling with null case_number
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number=None,
+            ruling_text="Some ruling without a case number.",
+            case_title=None,
+            case_type=None,
+            motion_type=None,
+            outcome=None,
+            parties=[],
+        ),
+    ]
+
+    with patch("courts.ca.cc_tentatives._extract_pdf_text", return_value=pdf_text_header):
+        docs = scraper.fetch_documents()
+
+    # Null case_number ruling must pass through (guard only fires on non-null)
+    assert len(docs) == 1
+    assert docs[0].case_number is None
+
+
+# ---------------------------------------------------------------------------
+# Prompt consistency test (#3798, AC#2)
+# ---------------------------------------------------------------------------
+
+
+def test_contra_costa_prompt_no_plaintiff_v_defendant_literal() -> None:
+    """AC#2 verify: prompt must not contain 'Plaintiff v. Defendant' literal.
+
+    The old rule 3 used generic role words as party names.  The fix must
+    replace this with explicit naming from the CASE NAME line, with a null
+    fallback.  Two conditions are checked:
+    1. The literal 'Plaintiff v. Defendant' (role-word placeholder) is gone.
+    2. The phrase 'return null' appears in the prompt (null fallback added).
+    """
+    from framework.prompts.contra_costa import CONTRA_COSTA_SYSTEM_PROMPT
+
+    # AC#2 verify condition 1: no role-word placeholder
+    assert "Plaintiff v. Defendant" not in CONTRA_COSTA_SYSTEM_PROMPT, (
+        "Prompt must not contain generic 'Plaintiff v. Defendant' role-word placeholder. "
+        "Fix rule 3 to use actual party names from the CASE NAME line."
+    )
+
+    # AC#2 verify condition 2: null fallback added for missing/ambiguous CASE NAME
+    assert "return null" in CONTRA_COSTA_SYSTEM_PROMPT, (
+        "Prompt must contain 'return null' in the case_title section "
+        "as a fallback when CASE NAME line is missing or ambiguous."
     )

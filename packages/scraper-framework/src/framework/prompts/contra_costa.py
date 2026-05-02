@@ -129,8 +129,12 @@ CONTRA_COSTA_SYSTEM_PROMPT = (
     "there is one ruling.\n\n"
     "2. Extract the case number EXACTLY as it appears in the PDF.\n"
     "3. For case_title:\n"
-    "   - Civil: construct 'Plaintiff v. Defendant' from the "
-    "CASE NAME line. Convert ALL-CAPS to title case.\n"
+    '   - Civil: use "<plaintiff_name> v. <defendant_name>" using '
+    "the actual party names from the CASE NAME line (e.g., "
+    '"Jpmorgan Chase Bank N.A. v. Shannon Hagmann"). If the '
+    "CASE NAME line is missing or you cannot confidently identify "
+    "both party names, return null. Do NOT emit the role words "
+    '"Plaintiff" or "Defendant" as party names.\n'
     "   - Probate: use the name as given (e.g., 'In the Matter "
     "of: Ajay Bhalla', 'Conservatorship of: June Stone'). "
     "Convert ALL-CAPS to title case.\n"
