@@ -49,9 +49,10 @@ def _make_cluster(
     court: str = "/api/rest/v4/courts/scotus/",
     precedential_status: str = "Published",
     date_modified: str = "2026-03-05T12:00:00Z",
+    docket: str | None = None,
 ) -> dict:
     """Build a sample CourtListener OpinionCluster response."""
-    return {
+    cluster: dict = {
         "id": cluster_id,
         "case_name": case_name,
         "case_name_short": case_name.split(" v. ")[0] if " v. " in case_name else case_name,
@@ -63,7 +64,13 @@ def _make_cluster(
         "date_modified": date_modified,
         "citation_count": 5,
         "absolute_url": f"/opinion/{cluster_id}/smith-v-jones/",
+        "docket": (
+            docket
+            if docket is not None
+            else f"{API_BASE_URL}/dockets/{cluster_id * 10}/?format=json"
+        ),
     }
+    return cluster
 
 
 def _make_opinion(
@@ -274,6 +281,99 @@ class TestCourtListenerClient:
         assert client.request_count == 2
         client.close()
 
+    @respx.mock
+    def test_fetch_docket(self) -> None:
+        """fetch_docket returns the parsed docket dict from a single GET."""
+        docket_data = {
+            "id": 123,
+            "docket_number": "1:24-cv-00123-ABC",
+            "case_name": "Alpha v. Beta",
+        }
+        respx.get(f"{API_BASE_URL}/dockets/123/").mock(
+            return_value=httpx.Response(200, json=docket_data)
+        )
+
+        client = CourtListenerClient(request_delay=0)
+        result = client.fetch_docket(f"{API_BASE_URL}/dockets/123/")
+        client.close()
+
+        assert result == docket_data
+        assert client.request_count == 1
+
+    @respx.mock
+    def test_fetch_dockets_for_clusters_batch(self) -> None:
+        """All three docket URLs resolve and request_count increments per fetch."""
+        docket_map = {
+            10: f"{API_BASE_URL}/dockets/10/?format=json",
+            20: f"{API_BASE_URL}/dockets/20/?format=json",
+            30: f"{API_BASE_URL}/dockets/30/?format=json",
+        }
+
+        def _mock_docket(request: httpx.Request) -> httpx.Response:
+            # Extract docket id from path e.g. /api/rest/v4/dockets/10/
+            path_parts = str(request.url.path).rstrip("/").split("/")
+            docket_id = int(path_parts[-1])
+            return httpx.Response(
+                200,
+                json={"id": docket_id, "docket_number": f"1:24-cv-0{docket_id}"},
+            )
+
+        respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_docket)
+
+        client = CourtListenerClient(request_delay=0)
+        result = client.fetch_dockets_for_clusters(docket_map)
+        client.close()
+
+        assert set(result.keys()) == {10, 20, 30}
+        assert result[10]["docket_number"] == "1:24-cv-010"
+        assert result[20]["docket_number"] == "1:24-cv-020"
+        assert result[30]["docket_number"] == "1:24-cv-030"
+        assert client.request_count == 3
+
+    @respx.mock
+    def test_fetch_dockets_for_clusters_partial_failure(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A 500 for one docket URL returns {} for that cluster id; others succeed.
+
+        Also verifies that a warning is logged for the failing cluster.
+        """
+        docket_map = {
+            100: f"{API_BASE_URL}/dockets/100/?format=json",
+            200: f"{API_BASE_URL}/dockets/200/?format=json",
+            300: f"{API_BASE_URL}/dockets/300/?format=json",
+        }
+        failing_path = "/api/rest/v4/dockets/200/"
+
+        def _mock_docket(request: httpx.Request) -> httpx.Response:
+            if (
+                str(request.url.path).startswith(failing_path.rstrip("/") + "/")
+                or str(request.url.path) == failing_path
+                or str(request.url.path).rstrip("/") == failing_path.rstrip("/")
+            ):
+                return httpx.Response(500, json={"detail": "Server error"})
+            path_parts = str(request.url.path).rstrip("/").split("/")
+            docket_id = int(path_parts[-1])
+            return httpx.Response(200, json={"id": docket_id, "docket_number": f"case-{docket_id}"})
+
+        respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_docket)
+
+        client = CourtListenerClient(request_delay=0)
+        result = client.fetch_dockets_for_clusters(docket_map)
+        client.close()
+
+        # Failing cluster maps to empty dict
+        assert result[200] == {}
+        # Successful clusters return their dockets
+        assert result[100]["docket_number"] == "case-100"
+        assert result[300]["docket_number"] == "case-300"
+        # All three cluster IDs in result
+        assert set(result.keys()) == {100, 200, 300}
+
+        # Warning for the failing cluster_id should be in stdout
+        captured = capsys.readouterr()
+        assert "200" in captured.out
+
 
 # ---------------------------------------------------------------------------
 # Data mapping helper tests
@@ -289,10 +389,36 @@ class TestDataMapping:
         assert _extract_docket_number(cluster) == "22-1234"
 
     def test_extract_docket_number_missing(self) -> None:
-        """Return None when docket number is missing."""
-        cluster = _make_cluster()
+        """Return CL-cluster-<id> fallback when both cluster and docket have no docket number."""
+        cluster = _make_cluster(cluster_id=1001)
         cluster["docket_number"] = None
-        assert _extract_docket_number(cluster) is None
+        assert _extract_docket_number(cluster) == "CL-cluster-1001"
+
+    def test_extract_docket_number_uses_docket_sub_resource(self) -> None:
+        """Prefer docket sub-resource docket_number over cluster docket_number=None.
+
+        Covers the issue's hand-verified payload shape for cluster 10841826.
+        """
+        cluster = _make_cluster(cluster_id=10841826)
+        cluster["docket_number"] = None
+        docket = {"docket_number": "1:24-cv-04372-JPB", "id": 73251044}
+        assert _extract_docket_number(cluster, docket=docket) == "1:24-cv-04372-JPB"
+
+    def test_extract_docket_number_falls_back_to_cl_cluster_id(self) -> None:
+        """Return CL-cluster-<id> when both cluster and docket have empty docket_number.
+
+        Covers the issue's hand-verified payload shape for cluster 10850488.
+        """
+        cluster = _make_cluster(cluster_id=10850488)
+        cluster["docket_number"] = None
+        docket = {"docket_number": None, "id": 99999}
+        assert _extract_docket_number(cluster, docket=docket) == "CL-cluster-10850488"
+
+    def test_extract_docket_number_prefers_docket_over_cluster(self) -> None:
+        """When both docket and cluster have docket_number, docket value wins."""
+        cluster = _make_cluster(cluster_id=5000, docket_number="cluster-side-value")
+        docket = {"docket_number": "docket-side-value", "id": 12345}
+        assert _extract_docket_number(cluster, docket=docket) == "docket-side-value"
 
     def test_extract_judge_names(self) -> None:
         """Extract judge names from cluster."""
@@ -664,7 +790,11 @@ class TestCourtListenerScraper:
 
     @respx.mock
     def test_missing_case_fields_handled(self) -> None:
-        """Scraper handles clusters with missing optional fields gracefully."""
+        """Scraper handles clusters with missing optional fields gracefully.
+
+        doc.case_number uses the deterministic CL-cluster-<id> fallback path
+        when both cluster.docket_number and docket sub-resource are absent.
+        """
         cluster = {
             "id": 9999,
             "case_name": None,
@@ -676,6 +806,7 @@ class TestCourtListenerScraper:
             "precedential_status": None,
             "date_modified": "2026-03-05T12:00:00Z",
             "citation_count": 0,
+            # No docket URL so no sub-resource fetch occurs
         }
         opinion = _make_opinion(plain_text="Some opinion text")
 
@@ -694,10 +825,49 @@ class TestCourtListenerScraper:
         assert len(docs) == 1
         doc = docs[0]
         assert doc.case_title is None
-        assert doc.case_number is None
+        # Deterministic fallback: CL-cluster-<id> (never None)
+        assert doc.case_number == "CL-cluster-9999"
         assert doc.judge_name is None
         assert doc.hearing_date is None
         assert doc.ruling_text == "Some opinion text"
+
+    @respx.mock
+    def test_case_number_resolved_from_docket_sub_resource(self) -> None:
+        """Full integration: cluster.docket_number=None resolved via docket sub-resource.
+
+        Verifies the fix for UNKNOWN-% case numbers by fetching the docket URL
+        and using docket_number from the docket response.
+        """
+        docket_url = f"{API_BASE_URL}/dockets/73251044/?format=json"
+        cluster = _make_cluster(
+            cluster_id=10841826,
+            docket_number=None,
+            docket=docket_url,
+        )
+        # Override docket_number to None explicitly (make_cluster might set it)
+        cluster["docket_number"] = None
+
+        opinion = _make_opinion(plain_text="Federal court opinion text")
+
+        respx.get(f"{API_BASE_URL}/clusters/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([cluster]))
+        )
+        respx.get(f"{API_BASE_URL}/opinions/").mock(
+            return_value=httpx.Response(200, json=_make_paginated_response([opinion]))
+        )
+        respx.get(docket_url).mock(
+            return_value=httpx.Response(
+                200, json={"id": 73251044, "docket_number": "1:24-cv-04372-JPB"}
+            )
+        )
+
+        config = _make_scraper_config()
+        client = CourtListenerClient(request_delay=0)
+        scraper = CourtListenerScraper(config, client=client, days_back=7)
+        docs = scraper.fetch_documents()
+
+        assert len(docs) == 1
+        assert docs[0].case_number == "1:24-cv-04372-JPB"
 
 
 # ---------------------------------------------------------------------------
