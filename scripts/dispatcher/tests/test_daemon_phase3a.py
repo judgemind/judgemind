@@ -3848,6 +3848,77 @@ class TestQueueScanExcludesNeedsHumanLabel:
         assert [i["number"] for i in issues] == [1, 3]
 
 
+class TestQueueScanExcludesDispatcherV3OnlyLabel:
+    """``_fetch_agent_ready_issues`` filters out ``dispatcher/v3-only`` (#3877).
+
+    During dispatcher-v3 cap=1 smoke / ramp, operators add
+    ``dispatcher/v3-only`` to specific issues so v3 (and only v3)
+    claims them. Without this consumer-side filter, v2's queue scan
+    would happily return the issue, the dispatcher would atomically
+    claim it before v3's launcher saw it, and the operator's
+    force-route never happens. The fix mirrors the existing
+    ``status/in-progress`` / ``status/needs-human`` filters: one
+    literal-string check inside the same loop.
+
+    See ``docs/specs/dispatcher-v3-spec.md`` §8.2 item 3.
+    """
+
+    def test_v3_only_label_excludes_issue_from_candidate_list(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """Issues carrying ``dispatcher/v3-only`` alongside ``agent/ready`` drop.
+
+        The operator-side write is the producer; this filter is the
+        consumer side. Without it, v2 races v3 to claim the smoke
+        issue and the force-route the operator wanted never happens.
+        """
+        d, _conn, _handler = _make_daemon(tmp_path)
+
+        def fake_run(cmd: list[str], **_kwargs: Any) -> Any:
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            r.stdout = json.dumps(
+                [
+                    {
+                        "number": 1,
+                        "labels": [{"name": "agent/ready"}],
+                        "title": "ok",
+                    },
+                    {
+                        "number": 2,
+                        "labels": [
+                            {"name": "agent/ready"},
+                            {"name": daemon.DISPATCHER_V3_ONLY_LABEL},
+                        ],
+                        "title": "v3-only smoke",
+                    },
+                    {
+                        "number": 3,
+                        "labels": [{"name": "agent/ready"}],
+                        "title": "ok2",
+                    },
+                ]
+            )
+            return r
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        issues = d._fetch_agent_ready_issues()
+        # #2 drops; #1 + #3 remain.
+        assert [i["number"] for i in issues] == [1, 3]
+
+    def test_dispatcher_v3_only_label_constant_value(self) -> None:
+        """The constant matches the literal string the spec + label require.
+
+        This pins the literal so a rename in code without an
+        accompanying GitHub label rename + spec edit can't slip
+        through silently. The label name appears in
+        ``docs/specs/dispatcher-v3-spec.md`` §8.2 and is created by
+        ``ensure_required_labels`` at boot.
+        """
+        assert daemon.DISPATCHER_V3_ONLY_LABEL == "dispatcher/v3-only"
+
+
 class TestGhIssueRemoveLabelsHelper:
     """Thin helper tests for :meth:`_gh_issue_remove_labels` (#2866)."""
 

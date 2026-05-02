@@ -1191,6 +1191,10 @@ class TestEnsureRequiredLabels:
         assert attempted >= 1
         # status/needs-human is in the essential set.
         assert any("status/needs-human" in c for c in calls)
+        # dispatcher/v3-only is in the essential set (#3877). The v2
+        # daemon creates this label on boot so operators can add it to
+        # smoke-route issues without first running ``gh label create``.
+        assert any(daemon.DISPATCHER_V3_ONLY_LABEL in c for c in calls)
         # --force is passed so re-runs are idempotent (gh 'create' is
         # otherwise non-idempotent — it errors on an existing label).
         assert any("--force" in c for c in calls)

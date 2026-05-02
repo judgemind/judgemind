@@ -821,6 +821,18 @@ ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded", "needs_review")
 #: atomic interlock; the label is human + queue-scan visible.
 STATUS_IN_PROGRESS_LABEL = "status/in-progress"
 
+#: Label that forces v2's claim step to skip an issue, leaving it for
+#: dispatcher-v3 to pick up (issue #3877; see
+#: ``docs/specs/dispatcher-v3-spec.md`` §8.2 item 3). Operators add this
+#: label to a trusted issue during v3's cap=1 smoke / ramp so v2 cannot
+#: race v3 to claim it. Without this filter, v2 would claim the smoke
+#: issue first and v3 would never get a chance to exercise the path the
+#: operator was trying to verify. v3 has no equivalent label today —
+#: v3 claims any ``agent/ready`` issue not already in v2's hands; if
+#: bounding v3 claims becomes useful during ramp, a symmetric
+#: ``dispatcher/v2-only`` filter can be added on the v3 side.
+DISPATCHER_V3_ONLY_LABEL = "dispatcher/v3-only"
+
 #: ``dispatcher.agents.kind`` value used by the ``/task`` skill's claim
 #: rows (issue #2866). Distinct from the daemon's default ``'task'``
 #: value so :meth:`_atomic_claim`'s UniqueViolation handler can emit a
@@ -4145,9 +4157,12 @@ class DispatcherDaemon:
         Returns a list of issue dicts as parsed from ``gh``'s JSON output.
         Each dict has at minimum ``number``, ``title``, ``labels``,
         ``createdAt``. Filters out issues that also carry
-        ``status/blocked`` (defensive — the label-filter flag on ``gh``
-        already excludes them in practice, but a label name change on
-        the server side should not silently inflate the queue count).
+        ``status/blocked``, ``status/in-progress``, ``status/needs-human``,
+        or ``dispatcher/v3-only`` (defensive — the label-filter flag on
+        ``gh`` already excludes ``status/blocked`` in practice, but a
+        label name change on the server side should not silently
+        inflate the queue count, and the other three are not on the
+        ``--label`` flag at all).
 
         Raises :class:`RuntimeError` on subprocess failure so the caller
         (``_scan_queue_and_snapshot``) can log + return -1 for the tick.
@@ -4210,23 +4225,30 @@ class DispatcherDaemon:
             )
 
         # Defensive filter: drop rows that also carry ``status/blocked``,
-        # ``status/in-progress``, or ``status/needs-human``. The
-        # ``gh --label agent/ready`` call returns issues that carry the
-        # label; a blocked, in-progress, or human-flagged issue that
-        # still has ``agent/ready`` attached (e.g. mid-transition or
-        # mid-escalation) should not inflate the queue depth because
-        # the daemon would never spawn on it. ``status/in-progress`` is
-        # the /task-skill↔daemon interlock signal — after #2927 the
-        # /task subagent uses label-only coordination (add
-        # ``status/in-progress`` BEFORE removing ``agent/ready``), so
-        # the label here is the sole race-defense primitive. The
-        # daemon's pre-claim recheck in ``_atomic_claim`` re-reads the
-        # label set at claim time to close the ~100ms propagation race.
+        # ``status/in-progress``, ``status/needs-human``, or
+        # ``dispatcher/v3-only``. The ``gh --label agent/ready`` call
+        # returns issues that carry the label; a blocked, in-progress,
+        # human-flagged, or v3-only issue that still has ``agent/ready``
+        # attached (e.g. mid-transition or operator-routed) should not
+        # inflate the queue depth because the daemon would never spawn
+        # on it. ``status/in-progress`` is the /task-skill↔daemon
+        # interlock signal — after #2927 the /task subagent uses
+        # label-only coordination (add ``status/in-progress`` BEFORE
+        # removing ``agent/ready``), so the label here is the sole
+        # race-defense primitive. The daemon's pre-claim recheck in
+        # ``_atomic_claim`` re-reads the label set at claim time to
+        # close the ~100ms propagation race.
         # ``status/needs-human`` is the diagnoser's escalation signal
         # (see ``_diagnose_and_escalate``); without this consumer-side
         # filter the daemon would re-claim a needs-human issue every
         # tick and waste a full agent run before reaching
         # ``push_and_pr_no_unmerged_files`` (#3825).
+        # ``dispatcher/v3-only`` is the operator's force-route signal
+        # for dispatcher-v3 cap=1 smoke / ramp (issue #3877;
+        # ``docs/specs/dispatcher-v3-spec.md`` §8.2 item 3). Without
+        # this filter v2 would claim the smoke issue and v3 would
+        # never see it; v3 has no equivalent claim filter today and
+        # claims any ``agent/ready`` issue not already in v2's hands.
         filtered: list[dict[str, Any]] = []
         for issue in issues:
             if not isinstance(issue, dict):
@@ -4240,6 +4262,8 @@ class DispatcherDaemon:
             if STATUS_IN_PROGRESS_LABEL in label_names:
                 continue
             if "status/needs-human" in label_names:
+                continue
+            if DISPATCHER_V3_ONLY_LABEL in label_names:
                 continue
             filtered.append(issue)
         return filtered
@@ -5542,6 +5566,11 @@ class DispatcherDaemon:
                 "source/dispatcher-audit",
                 "FBCA04",
                 "Filed by /dispatcher-audit periodic operational-health check",
+            ),
+            (
+                DISPATCHER_V3_ONLY_LABEL,
+                "FBCA04",
+                "Force-route this issue to dispatcher v3 only (v2 skips)",
             ),
         ]
         attempted = 0
