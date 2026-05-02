@@ -118,9 +118,24 @@ locals {
   # IAM rejects `Resource = []` with `MalformedPolicyDocument` (see
   # the analogous guard in modules/dispatcher-daemon/main.tf), so the
   # policy resource itself is skipped via `count = 0` when empty.
+  #
+  # Why every secret threaded through F2's task-defs MUST appear here:
+  # ECS injects `secrets[].valueFrom` entries at task-start time using
+  # the execution role -- NOT the task role. So even though the agent
+  # task role has broad Secrets Manager read in dev (for runtime reads
+  # like `scripts/with-secret.sh`), the task itself fails to even
+  # start with `ResourceInitializationError: AccessDeniedException` if
+  # the execution role lacks GetSecretValue on the per-task-def
+  # secret list. F4 (#3889) surfaced this with the launcher task
+  # failing to pull DATABASE_URL despite the launcher role having
+  # rds-db:connect to judgemind_dispatcher. The fix is to compact
+  # every secret ARN F2's `agent_secrets` and `launcher_secrets`
+  # blocks reference, here.
   execution_secret_arns = compact([
     var.telegram_bot_token_secret_arn,
     var.github_token_secret_arn,
+    var.anthropic_api_key_secret_arn,
+    var.db_connection_secret_arn,
   ])
 }
 

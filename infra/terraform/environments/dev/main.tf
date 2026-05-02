@@ -427,6 +427,16 @@ module "dispatcher_v3_iam" {
   # secret as v2. F2 will inject this into the task-runner / diagnoser
   # task definitions for `gh auth setup-git` inside the agent.
   github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+
+  # Anthropic + DB secrets — F2's task-defs pass these to ECS as
+  # `secrets[]` entries, which means the EXECUTION role (not the agent
+  # task role) is the principal that performs `secretsmanager:GetSecretValue`
+  # at task-start. The execution role's secret-read policy compacts both
+  # ARNs into its Resource list. Without these, the launcher task fails
+  # with `ResourceInitializationError: AccessDeniedException` -- the
+  # exact failure mode F4 (#3889) hit on first deploy.
+  anthropic_api_key_secret_arn = data.aws_secretsmanager_secret.anthropic_api_key.arn
+  db_connection_secret_arn     = module.database.db_connection_secret_arn
 }
 
 # ─── Dispatcher v3 sessions bucket (#3891) ──────────────────────────────────
