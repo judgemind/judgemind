@@ -1196,3 +1196,270 @@ class TestInfraPreemptionFilter:
         opened = handler.events("circuit_breaker_opened")
         assert len(opened) == 1
         assert opened[0].bad_count == 5  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------
+# v2-scope filter — issue #3876.
+#
+# During v2/v3 cohabitation v3's terminal_outcomes rows land in the same
+# table v2 reads. Without scoping, a cluster of v3 failures during ramp
+# would count toward v2's circuit-breaker threshold and prematurely flip
+# v2's ``concurrency_cap`` to 0. The fix threads
+# :data:`daemon.V2_SCOPED_PARENT_RUN_FILTER` (the same constant used by
+# the ``dispatcher.agents`` recovery sites in #3875) into the
+# ``terminal_outcomes`` rolling-window scan in
+# :meth:`_evaluate_circuit_breaker` AND the auto-close re-scan in
+# :meth:`_cb_current_bad_count`.
+#
+# These tests assert two halves of the contract:
+#
+# 1. **SQL shape** — the rolling-window SELECT contains
+#    ``parent_run_id`` and references ``dispatcher.runs`` (the
+#    correlated subquery that keeps the row only when its
+#    ``parent_run_id`` belongs to a v2 run). This is the static guard
+#    that catches a future PR removing the filter.
+# 2. **Behavior** — the fake-cursor breaker scenarios assume that the
+#    DB has already filtered the result set to v2-owned rows (the
+#    SQL-shape test ensures the filter is in the query). Given that
+#    pre-filter, the existing trip / no-trip semantics are preserved
+#    for v2 outcomes (regression for the existing behavior). The "v3
+#    rows do not trip v2's breaker" scenario is then asserted by
+#    feeding an empty fetchall — the analogue of "the parent_run_id
+#    filter excluded every v3 row from the rolling window."
+# --------------------------------------------------------------------------
+
+
+class TestEvaluateCircuitBreakerV2ScopeFilter:
+    """``_evaluate_circuit_breaker`` filters by ``V2_SCOPED_PARENT_RUN_FILTER``.
+
+    Issue #3876 — scope v2's breaker to its own outcomes during v2/v3
+    cohabitation so v3-owned terminal_outcomes rows cannot trip v2's
+    cap.
+    """
+
+    def _stub_config_reads(
+        self,
+        conn: _FakeConnection,
+        *,
+        enabled: Any = True,
+        window_minutes: Any = 30,
+        window_size: Any = 10,
+        threshold: Any = 5,
+    ) -> None:
+        conn.cursor_instance.fetch_queue.extend(
+            [
+                (enabled,),
+                (window_minutes,),
+                (window_size,),
+                (threshold,),
+            ]
+        )
+
+    def test_scan_query_includes_v2_parent_run_id_filter(self, tmp_path: Path) -> None:
+        """The rolling-window SELECT carries the v2-scope filter (#3876).
+
+        The captured SQL must reference ``parent_run_id`` (the column
+        the filter checks) AND ``dispatcher.runs`` (the correlated
+        subquery that limits parent_run_id to v2 runs). This is a
+        regression guard against a future PR removing
+        :data:`V2_SCOPED_PARENT_RUN_FILTER` from the breaker query.
+        """
+        d, conn, _h = _make_daemon(tmp_path)
+        self._stub_config_reads(conn)
+        # Empty scan — we only care about the SQL string.
+        conn.cursor_instance.fetchall_queue.append([])
+
+        d._evaluate_circuit_breaker("agent-scope")
+
+        scans = [
+            e
+            for e in conn.cursor_instance.executed
+            if "dispatcher.terminal_outcomes" in e[0]
+        ]
+        assert len(scans) == 1, (
+            f"expected one terminal_outcomes scan, got {len(scans)}: {scans!r}"
+        )
+        sql = scans[0][0]
+        assert "parent_run_id" in sql, (
+            f"breaker scan must filter by parent_run_id post-#3876: {sql!r}"
+        )
+        assert "dispatcher.runs" in sql, (
+            "breaker scan must correlate parent_run_id against "
+            f"dispatcher.runs (v2-scope filter, #3876): {sql!r}"
+        )
+        assert "dispatcher_version = 'v2'" in sql, (
+            f"breaker scan must restrict to v2 runs (#3876): {sql!r}"
+        )
+        # Defensive: ensure the filter is anchored on the t.* alias so
+        # the correlation is unambiguous (the breaker query joins
+        # terminal_outcomes ``t`` with a correlated dispatcher.failures
+        # subquery — the filter must reference t.parent_run_id).
+        assert "t.parent_run_id" in sql, (
+            f"v2-scope filter must use the t.* alias for parent_run_id: {sql!r}"
+        )
+
+    def test_three_v3_outcomes_do_not_trip_v2_breaker(self, tmp_path: Path) -> None:
+        """Issue #3876 AC: 3 v3 terminal_outcomes within 1h → v2 breaker stays closed.
+
+        With the v2-scope filter in the SELECT, the DB excludes v3-owned
+        rows from the rolling-window result set entirely. The breaker
+        sees an empty window — bad_count=0 < threshold=3 — so it does
+        NOT trip. We model "the DB filtered them all out" by feeding
+        an empty fetchall result, which is exactly what the v2-scope
+        filter produces when every recent terminal_outcome belongs to
+        a v3 run.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        # Threshold 3 so 3 bad outcomes WOULD trip if they reached the
+        # classifier. But the DB-side v2-scope filter strips them, so
+        # the fetchall is empty.
+        self._stub_config_reads(conn, window_minutes=60, window_size=10, threshold=3)
+        conn.cursor_instance.fetchall_queue.append([])
+
+        tripped = d._evaluate_circuit_breaker("v2-agent")
+
+        assert tripped is False, (
+            "v3 terminal_outcomes must not trip v2's breaker — the "
+            "v2-scope filter excludes them at the SELECT (#3876)"
+        )
+        # No cap flip.
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0] and "concurrency_cap" in e[0]
+        ]
+        assert cap_updates == []
+        assert handler.events("circuit_breaker_opened") == []
+
+    def test_three_v2_outcomes_still_trip_v2_breaker(self, tmp_path: Path) -> None:
+        """Issue #3876 AC: 3 v2 terminal_outcomes within 1h → v2 breaker DOES trip.
+
+        Regression guard for the existing behavior: when the
+        rolling-window contains v2-owned bad outcomes, the breaker
+        must still flip ``concurrency_cap`` to 0. The fake-cursor
+        feeds 3 v2-owned ``failed`` rows (no infra category) — same
+        shape the DB returns when ``V2_SCOPED_PARENT_RUN_FILTER``
+        keeps every row.
+        """
+        d, conn, handler = _make_daemon(tmp_path)
+        self._stub_config_reads(conn, window_minutes=60, window_size=10, threshold=3)
+        # 3 bad rows survive the v2-scope filter (they're v2-owned).
+        conn.cursor_instance.fetchall_queue.append(
+            [
+                ("failed", None),
+                ("failed", None),
+                ("crashed", None),
+            ]
+        )
+        # current_cap read after the threshold check fires.
+        conn.cursor_instance.fetch_queue.append((1,))
+
+        tripped = d._evaluate_circuit_breaker("v2-agent")
+
+        assert tripped is True, (
+            "v2 terminal_outcomes must still trip v2's breaker after #3876"
+        )
+        cap_updates = [
+            e
+            for e in conn.cursor_instance.executed
+            if "UPDATE dispatcher.config" in e[0]
+            and "concurrency_cap" in e[0]
+            and e[1] == ("circuit_breaker",)
+        ]
+        assert len(cap_updates) == 1
+        opened = handler.events("circuit_breaker_opened")
+        assert len(opened) == 1
+        assert opened[0].bad_count == 3  # type: ignore[attr-defined]
+
+
+class TestCBCurrentBadCountV2ScopeFilter:
+    """``_cb_current_bad_count`` mirrors the v2-scope filter (#3876).
+
+    The auto-close re-scan must use the same scope as the open path —
+    otherwise a cluster of v3 successes (or v3 bad outcomes that age
+    out on a different cadence) could spuriously close v2's breaker
+    while v2's actual bad-outcome cluster is still over threshold.
+    """
+
+    def test_auto_close_scan_query_includes_v2_parent_run_id_filter(
+        self, tmp_path: Path
+    ) -> None:
+        """Auto-close re-scan SELECT carries the v2-scope filter (#3876)."""
+        d, conn, _h = _make_daemon(tmp_path)
+        # Empty result — we only care about the SQL string.
+        conn.cursor_instance.fetchall_queue.append([])
+
+        d._cb_current_bad_count(window_minutes=30, window_size=10)
+
+        scans = [
+            e
+            for e in conn.cursor_instance.executed
+            if "dispatcher.terminal_outcomes" in e[0]
+        ]
+        assert len(scans) == 1, (
+            f"expected one terminal_outcomes scan, got {len(scans)}: {scans!r}"
+        )
+        sql = scans[0][0]
+        assert "parent_run_id" in sql, (
+            f"auto-close scan must filter by parent_run_id (#3876): {sql!r}"
+        )
+        assert "dispatcher.runs" in sql, (
+            "auto-close scan must correlate parent_run_id against "
+            f"dispatcher.runs (#3876): {sql!r}"
+        )
+        assert "dispatcher_version = 'v2'" in sql, (
+            f"auto-close scan must restrict to v2 runs (#3876): {sql!r}"
+        )
+        assert "t.parent_run_id" in sql, (
+            f"v2-scope filter must use the t.* alias for parent_run_id: {sql!r}"
+        )
+
+    def test_v3_rows_excluded_yields_zero_bad_count(self, tmp_path: Path) -> None:
+        """Auto-close: v3 rows excluded by the filter → bad_count=0.
+
+        Models the steady-state where every recent ``terminal_outcomes``
+        row is v3-owned. The DB's v2-scope filter strips them all from
+        the result set, so the bad-outcome count is 0 and the
+        auto-close caller can proceed to clear the flag (assuming
+        the operator-window check has elapsed).
+        """
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetchall_queue.append([])
+
+        bad = d._cb_current_bad_count(window_minutes=30, window_size=10)
+
+        assert bad == 0
+
+
+class TestWriteTerminalOutcomeWritesParentRunId:
+    """``_write_terminal_outcome`` populates ``parent_run_id`` on insert.
+
+    Issue #3876 acceptance criterion (re-asserted from #3872 / PR #3893):
+    after a v2 agent fails, the terminal_outcomes row must carry the
+    v2-owned ``parent_run_id`` so v2's breaker SELECT keeps it via
+    the cohabitation filter.
+    """
+
+    def test_insert_includes_parent_run_id_column_and_param(
+        self, tmp_path: Path
+    ) -> None:
+        """Insert SQL lists ``parent_run_id`` and the params tuple carries it."""
+        d, conn, _h = _make_daemon(tmp_path)
+        # First fetchone returns (issue_number, parent_run_id) — #3872.
+        conn.cursor_instance.fetch_queue = [(99, "v2-run-uuid")]
+
+        d._write_terminal_outcome("agent-99", "failed")
+
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.terminal_outcomes" in e[0]
+        ]
+        assert len(inserts) == 1
+        sql, params = inserts[0]
+        # Column list contains parent_run_id.
+        assert "parent_run_id" in sql, (
+            f"INSERT must list parent_run_id column (#3876 / #3872): {sql!r}"
+        )
+        # Params tuple carries the v2 run id from the agent lookup.
+        assert params == ("agent-99", 99, "failed", "v2-run-uuid")
