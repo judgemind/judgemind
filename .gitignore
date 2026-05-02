@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 # Dispatcher daemon venv (created by scripts/install-dispatcher-venv.sh)
 scripts/dispatcher/.venv/
+# Dispatcher v3 task-runner venv (created by scripts/install-dispatcher-v3-venv.sh)
+scripts/dispatcher_v3/.venv/
 .venv-scripts/
 venv/
 

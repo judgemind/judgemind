@@ -631,6 +631,14 @@ jobs:
       - name: Test dispatcher daemon skeleton
         if: matrix.shard == 'python'
         run: pytest scripts/dispatcher/tests/ -v --tb=short -n auto -m "not integration"
+      # Dispatcher v3 task-runner tests (scripts/dispatcher_v3/tests/).
+      # Separate invocation because these live in their own package dir
+      # (scripts/dispatcher_v3/tests/) rather than under scripts/tests/.
+      # Pure Python — no DB or AWS imports. See issue #3878 for the
+      # package skeleton story.
+      - name: Test dispatcher v3 task-runner skeleton
+        if: matrix.shard == 'python'
+        run: pytest scripts/dispatcher_v3/tests/ -v --tb=short -n auto
       - name: Check AWS CLI boolean flag usage
         if: matrix.shard == 'python'
         run: scripts/check-aws-bool-flags.sh
