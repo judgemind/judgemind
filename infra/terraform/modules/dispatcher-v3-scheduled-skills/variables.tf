@@ -21,6 +21,7 @@
 #   * 1× aws_sqs_queue_policy       (EventBridge sendMessage)
 #   * 1× aws_iam_role + 2× policies (EventBridge -> RunTask + PassRole)
 #   * 1× aws_cloudwatch_metric_alarm (FailedInvocations across rules)
+#   * 1× aws_cloudwatch_metric_alarm (DLQ depth)
 #
 # Cohabitation with v2: v2's daemon already runs these scheduled skills
 # via its in-process scheduler. During cohabitation both can fire -- the
@@ -179,6 +180,31 @@ variable "failed_invocations_period_seconds" {
 
 variable "failed_invocations_evaluation_periods" {
   description = "Number of consecutive evaluation periods that must breach before the alarm fires. Default 1 -- any failed invocation should be visible immediately (the spec adversarial-review's MAJOR 7 explicitly calls out silent skill failures)."
+  type        = number
+  default     = 1
+}
+
+# --- DLQ depth alarm --------------------------------------------------
+
+variable "dlq_depth_threshold" {
+  description = "Threshold for the DLQ depth alarm (alarm fires when ApproximateNumberOfMessagesVisible strictly exceeds this value). Default 0 -- any message landing in the DLQ is worth alerting on."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.dlq_depth_threshold >= 0
+    error_message = "dlq_depth_threshold must be >= 0 -- ApproximateNumberOfMessagesVisible is a non-negative count metric."
+  }
+}
+
+variable "dlq_depth_period_seconds" {
+  description = "Evaluation period for the DLQ depth alarm in seconds. Default 300 (5 minutes) -- matches the FailedInvocations alarm cadence."
+  type        = number
+  default     = 300
+}
+
+variable "dlq_depth_evaluation_periods" {
+  description = "Number of consecutive evaluation periods that must breach before the DLQ depth alarm fires. Default 1 -- any DLQ depth > 0 should surface immediately."
   type        = number
   default     = 1
 }

@@ -1077,3 +1077,8 @@ output "dispatcher_v3_scheduled_skills_alarm_names" {
   description = "Map of skill name -> CloudWatch alarm name on `AWS/Events FailedInvocations` for the per-rule alarm. Closes adversarial-review MAJOR 7 (silent skill failures)."
   value       = module.dispatcher_v3_scheduled_skills.alarm_names
 }
+
+output "dispatcher_v3_scheduled_skills_dlq_depth_alarm_name" {
+  description = "CloudWatch alarm name for the DLQ depth secondary-signal alarm (`AWS/SQS ApproximateNumberOfMessagesVisible`). Null when alerts are disabled. Issue #3956."
+  value       = module.dispatcher_v3_scheduled_skills.dlq_depth_alarm_name
+}
