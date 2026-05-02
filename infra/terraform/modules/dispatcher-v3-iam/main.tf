@@ -388,7 +388,7 @@ resource "aws_iam_role_policy" "launcher_logs_read" {
 
 resource "aws_iam_role" "agent_task" {
   name        = "${local.role_name_prefix}-agent-task-${var.environment}"
-  description = "Dispatcher v3 agent task role - dev-admin equivalent shared by task-runner / diagnoser / scheduled-skill (spec §10). Trust policy excludes assuming any cross-account role."
+  description = "Dispatcher v3 agent task role - dev-admin equivalent shared by task-runner / diagnoser / scheduled-skill (spec section 10). Trust policy excludes assuming any cross-account role."
 
   assume_role_policy = local.ecs_tasks_assume_role_policy
 }

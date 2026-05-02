@@ -718,7 +718,7 @@ output "dispatcher_v3_launcher_role_arn" {
 }
 
 output "dispatcher_v3_agent_task_role_arn" {
-  description = "Dev dispatcher-v3 agent task role ARN (dev-admin equivalent shared by task-runner / diagnoser / scheduled-skill — see spec §10). Trust policy excludes assuming any cross-account role."
+  description = "Dev dispatcher-v3 agent task role ARN (dev-admin equivalent shared by task-runner / diagnoser / scheduled-skill -- see spec section 10). Trust policy excludes assuming any cross-account role."
   value       = module.dispatcher_v3_iam.agent_task_role_arn
 }
 

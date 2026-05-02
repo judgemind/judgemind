@@ -20,7 +20,7 @@
 # rationale behind the broad `agent_task_role` scope.
 
 variable "environment" {
-  description = "Deployment environment. v3 IAM is dev-only — staging and production are human-operated and have no agent task role."
+  description = "Deployment environment. v3 IAM is dev-only -- staging and production are human-operated and have no agent task role."
   type        = string
 
   validation {
@@ -36,7 +36,7 @@ variable "aws_region" {
 }
 
 variable "aws_account_id" {
-  description = "AWS account ID for the dev environment. Used to construct scoped resource ARNs in IAM policies. Trust policies on both task roles deliberately do NOT reference any other account — production has no v3 footprint."
+  description = "AWS account ID for the dev environment. Used to construct scoped resource ARNs in IAM policies. Trust policies on both task roles deliberately do NOT reference any other account -- production has no v3 footprint."
   type        = string
   default     = "155326049300"
 }
@@ -62,13 +62,13 @@ variable "task_definition_family_prefix" {
 # the only secret-bearing path on the scheduler.
 
 variable "telegram_bot_token_secret_arn" {
-  description = "Secrets Manager ARN for TELEGRAM_BOT_TOKEN. The launcher role's only secret-read permission is scoped to this ARN. Empty disables — the launcher's `secretsmanager:GetSecretValue` policy resource is skipped entirely so a fresh stack without telegram wiring can still apply."
+  description = "Secrets Manager ARN for TELEGRAM_BOT_TOKEN. The launcher role's only secret-read permission is scoped to this ARN. Empty disables -- the launcher's `secretsmanager:GetSecretValue` policy resource is skipped entirely so a fresh stack without telegram wiring can still apply."
   type        = string
   default     = ""
 }
 
 variable "github_token_secret_arn" {
-  description = "Secrets Manager ARN for the v3 dispatcher's scoped GitHub PAT (re-used from v2 — `judgemind/dispatcher/github-token`). Threaded through to F2's task-runner and diagnoser task definitions for `gh auth setup-git` inside the agent. The launcher does not read this secret (its work is gh-API-via-PAT only via the `gh` MCP server in the agent task)."
+  description = "Secrets Manager ARN for the v3 dispatcher's scoped GitHub PAT (re-used from v2 -- `judgemind/dispatcher/github-token`). Threaded through to F2's task-runner and diagnoser task definitions for `gh auth setup-git` inside the agent. The launcher does not read this secret (its work is gh-API-via-PAT only via the `gh` MCP server in the agent task)."
   type        = string
   default     = ""
 }
@@ -84,7 +84,7 @@ variable "github_token_secret_arn" {
 # objects).
 
 variable "sessions_bucket_arn" {
-  description = "ARN of the v3 sessions bucket where session-log streaming writes per-agent jsonl. Reserved for forward compatibility with F6 (#3893) — the agent task role's full-S3 grant already covers writes to any bucket, but we list the bucket here for documentation and future scope-narrowing without breaking the spec §10 dev-admin invariant."
+  description = "ARN of the v3 sessions bucket where session-log streaming writes per-agent jsonl. Reserved for forward compatibility with F6 (#3893) -- the agent task role's full-S3 grant already covers writes to any bucket, but we list the bucket here for documentation and future scope-narrowing without breaking the spec section 10 dev-admin invariant."
   type        = string
   default     = ""
 }
@@ -97,7 +97,7 @@ variable "sessions_bucket_arn" {
 # invariant without re-implementing it.
 
 variable "prod_account_ids" {
-  description = "List of production AWS account IDs that must NEVER appear in any v3 trust policy. Used by `tests/policy-checks/check.sh` as a regression guard — see spec §10 (`Production accounts are not in scope. The trust policy on the agent task role excludes assuming any prod-account role`). Empty list disables the check; default is empty because there is no production AWS account in the Judgemind footprint at the time of writing."
+  description = "List of production AWS account IDs that must NEVER appear in any v3 trust policy. Used by `tests/policy-checks/check.sh` as a regression guard -- see spec section 10 (`Production accounts are not in scope. The trust policy on the agent task role excludes assuming any prod-account role`). Empty list disables the check; default is empty because there is no production AWS account in the Judgemind footprint at the time of writing."
   type        = list(string)
   default     = []
 }
