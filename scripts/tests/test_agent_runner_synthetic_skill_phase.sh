@@ -405,14 +405,14 @@ KIND_FIXTURE="scheduled_skill"
 watcher_workspace="$TEST_TMP/skill-phase-watcher-workspace"
 mkdir -p "$watcher_workspace"
 
-# The status file lives at REPO_ROOT/tmp/agent-status/AGENT_ID.txt.
+# The status file lives at REPO_ROOT/tmp/agent-status.txt.
 # REPO_ROOT = AGENT_WORKSPACE/repo (set in the entrypoint).
 # Create the directory and pre-seed with step-1.
 WATCHER_AGENT_ID="dddd1111-2222-3333-4444-555555555555"
-watcher_status_dir="$watcher_workspace/repo/tmp/agent-status"
+watcher_status_dir="$watcher_workspace/repo/tmp"
 mkdir -p "$watcher_status_dir"
 printf 'phase: spotcheck-step-1\nsummary: starting\n' \
-    > "$watcher_status_dir/$WATCHER_AGENT_ID.txt"
+    > "$watcher_status_dir/agent-status.txt"
 
 set +e
 out=$(AGENT_ID="$WATCHER_AGENT_ID" \
@@ -429,7 +429,7 @@ out=$(AGENT_ID="$WATCHER_AGENT_ID" \
       PHASE_TRANSITIONS_PARENT="$REPO_ROOT" \
       AGENT_RUNNER_MAX_PHASE_ITERATIONS=10 \
       AGENT_RUNNER_SKILL_PHASE_POLL_INTERVAL=1 \
-      CLAUDE_SKILL_PHASE_STATUS_FILE="$watcher_status_dir/$WATCHER_AGENT_ID.txt" \
+      CLAUDE_SKILL_PHASE_STATUS_FILE="$watcher_status_dir/agent-status.txt" \
       bash "$ENTRYPOINT" 2>&1)
 rc=$?
 set -e

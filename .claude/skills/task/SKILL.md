@@ -10,7 +10,7 @@ Pick up one issue from the Judgemind backlog and complete it autonomously. Do no
 
 **IMPORTANT — No backgrounding.** Do not use `run_in_background` on any Bash command, Agent tool call, or any other operation anywhere in a `/task` agent. All work runs synchronously in the foreground. The `/task` agent is already a background subagent from the dispatcher's perspective — further backgrounding causes completion notifications to surface in the wrong context (the dispatcher), leading to confusion and lost results.
 
-**IMPORTANT — Post-compaction recovery.** If your context was just autocompacted (your summary references "previous conversation"), you are NOT done with the task. Autocompaction preserves *what was done* but not the procedural imperative *what still needs to happen next* (see #2545). Before emitting any final report or `end_turn`, run the status-file-driven recovery check described in §A.0 (implementation tasks) or §B.0 (investigation tasks). The status file at `{repo_root}/tmp/agent-status/<agent-id>.txt` is your authoritative "where am I" anchor — re-read this SKILL.md from the section named by your current `phase` and continue. Only `phase=done`, `phase=verified`, or `phase=blocked` means stop.
+**IMPORTANT — Post-compaction recovery.** If your context was just autocompacted (your summary references "previous conversation"), you are NOT done with the task. Autocompaction preserves *what was done* but not the procedural imperative *what still needs to happen next* (see #2545). Before emitting any final report or `end_turn`, run the status-file-driven recovery check described in §A.0 (implementation tasks) or §B.0 (investigation tasks). The status file at `{worktree}/tmp/agent-status.txt` is your authoritative "where am I" anchor — re-read this SKILL.md from the section named by your current `phase` and continue. Only `phase=done`, `phase=verified`, or `phase=blocked` means stop.
 
 **IMPORTANT — MCP-first for GitHub reads.** Prefer `mcp__github__*` tools for reads (issue/PR lookup, status, files, comments, search). Keep `gh` for writes (comment, edit, create, merge, close) — the MCP server currently has no auth token so all writes fail. Keep `gh` permanently for `gh run watch`, `gh run list --workflow`, `gh pr edit --body-file`, and anything else without an MCP equivalent. Decision table: `docs/agent/github-api-access.md`. Full inventory: `docs/agent/gh-to-mcp-migration.md`.
 
@@ -38,18 +38,14 @@ After confirming the worktree, set up the agent status file so the dispatcher ca
 
 **Determining the agent-id (`AGENT_ID` env var precedence):**
 
-1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s status-file path, claim comment, and any future `progress.sh` calls correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#6 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
+1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s claim comment and any future `progress.sh` calls correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#6 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
 2. **Otherwise, fall back to the cwd-derived id** (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`). This is today's behavior — Agent-tool spawn via the dispatcher-v2 daemon does not export `AGENT_ID`, so the cwd-derived path remains the fallback.
 
 Quick check (env var first, cwd fallback): `echo "${AGENT_ID:-$(basename "$PWD")}"`.
 
-The chosen value is `{agent-id}` for the rest of this skill — it appears in the status-file path (below), the claim comment in Step 2, and any future `progress.sh` calls.
+The chosen value is `{agent-id}` for the rest of this skill — it appears in the claim comment in Step 2 and any future `progress.sh` calls.
 
-The status file lives at `{repo_root}/tmp/agent-status/{agent-id}.txt` (in the **repo root's** `tmp/`, not the worktree's `tmp/`). Create the directory if needed:
-
-```
-mkdir -p {repo_root}/tmp/agent-status
-```
+The status file lives at `{worktree}/tmp/agent-status.txt`. The `{worktree}/tmp/` directory was already created above — no additional `mkdir` needed.
 
 The status file format is:
 

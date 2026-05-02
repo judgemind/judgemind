@@ -28,13 +28,9 @@ Create a working directory for audit state:
 
 ### Status file setup
 
-Set up the agent status file for post-compaction recovery. The agent id is derived from the worktree path (e.g. `agent-ab4722a2`). Create the status directory if needed:
+Set up the agent status file for post-compaction recovery. The `{worktree}/tmp/` directory was already created in Step 0 above — no additional `mkdir` needed.
 
-```
-mkdir -p {repo_root}/tmp/agent-status
-```
-
-Write the initial status file at `{repo_root}/tmp/agent-status/{agent-id}.txt`:
+Write the initial status file at `{worktree}/tmp/agent-status.txt`:
 
 ```
 issue: audit

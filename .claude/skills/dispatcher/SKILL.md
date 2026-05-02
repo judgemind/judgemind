@@ -240,7 +240,7 @@ When an agent fails or exits without completing its task, implementation context
 **When to run this step:** Only for agent failures or incomplete completions. Skip for successful completions where the PR was merged and verification passed. To determine if the agent left work unfinished:
 
 1. Check whether the issue was closed (a merged PR with `Closes #N` would have closed it).
-2. Check the agent's status file at `tmp/agent-status/<agent-id>.txt` — the `phase` field indicates where the agent stopped.
+2. Check the agent's status file at `{worktree}/tmp/agent-status.txt` — the `phase` field indicates where the agent stopped.
 3. Check if the agent's worktree still exists at `.claude/worktrees/<agent-id>/` — a remaining worktree with uncommitted changes is a strong signal of incomplete work.
 
 If the issue is still open and the agent did not complete successfully, proceed with context extraction.
@@ -249,7 +249,7 @@ If the issue is still open and the agent did not complete successfully, proceed 
 
 The dispatcher reads available artifacts from the agent's worktree and status file to build a context summary. Not all artifacts will exist — extract what is available.
 
-1. **Status file** (`tmp/agent-status/<agent-id>.txt`): Read the `phase` and `summary` fields to determine where the agent stopped and what it was doing.
+1. **Status file** (`{worktree}/tmp/agent-status.txt`): Read the `phase` and `summary` fields to determine where the agent stopped and what it was doing.
 
 2. **Ralph review result** (`{worktree}/tmp/ralph/review-result.txt`): If this file exists, read it to determine whether the implementation passed review. A `SHIP` verdict means the approach was validated.
 
@@ -460,7 +460,7 @@ For each agent listed in the checkpoint:
 - If its worktree still exists in `git worktree list` — the agent is likely still running. Add it to the tracked active agent list.
 - If its worktree is gone — the agent has completed (or was cleaned up). Do not track it.
 
-Also check `tmp/agent-status/<agent-id>.txt` for each agent — the `phase` field indicates whether the agent is still working or has finished.
+Also check `{worktree}/tmp/agent-status.txt` for each agent — the `phase` field indicates whether the agent is still working or has finished.
 
 ### Re-establish behavioral discipline
 

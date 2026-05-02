@@ -27,16 +27,14 @@ set -uo pipefail
 
 WORKTREE="${1:?Usage: check-task-recovery.sh <worktree>}"
 
-# Derive the repo root and agent id from the worktree path.
+# Validate the worktree path.
 # Worktree path looks like: /path/to/repo/.claude/worktrees/agent-<id>
 if [[ "$WORKTREE" != *"/.claude/worktrees/"* ]]; then
     echo "UNKNOWN: worktree path does not contain .claude/worktrees/" >&2
     exit 2
 fi
 
-REPO_ROOT="${WORKTREE%%/.claude/worktrees/*}"
-AGENT_ID=$(basename "$WORKTREE")
-STATUS_FILE="$REPO_ROOT/tmp/agent-status/$AGENT_ID.txt"
+STATUS_FILE="$WORKTREE/tmp/agent-status.txt"
 
 if [ ! -f "$STATUS_FILE" ]; then
     cat >&2 <<EOF
