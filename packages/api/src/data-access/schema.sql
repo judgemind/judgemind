@@ -3,7 +3,7 @@
 -- To modify the schema, add a migration in packages/api/migrations/
 -- then run: scripts/regenerate_schema.sh
 --
--- Generated from 55 migrations.
+-- Generated from 56 migrations.
 
 
 
@@ -368,7 +368,13 @@ CREATE TABLE dispatcher.agents (
     execution_mode text DEFAULT 'subprocess'::text NOT NULL,
     ralph_iterations_observed integer DEFAULT 0 NOT NULL,
     merge_unstick_attempts integer DEFAULT 0 NOT NULL,
-    merge_conflict_attempts integer DEFAULT 0 NOT NULL
+    merge_conflict_attempts integer DEFAULT 0 NOT NULL,
+    current_milestone text,
+    current_milestone_detail text,
+    current_milestone_at timestamp with time zone,
+    session_s3_key text,
+    diagnoser_arn text,
+    outcome_summary text
 );
 
 
@@ -418,6 +424,24 @@ COMMENT ON COLUMN dispatcher.agents.merge_unstick_attempts IS 'Count of stale-ro
 
 
 COMMENT ON COLUMN dispatcher.agents.merge_conflict_attempts IS 'Count of fix_conflict-phase claude-resolution attempts for this agent (#3225). Bounded at FIX_CONFLICT_MAX_ATTEMPTS (default 2) per agent lifetime: each invocation of handle_fix_conflict increments this column before spawning the claude skill; when the value is already >= budget the handler advances to the conflict_unresolvable terminal without spending compute. Covers both the pre-push rebase-conflict path (push_and_pr) and the start-of-ralph baseline rebase-conflict path (secondary mitigation). See .claude/skills/task-v2-fix-conflict/SKILL.md.';
+
+
+COMMENT ON COLUMN dispatcher.agents.current_milestone IS 'v3-only — current pipeline milestone label written by the v3 agent runtime (e.g. ''plan_complete'', ''ralph_iter_2'', ''pr_opened''). v2 ignores this column. Paired with ``current_milestone_at`` for cockpit timing display. NULL on every v2-written row. Issue #3872.';
+
+
+COMMENT ON COLUMN dispatcher.agents.current_milestone_detail IS 'v3-only — free-form supplemental detail for the current milestone (e.g. failing test name, retry attempt count). NULL on every v2-written row. Issue #3872.';
+
+
+COMMENT ON COLUMN dispatcher.agents.current_milestone_at IS 'v3-only — timestamp the current milestone was entered. NULL on every v2-written row. Issue #3872.';
+
+
+COMMENT ON COLUMN dispatcher.agents.session_s3_key IS 'v3-only — S3 key of the agent''s transcript bundle. NULL on every v2-written row. Issue #3872.';
+
+
+COMMENT ON COLUMN dispatcher.agents.diagnoser_arn IS 'v3-only — ECS task ARN of the running diagnoser when an async-spawned diagnoser is in flight for this agent. NULL when no diagnoser is active and on every v2-written row. Issue #3872.';
+
+
+COMMENT ON COLUMN dispatcher.agents.outcome_summary IS 'v3-only — one-line outcome description rendered in the admin cockpit (succeeds v2''s ``failure_summary`` for both success and failure paths). NULL on every v2-written row. Issue #3872.';
 
 
 CREATE TABLE dispatcher.blocked_snapshots (
@@ -713,7 +737,8 @@ CREATE TABLE dispatcher.runs (
     heartbeat_ts timestamp with time zone DEFAULT now() NOT NULL,
     version_sha text NOT NULL,
     host text NOT NULL,
-    pid integer NOT NULL
+    pid integer NOT NULL,
+    dispatcher_version text DEFAULT 'v2'::text NOT NULL
 );
 
 
@@ -724,6 +749,9 @@ COMMENT ON COLUMN dispatcher.runs.heartbeat_ts IS 'Daemon updates every tick. Cl
 
 
 COMMENT ON COLUMN dispatcher.runs.version_sha IS 'Git SHA of the daemon build; supports forensic questions after a crash.';
+
+
+COMMENT ON COLUMN dispatcher.runs.dispatcher_version IS 'Which dispatcher daemon owns this run: ''v2'' (the original subprocess + ECS-launcher daemon) or ''v3'' (the cohabiting launcher being rolled out under #3872 and follow-ups). The DEFAULT ''v2'' backfills every pre-#3872 row at migration time. Per-row ownership for downstream tables (agents, terminal_outcomes) flows through ``parent_run_id``: each daemon reads only rows whose run lineage matches its own version. No CHECK constraint — the set is daemon-code owned. Issue #3872.';
 
 
 CREATE TABLE dispatcher.scheduled_skills (
@@ -764,7 +792,8 @@ CREATE TABLE dispatcher.terminal_outcomes (
     agent_id uuid,
     issue_number integer,
     status text NOT NULL,
-    ended_at timestamp with time zone DEFAULT now() NOT NULL
+    ended_at timestamp with time zone DEFAULT now() NOT NULL,
+    parent_run_id uuid
 );
 
 
@@ -775,6 +804,9 @@ COMMENT ON COLUMN dispatcher.terminal_outcomes.agent_id IS 'Nullable — synthet
 
 
 COMMENT ON COLUMN dispatcher.terminal_outcomes.status IS 'Free-form text (succeeded | failed | crashed | plan_blocked | needs_review | ...). Classifier in daemon decides which count as bad.';
+
+
+COMMENT ON COLUMN dispatcher.terminal_outcomes.parent_run_id IS 'The ``dispatcher.runs.run_id`` of the daemon whose terminal transition produced this outcome. Backfilled from ``dispatcher.agents.parent_run_id`` JOIN on ``agent_id``. NULL for rows whose agent_id is NULL (synthetic test input, per migration 29) or whose agent row was hard-deleted. v2''s circuit breaker ignores this column (it scans by ended_at only, #2860); v3 will scope its rolling-window scan to its own run lineage via ``WHERE parent_run_id = current_run_id``. Issue #3872.';
 
 
 CREATE SEQUENCE dispatcher.terminal_outcomes_outcome_id_seq
@@ -1558,6 +1590,10 @@ ALTER TABLE ONLY dispatcher.retry_markers
 
 ALTER TABLE ONLY dispatcher.scheduled_skills
     ADD CONSTRAINT scheduled_skills_last_triggered_agent_id_fkey FOREIGN KEY (last_triggered_agent_id) REFERENCES dispatcher.agents(agent_id) ON DELETE SET NULL;
+
+
+ALTER TABLE ONLY dispatcher.terminal_outcomes
+    ADD CONSTRAINT terminal_outcomes_parent_run_id_fkey FOREIGN KEY (parent_run_id) REFERENCES dispatcher.runs(run_id);
 
 
 ALTER TABLE ONLY dispatcher.unrecognized_diagnoser_actions

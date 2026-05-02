@@ -2809,10 +2809,16 @@ class DispatcherDaemon:
                     f"heartbeat_ts={existing_hb!s}"
                 )
 
+            # ``dispatcher_version`` is written explicitly so the value
+            # is observable in psycopg-3 query logging without having
+            # to consult the column DEFAULT. v3's launcher will write
+            # ``'v3'`` here; this v2 daemon always writes ``'v2'``.
+            # Issue #3872.
             cur.execute(
                 "INSERT INTO dispatcher.runs "
-                "    (started_at, heartbeat_ts, version_sha, host, pid) "
-                "VALUES (now(), now(), %s, %s, %s) "
+                "    (started_at, heartbeat_ts, version_sha, host, pid, "
+                "     dispatcher_version) "
+                "VALUES (now(), now(), %s, %s, %s, 'v2') "
                 "RETURNING run_id",
                 (self._cfg.version_sha, self._cfg.host, self._cfg.pid),
             )
@@ -19273,30 +19279,40 @@ class DispatcherDaemon:
         """Append a row to ``dispatcher.terminal_outcomes``.
 
         Called by :meth:`_mark_agent_terminal` for every terminal
-        status. ``issue_number`` is looked up from ``dispatcher.agents``
-        so the outcome row is self-contained (no JOIN needed at scan
-        time). Append-only: the ring-buffer semantics come from the
-        rolling-window scan in :meth:`_evaluate_circuit_breaker`, not
-        from deleting rows on write.
+        status. ``issue_number`` and ``parent_run_id`` are looked up
+        from ``dispatcher.agents`` so the outcome row is self-contained
+        (no JOIN needed at scan time). Append-only: the ring-buffer
+        semantics come from the rolling-window scan in
+        :meth:`_evaluate_circuit_breaker`, not from deleting rows on
+        write.
 
         exec-mode-agnostic (#3158): circuit-breaker feed; a terminal
         is a terminal regardless of which runtime produced it.
+
+        ``parent_run_id`` (#3872) carries the daemon-run lineage so
+        v3's per-run circuit-breaker scope can filter
+        ``WHERE parent_run_id = current_run_id``. v2's breaker
+        ignores this column today.
         """
         assert self._conn is not None, "connect() must run before outcome write"
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT issue_number FROM dispatcher.agents WHERE agent_id = %s",
+                "SELECT issue_number, parent_run_id "
+                "FROM dispatcher.agents WHERE agent_id = %s",
                 (agent_id,),
             )
             row = cur.fetchone()
-            issue_number = (
-                int(row[0]) if row is not None and row[0] is not None else None
-            )
+            if row is not None:
+                issue_number = int(row[0]) if row[0] is not None else None
+                parent_run_id = str(row[1]) if row[1] is not None else None
+            else:
+                issue_number = None
+                parent_run_id = None
             cur.execute(
                 "INSERT INTO dispatcher.terminal_outcomes "
-                "    (agent_id, issue_number, status, ended_at) "
-                "VALUES (%s, %s, %s, now())",
-                (agent_id, issue_number, status),
+                "    (agent_id, issue_number, status, parent_run_id, ended_at) "
+                "VALUES (%s, %s, %s, %s, now())",
+                (agent_id, issue_number, status, parent_run_id),
             )
         self._conn.commit()
 

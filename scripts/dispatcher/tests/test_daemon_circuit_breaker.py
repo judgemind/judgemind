@@ -196,10 +196,10 @@ class TestWriteTerminalOutcome:
     """``_write_terminal_outcome`` appends to ``dispatcher.terminal_outcomes``."""
 
     def test_writes_row_with_issue_number_lookup(self, tmp_path: Path) -> None:
-        """Row carries the issue_number looked up from ``dispatcher.agents``."""
+        """Row carries the issue_number + parent_run_id looked up from ``agents``."""
         d, conn, _h = _make_daemon(tmp_path)
-        # First fetchone returns the agent's issue_number.
-        conn.cursor_instance.fetch_queue = [(42,)]
+        # First fetchone returns (issue_number, parent_run_id) — #3872.
+        conn.cursor_instance.fetch_queue = [(42, "run-uuid-abc")]
 
         d._write_terminal_outcome("agent-42-uuid", "failed")
 
@@ -210,14 +210,16 @@ class TestWriteTerminalOutcome:
             if "INSERT INTO dispatcher.terminal_outcomes" in e[0]
         ]
         assert len(inserts) == 1
-        params = inserts[0][1]
-        assert params == ("agent-42-uuid", 42, "failed")
+        sql, params = inserts[0]
+        # parent_run_id is in the column list and the params tuple (#3872).
+        assert "parent_run_id" in sql
+        assert params == ("agent-42-uuid", 42, "failed", "run-uuid-abc")
         assert conn.commits >= 1
 
     def test_writes_row_with_null_issue_number_when_agent_missing(
         self, tmp_path: Path
     ) -> None:
-        """Fallback: agent row absent → issue_number is NULL. Still inserts."""
+        """Fallback: agent row absent → issue_number + parent_run_id NULL."""
         d, conn, _h = _make_daemon(tmp_path)
         conn.cursor_instance.fetch_queue = [None]  # agent row absent
 
@@ -230,7 +232,30 @@ class TestWriteTerminalOutcome:
         ]
         assert len(inserts) == 1
         params = inserts[0][1]
-        assert params == ("orphan-agent", None, "succeeded")
+        assert params == ("orphan-agent", None, "succeeded", None)
+
+    def test_writes_row_with_null_parent_run_id_when_agent_has_none(
+        self, tmp_path: Path
+    ) -> None:
+        """Agent exists but has NULL parent_run_id → outcome carries NULL too.
+
+        Regression guard for #3872: pre-migration agent rows or rows
+        inserted by a code path that doesn't set ``parent_run_id`` must
+        still flow through the new SELECT/INSERT shape without error.
+        """
+        d, conn, _h = _make_daemon(tmp_path)
+        conn.cursor_instance.fetch_queue = [(7, None)]
+
+        d._write_terminal_outcome("legacy-agent", "succeeded")
+
+        inserts = [
+            e
+            for e in conn.cursor_instance.executed
+            if "INSERT INTO dispatcher.terminal_outcomes" in e[0]
+        ]
+        assert len(inserts) == 1
+        params = inserts[0][1]
+        assert params == ("legacy-agent", 7, "succeeded", None)
 
 
 # --------------------------------------------------------------------------
