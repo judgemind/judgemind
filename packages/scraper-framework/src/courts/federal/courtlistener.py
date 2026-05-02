@@ -433,7 +433,12 @@ class CourtListenerScraper(BaseScraper):
         doc.county = resolved_county
 
         # Map structured fields
-        doc.case_title = cluster.get("case_name") or cluster.get("case_name_short") or None
+        doc.case_title = (
+            cluster.get("case_name_full")
+            or cluster.get("case_name")
+            or cluster.get("case_name_short")
+            or None
+        )
         doc.case_number = _extract_docket_number(cluster)
         doc.judge_name = _extract_judge_names(cluster)
         doc.hearing_date = _parse_date(cluster.get("date_filed"))
