@@ -1,7 +1,17 @@
-"""Example scraper — demonstrates the BaseScraper pattern with a dummy court.
+"""Reference template — demonstrates the BaseScraper pattern with a dummy court.
 
-This is not a real scraper. It shows how to implement BaseScraper correctly
-and is used as a reference when building per-court scrapers.
+This is not a real scraper and is not registered in the runner. It lives under
+``docs/examples/`` (rather than ``packages/scraper-framework/src/courts/``) so
+it cannot be mistaken for a production scraper. Use it as a starting point
+when building a new per-court scraper: copy it into
+``packages/scraper-framework/src/courts/<state>/<your_scraper>.py``, replace
+the dummy logic with real fetch/parse code, and register it in
+``framework/runner.py``.
+
+To run this template directly (for illustration), activate the
+``packages/scraper-framework/.venv`` and execute:
+
+    python docs/examples/scraper_template.py
 """
 
 from __future__ import annotations

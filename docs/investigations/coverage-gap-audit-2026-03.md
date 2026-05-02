@@ -45,7 +45,7 @@ Most scrapers are at 93-100%: cc_tentatives (98%), oc_tentatives (96%), oc_famil
 
 ### Intentionally low-coverage
 
-- `src/courts/ca/example.py` (0%) — example/template file, not production code
+- `docs/examples/scraper_template.py` (not measured) — reference template, moved out of `src/courts/ca/` per #3835 so it isn't mistaken for a production scraper
 - `src/framework/__main__.py` (0%) — CLI entry point
 - `src/ingestion/__main__.py` (0%) — CLI entry point
 
