@@ -36,7 +36,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 - Watch CI to completion (`gh run watch`) before doing anything else after pushing.
 - Create a PR immediately after your first push to a branch.
 - Re-fetch GitHub issue or PR state before acting on it if more than a few minutes have elapsed.
-- Set `timeout: 1200000` (20 minutes) on Bash commands that may take longer than 2 minutes: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh --script`, `scripts/rebuild_db.sh`, any data-processing script.
+- Set `timeout: 1200000` (20 minutes) on Bash commands that may take longer than 2 minutes: `pytest`, `gh run watch`, `terraform apply`, `pip install`, `npm install`, `npm run build`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/rebuild_db.sh`, any data-processing script.
 
 ## Enforced Rules — Automated Checks
 
@@ -49,6 +49,8 @@ scripts/preflight/branch-fresh.sh      # Fail if behind origin/main (pass --fetc
 scripts/preflight/venv-local.sh        # Fail if .venv is missing or is a symlink
 scripts/preflight/no-duplicate-pr.sh N # Check if open PR already exists for issue #N
 scripts/preflight/rate-budget.sh       # Warn if GitHub API rate budget < 100 remaining
+scripts/preflight/no-forbidden-syntax.sh CMD  # Check command string for $(), heredocs, python -c
+scripts/preflight/tf-not-root.sh              # Fail if running terraform from infra/terraform/ root
 ```
 
 `scripts/preflight.sh` is the umbrella runner / sourceable function library; the per-check wrappers under `scripts/preflight/` (in-worktree.sh, not-on-main.sh, etc.) each invoke one library function for use under permission rules that block `source ... && fn`.
@@ -266,7 +268,7 @@ When one of these tags arrives and you have a **pending question**: do not treat
 
 ### Telegram Integration (optional)
 
-Telegram integration (optional, opt-in) is delivered via the `plugin:telegram` MCP plugin when installed. Agents never invoke `/telegram:access` or edit `.claude/telegram/`.
+Telegram integration is delivered via the `plugin:telegram` MCP plugin when installed.
 
 When the user asks to pick up work, invoke `/task` as a background subagent. To enable continuous autonomous work queue management, invoke `/dispatcher`.
 
