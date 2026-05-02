@@ -110,7 +110,7 @@ resource "aws_sqs_queue_policy" "scheduled_skills_dlq" {
 
 resource "aws_iam_role" "events_invoker" {
   name        = "judgemind-${var.name_prefix}-scheduled-skills-events-${var.environment}"
-  description = "Dispatcher v3 EventBridge invoker role -- assumed by events.amazonaws.com to run scheduled-skill ECS tasks per §4.4 cron rules."
+  description = "Dispatcher v3 EventBridge invoker role -- assumed by events.amazonaws.com to run scheduled-skill ECS tasks per spec section 4.4 cron rules."
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"

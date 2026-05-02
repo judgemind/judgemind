@@ -28,7 +28,7 @@
 # v3 is the sole operator the v2 schedules will be retired.
 
 variable "environment" {
-  description = "Deployment environment. v3 scheduled skills are dev-only at first land -- staging and production are human-operated and have no v3 footprint (per spec §10)."
+  description = "Deployment environment. v3 scheduled skills are dev-only at first land -- staging and production are human-operated and have no v3 footprint (per spec section 10)."
   type        = string
 
   validation {
