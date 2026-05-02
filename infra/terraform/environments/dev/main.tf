@@ -924,7 +924,7 @@ output "dispatcher_v3_scheduled_skill_log_group" {
 # rollout after a fresh image push.
 
 output "dispatcher_v3_service_name" {
-  description = "Dev dispatcher-v3 launcher ECS service name (`judgemind-dispatcher-v3-dev`). Use with `aws ecs describe-services --cluster judgemind-dev --services <service_name>` to inspect runningCount / deployment status. Spec §6."
+  description = "Dev dispatcher-v3 launcher ECS service name (`judgemind-dispatcher-v3-dev`). Use with `aws ecs describe-services --cluster judgemind-dev --services <service_name>` to inspect runningCount / deployment status. Spec section 6."
   value       = module.dispatcher_v3_service.service_name
 }
 
