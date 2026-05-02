@@ -38,12 +38,28 @@ After confirming the worktree, set up the agent status file so the dispatcher ca
 
 **Determining the agent-id (`AGENT_ID` env var precedence):**
 
-1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s claim comment and any future `progress.sh` calls correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#6 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
+1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s claim comment and every `progress.sh` milestone call correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#6 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
 2. **Otherwise, fall back to the cwd-derived id** (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`). This is today's behavior — Agent-tool spawn via the dispatcher-v2 daemon does not export `AGENT_ID`, so the cwd-derived path remains the fallback.
 
 Quick check (env var first, cwd fallback): `echo "${AGENT_ID:-$(basename "$PWD")}"`.
 
-The chosen value is `{agent-id}` for the rest of this skill — it appears in the claim comment in Step 2 and any future `progress.sh` calls.
+The chosen value is `{agent-id}` for the rest of this skill — it appears in the claim comment in Step 2 and at every milestone call to `scripts/dispatcher/progress.sh` (see "Milestone progress reporting" below).
+
+### Milestone progress reporting (dispatcher-v3 cockpit)
+
+`scripts/dispatcher/progress.sh "$AGENT_ID" <milestone> [optional detail]` is a best-effort cockpit beacon that does ONE UPDATE on the `dispatcher.agents` row keyed by `agent_id` and exits 0 unconditionally — missing args, missing `DATABASE_URL`, missing `psql`, DB connect failure, and successful UPDATE all return 0. The helper exists so the cockpit can show "where is this agent right now" without reintroducing a phase state machine. See `docs/specs/dispatcher-v3-spec.md` §4.3 and #3973.
+
+Call this helper at every natural milestone in the /task workflow so the cockpit's `dispatcher.agents.current_milestone` column advances through the run instead of staying NULL. The recipe used at every site below is:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" <milestone> [detail] || true
+```
+
+The trailing `|| true` is defense-in-depth — `progress.sh` already returns 0 on every error path, but explicit `|| true` makes the intent visible to anyone reading the SKILL and survives copy-paste into contexts where `set -e` is in force. The whole call is silent on success and prints a one-line "swallowed" note to stderr on failure; it never blocks /task.
+
+Cohabitation note: dispatcher-v2 daemon-managed agents do not call this helper, so their `current_milestone*` columns stay NULL — exactly the expected v2 behavior per migration 56's column comments. v3 agents call it, the cockpit reads it, nothing else does.
+
+The terminal phases (`done`, `verified`, `blocked`) and the initial `claiming` row are written by the dispatcher-v3 launcher's `_mark_agent_terminal` / row-INSERT paths — NOT by /task. /task only writes the in-between milestones: `planning`, `ralph`, `summary`, `push_and_pr`, `awaiting_ci`, `fix_ci`, `merge`, `awaiting_deploy`, `verify`, `retro`. See the per-step recipes in Path A / Step 5 below.
 
 The status file lives at `{worktree}/tmp/agent-status.txt`. The `{worktree}/tmp/` directory was already created above — no additional `mkdir` needed.
 
@@ -396,6 +412,21 @@ npm install
 Skip this for Terraform-only or docs-only tasks.
 
 #### A.2 — Implement and review (ralph loop)
+
+**Cockpit milestone:** at the top of A.2 — *before* dispatching ralph or starting direct implementation — emit the `planning` milestone so the cockpit shows the agent has finished setup and is now planning the implementation:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" planning || true
+```
+
+Then, immediately before invoking `/ralph` (testable code paths), emit the `ralph` milestone so the cockpit can distinguish "agent is reading the issue" from "agent is in the iterate-implement-review loop":
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" ralph || true
+```
+
+For non-testable tasks that skip /ralph, the `planning` milestone is the only one in this section — the next milestone is `summary` at the top of A.2b.
+
 - **For testable code tasks** (Python, TypeScript): use the `/ralph` loop — iterative work-then-review with fresh context each iteration. See `.claude/skills/ralph/SKILL.md`. This replaces the old `/tdd` + self-review steps. `/ralph` handles implementation (TDD), pre-PR checks, and cross-perspective review internally. It returns when the reviewer subagent says SHIP.
 - **For non-testable tasks** (Terraform, DB migrations, CI/CD, docs): implement directly, then run all applicable pre-PR checks (see `docs/agent/code-standards.md` §Pre-PR Checks) and review your own diff before continuing.
 - **For ingestion/extraction pipeline tasks** (scraper changes, LLM prompt changes, enrichment logic): use the local dev stack to iterate. The local DB + S3 cache enables fast iteration without deploying to dev. Run `scripts/rebuild_db.sh --skip-reset` to re-process documents through the pipeline and verify data correctness against source documents. See `docs/agent/local-dev.md`. **Prioritize correctness over completeness** — verify that extracted fields match the source document, not just that fields are populated.
@@ -419,6 +450,12 @@ Skip this for Terraform-only or docs-only tasks.
 If any of these checks show that work remains (uncommitted changes exist, no PR yet), you MUST continue to A.2b. Do not exit. Do not return. Do not consider the task done. Exiting at this point is a critical workflow failure (#721, #2545).
 
 #### A.2b — Post process summary on issue (MANDATORY)
+
+**Cockpit milestone:** at the top of A.2b — before extracting acceptance criteria or writing the summary — emit the `summary` milestone:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" summary || true
+```
 
 Before committing or creating a PR, post a process summary comment on the GitHub issue. This creates an auditable record and forces explicit verification of each acceptance criterion.
 
@@ -460,6 +497,12 @@ gh issue comment <N> --repo judgemind/judgemind --body-file {worktree}/tmp/proce
 #### A.3 — Stage, commit, and push
 Write status: `phase: pushing`, `summary: Staging, committing, and pushing to remote`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} pushing`
+
+**Cockpit milestone:** before staging files / running `git push`, emit the `push_and_pr` milestone so the cockpit reflects "agent is leaving the worktree":
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" push_and_pr || true
+```
 
 Stage the files you changed (prefer naming specific files over `git add .`):
 ```
@@ -546,6 +589,12 @@ Resolve conflicts, `git rebase --continue`, then push with `--force-with-lease`.
 Write status: `phase: ci-watch`, `summary: Watching CI run <run-id>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} "ci-watch (1)"`
 
+**Cockpit milestone:** before starting the CI watch, emit the `awaiting_ci` milestone (with the PR number as the optional detail) so the cockpit can show "agent is parked on CI for PR <N>":
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" awaiting_ci "PR #<PR-N>" || true
+```
+
 **Run CI watches in the foreground** — do not use `run_in_background`. You cannot proceed until CI finishes, so background execution just generates unnecessary `<task-notification>` noise for the dispatcher. **Use `timeout: 1200000`** as CI runs typically take 10-25 minutes.
 
 Use `scripts/wait-for-ci.sh` as the canonical PR CI gate:
@@ -564,7 +613,13 @@ gh run watch <run-id> --repo judgemind/judgemind --interval 60 --exit-status --c
 
 For quick status polls without watching, `mcp__github__get_pull_request_status` returns the combined check rollup in one MCP call.
 
-If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} ci-fix`. Diagnose, fix locally, push, return to A.4. On the next CI watch, increment the attempt number in the phase name (e.g. `ci-watch (2)`). Repeat until all checks pass.
+If CI fails: write status `phase: ci-fix`, `summary: Fixing CI failure: <brief reason>`. Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} ci-fix`. Emit the `fix_ci` cockpit milestone (with a brief failure-class detail so the cockpit can group recurring failure patterns) before diagnosing:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" fix_ci "<brief failure class — e.g. ruff, pytest, typecheck>" || true
+```
+
+Diagnose, fix locally, push, return to A.4. On the next CI watch, increment the attempt number in the phase name (e.g. `ci-watch (2)`) and re-emit `awaiting_ci` for the new run. Repeat until all checks pass.
 
 #### A.6 — Update the PR test plan
 Fetch the current PR body via MCP:
@@ -581,6 +636,12 @@ gh pr edit <PR-N> --repo judgemind/judgemind --body-file {worktree}/tmp/pr_body.
 #### A.7 — Merge the PR
 Write status: `phase: merging`, `summary: Squash merging PR #<N>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} merging`
+
+**Cockpit milestone:** immediately before running `gh pr merge`, emit the `merge` milestone so the cockpit shows the agent has crossed the merge gate:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" merge "PR #<PR-N>" || true
+```
 
 The PR has passed the ralph loop review (A.2) and CI is green. **Before merging, confirm the merge gate is green.** The gate is:
 
@@ -615,6 +676,12 @@ Idempotent — exits 0 if the label is already absent. A failure here is logged 
 Write status: `phase: deploying`, `summary: Watching deploy pipeline for <workflow>`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} deploying`
 
+**Cockpit milestone:** at the top of A.8, before identifying the deploy workflow or starting the deploy watch, emit the `awaiting_deploy` milestone:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" awaiting_deploy || true
+```
+
 **A task is NOT done when the PR merges. A task is done when the change is deployed, verified working, AND verification evidence is posted.** The worktree stays alive until verification passes.
 
 **Determine if this change has a deployed component:**
@@ -642,6 +709,12 @@ Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {wo
 
 Write status: `phase: verifying`, `summary: Verifying feature works in dev environment`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} verifying`
+
+**Cockpit milestone:** at the start of Step 2, emit the `verify` milestone:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" verify || true
+```
 
 A successful deploy only means the new image is running — not that the service works. Verify the feature is actually functional:
 
@@ -826,6 +899,12 @@ If you only create sub-tasks and do not pick one up in this session, stop — th
 Write status: `phase: retrospective`, `summary: Filing retro issues`.
 Also start the phase timer: `python3 {worktree}/scripts/phase_timer.py start {worktree} retrospective`
 
+**Cockpit milestone:** at the top of Step 5, emit the `retro` milestone:
+
+```
+scripts/dispatcher/progress.sh "$AGENT_ID" retro || true
+```
+
 After completing a task (Path A or Path B), reflect on the work before cleaning up. This step produces concrete improvements to the codebase and workflow — not just observations.
 
 ### 5a — Workflow efficiency
@@ -886,4 +965,5 @@ Worktree cleanup is handled automatically by Claude Code when the agent exits.
 - **Use `timeout: 1200000`** on Bash commands that may exceed 2 minutes: `pytest`, `gh run watch`, `pip install`, `npm install`, `npm run build`, `terraform apply`, `ruff check` on large codebases, `scripts/ecs-run-task.sh`, `scripts/ecs-run.sh --script`, `scripts/rebuild_db.sh`, and any data-processing script. <!-- scripts/ecs-run-task.sh stays for stream-logs propagation (not replaceable by MCP — see docs/agent/aws-to-mcp-migration.md) -->
 - **After any context reset, run §A.0 / §B.0 recovery** — `{worktree}/scripts/check-task-recovery.sh {worktree}` is the authoritative "am I done?" check.
 - **Prefer MCP for reads** (`mcp__github__get_issue`, `get_pull_request`, `list_issues`, `list_pull_requests`, `get_pull_request_status`). Keep `gh` for writes and for workflow-run operations. See `docs/agent/github-api-access.md`.
+- **Cockpit milestones via `progress.sh`.** Call `scripts/dispatcher/progress.sh "$AGENT_ID" <milestone> || true` at every transition (`planning`, `ralph`, `summary`, `push_and_pr`, `awaiting_ci`, `fix_ci`, `merge`, `awaiting_deploy`, `verify`, `retro`). Best-effort, exits 0 unconditionally — see "Milestone progress reporting" in Step 0 and #3973.
 - See CLAUDE.md §Unattended Operation Patterns for the full list.
