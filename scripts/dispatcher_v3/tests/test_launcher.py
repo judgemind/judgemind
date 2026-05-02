@@ -67,6 +67,9 @@ if "psycopg" not in sys.modules:
 from dispatcher_v3.launcher import (  # noqa: E402 — must follow sys.modules patch
     DEFAULT_CLAIM_ATTEMPTS_MAX,
     DEFAULT_CONCURRENCY_CAP_V3,
+    DEFAULT_SILENT_HANG_MINUTES,
+    DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
+    EXIT_REASON_SILENT_HANG,
     LABEL_AGENT_READY,
     LABEL_DISPATCHER_V2_ONLY,
     LABEL_STATUS_IN_PROGRESS,
@@ -147,11 +150,19 @@ class FakeConn:
 def make_launcher(
     conn: FakeConn | None = None,
     ecs_client: MagicMock | None = None,
+    cloudwatch_logs_client: MagicMock | None = None,
     subprocess_runner: Any = None,
     trust_checker: Any = None,
     runner_name: str = "claude",
+    task_runner_log_group: str = "",
+    task_runner_log_stream_prefix: str = DEFAULT_TASK_RUNNER_LOG_STREAM_PREFIX,
 ) -> Launcher:
-    """Construct a :class:`Launcher` with sane test defaults."""
+    """Construct a :class:`Launcher` with sane test defaults.
+
+    The silent-hang detector is OFF by default (``task_runner_log_group=""``)
+    so existing watch tests don't have to mock CloudWatch. Tests that
+    exercise the detector pass an explicit ``task_runner_log_group``.
+    """
     return Launcher(
         run_id="run-test-uuid",
         github_repo="judgemind/judgemind",
@@ -161,8 +172,11 @@ def make_launcher(
         agent_runner_security_group_id="sg-aaa",
         sessions_bucket="judgemind-sessions-dev",
         runner_name=runner_name,
+        task_runner_log_group=task_runner_log_group,
+        task_runner_log_stream_prefix=task_runner_log_stream_prefix,
         conn=conn,
         ecs_client=ecs_client,
+        cloudwatch_logs_client=cloudwatch_logs_client,
         subprocess_runner=subprocess_runner,
         trust_checker=trust_checker,
     )
@@ -253,21 +267,25 @@ def test_claim_happy_path_records_call_order() -> None:
     # Recover the SQL trace and the gh CLI trace and assert ordering:
     # the INSERT must precede the label edits AND the ECS RunTask call.
     insert_idx = next(
-        i for i, (sql, _) in enumerate(conn.executed)
+        i
+        for i, (sql, _) in enumerate(conn.executed)
         if sql.startswith("INSERT INTO dispatcher.agents")
     )
     update_idx = next(
-        i for i, (sql, _) in enumerate(conn.executed)
+        i
+        for i, (sql, _) in enumerate(conn.executed)
         if sql.startswith("UPDATE dispatcher.agents") and "task_arn" in sql
     )
     assert insert_idx < update_idx, "DB INSERT must precede the task_arn UPDATE"
 
     add_label_idx = next(
-        i for i, cmd in enumerate(invocations)
+        i
+        for i, cmd in enumerate(invocations)
         if cmd[1:4] == ["issue", "edit", "9001"] and "--add-label" in cmd
     )
     remove_label_idx = next(
-        i for i, cmd in enumerate(invocations)
+        i
+        for i, cmd in enumerate(invocations)
         if cmd[1:4] == ["issue", "edit", "9001"] and "--remove-label" in cmd
     )
     assert add_label_idx < remove_label_idx, (
@@ -342,7 +360,8 @@ def test_watch_marks_succeeded_on_stopped_exit_zero() -> None:
     conn.install_handler(
         "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall",
+            cur,
+            "_next_fetchall",
             [("ag-1", "arn:task/1", 100), ("ag-2", "arn:task/2", 101)],
         ),
     )
@@ -364,9 +383,11 @@ def test_watch_marks_succeeded_on_stopped_exit_zero() -> None:
         ]
     }
 
-    launcher = make_launcher(conn=conn, ecs_client=ecs,
-                             subprocess_runner=lambda *a, **k: MagicMock(
-                                 returncode=0, stdout="", stderr=""))
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
     watched, transitions = launcher._watch_in_flight()
     assert watched == 2
     assert len(transitions) == 1
@@ -388,7 +409,9 @@ def test_watch_marks_failed_on_stopped_nonzero_with_reason() -> None:
     conn.install_handler(
         "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/1", 100)],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/1", 100)],
         ),
     )
 
@@ -404,9 +427,11 @@ def test_watch_marks_failed_on_stopped_nonzero_with_reason() -> None:
         ]
     }
 
-    launcher = make_launcher(conn=conn, ecs_client=ecs,
-                             subprocess_runner=lambda *a, **k: MagicMock(
-                                 returncode=0, stdout="", stderr=""))
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
     _, transitions = launcher._watch_in_flight()
     assert len(transitions) == 1
     assert transitions[0]["status"] == "failed"
@@ -420,7 +445,9 @@ def test_watch_handles_missing_exit_code_as_failure() -> None:
     conn.install_handler(
         "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [("ag-1", "arn:task/1", 100)],
+            cur,
+            "_next_fetchall",
+            [("ag-1", "arn:task/1", 100)],
         ),
     )
     ecs = MagicMock()
@@ -434,13 +461,424 @@ def test_watch_handles_missing_exit_code_as_failure() -> None:
             }
         ]
     }
-    launcher = make_launcher(conn=conn, ecs_client=ecs,
-                             subprocess_runner=lambda *a, **k: MagicMock(
-                                 returncode=0, stdout="", stderr=""))
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
     _, transitions = launcher._watch_in_flight()
     assert len(transitions) == 1
     assert transitions[0]["status"] == "failed"
     assert transitions[0]["exit_code"] == -1
+
+
+# ---------------------------------------------------------------------------
+# Silent-hang detector (issue #3881)
+# ---------------------------------------------------------------------------
+
+
+def _install_running_agent_row(
+    conn: FakeConn,
+    *,
+    agent_id: str = "ag-1",
+    task_arn: str = "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+    issue_number: int = 9001,
+) -> None:
+    """Install handler returning one RUNNING agent row for the watch query."""
+    conn.install_handler(
+        "SELECT agent_id, task_arn, issue_number FROM dispatcher.agents",
+        lambda cur, sql, params: setattr(
+            cur,
+            "_next_fetchall",
+            [(agent_id, task_arn, issue_number)],
+        ),
+    )
+
+
+def _install_silent_hang_config(conn: FakeConn, *, minutes: int | None) -> None:
+    """Install a config-row handler that returns ``minutes`` for ``silent_hang_minutes``.
+
+    ``minutes=None`` simulates a missing config row (default fallback).
+    """
+
+    def handler(cur: FakeCursor, sql: str, params: tuple[Any, ...]) -> None:
+        key = params[0] if params else ""
+        if key == "silent_hang_minutes":
+            cur._next_fetchone = None if minutes is None else (str(minutes),)
+        else:
+            cur._next_fetchone = None
+
+    conn.install_handler("FROM dispatcher.config WHERE key = %s", handler)
+
+
+def test_silent_hang_reaps_stale_running_task() -> None:
+    """RUNNING task whose log stream is older than threshold gets reaped.
+
+    Asserts: (1) ``ecs:StopTask`` was called with the right ARN; (2)
+    the agent row's UPDATE used ``status='failed'`` and
+    ``exit_reason='silent_hang'``; (3) the transition the watch loop
+    returns reflects the reap.
+    """
+    import time as _time
+
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+    _install_silent_hang_config(conn, minutes=None)  # fall back to default 30
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    # Stream's last event is 45min ago (> 30min default threshold).
+    stale_ms = int((_time.time() - (45 * 60)) * 1000)
+    cw = MagicMock()
+    cw.describe_log_streams.return_value = {
+        "logStreams": [
+            {
+                "logStreamName": "task-runner/task-runner/abc123def456",
+                "lastEventTimestamp": stale_ms,
+            }
+        ]
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        task_runner_log_group="/ecs/judgemind-task-runner-dev",
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    watched, transitions = launcher._watch_in_flight()
+
+    assert watched == 1
+    # The DescribeLogStreams call used the right group + stream name.
+    assert cw.describe_log_streams.call_count == 1
+    call_kwargs = cw.describe_log_streams.call_args.kwargs
+    assert call_kwargs["logGroupName"] == "/ecs/judgemind-task-runner-dev"
+    assert call_kwargs["logStreamNamePrefix"] == (
+        "task-runner/task-runner/abc123def456"
+    )
+    # ecs:StopTask called with the right ARN and a `silent_hang:` reason.
+    assert ecs.stop_task.call_count == 1
+    stop_kwargs = ecs.stop_task.call_args.kwargs
+    assert stop_kwargs["task"] == "arn:aws:ecs:us-west-2:0:task/jm/abc123def456"
+    assert stop_kwargs["reason"].startswith("silent_hang:")
+    # Agent row UPDATE marks failed with exit_reason='silent_hang'.
+    matching = [
+        (sql, params)
+        for sql, params in conn.executed
+        if sql.startswith("UPDATE dispatcher.agents") and "SET status = %s" in sql
+    ]
+    assert matching, "Expected an UPDATE to dispatcher.agents on silent_hang"
+    _, params = matching[-1]
+    assert params[0] == "failed"
+    assert params[2] == EXIT_REASON_SILENT_HANG
+    # Transition surfaced to the caller.
+    assert len(transitions) == 1
+    assert transitions[0]["status"] == "failed"
+    assert transitions[0]["exit_reason"] == EXIT_REASON_SILENT_HANG
+
+
+def test_silent_hang_skips_when_log_stream_fresh() -> None:
+    """RUNNING task with a recent log event is left alone (no reap)."""
+    import time as _time
+
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+    _install_silent_hang_config(conn, minutes=None)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    fresh_ms = int((_time.time() - 5) * 1000)  # 5s ago
+    cw = MagicMock()
+    cw.describe_log_streams.return_value = {
+        "logStreams": [
+            {
+                "logStreamName": "task-runner/task-runner/abc123def456",
+                "lastEventTimestamp": fresh_ms,
+            }
+        ]
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        task_runner_log_group="/ecs/judgemind-task-runner-dev",
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
+    # No UPDATE flipping the agent to failed.
+    assert not any(
+        sql.startswith("UPDATE dispatcher.agents") and "SET status = %s" in sql
+        for sql, _ in conn.executed
+    )
+
+
+def test_silent_hang_skips_when_log_stream_not_yet_found() -> None:
+    """A just-launched task (no log stream yet) is NOT reaped.
+
+    The awslogs driver creates the stream on the first event, which
+    can lag the ECS RUNNING transition by several seconds. Reaping in
+    that window would kill every freshly-launched agent.
+    """
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+    _install_silent_hang_config(conn, minutes=None)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    cw = MagicMock()
+    # Empty logStreams = stream not yet created.
+    cw.describe_log_streams.return_value = {"logStreams": []}
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        task_runner_log_group="/ecs/judgemind-task-runner-dev",
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
+    assert not any(
+        sql.startswith("UPDATE dispatcher.agents") and "SET status = %s" in sql
+        for sql, _ in conn.executed
+    )
+
+
+def test_silent_hang_skips_when_describe_streams_raises() -> None:
+    """A CloudWatch API error is logged but does not reap the agent.
+
+    CW transient errors (rate limits, IAM, network) must not flip
+    healthy agents to failed. Fail-closed on the side of NOT reaping.
+    """
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+    _install_silent_hang_config(conn, minutes=None)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    cw = MagicMock()
+    cw.describe_log_streams.side_effect = RuntimeError("Throttled")
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        task_runner_log_group="/ecs/judgemind-task-runner-dev",
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
+
+
+def test_silent_hang_skipped_entirely_when_log_group_unset() -> None:
+    """Empty TASK_RUNNER_LOG_GROUP → detector OFF (no CW calls at all).
+
+    The graceful-degradation path: F2 has not yet wired the awslogs
+    group, so the launcher must not crash trying to query a
+    nonexistent group. No CW client is even constructed.
+    """
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    cw = MagicMock()
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        # task_runner_log_group="" by default in make_launcher.
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert transitions == []
+    cw.describe_log_streams.assert_not_called()
+    ecs.stop_task.assert_not_called()
+
+
+def test_silent_hang_threshold_reads_from_config() -> None:
+    """``dispatcher.config.silent_hang_minutes`` overrides the default.
+
+    With a 15-minute override, a 20-minute-old log stream is reaped
+    (it would not be reaped under the default 30-minute threshold).
+    Pins the AC: "Threshold reads from dispatcher.config.silent_hang_minutes
+    with default 30. Verify: test with config=15 and confirm threshold
+    takes effect."
+    """
+    import time as _time
+
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+    _install_silent_hang_config(conn, minutes=15)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+
+    # 20min stale: under the default 30min threshold this would NOT
+    # reap, but with the config=15min override it SHOULD reap.
+    stale_ms = int((_time.time() - (20 * 60)) * 1000)
+    cw = MagicMock()
+    cw.describe_log_streams.return_value = {
+        "logStreams": [
+            {
+                "logStreamName": "task-runner/task-runner/abc123def456",
+                "lastEventTimestamp": stale_ms,
+            }
+        ]
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        task_runner_log_group="/ecs/judgemind-task-runner-dev",
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+
+    assert len(transitions) == 1
+    assert transitions[0]["exit_reason"] == EXIT_REASON_SILENT_HANG
+    assert ecs.stop_task.call_count == 1
+
+
+def test_read_silent_hang_minutes_default_when_missing() -> None:
+    """Missing config row → DEFAULT_SILENT_HANG_MINUTES (30)."""
+    conn = FakeConn()
+    launcher = make_launcher(conn=conn)
+    assert launcher._read_silent_hang_minutes() == DEFAULT_SILENT_HANG_MINUTES == 30
+
+
+def test_read_silent_hang_minutes_invalid_falls_back_to_default() -> None:
+    """Non-int / non-positive config values fall back to the default.
+
+    A misconfigured admin (``"banana"``, ``"-5"``) must not break the
+    detector or wedge the watch loop.
+    """
+    conn = FakeConn()
+    _install_silent_hang_config(conn, minutes=0)  # zero is invalid
+    launcher = make_launcher(conn=conn)
+    assert launcher._read_silent_hang_minutes() == DEFAULT_SILENT_HANG_MINUTES
+
+
+def test_silent_hang_log_stream_name_built_from_task_arn() -> None:
+    """The log stream name is ``<prefix>/task-runner/<task-id>``.
+
+    Task ARN format is
+    ``arn:aws:ecs:<region>:<acct>:task/<cluster>/<task-id>``; the
+    last URI segment is the task-id.
+    """
+    launcher = make_launcher(task_runner_log_stream_prefix="task-runner")
+    name = launcher._build_log_stream_name(
+        "arn:aws:ecs:us-west-2:155326049300:task/judgemind-dev/abcd1234beef5678"
+    )
+    assert name == "task-runner/task-runner/abcd1234beef5678"
+
+
+def test_silent_hang_skips_stream_with_mismatched_name() -> None:
+    """A prefix collision returning a different stream returns None.
+
+    If two streams happen to share a common prefix, ``DescribeLogStreams``
+    might return a different stream than we asked for. The detector
+    must not interpret a *different* stream's stale timestamp as our
+    task's silence.
+    """
+    conn = FakeConn()
+    _install_running_agent_row(conn)
+    _install_silent_hang_config(conn, minutes=None)
+
+    ecs = MagicMock()
+    ecs.describe_tasks.return_value = {
+        "tasks": [
+            {
+                "taskArn": "arn:aws:ecs:us-west-2:0:task/jm/abc123def456",
+                "lastStatus": "RUNNING",
+                "containers": [{}],
+            }
+        ]
+    }
+    cw = MagicMock()
+    cw.describe_log_streams.return_value = {
+        "logStreams": [
+            {
+                "logStreamName": "task-runner/task-runner/different-task-id",
+                "lastEventTimestamp": 0,  # ancient — would reap if matched
+            }
+        ]
+    }
+
+    launcher = make_launcher(
+        conn=conn,
+        ecs_client=ecs,
+        cloudwatch_logs_client=cw,
+        task_runner_log_group="/ecs/judgemind-task-runner-dev",
+        subprocess_runner=lambda *a, **k: MagicMock(returncode=0, stdout="", stderr=""),
+    )
+    _, transitions = launcher._watch_in_flight()
+    assert transitions == []
+    ecs.stop_task.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +895,7 @@ def test_budget_exhaustion_skips_and_marks_needs_human() -> None:
     test pins the user-visible behavior.
     """
     conn = FakeConn()
+
     # cap=1, so we have a slot; budget=3 (default — the missing
     # claim_attempts_max key falls through to the default); prior
     # attempts=3 (budget exhausted).
@@ -473,7 +912,9 @@ def test_budget_exhaustion_skips_and_marks_needs_human() -> None:
 
     conn.install_handler("FROM dispatcher.config WHERE key = %s", config_handler)
 
-    counts = iter([(0,), (3,)])  # first call: running v3 = 0; second: prior attempts = 3
+    counts = iter(
+        [(0,), (3,)]
+    )  # first call: running v3 = 0; second: prior attempts = 3
     conn.install_handler(
         "COUNT(*) FROM dispatcher.agents",
         lambda cur, sql, params: setattr(cur, "_next_fetchone", next(counts)),
@@ -497,7 +938,8 @@ def test_budget_exhaustion_skips_and_marks_needs_human() -> None:
         return MagicMock(returncode=0, stdout="", stderr="")
 
     launcher = make_launcher(
-        conn=conn, ecs_client=ecs,
+        conn=conn,
+        ecs_client=ecs,
         subprocess_runner=fake_subprocess,
         trust_checker=lambda n: True,
     )
@@ -519,8 +961,7 @@ def test_budget_exhaustion_skips_and_marks_needs_human() -> None:
     )
     ecs.run_task.assert_not_called()
     assert not any(
-        sql.startswith("INSERT INTO dispatcher.agents")
-        for sql, _ in conn.executed
+        sql.startswith("INSERT INTO dispatcher.agents") for sql, _ in conn.executed
     )
 
 
@@ -632,7 +1073,8 @@ def test_dispatcher_v2_only_label_skips_claim() -> None:
         return True
 
     launcher = make_launcher(
-        conn=conn, ecs_client=ecs,
+        conn=conn,
+        ecs_client=ecs,
         subprocess_runner=fake_subprocess,
         trust_checker=trust_checker,
     )
@@ -746,7 +1188,9 @@ def test_consume_commands_updates_concurrency_cap_v3() -> None:
     conn.install_handler(
         "SELECT command_id, command, payload",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [(1, "set_cap", {"cap": 3})],
+            cur,
+            "_next_fetchall",
+            [(1, "set_cap", {"cap": 3})],
         ),
     )
     launcher = make_launcher(conn=conn)
@@ -754,7 +1198,8 @@ def test_consume_commands_updates_concurrency_cap_v3() -> None:
     assert consumed == 1
     # The UPSERT writes the v3 key, not v2's.
     matching = [
-        (sql, params) for sql, params in conn.executed
+        (sql, params)
+        for sql, params in conn.executed
         if sql.startswith("INSERT INTO dispatcher.config") and params
     ]
     assert matching, "set_cap must write to dispatcher.config"
@@ -770,7 +1215,9 @@ def test_consume_commands_unknown_is_logged_and_consumed() -> None:
     conn.install_handler(
         "SELECT command_id, command, payload",
         lambda cur, sql, params: setattr(
-            cur, "_next_fetchall", [(2, "garbage", {})],
+            cur,
+            "_next_fetchall",
+            [(2, "garbage", {})],
         ),
     )
     launcher = make_launcher(conn=conn)
@@ -778,6 +1225,5 @@ def test_consume_commands_unknown_is_logged_and_consumed() -> None:
     assert consumed == 1  # consumed (so it doesn't block the queue)
     # No config write for unknown commands.
     assert not any(
-        sql.startswith("INSERT INTO dispatcher.config")
-        for sql, _ in conn.executed
+        sql.startswith("INSERT INTO dispatcher.config") for sql, _ in conn.executed
     )
