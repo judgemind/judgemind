@@ -14,16 +14,26 @@ The single long-lived process for dispatcher-v3. Each tick (default 30s):
    the session log's ``lastEventTimestamp``; if the stream has not
    received an event in ``silent_hang_minutes`` (default 30), the task
    is killed via ``ecs:StopTask`` and the agent row is marked
-   ``failed`` with ``exit_reason='silent_hang'``. The diagnoser
-   invocation on STOPPED-non-zero (and silent-hang reap) is the
-   responsibility of issue #3882 (C5) and is marked TODO inline.
-4. **Recover partial claims** — rows with ``status='claiming'`` and
+   ``failed`` with ``exit_reason='silent_hang'``. On any non-success
+   terminal (STOPPED-non-zero or silent-hang kill) the launcher
+   inline-spawns a ``diagnoser`` ECS task (issue #3882, spec §4.2)
+   with ``AGENT_ID`` set, capping at 1 diagnoser per agent.
+4. **Watch in-flight diagnosers** — for every v3-owned row with
+   ``diagnoser_arn IS NOT NULL AND status='failed' AND outcome_summary
+   IS NULL`` (the in-flight diagnoser predicate), call
+   ``ecs:DescribeTasks`` against ``diagnoser_arn`` and resolve. STOPPED-0
+   is a no-op for the launcher — the diagnoser SKILL has written
+   ``outcome_summary`` itself; the launcher only writes a fallback
+   sentinel if it's still null (so the watch query stops matching).
+   STOPPED-non-zero / OOM / spot-reclaim → set ``status='needs_review'``
+   and emit a TODO marker for the C6 Telegram alert.
+5. **Recover partial claims** — rows with ``status='claiming'`` and
    ``task_arn IS NULL`` that have aged past
    :data:`PARTIAL_CLAIM_RECOVERY_AGE_SECONDS` are marked ``failed``
    with ``exit_reason='claim_abandoned'``. Belt-and-suspenders for the
    narrow window where a label flip or RunTask fails after the DB
    INSERT lands.
-5. **Claim if cap allows** — read ``dispatcher.config.concurrency_cap_v3``
+6. **Claim if cap allows** — read ``dispatcher.config.concurrency_cap_v3``
    (v3-scoped key — see issue #3880 notes — kept independent of v2's
    ``concurrency_cap`` so each daemon can ramp / kill-switch without
    touching the other), count v3 running agents, and for each ready
@@ -234,6 +244,7 @@ class Launcher:
         github_repo: str,
         ecs_cluster_arn: str,
         task_runner_task_definition: str,
+        diagnoser_task_definition: str,
         agent_runner_subnet_ids: list[str],
         agent_runner_security_group_id: str,
         sessions_bucket: str,
@@ -251,6 +262,7 @@ class Launcher:
         self._github_repo = github_repo
         self._ecs_cluster_arn = ecs_cluster_arn
         self._task_runner_task_definition = task_runner_task_definition
+        self._diagnoser_task_definition = diagnoser_task_definition
         self._agent_runner_subnet_ids = list(agent_runner_subnet_ids)
         self._agent_runner_security_group_id = agent_runner_security_group_id
         self._sessions_bucket = sessions_bucket
@@ -279,6 +291,8 @@ class Launcher:
             "heartbeat": False,
             "watched": 0,
             "transitions": [],
+            "diagnosers_watched": 0,
+            "diagnoser_transitions": [],
             "claims": [],
             "claim_skipped": [],
             "recovered": 0,
@@ -288,6 +302,9 @@ class Launcher:
         watched, transitions = self._watch_in_flight()
         summary["watched"] = watched
         summary["transitions"] = transitions
+        d_watched, d_transitions = self._watch_diagnosers()
+        summary["diagnosers_watched"] = d_watched
+        summary["diagnoser_transitions"] = d_transitions
         summary["recovered"] = self._recover_partial_claims()
         claims, skipped = self._claim_if_cap_allows()
         summary["claims"] = claims
@@ -427,34 +444,71 @@ class Launcher:
             )
 
     def _force_kill_agent(self, agent_id: str) -> None:
-        """Stop a running ECS task for *agent_id* (best-effort)."""
+        """Stop running ECS tasks for *agent_id* (best-effort).
+
+        Cascades to both ``task_arn`` and ``diagnoser_arn`` (spec §4.2):
+        the operator's force-kill must also stop an in-flight diagnoser
+        so we don't leave an orphan running after the operator has
+        already decided. The row predicate intentionally drops the
+        ``ended_at IS NULL`` filter when reading ``diagnoser_arn`` —
+        the agent's row may carry ``ended_at`` (the original task ended
+        and a diagnoser was spawned to inspect it) while the diagnoser
+        ECS task itself is still in flight.
+        """
         assert self._conn is not None
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT task_arn FROM dispatcher.agents "
-                "WHERE agent_id = %s AND ended_at IS NULL",
+                "SELECT task_arn, diagnoser_arn, ended_at FROM dispatcher.agents "
+                "WHERE agent_id = %s",
                 (agent_id,),
             )
             row = cur.fetchone()
-        if row is None or row[0] is None:
+        if row is None:
             return
-        task_arn = str(row[0])
+        task_arn = row[0]
+        diagnoser_arn = row[1]
+        ended_at = row[2]
+        # The agent's task ARN is only "live" if the row hasn't ended.
+        # Once ended, the task has STOPPED and stop_task is a no-op
+        # (or fails); skip it. The diagnoser ARN is treated independently
+        # of ``ended_at`` — it may be set on a row whose original task
+        # already ended.
+        targets: list[tuple[str, str]] = []
+        if task_arn and ended_at is None:
+            targets.append(("task_arn", str(task_arn)))
+        if diagnoser_arn:
+            targets.append(("diagnoser_arn", str(diagnoser_arn)))
+        if not targets:
+            return
         try:
             client = self._get_ecs_client()
-            client.stop_task(
-                cluster=self._ecs_cluster_arn,
-                task=task_arn,
-                reason="force_kill",
-            )
         except Exception:
             log.exception(
-                "launcher.force_kill_failed",
+                "launcher.force_kill_client_init_failed",
                 extra={
-                    "event": "force_kill_failed",
+                    "event": "force_kill_client_init_failed",
                     "run_id": self._run_id,
                     "agent_id": agent_id,
                 },
             )
+            return
+        for kind, arn in targets:
+            try:
+                client.stop_task(
+                    cluster=self._ecs_cluster_arn,
+                    task=arn,
+                    reason="force_kill",
+                )
+            except Exception:
+                log.exception(
+                    "launcher.force_kill_failed",
+                    extra={
+                        "event": "force_kill_failed",
+                        "run_id": self._run_id,
+                        "agent_id": agent_id,
+                        "arn_kind": kind,
+                    },
+                )
 
     # -- step 2: heartbeat -------------------------------------------------
 
@@ -497,11 +551,13 @@ class Launcher:
           wall-clock cap itself is enforced by ECS via the task-def's
           ``stopTimeout`` (F2's responsibility, not this method).
 
-        TODO(#3882 — diagnoser invocation): on STOPPED-non-zero AND on
-        silent-hang reap we mark the row failed but do not yet spawn
-        the diagnoser ECS task — that wiring lands in C5. The
+        On any non-success terminal — STOPPED-non-zero or silent-hang
+        reap — the launcher inline-spawns a ``diagnoser`` ECS task
+        (issue #3882, spec §4.2) with ``AGENT_ID`` set. The per-agent
+        cap of 1 diagnoser is enforced inside ``_launch_diagnoser`` via
+        a fresh re-read of the row's ``diagnoser_arn`` value, and the
         ``exit_reason`` field carries the kill class so the diagnoser
-        can branch on it when it reads the row.
+        SKILL can branch on it when it reads the row.
         """
         if self._conn is None:
             return 0, []
@@ -558,14 +614,22 @@ class Launcher:
                     exit_code=exit_code,
                     exit_reason=exit_reason,
                 )
-                transitions.append(
-                    {
-                        "agent_id": str(agent_id),
-                        "status": new_status,
-                        "exit_code": exit_code,
-                        "exit_reason": exit_reason,
-                    }
-                )
+                stopped_transition: dict[str, Any] = {
+                    "agent_id": str(agent_id),
+                    "status": new_status,
+                    "exit_code": exit_code,
+                    "exit_reason": exit_reason,
+                }
+                # On failure, inline-launch the diagnoser (cap of 1 per
+                # agent enforced inside _launch_diagnoser via re-read of
+                # the row).
+                if new_status == "failed":
+                    diagnoser_arn = self._launch_diagnoser(
+                        agent_id=str(agent_id)
+                    )
+                    if diagnoser_arn:
+                        stopped_transition["diagnoser_arn"] = diagnoser_arn
+                transitions.append(stopped_transition)
                 continue
 
             # RUNNING — check for silent hang. The detector is opt-in
@@ -606,14 +670,21 @@ class Launcher:
                     "threshold_seconds": silent_hang_seconds,
                 },
             )
-            transitions.append(
-                {
-                    "agent_id": str(agent_id),
-                    "status": "failed",
-                    "exit_code": None,
-                    "exit_reason": EXIT_REASON_SILENT_HANG,
-                }
+            silent_hang_transition: dict[str, Any] = {
+                "agent_id": str(agent_id),
+                "status": "failed",
+                "exit_code": None,
+                "exit_reason": EXIT_REASON_SILENT_HANG,
+            }
+            # Silent-hang reaped agents are non-success terminals; run
+            # the diagnoser (cap of 1 enforced inside _launch_diagnoser
+            # via re-read of the row's diagnoser_arn).
+            silent_hang_diagnoser_arn = self._launch_diagnoser(
+                agent_id=str(agent_id)
             )
+            if silent_hang_diagnoser_arn:
+                silent_hang_transition["diagnoser_arn"] = silent_hang_diagnoser_arn
+            transitions.append(silent_hang_transition)
         return len(rows), transitions
 
     @staticmethod
@@ -882,7 +953,400 @@ class Launcher:
         if issue_number:
             self._gh_remove_labels(issue_number, [LABEL_STATUS_IN_PROGRESS])
 
-    # -- step 4: recover partial claims -----------------------------------
+    # -- step 3b: diagnoser invocation (issue #3882, spec §4.2) -----------
+
+    def _launch_diagnoser(self, *, agent_id: str) -> Optional[str]:
+        """Launch a diagnoser ECS task for *agent_id*; return the task ARN.
+
+        Cap of 1 enforced by an atomic re-read inside this method: if
+        ``diagnoser_arn`` is already set on the row (any prior diagnoser
+        attempt — running or completed), no new diagnoser is launched
+        and the method returns None. Per spec §4.2: "if the diagnoser
+        exits non-zero, OOMs, or is reclaimed → status='needs_review';
+        the next claim of the same issue bypasses the diagnoser
+        entirely on its first failure — there's no recursion of
+        'diagnose the diagnoser.'"
+
+        The diagnoser task definition family name is taken from the
+        constructor's ``diagnoser_task_definition`` argument (env var
+        ``DIAGNOSER_TASK_DEFINITION`` in production). The diagnoser
+        container's entrypoint runs ``claude -p "/diagnose-failure
+        $AGENT_ID"`` against the same image as the task-runner; the
+        ``AGENT_ID`` env var is the only override the launcher passes.
+
+        Returns None on cap-of-1 short-circuit, on RunTask failure
+        (logged via :func:`log.exception`), or when no diagnoser
+        task-def is configured. The caller treats None as a benign
+        outcome — the row stays ``status='failed'`` without a diagnoser,
+        and a future re-attempt on the same issue will not loop on
+        diagnosis.
+        """
+        if self._conn is None:
+            return None
+        if not self._diagnoser_task_definition:
+            # Configuration sanity: no diagnoser task-def wired up.
+            # F2 (#3887) hasn't landed yet in the dev environment, or
+            # the operator has explicitly unset the env var. Log + skip.
+            log.warning(
+                "launcher.diagnoser_task_def_unset",
+                extra={
+                    "event": "diagnoser_task_def_unset",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            return None
+
+        # Cap-of-1 re-check: read the row's current diagnoser_arn and
+        # bail if any prior diagnoser exists. Done as a fresh SELECT
+        # rather than relying on the watch-loop's row data so a
+        # concurrent diagnoser launch from a hypothetical second tick
+        # cannot race past the gate.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT diagnoser_arn FROM dispatcher.agents "
+                    "WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                row = cur.fetchone()
+            self._conn.commit()
+        except Exception:
+            log.exception(
+                "launcher.diagnoser_cap_check_failed",
+                extra={
+                    "event": "diagnoser_cap_check_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._safe_rollback()
+            return None
+        if row is not None and row[0] is not None:
+            log.info(
+                "launcher.diagnoser_skipped_capped",
+                extra={
+                    "event": "diagnoser_skipped_capped",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "existing_diagnoser_arn": str(row[0]),
+                },
+            )
+            return None
+
+        # ecs:RunTask the diagnoser. Same network configuration as the
+        # task-runner (private subnets, internal SG); the only env
+        # override is AGENT_ID — the diagnoser SKILL reads everything
+        # else from the DB row + S3 transcript.
+        try:
+            client = self._get_ecs_client()
+        except Exception:
+            log.exception(
+                "launcher.diagnoser_client_init_failed",
+                extra={
+                    "event": "diagnoser_client_init_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            return None
+
+        env_pairs = [
+            {"name": "AGENT_ID", "value": agent_id},
+        ]
+        overrides = {
+            "containerOverrides": [
+                {"name": "diagnoser", "environment": env_pairs}
+            ]
+        }
+        network_configuration = {
+            "awsvpcConfiguration": {
+                "subnets": list(self._agent_runner_subnet_ids),
+                "securityGroups": [self._agent_runner_security_group_id],
+                "assignPublicIp": "DISABLED",
+            }
+        }
+        tags = [
+            {"key": "agent_id", "value": agent_id},
+            {"key": "dispatcher_run_id", "value": self._run_id},
+            {"key": "dispatcher_version", "value": "v3"},
+            {"key": "kind", "value": "diagnoser"},
+        ]
+        try:
+            response = client.run_task(
+                cluster=self._ecs_cluster_arn,
+                taskDefinition=self._diagnoser_task_definition,
+                launchType="FARGATE",
+                count=1,
+                overrides=overrides,
+                networkConfiguration=network_configuration,
+                tags=tags,
+                propagateTags="TASK_DEFINITION",
+                enableExecuteCommand=True,
+            )
+        except Exception:
+            log.exception(
+                "launcher.diagnoser_run_task_raised",
+                extra={
+                    "event": "diagnoser_run_task_raised",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            return None
+        failures = response.get("failures") or []
+        if failures:
+            log.warning(
+                "launcher.diagnoser_run_task_failures",
+                extra={
+                    "event": "diagnoser_run_task_failures",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "failures": failures,
+                },
+            )
+            return None
+        tasks = response.get("tasks") or []
+        if not tasks:
+            return None
+        arn = tasks[0].get("taskArn")
+        if not arn:
+            return None
+        diagnoser_arn = str(arn)
+
+        # Persist the ARN. A failure here is logged; the row keeps
+        # status='failed' without diagnoser_arn — the diagnoser is
+        # already running but the launcher has no way to find it. The
+        # diagnoser will exit on its own (it doesn't need the launcher
+        # to operate).
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET diagnoser_arn = %s "
+                    "WHERE agent_id = %s",
+                    (diagnoser_arn, agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            log.exception(
+                "launcher.diagnoser_arn_update_failed",
+                extra={
+                    "event": "diagnoser_arn_update_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                    "diagnoser_arn": diagnoser_arn,
+                },
+            )
+            self._safe_rollback()
+            # Fall through — the diagnoser is launched, just not tracked.
+
+        log.info(
+            "launcher.diagnoser_launched",
+            extra={
+                "event": "diagnoser_launched",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "diagnoser_arn": diagnoser_arn,
+            },
+        )
+        return diagnoser_arn
+
+    def _watch_diagnosers(self) -> tuple[int, list[dict[str, Any]]]:
+        """Resolve in-flight diagnoser tasks.
+
+        The watch predicate is ``diagnoser_arn IS NOT NULL AND
+        status = 'failed' AND outcome_summary IS NULL``:
+
+        - ``diagnoser_arn IS NOT NULL`` — there is (or was) a diagnoser
+          for this agent.
+        - ``status = 'failed'`` — the agent has not yet been bumped to
+          ``needs_review`` (the diagnoser-failed terminal). Once we
+          observe a non-zero diagnoser exit and bump status, the row
+          drops out of this scan.
+        - ``outcome_summary IS NULL`` — neither the diagnoser SKILL nor
+          our STOPPED-0 fallback has written a sentinel yet. Once a
+          sentinel is written, the row drops out of this scan even if
+          the diagnoser ECS task lingers in STOPPED state.
+
+        Together these gate-against re-scanning a row whose diagnoser
+        has already been resolved. STOPPED-0 path: the diagnoser SKILL
+        wrote ``outcome_summary`` itself before exiting cleanly — the
+        launcher writes a fallback sentinel iff the column is still
+        null, so the next tick's predicate excludes the row. STOPPED-
+        non-zero path: status flips to ``needs_review``, the predicate
+        excludes the row.
+        """
+        if self._conn is None:
+            return 0, []
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_id, diagnoser_arn FROM dispatcher.agents "
+                    "WHERE diagnoser_arn IS NOT NULL "
+                    "  AND status = 'failed' "
+                    "  AND outcome_summary IS NULL "
+                    f"  AND {V3_SCOPED_PARENT_RUN_FILTER}",
+                )
+                rows = list(cur.fetchall() or [])
+            self._conn.commit()
+        except Exception:
+            log.exception(
+                "launcher.diagnoser_watch_scan_failed",
+                extra={
+                    "event": "diagnoser_watch_scan_failed",
+                    "run_id": self._run_id,
+                },
+            )
+            self._safe_rollback()
+            return 0, []
+
+        if not rows:
+            return 0, []
+
+        diagnoser_arns = [str(r[1]) for r in rows]
+        descriptions = self._describe_tasks(diagnoser_arns)
+        by_arn: dict[str, dict[str, Any]] = {}
+        for desc in descriptions:
+            arn = desc.get("taskArn")
+            if isinstance(arn, str):
+                by_arn[arn] = desc
+
+        transitions: list[dict[str, Any]] = []
+        for agent_id, diagnoser_arn in rows:
+            desc = by_arn.get(str(diagnoser_arn))
+            if desc is None:
+                continue
+            last_status = str(desc.get("lastStatus") or "")
+            if last_status != "STOPPED":
+                continue
+            exit_code, exit_reason = self._extract_exit_state(desc)
+            if exit_code == 0:
+                # Spec §4.2: "no further action — the diagnoser already
+                # wrote outcome_summary." Only write a fallback sentinel
+                # if the diagnoser somehow exited 0 without writing
+                # outcome_summary (defensive: stops the watch query
+                # from re-matching this row forever).
+                self._mark_diagnoser_succeeded(agent_id=str(agent_id))
+                transitions.append({
+                    "agent_id": str(agent_id),
+                    "diagnoser_status": "succeeded",
+                })
+            else:
+                # STOPPED-non-zero: bump agent to needs_review. The
+                # operator inspects from the cockpit; the per-issue
+                # claim budget governs whether a future ready-flip
+                # re-claims the issue. TODO(#3883 — C6): emit a
+                # Telegram alert here once the C6 wiring lands.
+                self._mark_agent_needs_review(
+                    agent_id=str(agent_id),
+                    diagnoser_exit_code=exit_code,
+                    diagnoser_exit_reason=exit_reason,
+                )
+                transitions.append({
+                    "agent_id": str(agent_id),
+                    "diagnoser_status": "failed",
+                    "diagnoser_exit_code": exit_code,
+                    "diagnoser_exit_reason": exit_reason,
+                })
+        return len(rows), transitions
+
+    def _mark_diagnoser_succeeded(self, *, agent_id: str) -> None:
+        """Write a fallback ``outcome_summary`` when diagnoser STOPPED-0.
+
+        Defensive only: under spec §4.2 the diagnoser SKILL writes its
+        own ``outcome_summary`` before exiting cleanly. If somehow the
+        diagnoser exited 0 without writing the column, this fallback
+        keeps the watch predicate (``outcome_summary IS NULL``) from
+        re-matching the row forever. We use ``COALESCE`` so a real
+        diagnoser write is never overwritten.
+        """
+        if self._conn is None:
+            return
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET outcome_summary = COALESCE(outcome_summary, %s) "
+                    "WHERE agent_id = %s",
+                    ("diagnoser_completed", agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            log.exception(
+                "launcher.diagnoser_success_mark_failed",
+                extra={
+                    "event": "diagnoser_success_mark_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._safe_rollback()
+
+    def _mark_agent_needs_review(
+        self,
+        *,
+        agent_id: str,
+        diagnoser_exit_code: Optional[int],
+        diagnoser_exit_reason: str,
+    ) -> None:
+        """Bump agent status to ``needs_review`` after a diagnoser failure.
+
+        Records the diagnoser exit context in ``outcome_summary`` so the
+        cockpit can render a useful one-liner without further DB joins.
+        Per spec §4.2 the next claim of the same issue bypasses the
+        diagnoser entirely on its first failure — there's no recursion;
+        the per-issue claim budget is what governs further attempts.
+        """
+        if self._conn is None:
+            return
+        # Build a compact summary string. Truncate the raw stoppedReason
+        # so we don't blow past TEXT-column display widths in the cockpit.
+        reason_tail = (diagnoser_exit_reason or "").strip()[:160]
+        summary = (
+            f"diagnoser_failed: exit={diagnoser_exit_code} {reason_tail}"
+        ).strip()[:240]
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE dispatcher.agents "
+                    "SET status = 'needs_review', "
+                    "    outcome_summary = COALESCE(outcome_summary, %s) "
+                    "WHERE agent_id = %s",
+                    (summary, agent_id),
+                )
+            self._conn.commit()
+        except Exception:
+            log.exception(
+                "launcher.needs_review_mark_failed",
+                extra={
+                    "event": "needs_review_mark_failed",
+                    "run_id": self._run_id,
+                    "agent_id": agent_id,
+                },
+            )
+            self._safe_rollback()
+            return
+        log.info(
+            "launcher.diagnoser_failed_needs_review",
+            extra={
+                "event": "diagnoser_failed_needs_review",
+                "run_id": self._run_id,
+                "agent_id": agent_id,
+                "diagnoser_exit_code": diagnoser_exit_code,
+            },
+        )
+        # TODO(#3883 — C6): once the Telegram-alert helper lands, emit
+        # an alert here so the operator sees the needs_review transition
+        # without polling the cockpit. The DB write above is the
+        # authoritative state; the alert is the human notification.
+
+    # -- step 4: watch in-flight diagnosers --------------------------------
+    # (defined above as part of step 3b's diagnoser-invocation block —
+    # ``_watch_diagnosers`` lives next to ``_launch_diagnoser`` because
+    # they share the cap-of-1 invariant.)
+
+    # -- step 5: recover partial claims -----------------------------------
 
     def _recover_partial_claims(self) -> int:
         """Mark stuck ``status='claiming' AND task_arn IS NULL`` rows failed."""
@@ -921,7 +1385,7 @@ class Launcher:
             )
         return int(rowcount or 0)
 
-    # -- step 5: claim if cap allows --------------------------------------
+    # -- step 6: claim if cap allows --------------------------------------
 
     def _claim_if_cap_allows(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Scan the queue and claim up to ``concurrency_cap_v3 - running`` issues."""
@@ -1505,6 +1969,14 @@ def _build_launcher_from_env() -> Launcher:
         github_repo=os.environ.get("GITHUB_REPO", "judgemind/judgemind"),
         ecs_cluster_arn=os.environ["ECS_CLUSTER_ARN"],
         task_runner_task_definition=os.environ["TASK_RUNNER_TASK_DEFINITION"],
+        # DIAGNOSER_TASK_DEFINITION is optional at boot — F2 (#3887) is in
+        # flight, and the cohabitation ramp tolerates a launcher that
+        # boots without diagnoser invocation wired (cap=0 means no
+        # failures fire either). When unset, ``_launch_diagnoser`` logs
+        # and skips; agents still mark ``failed`` correctly.
+        diagnoser_task_definition=os.environ.get(
+            "DIAGNOSER_TASK_DEFINITION", ""
+        ),
         agent_runner_subnet_ids=[
             s for s in os.environ.get("AGENT_RUNNER_SUBNET_IDS", "").split(",") if s
         ],
