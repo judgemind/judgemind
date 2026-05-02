@@ -37,3 +37,13 @@ output "dispatcher_agent_runner_repository_arn" {
   description = "ARN of the dispatcher agent-runner ECR repository"
   value       = aws_ecr_repository.dispatcher_agent_runner.arn
 }
+
+output "dispatcher_v3_repository_url" {
+  description = "ECR repository URL for the dispatcher v3 unified image (issue #3886; one image with multiple ECS task-def entrypoints)"
+  value       = aws_ecr_repository.dispatcher_v3.repository_url
+}
+
+output "dispatcher_v3_repository_arn" {
+  description = "ARN of the dispatcher v3 ECR repository"
+  value       = aws_ecr_repository.dispatcher_v3.arn
+}

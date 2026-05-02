@@ -1,0 +1,309 @@
+# Dispatcher v3 container image (issue #3886; design in
+# `docs/specs/dispatcher-v3-spec.md` §4 + §6).
+#
+# v3 architecture: ONE image, multiple ECS task definitions baked from
+# the same image with different entrypoints / argv:
+#
+#   - launcher        — long-lived ECS service, single replica.
+#                       `python -m dispatcher_v3.launcher` (default ENTRYPOINT).
+#   - task-runner     — one-shot ECS task per dispatched issue.
+#                       overrides command to run the task-runner entrypoint
+#                       (`python -m dispatcher_v3.agent_runner` or similar)
+#                       which spawns `claude -p "/task #N"`.
+#   - diagnoser       — one-shot ECS task on task-runner failure.
+#                       overrides command to run `claude -p "/diagnose-failure $AGENT_ID"`.
+#   - scheduled-skill — EventBridge-triggered one-shot task.
+#                       overrides command to run `claude -p "/$SKILL_NAME"`.
+#
+# All four roles share the same code, the same Python deps, and the same
+# Claude Code CLI version; they differ only in argv. The ECS task
+# definition's `command` override picks the role at launch time.
+#
+# This Dockerfile mirrors the structure of `Dockerfile.dispatcher`
+# (v2 daemon image) and `Dockerfile.dispatcher-agent-runner` (v2 per-agent
+# image). v3 collapses those two into one image — see the spec's "One image.
+# Three task definitions" line in §6.
+#
+# Why a separate Dockerfile instead of reusing the v2 ones?
+#   - The v2 images live alongside v2's runtime contract (entrypoint script
+#     pulls phase code from `scripts/dispatcher/`). v3 has no phase code;
+#     its entrypoint loads `scripts/dispatcher_v3/`. Sharing a Dockerfile
+#     would force an `if version == 'v3'` branch into the build that is
+#     simpler to express by checking out a separate file.
+#   - During cohabitation (spec §8) v2 and v3 run side-by-side. Each image
+#     needs to be redeployed independently — touching this file should
+#     never trigger a v2 daemon redeploy and vice versa. Separate Dockerfiles
+#     plus separate `paths:` filters in the deploy workflows give us that.
+#
+# Build (from repo root):
+#     docker build -f Dockerfile.dispatcher-v3 -t test:local \
+#         --build-arg GIT_SHA=$(git rev-parse --short HEAD) .
+#
+# Run locally — launcher (default):
+#     docker run --rm \
+#         -e DATABASE_URL="postgres://..." \
+#         test:local
+#
+# Run locally — task-runner (override command):
+#     docker run --rm \
+#         -e AGENT_ID=test-$(uuidgen) \
+#         -e TASK_ISSUE_NUMBER=42 \
+#         -e DATABASE_URL="postgres://..." \
+#         test:local \
+#         python -m dispatcher_v3.agent_runner
+
+FROM python:3.12-slim
+
+# ---------------------------------------------------------------------------
+# System deps — same baseline as Dockerfile.dispatcher / Dockerfile.dispatcher-agent-runner.
+#
+# `python:3.12-slim` is required because packages in this repo use PEP 695
+# generic syntax (e.g. `def retry_sync[T](...)` at
+# `packages/scraper-framework/src/framework/retry.py:13`) which fails to
+# parse on 3.11. See #2968 for the v2 incident that drove the 3.12 pin.
+#
+# - ca-certificates, curl, gnupg: outbound HTTPS + apt keyring installs.
+# - git: clone the repo at runtime, run pre-push hooks, etc. (`/task` pipeline).
+# - jq, postgresql-client: helpers `/task` invokes for DB queries and JSON
+#   parsing in scripts.
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        git \
+        jq \
+        postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Node.js 20 via NodeSource — required by `@anthropic-ai/claude-code`.
+# Same install pattern as Dockerfile.dispatcher; see that file's commentary
+# for the NodeSource rationale.
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# GitHub CLI — `/task` shells out to `gh` for issue / PR writes that the
+# MCP server cannot do (no auth token available in this image's claude
+# session for the GitHub MCP). Same install pattern as Dockerfile.dispatcher.
+# ---------------------------------------------------------------------------
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+#
+# - psycopg[binary]>=3.1 — Postgres driver. The launcher writes to
+#   `dispatcher.runs`, `dispatcher.agents`, `dispatcher.commands`,
+#   `dispatcher.config`, and `dispatcher.terminal_outcomes` (spec §5);
+#   the task-runner entrypoint may also poke `current_milestone` via
+#   `progress.sh` shell helpers but those use `psql` directly.
+# - boto3>=1.34 — AWS SDK. The launcher uses `ecs:RunTask` /
+#   `ecs:DescribeTasks` / `ecs:StopTask` (spec §4.1) and
+#   `cloudwatch:PutMetricData` for the heartbeat metric. The task-runner
+#   uploads the rendered transcript + raw jsonl to S3 on EXIT (spec §4.1
+#   "Session capture").
+#
+# Both pinned to the same floors as Dockerfile.dispatcher so the daemon
+# and v3 images stay in lockstep on shared dependencies.
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    "psycopg[binary]>=3.1,<4" \
+    "boto3>=1.34,<2"
+
+# AWS CLI — `/task` shells out to `aws ecs run-task`, `aws s3 cp`,
+# `aws logs filter-log-events`, etc. Same rationale as
+# Dockerfile.dispatcher-agent-runner — pip-installed (not bundled) to keep
+# the image slim.
+RUN pip install --no-cache-dir "awscli>=1.33,<2"
+
+# ---------------------------------------------------------------------------
+# Claude Code CLI
+#
+# Pinned to 2.1.114 — same version as Dockerfile.dispatcher and
+# Dockerfile.dispatcher-agent-runner. Bump in lockstep across all three
+# Dockerfiles whenever we re-spike a newer CLI.
+# ---------------------------------------------------------------------------
+RUN npm install -g @anthropic-ai/claude-code@2.1.114
+
+# Canary — verify the platform-native binary actually installed. See the
+# #3040 incident commentary in Dockerfile.dispatcher for why this matters
+# (npm `optionalDependencies` can silently drop the platform binary).
+RUN claude --version
+
+# ---------------------------------------------------------------------------
+# judgemind-transcripts/render-transcript.py — vendored, COPY'd into
+# `/opt/judgemind-transcripts/` so the task-runner entrypoint can invoke
+# `render-transcript.py` on EXIT to produce the compact transcript that
+# the diagnoser reads (spec §4.1 "Session capture: CloudWatch primary
+# (raw), S3 archive (compact)").
+#
+# We vendor the file (rather than `git clone` at build time) because the
+# upstream repo `judgemind/judgemind-transcripts` is private — cloning
+# from inside a Docker build would require either:
+#   1. Plumbing a `GITHUB_TOKEN` build-arg through, which risks the token
+#      ending up in intermediate layers' history (recoverable without
+#      BuildKit secret mounts, which our deploy workflow does not yet wire).
+#   2. An SSH deploy key — adds a secret-management surface for a single
+#      303-line script.
+#
+# Vendoring the file (see `vendor/judgemind-transcripts/README.md` for the
+# full rationale) sidesteps both problems. The script itself is not
+# sensitive — the upstream repo is private to keep the *transcripts*
+# private, not the renderer. Build-time COPY also makes builds offline-
+# reproducible: no network round-trip to a sibling repo at every CI run.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /opt/judgemind-transcripts
+COPY vendor/judgemind-transcripts/render-transcript.py /opt/judgemind-transcripts/render-transcript.py
+
+# Verify the renderer script landed where the entrypoint expects it. Cheap
+# build-time check — fails the build instead of a runtime EXIT-trap surprise
+# if the vendor path is ever moved without updating this Dockerfile.
+RUN test -f /opt/judgemind-transcripts/render-transcript.py
+
+# ---------------------------------------------------------------------------
+# Dispatcher user + HOME — same pattern as Dockerfile.dispatcher.
+#
+# The Claude Code CLI refuses `--dangerously-skip-permissions` when UID=0
+# (#2986); switching to the dispatcher user (UID 1000) here satisfies the
+# CLI check. ECS Fargate doesn't care what UID we pick as long as it's
+# consistent.
+#
+# Per-subprocess HOME isolation for the worker subagents that `/task`
+# spawns happens at spawn time (spec §10 / §14) — the entrypoint sets
+# `HOME=/tmp/agents/<agent_id>` on each child process so `~/.claude/`
+# state cannot leak across agents. The container-level `$HOME` value is
+# only used by the launcher loop itself.
+# ---------------------------------------------------------------------------
+ENV HOME=/home/dispatcher
+RUN groupadd --gid 1000 dispatcher \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --home-dir "$HOME" dispatcher \
+    && mkdir -p "$HOME" \
+    && chown -R dispatcher:dispatcher "$HOME"
+
+# ---------------------------------------------------------------------------
+# Per-agent workspace root — task-runner role only.
+#
+# When the image boots in task-runner mode the entrypoint clones the
+# judgemind/judgemind repo into `${AGENT_WORKSPACE}/repo` and uses it as
+# the cwd for the `/task` invocation. The launcher role never reads from
+# this directory — its concerns are ECS RunTask / DescribeTasks. Kept
+# under /var/lib so it doesn't collide with /app.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /var/lib/dispatcher-v3 \
+    && chown -R dispatcher:dispatcher /var/lib/dispatcher-v3
+ENV AGENT_WORKSPACE=/var/lib/dispatcher-v3
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Application code
+#
+# The v3 image needs:
+#   1. The `dispatcher_v3` Python package — launcher + task-runner +
+#      shared helpers (`scripts/dispatcher_v3/`).
+#   2. `scripts/check-issue-author.sh` — trust gate the launcher runs
+#      before claiming a ready issue (spec §4.1, §10).
+#   3. `scripts/preflight.sh` + `scripts/preflight-bash-fargate.sh` —
+#      the narrowed Fargate hook for in-container subagents (#2982).
+#   4. `.claude/hooks/preflight_cross_worktree.py` — helper invoked by
+#      the Fargate hook's cross-worktree-write check.
+#
+# We deliberately do NOT COPY the whole `scripts/` directory — most of
+# those scripts are operator-laptop helpers that don't need to ship in
+# the image. Keeping the COPY list tight reduces layer churn from
+# unrelated `scripts/*` edits.
+#
+# Note: `dispatcher_v3` is on `sys.path` at /app/scripts because the
+# entrypoint runs with WORKDIR=/app, and python imports
+# `dispatcher_v3.<module>` by adding /app/scripts to PYTHONPATH at the
+# entrypoint — see the ENV PYTHONPATH below.
+# ---------------------------------------------------------------------------
+COPY scripts/dispatcher_v3/ /app/scripts/dispatcher_v3/
+COPY scripts/check-issue-author.sh /app/scripts/check-issue-author.sh
+COPY scripts/preflight.sh /app/scripts/preflight.sh
+COPY scripts/preflight-bash-fargate.sh /app/fargate-hooks/preflight-bash.sh
+COPY .claude/hooks/preflight_cross_worktree.py /app/fargate-hooks/preflight_cross_worktree.py
+RUN chmod +x /app/scripts/check-issue-author.sh \
+    && chmod +x /app/fargate-hooks/preflight-bash.sh \
+    && chown -R dispatcher:dispatcher /app
+ENV DISPATCHER_FARGATE_HOOKS_DIR=/app/fargate-hooks
+
+# Make the dispatcher_v3 package importable as `import dispatcher_v3`
+# without the `scripts.` prefix. The package lives at
+# /app/scripts/dispatcher_v3/, so adding /app/scripts to PYTHONPATH lets
+# `python -m dispatcher_v3.<module>` resolve it.
+ENV PYTHONPATH=/app/scripts
+
+# ---------------------------------------------------------------------------
+# Git committer identity — same values as Dockerfile.dispatcher /
+# Dockerfile.dispatcher-agent-runner so any commits produced by the
+# task-runner have a consistent author line. GitHub attributes the
+# squash-merged commit to the PR author via the merge flow, not this
+# identity — these values are cosmetic, used only when git insists on a
+# committer (e.g. `git commit --amend`).
+# ---------------------------------------------------------------------------
+RUN git config --system user.email "noreply@judgemind.org" \
+    && git config --system user.name "Judgemind Dispatcher"
+
+# ---------------------------------------------------------------------------
+# Image provenance — CI sets GIT_SHA to the merge commit SHA. The
+# launcher reads GIT_SHA from the environment at startup and persists it
+# to `dispatcher.runs.version_sha` (spec §5) so post-hoc forensics can
+# pin a run to a specific image.
+# ---------------------------------------------------------------------------
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
+# Drop privileges before the entrypoint — same rationale as
+# Dockerfile.dispatcher (Claude Code CLI refuses
+# `--dangerously-skip-permissions` when UID=0).
+USER dispatcher
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+#
+# v3 ARCHITECTURE: One image, multiple ECS task definitions baked from
+# the same image with different entrypoints / argv. The task definition's
+# `command` override picks the role at launch time:
+#
+#   launcher        — `python -m dispatcher_v3.launcher`               (default CMD below)
+#   task-runner     — `python -m dispatcher_v3.agent_runner`            (CMD overridden)
+#   diagnoser       — `claude -p "/diagnose-failure $AGENT_ID"`          (CMD overridden)
+#   scheduled-skill — `claude -p "/$SKILL_NAME"`                         (CMD overridden)
+#
+# We use the canonical "exec the CMD as the process" entrypoint pattern:
+# the ENTRYPOINT is `/bin/sh -c "exec \"$@\""` and the CMD provides the
+# default argv. ECS overrides `command` to swap argv for non-launcher
+# roles. This shape also lets local debug `docker run` calls pass an
+# arbitrary argv through, which is how the AC's
+# `docker run test:local ls /opt/judgemind-transcripts/render-transcript.py`
+# verify command resolves the renderer file.
+#
+# Why exec-form sh -c rather than `ENTRYPOINT ["python", "-m",
+# "dispatcher_v3.launcher"]`: the latter would force `docker run <img>
+# <some_other_argv>` to append the args to python's argv (e.g. python -m
+# dispatcher_v3.launcher ls /opt/...) instead of running `ls` directly,
+# which breaks the AC verify shape.
+#
+# The actual `dispatcher_v3.launcher` module does not exist yet — landing
+# the image + ECR + CI workflow is a separate, leaf-most piece of the v3
+# buildout (per the spec section 4 architecture). Until the launcher
+# module lands, the placeholder CMD below prints a one-line "launcher
+# not yet implemented" message and exits cleanly. Once the launcher
+# lands, the CMD swaps to `["python", "-m", "dispatcher_v3.launcher"]`
+# in a follow-up PR.
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["/bin/sh", "-c", "exec \"$@\"", "--"]
+CMD ["/bin/sh", "-c", "echo 'dispatcher-v3 image: launcher entrypoint not yet implemented; override `command` to run task-runner / diagnoser / scheduled-skill roles.'; exit 0"]
