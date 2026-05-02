@@ -31,6 +31,26 @@ Acceptance criteria must be concrete and machine-checkable wherever possible. Va
 
 Each criterion should have at least one `Verify:` line that an agent can execute to confirm the criterion is met. This applies to issues filed by both humans and agents. If a verification command is not possible (e.g., requires subjective judgment), note that explicitly so reviewers know it requires manual verification.
 
+### Verify lines on Python tasks
+
+Do NOT write `python -c '<code>'` in `Verify:` lines. The preflight-bash hook blocks that exact form (it matches the `python -c` pattern in `docs/agent/interactive-shell-rules.md`), so any agent attempting to run the verification step will hit an immediate hook rejection and be forced into an unplanned detour to write a temp script anyway.
+
+Use one of these three approved forms instead, in preference order:
+
+1. **Run an existing CLI or module entry point** — when a runnable entry point exists:
+   ```
+   Verify: python path/to/existing_module.py --some-flag
+   ```
+2. **Reference an existing pytest test by name** — when the behaviour is already covered by a unit or integration test:
+   ```
+   Verify: pytest path/to/tests/test_foo.py::test_bar
+   ```
+3. **Write a one-shot probe to `{worktree}/tmp/verify.py`** — for cases where no CLI or relevant test exists and a short probe is genuinely the clearest expression:
+   ```
+   Verify: write probe to {worktree}/tmp/verify.py and run python {worktree}/tmp/verify.py
+   ```
+   The `{worktree}/tmp/` directory is the approved location for agent temp files (not `/tmp/`).
+
 ## Verify the gap exists before filing
 
 Before filing a "does X" / "enable X" / "add X" issue, run a single command that verifies X is not already the case. This rule exists because an agent-runner cycle spent re-creating state that already exists is pure waste — the canonical example is #3146, where an issue was filed to "enable Container Insights on the ECS cluster" after the Terraform attribute `enable_container_insights = true` had already shipped in a prior PR. The agent spent a full cycle discovering, through probing, that there was nothing to do. A thirty-second check before filing would have surfaced that immediately. This is a sibling of the external-integration feasibility note in §Writing Acceptance Criteria (line 15): both rules say "verify the precondition before you ask an agent to build on top of it."
