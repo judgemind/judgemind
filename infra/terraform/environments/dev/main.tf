@@ -398,6 +398,37 @@ module "dispatcher_agent_runner" {
   spotcheck_oneshot_script_bucket_arn         = "arn:aws:s3:::judgemind-assets-dev"
 }
 
+# ─── Dispatcher v3 IAM (F3, #3888) ──────────────────────────────────────────
+# Per `docs/specs/dispatcher-v3-spec.md` §10. Two task roles + one shared
+# execution role for the v3 task pipeline:
+#
+#   * `launcher_role` — narrow scheduler scope assumed by F2's `launcher`
+#     task definition.
+#   * `agent_task_role` — dev-admin equivalent assumed by F2's
+#     `task-runner`, `diagnoser`, and `scheduled-skill` task definitions.
+#   * `execution_role` — shared by every v3 task definition for ECR pull
+#     and secret injection.
+#
+# F2 (#3887) consumes these ARNs when registering task definitions; F4
+# stands up the launcher ECS service. Until F2 lands, the roles exist
+# but no task assumes them — they're inert by construction.
+module "dispatcher_v3_iam" {
+  source = "../../modules/dispatcher-v3-iam"
+
+  environment     = "dev"
+  ecs_cluster_arn = module.compute.cluster_arn
+
+  # Telegram bot token — re-uses the same secret v2's daemon does. Wired
+  # so the launcher can page the operator on a stuck queue without
+  # reaching for the broad agent-task-role secret list.
+  telegram_bot_token_secret_arn = ""
+
+  # Scoped GitHub PAT — re-uses the same `judgemind/dispatcher/github-token`
+  # secret as v2. F2 will inject this into the task-runner / diagnoser
+  # task definitions for `gh auth setup-git` inside the agent.
+  github_token_secret_arn = "arn:aws:secretsmanager:us-west-2:155326049300:secret:judgemind/dispatcher/github-token-QOmHlJ"
+}
+
 output "ecr_repository_url" {
   description = "Dev ECR repository URL for scraper images"
   value       = module.ecr.repository_url
@@ -675,4 +706,23 @@ output "dispatcher_daemon_security_group_id" {
 output "dispatcher_ecr_repository_url" {
   description = "Dev ECR repository URL for dispatcher v2 daemon images"
   value       = module.ecr.dispatcher_repository_url
+}
+
+# ─── Dispatcher v3 IAM outputs (F3, #3888) ──────────────────────────────────
+# Consumed by F2 (#3887) when wiring v3 task definitions and by F4 when
+# standing up the launcher ECS service.
+
+output "dispatcher_v3_launcher_role_arn" {
+  description = "Dev dispatcher-v3 launcher task role ARN (narrow scheduler scope: RunTask on agent task-defs, RDS connect to dispatcher.* only, Telegram secret read, CloudWatch read on /judgemind/dispatcher-v3/*)"
+  value       = module.dispatcher_v3_iam.launcher_role_arn
+}
+
+output "dispatcher_v3_agent_task_role_arn" {
+  description = "Dev dispatcher-v3 agent task role ARN (dev-admin equivalent shared by task-runner / diagnoser / scheduled-skill — see spec §10). Trust policy excludes assuming any cross-account role."
+  value       = module.dispatcher_v3_iam.agent_task_role_arn
+}
+
+output "dispatcher_v3_execution_role_arn" {
+  description = "Dev dispatcher-v3 shared task-execution role ARN (used by every v3 task definition for ECR pull + secret injection + log writes)"
+  value       = module.dispatcher_v3_iam.execution_role_arn
 }
