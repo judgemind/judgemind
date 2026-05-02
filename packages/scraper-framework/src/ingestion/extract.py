@@ -1402,6 +1402,11 @@ _TRAILING_CONNECTOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bare vs-separator at the end of a title — no defendant name follows (#3990).
+# Matches strings that end in a dangling "v", "vs", "vs." with no following text.
+# Examples: "Steinman v", "Doe vs", "Aoyagi vs.", "Serrato Vs"
+_BARE_VS_SUFFIX_RE = re.compile(r"(?:^|\s)[Vv][Ss]?\.?\s*$")
+
 
 def strip_trailing_connectors(title: str) -> str:
     """Strip trailing English connector words from a case title.
@@ -1426,6 +1431,25 @@ def strip_trailing_connectors(title: str) -> str:
     if stripped == title:
         return title
     return stripped.rstrip(".,;: ") or title
+
+
+def has_bare_vs_suffix(title: str) -> bool:
+    """Return True if *title* ends with a bare vs-separator and no defendant name.
+
+    Detects titles like ``"Steinman v"``, ``"Doe vs"``, ``"Aoyagi vs."``,
+    ``"Serrato Vs"`` where the LLM extracted the plaintiff but the defendant
+    name is missing, leaving only the dangling separator (#3990).
+
+    Args:
+        title: The case title string to check.
+
+    Returns:
+        True if the title ends with a bare "v", "vs", or "vs." with no
+        following party name.
+    """
+    if not title:
+        return False
+    return bool(_BARE_VS_SUFFIX_RE.search(title))
 
 
 def is_plausible_case_title(title: str) -> bool:
@@ -1477,6 +1501,11 @@ def is_plausible_case_title(title: str) -> bool:
     # contamination like "TAYLOR VS. AMAZON MSC21-02349 Romeo Cerina"
     # (#2242).
     if _PLAUSIBILITY_CASE_NUMBER_RE.search(stripped):
+        return False
+
+    # Reject titles that end with a bare vs-separator with no defendant name
+    # following — e.g. "Steinman v", "Doe vs", "Aoyagi vs." (#3990).
+    if _BARE_VS_SUFFIX_RE.search(stripped):
         return False
 
     return True

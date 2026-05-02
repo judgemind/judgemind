@@ -77,6 +77,7 @@ from .extract import (
     extract_case_type_from_title,
     extract_hearing_date,
     extract_judge_name,
+    has_bare_vs_suffix,
     is_plausible_case_title,
     is_plausible_hearing_date,
     is_probate_decedent_name,
@@ -1888,6 +1889,22 @@ class IngestionWorker:
                     },
                 )
                 case_title = sanitized
+
+        # Null bare-vs titles before the plausibility check: titles like
+        # "Steinman v" or "Doe vs." are partial — the defendant name was
+        # truncated/missing.  Accept NULL over a malformed partial title
+        # (option (b) from issue #3990).
+        if case_title and has_bare_vs_suffix(case_title):
+            logger.info(
+                "Nulled bare-vs case title (no defendant name follows)",
+                extra={
+                    "document_id": document_id,
+                    "old_title": case_title[:120],
+                    "telemetry_event": "bare_vs_title_nulled",
+                },
+            )
+            case_title = None
+            extraction_methods.pop("case_title", None)
 
         # For LLM-extracted events, the LLM-provided case_title can be
         # messy (motion descriptions, case citations, multiple parties).

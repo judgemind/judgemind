@@ -2552,6 +2552,76 @@ class TestStripTrailingCaseNumber:
         raw = "X 2024cubco20894"
         assert strip_trailing_case_number(raw) == "X"
 
+
+# ---------------------------------------------------------------------------
+# Bare "v" / "vs" suffix rejection (#3990)
+# ---------------------------------------------------------------------------
+
+
+class TestBareVsSuffix:
+    """Unit tests for bare-vs-suffix detection and rejection (#3990).
+
+    Covers:
+      - has_bare_vs_suffix() helper
+      - is_plausible_case_title() rejecting bare-vs inputs
+      - clean_case_title() returning None for bare-vs inputs
+      - test_bare_vs_separator_rejected (AC #3 named test)
+    """
+
+    def test_strips_bare_vs_suffix_helper(self) -> None:
+        """has_bare_vs_suffix() correctly identifies bare-vs trailing suffixes."""
+        from ingestion.extract import has_bare_vs_suffix
+
+        assert has_bare_vs_suffix("Steinman v") is True
+        assert has_bare_vs_suffix("Doe vs") is True
+        assert has_bare_vs_suffix("Aoyagi vs.") is True
+        assert has_bare_vs_suffix("Serrato Vs") is True
+        assert has_bare_vs_suffix("Bridges vs.") is True
+        # Titles with text after vs. are NOT bare-vs suffixes
+        assert has_bare_vs_suffix("Smith v. Jones") is False
+        assert has_bare_vs_suffix("Smith vs. State of California") is False
+        assert has_bare_vs_suffix("In re Marriage of Garcia") is False
+
+    def test_is_plausible_case_title_rejects_bare_vs(self) -> None:
+        """is_plausible_case_title() returns False for bare-vs trailing suffix."""
+        assert is_plausible_case_title("Steinman v") is False
+        assert is_plausible_case_title("Doe vs") is False
+        assert is_plausible_case_title("Aoyagi vs.") is False
+        assert is_plausible_case_title("Serrato Vs") is False
+        assert is_plausible_case_title("Bridges vs.") is False
+
+    def test_clean_case_title_returns_none_for_bare_vs(self) -> None:
+        """clean_case_title() returns None for bare-vs inputs (existing behavior)."""
+        assert clean_case_title("Steinman v") is None
+        assert clean_case_title("Doe vs") is None
+        assert clean_case_title("Aoyagi vs.") is None
+
+    def test_bare_vs_separator_rejected(self) -> None:
+        """AC #3: LA/OC/RV-shaped fixture inputs that previously produced bare 'v.'
+        must produce None (never the partial form).
+
+        These simulate LLM outputs where the defendant name was truncated/missing,
+        leaving a trailing bare vs-separator.
+        """
+        # LA-shaped: plaintiff name with trailing vs
+        la_fixture_1 = "Steinman v"
+        la_fixture_2 = "Doe vs."
+        # OC-shaped: longer name with trailing vs.
+        oc_fixture = "Aoyagi vs."
+        # RV-shaped: mixed case vs
+        rv_fixture = "Serrato Vs"
+
+        for fixture in [la_fixture_1, la_fixture_2, oc_fixture, rv_fixture]:
+            # is_plausible_case_title must reject it
+            assert is_plausible_case_title(fixture) is False, (
+                f"Expected is_plausible_case_title({fixture!r}) to be False"
+            )
+            # clean_case_title must return None (never the partial form)
+            result = clean_case_title(fixture)
+            assert result is None, (
+                f"Expected clean_case_title({fixture!r}) to be None, got {result!r}"
+            )
+
     def test_strips_4_digit_trailing(self) -> None:
         """Strip Ventura new-format case number with 4-digit sequence (#3511)."""
         from ingestion.extract import strip_trailing_case_number
