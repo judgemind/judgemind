@@ -579,6 +579,51 @@ module "dispatcher_v3_task_defs" {
   agent_runner_security_group_id = aws_security_group.dispatcher_v3_agent_runner.id
 }
 
+# ─── Dispatcher v3 scheduled skills (F5, #3890) ─────────────────────────────
+# Per `docs/specs/dispatcher-v3-spec.md` §4.4. Wires four EventBridge
+# cron rules to F2's `scheduled-skill` task definition (audit,
+# dispatcher-audit, dispatcher-daily-report, spotcheck). EventBridge
+# fires; ECS runs the task; the skill writes results directly via `gh`.
+# The launcher is uninvolved -- this is observation/cron, not
+# orchestration.
+#
+# A shared SQS dead-letter queue captures invocations EventBridge could
+# not deliver, and a per-rule CloudWatch alarm on the
+# `AWS/Events FailedInvocations` metric pages the operator via the
+# existing scraper-alerts SNS topic. Closes adversarial-review MAJOR 7.
+#
+# Cohabitation with v2: v2's daemon already runs these scheduled skills
+# via its in-process scheduler. During cohabitation both can fire -- the
+# skills are idempotent (file-issue dedup, GH Actions concurrency).
+# Once v3 is the sole operator the v2 schedules will be retired.
+module "dispatcher_v3_scheduled_skills" {
+  source = "../../modules/dispatcher-v3-scheduled-skills"
+
+  environment = "dev"
+
+  ecs_cluster_arn                        = module.compute.cluster_arn
+  scheduled_skill_task_definition_arn    = module.dispatcher_v3_task_defs.scheduled_skill_task_definition_arn
+  scheduled_skill_task_definition_family = module.dispatcher_v3_task_defs.scheduled_skill_task_definition_family
+
+  # Reuse the launcher / task-runner private subnets and the env-layer
+  # v3 agent-runner SG so scheduled-skill ECS tasks share the launcher's
+  # outbound posture (HTTPS / Postgres / Redis).
+  task_subnet_ids        = module.networking.private_subnet_ids
+  task_security_group_id = aws_security_group.dispatcher_v3_agent_runner.id
+
+  # F3 IAM roles. The EventBridge invoker role's PassRole policy is
+  # pinned to these two ARNs only -- RunTask cannot pass any other
+  # role.
+  execution_role_arn  = module.dispatcher_v3_iam.execution_role_arn
+  agent_task_role_arn = module.dispatcher_v3_iam.agent_task_role_arn
+
+  # Alarm wiring -- reuses the existing scraper-alerts SNS topic so the
+  # operator's existing email + Telegram subscription gets the page
+  # without provisioning a new topic.
+  enable_alerts       = true
+  alert_sns_topic_arn = module.compute.alerts_topic_arn
+}
+
 # ─── Dispatcher v3 launcher ECS service (F4, #3889) ─────────────────────────
 # Per `docs/specs/dispatcher-v3-spec.md` §6 + §9 step 2. Single-replica
 # ECS Fargate service that runs the v3 launcher loop alongside v2's
@@ -1001,4 +1046,34 @@ output "dispatcher_v3_service_arn" {
 output "dispatcher_v3_service_security_group_id" {
   description = "Dev dispatcher-v3 launcher security group ID (outbound HTTPS + Postgres + Redis only). Reference from any module that needs to allow ingress from the launcher (e.g. RDS / Redis security groups)."
   value       = module.dispatcher_v3_service.security_group_id
+}
+
+# ─── Dispatcher v3 scheduled skills outputs (F5, #3890) ─────────────────────
+# Consumed by operators for verification (`aws events list-rules
+# --name-prefix dispatcher-v3-`) and by the daemon's monitoring code if
+# it ever wants to poll the DLQ depth as a secondary health signal.
+
+output "dispatcher_v3_scheduled_skills_rule_names" {
+  description = "Map of skill name -> EventBridge rule name for the four v3 scheduled skills (audit / dispatcher-audit / dispatcher-daily-report / spotcheck). Use with `aws events describe-rule --name <value>` for smoke checks."
+  value       = module.dispatcher_v3_scheduled_skills.rule_names
+}
+
+output "dispatcher_v3_scheduled_skills_dlq_url" {
+  description = "URL of the shared SQS dead-letter queue for failed EventBridge invocations of v3 scheduled skills. Inspect via `aws sqs receive-message --queue-url <url>`."
+  value       = module.dispatcher_v3_scheduled_skills.dlq_url
+}
+
+output "dispatcher_v3_scheduled_skills_dlq_arn" {
+  description = "ARN of the shared SQS dead-letter queue."
+  value       = module.dispatcher_v3_scheduled_skills.dlq_arn
+}
+
+output "dispatcher_v3_scheduled_skills_invoker_role_arn" {
+  description = "ARN of the EventBridge invoker role assumed by `events.amazonaws.com` when firing the v3 scheduled-skill rules."
+  value       = module.dispatcher_v3_scheduled_skills.events_invoker_role_arn
+}
+
+output "dispatcher_v3_scheduled_skills_alarm_names" {
+  description = "Map of skill name -> CloudWatch alarm name on `AWS/Events FailedInvocations` for the per-rule alarm. Closes adversarial-review MAJOR 7 (silent skill failures)."
+  value       = module.dispatcher_v3_scheduled_skills.alarm_names
 }
