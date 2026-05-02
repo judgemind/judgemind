@@ -1010,6 +1010,34 @@ def test_riv_parse_document_dept_judge_fallback() -> None:
     assert result.judge_name == "Mapped Single Judge"
 
 
+@respx.mock
+def test_riv_parse_document_placeholder_judge_reset() -> None:
+    """parse_document resets placeholder judge names to None (#3785)."""
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra = {}
+    doc.judge_name = "Assigned Judge"
+
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value=None,
+    ):
+        result = scraper.parse_document(doc)
+
+    assert result.judge_name is None
+
+
 # ---------------------------------------------------------------------------
 # Riverside system prompt — now in extraction_config (#1728)
 # ---------------------------------------------------------------------------
