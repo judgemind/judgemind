@@ -2295,6 +2295,19 @@ _XREF_ORDER_ABOVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Riverside PDFs reference rulings by entry number: "See Ruling for #N Above".
+_XREF_RIVERSIDE_RE = re.compile(
+    r"See\s+Ruling\s+for\s+#(\d+)\s+Above",
+    re.IGNORECASE,
+)
+
+# Orange County PDFs reference rulings by case number:
+# "See the tentative ruling [set forth] above for <Party>, case no. XXXXXX".
+_XREF_OC_CASE_NUMBER_RE = re.compile(
+    r"See\s+the\s+tentative\s+ruling\s+(?:set\s+forth\s+)?above\s+for\s+[^,]+,?\s*case\s+(?:no|number)\.?\s*([A-Z0-9-]+)",
+    re.IGNORECASE,
+)
+
 # Minimum ruling_text length on the *referenced* entry for it to be considered
 # substantive enough to copy.  Short referenced text (< 100 chars) usually means
 # the reference target is itself a stub and copying would propagate the stub.
@@ -2312,6 +2325,7 @@ _XREF_STUB_MAX_TEXT_LENGTH = 2000
 def _resolve_cross_references(
     rulings: list[ExtractedRuling],
     entry_number_to_index: dict[int, int] | None = None,
+    case_number_to_index: dict[str, int] | None = None,
 ) -> list[ExtractedRuling]:
     """Resolve cross-reference entries by copying ruling_text from the referenced entry (#2317).
 
@@ -2320,6 +2334,10 @@ def _resolve_cross_references(
     and uses cross-reference text for the others (e.g., "See Line 4 for
     tentative ruling").  These entries end up with only the referral text as
     their ``ruling_text``, resulting in null outcome after enrichment.
+
+    Also handles Riverside PDFs that reference rulings by entry number
+    ("See Ruling for #N Above") and Orange County PDFs that reference rulings
+    by case number ("See the tentative ruling above for <Party>, case no. XXXXXX").
 
     This function:
 
@@ -2349,11 +2367,22 @@ def _resolve_cross_references(
         Mapping from calendar line entry_number to index in ``rulings``.  When
         ``None`` (cache-hit path), the map is built from each ruling's
         ``entry_number`` field so resolution works without pre-join row state.
+    case_number_to_index:
+        Mapping from extracted_case_number to index in ``rulings``.  Used to
+        resolve Orange County case-number cross-references.  When ``None``
+        (cache-hit path or ``_join_page_rows`` for non-OC PDFs), the map is
+        built from each ruling's ``extracted_case_number`` field.
     """
     # When no map is provided (cache-hit path), build it from per-ruling entry_number.
     if entry_number_to_index is None:
         entry_number_to_index = {
             r.entry_number: i for i, r in enumerate(rulings) if r.entry_number is not None
+        }
+
+    # When no case-number map is provided, build it from per-ruling extracted_case_number.
+    if case_number_to_index is None:
+        case_number_to_index = {
+            r.extracted_case_number: i for i, r in enumerate(rulings) if r.extracted_case_number
         }
 
     # Build reverse map: index -> entry_number (for "order above" lookups).
@@ -2425,6 +2454,63 @@ def _resolve_cross_references(
                         "llm_extractor.xref_resolved_order_above",
                         case_number=ruling.extracted_case_number,
                         prev_entry=ref_entry,
+                        stub_length=len(text),
+                        ref_length=len(ref_text),
+                    )
+            continue
+
+        # Try Riverside explicit entry-number pattern: "See Ruling for #N Above".
+        m_rv = _XREF_RIVERSIDE_RE.search(text)
+        if m_rv:
+            ref_entry_num = int(m_rv.group(1))
+            ref_idx = entry_number_to_index.get(ref_entry_num)
+            if ref_idx is not None and ref_idx != i:
+                ref_ruling = rulings[ref_idx]
+                ref_text = ref_ruling.ruling_text
+                if (
+                    ref_text
+                    and len(ref_text) >= _XREF_REF_MIN_TEXT_LENGTH
+                    and len(ref_text) > len(text)
+                ):
+                    rulings[i] = ruling.model_copy(
+                        update={
+                            "ruling_text": ref_text,
+                            "cross_reference_source": ref_entry_num,
+                        }
+                    )
+                    logger.info(
+                        "llm_extractor.xref_resolved_riverside",
+                        case_number=ruling.extracted_case_number,
+                        ref_entry_num=ref_entry_num,
+                        stub_length=len(text),
+                        ref_length=len(ref_text),
+                    )
+            continue
+
+        # Try Orange County case-number pattern:
+        # "See the tentative ruling [set forth] above for <Party>, case no. XXXXXX".
+        m_oc = _XREF_OC_CASE_NUMBER_RE.search(text)
+        if m_oc:
+            ref_case_number = m_oc.group(1)
+            ref_idx = case_number_to_index.get(ref_case_number)
+            if ref_idx is not None and ref_idx != i:
+                ref_ruling = rulings[ref_idx]
+                ref_text = ref_ruling.ruling_text
+                if (
+                    ref_text
+                    and len(ref_text) >= _XREF_REF_MIN_TEXT_LENGTH
+                    and len(ref_text) > len(text)
+                ):
+                    rulings[i] = ruling.model_copy(
+                        update={
+                            "ruling_text": ref_text,
+                            "cross_reference_source": ref_ruling.entry_number,
+                        }
+                    )
+                    logger.info(
+                        "llm_extractor.xref_resolved_oc_case_number",
+                        case_number=ruling.extracted_case_number,
+                        ref_case_number=ref_case_number,
                         stub_length=len(text),
                         ref_length=len(ref_text),
                     )
@@ -4248,12 +4334,18 @@ def _join_page_rows(
         if case_idx in case_index_to_ruling_index
     }
 
-    # Post-processing: resolve cross-reference entries (#2317).
+    # Post-processing: resolve cross-reference entries (#2317, #3857).
     # Santa Clara PDFs use cross-references like "See Line 4 for tentative
-    # ruling" when multiple motions share one ruling.  Copy the ruling text
-    # from the referenced entry so enrichment can extract an outcome.
-    if entry_number_to_index:
-        rulings = _resolve_cross_references(rulings, entry_number_to_index)
+    # ruling" when multiple motions share one ruling.  Riverside PDFs use
+    # "See Ruling for #N Above".  Orange County PDFs use case-number refs.
+    # Copy the ruling text from the referenced entry so enrichment can
+    # extract an outcome.
+    case_number_to_index = {
+        r.extracted_case_number: i for i, r in enumerate(rulings) if r.extracted_case_number
+    }
+    rulings = _resolve_cross_references(
+        rulings, entry_number_to_index or None, case_number_to_index
+    )
 
     # Post-processing: drop SC body-section orphans (#3663).
     # SC multi-page PDFs produce a body-section row with an empty
