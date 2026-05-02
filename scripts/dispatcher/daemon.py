@@ -762,6 +762,16 @@ FIX_CI_LOG_TAIL_MAX_CHARS = 20000
 #:   same issue. Operator either merges (→ PR close auto-unblocks),
 #:   closes (→ dispatcher housekeeping reclaims), or keeps editing —
 #:   all three paths eventually cycle the row out of this set.
+#:
+#: .. note:: **Migration 57 divergence.**  The SQL function
+#:    ``dispatcher.issue_has_active_agent`` (migration 57, #3738)
+#:    no longer treats every ``succeeded`` row as blocking — it only
+#:    blocks if ``merged_at IS NULL``.  This tuple intentionally
+#:    retains ``'succeeded'`` because ``check-dispatcher-terminals-
+#:    consistent.sh`` validates its members against terminal status
+#:    handling.  The SQL gate is the definitive source of truth for
+#:    queue filtering; this tuple governs daemon-side status membership
+#:    checks only.
 ACTIVE_AGENT_STATUSES = ("running", "retrying", "succeeded", "needs_review")
 
 #: GitHub label added to an issue on claim (by either the daemon or the
@@ -4806,11 +4816,13 @@ class DispatcherDaemon:
         observed by the queue scan — the ``gh issue list`` default is
         already priority-sorted by the GitHub API):
 
-        1. Skip if ``dispatcher.agents`` has a row for it with
-           ``status IN ('running', 'retrying', 'succeeded')``. A
-           ``failed`` or ``crashed`` row does NOT block re-claim via
-           the partial UNIQUE INDEX — manual retry is a documented
-           operator flow.
+        1. Skip if ``dispatcher.issue_has_active_agent`` returns True
+           (migration 57, #3738). As of migration 57 the gate is
+           merged-aware: ``status IN ('running', 'retrying',
+           'needs_review')`` blocks unconditionally; ``succeeded`` only
+           blocks if ``merged_at IS NULL``. A ``failed`` or ``crashed``
+           row does NOT block re-claim via the partial UNIQUE INDEX —
+           manual retry is a documented operator flow.
         2. **Per-issue cooldown (issue #2804):** skip if any
            ``dispatcher.agents`` row for this issue was created within
            the last :data:`FAILED_AGENT_COOLDOWN_SECONDS`. Guards
@@ -4929,8 +4941,20 @@ class DispatcherDaemon:
         """True if ``dispatcher.agents`` has any active/succeeded row for this issue.
 
         Delegates to ``dispatcher.issue_has_active_agent`` (SQL function,
-        migration 37).  The function mirrors :data:`ACTIVE_AGENT_STATUSES`
-        (``running``, ``retrying``, ``succeeded``, ``needs_review``).
+        migration 57, #3738 — supersedes migration 37).  As of migration 57
+        the function uses a merged-aware gate:
+
+        * ``status IN ('running', 'retrying', 'needs_review')`` — always
+          blocks re-claim.
+        * ``status = 'succeeded' AND merged_at IS NULL`` — blocks re-claim
+          only while the PR has not yet merged.  Once ``merged_at`` is
+          stamped the row no longer counts as an active blocker, so the issue
+          is immediately eligible for re-claim.
+
+        This diverges from :data:`ACTIVE_AGENT_STATUSES` intentionally;
+        the SQL function is the definitive gate for queue filtering.  The
+        housekeeping method :meth:`_cleanup_stale_succeeded_rows` closes the
+        originating issues for already-merged rows, completing the cleanup.
 
         The partial UNIQUE INDEX (migration 25) enforces uniqueness on
         ``running`` and ``retrying``. The extra ``succeeded`` / ``needs_review``
@@ -26251,6 +26275,73 @@ class DispatcherDaemon:
                 )
         return {"checked": checked, "cleared": cleared, "errors": errors}
 
+    def _cleanup_stale_succeeded_rows(self) -> dict[str, int]:
+        """Close GitHub issues for succeeded+merged agent rows (#3738).
+
+        SELECTs ``dispatcher.agents`` rows where ``status = 'succeeded' AND
+        merged_at IS NOT NULL``.  For each such row, calls
+        :meth:`_close_issue_post_merge` (already idempotent — handles
+        ``already_closed`` skip + ``agent/ready`` strip) to close the
+        originating GitHub issue.
+
+        Migration 57 narrows ``dispatcher.issue_has_active_agent`` so it
+        ignores succeeded rows whose PR has merged — those rows no longer
+        block re-claim.  This housekeeping method closes the issue so it
+        is also removed from the ``agent/ready`` queue and from the GitHub
+        issue list, completing the cleanup.
+
+        Per-row try/except + per-row commit for failure isolation so one
+        GitHub flake does not starve siblings.  Returns
+        ``{rows_scanned, issues_closed, errors}`` for observability.
+        Failures are caught by the caller (:meth:`_housekeeping_tick`).
+        """
+        assert self._conn is not None, "connect() must run before housekeeping"
+        rows: list[tuple[int, int | None]] = []
+        try:
+            with self._conn.cursor() as cur:
+                # exec-mode-agnostic (#3158): reads succeeded+merged rows for GH-side
+                # cleanup only; execution_mode has no bearing on whether a PR merged.
+                cur.execute(
+                    "SELECT issue_number, pr_number FROM dispatcher.agents "
+                    "WHERE status = 'succeeded' "
+                    "  AND merged_at IS NOT NULL",
+                )
+                rows = list(cur.fetchall())
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:  # pragma: no cover — best-effort
+                pass
+            return {"rows_scanned": 0, "issues_closed": 0, "errors": 1}
+
+        rows_scanned = 0
+        issues_closed = 0
+        errors = 0
+        for row in rows:
+            issue_number_r: int = row[0]
+            pr_number_r: int | None = row[1]
+            rows_scanned += 1
+            try:
+                self._close_issue_post_merge(issue_number_r, pr_number_r)
+                issues_closed += 1
+            except Exception:
+                errors += 1
+                self._log.exception(
+                    "daemon.housekeeping_succeeded_cleanup_error",
+                    extra={
+                        "event": "housekeeping_succeeded_cleanup_error",
+                        "run_id": self._run_id,
+                        "issue_number": issue_number_r,
+                        "pr_number": pr_number_r,
+                    },
+                )
+        return {
+            "rows_scanned": rows_scanned,
+            "issues_closed": issues_closed,
+            "errors": errors,
+        }
+
     def _housekeeping_close_orphan_prs(self) -> dict[str, int]:
         """Close open ``agent/*`` PRs whose every target issue is CLOSED (#3852).
 
@@ -26504,6 +26595,31 @@ class DispatcherDaemon:
                 "daemon.reconcile_stale_merged_at_failed",
                 extra={
                     "event": "reconcile_stale_merged_at_failed",
+                    "run_id": self._run_id,
+                },
+            )
+
+        # Issue #3738: close GitHub issues for succeeded+merged rows
+        # whose SQL gate was narrowed by migration 57. Runs in its own
+        # try/except so a GitHub flake here does not break the prune
+        # loop or merged_at reconcile.
+        try:
+            _cleanup_result = self._cleanup_stale_succeeded_rows()
+            self._log.info(
+                "daemon.housekeeping_succeeded_cleanup",
+                extra={
+                    "event": "housekeeping_succeeded_cleanup",
+                    "run_id": self._run_id,
+                    "rows_scanned": _cleanup_result["rows_scanned"],
+                    "issues_closed": _cleanup_result["issues_closed"],
+                    "errors": _cleanup_result["errors"],
+                },
+            )
+        except Exception:
+            self._log.exception(
+                "daemon.housekeeping_succeeded_cleanup_failed",
+                extra={
+                    "event": "housekeeping_succeeded_cleanup_failed",
                     "run_id": self._run_id,
                 },
             )

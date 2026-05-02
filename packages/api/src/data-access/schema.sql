@@ -102,12 +102,15 @@ CREATE FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) RETURN
         SELECT 1
           FROM dispatcher.agents
          WHERE issue_number = p_issue_number
-           AND status IN ('running', 'retrying', 'succeeded', 'needs_review')
+           AND (
+               status IN ('running', 'retrying', 'needs_review')
+               OR (status = 'succeeded' AND merged_at IS NULL)
+           )
     );
 $$;
 
 
-COMMENT ON FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) IS 'Returns TRUE when dispatcher.agents has any row for this issue with status IN (''running'', ''retrying'', ''succeeded'', ''needs_review''). Mirrors ACTIVE_AGENT_STATUSES in scripts/dispatcher/daemon.py:354. Issue #3001.';
+COMMENT ON FUNCTION dispatcher.issue_has_active_agent(p_issue_number integer) IS 'Returns TRUE when dispatcher.agents has any row for this issue that is actively blocking re-claim: status IN (''running'', ''retrying'', ''needs_review''), OR status=''succeeded'' with merged_at IS NULL (PR not yet merged). A succeeded row whose PR has merged (merged_at IS NOT NULL) is NOT counted — it no longer blocks re-claim. Diverges from ACTIVE_AGENT_STATUSES in scripts/dispatcher/daemon.py intentionally; see #3738. Issue #3738 + #3001.';
 
 
 CREATE FUNCTION public.update_updated_at() RETURNS trigger
