@@ -39,6 +39,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 # Ensure the scraper-framework source is importable
@@ -60,6 +61,12 @@ from ingestion.llm_providers import create_client as create_llm_client  # noqa: 
 configure_structlog(contextvars=True)
 logger = structlog.get_logger()
 
+# ---------------------------------------------------------------------------
+# Keyset pagination sentinels
+# ---------------------------------------------------------------------------
+
+_CURSOR_MIN_TIMESTAMP = datetime(1970, 1, 1)
+_CURSOR_MIN_UUID = "00000000-0000-0000-0000-000000000000"
 
 # ---------------------------------------------------------------------------
 # Stats tracking
@@ -185,30 +192,35 @@ def fetch_rulings_batch(
     *,
     force: bool = False,
     batch_size: int = 50,
-    offset: int = 0,
-    limit: int | None = None,
+    cursor: tuple[datetime, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch a batch of rulings for enrichment.
+    """Fetch a batch of rulings for enrichment using keyset pagination.
 
     Returns rulings joined with case and court info.  By default only
     fetches rulings where at least one enrichment field is missing.
     With ``force=True``, fetches all rulings with ruling_text.
+
+    The ``cursor`` parameter is a ``(created_at, id)`` pair that marks the
+    position of the last row returned by the previous page.  Pass ``None``
+    (or omit it) to start from the beginning.  After each call, advance the
+    cursor to ``(batch[-1]['created_at'], str(batch[-1]['ruling_id']))``.
     """
-    conditions = ["ct.county = %s", "r.ruling_text IS NOT NULL", "r.ruling_text != ''"]
-    params: list[Any] = [county]
+    if cursor is None:
+        cursor = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
+
+    conditions = [
+        "ct.county = %s",
+        "r.ruling_text IS NOT NULL",
+        "r.ruling_text != ''",
+        "(r.created_at, r.id) > (%s, %s)",
+    ]
+    params: list[Any] = [county, cursor[0], cursor[1]]
 
     if not force:
         conditions.append(
             "(r.motion_type IS NULL OR r.outcome IS NULL "
             "OR c.case_title IS NULL OR c.case_title = '')"
         )
-
-    effective_limit = batch_size
-    if limit is not None:
-        remaining = limit - offset
-        if remaining <= 0:
-            return []
-        effective_limit = min(batch_size, remaining)
 
     query = f"""
         SELECT
@@ -218,16 +230,16 @@ def fetch_rulings_batch(
             r.motion_type,
             r.outcome::text AS outcome,
             c.case_title,
-            c.id AS case_id_check
+            c.id AS case_id_check,
+            r.created_at AS created_at
         FROM rulings r
         JOIN cases c ON r.case_id = c.id
         JOIN courts ct ON c.court_id = ct.id
         WHERE {" AND ".join(conditions)}
-        ORDER BY r.created_at
-        OFFSET %s
+        ORDER BY r.created_at, r.id
         LIMIT %s
     """  # noqa: S608
-    params.extend([offset, effective_limit])
+    params.append(batch_size)
 
     with conn.cursor() as cur:
         cur.execute(query, params)
@@ -427,7 +439,7 @@ def process_county(
         logger.info("backfill.county_empty", county=county)
         return
 
-    offset = 0
+    cursor: tuple[datetime, str] = (_CURSOR_MIN_TIMESTAMP, _CURSOR_MIN_UUID)
     batch_num = 0
     total_processed = 0
 
@@ -437,8 +449,7 @@ def process_county(
             county,
             force=force,
             batch_size=batch_size,
-            offset=offset,
-            limit=limit,
+            cursor=cursor,
         )
 
         if not batch:
@@ -450,7 +461,6 @@ def process_county(
             county=county,
             batch=batch_num,
             size=len(batch),
-            offset=offset,
         )
 
         # Run LLM enrichment in parallel
@@ -510,7 +520,8 @@ def process_county(
                 updates=0,
             )
 
-        offset += len(batch)
+        # Advance keyset cursor to the last row of this batch
+        cursor = (batch[-1]["created_at"], str(batch[-1]["ruling_id"]))
 
         # Check limit
         if limit is not None and total_processed >= limit:
