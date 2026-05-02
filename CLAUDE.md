@@ -15,6 +15,7 @@ Shell-interactive prompt-prevention rules (`$()`, heredocs, inline `python -c`, 
 
 ### NEVER — Workflow
 - Never use `run_in_background` in any subagent (`/task`, `/ralph`, or Agent-spawned workers). All commands inside subagents run synchronously.
+- Never use the `Monitor` tool. Use synchronous polling instead — `scripts/wait-for-ci.sh` for PR CI gates, `gh run watch --interval 60` for workflow runs. Monitor's change-detection fires a wake-up event on every state-string change, including innocuous flickers like `mergeable=UNKNOWN ↔ MERGEABLE` while CI is still running, which bombards the agent with no-progress turns until it yields. Verified failure mode in PR #3927 / #3922 / #3909 transcripts.
 - Never commit directly to `main` during autonomous task work.
 - **You MAY merge your own PRs** after `/ralph` and CI are green: `gh pr merge <N> --repo judgemind/judgemind --squash --delete-branch`.
 - Never exit or stop after `/ralph` completes without finishing the full `/task` workflow (steps A.3–A.9 in the task skill). Ralph completing means code is ready — not committed, not pushed, not merged. See #721.
