@@ -321,13 +321,14 @@ class CourtListenerClient:
                     data: dict[str, Any] = response.json()
                     self._request_count += 1
                     return cluster_id, data
-                except httpx.HTTPStatusError as exc:
+                except (httpx.HTTPError, ValueError) as exc:
                     self._request_count += 1
                     logger.warning(
                         "Failed to fetch docket for cluster",
                         cluster_id=cluster_id,
                         docket_url=docket_url,
-                        status=exc.response.status_code,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
                     )
                     return cluster_id, {}
 

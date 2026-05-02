@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import respx
+import structlog.testing
 
 from courts.federal.courtlistener import (
     _CL_COURT_ID_TO_JURISDICTION,
@@ -331,9 +332,7 @@ class TestCourtListenerClient:
         assert client.request_count == 3
 
     @respx.mock
-    def test_fetch_dockets_for_clusters_partial_failure(
-        self, capsys: pytest.CaptureFixture
-    ) -> None:
+    def test_fetch_dockets_for_clusters_partial_failure(self) -> None:
         """A 500 for one docket URL returns {} for that cluster id; others succeed.
 
         Also verifies that a warning is logged for the failing cluster.
@@ -359,7 +358,8 @@ class TestCourtListenerClient:
         respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_docket)
 
         client = CourtListenerClient(request_delay=0)
-        result = client.fetch_dockets_for_clusters(docket_map)
+        with structlog.testing.capture_logs() as cap_logs:
+            result = client.fetch_dockets_for_clusters(docket_map)
         client.close()
 
         # Failing cluster maps to empty dict
@@ -370,9 +370,126 @@ class TestCourtListenerClient:
         # All three cluster IDs in result
         assert set(result.keys()) == {100, 200, 300}
 
-        # Warning for the failing cluster_id should be in stdout
-        captured = capsys.readouterr()
-        assert "200" in captured.out
+        # Structlog warning fired for the failing cluster
+        warnings = [
+            e
+            for e in cap_logs
+            if e.get("log_level") == "warning"
+            and e.get("event") == "Failed to fetch docket for cluster"
+            and e.get("cluster_id") == 200
+        ]
+        assert warnings, f"Expected warning for cluster_id=200, got: {cap_logs!r}"
+
+    @respx.mock
+    def test_fetch_dockets_for_clusters_connect_error(self) -> None:
+        """A ConnectError for one cluster returns {} for that id; others succeed."""
+        docket_map = {
+            100: f"{API_BASE_URL}/dockets/100/?format=json",
+            200: f"{API_BASE_URL}/dockets/200/?format=json",
+        }
+        failing_path = "/api/rest/v4/dockets/200/"
+
+        def _mock_docket(request: httpx.Request) -> httpx.Response:
+            if str(request.url.path).rstrip("/") == failing_path.rstrip("/"):
+                raise httpx.ConnectError("connection refused")
+            path_parts = str(request.url.path).rstrip("/").split("/")
+            docket_id = int(path_parts[-1])
+            return httpx.Response(200, json={"id": docket_id, "docket_number": f"case-{docket_id}"})
+
+        respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_docket)
+
+        client = CourtListenerClient(request_delay=0)
+        with structlog.testing.capture_logs() as cap_logs:
+            result = client.fetch_dockets_for_clusters(docket_map)
+        client.close()
+
+        assert 200 in result, "Failing cluster_id must be a key in result"
+        assert result[200] == {}, "Failing cluster must map to empty dict"
+        assert result[100]["docket_number"] == "case-100"
+        assert set(result.keys()) == {100, 200}
+
+        warnings = [
+            e
+            for e in cap_logs
+            if e.get("log_level") == "warning"
+            and e.get("event") == "Failed to fetch docket for cluster"
+            and e.get("cluster_id") == 200
+        ]
+        assert warnings, f"Expected warning for cluster_id=200, got: {cap_logs!r}"
+
+    @respx.mock
+    def test_fetch_dockets_for_clusters_timeout(self) -> None:
+        """A ReadTimeout for one cluster returns {} for that id; others succeed."""
+        docket_map = {
+            100: f"{API_BASE_URL}/dockets/100/?format=json",
+            200: f"{API_BASE_URL}/dockets/200/?format=json",
+        }
+        failing_path = "/api/rest/v4/dockets/200/"
+
+        def _mock_docket(request: httpx.Request) -> httpx.Response:
+            if str(request.url.path).rstrip("/") == failing_path.rstrip("/"):
+                raise httpx.ReadTimeout("timed out")
+            path_parts = str(request.url.path).rstrip("/").split("/")
+            docket_id = int(path_parts[-1])
+            return httpx.Response(200, json={"id": docket_id, "docket_number": f"case-{docket_id}"})
+
+        respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_docket)
+
+        client = CourtListenerClient(request_delay=0)
+        with structlog.testing.capture_logs() as cap_logs:
+            result = client.fetch_dockets_for_clusters(docket_map)
+        client.close()
+
+        assert 200 in result, "Failing cluster_id must be a key in result"
+        assert result[200] == {}, "Failing cluster must map to empty dict"
+        assert result[100]["docket_number"] == "case-100"
+        assert set(result.keys()) == {100, 200}
+
+        warnings = [
+            e
+            for e in cap_logs
+            if e.get("log_level") == "warning"
+            and e.get("event") == "Failed to fetch docket for cluster"
+            and e.get("cluster_id") == 200
+        ]
+        assert warnings, f"Expected warning for cluster_id=200, got: {cap_logs!r}"
+
+    @respx.mock
+    def test_fetch_dockets_for_clusters_malformed_json(self) -> None:
+        """Malformed JSON response for one cluster returns {} for that id; others succeed."""
+        docket_map = {
+            100: f"{API_BASE_URL}/dockets/100/?format=json",
+            200: f"{API_BASE_URL}/dockets/200/?format=json",
+        }
+        failing_path = "/api/rest/v4/dockets/200/"
+
+        def _mock_docket(request: httpx.Request) -> httpx.Response:
+            if str(request.url.path).rstrip("/") == failing_path.rstrip("/"):
+                return httpx.Response(200, content=b"not json{")
+            path_parts = str(request.url.path).rstrip("/").split("/")
+            docket_id = int(path_parts[-1])
+            return httpx.Response(200, json={"id": docket_id, "docket_number": f"case-{docket_id}"})
+
+        respx.get(url__startswith=f"{API_BASE_URL}/dockets/").mock(side_effect=_mock_docket)
+
+        client = CourtListenerClient(request_delay=0)
+        with structlog.testing.capture_logs() as cap_logs:
+            result = client.fetch_dockets_for_clusters(docket_map)
+        client.close()
+
+        assert 200 in result, "Failing cluster_id must be a key in result"
+        assert result[200] == {}, "Failing cluster must map to empty dict"
+        assert result[100]["docket_number"] == "case-100"
+        assert set(result.keys()) == {100, 200}
+
+        warnings = [
+            e
+            for e in cap_logs
+            if e.get("log_level") == "warning"
+            and e.get("event") == "Failed to fetch docket for cluster"
+            and e.get("cluster_id") == 200
+        ]
+        assert warnings, f"Expected warning for cluster_id=200, got: {cap_logs!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -949,13 +1066,10 @@ class TestFetchOpinionsForClusters:
         assert max_inflight[0] <= DEFAULT_OPINION_FETCH_CONCURRENCY
 
     @respx.mock
-    def test_fetch_opinions_for_clusters_partial_failure(
-        self, capsys: pytest.CaptureFixture
-    ) -> None:
+    def test_fetch_opinions_for_clusters_partial_failure(self) -> None:
         """A 500 for one cluster returns empty list for that id; others succeed.
 
         Also verifies that a warning is emitted for the failed cluster.
-        Structlog renders to stdout in tests, so we capture that.
         """
         cluster_ids = [100, 200, 300]
         failing_id = 200
@@ -970,7 +1084,8 @@ class TestFetchOpinionsForClusters:
         respx.get(f"{API_BASE_URL}/opinions/").mock(side_effect=_mock_opinions)
 
         client = CourtListenerClient(request_delay=0)
-        result = client.fetch_opinions_for_clusters(cluster_ids)
+        with structlog.testing.capture_logs() as cap_logs:
+            result = client.fetch_opinions_for_clusters(cluster_ids)
         client.close()
 
         # Failing cluster returns empty list.
@@ -983,9 +1098,15 @@ class TestFetchOpinionsForClusters:
         # All three cluster IDs appear in result (failed one has empty list, not missing).
         assert set(result.keys()) == {100, 200, 300}
 
-        # Structlog warning for the failing cluster was rendered to stdout.
-        captured = capsys.readouterr()
-        assert str(failing_id) in captured.out
+        # Structlog warning fired for the failing cluster.
+        warnings = [
+            e
+            for e in cap_logs
+            if e.get("log_level") == "warning"
+            and e.get("event") == "Failed to fetch opinions for cluster"
+            and e.get("cluster_id") == failing_id
+        ]
+        assert warnings, f"Expected warning for cluster_id={failing_id}, got: {cap_logs!r}"
 
     @respx.mock
     def test_50_cluster_fetch_completes_quickly(self) -> None:
