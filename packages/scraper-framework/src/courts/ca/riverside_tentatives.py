@@ -63,6 +63,18 @@ _LINK_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Riverside publishes these labels for departments without a permanent judge
+# assignment.  The link-text regex captures them as judge_name, but they are
+# not real judges — the PDF-text / dept-judge-map fallbacks should populate
+# the real name instead.
+_PLACEHOLDER_JUDGE_NAMES: frozenset[str] = frozenset({"assigned judge"})
+
+
+def _is_placeholder_judge(name: str | None) -> bool:
+    """Return True iff *name* is a known placeholder, not a real judge name."""
+    return bool(name and name.strip().casefold() in _PLACEHOLDER_JUDGE_NAMES)
+
+
 # Case numbers like "CVPS2306157", "CVRI2412345", "RIC1904113", "MCC2012345"
 # CV-prefixed: CV + 2-4 letter location code + 6-8 digits (e.g. CVPS2306157)
 # Location-prefixed: RIC, MCC, PSC, SWC, INC + 0-4 letters + 6-10 digits
@@ -185,6 +197,18 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
                 logger.warning("PDF text extraction failed", error=str(exc))
                 continue
 
+            # Reset placeholder judge names captured from link text (#3785).
+            # "Assigned Judge" (and variants) are department labels, not real
+            # judge names.  Clearing them here lets the PDF-text and
+            # dept-judge-map fallbacks below populate the real name.
+            if _is_placeholder_judge(doc.judge_name):
+                logger.info(
+                    "Resetting placeholder judge name from link text",
+                    department=doc.department,
+                    original=doc.judge_name,
+                )
+                doc.judge_name = None
+
             # Fallback: extract judge name from PDF text when link text
             # didn't provide one (#411).  Many Riverside PDFs contain
             # "Department X - Honorable Name" headers in the body text.
@@ -222,6 +246,9 @@ class RiversideTentativeRulingsScraper(PdfLinkScraper):
         doc = super().parse_document(doc)
         if doc.ruling_text and not doc.hearing_date:
             doc.hearing_date = _riv_hearing_date_from_text(doc.ruling_text)
+        # Reset placeholder judge names before attempting fallbacks (#3785).
+        if _is_placeholder_judge(doc.judge_name):
+            doc.judge_name = None
         # Fallback: extract judge name from ruling text (#411)
         if not doc.judge_name and doc.ruling_text:
             pdf_judge = extract_judge_name(doc.ruling_text)

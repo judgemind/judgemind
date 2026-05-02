@@ -39,9 +39,11 @@ from courts.ca.pdf_link_scraper import PdfLinkScraper, _extract_pdf_text
 from courts.ca.riverside_tentatives import (
     _CASE_NUMBER_RE,
     _LINK_TEXT_RE,
+    _PLACEHOLDER_JUDGE_NAMES,
     INDEX_URL,
     RiversideTentativeRulingsScraper,
     _is_no_tentative_rulings,
+    _is_placeholder_judge,
     _riv_courthouse,
     _riv_hearing_date_from_text,
 )
@@ -345,6 +347,106 @@ class TestLinkTextRe:
 
 
 # ---------------------------------------------------------------------------
+# _is_placeholder_judge — unit tests (#3785)
+# ---------------------------------------------------------------------------
+
+
+def test_placeholder_judge_names_constant() -> None:
+    """_PLACEHOLDER_JUDGE_NAMES contains the expected placeholder strings."""
+    assert "assigned judge" in _PLACEHOLDER_JUDGE_NAMES
+
+
+def test_is_placeholder_judge_none_returns_false() -> None:
+    """None is not a placeholder."""
+    assert _is_placeholder_judge(None) is False
+
+
+def test_is_placeholder_judge_empty_returns_false() -> None:
+    """Empty string is not a placeholder."""
+    assert _is_placeholder_judge("") is False
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["Assigned Judge", "assigned judge", "ASSIGNED JUDGE", "  Assigned Judge  "],
+)
+def test_assigned_judge_placeholder_rejected(variant: str) -> None:
+    """All case/whitespace variants of 'Assigned Judge' are detected as placeholders.
+
+    Tests the full fetch_documents pipeline: a single-link synthetic HTML page
+    with the given variant produces a document with judge_name=None (#3785).
+    """
+    html = (
+        "<html><body>"
+        f'<a href="/system/files/2026-02/01ruling030226.pdf">'
+        f"Department 01 - {variant}</a>"
+        "</body></html>"
+    )
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    with respx.mock:
+        respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+        respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+        config = riv_default_config()
+        config.request_delay_seconds = 0
+        scraper = RiversideTentativeRulingsScraper(config=config)
+
+        # Patch extract_judge_name to return None so only the link-text path fires
+        with patch(
+            "courts.ca.riverside_tentatives.extract_judge_name",
+            return_value=None,
+        ):
+            docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    assert docs[0].judge_name is None, (
+        f"Expected judge_name=None for placeholder variant {variant!r}, got {docs[0].judge_name!r}"
+    )
+
+
+@respx.mock
+def test_assigned_judge_placeholder_falls_back_to_dept_map() -> None:
+    """When 'Assigned Judge' placeholder is reset, the dept_judge_map fallback fires (#3785).
+
+    A scraper constructed with dept_judge_map={"1": "Honorable Real Name"} should
+    populate judge_name from the map after the placeholder is cleared.
+    Department "01" normalizes to "1" via normalize_department().
+    """
+    html = (
+        "<html><body>"
+        '<a href="/system/files/2026-02/01ruling030226.pdf">'
+        "Department 01 - Assigned Judge</a>"
+        "</body></html>"
+    )
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(url__regex=r"\.pdf$").mock(return_value=httpx.Response(200, content=pdf_bytes))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    # Department "01" normalizes to "1", so the key in the map must be "1"
+    scraper = RiversideTentativeRulingsScraper(
+        config=config,
+        dept_judge_map={"1": "Honorable Real Name"},
+    )
+
+    # Patch extract_judge_name to return None so the dept-map is the only fallback
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value=None,
+    ):
+        docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    assert docs[0].judge_name == "Honorable Real Name", (
+        f"Expected judge_name='Honorable Real Name' from dept map fallback, "
+        f"got {docs[0].judge_name!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression test — all three link-text shapes flow through fetch_documents
 # ---------------------------------------------------------------------------
 
@@ -389,9 +491,11 @@ def test_riv_all_link_text_shapes_processed() -> None:
     assert dept_map["04"].judge_name == "Daniel A. Ottolia"
     assert dept_map["04"].courthouse == "Hall of Justice"
 
-    # No-Honorable form — judge name still populated
+    # No-Honorable form — placeholder "Assigned Judge" is reset to None (#3785).
+    # The PDF fallback uses riv_ps1.pdf (Dept PS1, not 01), so it won't match
+    # dept 01; no dept_judge_map passed either.  Final value must be None.
     assert "01" in dept_map
-    assert dept_map["01"].judge_name == "Assigned Judge"
+    assert dept_map["01"].judge_name is None
 
     # No-dash form — department set, judge_name is None (fallback may fill later)
     assert "260" in dept_map
@@ -904,6 +1008,34 @@ def test_riv_parse_document_dept_judge_fallback() -> None:
         result = scraper.parse_document(doc)
 
     assert result.judge_name == "Mapped Single Judge"
+
+
+@respx.mock
+def test_riv_parse_document_placeholder_judge_reset() -> None:
+    """parse_document resets placeholder judge names to None (#3785)."""
+    pdf_bytes = _load_bytes("riv_ps1.pdf")
+
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+
+    config = riv_default_config()
+    config.request_delay_seconds = 0
+    scraper = RiversideTentativeRulingsScraper(config=config)
+
+    doc = scraper._make_base_doc(
+        source_url="https://example.com/test.pdf",
+        raw_content=pdf_bytes,
+        content_format=ContentFormat.PDF,
+    )
+    doc.extra = {}
+    doc.judge_name = "Assigned Judge"
+
+    with patch(
+        "courts.ca.riverside_tentatives.extract_judge_name",
+        return_value=None,
+    ):
+        result = scraper.parse_document(doc)
+
+    assert result.judge_name is None
 
 
 # ---------------------------------------------------------------------------
