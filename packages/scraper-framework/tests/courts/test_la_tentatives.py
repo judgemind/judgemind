@@ -4300,3 +4300,48 @@ class TestRebuildReversedTitleFromParties:
     def test_returns_none_on_empty_parties(self) -> None:
         result = _rebuild_reversed_title_from_parties("Foo v. Bar", [])
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestLlmExtractRulingsBracketedPlaceholderTitle — bracketed placeholder guard
+# (#3988)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmExtractRulingsBracketedPlaceholderTitle:
+    """Tests for bracketed-placeholder case_title sanitization in _llm_extract_rulings().
+
+    The LA LLM occasionally emits hallucinated bracketed placeholders like
+    "Ezra Arce v. [Defendant not specified]" instead of the real party name.
+    When no defendant is extractable, the post-processor should drop the title
+    to None.  When both parties are present, it should rebuild a clean title.
+    See #3988.
+    """
+
+    def test_bracketed_placeholder_title_drops_to_none_on_la_path(self) -> None:
+        """LA Arce shape: bracketed placeholder with only plaintiff → case_title is None.
+
+        'Ezra Arce v. [Defendant not specified]' + parties list containing only
+        a plaintiff.  The gate should trigger, _rebuild_title_from_parties cannot
+        build 'P v. D' (no defendant), so case_title is dropped to None.
+        """
+        rulings_data = [
+            {
+                "extracted_case_number": "25STCV12345",
+                "extracted_case_title": "Ezra Arce v. [Defendant not specified]",
+                "outcome": "denied",
+                "ruling_text": "The motion is DENIED.",
+                "parties": [
+                    {"name": "Ezra Arce", "role": "plaintiff"},
+                ],
+            }
+        ]
+        mock_response = _make_llm_response(rulings_data)
+        with patch("ingestion.llm_providers.call_llm", return_value=mock_response):
+            result = _llm_extract_rulings(
+                "<html><body><div id='speechSynthesis'>Case Number: 25STCV12345</div></body></html>"
+            )
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].case_title is None
