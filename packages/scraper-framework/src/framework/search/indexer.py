@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from opensearchpy import helpers
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
-from opensearchpy.exceptions import ConnectionTimeout
+from opensearchpy.exceptions import ConnectionTimeout, TransportError
 
 from .mapping import TENTATIVE_RULINGS_ALIAS, create_index
 
@@ -73,7 +73,19 @@ class IndexingConsumer:
         self._index = index_name
 
         if ensure_index:
-            create_index(self._os)
+            try:
+                create_index(self._os)
+            except (TransportError, OSConnectionError) as exc:
+                # OpenSearch is best-effort and fully derivable from derived.*.
+                # A transient or auth error at startup must never prevent the
+                # ingestion worker from starting.  Log a warning and continue —
+                # per-document indexing errors are handled separately in
+                # index_document().  See #3917.
+                logger.warning(
+                    "OpenSearch ensure_index failed at startup — worker will start "
+                    "without index pre-check; indexing may degrade until resolved. %s",
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # Direct indexing interface

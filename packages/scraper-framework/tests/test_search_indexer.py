@@ -7,8 +7,8 @@ from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from opensearchpy.exceptions import AuthorizationException, ConnectionTimeout, TransportError
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
-from opensearchpy.exceptions import ConnectionTimeout
 
 from framework.search.indexer import (
     CONSUMER_GROUP,
@@ -607,6 +607,94 @@ class TestStreamConsumer:
         call_kwargs = mock_opensearch.index.call_args.kwargs
         assert call_kwargs["id"] == "doc-str"
         mock_redis.xack.assert_called_once()
+
+
+class TestEnsureIndexStartup:
+    """Regression tests for #3917 — IndexingConsumer.__init__ must not raise
+    when OpenSearch returns a 403 (AuthorizationException) or other transport
+    errors on startup.  OpenSearch is best-effort and fully derivable from
+    derived.*; a transient or auth error at startup must never prevent the
+    ingestion worker from starting.
+    """
+
+    def test_authorization_exception_during_ensure_index_does_not_raise(self) -> None:
+        """AuthorizationException(403) from create_index is swallowed at startup.
+
+        Reproduces the exact crash loop seen in dev: the OpenSearch endpoint
+        returned 403 on the HEAD /tentative_rulings_v1 call inside create_index,
+        propagating up through IngestionWorker.__init__ and causing sys.exit(1).
+        """
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        # Simulate the 403 that dev was returning
+        mock_os.indices.exists.side_effect = AuthorizationException(403, "")
+
+        # Must NOT raise — worker should start and log a warning
+        consumer = IndexingConsumer(
+            opensearch_client=mock_os,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            ensure_index=True,
+        )
+        assert consumer is not None
+
+    def test_transport_error_during_ensure_index_does_not_raise(self) -> None:
+        """Any TransportError from create_index is swallowed at startup."""
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        mock_os.indices.exists.side_effect = TransportError(503, "Service Unavailable", {})
+
+        consumer = IndexingConsumer(
+            opensearch_client=mock_os,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            ensure_index=True,
+        )
+        assert consumer is not None
+
+    def test_connection_error_during_ensure_index_does_not_raise(self) -> None:
+        """OSConnectionError from create_index is swallowed at startup."""
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        mock_os.indices.exists.side_effect = OSConnectionError("N/A", "Connection refused", None)
+
+        consumer = IndexingConsumer(
+            opensearch_client=mock_os,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            ensure_index=True,
+        )
+        assert consumer is not None
+
+    def test_ensure_index_false_skips_create_index(self) -> None:
+        """When ensure_index=False, create_index is never called."""
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+
+        IndexingConsumer(
+            opensearch_client=mock_os,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            ensure_index=False,
+        )
+
+        mock_os.indices.exists.assert_not_called()
+
+    def test_successful_ensure_index_still_works(self) -> None:
+        """Normal path: index does not exist, create_index runs without error."""
+        mock_os = MagicMock()
+        mock_s3 = MagicMock()
+        mock_os.indices.exists.return_value = False  # index doesn't exist yet
+
+        consumer = IndexingConsumer(
+            opensearch_client=mock_os,
+            s3_client=mock_s3,
+            bucket="test-bucket",
+            ensure_index=True,
+        )
+
+        assert consumer is not None
+        mock_os.indices.create.assert_called_once()
 
 
 class TestFetchTextError:
