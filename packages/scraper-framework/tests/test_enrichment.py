@@ -495,6 +495,107 @@ class TestMatchCaseNumberProbateRegression:
 
 
 # ---------------------------------------------------------------------------
+# EnrichmentEngine — Federal/CourtListener generic-party regression (#4024)
+# ---------------------------------------------------------------------------
+
+
+class TestMatchCaseNumberFederalGenericPartyRegression:
+    """Regression tests for the Federal/CourtListener generic-party false-positive
+    fuzzy-match bug (#4024).  Spotcheck 2026-05-03.
+
+    The root cause: two unrelated cases from the same court share a single
+    generic party (e.g. "State of Texas", "United States") whose Jaccard
+    similarity is 1/3 ≈ 0.333.  With the old 0.3 threshold those two cases
+    could be silently merged.  Raising the floor to 0.5 (majority overlap)
+    defeats the whole generic-party collision class.
+    """
+
+    def test_two_texas_appellate_cases_sharing_only_state_of_texas_do_not_fuzzy_match(
+        self,
+    ) -> None:
+        """AC #1 (unit-level): two unrelated Texas appellate cases that share
+        only "State of Texas" (Jaccard=1/3≈0.333 < 0.5) and are within
+        Levenshtein distance 2 must NOT fuzzy-match.
+
+        Extracted ruling parties: ["Oliver Perry Harris", "State of Texas"]
+        Candidate DB parties:     ["Joey Sullivan", "State of Texas"]
+        Query case number:        02-25-00173-CR
+        Candidate case number:    02-25-00131-CR
+        Normalized distance:      levenshtein("022500173CR", "022500131CR") = 2
+        Jaccard:                  |{State of Texas}| / |{Oliver Perry Harris,
+                                   State of Texas, Joey Sullivan}| = 1/3 ≈ 0.333
+        """
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None
+        cursor.fetchall.return_value = [
+            (
+                "case-uuid-sullivan",
+                "02-25-00131-CR",
+                ["joey sullivan", "state of texas"],
+            ),
+        ]
+
+        engine = EnrichmentEngine(conn)
+        result = engine.match_case_number(
+            "02-25-00173-CR",
+            "court-uuid-tx-2nd",
+            extracted_parties=["Oliver Perry Harris", "State of Texas"],
+        )
+
+        # Jaccard = 1/3 ≈ 0.333 < 0.5 threshold → must NOT fuzzy-match
+        assert result.match_type == "new", (
+            "Two Texas appellate cases sharing only 'State of Texas' "
+            "must not fuzzy-match (#4024 regression)"
+        )
+        assert result.case_id == ""
+
+    def test_two_georgia_sct_cases_sharing_only_the_state_do_not_fuzzy_match(
+        self,
+    ) -> None:
+        """Second generic-party pattern: two Georgia Supreme Court cases
+        sharing only "State" (Chapple v. State / Kerns v. State), where
+        near-sequential docket numbers (S25A1158 vs S25A1159) place them
+        within Levenshtein distance 1.
+
+        Jaccard = 1/2 = 0.5 — exactly at the threshold, which must NOT
+        be accepted (overlap must be strictly >= threshold, enforced by the
+        ``< self._min_party_overlap`` guard, so 0.5 == 0.5 IS accepted).
+        Use a three-party set so Jaccard falls to 1/3 ≈ 0.333 < 0.5.
+
+        Extracted parties: ["Chapple", "State"]
+        Candidate parties: ["Kerns", "State"]
+        Query case number: S25A1158
+        Candidate:         S25A1159
+        Distance:          1
+        Jaccard:           1/3 ≈ 0.333 < 0.5 → must NOT fuzzy-match
+        """
+        conn = _make_mock_conn()
+        cursor = conn.cursor().__enter__()
+        cursor.fetchone.return_value = None
+        cursor.fetchall.return_value = [
+            (
+                "case-uuid-kerns",
+                "S25A1159",
+                ["kerns", "state"],
+            ),
+        ]
+
+        engine = EnrichmentEngine(conn)
+        result = engine.match_case_number(
+            "S25A1158",
+            "court-uuid-ga-sct",
+            extracted_parties=["Chapple", "State"],
+        )
+
+        # Jaccard = |{state}| / |{chapple, state, kerns}| = 1/3 ≈ 0.333 < 0.5
+        assert result.match_type == "new", (
+            "Two Georgia SCT cases sharing only 'State' must not fuzzy-match (#4024 regression)"
+        )
+        assert result.case_id == ""
+
+
+# ---------------------------------------------------------------------------
 # EnrichmentEngine — Fuzzy candidate query filtering
 # ---------------------------------------------------------------------------
 
