@@ -432,6 +432,62 @@ describe('Alert subscriptions — integration', () => {
     });
   });
 
+  describe('filters validation', () => {
+    it('rejects filters payload exceeding 4096 chars', async () => {
+      const bigFilters = JSON.stringify({ judge_id: judgeId, pad: 'x'.repeat(4100) });
+      const body = await gql(
+        `mutation($type: String!, $filters: String!) {
+          createAlertSubscription(alertType: $type, filters: $filters) { id }
+        }`,
+        { type: 'judge_ruling', filters: bigFilters },
+        authHeaders(),
+      );
+      expect(body.errors).toBeDefined();
+      expect(body.errors![0].extensions?.code).toBe('BAD_USER_INPUT');
+      expect(body.errors![0].message).toContain('4096');
+    });
+
+    it('rejects unknown filter keys via strict schema', async () => {
+      const filters = JSON.stringify({ judge_id: judgeId, evil: 'x' });
+      const body = await gql(
+        `mutation($type: String!, $filters: String!) {
+          createAlertSubscription(alertType: $type, filters: $filters) { id }
+        }`,
+        { type: 'judge_ruling', filters },
+        authHeaders(),
+      );
+      expect(body.errors).toBeDefined();
+      expect(body.errors![0].extensions?.code).toBe('BAD_USER_INPUT');
+    });
+
+    it('rejects filters with wrong key shape for alert_type', async () => {
+      const filters = JSON.stringify({ judge_id: judgeId });
+      const body = await gql(
+        `mutation($type: String!, $filters: String!) {
+          createAlertSubscription(alertType: $type, filters: $filters) { id }
+        }`,
+        { type: 'keyword', filters },
+        authHeaders(),
+      );
+      expect(body.errors).toBeDefined();
+      expect(body.errors![0].extensions?.code).toBe('BAD_USER_INPUT');
+    });
+
+    it('accepts existing valid keyword filters', async () => {
+      const filters = JSON.stringify({ keyword: 'msj' });
+      const body = await gql(
+        `mutation($type: String!, $filters: String!) {
+          createAlertSubscription(alertType: $type, filters: $filters) { id alertType }
+        }`,
+        { type: 'keyword', filters },
+        authHeaders(),
+      );
+      expect(body.errors).toBeUndefined();
+      const sub = body.data?.createAlertSubscription as Record<string, unknown>;
+      expect(sub.alertType).toBe('keyword');
+    });
+  });
+
   describe('deleteAlertSubscription', () => {
     it('deletes an owned subscription', async () => {
       const body = await gql(
