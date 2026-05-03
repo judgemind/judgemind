@@ -403,19 +403,32 @@ class TestAlphanumericDepartmentCodes:
 
 
 # ---------------------------------------------------------------------------
-# LA County — Long Beach courthouse (S25–S29 must survive, #3741)
+# LA County — Long Beach / Chatsworth / AV courthouses (letter+digits must
+# survive for regional courthouses, #3741 and #4014)
 # ---------------------------------------------------------------------------
 
 
-class TestLALongBeach:
-    """S25–S29 dept codes survive when courthouse is Long Beach.
+class TestLALetterDigitsKeep:
+    """S25–S29, F43–F51, A14 etc. dept codes survive for regional courthouses.
 
-    These are distinct courtrooms at the Long Beach Courthouse.  The generic
-    LA letter+digits collapse rule must be skipped for LB courthouses so that
-    analytics can distinguish S25 from S27 etc.
+    Long Beach (S-prefix), Chatsworth (F-prefix), and Antelope Valley
+    (A-prefix) all use letter+digits codes that identify distinct courtrooms.
+    The generic LA letter+digits collapse rule must be skipped for these
+    courthouses.
+
+    Carve-out mechanisms:
+    1. Courthouse name/code in the ``courthouse`` kwarg.
+    2. Case-number prefix (LBCV/LBCP/CHCV/CHCP/AVCV/AVCP) in the
+       ``case_number`` kwarg (covers the rebuild path where courthouse may
+       not be in the event).
 
     See: https://github.com/judgemind/judgemind/issues/3741
+    See: https://github.com/judgemind/judgemind/issues/4014
     """
+
+    # ------------------------------------------------------------------
+    # Long Beach — courthouse name path
+    # ------------------------------------------------------------------
 
     @pytest.mark.parametrize("dept", ["S25", "S26", "S27", "S28", "S29"])
     @pytest.mark.parametrize(
@@ -433,6 +446,100 @@ class TestLALongBeach:
         """S25–S29 must not be collapsed to 'S' for Long Beach Courthouse."""
         assert normalize_department("Los Angeles", dept, courthouse=courthouse) == dept
 
+    # ------------------------------------------------------------------
+    # Long Beach — case_number prefix path (AC1)
+    # ------------------------------------------------------------------
+
+    def test_lb_via_case_number(self) -> None:
+        """S27 + LB case_number (25LBCV03352) must survive as 'S27' (AC1)."""
+        assert normalize_department("Los Angeles", "S27", case_number="25LBCV03352") == "S27"
+
+    @pytest.mark.parametrize(
+        "case_number",
+        ["25LBCV03352", "24LBCP01234", "23LBCV99999"],
+    )
+    def test_lb_case_number_variants(self, case_number: str) -> None:
+        """Any LBCV/LBCP case_number should keep letter+digit dept intact."""
+        assert normalize_department("Los Angeles", "S27", case_number=case_number) == "S27"
+
+    # ------------------------------------------------------------------
+    # Chatsworth — courthouse name path (AC2)
+    # ------------------------------------------------------------------
+
+    def test_chatsworth_via_courthouse_name(self) -> None:
+        """F49 + Chatsworth courthouse must survive as 'F49' (AC2)."""
+        assert (
+            normalize_department("Los Angeles", "F49", courthouse="Chatsworth Courthouse North")
+            == "F49"
+        )
+
+    @pytest.mark.parametrize(
+        "courthouse",
+        ["Chatsworth Courthouse North", "chatsworth courthouse north", "CHC", "chc"],
+    )
+    def test_chatsworth_courthouse_variants(self, courthouse: str) -> None:
+        """All Chatsworth courthouse name/code variants keep F-prefix depts."""
+        assert normalize_department("Los Angeles", "F49", courthouse=courthouse) == "F49"
+
+    # ------------------------------------------------------------------
+    # Chatsworth — case_number prefix path
+    # ------------------------------------------------------------------
+
+    def test_chatsworth_via_case_number(self) -> None:
+        """F49 + CHCV case_number must survive as 'F49'."""
+        assert normalize_department("Los Angeles", "F49", case_number="24CHCV03577") == "F49"
+
+    @pytest.mark.parametrize(
+        "case_number",
+        ["24CHCV03577", "23CHCP00123", "25CHCV99999"],
+    )
+    def test_chatsworth_case_number_variants(self, case_number: str) -> None:
+        """Any CHCV/CHCP case_number should keep letter+digit dept intact."""
+        assert normalize_department("Los Angeles", "F49", case_number=case_number) == "F49"
+
+    # ------------------------------------------------------------------
+    # Antelope Valley — courthouse name path (AC3)
+    # ------------------------------------------------------------------
+
+    def test_av_via_courthouse_name(self) -> None:
+        """A14 + Antelope Valley courthouse must survive as 'A14' (AC3)."""
+        assert (
+            normalize_department("Los Angeles", "A14", courthouse="Antelope Valley Courthouse")
+            == "A14"
+        )
+
+    @pytest.mark.parametrize(
+        "courthouse",
+        ["Antelope Valley Courthouse", "antelope valley courthouse", "AV", "av"],
+    )
+    def test_av_courthouse_variants(self, courthouse: str) -> None:
+        """All AV courthouse name/code variants keep A-prefix depts."""
+        assert normalize_department("Los Angeles", "A14", courthouse=courthouse) == "A14"
+
+    # ------------------------------------------------------------------
+    # Antelope Valley — case_number prefix path
+    # ------------------------------------------------------------------
+
+    def test_av_via_case_number(self) -> None:
+        """A14 + AVCV case_number must survive as 'A14'."""
+        assert normalize_department("Los Angeles", "A14", case_number="23AVCV00370") == "A14"
+
+    @pytest.mark.parametrize(
+        "case_number",
+        ["23AVCV00370", "24AVCP01234", "25AVCV99999"],
+    )
+    def test_av_case_number_variants(self, case_number: str) -> None:
+        """Any AVCV/AVCP case_number should keep letter+digit dept intact."""
+        assert normalize_department("Los Angeles", "A14", case_number=case_number) == "A14"
+
+    # ------------------------------------------------------------------
+    # Guard test — Stanley Mosk must still collapse (no carve-out)
+    # ------------------------------------------------------------------
+
+    def test_stanley_mosk_still_collapses(self) -> None:
+        """X14 + Stanley Mosk case_number (25STCV) must still collapse to 'X'."""
+        assert normalize_department("Los Angeles", "X14", case_number="25STCV12345") == "X"
+
     def test_pomona_l10_still_collapses(self) -> None:
         """Non-LB courthouse: L10 must still collapse to 'L'."""
         assert normalize_department("Los Angeles", "L10", courthouse="Pomona Courthouse") == "L"
@@ -440,3 +547,12 @@ class TestLALongBeach:
     def test_courthouse_omitted_back_compat(self) -> None:
         """Omitting courthouse kwarg preserves existing collapse behaviour."""
         assert normalize_department("Los Angeles", "X14") == "X"
+
+    def test_case_number_none_back_compat(self) -> None:
+        """Passing case_number=None preserves existing collapse behaviour."""
+        assert normalize_department("Los Angeles", "X14", case_number=None) == "X"
+
+    def test_three_arg_call_back_compat(self) -> None:
+        """3-arg call (no case_number kwarg) still collapses as before."""
+        assert normalize_department("Los Angeles", "X14") == "X"
+        assert normalize_department("Los Angeles", "S27") == "S"

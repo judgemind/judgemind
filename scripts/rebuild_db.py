@@ -87,6 +87,31 @@ KEY_PATTERN = re.compile(
 
 EXT_TO_FORMAT = {"html": "html", "pdf": "pdf", "docx": "docx", "txt": "txt"}
 
+# Best-effort courthouse name extraction from HTML body text (#4014).
+# Used in build_event to set event["courthouse"] so that the ingestion worker's
+# normalize_department() can skip the letter+digits collapse for regional LA
+# courthouses (Long Beach, Chatsworth, Antelope Valley) whose combined codes
+# (S25–S29, F43–F51, A14, etc.) identify distinct courtrooms.
+# Kept conservative — only exact proper-noun courthouse names; no fuzzy matching.
+_LA_BODY_COURTHOUSE_RE = re.compile(
+    r"\b(Chatsworth Courthouse North"
+    r"|Long Beach Courthouse"
+    r"|Antelope Valley Courthouse"
+    r"|Pomona Courthouse"
+    r"|Stanley Mosk Courthouse"
+    r"|Norwalk Courthouse"
+    r"|Spring Street Courthouse"
+    r"|Van Nuys Courthouse"
+    r"|Alhambra Courthouse"
+    r"|Compton Courthouse"
+    r"|Glendale Courthouse"
+    r"|Inglewood Courthouse"
+    r"|Pasadena Courthouse"
+    r"|Torrance Courthouse"
+    r"|Burbank Courthouse"
+    r"|Beverly Hills Courthouse)\b"
+)
+
 # Timezone lookup by state (expand as we add states)
 STATE_TIMEZONES = {
     "ca": "America/Los_Angeles",
@@ -274,6 +299,14 @@ def build_event(
                     event["hearing_date"] = str(hearing_dt)
             except ImportError:
                 pass
+
+            # Best-effort courthouse extraction from HTML body (#4014).
+            # Sets event["courthouse"] so normalize_department() can skip the
+            # letter+digits collapse for regional LA courthouses.
+            ch_match = _LA_BODY_COURTHOUSE_RE.search(text)
+            if ch_match:
+                event["courthouse"] = ch_match.group(1)
+
     elif content_format in ("pdf", "docx"):
         event["ruling_text"] = content.decode("latin-1")
 

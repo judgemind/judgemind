@@ -8,7 +8,17 @@ Rules by county:
 
 * **Los Angeles** — strip courtroom/calendar suffixes (`` #N``, ``N`` glued
   to single-letter depts), strip courthouse prefixes (``SSC-``), map
-  ``SEP`` -> ``P``.
+  ``SEP`` -> ``P``.  The single-letter+digits collapse (``X14`` → ``X``) is
+  **skipped** for regional courthouses (Long Beach, Chatsworth, Antelope
+  Valley) where the combined code identifies a distinct courtroom.  The
+  carve-out can be triggered two ways:
+    1. Pass ``courthouse=<name or code>`` — checked against
+       ``_LA_LETTER_DIGITS_KEEP_COURTHOUSES``.
+    2. Pass ``case_number=<number>`` — prefix checked against
+       ``_LA_LETTER_DIGITS_KEEP_CASE_PREFIX_RE`` (covers LBCV/LBCP,
+       CHCV/CHCP, AVCV/AVCP).  ``PC`` is intentionally omitted — it
+       collides with LASC's old BC/PC format used across multiple
+       courthouses.
 * **Riverside** — strip leading zeros from purely numeric departments.
 * **San Bernardino** — strip hyphens from letter+number codes
   (``S-17`` -> ``S17``).
@@ -20,6 +30,7 @@ Called by the ingestion worker before DB writes so both scraper-provided
 and LLM-extracted department values are normalized.
 
 See: https://github.com/judgemind/judgemind/issues/2141
+See: https://github.com/judgemind/judgemind/issues/4014
 """
 
 from __future__ import annotations
@@ -48,13 +59,43 @@ _LA_COURTHOUSE_ALIASES: dict[str, str] = {
     "SEP": "P",
 }
 
-# Long Beach Courthouse identifiers (case-folded).
-# S25–S29 are distinct courtrooms at LB; we skip the letter+digits collapse
-# so these codes survive normalization intact.  The display name comes from
-# ``_OPTION_TEXT_RE`` in ``la_tentatives.py``; ``LBC``/``LBCV`` are the
-# case-number prefixes — included defensively in case they ever appear in the
-# event payload.
-_LA_LB_COURTHOUSE_NAMES: frozenset[str] = frozenset({"long beach courthouse", "lbc", "lbcv"})
+# Courthouse identifiers for regional LA courthouses where the letter+digits
+# collapse must be skipped.  Values are case-folded for comparison.
+#
+# Long Beach: S25–S29 are distinct courtrooms.  Display name from
+# ``_OPTION_TEXT_RE`` in ``la_tentatives.py``; ``LBC``/``LBCV`` are case-
+# number prefixes included defensively.
+#
+# Chatsworth: F43–F51 are distinct courtrooms.  ``CHC`` is the courthouse
+# code variant.
+#
+# Antelope Valley: A14 etc. are distinct courtrooms.  ``AV`` is the code.
+_LA_LETTER_DIGITS_KEEP_COURTHOUSES: frozenset[str] = frozenset(
+    {
+        # Long Beach
+        "long beach courthouse",
+        "lbc",
+        "lbcv",
+        # Chatsworth
+        "chatsworth courthouse north",
+        "chc",
+        # Antelope Valley
+        "antelope valley courthouse",
+        "av",
+    }
+)
+
+# Case-number prefixes that indicate a regional courthouse where the
+# letter+digits collapse must be skipped.
+# - LBCV/LBCP → Long Beach Civil / Long Beach Complex
+# - CHCV/CHCP → Chatsworth Civil / Chatsworth Complex
+# - AVCV/AVCP → Antelope Valley Civil / Antelope Valley Complex
+# ``PC`` is intentionally excluded — it collides with LASC old-format
+# BC/PC numbers used across multiple courthouses (see llm_extractor.py:517).
+_LA_LETTER_DIGITS_KEEP_CASE_PREFIX_RE = re.compile(
+    r"^\d{2}(LBCV|LBCP|CHCV|CHCP|AVCV|AVCP)\d",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Riverside
@@ -90,6 +131,7 @@ def normalize_department(
     department: str | None,
     *,
     courthouse: str | None = None,
+    case_number: str | None = None,
 ) -> str | None:
     """Normalize a department name using county-specific rules.
 
@@ -101,8 +143,14 @@ def normalize_department(
         The raw department value from the scraper or LLM.
     courthouse : str | None
         Optional courthouse display name or code.  Used by the LA normalizer
-        to skip the letter+digits collapse for courthouses (e.g. Long Beach)
-        where the combined code is a real identifier, not a glued suffix.
+        to skip the letter+digits collapse for regional courthouses (Long
+        Beach, Chatsworth, Antelope Valley) where the combined code
+        identifies a distinct courtroom.
+    case_number : str | None
+        Optional case number.  Used by the LA normalizer as a fallback when
+        ``courthouse`` is absent — a LBCV/CHCV/AVCV prefix triggers the
+        same letter+digits keep rule.  ``PC`` is intentionally omitted from
+        the prefix set (collision with LASC old-format BC/PC numbers).
 
     Returns
     -------
@@ -120,7 +168,7 @@ def normalize_department(
     county_lower = county.lower()
 
     if county_lower == "los angeles":
-        dept = _normalize_la(dept, courthouse=courthouse)
+        dept = _normalize_la(dept, courthouse=courthouse, case_number=case_number)
     elif county_lower == "riverside":
         dept = _normalize_riverside(dept)
     elif county_lower == "san bernardino":
@@ -131,7 +179,12 @@ def normalize_department(
     return dept if dept else None
 
 
-def _normalize_la(dept: str, *, courthouse: str | None = None) -> str:
+def _normalize_la(
+    dept: str,
+    *,
+    courthouse: str | None = None,
+    case_number: str | None = None,
+) -> str:
     """Normalize an LA County department name.
 
     Transformations (applied in order):
@@ -140,9 +193,13 @@ def _normalize_la(dept: str, *, courthouse: str | None = None) -> str:
     2. Map known courthouse aliases (``SEP`` -> ``P``).
     3. Strip `` #N`` courtroom/calendar suffix.
     4. Strip single-letter + digits glue (``X14`` -> ``X``), **unless**
-       the courthouse is a Long Beach courthouse — at LB these combined
-       codes (``S25``–``S29``) identify distinct courtrooms and must be
-       preserved.
+       the department is from a regional courthouse (Long Beach, Chatsworth,
+       Antelope Valley) where the combined code identifies a distinct
+       courtroom.  The carve-out fires when either:
+       * ``courthouse`` (case-folded) is in
+         ``_LA_LETTER_DIGITS_KEEP_COURTHOUSES``, or
+       * ``case_number`` matches ``_LA_LETTER_DIGITS_KEEP_CASE_PREFIX_RE``
+         (LBCV/LBCP/CHCV/CHCP/AVCV/AVCP prefixes).
     """
     # 1. Strip SSC- prefix first to reveal underlying patterns
     m = _LA_SSC_PREFIX_RE.match(dept)
@@ -158,9 +215,14 @@ def _normalize_la(dept: str, *, courthouse: str | None = None) -> str:
     dept = _LA_COURTROOM_SUFFIX_RE.sub("", dept).strip()
 
     # 4. Single letter + digits -> letter only.
-    # Skip for Long Beach Courthouse where the combined code is meaningful.
-    is_lb = (courthouse or "").strip().lower() in _LA_LB_COURTHOUSE_NAMES
-    if not is_lb:
+    # Skip when the courthouse or case_number indicates a regional courthouse
+    # where letter+digit codes are meaningful identifiers.
+    courthouse_keep = (courthouse or "").strip().lower() in _LA_LETTER_DIGITS_KEEP_COURTHOUSES
+    case_number_keep = bool(
+        case_number and _LA_LETTER_DIGITS_KEEP_CASE_PREFIX_RE.match(case_number)
+    )
+    keep_letter_digits = courthouse_keep or case_number_keep
+    if not keep_letter_digits:
         m = _LA_LETTER_PLUS_DIGITS_RE.match(dept)
         if m:
             dept = m.group(1)
