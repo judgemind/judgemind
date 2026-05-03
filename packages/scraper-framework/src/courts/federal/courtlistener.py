@@ -416,13 +416,20 @@ class CourtListenerScraper(BaseScraper):
         # Collect all valid cluster IDs upfront, then batch-fetch their
         # opinions with bounded concurrency.
         cluster_id_list: list[int] = [c["id"] for c in clusters if c.get("id")]
-        cluster_by_id: dict[int, dict[str, Any]] = {c["id"]: c for c in clusters if c.get("id")}
+        # Cap to _max_results after full pagination: the doc-build loop short-circuits
+        # at _max_results anyway, so fetching beyond that is wasted work.
+        cluster_id_list = cluster_id_list[: self._max_results]
+        cluster_by_id: dict[int, dict[str, Any]] = {
+            cid: c for c in clusters if (cid := c.get("id")) and cid in set(cluster_id_list)
+        }
 
         opinions_by_cluster = client.fetch_opinions_for_clusters(cluster_id_list)
 
         # Build docket URL map: skip clusters with no docket URL
         cluster_id_to_docket_url: dict[int, str] = {
-            c["id"]: c["docket"] for c in clusters if c.get("id") and c.get("docket")
+            c["id"]: c["docket"]
+            for c in clusters
+            if c.get("id") and c["id"] in set(cluster_id_list) and c.get("docket")
         }
         dockets_by_cluster = client.fetch_dockets_for_clusters(cluster_id_to_docket_url)
 
