@@ -1639,6 +1639,190 @@ def test_cc_fetch_llm_disabled_uses_regex(mock_llm_enabled: MagicMock) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regex fallback for null LLM outcome/motion_type fields (#4029)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_llm_split_null_outcome_fallback(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM returns outcome=None, the regex fallback populates outcome from ruling_text."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="C24-01512",  # valid case number in cc_dept16_031126.pdf
+            ruling_text="Motion for Summary Judgment is granted.",
+            case_title="Smith v. Jones",
+            case_type="civil",
+            motion_type="motion_for_summary_judgment",
+            outcome=None,  # LLM left this None
+            parties=[],
+        ),
+    ]
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    # Regex fallback should have extracted "granted" from ruling_text
+    assert docs[0].outcome == "granted"
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_llm_split_null_motion_type_fallback(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM returns motion_type=None, the regex fallback populates it from ruling_text."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="C24-01512",  # valid case number in cc_dept16_031126.pdf
+            ruling_text="*HEARING ON MOTION TO COMPEL\nThe motion is granted.",
+            case_title="Smith v. Jones",
+            case_type="civil",
+            motion_type=None,  # LLM left this None
+            outcome="granted",
+            parties=[],
+        ),
+    ]
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    # Regex fallback should have extracted a motion type from the HEARING ON MOTION line
+    assert docs[0].motion_type is not None
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_llm_split_preserves_positive_llm_classification(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM returns non-None outcome/motion_type, regex fallback must NOT overwrite."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="C24-01512",  # valid case number in cc_dept16_031126.pdf
+            # ruling_text says "is granted" but LLM says "denied" — LLM wins
+            ruling_text="*HEARING ON MOTION TO COMPEL\nThe motion is granted.",
+            case_title="Smith v. Jones",
+            case_type="civil",
+            motion_type="motion_to_compel",
+            outcome="denied",  # LLM classification
+            parties=[],
+        ),
+    ]
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    # LLM values must be preserved; regex fallback must NOT run
+    assert docs[0].outcome == "denied"
+    assert docs[0].motion_type == "motion_to_compel"
+
+
+@respx.mock
+@patch("courts.ca.cc_tentatives._llm_extract_rulings")
+@patch("courts.ca.cc_tentatives._cc_llm_enabled", return_value=True)
+def test_cc_llm_split_null_fields_with_no_ruling_text(
+    mock_llm_enabled: MagicMock,
+    mock_extract: MagicMock,
+) -> None:
+    """When LLM returns both fields None and ruling_text is empty, both remain None (no crash)."""
+    config = cc_default_config()
+    scraper = CCTentativeRulingsScraper(config)
+
+    index_html = (
+        "<html><body>"
+        '<a class="tentative-ruling" '
+        'href="TR\\Department 16 - Judge Reyes\\16_031126.pdf">Mar 11</a>'
+        "</body></html>"
+    )
+    respx.get(INDEX_URL).mock(return_value=httpx.Response(200, text=index_html))
+
+    pdf_bytes = _load_bytes("cc_dept16_031126.pdf")
+    respx.route(method="GET", url__regex=r".*\.pdf$").mock(
+        return_value=httpx.Response(200, content=pdf_bytes)
+    )
+
+    mock_extract.return_value = [
+        CCSplitRuling(
+            ruling_index=1,
+            case_number="C24-01512",  # valid case number in cc_dept16_031126.pdf
+            ruling_text="",  # Empty ruling text
+            case_title="Smith v. Jones",
+            case_type="civil",
+            motion_type=None,
+            outcome=None,
+            parties=[],
+        ),
+    ]
+
+    docs = scraper.fetch_documents()
+
+    assert len(docs) == 1
+    # Both fields remain None — no crash, no spurious match
+    assert docs[0].outcome is None
+    assert docs[0].motion_type is None
+
+
+# ---------------------------------------------------------------------------
 # Regression: probate PDFs use content-hash filenames — hearing_date from PDF header
 # (#3739)
 # ---------------------------------------------------------------------------

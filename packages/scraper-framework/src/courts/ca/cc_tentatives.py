@@ -665,6 +665,11 @@ class CCTentativeRulingsScraper(PdfLinkScraper):
                                 doc.ruling_text = ruling.ruling_text
                                 doc.motion_type = ruling.motion_type
                                 doc.outcome = ruling.outcome
+                                # Regex fallback for null LLM fields (#4029)
+                                if doc.outcome is None and doc.ruling_text:
+                                    doc.outcome = _cc_extract_outcome(doc.ruling_text)
+                                if doc.motion_type is None and doc.ruling_text:
+                                    doc.motion_type = _cc_extract_motion_type(doc.ruling_text)
                                 doc.parties = ruling.parties
                                 doc.extra["_llm_extracted"] = True
                                 doc.extra["pre_split"] = True
