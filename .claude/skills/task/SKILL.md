@@ -38,7 +38,7 @@ After confirming the worktree, set up the agent status file so the dispatcher ca
 
 **Determining the agent-id (`AGENT_ID` env var precedence):**
 
-1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s claim comment and every `progress.sh` milestone call correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#6 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
+1. **If the `AGENT_ID` environment variable is set, use that value verbatim** as `{agent-id}`. The dispatcher-v3 task-runner ECS task launches `claude -p --worktree=agent-<uuid> "/task #N"` with `AGENT_ID=<uuid>` exported in the env. Using the launcher-assigned id ensures `/task`'s claim comment and every `progress.sh` milestone call correlate with the dispatcher's DB rows for the same agent. See the dispatcher-v3 spec (§11 OQ#5 and §4.3) for the full launcher contract — and #3873 for the issue that landed this env-var precedence.
 2. **Otherwise, fall back to the cwd-derived id** (e.g. `agent-ab4722a2` from `.claude/worktrees/agent-ab4722a2`, or `worker-2` from `worktrees/worker-2`). This is today's behavior — Agent-tool spawn via the dispatcher-v2 daemon does not export `AGENT_ID`, so the cwd-derived path remains the fallback.
 
 Quick check (env var first, cwd fallback): `echo "${AGENT_ID:-$(basename "$PWD")}"`.

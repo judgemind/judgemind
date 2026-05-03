@@ -133,7 +133,7 @@ EXIT_REASON_SILENT_HANG = "silent_hang"
 
 #: Default wall-clock cap (seconds) for a task-runner ECS task. The
 #: launcher's ``_watch_in_flight`` loop ecs:StopTask's any task-runner
-#: whose ``now - started_at`` exceeds this. Matches v3 spec §11 OQ#4:
+#: whose ``now - started_at`` exceeds this. Matches v3 spec §11 OQ#3:
 #: 6h covers virtually every real ``/task`` run including a long ralph
 #: + fix-CI cycle.
 #:
@@ -656,7 +656,7 @@ class Launcher:
           ``task_runner_wall_clock_seconds`` (default 21600, 6h) →
           ``ecs:StopTask`` + ``failed`` with
           ``exit_reason='wall_clock_exceeded'``. The wall-clock cap is
-          the *coarse* liveness check per spec §11 OQ#4; pre-#3940 it
+          the *coarse* liveness check per spec §11 OQ#3; pre-#3940 it
           was rendered into the task-def's ``stopTimeout`` field, but
           Fargate rejects task-defs with ``stopTimeout > 120s``, so the
           launcher enforces it here instead. Checked BEFORE the silent-
