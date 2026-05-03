@@ -279,7 +279,13 @@ class EnrichmentEngine:
         Default is 2.
     min_party_overlap : float
         Minimum party overlap (Jaccard similarity) required for a fuzzy
-        case number match to be accepted. Default is 0.3 (30%).
+        case number match to be accepted. Default is 0.5 (50%).
+
+        The floor is set at majority overlap to defeat the generic-party
+        collision class: when two cases share only a single generic party
+        (e.g. "State of Texas", "United States") the Jaccard score is
+        typically 1/3 ≈ 0.33, well below the 0.5 threshold
+        (Federal/CourtListener regression — see #4024).
 
         When party data is missing on either side (empty ``extracted_parties``
         or empty candidate parties) and the caller has explicitly provided
@@ -301,7 +307,7 @@ class EnrichmentEngine:
         *,
         court_portal: CourtPortalLookup | None = None,
         max_levenshtein: int = 2,
-        min_party_overlap: float = 0.3,
+        min_party_overlap: float = 0.5,
         max_fuzzy_candidates: int = 500,
     ) -> None:
         self._conn = conn
@@ -386,13 +392,13 @@ class EnrichmentEngine:
 
         # Step 2: Fuzzy match
         #
-        # Party-identity validation (#2467): track whether the caller has
-        # party information available for this ruling.  ``extracted_parties
-        # is None`` means "no party data known" (legacy caller contract) —
-        # accept on distance alone.  An empty or non-empty list means the
-        # caller DOES have a notion of the ruling's parties — require
-        # non-empty parties on both sides AND Jaccard overlap >= threshold
-        # to accept the fuzzy match.  Silent acceptance without party
+        # Party-identity validation (#2467, see also #4024): track whether the
+        # caller has party information available for this ruling.
+        # ``extracted_parties is None`` means "no party data known" (legacy
+        # caller contract) — accept on distance alone.  An empty or non-empty
+        # list means the caller DOES have a notion of the ruling's parties —
+        # require non-empty parties on both sides AND Jaccard overlap >=
+        # threshold to accept the fuzzy match.  Silent acceptance without party
         # validation collapses distinct rulings onto the same case_number
         # when near-duplicate numbers exist in the court.
         _parties_known = extracted_parties is not None
