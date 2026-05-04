@@ -1,9 +1,14 @@
 """Ingestion validation gate — LLM-based quality checks before DB write.
 
 Validates extracted fields against ruling text using a cheap LLM model
-(Haiku-class) to catch data quality issues that regression tests and
-volume-based monitoring miss. Runs inline in the ingestion worker between
-enrichment and DB write.
+to catch data quality issues that regression tests and volume-based
+monitoring miss. Runs inline in the ingestion worker between enrichment
+and DB write.
+
+The provider and model are resolved by ``call_llm`` from the
+``LLM_PROVIDER`` / ``LLM_MODEL`` environment variables — this module
+no longer pins a provider, so flipping ``LLM_PROVIDER`` (anthropic →
+google) takes effect here without code changes (#4032).
 
 Gated behind ``ENABLE_INGESTION_VALIDATION`` environment variable.
 Validation failures never block ingestion — on LLM errors, the document
@@ -20,10 +25,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from judgemind_config import DEFAULT_HAIKU_MODEL
-
 from framework.llm_utils import parse_llm_json
-from ingestion.llm_providers import LLMResponse, call_llm
+from ingestion.llm_providers import LLMResponse, call_llm, resolve_model
 
 if TYPE_CHECKING:
     import psycopg
@@ -33,9 +36,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Default model — always Haiku for cost efficiency.
-_VALIDATION_MODEL = DEFAULT_HAIKU_MODEL
 
 # Max output tokens — validation responses are short JSON.
 _DEFAULT_MAX_TOKENS = 512
@@ -141,9 +141,12 @@ def validate_document(
     client : object | None
         Pre-created LLM client for connection reuse.
     provider : str | None
-        LLM provider. Defaults to "anthropic" for validation.
+        LLM provider. Defaults to the value resolved by ``call_llm``
+        (``LLM_PROVIDER`` env var, then ``"google"``).
     model : str | None
-        Model ID. Defaults to Haiku.
+        Model ID. Defaults to the per-provider default resolved by
+        ``call_llm`` (``LLM_MODEL`` env var, then the provider's default
+        model).
     timeout : float | None
         Per-call timeout in seconds.
 
@@ -162,8 +165,9 @@ def validate_document(
             latency_ms=0,
         )
 
-    resolved_model = model or _VALIDATION_MODEL
-    resolved_provider = provider or "anthropic"
+    # Resolve via the same precedence call_llm uses, so the model recorded
+    # in ValidationResult matches the model that was actually called.
+    resolved_model = resolve_model(provider, model)
 
     # Build the user message with extracted fields and ruling text excerpt.
     # Use a 500-char excerpt to keep costs low while providing enough context.
@@ -195,7 +199,7 @@ def validate_document(
         response = call_llm(
             _SYSTEM_PROMPT,
             user_message,
-            provider=resolved_provider,
+            provider=provider,
             model=resolved_model,
             client=client,
             timeout=timeout,

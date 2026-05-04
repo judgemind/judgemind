@@ -1,31 +1,32 @@
-"""Ruling summarization at ingestion time using Claude Haiku.
+"""Ruling summarization at ingestion time using the configured LLM provider.
 
 Generates plain-English summaries of tentative rulings during ingestion.
 Summaries are pre-computed and cached in the ``rulings`` table — user-facing
 pages serve cached summaries without live AI calls.
 
+The provider and model are resolved by ``call_llm`` from the
+``LLM_PROVIDER`` / ``LLM_MODEL`` environment variables — this module does
+not pin a provider, so flipping ``LLM_PROVIDER`` (anthropic → google) takes
+effect here without code changes (#4032).
+
 Gated behind ``ENABLE_RULING_SUMMARIZATION`` environment variable.
 Summary generation failures never block ruling ingestion (graceful degradation).
 
-Uses the same prompt and model as ``scripts/backfill_summaries.py`` and
+Uses the same prompt as ``scripts/backfill_summaries.py`` and
 ``packages/nlp-pipeline/src/summarization/summarizer.py`` for consistency.
 """
 
 from __future__ import annotations
 
 import structlog
-from judgemind_config import DEFAULT_HAIKU_MODEL
 
-from .llm_providers import LLMResponse, call_llm
+from .llm_providers import LLMResponse, call_llm, resolve_model
 
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Default model — always Haiku for cost efficiency.
-_SUMMARY_MODEL = DEFAULT_HAIKU_MODEL
 
 # Max output tokens — summaries are 2-4 sentences, 512 is generous.
 _DEFAULT_MAX_TOKENS = 512
@@ -61,24 +62,30 @@ def summarize_ruling(
 ) -> tuple[str | None, str]:
     """Generate a plain-English summary of a tentative ruling.
 
-    Uses Claude Haiku via the provider-agnostic ``call_llm`` adapter.
-    On any failure, returns ``(None, model)`` — the caller should
-    continue without a summary rather than blocking ingestion.
+    Uses the env-configured LLM provider (``LLM_PROVIDER`` — Anthropic or
+    Google) via the provider-agnostic ``call_llm`` adapter.  On any
+    failure, returns ``(None, model)`` — the caller should continue
+    without a summary rather than blocking ingestion.
 
     Args:
         ruling_text: The full text of the tentative ruling.
         case_context: Optional dict with case metadata (e.g. ``case_title``,
             ``motion_type``) to improve summary specificity.
-        client: Optional pre-created Anthropic client for connection reuse.
+        client: Optional pre-created provider client for connection reuse.
+            The client must match the provider resolved by ``call_llm``.
         timeout: Per-call timeout in seconds.
         max_tokens: Maximum output tokens for the LLM call.
 
     Returns:
         Tuple of ``(summary_text_or_none, model_id)``.  The model ID is
         always returned so the caller can persist it even when the summary
-        is ``None`` (for debugging/metrics).
+        is ``None`` (for debugging/metrics).  Resolved using the same
+        precedence as ``call_llm`` (``LLM_MODEL`` env var, then the
+        per-provider default).
     """
-    model = _SUMMARY_MODEL
+    # Resolve the model the same way call_llm does, so the recorded
+    # model in the rulings table matches the one actually called.
+    model = resolve_model()
 
     if not ruling_text or not ruling_text.strip():
         logger.warning("ruling_summarizer.empty_text")
@@ -102,8 +109,6 @@ def summarize_ruling(
         llm_response: LLMResponse | None = call_llm(
             system_prompt=_SYSTEM_PROMPT,
             user_message=user_content,
-            provider="anthropic",
-            model=model,
             client=client,
             max_tokens=max_tokens,
             timeout=timeout,

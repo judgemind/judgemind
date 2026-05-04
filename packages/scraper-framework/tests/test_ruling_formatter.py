@@ -290,3 +290,76 @@ def test_format_ruling_text_strips_code_fences(mock_call_llm: object) -> None:
     result = format_ruling_text(original, client=object())
     assert "```" not in result
     assert '<div class="ruling">' in result
+
+
+# ---------------------------------------------------------------------------
+# Regression test for #4032: provider falls through to LLM_PROVIDER env var.
+# ---------------------------------------------------------------------------
+
+
+@patch("ingestion.ruling_formatter.call_llm")
+def test_format_ruling_text_falls_through_to_env_provider(
+    mock_call_llm: object,
+) -> None:
+    """call_llm is invoked WITHOUT explicit provider/model so resolution
+    falls through to ``LLM_PROVIDER`` / ``LLM_MODEL`` env vars (#4032).
+
+    Prior to #4032 this module hardcoded ``provider="anthropic"`` plus
+    ``model=DEFAULT_HAIKU_MODEL``, which silently bypassed the env var
+    that the rest of the ingestion pipeline (and #4031's terraform flip)
+    rely on. The regression guarded here is "the formatter pins the
+    provider to Anthropic regardless of LLM_PROVIDER".
+    """
+    mock_call_llm.return_value = LLMResponse(  # type: ignore[union-attr]
+        text='<div class="ruling"><p>'
+        + "The motion for summary judgment is GRANTED. " * 5
+        + "</p></div>",
+        input_tokens=100,
+        output_tokens=200,
+    )
+
+    original = "The motion for summary judgment is GRANTED. " * 5
+    format_ruling_text(original, client=object())
+
+    call_kwargs = mock_call_llm.call_args.kwargs  # type: ignore[union-attr]
+    assert "provider" not in call_kwargs, (
+        f"provider must not be pinned (#4032), got {call_kwargs.get('provider')!r}"
+    )
+    assert "model" not in call_kwargs, (
+        f"model must not be pinned (#4032), got {call_kwargs.get('model')!r}"
+    )
+
+
+def test_format_ruling_text_routes_through_google_when_env_set(
+    monkeypatch: object,
+) -> None:
+    """End-to-end: with ``LLM_PROVIDER=google`` set, the formatter dispatches
+    through ``_call_google`` (not ``_call_anthropic``). This is the
+    integration-style regression for #4032 — covers the full path from
+    ``format_ruling_text`` through ``call_llm`` to the provider adapter.
+    """
+    monkeypatch.setenv("LLM_PROVIDER", "google")  # type: ignore[attr-defined]
+    monkeypatch.delenv("LLM_MODEL", raising=False)  # type: ignore[attr-defined]
+
+    google_response = LLMResponse(
+        text='<div class="ruling"><p>'
+        + "The motion for summary judgment is GRANTED. " * 5
+        + "</p></div>",
+        input_tokens=100,
+        output_tokens=200,
+    )
+
+    with (
+        patch("ingestion.llm_providers._call_google") as mock_google,
+        patch("ingestion.llm_providers._call_anthropic") as mock_anthropic,
+    ):
+        mock_google.return_value = google_response
+
+        original = "The motion for summary judgment is GRANTED. " * 5
+        format_ruling_text(original, client=object())
+
+    mock_google.assert_called_once()
+    mock_anthropic.assert_not_called()
+    # The model resolves to the per-provider default for google.
+    google_call_args = mock_google.call_args
+    assert google_call_args[0][2] == "gemini-2.5-flash-lite"

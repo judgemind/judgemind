@@ -1,8 +1,13 @@
 """LLM-powered ruling text formatter for consistent, readable HTML display.
 
-Transforms raw ``ruling_text`` into structured semantic HTML using Claude Haiku.
-The formatted output follows a standard template with consistent CSS classes
-for case headers, captions, hearing info, and ruling body content.
+Transforms raw ``ruling_text`` into structured semantic HTML.  The formatted
+output follows a standard template with consistent CSS classes for case
+headers, captions, hearing info, and ruling body content.
+
+The provider and model are resolved by ``call_llm`` from the ``LLM_PROVIDER``
+and ``LLM_MODEL`` environment variables — this module does not pin a
+provider or model, so flipping ``LLM_PROVIDER`` (e.g. anthropic → google)
+takes effect here without code changes (#4032).
 
 Key guarantees:
 - **Zero information loss**: validates that formatted output preserves all
@@ -15,6 +20,7 @@ Key guarantees:
 Configuration:
 - ``ENABLE_RULING_FORMATTING``: environment variable to enable/disable.
   Defaults to disabled.
+- ``LLM_PROVIDER``, ``LLM_MODEL``: see ``llm_providers.call_llm``.
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ import html
 import re
 
 import structlog
-from judgemind_config import DEFAULT_HAIKU_MODEL
 
 from framework.llm_utils import strip_llm_json_fences
 
@@ -45,10 +50,9 @@ _MIN_TEXT_LENGTH = 100
 # catching content loss or summarization.
 _VALIDATION_THRESHOLD = 0.95
 
-# Default model for formatting — always Haiku for cost efficiency.
-_FORMATTING_MODEL = DEFAULT_HAIKU_MODEL
-
-# Default max output tokens.  Haiku supports up to 8192 output tokens.
+# Default max output tokens.  Both Haiku and Gemini Flash variants
+# comfortably support 8192 output tokens for the long-form HTML this
+# formatter produces.
 _DEFAULT_MAX_TOKENS = 8192
 
 # ---------------------------------------------------------------------------
@@ -291,17 +295,18 @@ def format_ruling_text(
 ) -> str:
     """Format raw ruling text into structured semantic HTML.
 
-    Uses Claude Haiku to transform unstructured court ruling text into
-    clean HTML following a consistent template.  The result is sanitized
-    and validated for zero information loss.
+    Uses the env-configured LLM provider (``LLM_PROVIDER`` — Anthropic or
+    Google) to transform unstructured court ruling text into clean HTML
+    following a consistent template.  The result is sanitized and
+    validated for zero information loss.
 
     On any failure (LLM error, truncation, validation failure), returns
     the original text wrapped in ``<pre>`` tags.
 
     Args:
         ruling_text: Raw ruling text to format.
-        client: Optional pre-created ``anthropic.Anthropic`` client for
-            connection reuse.
+        client: Optional pre-created provider client for connection reuse.
+            The client must match the provider resolved by ``call_llm``.
         timeout: Per-call timeout in seconds.
         max_tokens: Maximum output tokens for the LLM call.
 
@@ -320,12 +325,11 @@ def format_ruling_text(
         )
         return _pre_wrap_fallback(ruling_text)
 
-    # Call LLM for formatting
+    # Call LLM for formatting.  Provider and model resolved from
+    # LLM_PROVIDER / LLM_MODEL env vars (see llm_providers.call_llm).
     llm_response: LLMResponse | None = call_llm(
         system_prompt=_FORMATTING_SYSTEM_PROMPT,
         user_message=ruling_text,
-        provider="anthropic",
-        model=_FORMATTING_MODEL,
         client=client,
         max_tokens=max_tokens,
         timeout=timeout,
