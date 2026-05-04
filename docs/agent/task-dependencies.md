@@ -33,6 +33,28 @@ This atomically:
 
 **Note:** `Parent: #N` expresses hierarchy (this is a sub-task of #N), not dependency. A sub-task can be worked on independently even while the parent is open. Only use `Blocked by #N` when the issue genuinely cannot proceed until #N is resolved.
 
+### When the upstream blocker has no GitHub issue yet
+
+A common /task failure mode: the agent discovers an upstream condition (billing depleted, secret rotated, infra-only failure) that does not yet have a GitHub issue tracking it. Posting a BLOCKED comment is necessary but not sufficient — without a tracker + `Blocked by #N` line, the issue stays `agent/ready` and the next agent re-investigates the same upstream condition (see #4035).
+
+Use the helper:
+
+```
+scripts/block-on-new-issue.sh <dependent-issue> \
+    --title "<conventional-commits style title>" \
+    --body-file <path> \
+    [--label <label> ...] \
+    [--priority p0|p1|p2|p3]
+```
+
+This atomically:
+
+1. Files a new tracker issue with the supplied title / body / labels.
+2. Calls `block-issue.sh` to wire `Blocked by #<new>` + `status/blocked` on the dependent issue.
+3. Prints both numbers (and URLs) to stdout.
+
+**Do NOT pass `--label agent/ready`** for operator-only blockers (billing, secrets, account-level limits). Leaving an operator-only tracker `agent/ready` just sends another agent down the same dead end. Pick a `priority/p1` (workflow accelerator) or `priority/p0` (pipeline halted) label instead, and let the operator pick it up.
+
 ## When you finish a task
 
 **Implementation tasks (PRs):** dependent issues are unblocked automatically by the `unblock-issues` CI workflow when the PR merges. The PR body must include `Closes #N`.
