@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import httpx
@@ -33,7 +33,7 @@ from courts.federal.courtlistener import (
     _parse_date,
     default_config,
 )
-from framework import ContentFormat, ScraperConfig
+from framework import CapturedDocument, ContentFormat, ScraperConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures — sample API responses
@@ -862,8 +862,15 @@ class TestCourtListenerScraper:
         assert docs[0].hearing_date == datetime(2026, 3, 15)
 
     @respx.mock
-    def test_parse_document_is_passthrough(self) -> None:
-        """parse_document returns the document unchanged (fields set in mapping)."""
+    def test_parse_document_idempotent_on_already_populated_doc(self) -> None:
+        """parse_document on an already-mapped doc preserves the populated fields.
+
+        After _map_to_document populates the doc from the envelope, calling
+        parse_document re-runs the same envelope-population step from
+        raw_content.  The fields must come out unchanged because the
+        envelope stored in raw_content is the same data the original mapping
+        used.
+        """
         cluster = _make_cluster()
         opinion = _make_opinion(plain_text="Opinion text")
 
@@ -880,8 +887,10 @@ class TestCourtListenerScraper:
         docs = scraper.fetch_documents()
 
         original_title = docs[0].case_title
+        original_ruling_text = docs[0].ruling_text
         parsed = scraper.parse_document(docs[0])
         assert parsed.case_title == original_title
+        assert parsed.ruling_text == original_ruling_text
 
     @respx.mock
     def test_run_returns_health_event(self) -> None:
@@ -1596,3 +1605,256 @@ class TestFetchCapsToMaxResults:
         assert len(docs) == max_results, (
             f"Expected exactly {max_results} docs from page 1, got {len(docs)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# parse_document on a fresh CapturedDocument — reingest path (issue #3986)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDocumentReingestPath:
+    """Regression tests for the reingest path: ``parse_document`` must
+    populate ``ruling_text`` / ``ruling_text_html`` from a fresh
+    ``CapturedDocument`` carrying only ``raw_content``.
+
+    Before the fix in issue #3986, ``parse_document`` was a no-op that
+    assumed ``_map_to_document`` had already populated the fields.  This
+    held for the live capture path but not for ``scripts/reingest_from_s3.py``,
+    which constructs a fresh ``CapturedDocument`` from S3-archived bytes.
+    The reingest path therefore stored the raw JSON envelope (truncated
+    to 50,000 chars by the SQL writer) as ``ruling_text``.
+    """
+
+    def _make_envelope_doc(
+        self,
+        *,
+        cluster: dict | None = None,
+        opinion: dict | None = None,
+        docket: dict | None = None,
+    ) -> CapturedDocument:
+        """Build a fresh CapturedDocument with only raw_content set —
+        mirrors the shape ``scripts/reingest_from_s3.py:890-901`` constructs.
+        """
+        envelope: dict = {}
+        if cluster is not None:
+            envelope["cluster"] = cluster
+        if opinion is not None:
+            envelope["opinion"] = opinion
+        if docket is not None:
+            envelope["docket"] = docket
+        raw_content = json.dumps(envelope, default=str).encode("utf-8")
+
+        return CapturedDocument(
+            document_id="reingest-doc-1",
+            scraper_id="federal-courtlistener-opinions",
+            state="Federal",
+            county="Federal",
+            court="CourtListener",
+            source_url="https://www.courtlistener.com/api/rest/v4/opinions/2001/",
+            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            content_format=ContentFormat.TEXT,
+            raw_content=raw_content,
+            content_hash="0" * 64,
+        )
+
+    def _make_scraper(self) -> CourtListenerScraper:
+        """Build a scraper with no client — parse_document doesn't touch the network."""
+        config = _make_scraper_config()
+        return CourtListenerScraper(config, client=MagicMock(), days_back=7)
+
+    def test_parse_document_populates_ruling_text_from_plain_text(self) -> None:
+        """AC1: parse_document populates ruling_text from opinion["plain_text"].
+
+        Issue #3986: a fresh CapturedDocument from reingest carrying only
+        raw_content (the JSON envelope) must come out of parse_document with
+        ruling_text == opinion["plain_text"], not the raw JSON envelope.
+        """
+        cluster = _make_cluster()
+        opinion = {
+            "id": 2001,
+            "type": "010combined",
+            "plain_text": "Hello world",
+            "html_with_citations": "<pre>Hello world</pre>",
+        }
+        doc = self._make_envelope_doc(cluster=cluster, opinion=opinion)
+        # Pre-condition: fresh doc has no ruling_text yet (mirrors reingest).
+        assert doc.ruling_text is None
+        assert doc.ruling_text_html is None
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+
+        assert parsed.ruling_text == "Hello world"
+        assert parsed.ruling_text_html == "<pre>Hello world</pre>"
+
+    def test_parse_document_populates_html_fallback_when_plain_text_empty(self) -> None:
+        """AC1 (fallback): when plain_text is empty, ruling_text falls back
+        to the same html_with_citations / html / html_columbia / html_lawbox
+        chain that ``_map_to_document`` uses.
+        """
+        cluster = _make_cluster()
+        opinion = {
+            "id": 2002,
+            "type": "010combined",
+            "plain_text": "",
+            "html_with_citations": "<pre>HTML only opinion</pre>",
+        }
+        doc = self._make_envelope_doc(cluster=cluster, opinion=opinion)
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+
+        assert parsed.ruling_text == "<pre>HTML only opinion</pre>"
+        assert parsed.ruling_text_html == "<pre>HTML only opinion</pre>"
+
+    def test_parse_document_returns_unchanged_for_invalid_json(self) -> None:
+        """AC2: parse_document tolerates raw_content that is not valid JSON.
+
+        Pre-2024 captures or partial files may have raw_content that is not
+        a valid JSON envelope.  parse_document must not raise and must
+        leave the doc untouched so the reingest caller can fall back to
+        its raw text decode.
+        """
+        doc = CapturedDocument(
+            document_id="reingest-bad-json",
+            scraper_id="federal-courtlistener-opinions",
+            state="Federal",
+            county="Federal",
+            court="CourtListener",
+            source_url="https://www.courtlistener.com/api/rest/v4/opinions/9999/",
+            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            content_format=ContentFormat.TEXT,
+            raw_content=b"not json",
+            content_hash="0" * 64,
+        )
+
+        scraper = self._make_scraper()
+        # Must not raise.
+        parsed = scraper.parse_document(doc)
+
+        # Doc returned unchanged — ruling_text stays None so the reingest
+        # caller can fall back to its raw-text-decode path.
+        assert parsed.ruling_text is None
+        assert parsed.ruling_text_html is None
+        assert parsed.case_title is None
+
+    def test_parse_document_returns_unchanged_for_missing_envelope_keys(self) -> None:
+        """AC2 (extension): parse_document tolerates JSON that is well-formed
+        but doesn't have the expected ``cluster``/``opinion`` shape.
+        """
+        # Well-formed JSON but no cluster/opinion keys.
+        raw = json.dumps({"unrelated": {"data": "shape"}}).encode("utf-8")
+        doc = CapturedDocument(
+            document_id="reingest-wrong-shape",
+            scraper_id="federal-courtlistener-opinions",
+            state="Federal",
+            county="Federal",
+            court="CourtListener",
+            source_url="https://www.courtlistener.com/api/rest/v4/opinions/9999/",
+            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            content_format=ContentFormat.TEXT,
+            raw_content=raw,
+            content_hash="0" * 64,
+        )
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+
+        assert parsed.ruling_text is None
+        assert parsed.ruling_text_html is None
+        assert parsed.case_title is None
+
+    def test_parse_document_populates_structured_fields_from_envelope(self) -> None:
+        """parse_document populates case_title, case_number, judge_name,
+        hearing_date, motion_type, and extra metadata so reingest benefits
+        from the #3970 case_name_full mapper without requiring a second pass.
+        """
+        cluster = {
+            "id": 1001,
+            "case_name": "Smith v. Jones",
+            "case_name_full": "Joseph Smith v. Williams Jones et al.",
+            "case_name_short": "Smith",
+            "docket_number": "22-1234",
+            "judges": "Justice Roberts",
+            "date_filed": "2026-03-01",
+            "court": "/api/rest/v4/courts/scotus/",
+            "precedential_status": "Published",
+            "date_modified": "2026-03-05T12:00:00Z",
+            "citation_count": 5,
+        }
+        opinion = {
+            "id": 2001,
+            "type": "010combined",
+            "plain_text": "The court holds that...",
+        }
+        doc = self._make_envelope_doc(cluster=cluster, opinion=opinion)
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+
+        # case_title should pick up case_name_full per #3970 even via reingest.
+        assert parsed.case_title == "Joseph Smith v. Williams Jones et al."
+        assert parsed.case_number == "22-1234"
+        assert parsed.judge_name == "Justice Roberts"
+        assert parsed.hearing_date == datetime(2026, 3, 1)
+        assert parsed.motion_type == "Combined Opinion"
+        assert parsed.ruling_text == "The court holds that..."
+        # extra metadata populated for downstream consumers.
+        assert parsed.extra["courtlistener_cluster_id"] == 1001
+        assert parsed.extra["courtlistener_opinion_id"] == 2001
+        assert parsed.extra["courtlistener_court_id"] == "scotus"
+
+    def test_parse_document_does_not_store_json_envelope_as_ruling_text(self) -> None:
+        """Direct regression for issue #3986: ruling_text must NOT start
+        with the JSON envelope shape (``{"cluster":...``).
+
+        Verifies the failure mode ``_TRUNCATION_SENTINEL_LENGTH`` was
+        added to detect (deterministic.py:40).  Before the fix, reingest
+        produced rows with length(ruling_text) == 50000 and ruling_text
+        starting ``{"cluster":...``.  After the fix, ruling_text is the
+        opinion's plain_text body.
+        """
+        # Simulate a long opinion where naive UTF-8 decode of the envelope
+        # would absolutely contain "{\"cluster\":..." at the start.
+        cluster = _make_cluster()
+        opinion = {
+            "id": 2001,
+            "type": "010combined",
+            "plain_text": "The motion is GRANTED. " * 1000,  # ~22 KB body
+        }
+        doc = self._make_envelope_doc(cluster=cluster, opinion=opinion)
+
+        # Sanity check: the raw_content envelope DOES start with the JSON
+        # shape — this is exactly what the buggy decode path would store.
+        assert doc.raw_content.decode("utf-8").startswith('{"cluster":')
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+
+        assert parsed.ruling_text is not None
+        assert not parsed.ruling_text.startswith('{"cluster":'), (
+            "ruling_text must be the opinion body, not the JSON envelope"
+        )
+        assert parsed.ruling_text.startswith("The motion is GRANTED.")
+        # Sanity: respected the 10000-char cap matching _map_to_document.
+        assert len(parsed.ruling_text) == 10000
+
+    def test_parse_document_handles_none_raw_content(self) -> None:
+        """Defensive: parse_document on a doc with raw_content=b'' returns unchanged."""
+        doc = CapturedDocument(
+            document_id="reingest-empty",
+            scraper_id="federal-courtlistener-opinions",
+            state="Federal",
+            county="Federal",
+            court="CourtListener",
+            source_url="https://www.courtlistener.com/api/rest/v4/opinions/9999/",
+            capture_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            content_format=ContentFormat.TEXT,
+            raw_content=b"",
+            content_hash="0" * 64,
+        )
+
+        scraper = self._make_scraper()
+        parsed = scraper.parse_document(doc)
+        assert parsed.ruling_text is None
+        assert parsed.ruling_text_html is None

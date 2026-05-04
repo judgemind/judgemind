@@ -473,6 +473,7 @@ class CourtListenerScraper(BaseScraper):
         Returns:
             A CapturedDocument, or None if the opinion has no usable content.
         """
+        # Skip opinions with no usable content before doing any other work.
         # CourtListener opinions ship two parallel representations:
         #   - plain_text:           clean text, no markup (what we want for ruling_text)
         #   - html_with_citations:  same text wrapped in <pre class="inline"> with
@@ -488,11 +489,8 @@ class CourtListenerScraper(BaseScraper):
             or opinion.get("html_lawbox")
             or ""
         )
-
         if not plain_text_value and not html_text_value:
             return None
-
-        canonical_text = plain_text_value or html_text_value
 
         raw_content = json.dumps(
             {"cluster": cluster, "opinion": opinion},
@@ -503,10 +501,88 @@ class CourtListenerScraper(BaseScraper):
         opinion_id = opinion.get("id", "unknown")
         source_url = f"https://www.courtlistener.com/api/rest/v4/opinions/{opinion_id}/"
 
-        # Extract court identifier from cluster
-        court_id = cluster.get("court", "") or ""
+        doc = self._make_base_doc(
+            source_url=source_url,
+            raw_content=raw_content,
+            content_format=ContentFormat.TEXT,
+        )
+
+        self._populate_from_envelope(doc, cluster=cluster, opinion=opinion, docket=docket)
+        return doc
+
+    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
+        """Parse structured fields from doc.raw_content.
+
+        Single source of truth for both the live capture path
+        (``_map_to_document`` calls ``_populate_from_envelope`` after
+        building ``raw_content``) and the reingest path
+        (``scripts/reingest_from_s3.py`` constructs a fresh
+        ``CapturedDocument`` carrying only ``raw_content`` and calls this
+        method).  Without this populating step, reingest fell back to
+        ``raw_content.decode("utf-8")`` and stored the raw JSON envelope
+        as ``ruling_text`` (issue #3986).
+
+        Tolerates ``raw_content`` that is not valid JSON or is missing the
+        expected ``cluster``/``opinion`` keys — in those cases the doc is
+        returned unchanged so pre-2024 captures or partial files do not
+        crash reingest.
+        """
+        if not doc.raw_content:
+            return doc
+
+        try:
+            payload = json.loads(doc.raw_content)
+        except (ValueError, TypeError):
+            # Not valid JSON — likely a pre-2024 capture or a truncated file.
+            # Return unchanged so the reingest caller falls back to the raw
+            # text decode it already had.
+            return doc
+
+        if not isinstance(payload, dict):
+            return doc
+
+        cluster = payload.get("cluster")
+        opinion = payload.get("opinion")
+        if not isinstance(cluster, dict) or not isinstance(opinion, dict):
+            # Envelope shape doesn't match what we wrote — leave the doc
+            # untouched rather than risk populating with garbage.
+            return doc
+
+        docket = payload.get("docket") if isinstance(payload.get("docket"), dict) else None
+        self._populate_from_envelope(doc, cluster=cluster, opinion=opinion, docket=docket)
+        return doc
+
+    def _populate_from_envelope(
+        self,
+        doc: CapturedDocument,
+        *,
+        cluster: dict[str, Any],
+        opinion: dict[str, Any],
+        docket: dict[str, Any] | None = None,
+    ) -> None:
+        """Populate structured fields on ``doc`` from a CourtListener envelope.
+
+        Single source of truth for the field-mapping logic shared by the
+        live capture path (``_map_to_document``) and the reingest path
+        (``parse_document``).  Mutates ``doc`` in place.
+
+        See the resolution order in ``_map_to_document`` for the
+        plain_text / html_with_citations fallback rationale.
+        """
+        plain_text_value = opinion.get("plain_text") or ""
+        html_text_value = (
+            opinion.get("html_with_citations")
+            or opinion.get("html")
+            or opinion.get("html_columbia")
+            or opinion.get("html_lawbox")
+            or ""
+        )
+        canonical_text = plain_text_value or html_text_value
+
+        # Extract court identifier from cluster.
         # court field is typically a URL like "/api/rest/v4/courts/scotus/"
-        # Extract the short ID from the URL path
+        # — extract the short ID from the URL path.
+        court_id = cluster.get("court", "") or ""
         if "/" in court_id:
             parts = court_id.rstrip("/").split("/")
             court_id = parts[-1] if parts else court_id
@@ -529,17 +605,10 @@ class CourtListenerScraper(BaseScraper):
             resolved_state = self.config.state
             resolved_county = self.config.county
 
-        doc = self._make_base_doc(
-            source_url=source_url,
-            raw_content=raw_content,
-            content_format=ContentFormat.TEXT,
-        )
-
-        # Override state/county with the resolved jurisdiction
         doc.state = resolved_state
         doc.county = resolved_county
 
-        # Map structured fields
+        # Map structured fields.
         doc.case_title = (
             cluster.get("case_name_full")
             or cluster.get("case_name")
@@ -554,7 +623,7 @@ class CourtListenerScraper(BaseScraper):
         doc.outcome = None  # CourtListener opinions don't have a simple outcome field
         doc.motion_type = _map_opinion_type(opinion.get("type"))
 
-        # Store CourtListener-specific metadata in extra
+        # Store CourtListener-specific metadata in extra.
         doc.extra = {
             "courtlistener_cluster_id": cluster.get("id"),
             "courtlistener_opinion_id": opinion.get("id"),
@@ -564,20 +633,6 @@ class CourtListenerScraper(BaseScraper):
             "precedential_status": cluster.get("precedential_status"),
             "citation_count": cluster.get("citation_count", 0),
         }
-
-        return doc
-
-    def parse_document(self, doc: CapturedDocument) -> CapturedDocument:
-        """Parse structured fields from doc.raw_content.
-
-        For CourtListener, most parsing happens in _map_to_document() because
-        the API returns structured JSON.  This method performs any additional
-        cleanup or enrichment.
-        """
-        # Fields are already populated in _map_to_document.
-        # The raw_content is the full JSON payload; ruling_text was extracted
-        # during mapping.  No additional parsing needed.
-        return doc
 
 
 def _extract_docket_number(
