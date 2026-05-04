@@ -241,6 +241,7 @@ jobs:
 
     env:
       INGESTION_SERVICE: judgemind-ingestion-worker-dev
+      INGESTION_CONTAINER: ingestion-worker
 
     steps:
       - name: Configure AWS credentials
@@ -269,6 +270,28 @@ jobs:
           INGESTION_SERVICE: ${{ env.INGESTION_SERVICE }}
           LOG_GROUP: /ecs/judgemind-ingestion-worker-dev
         run: bash scripts/ecs-post-deploy-healthcheck.sh
+
+      # Drift gate (#4044): assert the running task-def's container_definitions
+      # match the terraform-rendered SSM parameter. Closes the silent-drift
+      # class where deploy-scraper races terraform.yml dev-apply, reads a
+      # stale SSM parameter, and pins the service to a pre-apply revision
+      # while terraform's intent lives in a strictly-newer revision the
+      # service cannot pick up because of `lifecycle.ignore_changes =
+      # [task_definition]` on the ECS service. Failing this step surfaces
+      # the drift before stale env vars affect production-like dev traffic.
+      - name: Verify ingestion-worker task-def matches terraform SSM (#4044)
+        id: fingerprint
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          INGESTION_SERVICE: ${{ env.INGESTION_SERVICE }}
+          INGESTION_CONTAINER: ${{ env.INGESTION_CONTAINER }}
+          INGESTION_WORKER_CONTAINER_DEFS_SSM_PARAMETER: ${{ env.INGESTION_WORKER_CONTAINER_DEFS_SSM_PARAMETER }}
+        run: |
+          bash scripts/check-ingestion-worker-task-def-fingerprint.sh \
+            --cluster "$ECS_CLUSTER" \
+            --service "$INGESTION_SERVICE" \
+            --container-name "$INGESTION_CONTAINER" \
+            --ssm-parameter "$INGESTION_WORKER_CONTAINER_DEFS_SSM_PARAMETER"
 
       - name: Set health check status
         if: always()

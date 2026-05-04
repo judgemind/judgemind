@@ -20,6 +20,7 @@
 #   regressions surface on the next unrelated deploy. Current callers:
 #     - .github/workflows/deploy-scraper.yml
 #     - .github/workflows/deploy-api.yml
+#     - .github/workflows/terraform.yml (dev-apply force-deploy, #4044)
 #
 # Identifying the deployment:
 #   - CI path knows the new task-def ARN up front.
