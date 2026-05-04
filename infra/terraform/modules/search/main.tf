@@ -107,15 +107,32 @@ resource "aws_opensearch_domain" "main" {
     }
   }
 
-  # Defence-in-depth (#3704): the security group is the network gate (HTTPS
-  # from VPC CIDR only); this IAM policy is the second layer, restricting
-  # es:* to enumerated role ARNs instead of the prior AWS="*" wildcard.
+  # Access policy is intentionally wide-open at the IAM layer
+  # (Principal = "*").  This is NOT a permissive misconfiguration —
+  # see #3771 for the chain of reasoning.  Short version: with
+  # fine-grained access control + internal user database (basic auth via
+  # Secrets Manager), HTTP requests using basic auth have no IAM
+  # principal at the AWS layer.  AWS evaluates the access policy
+  # against "anonymous" principal in that case.  If the policy is
+  # narrower than `*` (e.g. specific role ARNs), every basic-auth
+  # request is denied as "User: anonymous is not authorized" before
+  # FGAC's internal user DB ever validates the username/password.
+  # PR #3720 attempted to tighten this to enumerated role ARNs (#3704)
+  # and immediately broke ingestion-worker startup with the exact
+  # 403-anonymous symptom in #3771.  Reverted here; defence-in-depth
+  # remains via the SG (VPC-only HTTPS), encrypt-at-rest,
+  # node-to-node encryption, and FGAC's internal user database.
+  # The principal_arns variable is preserved (and dev/prod still pass
+  # specific ARNs to it) so that a future SigV4 migration of all
+  # OpenSearch clients can re-tighten the policy without a TF
+  # interface change.  Tracking issue for that migration: see the
+  # follow-up filed against #3704 in this PR's body.
   access_policies = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Effect    = "Allow"
-        Principal = { AWS = var.principal_arns }
+        Principal = { AWS = "*" }
         Action    = "es:*"
         Resource  = "arn:aws:es:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:domain/judgemind-${var.environment}/*"
       }

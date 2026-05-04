@@ -34,8 +34,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from opensearchpy import helpers
+from opensearchpy.exceptions import AuthorizationException, ConnectionTimeout, TransportError
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
-from opensearchpy.exceptions import ConnectionTimeout, TransportError
 
 from .mapping import TENTATIVE_RULINGS_ALIAS, create_index
 
@@ -49,6 +49,38 @@ logger = logging.getLogger(__name__)
 CONSUMER_GROUP = "indexer"
 CONSUMER_NAME = "indexer-1"
 STREAM_DOCUMENT_VALIDATED = "document.validated"
+
+
+def _is_anonymous_user_403(exc: BaseException) -> bool:
+    """Return True if the exception is OpenSearch's "User: anonymous" 403.
+
+    The 403-anonymous case is OpenSearch-FGAC's behavior when the AWS-level
+    domain access policy is narrower than ``Principal: AWS=*`` AND the
+    request uses HTTP Basic auth (which has no IAM principal at the AWS
+    layer).  Detecting this case lets the worker emit an actionable
+    diagnostic instead of a generic 403 swallow.  See issue #3771.
+
+    Robust to either 2-arg ``AuthorizationException(403, body)`` or 3-arg
+    ``AuthorizationException(403, msg, info)`` construction — opensearchpy
+    uses both shapes depending on the call path.
+    """
+    if not isinstance(exc, AuthorizationException):
+        return False
+    # opensearchpy's AuthorizationException stores the response under .error
+    # for 2-arg construction and .info for 3-arg construction.  Stringify both
+    # because the body may be a JSON string, a dict, or already-decoded text.
+    haystack_parts: list[str] = []
+    for attr in ("error", "info"):
+        try:
+            value = getattr(exc, attr, None)
+        except IndexError:
+            # .info raises IndexError when args has fewer than 3 elements.
+            value = None
+        if value is not None:
+            haystack_parts.append(str(value))
+    haystack_parts.append(str(exc))
+    haystack = " ".join(haystack_parts).lower()
+    return "anonymous" in haystack
 
 
 class IndexingConsumer:
@@ -86,6 +118,40 @@ class IndexingConsumer:
                     "without index pre-check; indexing may degrade until resolved. %s",
                     exc,
                 )
+
+                # Self-diagnosing escalation for the 403-anonymous-user case:
+                # when OpenSearch returns 403 with "User: anonymous" in the
+                # body, log an ERROR-level diagnostic naming the two known
+                # root causes so the next occurrence is self-diagnosing
+                # instead of mysterious silence.  Acceptance criterion #4
+                # of issue #3771.
+                if _is_anonymous_user_403(exc):
+                    logger.error(
+                        "OpenSearch denied request as 'User: anonymous' "
+                        "(403). The OpenSearch client is sending requests "
+                        "that the cluster treats as having NO authenticated "
+                        "AWS principal. Most likely root causes (in priority "
+                        "order):\n"
+                        "  1. The OPENSEARCH_USERNAME / OPENSEARCH_PASSWORD "
+                        "env vars are missing or empty in this task — the "
+                        "client falls back to anonymous when basic-auth is "
+                        "not configured.\n"
+                        "  2. The OpenSearch domain access policy does not "
+                        "grant 'Principal: AWS=*' for es:* actions. With "
+                        "fine-grained access control + internal user DB, "
+                        "basic-auth requests are evaluated as anonymous at "
+                        "the AWS layer; if the access policy is narrowed to "
+                        "specific role ARNs, basic auth is rejected before "
+                        "FGAC can validate the username/password. Either "
+                        "widen the policy back to '*' or migrate the "
+                        "client to SigV4-signed requests.\n"
+                        "  3. The OpenSearch master_user password in "
+                        "Secrets Manager has drifted from the actual "
+                        "domain master user (rotated out of band). "
+                        "See issue #3771 for the full root-cause analysis. "
+                        "Underlying exception: %s",
+                        exc,
+                    )
 
     # ------------------------------------------------------------------
     # Direct indexing interface
